@@ -1,6 +1,6 @@
 # 当前项目架构蓝图：实施记录
 
-日期：2026-09-10。状态：Markdown Task1已完成；其一项Minor及链接小修由Task2收口。Task2源码`abeabf6bda611113629ffa8b36cd8dceb55c7126`独立规格符合、质量Approved，Critical=0、Important=0、Minor=2；完整受影响测试、真实双HTML生成/门禁及新蓝图浏览器验收通过。本次交付包含两份实际HTML和中文记录；计划最终整体审查仍待，不表示全项目或生产迁移完成。
+日期：2026-09-10。状态：本蓝图与双目标HTML计划完成。Markdown Task1及Task2源码`abeabf6bda611113629ffa8b36cd8dceb55c7126`均通过独立规格/质量审查；完整受影响测试、真实双HTML生成/门禁及新蓝图浏览器验收通过。两份实际HTML及中文记录已在`3283eaf`纳管；最终整体审查的3项Minor由`fa991e2`收口，唯一限定复审3/3关闭、无新增问题。此结论不表示全项目或生产迁移完成。
 
 ## 已交付
 
@@ -63,6 +63,8 @@ Chrome/152.0.7977.83使用独立临时profile，Browser.close已返回确认且�
 
 Task2按[双目标计划](../superpowers/plans/2026-09-09-current-blueprint-offline-html.md)完成独立规格/质量审查；SOURCE为abeabf6，正式差异包固定d78acbd..abeabf6，仅11份源码/测试及两处新MD修订，主线实际产物证据另供审查。结论Spec符合、Quality Approved、C0/I0/M2。最小目标识别的正式RED为1 run / 2 assertions、exit1、旧target_unknown；测试装配阶段的NameError不计为行为RED。
 
-两项非阻断Minor交最终整体审查统一处理：browser usage尚未准确表达“endpoint加至少一个profile”；SHA反例仅直接覆盖catalog摘要，建议补manifest独立漂移。审查确认现有完整对象比较已拒绝manifest不匹配，不把测试粒度建议描述为当前校验绕过。
+最终整体审查固定`ee0db4a..3283eaf`，技术通过的三项Minor均在`fa991e2b4c4c27e0b9ac511ab8b1e85ea4b25833`关闭：browser usage准确表达endpoint加至少一个profile；新增仅改变manifest合法JSON空白、正式Catalog仍有效、旧SHA声明写前拒绝的独立反例；W15 §13和README精确导航共同纳管。最终定向合批2 runs / 14 assertions、0失败/错误/跳过，未将此前55项冒充修复后全量重跑。唯一限定复审固定`3283eaf..fa991e2`，3/3 ADDRESSED、无新增问题。
 
-尚未完成本计划最终整体审查、远端CI或生产接收证明。旧v5–v9审计顺序兼容、完整W15–W21及52 Unit迁移等仍按[开发入口](README.md)继续；[追加存储证据](implementation-durable-upgrade-2026-09-08.md#追加存储能提供的顺序证据)只是已核查的兼容设计输入，不是运行修复。
+父线以提交对象确认四个修复文件与工作文件一致，W15 §13标题、§11提示、README导航及11个源码链接有效。浏览器脚本仅usage常量改变，其他执行逻辑逐字节相同；其新SHA为`39a8c2ac1429abe7c397051633f3526a0f2dcead0a9f98ad5d4ddae2a092ecf0`。构建实现、两份Markdown/HTML、模板与资产未改变，因此保留原实际构建及浏览器验收证据，不把帮助文案变化说成脚本原字节未变。
+
+远端CI、生产接收证明与完整运行时迁移仍未完成。后续按[W15当前记录查询计划](../superpowers/plans/2026-09-10-readiness-current-record-query.md)复用现有v3集合接线，认证与最终health/readiness/CLI仍为独立必要验收，不以内部候选入口替代。旧v5–v9审计顺序兼容、完整W15–W21及52 Unit迁移等仍按[开发入口](README.md)继续；[追加存储证据](implementation-durable-upgrade-2026-09-08.md#追加存储能提供的顺序证据)只是已核查的兼容设计输入，不是运行修复。
