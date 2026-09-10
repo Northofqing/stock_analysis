@@ -27,6 +27,7 @@ mod generic_transport;
 mod intent_store;
 mod migration;
 mod operational_readiness;
+mod operator_request;
 mod phase_scheduler;
 mod readiness_probe;
 mod readiness_query;
@@ -89,6 +90,8 @@ mod finalization_sla_tests;
 mod generic_transport_tests;
 #[cfg(test)]
 mod operational_readiness_tests;
+#[cfg(test)]
+mod operator_request_tests;
 #[cfg(test)]
 mod phase_scheduler_tests;
 #[cfg(test)]
