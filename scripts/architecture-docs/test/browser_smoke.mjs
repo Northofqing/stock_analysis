@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const USAGE = 'Usage: browser_smoke.mjs --endpoint WS_URL --rfc HTML_PATH --diagram HTML_PATH [--blueprint HTML_PATH]';
+const USAGE = 'Usage: browser_smoke.mjs --endpoint WS_URL [--rfc HTML_PATH] [--diagram HTML_PATH] [--blueprint HTML_PATH] (at least one profile required; profiles may be combined)';
 
 function parseArgs(argv) {
   const values = new Map();

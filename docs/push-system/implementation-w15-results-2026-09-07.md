@@ -156,6 +156,8 @@ Task3E 独立审查保留一项非阻塞清理建议：仅测试调用的错误�
 
 ## 11. 来源与部署的后续接线顺序
 
+本节记录当时的接线缺口；其中“只有单manifest/generation”的结构限制已由后续v3集合路径补齐，见[最新边界核对](#13-v3集合与实际查询入口的最新边界-2026-09-10)。来源认证、生产授权和实际probe尚未因此完成，以下历史测试及当时分析不改写为新验收结果。
+
 Task3H 已完成限定实现与审查，最终证据见 §12：在 database 模块给既有 BR159 完整链/receipt 验证增加 rusqlite 事务行加载适配器，与 Diesel reader 共用规则，不跨驱动重开路径。该适配器自身不打开文件、不改变事务生命周期，也不认证源 schema/注册；完整来源读取仍须外层安全 opener、实际 schema 与上下文绑定。
 
 接线设计核对发现两项必须解决的前置条件：
@@ -179,3 +181,18 @@ Task3H 已完成限定实现与审查，最终证据见 §12：在 database 模�
 审查不能从差异证明的外层提交、schema/source 所有权及 W15 authority，均不在本适配器声明的证明范围，仍明确列为后续来源拥有者和部署验证器的必要验收，未据此签发 Ready。
 
 下一条完整开发链按 [W16 实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md) 推进：先同一只读事务加载全 Unit 的实际 manifest/journal、重算内容及完整链、区分未登记/待协调/持久一致，再接外部认证与当前 owner。读取一致不等于部署认证或允许发送；真实平台信任根、Shadow/legacy 共同授权等未决项保留。没有启动监控或生产操作。
+
+## 13. v3集合与实际查询入口的最新边界（2026-09-10）
+
+此次为隔离树源码只读核对，Rust/Cargo仍在`aef7972965f610ed418049593dfff1d55341772e`，没有重跑已关闭的v3/store/codec测试或启动实际probe。它更新下一步依赖判断，不为W15签发完成证书。
+
+| 旧剩余项/入口 | 当前已有能力 | 仍需补齐的边界 |
+| --- | --- | --- |
+| 单一manifest/generation | [逐Unit部署声明](../../src/push_foundation/activation_readiness.rs#L31)及[完整集合](../../src/push_foundation/activation_readiness.rs#L161)已存在；[v3载荷](../../src/push_foundation/readiness_snapshot.rs#L538)包含完整deployment set及摘要 | 不能再按“尚无集合结构”重复开发；v2 scalar兼容分支仍保留，并非被删除 |
+| 集合评估/快照 | [evaluate_for_deployment_set](../../src/push_foundation/operational_readiness.rs#L441)、[try_new_v3](../../src/push_foundation/readiness_snapshot.rs#L222)按同一catalog重算并核对assessment | 部署声明和证据仍须独立认证；[模块契约](../../src/push_foundation/activation_readiness.rs#L1)明确不认证source/owner/binary/执行权，hash相等不提升为批准 |
+| 已持久化查询 | [load_head/load_record](../../src/push_foundation/readiness_store.rs#L144)验证并返回head链上的记录 | [StoredReadinessRecord](../../src/push_foundation/readiness_store.rs#L75)只证明持久receipt，内部仍是CandidateReadinessRecord；不是已认证运行快照 |
+| W15 probe | [readiness_probe](../../src/push_foundation/readiness_probe.rs#L1)以catalog和调用者facts生成候选inventory | 尚非同一已认证store快照的消费者；不能用候选计数替代权威查询 |
+| 现有gRPC probe | [run](../../src/bin/grpc_local_readiness_probe.rs#L117)直连外部健康/能力/业务查询 | 它不是W15 store查询入口，不能因名称相似就合并完成状态；本轮未执行任何RPC |
+| monitor组合 | [Foundation声明/导出](../../src/push_foundation/mod.rs#L19)中这些模块仍为内部边界 | 限定检索monitor及该gRPC probe未找到这些W15记录/集合/store标识的直接consumer，不是全仓间接调用图证明，也不表示删除已有能力 |
+
+限定检索标识为`ReadinessDeploymentSetContext`、`CandidateReadinessSnapshot`、`CandidateReadinessInventory`、`StoredReadinessRecord`、`ReadinessStore`、`readiness_store`、`readiness_snapshot`、`readiness_probe`、`try_new_v3`；范围为`src/bin/monitor`下源码及`src/bin/grpc_local_readiness_probe.rs`。后续应在已存在的全Unit集合能力上补来源/owner/build真实性、认证后的记录存储与恢复，再让query/probe/monitor消费同一认证快照；不要退回单Unit、自报bool或任意文件路径。具体生产信任材料与授权仍单独验收。

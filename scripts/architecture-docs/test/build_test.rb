@@ -14,6 +14,7 @@ require_relative 'support/catalog_fixture'
 require_relative 'support/document_check_fixture'
 
 BUILD = File.expand_path('../build.rb', __dir__)
+BROWSER_SMOKE = File.expand_path('browser_smoke.mjs', __dir__)
 
 class ArchitectureDocsBuildTest < Minitest::Test
   def test_blueprint_is_a_supported_closed_target
@@ -99,6 +100,19 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_includes stdout, 'target=blueprint'
       assert_empty stderr
     end
+  end
+
+  def test_browser_smoke_usage_describes_one_or_more_explicit_profiles
+    stdout, stderr, result = Open3.capture3(
+      'node', BROWSER_SMOKE, '--endpoint', 'ws://127.0.0.1:1'
+    )
+
+    assert_equal 2, result.exitstatus, stdout + stderr
+    assert_empty stdout
+    assert_equal <<~USAGE, stderr
+      arguments_invalid
+      Usage: browser_smoke.mjs --endpoint WS_URL [--rfc HTML_PATH] [--diagram HTML_PATH] [--blueprint HTML_PATH] (at least one profile required; profiles may be combined)
+    USAGE
   end
 
   def test_all_builds_in_fixed_order_and_check_aggregates_target_failures_read_only
@@ -198,6 +212,32 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_equal "blueprint_source_identity_mismatch target=blueprint\n", stdout
       assert_empty stderr
       refute File.exist?(output)
+    end
+  end
+
+  def test_manifest_byte_drift_alone_invalidates_blueprint_declaration_before_writing
+    with_dual_fixture do |root|
+      catalog_path = File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json')
+      manifest_path = File.join(root, 'docs/push-system/push-current-evidence-manifest.v1.json')
+      blueprint_path = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md')
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      catalog_before = File.binread(catalog_path)
+      manifest_before = File.binread(manifest_path)
+      blueprint_before = File.binread(blueprint_path)
+      output_before = [File.binread(output), File.mtime(output)]
+
+      File.binwrite(manifest_path, "\n#{manifest_before}")
+
+      assert_equal JSON.parse(manifest_before), JSON.parse(File.binread(manifest_path))
+      assert_equal catalog_before, File.binread(catalog_path)
+      assert_equal blueprint_before, File.binread(blueprint_path)
+      assert_empty ArchitectureDocs::Catalog.validate(root, strict: false)
+
+      stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+      assert_equal 1, result.exitstatus, stdout + stderr
+      assert_equal "blueprint_source_identity_mismatch target=blueprint\n", stdout
+      assert_empty stderr
+      assert_equal output_before, [File.binread(output), File.mtime(output)]
     end
   end
 
