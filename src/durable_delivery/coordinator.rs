@@ -344,7 +344,9 @@ struct AttestedOperationLease<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DatabaseOperationTestPhase {
     AfterPreValidationBeforeSql,
+    AfterConnectionSchemaValidationBeforeTransaction,
     AfterSqlBeforePreCommitValidation,
+    AfterSqlBeforePostValidation,
 }
 
 #[cfg(test)]
@@ -376,6 +378,13 @@ pub(crate) enum OperationPostvalidationTestFault {
     ManualResolutionRef,
     SinkDeliveryAuditRef,
     TaskHydrationState,
+    SchemaVersion(i64),
+}
+
+#[derive(Clone, Copy)]
+enum SchemaVersionPolicy {
+    Bootstrap,
+    Runtime,
 }
 
 #[derive(Clone, Debug)]
@@ -2484,15 +2493,21 @@ impl DurableDeliveryCoordinator {
         };
         drop(attestation_guard);
 
-        coordinator.with_connection(|connection| configure_attested_connection(connection))?;
-        coordinator.with_immediate_transaction(|transaction| {
-            initialize_schema(transaction)?;
-            #[cfg(test)]
-            run_database_bootstrap_test_hook(
-                DatabaseBootstrapTestPhase::AfterSchemaSqlBeforeCommitValidation,
-            )?;
-            Ok(())
-        })?;
+        coordinator
+            .with_connection_for_schema_policy(SchemaVersionPolicy::Bootstrap, |connection| {
+                configure_attested_connection(connection)
+            })?;
+        coordinator.with_immediate_transaction_for_schema_policy(
+            SchemaVersionPolicy::Bootstrap,
+            |transaction| {
+                initialize_schema(transaction)?;
+                #[cfg(test)]
+                run_database_bootstrap_test_hook(
+                    DatabaseBootstrapTestPhase::AfterSchemaSqlBeforeCommitValidation,
+                )?;
+                Ok(())
+            },
+        )?;
         coordinator
             .database_binding()?
             .sync_parent_directory("database parent before coordinator success")?;
@@ -2513,10 +2528,20 @@ impl DurableDeliveryCoordinator {
             )
         })?;
         verify_connection_configuration(&connection_guard)?;
-        let _final_post_connection_lifetime = database_binding.validate_under_open_lock()?;
+        let schema_validation = require_current_schema_version(&connection_guard);
+        let final_post_connection_lifetime = database_binding.validate_under_open_lock();
         drop(connection_guard);
         drop(final_lease);
-        Ok(coordinator)
+        match (schema_validation, final_post_connection_lifetime) {
+            (Ok(()), Ok(_final_post_connection_lifetime)) => Ok(coordinator),
+            (Err(schema_error), Ok(_final_post_connection_lifetime)) => Err(schema_error),
+            (Ok(()), Err(post_error)) => Err(post_error),
+            (Err(schema_error), Err(post_error)) => {
+                Err(DurableDeliveryError::IsolationViolation(format!(
+                    "final bootstrap schema validation failed; primary={schema_error}; post_validation={post_error}"
+                )))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4505,6 +4530,14 @@ impl DurableDeliveryCoordinator {
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
+        self.with_connection_for_schema_policy(SchemaVersionPolicy::Runtime, operation)
+    }
+
+    fn with_connection_for_schema_policy<T>(
+        &self,
+        schema_policy: SchemaVersionPolicy,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         // The global lease serializes process-fd attestation with coordinator
         // opens and retains one live SHM-owning Connection Arc throughout the
         // complete pre -> SQLite operation -> post boundary.
@@ -4517,17 +4550,40 @@ impl DurableDeliveryCoordinator {
         })?;
         let _locked_pre_lifetime = database_binding.validate_under_open_lock()?;
         #[cfg(test)]
-        let outcome = match self.run_database_operation_test_hook(
+        let pre_sql_hook = self.run_database_operation_test_hook(
             DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
-        ) {
-            Ok(()) => operation(&mut connection),
+        );
+        #[cfg(not(test))]
+        let pre_sql_hook = Ok(());
+        let outcome = match pre_sql_hook {
+            Ok(()) => match schema_policy {
+                SchemaVersionPolicy::Bootstrap => operation(&mut connection),
+                SchemaVersionPolicy::Runtime => match require_current_schema_version(&connection) {
+                    Ok(()) => operation(&mut connection),
+                    Err(error) => Err(error),
+                },
+            },
             Err(error) => Err(error),
         };
-        #[cfg(not(test))]
-        let outcome = operation(&mut connection);
+        #[cfg(test)]
+        let outcome = match outcome {
+            Ok(value) => match self.run_database_operation_test_hook(
+                DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            ) {
+                Ok(()) => Ok(value),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
         let reference_post = outcome
             .as_ref()
-            .map(|_| validate_persisted_immutable_references(&connection))
+            .map(|_| match schema_policy {
+                SchemaVersionPolicy::Bootstrap => Ok(()),
+                SchemaVersionPolicy::Runtime => {
+                    require_current_schema_version(&connection)?;
+                    validate_persisted_immutable_references(&connection)
+                }
+            })
             .unwrap_or(Ok(()));
         let post = database_binding.validate_under_open_lock();
         drop(connection);
@@ -4563,9 +4619,30 @@ impl DurableDeliveryCoordinator {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.with_connection(|connection| {
+        self.with_immediate_transaction_for_schema_policy(SchemaVersionPolicy::Runtime, operation)
+    }
+
+    fn with_immediate_transaction_for_schema_policy<T>(
+        &self,
+        schema_policy: SchemaVersionPolicy,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_connection_for_schema_policy(schema_policy, |connection| {
+            #[cfg(test)]
+            self.run_database_operation_test_hook(
+                DatabaseOperationTestPhase::AfterConnectionSchemaValidationBeforeTransaction,
+            )?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if matches!(schema_policy, SchemaVersionPolicy::Runtime) {
+                if let Err(primary) = require_current_schema_version(&transaction) {
+                    return Err(self.rollback_transaction_with_evidence(
+                        &transaction,
+                        "schema validation after BEGIN IMMEDIATE",
+                        primary,
+                    ));
+                }
+            }
             let value = match operation(&transaction) {
                 Ok(value) => value,
                 Err(primary) => {
@@ -4591,6 +4668,13 @@ impl DurableDeliveryCoordinator {
                 return Err(self.rollback_transaction_with_evidence(
                     &transaction,
                     "operation postvalidation test fault",
+                    primary,
+                ));
+            }
+            if let Err(primary) = require_current_schema_version(&transaction) {
+                return Err(self.rollback_transaction_with_evidence(
+                    &transaction,
+                    "schema validation before commit",
                     primary,
                 ));
             }
@@ -4651,6 +4735,10 @@ impl DurableDeliveryCoordinator {
         };
         let whitespace = " \t\n\r";
         let changed = match fault {
+            OperationPostvalidationTestFault::SchemaVersion(version) => {
+                transaction.pragma_update(None, "user_version", version)?;
+                return Ok(());
+            }
             OperationPostvalidationTestFault::ImmutableAuditOutboxRef => transaction.execute(
                 "UPDATE immutable_audit_outbox SET immutable_audit_ref=?1
                  WHERE audit_identity=(
@@ -9199,6 +9287,17 @@ fn require_single_cas_update(changed: usize, operation: &str) -> Result<()> {
     if changed != 1 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
             "{operation} compare-and-set affected {changed} rows; expected exactly one"
+        )));
+    }
+    Ok(())
+}
+
+fn require_current_schema_version(connection: &Connection) -> Result<()> {
+    let schema_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != SCHEMA_VERSION {
+        return Err(DurableDeliveryError::InvalidConfiguration(format!(
+            "durable-delivery schema version {schema_version} does not match required version {SCHEMA_VERSION}"
         )));
     }
     Ok(())

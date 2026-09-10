@@ -2670,6 +2670,507 @@ fn br194_schema_v5_migration_matrix_is_repeatable_and_rejects_newer_versions() {
 }
 
 #[test]
+fn runtime_schema_guard_rejects_visible_drift_before_read_and_write_callbacks() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_VISIBLE_DRIFT");
+    let existing = envelope(
+        "RUNTIME_SCHEMA_VISIBLE_DRIFT_EXISTING",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&existing, 1, now())
+        .expect("prepare actual decision before schema drift");
+
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let drift_connection =
+        Connection::open(&fixture.database_path).expect("open isolated schema drift connection");
+    drift_connection
+        .pragma_update(None, "user_version", drifted_version)
+        .expect("drift isolated database schema version");
+    drop(drift_connection);
+
+    let read = fixture
+        .coordinator
+        .decision_state(&existing.decision_identity);
+    let new_candidate = envelope(
+        "RUNTIME_SCHEMA_VISIBLE_DRIFT_NEW",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let write = fixture.coordinator.prepare(&new_candidate, 1, now());
+
+    assert!(matches!(
+        read,
+        Err(DurableDeliveryError::InvalidConfiguration(reason))
+            if reason.contains("schema version")
+    ));
+    assert!(matches!(
+        write,
+        Err(DurableDeliveryError::InvalidConfiguration(reason))
+            if reason.contains("schema version")
+    ));
+    assert_eq!(
+        fixture.query_i64(&format!(
+            "SELECT COUNT(*) FROM delivery_decisions WHERE decision_identity='{}'",
+            new_candidate.decision_identity
+        )),
+        0,
+        "visible drift must be rejected before the write callback changes business data"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rejects_zero_legacy_and_newer_versions_until_restored() {
+    for (label, drifted_version) in [
+        ("ZERO", 0),
+        ("LEGACY", 4),
+        ("NEWER", super::schema::SCHEMA_VERSION + 1),
+    ] {
+        let fixture = Fixture::new(&format!("RUNTIME_SCHEMA_MATRIX_{label}"));
+        let candidate = envelope(
+            &format!("RUNTIME_SCHEMA_MATRIX_{label}"),
+            PushKind::ReviewProviderTopN,
+            DeliverySubKind::None,
+            "2026-07-30",
+            true,
+        );
+        fixture
+            .coordinator
+            .prepare(&candidate, 1, now())
+            .expect("prepare actual decision before matrix drift");
+        set_isolated_schema_version(&fixture.database_path, drifted_version);
+
+        assert_schema_version_error(
+            fixture
+                .coordinator
+                .decision_state(&candidate.decision_identity),
+            drifted_version,
+        );
+
+        set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+        assert_eq!(
+            fixture
+                .coordinator
+                .decision_state(&candidate.decision_identity)
+                .expect("runtime read succeeds after restoring current schema version"),
+            DecisionState::Reserved
+        );
+    }
+}
+
+#[test]
+fn runtime_schema_guard_rechecks_after_operation_prevalidation_before_read_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_OPERATION_PREVALIDATION");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_OPERATION_PREVALIDATION",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare actual decision before prevalidation drift");
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let coordinator = fixture_coordinator_arc(&fixture);
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_by_probe = callback_count.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                coordinator.install_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+                    move || {
+                        callback_count_by_probe.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .expect("install drift after operation prevalidation");
+
+    assert_schema_version_error(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity),
+        drifted_version,
+    );
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        0,
+        "the read callback must not reach its post-SQL checkpoint after schema drift"
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let restored_state = fixture
+        .coordinator
+        .decision_state(&candidate.decision_identity)
+        .expect("read succeeds after restoring current schema version");
+    assert_eq!(restored_state, DecisionState::Reserved);
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        1,
+        "the restored read must prove the post-SQL checkpoint is reachable"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rechecks_after_begin_immediate_before_write_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_OUTER_CHECK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_OUTER_CHECK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let coordinator = fixture_coordinator_arc(&fixture);
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_by_probe = callback_count.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterConnectionSchemaValidationBeforeTransaction,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                coordinator.install_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePreCommitValidation,
+                    move || {
+                        callback_count_by_probe.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .expect("install drift after outer validation");
+
+    assert_schema_version_error(
+        fixture.coordinator.prepare(&candidate, 1, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        fixture.query_i64(&format!(
+            "SELECT COUNT(*) FROM delivery_decisions WHERE decision_identity='{}'",
+            candidate.decision_identity
+        )),
+        0,
+        "the transaction callback must not run after the post-BEGIN check rejects drift"
+    );
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        0,
+        "the write callback must not reach its post-SQL checkpoint after schema drift"
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let restored = fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare succeeds after restoring current schema version");
+    assert_eq!(restored.state, DecisionState::Reserved);
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        1,
+        "the restored write must prove the post-SQL checkpoint is reachable"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rolls_back_business_audit_and_version_drift_before_commit() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_PRECOMMIT_ROLLBACK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_PRECOMMIT_ROLLBACK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "daily_budget_reservations",
+    ];
+    let before_connection =
+        Connection::open(&fixture.database_path).expect("open precommit baseline connection");
+    let before = authority_snapshot(&before_connection, &tables);
+    drop(before_connection);
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    fixture
+        .coordinator
+        .install_operation_postvalidation_test_fault(
+            OperationPostvalidationTestFault::SchemaVersion(drifted_version),
+        )
+        .expect("install transaction-local schema drift");
+
+    assert_schema_version_error(
+        fixture.coordinator.prepare(&candidate, 1, now()),
+        drifted_version,
+    );
+
+    let after_connection =
+        Connection::open(&fixture.database_path).expect("open precommit rollback connection");
+    assert_eq!(
+        after_connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read schema version after rollback"),
+        super::schema::SCHEMA_VERSION,
+        "transaction-local schema drift must roll back"
+    );
+    assert_eq!(
+        authority_snapshot(&after_connection, &tables),
+        before,
+        "business rows, reservations, audit rows, and schema version must not partially commit"
+    );
+    drop(after_connection);
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .prepare(&candidate, 1, now())
+            .expect("same write succeeds after one-shot drift rollback")
+            .state,
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rejects_read_when_version_drifts_after_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_READ_POSTCHECK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_READ_POSTCHECK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare actual decision before read postcheck");
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                Ok(())
+            },
+        )
+        .expect("install drift after read callback");
+
+    assert_schema_version_error(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity),
+        drifted_version,
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read succeeds after restoring current schema version"),
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_reconcile_visible_drift_has_no_database_or_append_effect() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_RECONCILE_VISIBLE_DRIFT");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_RECONCILE_VISIBLE_DRIFT",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare pending audit before visible drift");
+    let tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "daily_budget_reservations",
+    ];
+    let before_connection =
+        Connection::open(&fixture.database_path).expect("open reconcile baseline connection");
+    let before = authority_snapshot(&before_connection, &tables);
+    drop(before_connection);
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    set_isolated_schema_version(&fixture.database_path, drifted_version);
+    let append = MemoryAppendPort::default();
+
+    assert_schema_version_error(
+        fixture.coordinator.reconcile_all_pending(&append, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        append.record_count(),
+        0,
+        "visible drift must be rejected before any external append"
+    );
+    let after_connection =
+        Connection::open(&fixture.database_path).expect("open rejected reconcile snapshot");
+    assert_eq!(authority_snapshot(&after_connection, &tables), before);
+    drop(after_connection);
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let retry = fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("reconcile succeeds after restoring current schema version");
+    assert!(retry.progress_count > 0);
+    assert!(append.record_count() > 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("public read succeeds after restored reconcile"),
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_external_append_survives_rejected_database_ack() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_EXTERNAL_APPEND");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_EXTERNAL_APPEND",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare pending audit before append boundary drift");
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let append = SchemaDriftAfterAppend::new(
+        fixture_coordinator_arc(&fixture),
+        "DecisionStateChanged",
+        drifted_version,
+    );
+
+    assert_schema_version_error(
+        fixture.coordinator.reconcile_all_pending(&append, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        append.inner.count_kind("DecisionStateChanged"),
+        1,
+        "an already successful external append cannot be rolled back"
+    );
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox
+             WHERE audit_kind='DecisionStateChanged'
+               AND append_state='Pending' AND immutable_audit_ref IS NULL"
+        ),
+        1,
+        "the database acknowledgement and transaction-local version drift must roll back"
+    );
+    assert_eq!(
+        fixture.query_i64("PRAGMA user_version"),
+        super::schema::SCHEMA_VERSION
+    );
+
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("idempotent retry acknowledges the existing external append");
+    assert_eq!(
+        append.inner.count_kind("DecisionStateChanged"),
+        1,
+        "retry must reuse the same exact external append"
+    );
+}
+
+#[cfg(unix)]
+#[serial_test::serial(durable_physical_isolation)]
+#[test]
+fn runtime_schema_guard_final_open_boundary_rejects_version_drift() {
+    let test_code = format!(
+        "TEST_CODE_RUNTIME_SCHEMA_FINAL_OPEN_{}_{}",
+        std::process::id(),
+        NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
+    );
+    let fixture = PhysicalAliasFixture::new(&test_code);
+    fixture.ensure_test_root();
+    let database_path = fixture.test_database_path();
+    let callback_database_path = database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let _hook = install_database_bootstrap_test_hook(
+        DatabaseBootstrapTestPhase::AfterFinalParentSyncBeforeSuccessValidation,
+        move || {
+            set_isolated_schema_version(&callback_database_path, drifted_version);
+            Ok(())
+        },
+    )
+    .expect("install final-open schema drift");
+
+    assert_schema_version_error(fixture.open_test(), drifted_version);
+    assert_eq!(
+        Connection::open(&database_path)
+            .expect("open rejected final bootstrap database")
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read rejected final bootstrap version"),
+        drifted_version,
+        "the external version change occurs after bootstrap committed"
+    );
+}
+
+fn set_isolated_schema_version(database_path: &Path, version: i64) {
+    Connection::open(database_path)
+        .expect("open isolated schema-version connection")
+        .pragma_update(None, "user_version", version)
+        .expect("set isolated schema version");
+}
+
+fn assert_schema_version_error<T>(result: Result<T>, observed_version: i64) {
+    match result {
+        Err(DurableDeliveryError::InvalidConfiguration(reason)) => {
+            assert!(
+                reason.contains("schema version"),
+                "unexpected error: {reason}"
+            );
+            assert!(
+                reason.contains(&observed_version.to_string()),
+                "schema error must report observed version {observed_version}: {reason}"
+            );
+            assert!(
+                reason.contains(&super::schema::SCHEMA_VERSION.to_string()),
+                "schema error must report required version {}: {reason}",
+                super::schema::SCHEMA_VERSION
+            );
+        }
+        Err(error) => panic!("expected schema-version configuration error, got {error}"),
+        Ok(_) => panic!("schema version {observed_version} unexpectedly reached callback"),
+    }
+}
+
+#[test]
 fn audit_v4_upgrade_formal_open_rejects_missing_predecessor_and_rolls_back() {
     let mut fixture = Fixture::new("AUDIT_V4_UPGRADE_MISSING_PREDECESSOR");
     let append = MemoryAppendPort::default();
@@ -4456,6 +4957,14 @@ struct RollbackAcknowledgementAfterAppend {
     armed: std::sync::atomic::AtomicBool,
 }
 
+struct SchemaDriftAfterAppend {
+    inner: MemoryAppendPort,
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    target_kind: &'static str,
+    drifted_version: i64,
+    armed: std::sync::atomic::AtomicBool,
+}
+
 struct EmptyAppendPort {
     inner: MemoryAppendPort,
     target_kind: &'static str,
@@ -4560,6 +5069,43 @@ impl ImmutableAppendPort for RollbackAcknowledgementAfterAppend {
     }
 }
 
+impl SchemaDriftAfterAppend {
+    fn new(
+        coordinator: Arc<DurableDeliveryCoordinator>,
+        target_kind: &'static str,
+        drifted_version: i64,
+    ) -> Self {
+        Self {
+            inner: MemoryAppendPort::default(),
+            coordinator,
+            target_kind,
+            drifted_version,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+impl ImmutableAppendPort for SchemaDriftAfterAppend {
+    fn append_exact(
+        &self,
+        record_kind: &str,
+        identity: &str,
+        canonical_bytes: &[u8],
+        sha256: &str,
+    ) -> Result<String> {
+        let immutable_ref =
+            self.inner
+                .append_exact(record_kind, identity, canonical_bytes, sha256)?;
+        if record_kind == self.target_kind && self.armed.swap(false, Ordering::SeqCst) {
+            self.coordinator
+                .install_operation_postvalidation_test_fault(
+                    OperationPostvalidationTestFault::SchemaVersion(self.drifted_version),
+                )?;
+        }
+        Ok(immutable_ref)
+    }
+}
+
 impl Default for FailScheduleHydrationAppliedOnce {
     fn default() -> Self {
         Self {
@@ -4570,6 +5116,10 @@ impl Default for FailScheduleHydrationAppliedOnce {
 }
 
 impl MemoryAppendPort {
+    fn record_count(&self) -> usize {
+        self.records.lock().expect("append records").len()
+    }
+
     fn count_kind(&self, kind: &str) -> usize {
         self.records
             .lock()
