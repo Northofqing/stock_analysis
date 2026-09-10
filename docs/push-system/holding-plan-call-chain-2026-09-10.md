@@ -4,6 +4,8 @@
 
 后续状态：手动入口真实健康准备与失败退出已在初版 `de990c8`、最终 `41e7762` 修复。初审测试接口问题已修正，10 项新回归重新通过，7 项未改调度器测试证据保留，限定复审通过，见[实施记录](implementation-manual-push-bootstrap-outcome-2026-09-10.md)。下表与原问题保留审计基线及当时行号，不代表新源码仍有同样的手动错误；查看原实现应使用上方 Git 基线。日表、来源及重发资格缺口没有在此修复中消失。
 
+最新来源修复：`112ff8f` 已让实际准备入口一次固定用户快照、按精确代码取保留 evidence 的行情批次，并把双方来源绑定到实际 counted canonical；正文时间、业务日和本地 observed_at 同轮一致。27 项定向测试与静态检查通过，独立 Spec/Quality 通过，见[来源实施记录](implementation-holding-plan-frozen-source-2026-09-10.md)。因此下方问题 4 的重复读取/证据丢失已修复；来源认证、新鲜度、日表原子完成权及有效修订准入仍未解决。不是上线或完整 Unit 验收。
+
 ## 精确身份
 
 [MU-holding-plan](push-capability-catalog.v1.json#L8894) 的三个 producer 是 `holding-plan-periodic`、`holding-plan-manual`、`startup-resume-holding-plan`，主阶段盘中。可读 occurrence 是 `holding-plan:{date}:{code}`，但 counted decision 还绑定来源、subject、policy 和正文摘要；[实际策略](../../src/durable_delivery/model.rs#L409)为 PerTicket、Rolling 1800 秒并计日预算，不是 BusinessDateOnce。
@@ -30,7 +32,7 @@
 ## 后续最小开发方向
 
 - 修通手动入口的真实健康准备与失败退出；使用隔离输入/受限 sink 验证，不运行生产 `--push`，不增加健康通知副作用或默认健康值。
-- 一次固定用户持仓快照，按该快照精确代码取得保留 evidence 的行情批次；完整提案携带可核验来源，两条生成路径不能重新读取“最新”值。
+- 一次固定用户持仓快照，按该快照精确代码取得保留 evidence 的行情批次；完整提案携带可核验来源，两条生成路径不能重新读取“最新”值。该来源保留工程已由文首 `112ff8f` 完成；来源真实性与新鲜度认证另计，不因保留字段自动通过。
 - 依据下方已存在的裁决，不能将三个 producer 简化成“每日严格一次”，也不能允许无条件多发。下一步应明确何谓有效业务修订及再次发送资格，再统一持久完成权；不改 occurrence、冷却或重发权限来绕过这项缺口。
 
 上述问题没有在 runtime schema guard 中顺带修复；其后的手动入口切片单独实现、取证，状态见文首链接。累计可指出实际旧入口与主要完成门的 Unit 仍为 10 个，另 42 个尚未逐链完成；这不是 10/52 的迁移完成率，也不是生产认证数量。

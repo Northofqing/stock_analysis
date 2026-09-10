@@ -20,13 +20,14 @@
 - [旧库升级与恢复审计接续](implementation-durable-upgrade-2026-09-08.md)：源码77cc3bc；正式升级/提交、原rowid与数据保持、正确接续/终态、重复恢复/实例重开及坏FK完整回滚，最终67项合批、静态检查及独立规格/质量审查通过。已被旧迁移重排的v5–v9库保留独立兼容任务，不代表全部审计兼容或全项目完成。
 - [Durable 运行期版本防护](implementation-durable-runtime-schema-guard-2026-09-10.md)：源码8ee1e13；初始版本漂移、callback前/写锁后二验、事务回滚、read后验和final open检查已实现，9新+14旧定向测试及静态检查通过，独立Spec/Quality Approved，本Task完成。报告摘要Minor已纠正并只读复核，保留43测试/188Clippy旧告警；不改schema版本，不代替旧writer排空或历史顺序兼容。
 - [手动推送健康准备与失败结果](implementation-manual-push-bootstrap-outcome-2026-09-10.md)：初版de990c8、最终41e7762；先准备真实banner，部分失败返回Err并由原CLI退出2，盘后A-01健康失败仍继续独立A-10，P-01 owner不变。两个真实RED后实现，初审A-01测试接口问题修正为date-only，修后10项回归/静态检查与限定复审通过，旧7项scheduler证据保留。Clippy无新增告警；全仓fmt旧差异明确保留。本局部任务完成，不改变时间窗口或宣称生产已使用新代码。
+- [持仓计划同快照、同行情批次来源接线](implementation-holding-plan-frozen-source-2026-09-10.md)：源码112ff8f；实际manual/periodic共用准备固定一份持仓、按其代码请求行情并保留完整batch evidence，单次本地时间驱动正文/业务日/本地observed_at。来源实际RED后修复，27项最终定向测试及静态检查通过，独立Spec/Quality通过；既有告警Minor保留。日表与durable统一、有效修订/再次发送资格及来源认证仍待，不是完整Unit迁移或生产切换。
 - [恢复分类不确定投递读取修复](implementation-recovered-uncertain-read-2026-09-08.md)：源码a2429b3、修复fb55d32/61e9d16；真实过期恢复贯通Generic/P01及SLA/指标。自环与跳链均实际RED后修复，最终55项/静态检查/限定复审通过；无盲重发或状态提升，不等于完整Q39/W19完成。
 - [CI 映射式触发识别修复](implementation-ci-mapping-trigger-2026-09-08.md)：源码80d0fb2；95项定向测试、614条断言通过，独立复审已关闭排除项取消全部正向匹配漏洞；识别当前真实CI触发格式，不改CI配置，也不代表HTML/统一checker/实际CI已交付。
 - [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-10最新补充后，10个Unit已定位实际旧业务入口及主要完成门，42个尚未逐链完成；原9/43、8/44等历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
 - [集合竞价候选单元调用链](auction-candidates-call-chain-2026-09-10.md)：源码409dbaf；A-02/P-05分时成功与同轮双bool外门不匹配，P-05在主卡发送前推进快照并忽略失效通知结果。仅源码反例与后续接线约束，不是生产复现或已修复，不扩大当前P-02量能诊断任务。
 - [盘中连板单元调用链](limit-boards-call-chain-2026-09-10.md)：源码1931014；上游主力净流None与下游Some过滤导致当前选集为空；正式接源后还需解决发送前封口、Top10前推进集合及三形态共享冷却。仅静态分析，尚未修复或生产验证，不混入当前P-02诊断任务。
 - [盘后产业链单元调用链](chain-post-close-call-chain-2026-09-10.md)：源码20f215d；通知false/异常被mode吞成Ok后封日，跨自然日可重复同业务日，报告先落盘且同名覆盖，多渠道bool不等于强回执。保留快讯回退与龙虎榜独立日期/降级边界；只读分析，未修复或生产复现。
-- [盘中持仓计划三入口调用链](holding-plan-call-chain-2026-09-10.md)：原源码8daa8bf的手动banner/错误退出问题已有上方41e7762切片修复并复审通过；周期日表与durable非原子、manual/startup不维护同一日表、持仓重复读取/丢行情证据仍待。另补核既有裁决：真实修订不能被日级展示名吞掉，但不授权仅时间戳变化自动重发；不是完整Unit迁移验收。
+- [盘中持仓计划三入口调用链](holding-plan-call-chain-2026-09-10.md)：原源码8daa8bf的手动banner/错误退出问题已由41e7762修复；重复持仓读取/行情证据丢失已由112ff8f修复并独立审查通过。周期日表与durable非原子、manual/startup不维护同一日表、来源认证与有效修订资格仍待。既有裁决要求真实修订不能被日级展示名吞掉，但不授权仅时间戳变化自动重发；不是完整Unit迁移验收。
 - [P-02 来源观察保留实施记录](implementation-auction-source-observation-2026-09-08.md)：本计划完成，20项lib与51项monitor回归、Clippy及独立评审通过。实际采集/名称分片/审计回执保留到竞价tick消费，旧投影兼容；非空池缺量比不称VerifiedEmpty，不增加量比来源或生产权限，不等于完整W17完成。
 - [P-02 冻结业务准备实施记录](implementation-auction-frozen-preparation-2026-09-08.md)：源码`eeb2ddc`、测试修复`74954fe`；一次横幅捕获、完整消息/逐票记录/通知集合提案已被实际dispatcher消费。修复后51项测试、静态检查及限定复审通过；没有补造量比来源，不代表完整W17迁移或上线完成。
 - [P-02 量比与来源证据核对](auction-source-evidence-gaps-2026-09-08.md)：现行规则禁止跨批补量比，MarketStatistics同名字段尚无完整竞价合同；区分可先行的真实证据保留工程与需要产品/提供方确认的接源条件，不改变生产来源。
