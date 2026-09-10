@@ -69,4 +69,4 @@
 
 真实涨停池投影仍为[volume_ratio: None](../../src/market_analyzer/limit_up.rs#L295)，本次没有补量比、跨源join或放宽发送条件。因此“错误原因可诊断”不等于“已有可发送数据”或“已恢复线上推送”。
 
-完整下一层仍需[真实P-02影子接线](p02-shadow-integration-handoff-2026-09-10.md)、同次完整业务提案比较、真实注册与来源认证、八类实际效果纳管及W16 owner/fence。已准备的[业务提案比较计划](../superpowers/plans/2026-09-10-shadow-business-proposals.md)尚未派发；它也不代表上述全部工作完成。
+后续[同次业务提案比较机制](implementation-shadow-business-proposals-2026-09-10.md)已完成至9b2a5df：最终26项定向测试及限定复审通过，过程例外保留。完整下一层仍需[真实P-02影子接线](p02-shadow-integration-handoff-2026-09-10.md)、真实注册与来源认证、八类实际效果纳管及W16 owner/fence；泛型机制完成不代表真实业务已接入或上述全部工作完成。

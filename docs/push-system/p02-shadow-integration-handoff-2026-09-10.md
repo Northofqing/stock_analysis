@@ -1,6 +1,6 @@
 # P-02 真实业务影子接线：当前证据与实施前置
 
-日期：2026-09-10。当前源码引用更新至提交 `298ab0d7b089a8c9173a90740b40f6d2148147bf`；原观察、冻结提案、dispatcher与W17内核行为未在本批改变。本记录承接这些已有能力，避免下一任务重复实现；不是新的影子 adapter 已交付、不是运行期或生产验收。W18请求入口与P-02选集拒绝诊断局部任务均完成；诊断的10项定向测试和独立审查见[实施记录](implementation-auction-selection-diagnostics-2026-09-10.md)，不能据此关闭下面的完整接线缺口。
+日期：2026-09-10。P-02业务源码引用更新至提交 `298ab0d7b089a8c9173a90740b40f6d2148147bf`，原观察、冻结提案和dispatcher未在后续W17批次改变。W17泛型业务提案机制已完成至 `9b2a5df7033cc490ffe9ed5749073eada3f09653`，26项定向测试及限定复审通过，过程例外见[实施记录](implementation-shadow-business-proposals-2026-09-10.md)。本记录承接已有能力，避免下一任务重复实现；不是新的影子adapter已交付、不是运行期或生产验收。W18请求入口与P-02选集拒绝诊断局部任务均完成；诊断的10项定向测试和独立审查见[实施记录](implementation-auction-selection-diagnostics-2026-09-10.md)，不能据此关闭下面的完整接线缺口。
 
 ## 已有能力与真正缺口
 
@@ -12,7 +12,7 @@
 | [横幅捕获](../../src/bin/monitor/push_templates.rs#L256) | `CapturedBanner` 已冻结展示文本；捕获会读外部账户/估值说明 | 把捕获放在 old/new 纯投影之前，两侧只用同一结果；不能在影子 callback 内再次 `capture/render` 触发外部读取 |
 | [完整业务提案](../../src/bin/monitor/push_templates.rs#L6187)、[判等](../../src/bin/monitor/push_templates.rs#L6218) | 同时包含 message、有序逐票 records、notified_codes；价格按 `to_bits` 比较，records 字段及顺序均参与 | 影子比较必须覆盖这三部分，而不只比较可见文案或文案 hash |
 | [当前 dispatcher](../../src/bin/monitor/push_templates.rs#L6295) | 先冻结一次提案；sink 成功且所有 recorder 成功后才推进通知集合 | 引入比较后，发送/记录/集合推进仍消费被比较的同一旧提案；禁止比较完重新 prepare 一份 |
-| [W17 执行入口](../../src/monitor/push_job/shadow.rs#L279)、[Ready 绑定校验](../../src/monitor/push_job/shadow.rs#L348) | 同 context/Arc facts，真实 JobDecision/语义/字节/完成提案比较及八类拒绝能力 | 还没有 P-02 实际 old/new adapter，也未将其完整业务提案纳入本次执行的结构化比较 |
+| [W17同次业务入口](../../src/monitor/push_job/shadow.rs#L439)、[绑定校验](../../src/monitor/push_job/shadow.rs#L611) | 共用内核、同context/Arc facts和八类拒绝能力；比较本次实际传入的P，保留旧原对象。基础与提案存在性双重错误均留证据，原入口兼容 | 还没有P-02实际old/new adapter；必须在真实调用处传完整PreparedAuctionVolumeDispatch，而非空载荷或两份相同结果的克隆 |
 | [PreparedPush](../../src/monitor/push_job/projection.rs#L713) | 绑定 intent/decision/context/facts/semantic/rendered bytes | 该对象没有 P-02 的逐票写库记录和通知集合，不能仅因其相等而断言完整 P-02 行为相等 |
 | [上下文工厂](../../src/monitor/push_job/context.rs#L189)、[投影构造](../../src/monitor/push_job/projection.rs#L277) | 非 test 的 factory/type/构造逻辑已经存在，但 binding/input 字段和有效构造路径受限 | 缺的是可信注册与实际运行输入进入这些构造路径的 interface，不是“所有类型只在 cfg(test) 存在” |
 | [机器注册字段](../../src/monitor/push_job/catalog.rs#L191) | Unit、completion owner、producer、occurrence family、phase 已有权威目录关系 | source contract/version、模板、audience、completion policy 不能从测试常量推定为生产注册；需明确实际注册来源和绑定 |
@@ -23,11 +23,28 @@
 
 业务提案的精确比较应与同次 W17 执行绑定，并保留旧提案供实际发送。可复用现有 `PartialEq`，但单独在测试比较两个提案、或由 caller 自报一个 payload hash，都不能证明运行时比较了完整实际输出。接口还须确保回调失败、未执行、任一拒绝端口非零时不能生成 Match；Debug 仅输出类型、数量和差异类别，不输出提案正文。
 
-按1931014再次核对，[ShadowObservation](../../src/monitor/push_job/shadow.rs#L127)没有业务记录/通知集合载荷；[execute_shadow](../../src/monitor/push_job/shadow.rs#L279)在同次调用内持有两个实际结果并完成验证，但只返回[ShadowReport](../../src/monitor/push_job/shadow.rs#L224)，不返回可供dispatcher消费的旧业务提案。这明确了下一处interface缺口：比较器须接收两侧真实提案、在同次执行中比较，并保留原旧提案的所有权；不能仅在外部拼接一个“相等”bool或事后重新prepare。原report的is_match仍只证明其已覆盖的语义与所提供拒绝能力，未证明全部P-02业务一致或允许发送。具体载荷interface尚未实现，本轮诊断任务不改该内核。
+历史1931014核对时，ShadowObservation没有业务记录/通知集合载荷；execute_shadow只返回ShadowReport，不返回可供dispatcher消费的旧业务提案。这确定了需补的机制：比较器接收两侧真实提案、在同次执行中比较，并保留原旧提案的所有权；不能在外部拼接自报“相等”bool或事后重新prepare。原report的is_match仍只证明原接口覆盖的语义与所提供拒绝能力，未证明全部P-02业务一致或允许发送。此段为历史缺口，不以旧行号链接冒充当前源码位置。
 
-这一机制现已整理为[同次完整业务提案比较计划](../superpowers/plans/2026-09-10-shadow-business-proposals.md)，四项interface澄清已通过独立只读限定复核，待当前唯一实现任务交接后再执行。它保留原execute_shadow及其公开闭集合同，拟由新执行入口比较真实传入的完整载荷并移动保留旧输出；泛型比较机制不替代真实P-02类型和两个adapter的完整性审查，也不替代来源认证。
+这一机制已按[同次完整业务提案比较计划](../superpowers/plans/2026-09-10-shadow-business-proposals.md)完成至9b2a5df：保留原execute_shadow及公开闭集合同，新入口比较实际传入载荷并移动保留旧输出。基础无效同时缺提案的漏证据已修复，最终26项测试及限定复审通过；开发验证过程例外见[实施记录](implementation-shadow-business-proposals-2026-09-10.md)。[take_legacy_proposal](../../src/monitor/push_job/shadow.rs#L391)只交回普通业务数据，不以整个report的Match授予/撤销owner，也不是发送capability。真实P-02完整类型、两个adapter、同次捕获与dispatcher消费仍须接线审查，来源认证没有由此完成。
 
 ## 实施依赖顺序
+
+### 注册入口不能靠放宽构造器完成
+
+以下接点按20f215d再次只读核对，属于真实adapter计划的必需输入，不是又一份已实现注册能力：
+
+| 接点 | 已有检查 / 尚缺输入 |
+| --- | --- |
+| [目录查询](../../src/monitor/push_job/catalog.rs#L191) | 可获得producer所属Unit、owner、occurrence family及phase；结构中没有来源合同/version、audience、模板或completion policy，不能从目录查询凭空补出这些批准值 |
+| [RunContextFactory](../../src/monitor/push_job/context.rs#L189) | binding/input的字段仍私有；build_context校验family、Test命名空间run_id及trigger匹配。构造器可见性不等于真实性认证，不能改成公开任意字段入口来接main |
+| [一次捕获入口](../../src/monitor/push_job/context.rs#L267)、[capture_once](../../src/monitor/push_job/facts.rs#L649) | context与预期来源合同先绑定，再至多一次执行acquire并封存事实；实际接线须让原观察进入这次捕获，不能在已有采集之外调用第二个provider补事实 |
+| [DecisionProjector](../../src/monitor/push_job/projection.rs#L277) | 现有构造校验Unit并绑定context摘要；ProjectionBinding还需audience、kind/sub_kind、owner、policy与模板。输入值必须来自同一注册及运行证据，不是测试fixture |
+| [SourceRef](../../src/monitor/push_job/facts.rs#L49) | 公共构造器只组合类型化引用，不核验外部provider身份；能构造引用不代表已认证来源，真实审计receipt也不能代替该认证 |
+| [部署候选](../../src/push_foundation/activation_deployment.rs#L1)、[当前记录读取](../../src/push_foundation/readiness_query.rs#L1) | 都明确只返回未认证候选；不能因已通过目录闭合、磁盘重读或摘要一致，就把它们直接提升为context需要的批准generation/build/业务日来源 |
+
+这符合[RFC RunContext逐字段合同](push-system-implementation-rfc.md#类型runcontextproposed)：generation来自已批准owner栅栏、build与activation校验身份一致、业务日由交易日authority捕获。后续可开发受约束的校验/传递接线，但没有真实根、来源与批准值时必须保持不可发放生产权限；不把“所有类型都不存在”或“只差公开一个new”当剩余工作描述。
+
+### 真实adapter与上线验收顺序
 
 1. **完成真实注册/捕获 interface 的具体设计。** 核对正式 Unit/producer/occurrence/owner 关系，将 source、模板、audience、completion policy 与部署/来源证据逐项绑定。不得放宽私有字段或增加任意“成功构造器”来让跨 crate 测试通过。这里不要求先完成全部 W15，但来源/部署声明与真正认证必须分清；缺实际配置的生产权限不可由本地默认值补齐。
 2. **一次捕获，两个真实纯 adapter。** 同一个 RunContext、共享 PreparedFacts、同一来源观察、通知集合起始快照与 CapturedBanner 进入旧/新路径。两侧使用实际业务逻辑及 W05 投影，比较完整决策和业务提案；不能将 legacy 的一个结果克隆两份冒充两条执行，也不能二次读取行情、账户或墙上时钟。
