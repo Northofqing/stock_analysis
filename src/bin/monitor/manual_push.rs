@@ -18,7 +18,7 @@ pub(super) trait ManualPushEffects {
     async fn dispatch_industry_chain(&mut self, hhmm: &str, banner: &Self::Banner) -> bool;
     async fn dispatch_news_to_idea(&mut self, hhmm: &str, banner: &Self::Banner) -> bool;
     async fn dispatch_holding_plan(&mut self, banner: &Self::Banner) -> Vec<String>;
-    async fn dispatch_paper_review(&mut self, date: &str, banner: &Self::Banner) -> bool;
+    async fn dispatch_paper_review(&mut self, date: &str) -> bool;
     async fn dispatch_catalyst_review(&mut self, date: &str) -> bool;
 }
 
@@ -88,9 +88,9 @@ pub(super) async fn run_manual_push<E: ManualPushEffects>(
         PushWindow::Evening | PushWindow::Outside => {
             match effects.refresh_banner().await {
                 Ok(()) => match effects.read_banner() {
-                    Ok(banner) => report_dispatch_outcome(
+                    Ok(_) => report_dispatch_outcome(
                         "A-01",
-                        effects.dispatch_paper_review(context.date, &banner).await,
+                        effects.dispatch_paper_review(context.date).await,
                         &mut failures,
                     ),
                     Err(error) => failures.push(format!(
@@ -198,7 +198,7 @@ impl ManualPushEffects for RealManualPushEffects {
         failures
     }
 
-    async fn dispatch_paper_review(&mut self, date: &str, _banner: &Self::Banner) -> bool {
+    async fn dispatch_paper_review(&mut self, date: &str) -> bool {
         crate::push_templates::dispatch_paper_review_daily(date).await
     }
 
@@ -217,7 +217,7 @@ mod tests {
         ReadBanner,
         Intraday(&'static str, String, String),
         HoldingPlan(String),
-        PaperReview(String, String),
+        PaperReview(String),
         CatalystReview(String),
     }
 
@@ -290,9 +290,8 @@ mod tests {
             std::mem::take(&mut self.holding_failures)
         }
 
-        async fn dispatch_paper_review(&mut self, date: &str, banner: &Self::Banner) -> bool {
-            self.events
-                .push(Event::PaperReview(date.to_owned(), (*banner).to_owned()));
+        async fn dispatch_paper_review(&mut self, date: &str) -> bool {
+            self.events.push(Event::PaperReview(date.to_owned()));
             !self.unconfirmed.contains(&"A-01")
         }
 
@@ -558,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evening_and_outside_refresh_before_routing_a01_and_a10_with_one_date() {
+    async fn evening_and_outside_require_health_before_routing_a01_and_a10_with_one_date() {
         for window in [PushWindow::Evening, PushWindow::Outside] {
             let mut effects = MemoryEffects {
                 banner: Some("stale-banner-must-be-replaced"),
@@ -585,10 +584,7 @@ mod tests {
                 vec![
                     Event::RefreshBanner,
                     Event::ReadBanner,
-                    Event::PaperReview(
-                        "2026-09-10".to_owned(),
-                        "refreshed-conservative-banner".to_owned(),
-                    ),
+                    Event::PaperReview("2026-09-10".to_owned()),
                     Event::CatalystReview("2026-09-10".to_owned()),
                 ],
                 "window={window:?}"
