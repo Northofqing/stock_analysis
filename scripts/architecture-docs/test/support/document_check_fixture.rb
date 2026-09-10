@@ -31,18 +31,20 @@ module DocumentCheckFixture
     overlay_current_documents(@fixture_template)
     run_ruby(@fixture_template, 'scripts/architecture-docs/render-catalog.rb', '--root', @fixture_template, '--write')
     run_ruby(@fixture_template, 'scripts/architecture-docs/render-catalog.rb', '--root', @fixture_template, '--current', '--write')
-    run_ruby(@fixture_template, 'scripts/architecture-docs/build.rb', 'rfc', '--root', @fixture_template, '--draft')
-    git(@fixture_template, 'add', '-f', 'docs', 'scripts/architecture-docs',
+    run_ruby(@fixture_template, 'scripts/architecture-docs/build.rb', '--all', '--root', @fixture_template, '--draft')
+    git(@fixture_template, 'add', '-f', 'docs', 'scripts/architecture-docs', 'scripts/render-architecture-blueprint-html.rb',
         'design-source-catalog.v1.json', '.github/workflows/ci.yml')
     git(@fixture_template, '-c', 'user.name=Document Check Test', '-c', 'user.email=document-check@example.invalid',
         'commit', '-qm', 'historical code aligned document fixture')
     %w[docs/push-system/push-capability-catalog.md
        docs/push-system/push-current-capability-catalog.md
        docs/push-system/push-system-implementation-rfc.html
+       docs/architecture/current/Project_Architecture_Blueprint.html
        scripts/architecture-docs/assets/mermaid.min.js].each do |path|
       git(@fixture_template, 'ls-files', '--error-unmatch', path)
     end
-    raise 'fixture template is dirty' unless git(@fixture_template, 'status', '--porcelain', '--untracked-files=all').empty?
+    status = git(@fixture_template, 'status', '--porcelain', '--untracked-files=all')
+    raise "fixture template is dirty:\n#{status}" unless status.empty?
 
     @fixture_template
   rescue StandardError
@@ -68,6 +70,7 @@ module DocumentCheckFixture
       'docs/push-system/push-evidence-manifest.v1.json',
       'docs/push-system/push-current-capability-catalog.v1.json',
       'docs/push-system/push-current-evidence-manifest.v1.json',
+      'docs/architecture/current/Project_Architecture_Blueprint.md',
       'docs/push-system/push-system-implementation-rfc.md',
       'docs/push-system/push-system-foundation.v1.sql',
       'docs/push-system/push-system-wbs.v1.json',
@@ -83,6 +86,7 @@ module DocumentCheckFixture
        rfc_inputs.rb rfc_spec.rb rust_evidence.rb source_catalog.rb wbs.rb].each do |name|
       copy_path(root, File.join('scripts/architecture-docs', name))
     end
+    copy_path(root, 'scripts/render-architecture-blueprint-html.rb')
     %w[templates/document.html.erb assets/mermaid-manifest.v1.json assets/mermaid.min.js
        assets/mermaid.LICENSE].each do |path|
       copy_path(root, File.join('scripts/architecture-docs', path))

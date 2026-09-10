@@ -99,7 +99,7 @@ class DocumentCheckTest < Minitest::Test
 
       assert_equal 0, status.exitstatus, out + err
       assert_includes out, 'architecture_docs_valid'
-      assert_includes out, 'html_targets=rfc'
+      assert_includes out, 'html_targets=rfc,blueprint'
       assert_empty err
       assert_equal before, snapshot(root)
     end
@@ -229,6 +229,24 @@ class DocumentCheckTest < Minitest::Test
     end
   end
 
+  def test_missing_and_stale_html_targets_are_reported_independently
+    DocumentCheckFixture.with_fixture do |root|
+      rfc = File.join(root, 'docs/push-system/push-system-implementation-rfc.html')
+      blueprint = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      File.delete(rfc)
+      File.binwrite(blueprint, 'stale blueprint')
+      before = [File.binread(blueprint), File.mtime(blueprint)]
+
+      out, err, status = run_check(root, '--draft')
+      assert_equal 1, status.exitstatus, out + err
+      assert_includes out, 'html_missing target=rfc'
+      assert_includes out, 'html_stale target=blueprint'
+      assert_empty err
+      assert_equal before, [File.binread(blueprint), File.mtime(blueprint)]
+      refute File.exist?(rfc)
+    end
+  end
+
   def test_html_byte_template_implementation_and_asset_drift_are_detected
     mutations = {
       'html bytes' => proc { |root| File.open(File.join(root, 'docs/push-system/push-system-implementation-rfc.html'), 'ab') { |file| file.write('changed') } },
@@ -329,7 +347,7 @@ class DocumentCheckTest < Minitest::Test
         local_cli = File.join(root, 'scripts/architecture-docs/check.rb')
         out, err, status = Open3.capture3(RbConfig.ruby, local_cli, '--draft', chdir: calling_directory)
         assert_equal 0, status.exitstatus, out + err
-        assert_includes out, 'architecture_docs_valid html_targets=rfc'
+        assert_includes out, 'architecture_docs_valid html_targets=rfc,blueprint'
         assert_empty err
         assert_equal before, snapshot(root)
       end
@@ -419,7 +437,7 @@ class DocumentCheckTest < Minitest::Test
   end
 
   def error_lines(output)
-    output.lines.map(&:strip).reject { |line| line.empty? || line == 'html_targets=rfc' }
+    output.lines.map(&:strip).reject { |line| line.empty? || line == 'html_targets=rfc,blueprint' }
   end
 
   def strict_release_errors

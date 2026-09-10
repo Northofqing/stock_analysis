@@ -10,7 +10,7 @@ checks = []
 all_targets = []
 
 parser = OptionParser.new do |options|
-  options.banner = 'Usage: build.rb rfc [--root ROOT] [--check] [--draft]'
+  options.banner = 'Usage: build.rb rfc|blueprint [--root ROOT] [--check] --draft | build.rb --all [--root ROOT] [--check] --draft'
   options.on('--root ROOT') { |value| roots << value }
   options.on('--check') { checks << true }
   options.on('--draft') { drafts << true }
@@ -24,7 +24,7 @@ end
 begin
   parser.parse!(ARGV)
   target = ARGV.shift
-  valid_target = target == 'rfc' && all_targets.empty?
+  valid_target = %w[rfc blueprint].include?(target) && all_targets.empty?
   valid_all = target.nil? && all_targets.length == 1
   valid_counts = roots.length <= 1 && checks.length <= 1 && drafts.length <= 1
   valid_counts &&= ARGV.empty? && (valid_target || valid_all)
@@ -36,23 +36,27 @@ rescue OptionParser::ParseError => error
 end
 
 root = roots.first || File.expand_path('../..', __dir__)
-target = 'rfc'
-label = all_targets.empty? ? 'target=rfc' : 'targets=rfc'
+targets = all_targets.empty? ? [target] : %w[rfc blueprint]
+label = all_targets.empty? ? "target=#{target}" : 'targets=rfc,blueprint'
 
 if drafts.empty?
   puts "html_status_provisional #{label}"
   exit 1
 end
 
-begin
-  result = if checks.empty?
-             ArchitectureDocs::HtmlBuilder.build(root, target)
-           else
-             ArchitectureDocs::HtmlBuilder.check(root, target)
-           end
-  puts "html_#{result} #{label} status=PROVISIONAL"
-rescue ArchitectureDocs::HtmlBuilder::Invalid => error
-  reason = error.message.sub(/\s+target=rfc\z/, '')
-  puts "#{reason} #{label}"
-  exit 1
+failed = false
+targets.each do |current|
+  begin
+    result = if checks.empty?
+               ArchitectureDocs::HtmlBuilder.build(root, current)
+             else
+               ArchitectureDocs::HtmlBuilder.check(root, current)
+             end
+    puts "html_#{result} target=#{current} status=PROVISIONAL"
+  rescue ArchitectureDocs::HtmlBuilder::Invalid => error
+    reason = error.message.sub(/\s+target=#{Regexp.escape(current)}\z/, '')
+    puts "#{reason} target=#{current}"
+    failed = true
+  end
 end
+exit 1 if failed

@@ -90,18 +90,20 @@ errors.concat(catalog_errors)
 end
 
 errors.concat(ArchitectureDocs::RfcSpec.validate(root, strict: strict))
-begin
-  ArchitectureDocs::HtmlBuilder.check(root, 'rfc')
-rescue ArchitectureDocs::HtmlBuilder::Invalid => error
-  errors << error.message
+%w[rfc blueprint].each do |target|
+  begin
+    ArchitectureDocs::HtmlBuilder.check(root, target)
+  rescue ArchitectureDocs::HtmlBuilder::Invalid => error
+    errors << error.message
+  end
 end
 
 errors.uniq!
 if errors.empty?
-  puts 'architecture_docs_valid html_targets=rfc'
+  puts 'architecture_docs_valid html_targets=rfc,blueprint'
   exit 0
 end
 
-puts 'html_targets=rfc'
+puts 'html_targets=rfc,blueprint'
 puts errors
 exit 1

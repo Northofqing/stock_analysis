@@ -6,6 +6,7 @@ require 'digest'
 require 'erb'
 require 'json'
 require 'tempfile'
+require_relative 'catalog'
 require_relative 'markdown_renderer'
 require_relative 'rfc_inputs'
 
@@ -13,8 +14,20 @@ module ArchitectureDocs
   module HtmlBuilder
     class Invalid < StandardError; end
 
-    SOURCE = 'docs/push-system/push-system-implementation-rfc.md'
-    OUTPUT = 'docs/push-system/push-system-implementation-rfc.html'
+    TARGETS = {
+      'rfc' => {
+        source: 'docs/push-system/push-system-implementation-rfc.md',
+        output: 'docs/push-system/push-system-implementation-rfc.html',
+        preflight: :rfc,
+        fallback_title: 'RFC'
+      },
+      'blueprint' => {
+        source: 'docs/architecture/current/Project_Architecture_Blueprint.md',
+        output: 'docs/architecture/current/Project_Architecture_Blueprint.html',
+        preflight: :blueprint,
+        fallback_title: 'Architecture Blueprint'
+      }
+    }.freeze
     TEMPLATE = 'scripts/architecture-docs/templates/document.html.erb'
     ASSET_DIRECTORY = 'scripts/architecture-docs/assets'
     MERMAID_MANIFEST = File.join(ASSET_DIRECTORY, 'mermaid-manifest.v1.json')
@@ -41,14 +54,16 @@ module ArchitectureDocs
     end
 
     def build(root, target, check: false)
-      raise Invalid, 'target_unknown' unless target == 'rfc'
+      definition = TARGETS[target]
+      raise Invalid, 'target_unknown' unless definition
 
       root = canonical_root(root)
-      problems = RfcInputs.validate(root)
+      problems = preflight(root, definition.fetch(:preflight))
       raise Invalid, problems.first unless problems.empty?
 
       mermaid = load_mermaid(root)
-      source = read_checked(root, SOURCE, 'html_source')
+      source = read_checked(root, definition.fetch(:source), 'html_source')
+      validate_blueprint_source(root, source) if target == 'blueprint'
       template = read_checked(root, TEMPLATE, 'html_template')
       source_utf8 = source.dup.force_encoding(Encoding::UTF_8)
       raise Invalid, 'html_source_encoding_invalid' unless source_utf8.valid_encoding?
@@ -66,20 +81,20 @@ module ArchitectureDocs
       document = MarkdownRenderer.render_document(source_utf8)
       body_html = document.html
       navigation_html = render_navigation(document.headings)
-      document_title = document.headings.empty? ? 'RFC' : document.headings.first.text
+      document_title = document.headings.empty? ? definition.fetch(:fallback_title) : document.headings.first.text
       build_metadata_json = metadata_json(
-        source, source_sha256, template, template_sha256,
+        target, definition, source, source_sha256, template, template_sha256,
         implementation_sha256, mermaid_metadata, document.diagram_count
       )
       mermaid_license_html = CGI.escapeHTML(mermaid_license.force_encoding(Encoding::UTF_8))
       html = render_template(template_utf8, binding)
-      output = File.join(root, OUTPUT)
-      output_exists = validate_output(root, output)
+      output = File.join(root, definition.fetch(:output))
+      output_exists = validate_output(root, definition.fetch(:output), output)
       if output_exists
         return 'current' if File.binread(output) == html
-        raise Invalid, 'html_stale target=rfc' if check
+        raise Invalid, "html_stale target=#{target}" if check
       elsif check
-        raise Invalid, 'html_missing target=rfc'
+        raise Invalid, "html_missing target=#{target}"
       end
 
       atomic_write(output, html)
@@ -88,6 +103,53 @@ module ArchitectureDocs
       raise Invalid, 'html_input_missing'
     rescue SystemCallError
       raise Invalid, 'html_build_failed'
+    end
+
+    def preflight(root, kind)
+      kind == :rfc ? RfcInputs.validate(root) : Catalog.validate(root, strict: false)
+    end
+
+    def validate_blueprint_source(root, source)
+      marker = /^```architecture-source-v1\s*$/
+      raise Invalid, 'blueprint_source_identity_duplicate' unless source.lines.grep(marker).length == 1
+
+      match = source.match(/\A# [^\r\n]+\r?\n\r?\n```architecture-source-v1\r?\n(.*?)\r?\n```(?:\r?\n|\z)/m)
+      raise Invalid, 'blueprint_source_identity_invalid' unless match
+
+      declaration = JSON.parse(match[1])
+      unless declaration.is_a?(Hash) && declaration.keys.sort == %w[baseline_commit catalog manifest role schema_version status]
+        raise Invalid, 'blueprint_source_identity_structure_invalid'
+      end
+      %w[catalog manifest].each do |field|
+        value = declaration[field]
+        unless value.is_a?(Hash) && value.keys.sort == %w[path sha256]
+          raise Invalid, "blueprint_source_identity_structure_invalid field=#{field}"
+        end
+      end
+
+      catalog_bytes = read_checked(root, CurrentAudit::CATALOG_PATH, 'current_catalog')
+      manifest_bytes = read_checked(root, CurrentAudit::MANIFEST_PATH, 'current_manifest')
+      catalog = JSON.parse(catalog_bytes)
+      manifest = JSON.parse(manifest_bytes)
+      expected = {
+        'schema_version' => 1,
+        'status' => 'PROVISIONAL',
+        'role' => 'current-source-audit',
+        'baseline_commit' => catalog['baseline_commit'],
+        'catalog' => {
+          'path' => CurrentAudit::CATALOG_PATH,
+          'sha256' => Digest::SHA256.hexdigest(catalog_bytes)
+        },
+        'manifest' => {
+          'path' => CurrentAudit::MANIFEST_PATH,
+          'sha256' => Digest::SHA256.hexdigest(manifest_bytes)
+        }
+      }
+      unless manifest['baseline_commit'] == catalog['baseline_commit'] && declaration == expected
+        raise Invalid, 'blueprint_source_identity_mismatch'
+      end
+    rescue JSON::ParserError
+      raise Invalid, 'blueprint_source_identity_json_invalid'
     end
 
     def atomic_write(path, bytes)
@@ -119,9 +181,9 @@ module ArchitectureDocs
       raise Invalid, 'html_template_render_failed'
     end
 
-    def validate_output(root, output)
+    def validate_output(root, relative_output, output)
       current = root
-      File.dirname(OUTPUT).split('/').each do |part|
+      File.dirname(relative_output).split('/').each do |part|
         current = File.join(current, part)
         stat = File.lstat(current)
         raise Invalid, 'html_output_parent_path_invalid' if stat.symlink? || !stat.directory?
@@ -155,13 +217,13 @@ module ArchitectureDocs
       "<ol>#{items.join}</ol>"
     end
 
-    def metadata_json(source, source_sha256, template, template_sha256, implementation_sha256, mermaid, diagram_count)
+    def metadata_json(target, definition, source, source_sha256, template, template_sha256, implementation_sha256, mermaid, diagram_count)
       metadata = {
         'schema_version' => 1,
         'status' => 'PROVISIONAL',
-        'target' => 'rfc',
+        'target' => target,
         'source' => {
-          'path' => SOURCE,
+          'path' => definition.fetch(:source),
           'bytes' => source.bytesize,
           'sha256' => source_sha256
         },

@@ -4,19 +4,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const USAGE = 'Usage: browser_smoke.mjs --endpoint WS_URL --rfc HTML_PATH --diagram HTML_PATH';
+const USAGE = 'Usage: browser_smoke.mjs --endpoint WS_URL --rfc HTML_PATH --diagram HTML_PATH [--blueprint HTML_PATH]';
 
 function parseArgs(argv) {
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     const option = argv[index];
     const value = argv[index + 1];
-    if (!['--endpoint', '--rfc', '--diagram'].includes(option) || value === undefined || values.has(option)) {
+    if (!['--endpoint', '--rfc', '--diagram', '--blueprint'].includes(option) || value === undefined || values.has(option)) {
       throw new Error('arguments_invalid');
     }
     values.set(option, value);
   }
-  if (values.size !== 3) throw new Error('arguments_invalid');
+  if (!values.has('--endpoint') || !['--rfc', '--diagram', '--blueprint'].some(option => values.has(option))) {
+    throw new Error('arguments_invalid');
+  }
 
   const endpoint = new URL(values.get('--endpoint'));
   const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname);
@@ -24,12 +26,21 @@ function parseArgs(argv) {
 
   const files = {};
   for (const name of ['rfc', 'diagram']) {
+    if (!values.has(`--${name}`)) continue;
     const file = values.get(`--${name}`);
     if (!path.isAbsolute(file)) throw new Error(`${name}_path_not_absolute`);
     let stat;
     try { stat = fs.statSync(file); } catch (_error) { throw new Error(`${name}_path_not_file`); }
     if (!stat.isFile()) throw new Error(`${name}_path_not_file`);
     files[name] = pathToFileURL(file).href;
+  }
+  if (values.has('--blueprint')) {
+    const file = values.get('--blueprint');
+    if (!path.isAbsolute(file)) throw new Error('blueprint_path_not_absolute');
+    let stat;
+    try { stat = fs.statSync(file); } catch (_error) { throw new Error('blueprint_path_not_file'); }
+    if (!stat.isFile()) throw new Error('blueprint_path_not_file');
+    files.blueprint = pathToFileURL(file).href;
   }
   return { endpoint: endpoint.href, ...files };
 }
@@ -192,6 +203,133 @@ async function checkRfc(cdp, sessionId, url) {
   return structure;
 }
 
+async function checkBlueprint(cdp, sessionId, url) {
+  await navigate(cdp, sessionId, url);
+  const structure = await evaluate(cdp, sessionId, `(() => {
+    const figures = Array.from(document.querySelectorAll('#document-content .diagram'));
+    return {
+      title: document.querySelector('#document-content h1')?.textContent.trim(),
+      status: document.documentElement.dataset.status,
+      headings: document.querySelectorAll('#document-content h1,#document-content h2,#document-content h3,#document-content h4,#document-content h5,#document-content h6').length,
+      tables: document.querySelectorAll('#document-content table').length,
+      diagrams: figures.length,
+      rendered: figures.filter(figure => figure.dataset.diagramState === 'rendered' && figure.querySelector('.mermaid-render svg')).length,
+      failed: figures.filter(figure => figure.dataset.diagramState === 'error' && figure.querySelector('.mermaid-render').textContent.includes('图表渲染失败')).length,
+      sourcePreserved: figures.every(figure => figure.querySelector('.mermaid-source code')?.textContent.trim().length > 0),
+      fullscreenControls: figures.filter(figure => figure.querySelector('[data-diagram-fullscreen]')).length,
+      toc: document.querySelectorAll('#table-of-contents a').length,
+      sourceBytes: atob(document.getElementById('markdown-source').textContent).length,
+      metadataBytes: JSON.parse(document.getElementById('build-metadata').textContent).source.bytes
+    };
+  })()`);
+  assert(structure.title === 'Stock Analysis 当前项目架构蓝图', 'blueprint_title_invalid');
+  assert(structure.status === 'PROVISIONAL', 'blueprint_status_invalid');
+  assert(structure.headings === 35, 'blueprint_heading_count_invalid');
+  assert(structure.tables === 33, 'blueprint_table_count_invalid');
+  assert(structure.diagrams === 6, 'blueprint_diagram_count_invalid');
+  assert(structure.rendered + structure.failed === structure.diagrams, 'blueprint_diagram_state_invalid');
+  assert(structure.rendered === structure.diagrams, 'blueprint_diagram_render_failed');
+  assert(structure.sourcePreserved, 'blueprint_diagram_source_not_preserved');
+  assert(structure.fullscreenControls === structure.diagrams, 'blueprint_fullscreen_control_missing');
+  assert(structure.toc === structure.headings, 'blueprint_toc_count_invalid');
+  assert(structure.sourceBytes === structure.metadataBytes, 'blueprint_source_bytes_invalid');
+
+  const interactions = await evaluate(cdp, sessionId, `(() => {
+    const search = document.getElementById('doc-search');
+    search.value = '模块、target、协议和 schema 目录';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    const visibleToc = Array.from(document.querySelectorAll('#table-of-contents li')).filter(item => item.dataset.searchHidden !== 'true').length;
+    const hiddenToc = document.querySelectorAll('#table-of-contents li[data-search-hidden="true"]').length;
+    document.getElementById('theme-toggle').click();
+    const theme = document.documentElement.dataset.theme;
+    document.getElementById('collapse-all').click();
+    const collapsed = document.querySelectorAll('#document-content [hidden]').length;
+    document.getElementById('expand-all').click();
+    const expanded = document.querySelectorAll('#document-content [hidden]').length;
+    return { visibleToc, hiddenToc, theme, collapsed, expanded };
+  })()`);
+  assert(interactions.visibleToc >= 1 && interactions.hiddenToc >= 1, 'blueprint_search_failed');
+  assert(interactions.theme === 'dark', 'blueprint_theme_failed');
+  assert(interactions.collapsed >= 1 && interactions.expanded === 0, 'blueprint_collapse_failed');
+
+  const fullscreen = await evaluate(cdp, sessionId, `(async () => {
+    const figure = Array.from(document.querySelectorAll('.diagram')).find(item => item.dataset.diagramState === 'rendered');
+    const button = figure?.querySelector('[data-diagram-fullscreen]');
+    if (!figure || !button || typeof figure.requestFullscreen !== 'function') return { supported: false };
+    button.click();
+    for (let index = 0; index < 40 && document.fullscreenElement !== figure; index += 1) await new Promise(resolve => setTimeout(resolve, 50));
+    const entered = document.fullscreenElement === figure;
+    if (entered) await document.exitFullscreen();
+    for (let index = 0; index < 40 && document.fullscreenElement !== null; index += 1) await new Promise(resolve => setTimeout(resolve, 50));
+    return { supported: true, entered, exited: document.fullscreenElement === null };
+  })()`, { userGesture: true });
+  assert(fullscreen.supported && fullscreen.entered && fullscreen.exited, 'blueprint_fullscreen_failed');
+
+  await cdp.send('Emulation.setEmulatedMedia', { media: 'print' }, sessionId);
+  const print = await evaluate(cdp, sessionId, `(() => {
+    window.dispatchEvent(new Event('beforeprint'));
+    return { toolbar: getComputedStyle(document.querySelector('.toolbar')).display,
+      hidden: document.querySelectorAll('#document-content [hidden]').length };
+  })()`);
+  assert(print.toolbar === 'none' && print.hidden === 0, 'blueprint_print_expansion_failed');
+  await cdp.send('Emulation.setEmulatedMedia', { media: '' }, sessionId);
+  return structure;
+}
+
+async function checkBlueprintFailureFallback(cdp, sessionId, url) {
+  await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      (() => {
+        let installed = false;
+        Object.defineProperty(globalThis, 'mermaid', {
+          configurable: true,
+          get() { return undefined; },
+          set(value) {
+            if (!installed && value && typeof value.render === 'function') {
+              installed = true;
+              const render = value.render.bind(value);
+              let first = true;
+              value.render = (...args) => {
+                if (first) {
+                  first = false;
+                  return Promise.reject(new Error('blueprint_failure_fallback_probe'));
+                }
+                return render(...args);
+              };
+            }
+            Object.defineProperty(globalThis, 'mermaid', {
+              configurable: true,
+              enumerable: true,
+              writable: true,
+              value
+            });
+          }
+        });
+      })();
+    `
+  }, sessionId);
+  await navigate(cdp, sessionId, url);
+  const result = await evaluate(cdp, sessionId, `(() => {
+    const figures = Array.from(document.querySelectorAll('#document-content .diagram'));
+    const failed = figures.filter(figure => figure.dataset.diagramState === 'error');
+    const rendered = figures.filter(figure => figure.dataset.diagramState === 'rendered');
+    return {
+      total: figures.length,
+      failed: failed.length,
+      rendered: rendered.length,
+      readable: failed.every(figure => figure.querySelector('.mermaid-render').textContent.includes('图表渲染失败')),
+      sourcePreserved: figures.every(figure => figure.querySelector('.mermaid-source code')?.textContent.trim().length > 0),
+      renderedSvg: rendered.filter(figure => figure.querySelector('.mermaid-render svg')).length
+    };
+  })()`);
+  assert(result.total === 6, 'blueprint_failure_probe_count_invalid');
+  assert(result.failed === 1 && result.rendered === 5, 'blueprint_failure_probe_state_invalid');
+  assert(result.readable, 'blueprint_failure_fallback_unreadable');
+  assert(result.sourcePreserved, 'blueprint_failure_source_not_preserved');
+  assert(result.renderedSvg === result.rendered, 'blueprint_failure_isolation_invalid');
+  return result;
+}
+
 async function checkDiagrams(cdp, sessionId, url) {
   await navigate(cdp, sessionId, url);
   const diagrams = await evaluate(cdp, sessionId, `(() => {
@@ -324,20 +462,35 @@ async function main() {
     await cdp.send('Network.enable', {}, sessionId);
     await cdp.send('Network.setBlockedURLs', { urls: ['http://*', 'https://*'] }, sessionId);
 
-    const rfc = await checkRfc(cdp, sessionId, options.rfc);
-    await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
-      source: `
-        globalThis.mermaidClickExecuted = false;
-        globalThis.mermaidHtmlExecuted = false;
-        globalThis.mermaidClickProbe = () => { globalThis.mermaidClickExecuted = true; };
-      `
-    }, sessionId);
-    const diagrams = await checkDiagrams(cdp, sessionId, options.diagram);
+    const summaries = [];
+    if (options.rfc) {
+      const rfc = await checkRfc(cdp, sessionId, options.rfc);
+      summaries.push(`headings=${rfc.headings}`, `tables=${rfc.tables}`);
+    }
+    if (options.diagram) {
+      await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+        source: `
+          globalThis.mermaidClickExecuted = false;
+          globalThis.mermaidHtmlExecuted = false;
+          globalThis.mermaidClickProbe = () => { globalThis.mermaidClickExecuted = true; };
+        `
+      }, sessionId);
+      const diagrams = await checkDiagrams(cdp, sessionId, options.diagram);
+      summaries.push(`diagrams=${diagrams.rendered}`, `diagram_errors=${diagrams.failed}`,
+        'fullscreen=entered_exited', 'injection=blocked');
+    }
+    if (options.blueprint) {
+      const blueprint = await checkBlueprint(cdp, sessionId, options.blueprint);
+      const failure = await checkBlueprintFailureFallback(cdp, sessionId, options.blueprint);
+      summaries.push(`blueprint_headings=${blueprint.headings}`, `blueprint_tables=${blueprint.tables}`,
+        `blueprint_diagrams=${blueprint.rendered}`, `blueprint_failure_errors=${failure.failed}`,
+        'blueprint_fullscreen=entered_exited');
+    }
     assert(
       networkAttempts.length === 0,
       `external_network_attempts=${networkAttempts.length} urls=${JSON.stringify(networkAttempts)}`
     );
-    process.stdout.write(`browser_smoke_ok headings=${rfc.headings} tables=${rfc.tables} diagrams=${diagrams.rendered} diagram_errors=${diagrams.failed} fullscreen=entered_exited injection=blocked network_attempts=0\n`);
+    process.stdout.write(`browser_smoke_ok ${summaries.join(' ')} network_attempts=0\n`);
   } finally {
     for (const targetId of targets) {
       try { await cdp.send('Target.closeTarget', { targetId }); } catch (_error) { /* best effort */ }

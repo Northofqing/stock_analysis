@@ -9,10 +9,45 @@ require 'minitest/autorun'
 require 'open3'
 require 'rbconfig'
 require 'tmpdir'
+require_relative '../html_builder'
+require_relative 'support/catalog_fixture'
+require_relative 'support/document_check_fixture'
 
 BUILD = File.expand_path('../build.rb', __dir__)
 
 class ArchitectureDocsBuildTest < Minitest::Test
+  def test_blueprint_is_a_supported_closed_target
+    with_fixture do |root, _markdown|
+      error = assert_raises(ArchitectureDocs::HtmlBuilder::Invalid) do
+        ArchitectureDocs::HtmlBuilder.build(root, 'blueprint')
+      end
+
+      refute_equal 'target_unknown', error.message
+    end
+  end
+
+  def test_blueprint_build_embeds_its_exact_source_and_target_metadata
+    DocumentCheckFixture.with_fixture do |root|
+      source = File.binread(File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md'))
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      File.delete(output)
+      refute File.exist?(output)
+
+      stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+
+      assert_equal 0, result.exitstatus, stdout + stderr
+      assert_equal "html_written target=blueprint status=PROVISIONAL\n", stdout
+      assert_empty stderr
+      html = File.binread(output)
+      metadata = JSON.parse(html.match(%r{<script id="build-metadata" type="application/json">(.*?)</script>}m)[1])
+      assert_equal 'blueprint', metadata.fetch('target')
+      assert_equal 'docs/architecture/current/Project_Architecture_Blueprint.md', metadata.dig('source', 'path')
+      assert_equal Digest::SHA256.hexdigest(source), metadata.dig('source', 'sha256')
+      assert_includes html, Base64.strict_encode64(source)
+      assert_includes html, '<a href="../../Project_Architecture_Blueprint.md#L1833">A.1 61 个 src/lib.rs 顶层模块</a>'.b
+    end
+  end
+
   def test_draft_build_creates_offline_html_with_source_provenance
     with_fixture do |root, markdown|
       output = File.join(root, 'docs/push-system/push-system-implementation-rfc.html')
@@ -43,7 +78,7 @@ class ArchitectureDocsBuildTest < Minitest::Test
         stdout, stderr, result = Open3.capture3(RbConfig.ruby, BUILD, *args)
         assert_equal 2, result.exitstatus, "args=#{args.inspect}\n#{stdout}#{stderr}"
         assert_empty stdout
-        assert_includes stderr, 'Usage: build.rb rfc [--root ROOT] [--check] [--draft]'
+        assert_includes stderr, 'Usage: build.rb rfc|blueprint'
         refute_includes stderr, 'backtrace'
       end
 
@@ -59,9 +94,224 @@ class ArchitectureDocsBuildTest < Minitest::Test
       refute File.exist?(File.join(root, 'docs/push-system/push-system-implementation-rfc.html'))
 
       stdout, stderr, result = run_build(root, '--all', '--draft')
-      assert_equal 0, result.exitstatus, stdout + stderr
-      assert_equal "html_written targets=rfc status=PROVISIONAL\n", stdout
+      assert_equal 1, result.exitstatus, stdout + stderr
+      assert stdout.start_with?("html_written target=rfc status=PROVISIONAL\n"), stdout
+      assert_includes stdout, 'target=blueprint'
       assert_empty stderr
+    end
+  end
+
+  def test_all_builds_in_fixed_order_and_check_aggregates_target_failures_read_only
+    with_dual_fixture do |root|
+      outputs = %w[docs/push-system/push-system-implementation-rfc.html
+                   docs/architecture/current/Project_Architecture_Blueprint.html].map { |path| File.join(root, path) }
+      outputs.each { |path| File.delete(path) }
+
+      stdout, stderr, result = run_build(root, '--all', '--draft')
+      assert_equal 0, result.exitstatus, stdout + stderr
+      assert_equal ["html_written target=rfc status=PROVISIONAL\n",
+                    "html_written target=blueprint status=PROVISIONAL\n"], stdout.lines
+      assert_empty stderr
+
+      outputs.each { |path| File.binwrite(path, "stale #{File.basename(path)}") }
+      before = outputs.map { |path| [File.binread(path), File.mtime(path)] }
+      stdout, stderr, result = run_build(root, '--all', '--check', '--draft')
+      assert_equal 1, result.exitstatus, stdout + stderr
+      assert_equal ["html_stale target=rfc\n", "html_stale target=blueprint\n"], stdout.lines
+      assert_empty stderr
+      assert_equal before, outputs.map { |path| [File.binread(path), File.mtime(path)] }
+    end
+  end
+
+  def test_single_targets_do_not_modify_each_others_outputs
+    with_dual_fixture do |root|
+      rfc = File.join(root, 'docs/push-system/push-system-implementation-rfc.html')
+      blueprint = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      rfc_before = [File.binread(rfc), File.mtime(rfc)]
+      File.delete(blueprint)
+
+      stdout, stderr, result = run_build(root, 'rfc', '--draft')
+      assert_equal 0, result.exitstatus, stdout + stderr
+      refute File.exist?(blueprint)
+      assert_equal rfc_before, [File.binread(rfc), File.mtime(rfc)]
+
+      stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+      assert_equal 0, result.exitstatus, stdout + stderr
+      assert File.file?(blueprint)
+      assert_equal rfc_before, [File.binread(rfc), File.mtime(rfc)]
+    end
+  end
+
+  def test_blueprint_source_identity_rejects_malformed_or_stale_declarations_before_writing
+    with_dual_fixture do |root|
+      source = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md')
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      original = File.binread(source)
+      declaration = original[/```architecture-source-v1\n(.*?)\n```/m, 1]
+      mutations = {
+        'missing' => original.sub('architecture-source-v1', 'architecture-source-v0'),
+        'unclosed' => original.sub("\n```\n\n## 1.", "\n\n## 1."),
+        'duplicate' => original.sub("\n## 1.", "\n```architecture-source-v1\n#{declaration}\n```\n\n## 1."),
+        'json' => original.sub('"schema_version": 1', '"schema_version":'),
+        'not object' => original.sub(declaration, '[]'),
+        'extra field' => original.sub('"schema_version": 1,', '"schema_version": 1, "extra": true,'),
+        'nested field' => original.sub('"path": "docs/push-system/push-current-capability-catalog.v1.json",',
+                                       '"path": "docs/push-system/push-current-capability-catalog.v1.json", "extra": true,'),
+        'schema' => original.sub('"schema_version": 1', '"schema_version": 2'),
+        'status' => original.sub('"status": "PROVISIONAL"', '"status": "FINAL"'),
+        'role' => original.sub('"role": "current-source-audit"', '"role": "historical"'),
+        'path' => original.sub('docs/push-system/push-current-capability-catalog.v1.json', 'docs/push-system/other.json'),
+        'manifest path' => original.sub('docs/push-system/push-current-evidence-manifest.v1.json', 'docs/push-system/other.json'),
+        'pin' => original.sub(/"baseline_commit": "[0-9a-f]{40}"/, '"baseline_commit": "0000000000000000000000000000000000000000"'),
+        'sha' => original.sub(/"sha256": "[0-9a-f]{64}"/, '"sha256": "0000000000000000000000000000000000000000000000000000000000000000"')
+      }
+      mutations.each do |label, bytes|
+        File.binwrite(source, bytes)
+        File.delete(output) if File.exist?(output)
+        stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+        assert_equal 1, result.exitstatus, "#{label}: #{stdout}#{stderr}"
+        assert_includes stdout, 'blueprint_source_identity', label
+        assert_empty stderr
+        refute File.exist?(output), label
+      end
+    ensure
+      File.binwrite(source, original) if source && original
+    end
+  end
+
+  def test_current_source_evolution_invalidates_blueprint_declaration_before_writing
+    with_dual_fixture do |root|
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      File.delete(output)
+      catalog_path = File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json')
+      catalog = JSON.parse(File.binread(catalog_path))
+      catalog['scope'] += ' evolved'
+      File.binwrite(catalog_path, JSON.pretty_generate(catalog) + "\n")
+      manifest_path = File.join(root, 'docs/push-system/push-current-evidence-manifest.v1.json')
+      manifest = JSON.parse(File.binread(manifest_path))
+      binding = manifest['bindings'].find { |entry| entry['path'] == 'docs/push-system/push-current-capability-catalog.v1.json' }
+      binding['sha256'] = Digest::SHA256.file(catalog_path).hexdigest
+      File.binwrite(manifest_path, JSON.pretty_generate(manifest) + "\n")
+
+      stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+      assert_equal 1, result.exitstatus, stdout + stderr
+      assert_equal "blueprint_source_identity_mismatch target=blueprint\n", stdout
+      assert_empty stderr
+      refute File.exist?(output)
+    end
+  end
+
+  def test_blueprint_check_can_be_stale_while_rfc_is_current
+    with_dual_fixture do |root|
+      source = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md')
+      File.open(source, 'ab') { |file| file.write("\nbody drift\n") }
+
+      stdout, stderr, result = run_build(root, 'rfc', '--check', '--draft')
+      assert_equal 0, result.exitstatus, stdout + stderr
+      assert_equal "html_current target=rfc status=PROVISIONAL\n", stdout
+
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      before = [File.binread(output), File.mtime(output)]
+      stdout, stderr, result = run_build(root, 'blueprint', '--check', '--draft')
+      assert_equal 1, result.exitstatus, stdout + stderr
+      assert_equal "html_stale target=blueprint\n", stdout
+      assert_empty stderr
+      assert_equal before, [File.binread(output), File.mtime(output)]
+    end
+  end
+
+  def test_blueprint_rejects_source_output_and_parent_links_without_writing
+    with_dual_fixture do |root|
+      source = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md')
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      source_saved = source + '.saved'
+      File.rename(source, source_saved)
+      File.symlink(source_saved, source)
+      before = [File.binread(output), File.mtime(output)]
+      assert_cli_failure(root, 'html_source_path_invalid', 'blueprint', '--draft')
+      assert_equal before, [File.binread(output), File.mtime(output)]
+    end
+
+    with_dual_fixture do |root|
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      saved = output + '.saved'
+      File.rename(output, saved)
+      File.symlink(saved, output)
+      assert_cli_failure(root, 'html_output_path_invalid', 'blueprint', '--draft')
+      assert_equal File.binread(saved), File.binread(output)
+    end
+
+    with_dual_fixture do |root|
+      output = File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html')
+      saved = output + '.saved'
+      File.rename(output, saved)
+      File.link(saved, output)
+      assert_cli_failure(root, 'html_output_hardlink_invalid', 'blueprint', '--draft')
+      assert_equal 2, File.stat(output).nlink
+    end
+
+    with_dual_fixture do |root|
+      directory = File.join(root, 'docs/architecture/current')
+      saved = directory + '.saved'
+      File.rename(directory, saved)
+      File.symlink(saved, directory)
+      assert_cli_failure(root, 'html_source_path_invalid', 'blueprint', '--draft')
+      refute File.exist?(File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.html.tmp'))
+    end
+  end
+
+  def test_blueprint_invalid_roots_fail_without_backtraces
+    Dir.mktmpdir('blueprint-roots-') do |parent|
+      missing = File.join(parent, 'missing')
+      regular = File.join(parent, 'regular')
+      link = File.join(parent, 'link')
+      File.binwrite(regular, 'file')
+      File.symlink(parent, link)
+      [[missing, 'html_root_missing'], [regular, 'html_root_invalid'], [link, 'html_root_path_invalid']].each do |root, code|
+        stdout, stderr, result = run_build(root, 'blueprint', '--draft')
+        assert_equal 1, result.exitstatus, stdout + stderr
+        assert_equal "#{code} target=blueprint\n", stdout
+        assert_empty stderr
+        refute_includes stdout + stderr, 'backtrace'
+      end
+    end
+  end
+
+  def test_blueprint_wrapper_preserves_help_and_provisional_failure
+    wrapper = File.expand_path('../../render-architecture-blueprint-html.rb', __dir__)
+    Dir.mktmpdir('blueprint-wrapper-') do |root|
+      [['--help'], ['--root', root]].each do |arguments|
+        expected = Open3.capture3(RbConfig.ruby, BUILD, 'blueprint', *arguments)
+        actual = Open3.capture3(RbConfig.ruby, wrapper, *arguments)
+        assert_equal expected.map { |value| value.respond_to?(:exitstatus) ? value.exitstatus : value },
+                     actual.map { |value| value.respond_to?(:exitstatus) ? value.exitstatus : value }
+      end
+    end
+    with_dual_fixture do |root|
+      expected = Open3.capture3(RbConfig.ruby, BUILD, 'blueprint', '--check', '--draft', '--root', root)
+      actual = Open3.capture3(RbConfig.ruby, wrapper, '--check', '--draft', '--root', root)
+      assert_equal expected.map { |value| value.respond_to?(:exitstatus) ? value.exitstatus : value },
+                   actual.map { |value| value.respond_to?(:exitstatus) ? value.exitstatus : value }
+    end
+  end
+
+  def test_build_commands_preserve_the_frozen_blueprint_sentinel
+    with_dual_fixture do |root|
+      sentinel = File.join(root, 'docs/Project_Architecture_Blueprint.md')
+      fixed_time = Time.at(946_684_800)
+      File.binwrite(sentinel, "frozen historical blueprint\n")
+      File.utime(fixed_time, fixed_time, sentinel)
+      before = [File.binread(sentinel), File.mtime(sentinel)]
+      commands = [
+        ['rfc', '--draft'],
+        ['blueprint', '--draft'],
+        ['--all', '--check', '--draft']
+      ]
+      commands.each do |arguments|
+        stdout, stderr, result = run_build(root, *arguments)
+        assert_equal 0, result.exitstatus, stdout + stderr
+        assert_equal before, [File.binread(sentinel), File.mtime(sentinel)]
+      end
     end
   end
 
@@ -81,11 +331,6 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_empty stderr
       assert_equal first, File.binread(output)
       assert_equal fixed_time, File.mtime(output)
-
-      stdout, stderr, result = run_build(root, '--all', '--check', '--draft')
-      assert_equal 0, result.exitstatus, stdout + stderr
-      assert_equal "html_current targets=rfc status=PROVISIONAL\n", stdout
-      assert_empty stderr
 
       stdout, stderr, result = run_build(root, 'rfc', '--check', '--draft')
       assert_equal 0, result.exitstatus, stdout + stderr
@@ -108,10 +353,6 @@ class ArchitectureDocsBuildTest < Minitest::Test
       assert_empty stderr
       refute File.exist?(output)
 
-      stdout, stderr, result = run_build(root, '--all', '--check', '--draft')
-      assert_equal 1, result.exitstatus, stdout + stderr
-      assert_equal "html_missing targets=rfc\n", stdout
-      assert_empty stderr
     end
   end
 
@@ -725,7 +966,8 @@ class ArchitectureDocsBuildTest < Minitest::Test
   def install_builder_sources(root)
     source_dir = File.expand_path('..', __dir__)
     destination = File.join(root, 'scripts/architecture-docs')
-    %w[build.rb html_builder.rb markdown_renderer.rb rfc_inputs.rb].each do |name|
+    %w[build.rb catalog.rb current_audit.rb html_builder.rb markdown_renderer.rb rfc_inputs.rb
+       rust_evidence.rb source_catalog.rb].each do |name|
       FileUtils.cp(File.join(source_dir, name), File.join(destination, name))
     end
     File.join(destination, 'build.rb')
@@ -779,6 +1021,47 @@ class ArchitectureDocsBuildTest < Minitest::Test
     manifest = JSON.parse(File.binread(path))
     yield manifest
     File.binwrite(path, JSON.pretty_generate(manifest) + "\n")
+  end
+
+  def with_dual_fixture
+    fixture = Object.new.extend(CatalogFixture)
+    fixture.with_fixture do |root|
+      FileUtils.mkdir_p(File.join(root, 'docs/architecture/current'))
+      FileUtils.mkdir_p(File.join(root, 'scripts/architecture-docs/assets'))
+      FileUtils.mkdir_p(File.join(root, 'scripts/architecture-docs/templates'))
+      File.binwrite(source_path(root), "# 中文标题\n\n第一段。\n".encode(Encoding::UTF_8))
+      File.binwrite(File.join(root, 'docs/input.bin'), "\x00".b)
+      write_rfc_input_manifest(root)
+      write_mermaid_fixture(root)
+      template = "<!doctype html><html><body><%= body_html %><span><%= source_sha256 %></span><span><%= implementation_sha256.values.join %></span><span><%= mermaid_metadata.values.join %></span><pre><%= mermaid_license %></pre><script><%= mermaid_script %></script><script id=\"build-metadata\" type=\"application/json\"><%= build_metadata_json %></script><script id=\"markdown-source\" type=\"application/octet-stream\"><%= source_base64 %></script></body></html>\n"
+      File.binwrite(template_path(root), template)
+      File.binwrite(File.join(root, 'docs/architecture/current/Project_Architecture_Blueprint.md'), blueprint_source(root))
+      stdout, stderr, result = run_build(root, '--all', '--draft')
+      raise stdout + stderr unless result.success?
+
+      yield root
+    end
+  end
+
+  def blueprint_source(root)
+    catalog_path = File.join(root, 'docs/push-system/push-current-capability-catalog.v1.json')
+    manifest_path = File.join(root, 'docs/push-system/push-current-evidence-manifest.v1.json')
+    catalog = JSON.parse(File.binread(catalog_path))
+    declaration = {
+      'schema_version' => 1,
+      'status' => 'PROVISIONAL',
+      'role' => 'current-source-audit',
+      'baseline_commit' => catalog.fetch('baseline_commit'),
+      'catalog' => {
+        'path' => 'docs/push-system/push-current-capability-catalog.v1.json',
+        'sha256' => Digest::SHA256.file(catalog_path).hexdigest
+      },
+      'manifest' => {
+        'path' => 'docs/push-system/push-current-evidence-manifest.v1.json',
+        'sha256' => Digest::SHA256.file(manifest_path).hexdigest
+      }
+    }
+    "# Fixture Blueprint\n\n```architecture-source-v1\n#{JSON.pretty_generate(declaration)}\n```\n\n## 1. Current\n\n| A | B |\n| --- | --- |\n| 一 | 二 |\n"
   end
 
   def with_fixture(markdown: nil, template: nil)
