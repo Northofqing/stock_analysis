@@ -179,10 +179,14 @@ impl<'a> ReadinessRecordStore<'a> {
             let committed = self
                 .head_chain(connection, &target.stream)?
                 .ok_or(ReadinessStoreError::RecordMissing)?;
-            if committed != chain {
-                return Err(ReadinessStoreError::HeadConflict);
+            if committed == chain {
+                return Ok(target.clone());
             }
-            Ok(target.clone())
+            if committed.iter().any(|record| record == target) {
+                Err(ReadinessStoreError::HeadConflict)
+            } else {
+                Err(ReadinessStoreError::RecordMissing)
+            }
         })
     }
 

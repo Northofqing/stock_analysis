@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::monitor::push_job::{MachineCatalog, ProducerId, UnitId, UtcMicros};
+use crate::monitor::push_job::{MachineCatalog, ProducerId, Sha256Digest, UnitId, UtcMicros};
 use rusqlite::{params, Connection};
 
 use super::operational_readiness::{DependencyKind, ReadinessScope, ReadinessStatus};
@@ -79,6 +79,124 @@ fn w15_store_reopens_the_same_pending_snapshot_event_and_head() {
         committed
     );
     assert!(!format!("{committed:?}").contains("TEST_CODE-SECRET"));
+}
+
+#[test]
+fn w15_load_current_distinguishes_current_history_missing_and_orphan_records() {
+    let root = tempfile::tempdir().expect("TEST_CODE current classification root");
+    let database = root
+        .path()
+        .canonicalize()
+        .expect("TEST_CODE canonical current classification root")
+        .join("readiness.sqlite3");
+    let catalog = MachineCatalog::bundled().expect("TEST_CODE catalog");
+    let namespace = context(100).namespace;
+    initialize_database(&database, &namespace).expect("TEST_CODE initialize store");
+    let (assessment, evidence) = assessed(&ReadinessScope::Core, Some(DependencyKind::Schema));
+    let genesis = CandidateReadinessRecord::try_new(
+        None,
+        context(100),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE genesis record");
+    let current = CandidateReadinessRecord::try_new(
+        Some(genesis.snapshot()),
+        context(200),
+        assessment.clone(),
+        evidence.clone(),
+        vec![],
+    )
+    .expect("TEST_CODE current record");
+    let orphan = CandidateReadinessRecord::try_new(
+        Some(genesis.snapshot()),
+        context(300),
+        assessment,
+        evidence,
+        vec![],
+    )
+    .expect("TEST_CODE valid orphan branch record");
+    let missing = Sha256Digest::parse("TEST_CODE missing record", &"f".repeat(64))
+        .expect("TEST_CODE missing digest");
+    let store = ReadinessRecordStore::at(&database, &namespace, &catalog);
+    let genesis_stored = store
+        .append(None, &genesis)
+        .expect("TEST_CODE commit genesis");
+    let current_stored = store
+        .append(Some(&genesis_stored), &current)
+        .expect("TEST_CODE commit current");
+
+    assert_eq!(
+        store
+            .load_current(current.snapshot().snapshot_id())
+            .expect("TEST_CODE current record succeeds"),
+        current_stored
+    );
+    assert_eq!(
+        store.load_current(genesis.snapshot().snapshot_id()),
+        Err(ReadinessStoreError::HeadConflict),
+        "TEST_CODE a committed ancestor is valid history, not current"
+    );
+    assert_eq!(
+        store.load_current(&missing),
+        Err(ReadinessStoreError::RecordMissing),
+        "TEST_CODE an absent row remains missing"
+    );
+
+    // Seed a fully canonical sibling branch without changing the committed head.
+    // The public append contract correctly forbids creating this orphan state.
+    let connection = Connection::open(&database).expect("TEST_CODE orphan seed connection");
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")
+        .expect("TEST_CODE begin orphan seed transaction");
+    connection
+        .execute(
+            "INSERT INTO operational_readiness_recovery_event(\
+             event_id,event_sha256,before_snapshot_id,after_snapshot_id,canonical_bytes\
+             ) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                orphan.snapshot().recovery_event_id().as_str(),
+                orphan.event_sha256().as_str(),
+                orphan.before_snapshot_id().map(Sha256Digest::as_str),
+                orphan.snapshot().snapshot_id().as_str(),
+                orphan.event_bytes(),
+            ],
+        )
+        .expect("TEST_CODE insert canonical orphan event");
+    connection
+        .execute(
+            "INSERT INTO operational_readiness_snapshot(snapshot_id,event_id,canonical_bytes) \
+             VALUES(?1,?2,?3)",
+            params![
+                orphan.snapshot().snapshot_id().as_str(),
+                orphan.snapshot().recovery_event_id().as_str(),
+                orphan.snapshot().canonical_bytes(),
+            ],
+        )
+        .expect("TEST_CODE insert canonical orphan snapshot");
+    connection
+        .execute_batch("COMMIT;")
+        .expect("TEST_CODE commit orphan seed transaction");
+    drop(connection);
+
+    assert_eq!(
+        store.load_record(orphan.snapshot().snapshot_id()),
+        Err(ReadinessStoreError::RecordMissing),
+        "TEST_CODE the legacy reader classifies a canonical orphan as missing from the committed chain"
+    );
+    let before = directory_bytes(root.path());
+    let outcome = store.load_current(orphan.snapshot().snapshot_id());
+    assert_eq!(
+        directory_bytes(root.path()),
+        before,
+        "TEST_CODE orphan rejection does not repair rows or create sidecars"
+    );
+    assert_eq!(
+        outcome,
+        Err(ReadinessStoreError::RecordMissing),
+        "TEST_CODE an orphan is not a superseded committed ancestor"
+    );
 }
 
 #[test]
