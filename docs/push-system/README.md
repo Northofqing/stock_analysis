@@ -20,13 +20,15 @@
 - [旧库升级与恢复审计接续](implementation-durable-upgrade-2026-09-08.md)：源码77cc3bc；正式升级/提交、原rowid与数据保持、正确接续/终态、重复恢复/实例重开及坏FK完整回滚，最终67项合批、静态检查及独立规格/质量审查通过。已被旧迁移重排的v5–v9库保留独立兼容任务，不代表全部审计兼容或全项目完成。
 - [恢复分类不确定投递读取修复](implementation-recovered-uncertain-read-2026-09-08.md)：源码a2429b3、修复fb55d32/61e9d16；真实过期恢复贯通Generic/P01及SLA/指标。自环与跳链均实际RED后修复，最终55项/静态检查/限定复审通过；无盲重发或状态提升，不等于完整Q39/W19完成。
 - [CI 映射式触发识别修复](implementation-ci-mapping-trigger-2026-09-08.md)：源码80d0fb2；95项定向测试、614条断言通过，独立复审已关闭排除项取消全部正向匹配漏洞；识别当前真实CI触发格式，不改CI配置，也不代表HTML/统一checker/实际CI已交付。
-- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-10补充后，7个Unit可指出实际旧业务入口，45个尚未逐链追完；原6/46历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
+- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-10本轮补充后，8个Unit已定位实际旧业务入口及主要完成门，44个尚未逐链完成；原7/45及6/46历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
 - [集合竞价候选单元调用链](auction-candidates-call-chain-2026-09-10.md)：源码409dbaf；A-02/P-05分时成功与同轮双bool外门不匹配，P-05在主卡发送前推进快照并忽略失效通知结果。仅源码反例与后续接线约束，不是生产复现或已修复，不扩大当前P-02量能诊断任务。
+- [盘中连板单元调用链](limit-boards-call-chain-2026-09-10.md)：源码1931014；上游主力净流None与下游Some过滤导致当前选集为空；正式接源后还需解决发送前封口、Top10前推进集合及三形态共享冷却。仅静态分析，尚未修复或生产验证，不混入当前P-02诊断任务。
 - [P-02 来源观察保留实施记录](implementation-auction-source-observation-2026-09-08.md)：本计划完成，20项lib与51项monitor回归、Clippy及独立评审通过。实际采集/名称分片/审计回执保留到竞价tick消费，旧投影兼容；非空池缺量比不称VerifiedEmpty，不增加量比来源或生产权限，不等于完整W17完成。
 - [P-02 冻结业务准备实施记录](implementation-auction-frozen-preparation-2026-09-08.md)：源码`eeb2ddc`、测试修复`74954fe`；一次横幅捕获、完整消息/逐票记录/通知集合提案已被实际dispatcher消费。修复后51项测试、静态检查及限定复审通过；没有补造量比来源，不代表完整W17迁移或上线完成。
 - [P-02 量比与来源证据核对](auction-source-evidence-gaps-2026-09-08.md)：现行规则禁止跨批补量比，MarketStatistics同名字段尚无完整竞价合同；区分可先行的真实证据保留工程与需要产品/提供方确认的接源条件，不改变生产来源。
 - [P-02 真实业务影子接线前置](p02-shadow-integration-handoff-2026-09-10.md)：按当前源码核对已完成的观察、冻结提案与影子内核；下一步须比较消息/逐票记录/通知集合，并让dispatcher消费同一旧提案。可信注册、完整业务adapter与八端口接线尚未交付，不重复开发来源保留、不把缺量比当VerifiedEmpty。
-- [P-02 选集拒绝诊断计划](../superpowers/plans/2026-09-10-auction-selection-diagnostics.md)：准备中，等待唯一实现/Cargo队列交接；让真实selector/tick保留空源、缺字段、有效行已通知的结构化事实，成功选票/文案/写库/通知集合规则不变。仅补影子接线的必要输入事实，不补量比、不签发领域完成或生产权限。
+- [P-02 选集拒绝诊断实施记录](implementation-auction-selection-diagnostics-2026-09-10.md)：源码298ab0d；真实selector/tick保留空源、缺字段、有效行已通知的结构化事实，成功选票/文案/写库/通知集合规则不变。10项定向测试及静态检查通过，独立Spec/Quality Approved，本Task完成；保留库警告Minor与早期RED捕获局限。[计划](../superpowers/plans/2026-09-10-auction-selection-diagnostics.md)仅补必要输入事实，不补量比、不签发领域完成或生产权限。
+- [W17完整业务提案比较计划](../superpowers/plans/2026-09-10-shadow-business-proposals.md)：计划及独立只读预检完成，四项interface澄清已通过限定复核，未派发实现。让同次影子执行比较实际完整提案并保留原旧输出；保持原语义接口，不凭比较结果授予发送或认证。真实P-02注册、adapter及效果纳管仍独立待交付。
 - [W19 全量库存指标实施记录](implementation-w19-inventory-results-2026-09-08.md)：源码8094ffc、修复c10ec78；覆盖指定namespace全部业务日/状态、真实来源SLA、错误分母与扫描预算。N02缺lock冷读与Completed+Conflict漏等待年龄两个反例先RED再修复，最终107项测试/静态检查/限定复审通过。readiness/晋级消费者、完整留存与安全审计仍待，不将库存指标当生产健康许可。
 - [W19 持久化最终化延迟检查结果](implementation-w19-results-2026-09-08.md)：初版27967be、修复6f8713c；通过Generic/P01/N02实际持久化reader与同事务业务全链读取，使用原始接受时间计算两周期目标/五分钟硬上限，保留人工、未决和冲突状态。审查发现的历史终态/资格遗漏先实际复现13种矛盾再修复，最终78项测试通过、本批静态零诊断，限定复审全部关闭；仅N02明确支持的局部occurrence约定，不代表生产注册。完整W19的指标汇总、留存与安全审计及生产消费仍待。
 - [W17 影子执行内核结果](implementation-w17-results-2026-09-08.md)：源码`89128f3`，一次采集共用context/facts，精确比较真实决策/语义/渲染字节/完成提案；八类拒绝端口先计数再拒绝。17项新测试和52项相邻测试全部通过，最终静态检查本批零诊断，独立Spec/Quality通过。生产业务适配、全局端口纳管及W16激活证据仍待，不代表完整W17或迁移完成。

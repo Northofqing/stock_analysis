@@ -1,6 +1,6 @@
 # P-02 真实业务影子接线：当前证据与实施前置
 
-日期：2026-09-10。依据提交 `8dbd3efe473e13a8fc31d4f4dbfeca71618a4873` 中未改的下列源码再次核对。本记录承接已完成的来源观察、冻结业务提案和 W17 内核，避免下一任务重复实现它们；不是新的影子 adapter 已交付、不是运行期或生产验收。当前唯一代码实现任务是 W18 请求入口，本文不启动第二个 Rust 写入者或 Cargo。
+日期：2026-09-10。当前源码引用更新至提交 `298ab0d7b089a8c9173a90740b40f6d2148147bf`；原观察、冻结提案、dispatcher与W17内核行为未在本批改变。本记录承接这些已有能力，避免下一任务重复实现；不是新的影子 adapter 已交付、不是运行期或生产验收。W18请求入口与P-02选集拒绝诊断局部任务均完成；诊断的10项定向测试和独立审查见[实施记录](implementation-auction-selection-diagnostics-2026-09-10.md)，不能据此关闭下面的完整接线缺口。
 
 ## 已有能力与真正缺口
 
@@ -8,10 +8,10 @@
 | --- | --- | --- |
 | [目录 Unit](push-capability-catalog.v1.json#L8813) | P-02 对应 `MU-auction-volume`，producer 为 `auction-volume` | 不把测试示例 `MU-p02` 等任意文本当正式注册；该目录是冻结历史，旧的“双次加载”说明不代表当前实现 |
 | [观察对象](../../src/market_analyzer/limit_up.rs#L67)、[真实采集入口](../../src/market_analyzer/limit_up.rs#L497) | 私有字段保留涨停池、名称分片、原请求 hash、实际审计回执及原始股票 | 将同一次观察绑定到一次准备事实，不能重新采集以补证据；本地回执不是生产来源身份认证 |
-| [真实 loader](../../src/bin/monitor/push_templates.rs#L6059)、[实际 main 消费](../../src/bin/monitor/main.rs#L9710) | loader 从观察的股票生成快照，main 保留完整 tick，P-02 与后续持仓检测借用它 | 新路径必须接在这个实际调用点，不能只增加无人调用的模拟入口 |
+| [真实 loader](../../src/bin/monitor/push_templates.rs#L6165)、[实际 main 消费](../../src/bin/monitor/main.rs#L9710) | loader 从观察的股票生成快照，main 保留完整 tick、typed选择错误，P-02 与后续持仓检测借用它 | 新路径必须接在这个实际调用点，不能只增加无人调用的模拟入口 |
 | [横幅捕获](../../src/bin/monitor/push_templates.rs#L256) | `CapturedBanner` 已冻结展示文本；捕获会读外部账户/估值说明 | 把捕获放在 old/new 纯投影之前，两侧只用同一结果；不能在影子 callback 内再次 `capture/render` 触发外部读取 |
-| [完整业务提案](../../src/bin/monitor/push_templates.rs#L6081)、[判等](../../src/bin/monitor/push_templates.rs#L6112) | 同时包含 message、有序逐票 records、notified_codes；价格按 `to_bits` 比较，records 字段及顺序均参与 | 影子比较必须覆盖这三部分，而不只比较可见文案或文案 hash |
-| [当前 dispatcher](../../src/bin/monitor/push_templates.rs#L6189) | 先冻结一次提案；sink 成功且所有 recorder 成功后才推进通知集合 | 引入比较后，发送/记录/集合推进仍消费被比较的同一旧提案；禁止比较完重新 prepare 一份 |
+| [完整业务提案](../../src/bin/monitor/push_templates.rs#L6187)、[判等](../../src/bin/monitor/push_templates.rs#L6218) | 同时包含 message、有序逐票 records、notified_codes；价格按 `to_bits` 比较，records 字段及顺序均参与 | 影子比较必须覆盖这三部分，而不只比较可见文案或文案 hash |
+| [当前 dispatcher](../../src/bin/monitor/push_templates.rs#L6295) | 先冻结一次提案；sink 成功且所有 recorder 成功后才推进通知集合 | 引入比较后，发送/记录/集合推进仍消费被比较的同一旧提案；禁止比较完重新 prepare 一份 |
 | [W17 执行入口](../../src/monitor/push_job/shadow.rs#L279)、[Ready 绑定校验](../../src/monitor/push_job/shadow.rs#L348) | 同 context/Arc facts，真实 JobDecision/语义/字节/完成提案比较及八类拒绝能力 | 还没有 P-02 实际 old/new adapter，也未将其完整业务提案纳入本次执行的结构化比较 |
 | [PreparedPush](../../src/monitor/push_job/projection.rs#L713) | 绑定 intent/decision/context/facts/semantic/rendered bytes | 该对象没有 P-02 的逐票写库记录和通知集合，不能仅因其相等而断言完整 P-02 行为相等 |
 | [上下文工厂](../../src/monitor/push_job/context.rs#L189)、[投影构造](../../src/monitor/push_job/projection.rs#L277) | 非 test 的 factory/type/构造逻辑已经存在，但 binding/input 字段和有效构造路径受限 | 缺的是可信注册与实际运行输入进入这些构造路径的 interface，不是“所有类型只在 cfg(test) 存在” |
@@ -19,9 +19,13 @@
 
 ## 不能只比消息：已有独立反例
 
-[完整提案测试](../../src/bin/monitor/push_templates.rs#L18030)逐字断言文案、两条 records 的全部业务字段和通知集合；[价格/指标/集合差异反例](../../src/bin/monitor/push_templates.rs#L18088)明确证明，价格改变或隐藏在显示舍入后的指标变化，可以让消息完全相同而业务记录不同。下一任务须复用这些独立期望并从实际影子 interface 检测差异，不能改成“同一个 prepare 调用两次，所以结果相等”。
+[完整提案测试](../../src/bin/monitor/push_templates.rs#L18491)逐字断言文案、两条 records 的全部业务字段和通知集合；[价格/指标/集合差异反例](../../src/bin/monitor/push_templates.rs#L18548)明确证明，价格改变或隐藏在显示舍入后的指标变化，可以让消息完全相同而业务记录不同。下一任务须复用这些独立期望并从实际影子 interface 检测差异，不能改成“同一个 prepare 调用两次，所以结果相等”。
 
 业务提案的精确比较应与同次 W17 执行绑定，并保留旧提案供实际发送。可复用现有 `PartialEq`，但单独在测试比较两个提案、或由 caller 自报一个 payload hash，都不能证明运行时比较了完整实际输出。接口还须确保回调失败、未执行、任一拒绝端口非零时不能生成 Match；Debug 仅输出类型、数量和差异类别，不输出提案正文。
+
+按1931014再次核对，[ShadowObservation](../../src/monitor/push_job/shadow.rs#L127)没有业务记录/通知集合载荷；[execute_shadow](../../src/monitor/push_job/shadow.rs#L279)在同次调用内持有两个实际结果并完成验证，但只返回[ShadowReport](../../src/monitor/push_job/shadow.rs#L224)，不返回可供dispatcher消费的旧业务提案。这明确了下一处interface缺口：比较器须接收两侧真实提案、在同次执行中比较，并保留原旧提案的所有权；不能仅在外部拼接一个“相等”bool或事后重新prepare。原report的is_match仍只证明其已覆盖的语义与所提供拒绝能力，未证明全部P-02业务一致或允许发送。具体载荷interface尚未实现，本轮诊断任务不改该内核。
+
+这一机制现已整理为[同次完整业务提案比较计划](../superpowers/plans/2026-09-10-shadow-business-proposals.md)，四项interface澄清已通过独立只读限定复核，待当前唯一实现任务交接后再执行。它保留原execute_shadow及其公开闭集合同，拟由新执行入口比较真实传入的完整载荷并移动保留旧输出；泛型比较机制不替代真实P-02类型和两个adapter的完整性审查，也不替代来源认证。
 
 ## 实施依赖顺序
 
@@ -33,11 +37,11 @@
 
 ## 必须保留的缺源与拒绝语义
 
-当前真实投影仍明确设置 [volume_ratio: None](../../src/market_analyzer/limit_up.rs#L295)，[P-02 selector](../../src/bin/monitor/push_templates.rs#L5964)仍要求有限正量比、有限涨跌幅和有限正价格。保留来源观察不等于获得量比。
+当前真实投影仍明确设置 [volume_ratio: None](../../src/market_analyzer/limit_up.rs#L295)，[P-02 selector](../../src/bin/monitor/push_templates.rs#L6041)仍要求有限正量比、有限涨跌幅和有限正价格。保留来源观察不等于获得量比。
 
 - provider 证实空池，只能依照观察对象自身的 `VerifiedEmpty` 事实生成 NoData 证据。
-- 非空池却缺量比、字段非法或来源未认证，不能当 VerifiedEmpty；不能把一个 `snapshot: Err(String)` 不加区分地映射为 NoData。
-- 全部已通知造成的空选集和缺输入造成的空选集，必须依既有政策/输入合同区分，不能通过错误字符串猜测或把二者都当真实空池。
+- 非空池却缺量比、字段非法或来源未认证，不能当 VerifiedEmpty；现在的 `snapshot: Err(AuctionVolumeSelectionError)` 已保留空源和非空不可选的区别，仍不能不加来源验证地映射为 NoData。
+- 全部已通知造成的空选集和缺输入造成的空选集，已有[只读计数与严格事实判断](../../src/bin/monitor/push_templates.rs#L5961)可区分；后续adapter仍须依既有政策/输入合同决策，不能将选择事实当领域完成或真实空池。
 - 任何新的跨源补量比仍需[量比来源合同](auction-source-evidence-gaps-2026-09-08.md)中列出的产品决定与提供方事实；不得新增隐式 MarketStatistics join，也不得将原 receipt/hash 重新命名为认证。
 
 ## 下一任务的可观察验收
@@ -46,4 +50,4 @@
 
 最终测试命令与文件 ownership 须在具体 adapter/注册 interface 确定后写入正式实施计划，并逐项核对测试是否会调用全局数据库、网络或 dispatcher 日志。当前未运行这些新测试，也未创建这套实现。已有[冻结准备](implementation-auction-frozen-preparation-2026-09-08.md)、[来源保留](implementation-auction-source-observation-2026-09-08.md)、[W17 内核](implementation-w17-results-2026-09-08.md)的完成状态不重开；只补它们之间真实缺失的接线。
 
-其中无需先签发生产权限的输入事实保留已拆出[选集拒绝诊断计划](../superpowers/plans/2026-09-10-auction-selection-diagnostics.md)：将真实选择器/tick的String失败替换为可区分空源、缺字段、有效行已通知的结构化事实，原成功发送结果不变。该计划目前仅准备，须等待唯一实现/Cargo队列交接；它不是完整adapter/注册计划，也不解决真实缺量比或认证。
+其中无需先签发生产权限的输入事实保留已完成[选集拒绝诊断计划](../superpowers/plans/2026-09-10-auction-selection-diagnostics.md)：真实选择器/tick的String失败已替换为可区分空源、缺字段、有效行已通知的结构化事实，原成功发送结果不变。源码298ab0d经10项纯测试和独立Spec/Quality审查通过；它不是完整adapter/注册计划，也不解决真实缺量比或认证。
