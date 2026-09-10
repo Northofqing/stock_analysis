@@ -211,6 +211,38 @@ fn object_order_and_whitespace_do_not_change_request_identity() {
 }
 
 #[test]
+fn parses_independent_production_null_namespace_golden_as_unverified() {
+    let wire = br#"{
+        "command":"inspect",
+        "target":{"kind":"unit","id":"MU-p01","namespace":{"kind":"Production","run_id":null}},
+        "expected_version":0,
+        "expected_generation":0,
+        "dry_run":true,
+        "authenticated_operator_ref":"TEST_CODE-operator-session",
+        "reason":"operator.evidence_invalid",
+        "evidence_refs":[],
+        "requested_at":0,
+        "command_id":"4f80bb38823491535dcf9df0646c647df47aa1f95b1f2c4df7b83d077f5bbc99"
+    }"#;
+    let request =
+        UnverifiedOperatorRequest::parse(wire).expect("TEST_CODE Production namespace claim");
+
+    assert!(matches!(
+        request.target().namespace(),
+        Namespace::Production
+    ));
+    assert_eq!(request.canonical_bytes().len(), 322);
+    assert_eq!(
+        request.canonical_bytes(),
+        b"PushOperatorRequest/v1\0{\"authenticated_operator_ref\":\"TEST_CODE-operator-session\",\"command\":\"inspect\",\"dry_run\":true,\"evidence_refs\":[],\"expected_generation\":0,\"expected_version\":0,\"reason\":\"operator.evidence_invalid\",\"requested_at\":0,\"target\":{\"id\":\"MU-p01\",\"kind\":\"unit\",\"namespace\":{\"kind\":\"Production\",\"run_id\":null}}}"
+    );
+    assert_eq!(
+        request.request_digest().as_str(),
+        "4f80bb38823491535dcf9df0646c647df47aa1f95b1f2c4df7b83d077f5bbc99"
+    );
+}
+
+#[test]
 fn every_material_field_changes_identity_but_command_id_is_not_self_material() {
     let mut mutations = Vec::new();
 
@@ -512,6 +544,13 @@ fn rejects_array_encoding_for_structs_and_object_encoding_for_command() {
         Err(OperatorRequestError::WireStructure)
     );
 
+    let mut production_namespace_sequence = unit_wire_value();
+    production_namespace_sequence["target"]["namespace"] = json!(["Production", null]);
+    assert_eq!(
+        parse_value(&production_namespace_sequence),
+        Err(OperatorRequestError::WireStructure)
+    );
+
     let mut object_command = unit_wire_value();
     object_command["command"] = json!({"inspect": null});
     assert_eq!(
@@ -578,12 +617,12 @@ fn rejects_wrong_types_invalid_numbers_and_invalid_closed_values() {
         (
             "/command",
             json!("delete"),
-            OperatorRequestError::WireStructure,
+            OperatorRequestError::InvalidField("command"),
         ),
         (
             "/target/kind",
             json!("occurrence"),
-            OperatorRequestError::WireStructure,
+            OperatorRequestError::InvalidField("target.kind"),
         ),
         (
             "/reason",
@@ -625,7 +664,6 @@ fn enforces_namespace_shape_and_command_target_matrix() {
         json!({"kind": "Production", "run_id": "TEST_CODE-run"}),
         json!({"kind": "Test"}),
         json!({"kind": "Test", "run_id": null}),
-        json!({"kind": "Unknown", "run_id": null}),
     ] {
         let mut wrong = unit_wire_value();
         wrong["target"]["namespace"] = namespace;
@@ -634,6 +672,13 @@ fn enforces_namespace_shape_and_command_target_matrix() {
             Err(OperatorRequestError::WireStructure)
         );
     }
+
+    let mut unknown_namespace = unit_wire_value();
+    unknown_namespace["target"]["namespace"] = json!({"kind": "Unknown", "run_id": null});
+    assert_eq!(
+        parse_value(&unknown_namespace),
+        Err(OperatorRequestError::InvalidField("target.namespace.kind"))
+    );
 
     let digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     for (command, kind, id) in [
@@ -905,12 +950,69 @@ fn debug_and_errors_do_not_disclose_operator_uri_or_target_sentinels() {
         assert!(!rendered.contains("vault://"), "{rendered}");
     }
 
+    let assert_redacted = |wire: &[u8], expected: OperatorRequestError| {
+        let error = UnverifiedOperatorRequest::parse(wire).unwrap_err();
+        assert_eq!(error, expected);
+        for rendered in [format!("{error}"), format!("{error:?}")] {
+            for sensitive in [
+                "TEST_CODE-SECRET",
+                "vault://",
+                "/PATH",
+                "\"authenticated_operator_ref\"",
+            ] {
+                assert!(!rendered.contains(sensitive), "{rendered}");
+            }
+        }
+    };
+
     let malformed = intent_wire.replace("\"expected_version\":0", "\"expected_version\":null");
-    let error = UnverifiedOperatorRequest::parse(malformed.as_bytes()).unwrap_err();
-    for rendered in [format!("{error}"), format!("{error:?}")] {
-        assert!(!rendered.contains("TEST_CODE-SECRET"), "{rendered}");
-        assert!(!rendered.contains("vault://"), "{rendered}");
-    }
+    assert_redacted(malformed.as_bytes(), OperatorRequestError::WireStructure);
+
+    let fixture: Value = serde_json::from_str(intent_wire).expect("TEST_CODE secret fixture JSON");
+
+    let mut invalid_field = fixture.clone();
+    invalid_field["reason"] = json!("TEST_CODE-SECRET-REASON");
+    assert_redacted(
+        &serde_json::to_vec(&invalid_field).unwrap(),
+        OperatorRequestError::InvalidField("reason"),
+    );
+
+    let mut target_mismatch = fixture.clone();
+    target_mismatch["command"] = json!("resolve-uncertain");
+    assert_redacted(
+        &serde_json::to_vec(&target_mismatch).unwrap(),
+        OperatorRequestError::TargetCommandMismatch,
+    );
+
+    let mut duplicate_evidence = fixture.clone();
+    let evidence = fixture["evidence_refs"][0].clone();
+    duplicate_evidence["evidence_refs"] = json!([evidence.clone(), evidence]);
+    assert_redacted(
+        &serde_json::to_vec(&duplicate_evidence).unwrap(),
+        OperatorRequestError::DuplicateEvidence,
+    );
+
+    let mut identity_mismatch = fixture.clone();
+    identity_mismatch["requested_at"] = json!(1);
+    assert_redacted(
+        &serde_json::to_vec(&identity_mismatch).unwrap(),
+        OperatorRequestError::CommandIdMismatch,
+    );
+
+    let mut too_many_evidence = fixture.clone();
+    too_many_evidence["evidence_refs"] = Value::Array(
+        (0..65)
+            .map(|_| fixture["evidence_refs"][0].clone())
+            .collect(),
+    );
+    assert_redacted(
+        &serde_json::to_vec(&too_many_evidence).unwrap(),
+        OperatorRequestError::TooManyEvidenceRefs,
+    );
+
+    let mut too_large = intent_wire.as_bytes().to_vec();
+    too_large.resize(64 * 1024 + 1, b' ');
+    assert_redacted(&too_large, OperatorRequestError::InputTooLarge);
 }
 
 #[test]

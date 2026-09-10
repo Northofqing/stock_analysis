@@ -332,30 +332,25 @@ where
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-enum WireTarget {
-    #[serde(rename = "unit")]
-    Unit {
-        id: String,
-        namespace: MapOnly<WireNamespace>,
-    },
-    #[serde(rename = "intent")]
-    Intent {
-        id: String,
-        namespace: MapOnly<WireNamespace>,
-    },
-    #[serde(rename = "decision")]
-    Decision {
-        id: String,
-        namespace: MapOnly<WireNamespace>,
-    },
+#[serde(deny_unknown_fields)]
+struct WireTarget {
+    kind: String,
+    id: String,
+    namespace: MapOnly<WireNamespace>,
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-enum WireNamespace {
-    Production { run_id: () },
-    Test { run_id: String },
+#[serde(deny_unknown_fields)]
+struct WireNamespace {
+    kind: String,
+    run_id: WireRunId,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireRunId {
+    Null(()),
+    Text(String),
 }
 
 #[derive(Deserialize)]
@@ -368,28 +363,36 @@ struct WireEvidenceRef {
 }
 
 fn parse_target(MapOnly(target): MapOnly<WireTarget>) -> Result<OperatorTarget> {
-    match target {
-        WireTarget::Unit { id, namespace } => Ok(OperatorTarget::Unit {
+    let WireTarget {
+        kind,
+        id,
+        namespace,
+    } = target;
+    match kind.as_str() {
+        "unit" => Ok(OperatorTarget::Unit {
             id: UnitId::try_new(id).map_err(|_| OperatorRequestError::InvalidField("target.id"))?,
             namespace: parse_namespace(namespace)?,
         }),
-        WireTarget::Intent { id, namespace } => Ok(OperatorTarget::Intent {
+        "intent" => Ok(OperatorTarget::Intent {
             id: parse_digest("target.id", &id)?,
             namespace: parse_namespace(namespace)?,
         }),
-        WireTarget::Decision { id, namespace } => Ok(OperatorTarget::Decision {
+        "decision" => Ok(OperatorTarget::Decision {
             id: parse_digest("target.id", &id)?,
             namespace: parse_namespace(namespace)?,
         }),
+        _ => Err(OperatorRequestError::InvalidField("target.kind")),
     }
 }
 
 fn parse_namespace(MapOnly(namespace): MapOnly<WireNamespace>) -> Result<Namespace> {
-    match namespace {
-        WireNamespace::Production { run_id: () } => Ok(Namespace::Production),
-        WireNamespace::Test { run_id } => RunId::try_new(run_id)
+    match (namespace.kind.as_str(), namespace.run_id) {
+        ("Production", WireRunId::Null(())) => Ok(Namespace::Production),
+        ("Test", WireRunId::Text(run_id)) => RunId::try_new(run_id)
             .map(Namespace::test)
             .map_err(|_| OperatorRequestError::InvalidField("target.namespace.run_id")),
+        ("Production" | "Test", _) => Err(OperatorRequestError::WireStructure),
+        _ => Err(OperatorRequestError::InvalidField("target.namespace.kind")),
     }
 }
 
@@ -425,7 +428,7 @@ fn parse_command(value: &str) -> Result<OperatorCommand> {
         "resolve-uncertain" => Ok(OperatorCommand::ResolveUncertain),
         "promote" => Ok(OperatorCommand::Promote),
         "rollback" => Ok(OperatorCommand::Rollback),
-        _ => Err(OperatorRequestError::WireStructure),
+        _ => Err(OperatorRequestError::InvalidField("command")),
     }
 }
 
