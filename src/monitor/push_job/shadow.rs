@@ -199,6 +199,12 @@ pub enum ShadowInvalidBinding {
     DecisionReason,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ShadowBusinessInvalidBinding {
+    ReadyProposalMissing,
+    NonReadyProposalPresent,
+}
+
 /// Closed, deterministically ordered differences containing no payload or callback strings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ShadowDifference {
@@ -217,6 +223,17 @@ pub enum ShadowDifference {
     CompletionCursor,
     CompletionRetry,
     CompletionManual,
+}
+
+/// Business comparison evidence combines every original difference with proposal evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ShadowBusinessDifference {
+    Shadow(ShadowDifference),
+    InvalidObservation {
+        path: ShadowPath,
+        binding: ShadowBusinessInvalidBinding,
+    },
+    BusinessProposal,
 }
 
 /// Read-only evidence for this invocation. Only execute_shadow can construct it.
@@ -274,6 +291,124 @@ impl ShadowReport {
     }
 }
 
+/// An observation and the actual business proposal owned by that adapter invocation.
+pub struct ShadowBusinessObservation<'a, P> {
+    observation: ShadowObservation<'a>,
+    proposal: Option<P>,
+}
+
+impl<'a, P> ShadowBusinessObservation<'a, P> {
+    pub fn new(observation: ShadowObservation<'a>, proposal: Option<P>) -> Self {
+        Self {
+            observation,
+            proposal,
+        }
+    }
+}
+
+impl<P> fmt::Debug for ShadowBusinessObservation<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShadowBusinessObservation")
+            .field("proposal_type", &std::any::type_name::<P>())
+            .field("proposal_present", &self.proposal.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read-only evidence covering both the original shadow semantics and full proposal equality.
+pub struct ShadowBusinessReport {
+    base: ShadowReport,
+    statuses: [ShadowPathStatus; 2],
+    differences: Vec<ShadowBusinessDifference>,
+}
+
+impl ShadowBusinessReport {
+    pub fn unit_id(&self) -> &UnitId {
+        self.base.unit_id()
+    }
+
+    pub fn run_context_sha256(&self) -> &Sha256Digest {
+        self.base.run_context_sha256()
+    }
+
+    pub fn prepared_facts_sha256(&self) -> &Sha256Digest {
+        self.base.prepared_facts_sha256()
+    }
+
+    pub fn status(&self, path: ShadowPath) -> ShadowPathStatus {
+        self.statuses[path as usize]
+    }
+
+    pub fn counts(&self, path: ShadowPath) -> &ShadowEffectCounts {
+        self.base.counts(path)
+    }
+
+    pub fn differences(&self) -> &[ShadowBusinessDifference] {
+        &self.differences
+    }
+
+    pub fn reasons(&self) -> Vec<ReasonCode> {
+        let mut reasons = self.base.reasons();
+        if !self.differences.is_empty() && !reasons.contains(&ReasonCode::ShadowSemanticDiff) {
+            reasons.insert(0, ReasonCode::ShadowSemanticDiff);
+        }
+        reasons
+    }
+
+    /// Match covers original semantics, proposal presence/equality, and supplied capabilities.
+    pub fn is_match(&self) -> bool {
+        self.statuses == [ShadowPathStatus::Completed; 2]
+            && self.differences.is_empty()
+            && self.base.is_match()
+    }
+}
+
+impl fmt::Debug for ShadowBusinessReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShadowBusinessReport")
+            .field("statuses", &self.statuses)
+            .field(
+                "counts",
+                &[self.counts(ShadowPath::Old), self.counts(ShadowPath::New)],
+            )
+            .field("differences", &self.differences)
+            .finish()
+    }
+}
+
+/// A business report plus the original legacy proposal, if that path produced a valid Ready
+/// observation. Taking the proposal transfers ordinary data, never execution authority.
+pub struct ShadowBusinessExecution<P> {
+    report: ShadowBusinessReport,
+    legacy_proposal: Option<P>,
+}
+
+impl<P> ShadowBusinessExecution<P> {
+    pub fn report(&self) -> &ShadowBusinessReport {
+        &self.report
+    }
+
+    pub fn take_legacy_proposal(&mut self) -> Option<P> {
+        self.legacy_proposal.take()
+    }
+}
+
+impl<P> fmt::Debug for ShadowBusinessExecution<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShadowBusinessExecution")
+            .field("proposal_type", &std::any::type_name::<P>())
+            .field("legacy_proposal_present", &self.legacy_proposal.is_some())
+            .field("report", &self.report)
+            .finish()
+    }
+}
+
+struct ShadowCoreExecution<Output> {
+    report: ShadowReport,
+    old_output: Option<Output>,
+    new_output: Option<Output>,
+}
+
 /// Executes both synchronous adapters against the same references. Initial context/facts
 /// mismatch executes neither adapter. Callback failure does not skip the other adapter.
 pub fn execute_shadow<'a, Old, New>(
@@ -294,6 +429,125 @@ where
         &ShadowDeniedEffects,
     ) -> Result<ShadowObservation<'a>, ShadowCallbackFailure>,
 {
+    execute_shadow_core(context, facts, old, new, |observation| observation).report
+}
+
+/// Executes both adapters once and compares their actual business proposals in the same
+/// invocation. Only a valid legacy Ready observation retains its original proposal for transfer.
+/// `P::eq` defines proposal coverage; this does not certify adapter completeness or global I/O
+/// confinement.
+pub fn execute_shadow_with_proposals<'a, P, Old, New>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+    old: Old,
+    new: New,
+) -> ShadowBusinessExecution<P>
+where
+    P: PartialEq,
+    Old: FnOnce(
+        &'a RunContext,
+        &'a PreparedFactsSnapshot,
+        &ShadowDeniedEffects,
+    ) -> Result<ShadowBusinessObservation<'a, P>, ShadowCallbackFailure>,
+    New: FnOnce(
+        &'a RunContext,
+        &'a PreparedFactsSnapshot,
+        &ShadowDeniedEffects,
+    ) -> Result<ShadowBusinessObservation<'a, P>, ShadowCallbackFailure>,
+{
+    let core = execute_shadow_core(context, facts, old, new, |output| &output.observation);
+    let ShadowCoreExecution {
+        report: base,
+        mut old_output,
+        new_output,
+    } = core;
+    let mut statuses = [base.status(ShadowPath::Old), base.status(ShadowPath::New)];
+    let mut differences: BTreeSet<_> = base
+        .differences()
+        .iter()
+        .copied()
+        .map(ShadowBusinessDifference::Shadow)
+        .collect();
+    let mut old_proposal_valid = false;
+
+    for (path, output) in [
+        (ShadowPath::Old, old_output.as_ref()),
+        (ShadowPath::New, new_output.as_ref()),
+    ] {
+        if statuses[path as usize] != ShadowPathStatus::Completed {
+            continue;
+        }
+        match business_invalid_binding(output.expect("completed path has output")) {
+            Some(binding) => {
+                statuses[path as usize] = ShadowPathStatus::InvalidObservation;
+                differences.insert(ShadowBusinessDifference::InvalidObservation { path, binding });
+            }
+            None if path == ShadowPath::Old => old_proposal_valid = true,
+            None => {}
+        }
+    }
+
+    if let (Some(old), Some(new)) = (&old_output, &new_output) {
+        if let (Some(old), Some(new)) = (&old.proposal, &new.proposal) {
+            if old != new {
+                differences.insert(ShadowBusinessDifference::BusinessProposal);
+            }
+        }
+    }
+
+    let legacy_proposal = if old_proposal_valid {
+        old_output
+            .as_mut()
+            .and_then(|output| output.proposal.take())
+    } else {
+        None
+    };
+    ShadowBusinessExecution {
+        report: ShadowBusinessReport {
+            base,
+            statuses,
+            differences: differences.into_iter().collect(),
+        },
+        legacy_proposal,
+    }
+}
+
+fn business_invalid_binding<P>(
+    output: &ShadowBusinessObservation<'_, P>,
+) -> Option<ShadowBusinessInvalidBinding> {
+    match (
+        matches!(
+            output.observation.decision.view(),
+            JobDecisionView::Ready(_)
+        ),
+        output.proposal.is_some(),
+    ) {
+        (true, false) => Some(ShadowBusinessInvalidBinding::ReadyProposalMissing),
+        (false, true) => Some(ShadowBusinessInvalidBinding::NonReadyProposalPresent),
+        _ => None,
+    }
+}
+
+fn execute_shadow_core<'a, Output, Old, New, Observe>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+    old: Old,
+    new: New,
+    observation_of: Observe,
+) -> ShadowCoreExecution<Output>
+where
+    Old: FnOnce(
+        &'a RunContext,
+        &'a PreparedFactsSnapshot,
+        &ShadowDeniedEffects,
+    ) -> Result<Output, ShadowCallbackFailure>,
+    New: FnOnce(
+        &'a RunContext,
+        &'a PreparedFactsSnapshot,
+        &ShadowDeniedEffects,
+    ) -> Result<Output, ShadowCallbackFailure>,
+    Observe: for<'output> Fn(&'output Output) -> &'output ShadowObservation<'a>,
+{
     let mut report = ShadowReport {
         unit_id: context.unit_id().clone(),
         run_context_sha256: context.canonical_sha256(),
@@ -306,7 +560,11 @@ where
         report
             .differences
             .push(ShadowDifference::ContextFactsBinding);
-        return report;
+        return ShadowCoreExecution {
+            report,
+            old_output: None,
+            new_output: None,
+        };
     }
 
     let old_effects = ShadowDeniedEffects::new();
@@ -324,8 +582,8 @@ where
                 differences.insert(ShadowDifference::CallbackFailed(path));
                 ShadowPathStatus::CallbackFailed
             }
-            Ok(observation) => {
-                let invalid = validate_observation(context, facts, &report, observation);
+            Ok(output) => {
+                let invalid = validate_observation(context, facts, &report, observation_of(output));
                 if invalid.is_empty() {
                     ShadowPathStatus::Completed
                 } else {
@@ -339,10 +597,14 @@ where
     }
     // Preserve output differences even when a path supplied an invalid binding.
     if let (Ok(old), Ok(new)) = (&old_result, &new_result) {
-        compare_observations(old, new, &mut differences);
+        compare_observations(observation_of(old), observation_of(new), &mut differences);
     }
     report.differences = differences.into_iter().collect();
-    report
+    ShadowCoreExecution {
+        report,
+        old_output: old_result.ok(),
+        new_output: new_result.ok(),
+    }
 }
 
 fn validate_observation(

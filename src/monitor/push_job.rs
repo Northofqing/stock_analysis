@@ -58,7 +58,9 @@ pub use projection::{
     SemanticProjection, Severity, SourceBinding, SubKind, SubKindValue, Suppression,
 };
 pub use shadow::{
-    execute_shadow, ShadowCallbackFailure, ShadowDeniedEffects, ShadowDiagnostics,
+    execute_shadow, execute_shadow_with_proposals, ShadowBusinessDifference,
+    ShadowBusinessExecution, ShadowBusinessInvalidBinding, ShadowBusinessObservation,
+    ShadowBusinessReport, ShadowCallbackFailure, ShadowDeniedEffects, ShadowDiagnostics,
     ShadowDifference, ShadowEffect, ShadowEffectCounts, ShadowEffectDenied, ShadowInvalidBinding,
     ShadowObservation, ShadowPath, ShadowPathStatus, ShadowReport,
 };

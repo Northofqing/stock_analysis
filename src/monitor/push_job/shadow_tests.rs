@@ -1,4 +1,4 @@
-use std::{cell::Cell, time::Duration};
+use std::{cell::Cell, collections::BTreeSet, time::Duration};
 
 use super::context::{context_fixture, ContextFixtureCase};
 use super::facts::capture_fixture;
@@ -134,6 +134,84 @@ fn ready<'a>(context: &'a RunContext, facts: &'a PreparedFactsSnapshot) -> Shado
     )
 }
 
+#[derive(PartialEq)]
+struct BusinessRecord {
+    symbol: String,
+    price_bits: u64,
+    hidden_raw_metric: i64,
+}
+
+#[derive(PartialEq)]
+struct BusinessProposal {
+    message: String,
+    records: Vec<BusinessRecord>,
+    notifications: BTreeSet<String>,
+    ownership_marker: Box<u8>,
+}
+
+fn business_proposal() -> BusinessProposal {
+    BusinessProposal {
+        message: "sensitive-business-message".to_owned(),
+        records: vec![
+            BusinessRecord {
+                symbol: "SENSITIVE-A".to_owned(),
+                price_bits: 42.25_f64.to_bits(),
+                hidden_raw_metric: 7_001,
+            },
+            BusinessRecord {
+                symbol: "SENSITIVE-B".to_owned(),
+                price_bits: 9.75_f64.to_bits(),
+                hidden_raw_metric: 8_002,
+            },
+        ],
+        notifications: BTreeSet::from([
+            "sensitive-notification-a".to_owned(),
+            "sensitive-notification-b".to_owned(),
+        ]),
+        ownership_marker: Box::new(17),
+    }
+}
+
+#[test]
+fn business_proposal_equal_independent_outputs_match_and_return_original_legacy_value_once() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let expected_context = capture.context();
+    let expected_facts = &facts;
+    let calls = Cell::new([0_u8; 2]);
+    let legacy = business_proposal();
+    let legacy_marker = (&*legacy.ownership_marker) as *const u8;
+
+    let mut execution = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, observed_facts, _| {
+            calls.set([calls.get()[0] + 1, calls.get()[1]]);
+            assert!(std::ptr::eq(expected_context, context));
+            assert!(expected_facts.shares_instance_with(observed_facts));
+            Ok(ShadowBusinessObservation::new(
+                ready(context, observed_facts),
+                Some(legacy),
+            ))
+        },
+        |context, observed_facts, _| {
+            calls.set([calls.get()[0], calls.get()[1] + 1]);
+            assert!(std::ptr::eq(expected_context, context));
+            assert!(expected_facts.shares_instance_with(observed_facts));
+            Ok(ShadowBusinessObservation::new(
+                ready(context, observed_facts),
+                Some(business_proposal()),
+            ))
+        },
+    );
+
+    assert!(execution.report().is_match());
+    assert_eq!(calls.get(), [1, 1]);
+    let returned = execution.take_legacy_proposal().unwrap();
+    assert_eq!((&*returned.ownership_marker) as *const u8, legacy_marker);
+    assert!(execution.take_legacy_proposal().is_none());
+    assert!(execution.report().is_match());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Case {
     Ready,
@@ -143,6 +221,46 @@ enum Case {
     Suppressed(ReasonCode, Option<UtcMicros>),
     Retryable(ReasonCode, Option<UtcMicros>),
     Permanent(ReasonCode),
+}
+
+fn business_ready<'a>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+    proposal: Option<BusinessProposal>,
+) -> ShadowBusinessObservation<'a, BusinessProposal> {
+    ShadowBusinessObservation::new(ready(context, facts), proposal)
+}
+
+fn business_non_ready<'a>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+    proposal: Option<BusinessProposal>,
+) -> ShadowBusinessObservation<'a, BusinessProposal> {
+    ShadowBusinessObservation::new(
+        observe(context, facts, Case::Disabled(ReasonCode::PolicyDisabled)),
+        proposal,
+    )
+}
+
+fn business_invalid_no_data<'a>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+    evidence_facts: &PreparedFactsSnapshot,
+) -> ShadowBusinessObservation<'a, BusinessProposal> {
+    ShadowBusinessObservation::new(
+        ShadowObservation::new(
+            context,
+            facts,
+            projector(context)
+                .decide_no_data(evidence_facts, ReasonCode::IntentNoData)
+                .unwrap(),
+            None,
+            ReasonCode::IntentNoData,
+            completion(),
+            ShadowDiagnostics::default(),
+        ),
+        None,
+    )
 }
 
 fn observe<'a>(
@@ -954,5 +1072,377 @@ fn debug_and_error_surfaces_never_expose_input_rendered_model_or_callback_conten
     }
     for effect in ShadowEffect::ALL {
         assert!(debug.contains(effect.as_str()));
+    }
+}
+
+#[test]
+fn business_proposal_all_complete_fields_and_record_order_are_compared() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    for change in 0..5 {
+        let mut execution = execute_shadow_with_proposals(
+            capture.context(),
+            &facts,
+            |context, facts, _| Ok(business_ready(context, facts, Some(business_proposal()))),
+            |context, facts, _| {
+                let mut proposal = business_proposal();
+                match change {
+                    0 => proposal.message = "different-business-message".to_owned(),
+                    1 => proposal.records[0].price_bits = 42.5_f64.to_bits(),
+                    2 => proposal.records[0].hidden_raw_metric = 7_002,
+                    3 => proposal.records.swap(0, 1),
+                    4 => {
+                        assert!(proposal.notifications.remove("sensitive-notification-b"));
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(business_ready(context, facts, Some(proposal)))
+            },
+        );
+        assert_eq!(
+            execution.report().differences(),
+            &[ShadowBusinessDifference::BusinessProposal],
+            "change {change}"
+        );
+        for path in [ShadowPath::Old, ShadowPath::New] {
+            assert_eq!(execution.report().status(path), ShadowPathStatus::Completed);
+        }
+        assert_eq!(
+            execution.report().reasons(),
+            [ReasonCode::ShadowSemanticDiff]
+        );
+        assert!(execution.take_legacy_proposal().is_some());
+    }
+}
+
+#[test]
+fn business_proposal_invalid_presence_is_path_specific_even_when_both_paths_agree() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let mut ready_missing = execute_shadow_with_proposals::<BusinessProposal, _, _>(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_ready(context, facts, None)),
+        |context, facts, _| Ok(business_ready(context, facts, None)),
+    );
+    assert!(!ready_missing.report().is_match());
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            ready_missing.report().status(path),
+            ShadowPathStatus::InvalidObservation
+        );
+        assert!(ready_missing.report().differences().contains(
+            &ShadowBusinessDifference::InvalidObservation {
+                path,
+                binding: ShadowBusinessInvalidBinding::ReadyProposalMissing,
+            }
+        ));
+    }
+    assert!(ready_missing.take_legacy_proposal().is_none());
+
+    let mut non_ready_present = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| {
+            Ok(business_non_ready(
+                context,
+                facts,
+                Some(business_proposal()),
+            ))
+        },
+        |context, facts, _| {
+            Ok(business_non_ready(
+                context,
+                facts,
+                Some(business_proposal()),
+            ))
+        },
+    );
+    assert!(!non_ready_present.report().is_match());
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            non_ready_present.report().status(path),
+            ShadowPathStatus::InvalidObservation
+        );
+        assert!(non_ready_present.report().differences().contains(
+            &ShadowBusinessDifference::InvalidObservation {
+                path,
+                binding: ShadowBusinessInvalidBinding::NonReadyProposalPresent,
+            }
+        ));
+    }
+    assert!(non_ready_present.take_legacy_proposal().is_none());
+}
+
+#[test]
+fn business_proposal_callback_failures_run_both_paths_and_apply_legacy_retention_rules() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let calls = Cell::new([0_u8; 2]);
+    let mut new_failed = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| {
+            calls.set([calls.get()[0] + 1, calls.get()[1]]);
+            Ok(business_ready(context, facts, Some(business_proposal())))
+        },
+        |_, _, _| {
+            calls.set([calls.get()[0], calls.get()[1] + 1]);
+            Err(ShadowCallbackFailure)
+        },
+    );
+    assert_eq!(calls.get(), [1, 1]);
+    assert_eq!(
+        new_failed.report().status(ShadowPath::New),
+        ShadowPathStatus::CallbackFailed
+    );
+    assert!(new_failed
+        .report()
+        .differences()
+        .contains(&ShadowBusinessDifference::Shadow(
+            ShadowDifference::CallbackFailed(ShadowPath::New)
+        )));
+    assert!(new_failed.take_legacy_proposal().is_some());
+
+    let calls = Cell::new([0_u8; 2]);
+    let mut old_failed = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |_, _, _| {
+            calls.set([calls.get()[0] + 1, calls.get()[1]]);
+            Err(ShadowCallbackFailure)
+        },
+        |context, facts, _| {
+            calls.set([calls.get()[0], calls.get()[1] + 1]);
+            Ok(business_ready(context, facts, Some(business_proposal())))
+        },
+    );
+    assert_eq!(calls.get(), [1, 1]);
+    assert!(old_failed.take_legacy_proposal().is_none());
+
+    let calls = Cell::new([0_u8; 2]);
+    let both_failed = execute_shadow_with_proposals::<BusinessProposal, _, _>(
+        capture.context(),
+        &facts,
+        |_, _, _| {
+            calls.set([calls.get()[0] + 1, calls.get()[1]]);
+            Err(ShadowCallbackFailure)
+        },
+        |_, _, _| {
+            calls.set([calls.get()[0], calls.get()[1] + 1]);
+            Err(ShadowCallbackFailure)
+        },
+    );
+    assert_eq!(calls.get(), [1, 1]);
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            both_failed.report().status(path),
+            ShadowPathStatus::CallbackFailed
+        );
+        assert!(both_failed
+            .report()
+            .differences()
+            .contains(&ShadowBusinessDifference::Shadow(
+                ShadowDifference::CallbackFailed(path)
+            )));
+    }
+}
+
+#[test]
+fn business_proposal_context_and_observation_bindings_cannot_be_hidden_by_equal_payloads() {
+    let (_, facts) = fixture(false, b"secret-facts");
+    let wrong_context = context_fixture(ContextFixtureCase::ValidEvent).unwrap();
+    let calls = Cell::new(0);
+    let mut mismatch = execute_shadow_with_proposals::<BusinessProposal, _, _>(
+        &wrong_context,
+        &facts,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            unreachable!()
+        },
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            unreachable!()
+        },
+    );
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        mismatch.report().differences(),
+        &[ShadowBusinessDifference::Shadow(
+            ShadowDifference::ContextFactsBinding
+        )]
+    );
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            mismatch.report().status(path),
+            ShadowPathStatus::NotExecuted
+        );
+    }
+    assert!(mismatch.take_legacy_proposal().is_none());
+
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let (other_capture, other_facts) = fixture(false, b"secret-facts");
+    let mut wrong_instances = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |_, _, _| {
+            Ok(business_ready(
+                other_capture.context(),
+                &other_facts,
+                Some(business_proposal()),
+            ))
+        },
+        |context, facts, _| Ok(business_ready(context, facts, Some(business_proposal()))),
+    );
+    for binding in [
+        ShadowInvalidBinding::ContextInstance,
+        ShadowInvalidBinding::FactsInstance,
+    ] {
+        assert!(wrong_instances.report().differences().contains(
+            &ShadowBusinessDifference::Shadow(ShadowDifference::InvalidObservation {
+                path: ShadowPath::Old,
+                binding,
+            })
+        ));
+    }
+    assert!(wrong_instances.take_legacy_proposal().is_none());
+
+    let mut invalid_ready = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| {
+            let (decision, _) = ready_parts(context, facts, b"same", Severity::Info);
+            Ok(ShadowBusinessObservation::new(
+                ShadowObservation::new(
+                    context,
+                    facts,
+                    decision,
+                    None,
+                    ReasonCode::IntentCreated,
+                    completion(),
+                    ShadowDiagnostics::default(),
+                ),
+                Some(business_proposal()),
+            ))
+        },
+        |context, facts, _| Ok(business_ready(context, facts, Some(business_proposal()))),
+    );
+    assert!(invalid_ready
+        .report()
+        .differences()
+        .contains(&ShadowBusinessDifference::Shadow(
+            ShadowDifference::InvalidObservation {
+                path: ShadowPath::Old,
+                binding: ShadowInvalidBinding::ReadyProjectionMissing,
+            }
+        )));
+    assert!(invalid_ready.take_legacy_proposal().is_none());
+
+    let (empty_capture, empty_facts) = fixture(true, b"empty-facts");
+    let (_, other_empty_facts) = fixture(true, b"other-empty-facts");
+    let invalid_no_data = execute_shadow_with_proposals(
+        empty_capture.context(),
+        &empty_facts,
+        |context, facts, _| Ok(business_invalid_no_data(context, facts, &other_empty_facts)),
+        |context, facts, _| Ok(business_invalid_no_data(context, facts, &other_empty_facts)),
+    );
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert!(invalid_no_data.report().differences().contains(
+            &ShadowBusinessDifference::Shadow(ShadowDifference::InvalidObservation {
+                path,
+                binding: ShadowInvalidBinding::NoDataEvidence,
+            })
+        ));
+    }
+}
+
+#[test]
+fn business_proposal_all_denied_capabilities_are_counted_before_rejection() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    for effect in ShadowEffect::ALL {
+        for attempted_path in [ShadowPath::Old, ShadowPath::New] {
+            let mut execution = execute_shadow_with_proposals(
+                capture.context(),
+                &facts,
+                |context, facts, effects| {
+                    if attempted_path == ShadowPath::Old {
+                        assert_eq!(effects.request(effect).unwrap_err().effect(), effect);
+                    }
+                    Ok(business_ready(context, facts, Some(business_proposal())))
+                },
+                |context, facts, effects| {
+                    if attempted_path == ShadowPath::New {
+                        assert_eq!(effects.request(effect).unwrap_err().effect(), effect);
+                    }
+                    Ok(business_ready(context, facts, Some(business_proposal())))
+                },
+            );
+            assert!(!execution.report().is_match());
+            assert!(execution.report().differences().is_empty());
+            assert_eq!(
+                execution.report().reasons(),
+                [ReasonCode::ShadowSideEffectAttempted]
+            );
+            for path in [ShadowPath::Old, ShadowPath::New] {
+                for counted in ShadowEffect::ALL {
+                    assert_eq!(
+                        execution.report().counts(path).get(counted),
+                        u64::from(path == attempted_path && counted == effect)
+                    );
+                }
+            }
+            assert!(execution.take_legacy_proposal().is_some());
+        }
+    }
+}
+
+#[test]
+fn business_proposal_valid_non_ready_observations_match_without_legacy_output() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let mut execution = execute_shadow_with_proposals::<BusinessProposal, _, _>(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_non_ready(context, facts, None)),
+        |context, facts, _| Ok(business_non_ready(context, facts, None)),
+    );
+    assert!(execution.report().is_match());
+    assert!(execution.report().differences().is_empty());
+    assert!(execution.take_legacy_proposal().is_none());
+}
+
+#[test]
+fn business_proposal_debug_and_errors_do_not_require_or_expose_payload_debug() {
+    let (capture, facts) = fixture(false, b"sensitive-input-payload");
+    let observation = business_ready(capture.context(), &facts, Some(business_proposal()));
+    let observation_debug = format!("{observation:?}");
+    let mut execution = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_ready(context, facts, Some(business_proposal()))),
+        |context, facts, effects| {
+            let denied = effects.request(ShadowEffect::TransportSend).unwrap_err();
+            assert_eq!(denied.to_string(), "shadow effect denied: TransportSend");
+            let _sensitive_callback_error = "sensitive-callback-error";
+            Ok(business_ready(context, facts, Some(business_proposal())))
+        },
+    );
+    let before_take = format!("{execution:?}");
+    assert!(execution.take_legacy_proposal().is_some());
+    let after_take = format!("{execution:?}");
+    assert_eq!(
+        execution.report().reasons(),
+        [ReasonCode::ShadowSideEffectAttempted]
+    );
+    for debug in [observation_debug, before_take, after_take] {
+        for secret in [
+            "sensitive-business-message",
+            "SENSITIVE-A",
+            "SENSITIVE-B",
+            "sensitive-notification-a",
+            "sensitive-notification-b",
+            "sensitive-input-payload",
+            "sensitive-callback-error",
+            &42.25_f64.to_bits().to_string(),
+            "7001",
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret}");
+        }
     }
 }
