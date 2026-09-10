@@ -29,6 +29,7 @@ mod migration;
 mod operational_readiness;
 mod phase_scheduler;
 mod readiness_probe;
+mod readiness_query;
 mod readiness_recovery;
 mod readiness_recovery_codec;
 mod readiness_snapshot;
@@ -94,6 +95,8 @@ mod phase_scheduler_tests;
 mod readiness_deployment_set_tests;
 #[cfg(test)]
 mod readiness_probe_tests;
+#[cfg(test)]
+mod readiness_query_tests;
 #[cfg(test)]
 mod readiness_recovery_codec_tests;
 #[cfg(test)]

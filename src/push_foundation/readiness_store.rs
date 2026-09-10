@@ -169,6 +169,23 @@ impl<'a> ReadinessRecordStore<'a> {
         })
     }
 
+    pub(crate) fn load_current(
+        &self,
+        snapshot_id: &Sha256Digest,
+    ) -> Result<StoredReadinessRecord, ReadinessStoreError> {
+        with_read_only(self.path, self.namespace, |connection| {
+            let chain = self.record_chain(connection, snapshot_id)?;
+            let target = chain.last().ok_or(corrupt("empty_chain"))?;
+            let committed = self
+                .head_chain(connection, &target.stream)?
+                .ok_or(ReadinessStoreError::RecordMissing)?;
+            if committed != chain {
+                return Err(ReadinessStoreError::HeadConflict);
+            }
+            Ok(target.clone())
+        })
+    }
+
     pub(crate) fn append(
         &self,
         expected: Option<&StoredReadinessRecord>,

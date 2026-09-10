@@ -72,6 +72,12 @@ fn w15_store_reopens_the_same_pending_snapshot_event_and_head() {
             .expect("TEST_CODE reopened record"),
         committed
     );
+    assert_eq!(
+        reopened
+            .load_current(pending.snapshot().snapshot_id())
+            .expect("TEST_CODE reopened current record"),
+        committed
+    );
     assert!(!format!("{committed:?}").contains("TEST_CODE-SECRET"));
 }
 
@@ -649,6 +655,17 @@ fn w15_store_reopens_an_explicit_producer_recovery_with_both_ends_intact() {
             .load_record(pending.snapshot().snapshot_id())
             .expect("TEST_CODE old endpoint"),
         first
+    );
+    assert_eq!(
+        reopened.load_current(pending.snapshot().snapshot_id()),
+        Err(ReadinessStoreError::HeadConflict),
+        "TEST_CODE a valid historical record is not the current record"
+    );
+    assert_eq!(
+        reopened
+            .load_current(recovered.snapshot().snapshot_id())
+            .expect("TEST_CODE current-only endpoint"),
+        second
     );
     assert_eq!(
         reopened

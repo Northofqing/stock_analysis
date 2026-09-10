@@ -35,7 +35,7 @@ fn digest(value: char) -> Sha256Digest {
         .expect("TEST_CODE digest")
 }
 
-fn deployment_assessment(
+pub(super) fn deployment_assessment(
     catalog: &MachineCatalog,
     set: &ActivationDeploymentSet,
     missing: Option<DependencyKind>,
@@ -94,7 +94,10 @@ fn deployment_assessment(
     (assessment, evidence)
 }
 
-fn v3_context(set: ActivationDeploymentSet, captured_at: i64) -> ReadinessDeploymentSetContext {
+pub(super) fn v3_context(
+    set: ActivationDeploymentSet,
+    captured_at: i64,
+) -> ReadinessDeploymentSetContext {
     ReadinessDeploymentSetContext::new(
         BusinessDate::parse("2026-09-08").expect("TEST_CODE date"),
         UtcMicros::try_new(captured_at).expect("TEST_CODE time"),
