@@ -263,6 +263,45 @@ fn business_invalid_no_data<'a>(
     )
 }
 
+fn business_invalid_ready_without_proposal<'a>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+) -> ShadowBusinessObservation<'a, BusinessProposal> {
+    let (decision, _) = ready_parts(context, facts, b"same", Severity::Info);
+    ShadowBusinessObservation::new(
+        ShadowObservation::new(
+            context,
+            facts,
+            decision,
+            None,
+            ReasonCode::IntentCreated,
+            completion(),
+            ShadowDiagnostics::default(),
+        ),
+        None,
+    )
+}
+
+fn business_invalid_non_ready_with_proposal<'a>(
+    context: &'a RunContext,
+    facts: &'a PreparedFactsSnapshot,
+) -> ShadowBusinessObservation<'a, BusinessProposal> {
+    ShadowBusinessObservation::new(
+        ShadowObservation::new(
+            context,
+            facts,
+            projector(context)
+                .decide_disabled(ReasonCode::PolicyDisabled)
+                .unwrap(),
+            None,
+            ReasonCode::PolicyOptInDisabled,
+            completion(),
+            ShadowDiagnostics::default(),
+        ),
+        Some(business_proposal()),
+    )
+}
+
 fn observe<'a>(
     context: &'a RunContext,
     facts: &'a PreparedFactsSnapshot,
@@ -1170,6 +1209,99 @@ fn business_proposal_invalid_presence_is_path_specific_even_when_both_paths_agre
         ));
     }
     assert!(non_ready_present.take_legacy_proposal().is_none());
+}
+
+#[test]
+fn business_proposal_presence_is_reported_alongside_base_invalidity_and_retains_valid_old() {
+    let (capture, facts) = fixture(false, b"secret-facts");
+    let mut ready_missing = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_invalid_ready_without_proposal(context, facts)),
+        |context, facts, _| Ok(business_invalid_ready_without_proposal(context, facts)),
+    );
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            ready_missing.report().status(path),
+            ShadowPathStatus::InvalidObservation
+        );
+        assert!(ready_missing
+            .report()
+            .differences()
+            .contains(&ShadowBusinessDifference::Shadow(
+                ShadowDifference::InvalidObservation {
+                    path,
+                    binding: ShadowInvalidBinding::ReadyProjectionMissing,
+                }
+            )));
+        assert!(ready_missing.report().differences().contains(
+            &ShadowBusinessDifference::InvalidObservation {
+                path,
+                binding: ShadowBusinessInvalidBinding::ReadyProposalMissing,
+            }
+        ));
+    }
+    assert!(ready_missing.take_legacy_proposal().is_none());
+
+    let mut non_ready_present = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_invalid_non_ready_with_proposal(context, facts)),
+        |context, facts, _| Ok(business_invalid_non_ready_with_proposal(context, facts)),
+    );
+    for path in [ShadowPath::Old, ShadowPath::New] {
+        assert_eq!(
+            non_ready_present.report().status(path),
+            ShadowPathStatus::InvalidObservation
+        );
+        assert!(non_ready_present.report().differences().contains(
+            &ShadowBusinessDifference::Shadow(ShadowDifference::InvalidObservation {
+                path,
+                binding: ShadowInvalidBinding::DecisionReason,
+            })
+        ));
+        assert!(non_ready_present.report().differences().contains(
+            &ShadowBusinessDifference::InvalidObservation {
+                path,
+                binding: ShadowBusinessInvalidBinding::NonReadyProposalPresent,
+            }
+        ));
+    }
+    assert!(non_ready_present.take_legacy_proposal().is_none());
+
+    let old_proposal = business_proposal();
+    let old_marker = (&*old_proposal.ownership_marker) as *const u8;
+    let mut new_invalid = execute_shadow_with_proposals(
+        capture.context(),
+        &facts,
+        |context, facts, _| Ok(business_ready(context, facts, Some(old_proposal))),
+        |context, facts, _| Ok(business_invalid_ready_without_proposal(context, facts)),
+    );
+    assert_eq!(
+        new_invalid.report().status(ShadowPath::Old),
+        ShadowPathStatus::Completed
+    );
+    assert_eq!(
+        new_invalid.report().status(ShadowPath::New),
+        ShadowPathStatus::InvalidObservation
+    );
+    assert!(new_invalid
+        .report()
+        .differences()
+        .contains(&ShadowBusinessDifference::Shadow(
+            ShadowDifference::InvalidObservation {
+                path: ShadowPath::New,
+                binding: ShadowInvalidBinding::ReadyProjectionMissing,
+            }
+        )));
+    assert!(new_invalid.report().differences().contains(
+        &ShadowBusinessDifference::InvalidObservation {
+            path: ShadowPath::New,
+            binding: ShadowBusinessInvalidBinding::ReadyProposalMissing,
+        }
+    ));
+    let returned = new_invalid.take_legacy_proposal().unwrap();
+    assert_eq!((&*returned.ownership_marker) as *const u8, old_marker);
 }
 
 #[test]

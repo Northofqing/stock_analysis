@@ -474,15 +474,16 @@ where
         (ShadowPath::Old, old_output.as_ref()),
         (ShadowPath::New, new_output.as_ref()),
     ] {
-        if statuses[path as usize] != ShadowPathStatus::Completed {
+        let Some(output) = output else {
             continue;
-        }
-        match business_invalid_binding(output.expect("completed path has output")) {
+        };
+        let base_valid = statuses[path as usize] == ShadowPathStatus::Completed;
+        match business_invalid_binding(output) {
             Some(binding) => {
                 statuses[path as usize] = ShadowPathStatus::InvalidObservation;
                 differences.insert(ShadowBusinessDifference::InvalidObservation { path, binding });
             }
-            None if path == ShadowPath::Old => old_proposal_valid = true,
+            None if path == ShadowPath::Old && base_valid => old_proposal_valid = true,
             None => {}
         }
     }
