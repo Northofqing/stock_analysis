@@ -149,6 +149,7 @@ mod attribution_epoch_runtime;
 mod blocking_market_data;
 mod closing_valuation_runtime;
 mod data_mode_probe;
+mod manual_push;
 mod market_data; // BR-148: capability probes remain independent from governance DataMode
 
 fn audit_full_market_rankings_unavailable(owner: &str) {
@@ -1467,33 +1468,15 @@ fn run_daily_pushes_dry_run_blocking(
 
 /// 按当前时间窗触发 active dispatcher
 
-/// - 09:00 → P-01 (盘前新闻)
+/// - 盘前 P-01 由常驻 scheduler/专属 compensation 拥有，本入口拒绝
 
-/// - 10:30/11:00/14:30 → I-01/I-02/I-03/I-04/D-01 (盘中)
+/// - 10:30/11:00/14:30 → I-01/I-02/I-03/D-01/I-04 (盘中)
 
 /// - 19:00 → A-01/A-10 (盘后复盘)
 
 /// - 推送时刻由 `OpportunitySchedule::default()` 统一拥有
 
-fn report_dispatch_outcome(name: &str, delivered: bool, failures: &mut Vec<String>) {
-    if delivered {
-        log::info!("[v22] {} dispatcher completed", name);
-    } else {
-        log::warn!(
-            "[v22] {} dispatcher did not confirm delivery, continue to next dispatcher",
-            name
-        );
-        failures.push(format!("{name} did not confirm delivery"));
-    }
-}
-
 async fn run_daily_pushes() -> Result<(), String> {
-    use push_templates::{
-        dispatch_catalyst_review_daily, dispatch_industry_chain_intraday_daily,
-        dispatch_intraday_market_daily, dispatch_news_catalyst_daily, dispatch_news_to_idea_daily,
-        dispatch_paper_review_daily,
-    };
-
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
 
     // 推送时刻由 OpportunitySchedule::default() 统一拥有。
@@ -1520,145 +1503,30 @@ async fn run_daily_pushes() -> Result<(), String> {
 
     log::info!("[v22] 推送窗口: {:?}", window);
 
-    let mut failures = Vec::new();
-
-    match window {
-        PushWindow::Preopen => {
-            failures.push(
-                "P-01 is owned by the BR-241 resident scheduler or the exclusive --compensate=P-01 command"
-                    .to_owned(),
-            );
-        }
-
-        PushWindow::Intraday => {
-            // 5 个盘中 dispatcher (I-01/I-02/I-03/I-04/D-01)
-            let banner = current_banner()
-                .map_err(|error| format!("BR-108 --push banner unavailable: {error}"))?;
-
-            report_dispatch_outcome(
-                "I-01",
-                dispatch_intraday_market_daily(&hhmm, &banner).await,
-                &mut failures,
-            );
-            report_dispatch_outcome(
-                "I-02",
-                dispatch_news_catalyst_daily(&hhmm, &banner).await,
-                &mut failures,
-            );
-            report_dispatch_outcome(
-                "I-03",
-                dispatch_industry_chain_intraday_daily(&hhmm, &banner).await,
-                &mut failures,
-            );
-            report_dispatch_outcome(
-                "D-01",
-                dispatch_news_to_idea_daily(&hhmm, &banner).await,
-                &mut failures,
-            );
-            // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
-            // 与运行时 I-04 计时器同一实现 (prepare_holding_plan_messages)。
-            match prepare_holding_plan_messages(&banner).await {
-                Ok(messages) => {
-                    let mut all_confirmed = true;
-                    for prepared in messages {
-                        let token = match crate::presentation_registry::acquire_token(
-                            "T-03-holding-plan",
-                            PushKind::HoldingPlan,
-                            "holding_plan_dispatcher",
-                            "render_holding_plan",
-                        ) {
-                            Ok(token) => token,
-                            Err(reason) => {
-                                failures.push(format!(
-                                    "I-04 T-03 token rejected code={}: {reason}",
-                                    prepared.code
-                                ));
-                                all_confirmed = false;
-                                continue;
-                            }
-                        };
-                        let outcome = notify::push_counted_with_binding(
-                            token,
-                            &prepared.text,
-                            None,
-                            prepared.binding,
-                        )
-                        .await;
-                        if !matches!(
-                            outcome,
-                            notify::PushOutcome::Pushed | notify::PushOutcome::Deduped
-                        ) {
-                            failures.push(format!(
-                                "I-04 T-03 delivery unconfirmed code={}: {:?}",
-                                prepared.code, outcome
-                            ));
-                            all_confirmed = false;
-                        }
-                    }
-                    if all_confirmed {
-                        report_dispatch_outcome("I-04", true, &mut failures);
-                    }
-                }
-                Err(error) => {
-                    failures.push(format!("I-04 T-03 batch rejected: {error}"));
-                }
-            }
-        }
-
-        PushWindow::Evening => {
-            report_dispatch_outcome(
-                "A-01",
-                dispatch_paper_review_daily(&date).await,
-                &mut failures,
-            );
-            report_dispatch_outcome(
-                "A-10",
-                dispatch_catalyst_review_daily(&date).await,
-                &mut failures,
-            );
-        }
-
-        PushWindow::Outside => {
-            // v22: 窗口外, 仅 A-01/A-10 兜底 (窗口信息读 config, 不再写死 09:00-19:00)
-
-            log::warn!(
-
-                "[v22] 当前时间 {} 不在 push 窗口内 (盘前 {} / 盘中 {:?} / 盘后 {}), 仅推 A-01/A-10 兜底",
-
-                hhmm,
-
-                schedule.push_preopen.format("%H:%M"),
-
-                schedule.push_intraday.iter().map(|t| t.format("%H:%M").to_string()).collect::<Vec<_>>(),
-
-                schedule.push_evening.format("%H:%M"),
-
-            );
-
-            report_dispatch_outcome(
-                "A-01",
-                dispatch_paper_review_daily(&date).await,
-                &mut failures,
-            );
-            report_dispatch_outcome(
-                "A-10",
-                dispatch_catalyst_review_daily(&date).await,
-                &mut failures,
-            );
-        }
-    }
-
-    if failures.is_empty() {
-        log::info!("[v22] --push 完成 (HHMM: {})", hhmm);
-    } else {
+    if matches!(window, PushWindow::Outside) {
         log::warn!(
-            "[v22] --push 已完成但部分调度未确认: {} / {hhmm}, fails={:?}",
-            failures.len(),
-            failures
+            "[v22] 当前时间 {} 不在 push 窗口内 (盘前 {} / 盘中 {:?} / 盘后 {}), 仅推 A-01/A-10 兜底",
+            hhmm,
+            schedule.push_preopen.format("%H:%M"),
+            schedule
+                .push_intraday
+                .iter()
+                .map(|time| time.format("%H:%M").to_string())
+                .collect::<Vec<_>>(),
+            schedule.push_evening.format("%H:%M"),
         );
     }
 
-    Ok(())
+    let mut effects = manual_push::RealManualPushEffects;
+    manual_push::run_manual_push(
+        manual_push::ManualPushContext {
+            window,
+            date: &date,
+            hhmm: &hhmm,
+        },
+        &mut effects,
+    )
+    .await
 }
 
 // ============= v12 PR1-1.7: AccountMode 评估钩子 =============
@@ -8790,7 +8658,11 @@ fn overlay_net_yi(
     overlay: &std::collections::HashMap<String, f64>,
     s: &stock_analysis::market_data::TopStock,
 ) -> f64 {
-    overlay.get(&s.code).copied().or(s.main_net_yi).unwrap_or(0.0)
+    overlay
+        .get(&s.code)
+        .copied()
+        .or(s.main_net_yi)
+        .unwrap_or(0.0)
 }
 
 async fn monitor_loop() {
