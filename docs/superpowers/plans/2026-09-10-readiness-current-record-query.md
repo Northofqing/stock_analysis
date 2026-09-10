@@ -1,6 +1,6 @@
 # W15 同快照查询的当前记录消费接线
 
-日期：2026-09-10。状态：待实施。此计划是完整 W15/W16 认证查询链的内部前置，不是以 candidate-only CLI 替代最终 health/readiness/CLI。现有 v3 集合、codec、恢复和存储已经交付，不重复实现。
+日期：2026-09-10。状态：本内部查询任务完成；初版 `c737110`、孤立分支修复 `14def95` 已提交，修复后8项query/12项store及格式/Clippy通过，独立初审质量Approved、限定复审问题关闭且无新阻断项，见[实施记录](../../push-system/implementation-readiness-current-query-2026-09-10.md)。初版相邻v3测试1项通过，本轮未改夹具、未重复运行；初版过程证据和activation直测Minor继续保留。此计划是完整 W15/W16 认证查询链的内部前置，不是以 candidate-only CLI 替代最终 health/readiness/CLI。现有 v3 集合、codec、恢复和存储已经交付，不重复实现。
 
 权威要求：[W15 设计](../specs/2026-09-07-push-foundation-w15-operational-readiness-design.md) §3/6/7、[W15 计划](2026-09-07-push-foundation-w15-operational-readiness.md) Task4、[W16 计划](2026-09-08-push-foundation-w16-activation.md) T6，以及 [RFC 同快照查询合同](../../push-system/push-system-implementation-rfc.md#就绪查询与恢复合同-proposed)。该内部前置不得更改上述完整验收。
 
