@@ -8,13 +8,14 @@
 //! 子模块互见: 在 mod.rs 把 fetchers 声明为 super 模块, 这里用 super::xxx 调入 fetchers.
 
 use futures::stream::{self, StreamExt};
-use log::{info, warn};
+use log::info;
+#[cfg(test)]
+use log::warn;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::agent::tool::Tool;
 use crate::agent::tools_sector::FetchSectorTool;
-use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::data_gateway::{
     BatchEvidence, BoardDataGateway, BoardKind, DragonTigerGateway, DragonTigerStockReview,
     GatewayBatch,
@@ -26,6 +27,7 @@ use super::ChainCluster;
 // is_generic_board 在 mod.rs 是 pub(super) — 让 fetchers 可见
 use super::is_generic_board;
 
+#[cfg(test)]
 type SearchFuture = futures::future::BoxFuture<'static, Vec<crate::search_service::SearchResult>>;
 
 /// 获取指定代码集的概念标签：优先 7 天内缓存，缺失的并发拉取并落库。
@@ -181,9 +183,14 @@ pub(super) async fn fetch_laggard_candidates(
 /// 2026-08-06 实证: disclosure_limit 原传 5_000, R-04 gateway 上限 100
 /// (invalid request: market dragon-tiger limit must be at most 100) —
 /// 断点 A 接线后首次暴露, 改为上限内值。
-pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
+/// Preserve Gateway status before the legacy optional-background projection loses it.
+pub(super) async fn fetch_lhb_observed(
+) -> Result<(HashMap<String, f64>, super::preparation::SourceObservation), String> {
+    use super::preparation::{SourceObservation, SourceStatus};
+    let requested_at = chrono::Local::now();
+    let request_date = requested_at.date_naive();
     let batch = match DragonTigerGateway::new()
-        .market_review(chrono::Local::now().date_naive(), 100, 5_000)
+        .market_review(request_date, 100, 5_000)
         .await
     {
         Ok(batch) => batch,
@@ -192,24 +199,27 @@ pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
         // 同语义, 出声不静默)。盘前时段 Eastmoney 接口常返回 no usable
         // records (09:07 实证), 原 map_err 硬失败导致整条链分析推送失败。
         Err(error) => {
-            log::warn!(
-                "[产业链][BR-164] 龙虎榜 Gateway 不可用, 降级为空背景 (LLM 无净买入): {error}"
-            );
-            return Ok(HashMap::new());
+            log::warn!("[产业链][BR-164] 龙虎榜 Gateway 不可用，降级为空背景");
+            return Ok((
+                HashMap::new(),
+                SourceObservation::unavailable(error.to_string())
+                    .requested(request_date, requested_at.to_rfc3339()),
+            ));
         }
     };
     match batch {
-        GatewayBatch::Available { records, .. } => map_lhb_reviews(records),
+        GatewayBatch::Available { records, evidence } => Ok((
+            map_lhb_reviews(records)?,
+            SourceObservation::batch(SourceStatus::Available, &evidence)
+                .requested(request_date, requested_at.to_rfc3339()),
+        )),
         GatewayBatch::VerifiedEmpty(evidence) => {
-            log::info!(
-                "[产业链][BR-164] 龙虎榜已验证为空 provider={:?} source={} \
-                 observed_at={} batch_id={}",
-                evidence.provider,
-                evidence.source,
-                evidence.observed_at,
-                evidence.batch_id
-            );
-            Ok(HashMap::new())
+            log::info!("[产业链][BR-164] 龙虎榜已验证为空");
+            Ok((
+                HashMap::new(),
+                SourceObservation::batch(SourceStatus::VerifiedEmpty, &evidence)
+                    .requested(request_date, requested_at.to_rfc3339()),
+            ))
         }
     }
 }
@@ -228,7 +238,7 @@ fn map_lhb_reviews(records: Vec<DragonTigerStockReview>) -> Result<HashMap<Strin
     Ok(out)
 }
 
-fn append_after_market_items(
+pub(super) fn append_after_market_items(
     items: &mut Vec<String>,
     theme: &str,
     results: Vec<crate::search_service::SearchResult>,
@@ -249,7 +259,11 @@ fn append_after_market_items(
     }
 }
 
-fn render_after_market_section(today: &str, time_label: &str, items: &[String]) -> String {
+pub(super) fn render_after_market_section(
+    today: &str,
+    time_label: &str,
+    items: &[String],
+) -> String {
     if items.is_empty() {
         return String::new();
     }
@@ -262,30 +276,7 @@ fn render_after_market_section(today: &str, time_label: &str, items: &[String]) 
     )
 }
 
-/// 拉取盘后催化快讯，专门用于更新报告时效性。
-/// 通过搜索引擎搜最新主题相关新闻，返回格式化的 Markdown 片段。
-pub(super) async fn fetch_after_market_catalysts(top_themes: &[&str]) -> String {
-    use crate::search_service::get_search_service;
-    let svc = get_search_service();
-    if !svc.is_available() {
-        return String::new();
-    }
-
-    let now = chrono::Local::now();
-    let today_str = now.format("%m月%d日").to_string();
-    let hour = now.format("%H").to_string().parse::<u32>().unwrap_or(0);
-    let time_label = if hour >= 15 { "盘后" } else { "盘中" };
-
-    resolve_after_market_catalysts(
-        top_themes,
-        &today_str,
-        time_label,
-        std::time::Duration::from_secs(8),
-        move |query, limit| Box::pin(async move { svc.search_topic(&query, limit).await }),
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn resolve_after_market_catalysts<F>(
     top_themes: &[&str],
     today: &str,
@@ -310,7 +301,7 @@ where
     render_after_market_section(today, time_label, &items)
 }
 
-fn build_cluster_query_context(
+pub(super) fn build_cluster_query_context(
     cluster: &ChainCluster,
     concepts: &HashMap<String, Vec<String>>,
 ) -> (Vec<String>, String) {
@@ -356,7 +347,7 @@ fn build_cluster_query_context(
     (queries, prompt)
 }
 
-fn append_generated_cluster_queries(queries: &mut Vec<String>, text: &str) {
+pub(super) fn append_generated_cluster_queries(queries: &mut Vec<String>, text: &str) {
     for line in text.lines() {
         let query = line
             .trim()
@@ -380,7 +371,7 @@ fn append_generated_cluster_queries(queries: &mut Vec<String>, text: &str) {
     }
 }
 
-fn append_cluster_news_items(
+pub(super) fn append_cluster_news_items(
     seen: &mut HashSet<String>,
     items: &mut Vec<String>,
     results: Vec<crate::search_service::SearchResult>,
@@ -402,40 +393,7 @@ fn append_cluster_news_items(
     }
 }
 
-/// 定向检索某主线簇的产业催化新闻（主线级，区别于通用宏观头条）。
-///
-/// 两段式：先让 LLM 根据簇内股票推测催化事件方向、生成具体搜索词
-/// （解决"世界杯转播/上游停产/替代材料"这类不含概念名的催化搜不到的问题），
-/// 再连同默认检索词一起执行、合并去重。
-pub(super) async fn fetch_cluster_news(
-    analyzer: &GeminiAnalyzer,
-    cluster: &ChainCluster,
-    concepts: &HashMap<String, Vec<String>>,
-) -> String {
-    let search = crate::search_service::get_search_service();
-    if !search.is_available() {
-        return String::new();
-    }
-
-    let (queries, q_prompt) = build_cluster_query_context(cluster, concepts);
-    let generated_queries = analyzer
-        .call_api_mode(
-            &q_prompt,
-            "你是A股题材挖掘专家，只输出新闻搜索词，每行一条。",
-            AgentMode::Quick,
-        )
-        .await
-        .map_err(|error| error.to_string());
-    resolve_cluster_news(
-        cluster,
-        queries,
-        generated_queries,
-        std::time::Duration::from_secs(15),
-        move |query, limit| Box::pin(async move { search.search_topic(&query, limit).await }),
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn resolve_cluster_news<F>(
     cluster: &ChainCluster,
     mut queries: Vec<String>,

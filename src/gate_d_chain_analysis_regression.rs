@@ -10,36 +10,35 @@ fn stock(code: &str, name: &str) -> TopStock {
     }
 }
 
-fn cluster(concept: &str, base: usize, count: usize) -> ChainCluster {
-    ChainCluster {
-        concept: concept.to_string(),
-        aliases: Vec::new(),
-        stocks: (0..count)
-            .map(|offset| {
-                stock(
-                    &format!("TEST_CODE_GATE_D_{:06}", base + offset),
-                    &format!("失败协议股{offset}"),
-                )
-            })
-            .collect(),
-        continuation_count: 0,
-        streak_days: 1,
-        candidates: Vec::new(),
-        score: None,
-        scenario: None,
-    }
+fn stocks(base: usize, count: usize) -> Vec<TopStock> {
+    (0..count)
+        .map(|offset| {
+            stock(
+                &format!("TEST_CODE_GATE_D_{:06}", base + offset),
+                &format!("失败协议股{offset}"),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn model_commit_failures_remain_missing_sections_instead_of_fake_analysis() {
-    let deep = cluster("TEST_CODE_深度失败", 100, TIER1_MIN);
-    let simple = cluster("TEST_CODE_简化失败", 200, TIER2_MIN);
-    let limit_ups: Vec<TopStock> = deep
-        .stocks
+    let deep = stocks(100, TIER1_MIN);
+    let simple = stocks(200, TIER2_MIN);
+    let mut concepts: HashMap<String, Vec<String>> = deep
         .iter()
-        .chain(simple.stocks.iter())
-        .cloned()
+        .map(|stock| (stock.code.clone(), vec!["TEST_CODE_深度失败".into()]))
         .collect();
+    concepts.extend(
+        simple
+            .iter()
+            .map(|stock| (stock.code.clone(), vec!["TEST_CODE_简化失败".into()])),
+    );
+    concepts.insert(
+        "TEST_CODE_协议持仓".into(),
+        vec!["TEST_CODE_深度失败".into()],
+    );
+    let limit_ups = deep.into_iter().chain(simple).collect();
     let server = crate::data_provider::TestHttpServer::new(vec![
         crate::data_provider::TestHttpResponse {
             status: 503,
@@ -64,28 +63,44 @@ async fn model_commit_failures_remain_missing_sections_instead_of_fake_analysis(
         agent_pipeline: false,
         ..crate::analyzer::GeminiConfig::default()
     });
-    let evidence = ResolvedChainEvidence {
-        cluster_news: HashMap::new(),
-        after_market: String::new(),
+    let mut io = preparation_tests::ProtocolIo {
+        analyzer: Some(analyzer),
+        scripted: None,
+        concepts,
+        search_enabled: false,
+        queries: vec![],
     };
 
-    let report = render_resolved_chain_analysis(
-        &analyzer,
-        "2026-07-19",
-        &limit_ups,
-        &HashMap::new(),
-        &[deep, simple],
-        &[],
-        &[],
-        &HashMap::new(),
-        "",
-        ChainEvidenceSource::Resolved(evidence),
+    let prepared = preparation::prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        limit_ups,
+        Some("TEST_CODE_显式宏观输入".into()),
+        &mut io,
     )
     .await
     .expect("model failures must still produce a truthful cluster-only report");
 
+    let report = prepared.report();
     assert!(report.contains("深度分析 0 条 + 简化分析 0 条"));
     assert!(!report.contains("deep unavailable"));
     assert!(!report.contains("simple unavailable"));
-    assert_eq!(server.finish().len(), 3);
+    let failed = prepared
+        .model_calls()
+        .iter()
+        .filter(|call| call.failure().is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(failed.len(), 3);
+    for (call, stage) in failed.iter().zip([
+        preparation::ModelStage::Deep,
+        preparation::ModelStage::Simple,
+        preparation::ModelStage::Overview,
+    ]) {
+        assert_eq!(call.stage(), stage);
+        assert_eq!(call.response(), None);
+        assert!(call.prompt().is_some());
+        assert!(!format!("{call:?}").contains("TEST_CODE"));
+    }
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|path| path == "/chat/completions"));
 }
