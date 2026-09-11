@@ -602,6 +602,42 @@ pub struct PositionDiag {
     pub in_limit_pool: bool,
 }
 
+/// Preserve cluster order: the first direct-member or concept/alias match wins.
+/// An isolated input limit-up is not a cluster member for in_limit_pool.
+fn match_position_diags(
+    positions: &[preparation::PositionInput],
+    clusters: &[ChainCluster],
+    concept_map: &HashMap<String, Vec<String>>,
+) -> Vec<PositionDiag> {
+    positions
+        .iter()
+        .map(|position| PositionDiag {
+            code: position.code().to_owned(),
+            name: position.name().to_owned(),
+            return_rate: position.return_rate(),
+            in_limit_pool: clusters.iter().any(|cluster| {
+                cluster
+                    .stocks
+                    .iter()
+                    .any(|stock| stock.code == position.code())
+            }),
+            mainline: clusters
+                .iter()
+                .find(|cluster| {
+                    cluster
+                        .stocks
+                        .iter()
+                        .any(|stock| stock.code == position.code())
+                        || concept_map.get(position.code()).is_some_and(|tags| {
+                            tags.iter()
+                                .any(|tag| tag == &cluster.concept || cluster.aliases.contains(tag))
+                        })
+                })
+                .map(|cluster| (cluster.concept.clone(), cluster.streak_days)),
+        })
+        .collect()
+}
+
 /// 持仓股与今日主线的归属诊断（确定性本地匹配，不依赖 LLM）。
 #[cfg(test)]
 async fn diagnose_positions(clusters: &[ChainCluster]) -> Result<Vec<PositionDiag>> {
@@ -619,32 +655,13 @@ async fn diagnose_positions(clusters: &[ChainCluster]) -> Result<Vec<PositionDia
         .await
         .map_err(anyhow::Error::msg)?;
 
-    Ok(positions
-        .iter()
-        .map(|p| {
-            let in_limit_pool = clusters
-                .iter()
-                .any(|c| c.stocks.iter().any(|s| s.code == p.code));
-            // 优先按簇成员直接匹配，其次按概念标签匹配
-            let mainline = clusters
-                .iter()
-                .find(|c| {
-                    c.stocks.iter().any(|s| s.code == p.code)
-                        || concept_map.get(&p.code).is_some_and(|tags| {
-                            tags.iter()
-                                .any(|t| t == &c.concept || c.aliases.contains(t))
-                        })
-                })
-                .map(|c| (c.concept.clone(), c.streak_days));
-            PositionDiag {
-                code: p.code.clone(),
-                name: p.name.clone(),
-                return_rate: p.return_rate,
-                mainline,
-                in_limit_pool,
-            }
+    let positions = positions
+        .into_iter()
+        .map(|position| {
+            preparation::PositionInput::new(position.code, position.name, position.return_rate)
         })
-        .collect())
+        .collect::<Vec<_>>();
+    Ok(match_position_diags(&positions, clusters, &concept_map))
 }
 
 // fetch_lhb_map 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)

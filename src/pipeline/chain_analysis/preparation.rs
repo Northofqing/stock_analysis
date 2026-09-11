@@ -1009,27 +1009,7 @@ pub async fn prepare_chain_analysis_with_io(
     if !positions.is_empty() {
         prepared.data.position_concept_source = SourceObservation::unknown();
     }
-    let position_diags = positions
-        .iter()
-        .map(|p| PositionDiag {
-            code: p.code.clone(),
-            name: p.name.clone(),
-            return_rate: p.return_rate,
-            in_limit_pool: clusters
-                .iter()
-                .any(|c| c.stocks.iter().any(|s| s.code == p.code)),
-            mainline: clusters
-                .iter()
-                .find(|c| {
-                    c.stocks.iter().any(|s| s.code == p.code)
-                        || position_concepts.get(&p.code).is_some_and(|tags| {
-                            tags.iter()
-                                .any(|t| t == &c.concept || c.aliases.contains(t))
-                        })
-                })
-                .map(|c| (c.concept.clone(), c.streak_days)),
-        })
-        .collect::<Vec<_>>();
+    let position_diags = super::match_position_diags(&positions, &clusters, &position_concepts);
     prepared.data.position_diags = position_diags.clone();
     let (lhb_map, lhb_source) =
         observe_stage(io.lhb().await, PreparationStage::DragonTiger, &mut prepared)?;

@@ -604,6 +604,182 @@ async fn macro_preparation_preserves_input_preference_and_observed_fallback_stat
 }
 
 #[tokio::test]
+async fn position_preparation_preserves_member_concept_alias_and_first_cluster_matching() {
+    struct PositionMatchIo {
+        base: CoverageIo,
+        positions: Vec<PositionInput>,
+        position_concepts: HashMap<String, Vec<String>>,
+        concept_calls: usize,
+    }
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for PositionMatchIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.concept_calls += 1;
+            if self.concept_calls == 1 {
+                return self.base.concepts(codes).await;
+            }
+            assert_eq!(self.concept_calls, 2);
+            assert_eq!(
+                codes,
+                self.positions
+                    .iter()
+                    .map(|p| p.code().to_string())
+                    .collect::<Vec<_>>()
+            );
+            Ok(self.position_concepts.clone())
+        }
+        fn min_cluster_size(&mut self) -> usize {
+            3
+        }
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.base.persist_clusters(date, rows).await
+        }
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.base.board_codes().await
+        }
+        async fn candidates(
+            &mut self,
+            board: &str,
+            excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.base.candidates(board, excluded).await
+        }
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            Ok(self.positions.clone())
+        }
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.base.lhb().await
+        }
+        fn model_available(&mut self) -> bool {
+            false
+        }
+    }
+    let (mut stocks, mut concepts) = protocol_inputs();
+    for index in 0..8 {
+        concepts
+            .get_mut(&format!("TEST_CODE_DEEP_{index}"))
+            .unwrap()
+            .push("TEST_CODE_深度别名".into());
+    }
+    stocks.push(TopStock {
+        code: "TEST_CODE_孤立持仓".into(),
+        name: "TEST_CODE_孤立股".into(),
+        change_pct: 10.0,
+        price: 10.0,
+        ..TopStock::default()
+    });
+    concepts.insert(
+        "TEST_CODE_孤立持仓".into(),
+        vec!["TEST_CODE_独立逻辑".into()],
+    );
+    let cases = [
+        (
+            "TEST_CODE_DEEP_0",
+            vec![],
+            Some(1.25),
+            Some("TEST_CODE_深度主线"),
+            true,
+        ),
+        (
+            "TEST_CODE_仅概念持仓",
+            vec!["TEST_CODE_深度主线"],
+            None,
+            Some("TEST_CODE_深度主线"),
+            false,
+        ),
+        (
+            "TEST_CODE_仅别名持仓",
+            vec!["TEST_CODE_深度别名"],
+            Some(-2.5),
+            Some("TEST_CODE_深度主线"),
+            false,
+        ),
+        (
+            "TEST_CODE_无关持仓",
+            vec!["TEST_CODE_其他逻辑"],
+            Some(0.0),
+            None,
+            false,
+        ),
+        // Preserve the actual first-cluster policy: an earlier concept match wins
+        // even though the position is a direct member of a later cluster.
+        (
+            "TEST_CODE_SIMPLE_0",
+            vec!["TEST_CODE_深度主线"],
+            Some(3.0),
+            Some("TEST_CODE_深度主线"),
+            true,
+        ),
+        // Legacy in_limit_pool means cluster member, not any stock in the input pool.
+        (
+            "TEST_CODE_孤立持仓",
+            vec!["TEST_CODE_独立逻辑"],
+            None,
+            None,
+            false,
+        ),
+    ];
+    let positions = cases
+        .iter()
+        .map(|(code, _, rate, _, _)| {
+            PositionInput::new((*code).into(), format!("{code}_敏感名"), *rate)
+        })
+        .collect();
+    let position_concepts = cases
+        .iter()
+        .map(|(code, tags, _, _, _)| {
+            (
+                (*code).into(),
+                tags.iter().map(|tag| (*tag).into()).collect(),
+            )
+        })
+        .collect();
+    let mut io = PositionMatchIo {
+        base: coverage_io(concepts, None),
+        positions,
+        position_concepts,
+        concept_calls: 0,
+    };
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_持仓匹配宏观".into()),
+        &mut io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(io.concept_calls, 2);
+    assert_eq!(prepared.clusters().len(), 2);
+    assert_eq!(prepared.clusters()[0].concept, "TEST_CODE_深度主线");
+    assert_eq!(prepared.clusters()[0].aliases, vec!["TEST_CODE_深度别名"]);
+    assert_eq!(prepared.clusters()[1].concept, "TEST_CODE_简化主线");
+    assert_eq!(prepared.isolated()[0].code, "TEST_CODE_孤立持仓");
+    assert_eq!(prepared.position_diags().len(), 6);
+    for (diag, (code, _, rate, mainline, in_pool)) in prepared.position_diags().iter().zip(cases) {
+        assert_eq!(diag.code, code);
+        assert_eq!(diag.name, format!("{code}_敏感名"));
+        assert_eq!(diag.return_rate, rate);
+        assert_eq!(diag.mainline, mainline.map(|name| (name.to_string(), 2)));
+        assert_eq!(diag.in_limit_pool, in_pool);
+        assert!(prepared.report().contains(&diag.name));
+    }
+    assert!(prepared.position_concepts()["TEST_CODE_DEEP_0"].is_empty());
+    assert_eq!(
+        prepared.position_concepts()["TEST_CODE_仅别名持仓"],
+        vec!["TEST_CODE_深度别名"]
+    );
+}
+
+#[tokio::test]
 async fn optional_failures_preserve_missing_analysis_and_uncertified_empty_searches() {
     use super::preparation::{ModelStage, SearchStage};
     for search_failure in [true, false] {
