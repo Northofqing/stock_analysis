@@ -2,6 +2,8 @@
 
 日期：2026-09-08。完整 W16 未完成；此记录区分规范纠错、完整性读取、实际认证与生产接管，不以局部绿灯替代全目标。
 
+2026-09-11 进行中：[P-01/N-02 专用业务恢复接线](implementation-dedicated-business-recovery-2026-09-11.md)源码3fed7aa已提交；修后10项专用测试与相关代码未变的37项回归有通过证据，涵盖真实进程及完整结果/证明，最终Clippy无新增诊断。独立规格/质量审查仍在进行；以下已完成历史任务不重开，也不据此关闭完整T4/W16。
+
 ## 已完成：Shadow 范围纠错
 
 `e7bf3d5` 将 RFC 与机器校验器的 Shadow owner=None 限定到新 shadow actor，保留 Unit 实际 incumbent；初始 Disabled 与排空后 Disabled 的准入从不可变已执行历史和真实批准推导，不新增状态表，不复用旧 token。

@@ -2,7 +2,7 @@
 
 状态：`PROVISIONAL`。本批输入冻结日期为 `2026-09-06`。源码接线、历史统计、原工作区文档和拟议设计必须分开阅读；它们不等于部署证明、远端 `TransportAccepted` 或用户已读。
 
-## 当前开发入口（更新至2026-09-10）
+## 当前开发入口（更新至2026-09-11）
 
 当前审计基线：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；该批真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图已消费最终SHA，不混用审计初版ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
 
@@ -40,6 +40,7 @@
 - [W17 影子执行内核结果](implementation-w17-results-2026-09-08.md)：源码`89128f3`，一次采集共用context/facts，精确比较真实决策/语义/渲染字节/完成提案；八类拒绝端口先计数再拒绝。17项新测试和52项相邻测试全部通过，最终静态检查本批零诊断，独立Spec/Quality通过。生产业务适配、全局端口纳管及W16激活证据仍待，不代表完整W17或迁移完成。
 - [W15 实施结果](implementation-w15-results-2026-09-07.md) §10–13：依赖候选合同、实际 occurrence 读取、采集事务适配器及后续v3完整Unit集合已经存在；[§13 最新只读核对](implementation-w15-results-2026-09-07.md#13-v3集合与实际查询入口的最新边界-2026-09-10)纠正“仍只有单manifest”的旧状态。完整来源认证、同一认证快照的query/probe及调度联结尚未完成。
 - [W16 实施结果](implementation-w16-results-2026-09-08.md)：已有跨进程broker接入真实initial写入、Generic发送与只恢复；最新T4D将精确业务恢复/finalizer写入接入同一worker许可（源码`4c07aaa`、测试修正`667ee4a`）。修正后受影响合批104项通过，含4个真实进程父测试，目标Clippy零诊断，限定复核全部关闭；未变邻域保留此前498项通过证据，不冒称修正后全量重跑。生产身份/受保护根、完整四actor共同fence、实际切换、具体Unit cursor及全Unit消费仍按[实施计划](../superpowers/plans/2026-09-08-push-foundation-w16-activation.md)交付，不能按基础切片标W16完成。
+- [P-01/N-02 专用业务恢复接线进展](implementation-dedicated-business-recovery-2026-09-11.md)：源码3fed7aa；两类真实终态进入同一worker恢复/最终化，N02绑定实际持锁读取的年份文件。修后10项专用反例/完整编码通过，另37项未变范围回归保留通过证据（含真实进程），最终Clippy相对基线无新增诊断。独立审查进行中；不是单次47项全绿，也不代表完整W16或生产迁移完成。
 - [W16 合同裁决](activation-contract-decisions-2026-09-08.md)：澄清 shadow actor 与旧推送关系，固定外部批准包、同事务写入和paused确认顺序；真实监督器及恢复接线仍需实现证明，不是生产批准。
 - [全 Unit 部署集合合同](activation-deployment-set-contract-2026-09-08.md)：全52Unit候选集合构造、真实读取、重读漂移和范围投影已实现至`e0cdd0d`，11项专项及最终golden1项通过，限定复核关闭排序缺陷。集合版持久消费后续进展见下方计划入口及[实施结果](implementation-w16-results-2026-09-08.md)，实际来源认证仍未交付。
 - [P-02 同批数据修复结果](implementation-auction-volume-results-2026-09-08.md)：源码`0dda4cc`将选票、消息、入池和通知set绑定到一次采集的选中快照，同时保留持仓检测使用的完整原始列表。13项相关测试通过，最终静态检查在本次两份改动文件零诊断，独立规格/质量审查通过，无待修问题；[实施计划](../superpowers/plans/2026-09-08-auction-volume-batch-binding.md)的完整Unit迁移边界保持不变，生产monitor不替换。
