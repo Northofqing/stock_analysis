@@ -4,6 +4,8 @@
 
 ## 当前开发入口（更新至2026-09-11）
 
+- [真实通知逐目标结果实施记录](implementation-notification-attempt-observation-2026-09-11.md)：初版bd143fe、最终de38876；旧send实际委托逐目标观察，保留Custom重复目标及任一弱成功投影，false/Err保留Unknown。修后16项定向测试通过、Clippy188条既有诊断无新增，初审唯一Important日志语义已修复且限定复审Approved，本前置Task完成。[盘后持久恢复设计](chain-post-close-recovery-design-2026-09-11.md)保留实际timer、同业务库准备/尝试进度、重启恢复和强完成cursor后续；普通飞书长报告截断仍待，不能说盘后误封日或完整Unit迁移已完成。
+
 当前审计基线：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；该批真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图已消费最终SHA，不混用审计初版ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
 
 2026-09-10：完整[当前架构蓝图](../architecture/current/Project_Architecture_Blueprint.md)已在c1e24d0交付Markdown，覆盖18节、65/102/52精确身份及16份设计来源，独立Spec/Quality Approved。双目标源码abeabf6通过55项/1128断言及独立审查；[当前离线蓝图](../architecture/current/Project_Architecture_Blueprint.html)和[RFC离线页面](push-system-implementation-rfc.html)实际生成、重复/只读门禁及浏览器验收通过，制品已在3283eaf纳管。最终三项收尾fa991e2通过新增2项/14断言和唯一限定复审，3/3关闭；本蓝图计划完成。具体摘要/命令/发布阻断见[实施记录](implementation-current-blueprint-2026-09-10.md)，不代表完整运行时或生产迁移完成。
