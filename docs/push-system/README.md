@@ -4,7 +4,7 @@
 
 ## 当前开发入口（更新至2026-09-11）
 
-- [盘后产业链持久恢复实施计划](../superpowers/plans/2026-09-11-chain-post-close-recovery.md)：基线42ce098，初版60e18ae。固定事实/模型/候选证据、版本化原字节封存已接真实准备入口，旧回归已迁移。初审持仓匹配重复已提取共享实现，修后19项回归、另两个真实SQLite单例、CLI/monitor编译及格式检查通过；待限定复审，尚未验收Task1，详见[实施进度与验证边界](implementation-chain-preparation-2026-09-11.md)。同库持久层尚未实现；当前一名Rust实施者、主控单Cargo队列。尚未改定时器，不代表误封日已修复或生产已切换。
+- [盘后产业链持久恢复实施计划](../superpowers/plans/2026-09-11-chain-post-close-recovery.md)：基线42ce098，Task1最终源码40b0a63。固定事实/模型/候选证据、版本化原字节封存已接真实准备入口，旧回归已迁移，生产/旧持仓回归共用匹配实现。修后19项回归、另两个真实SQLite单例、CLI/monitor编译及格式检查通过，独立初审与限定修复复审完成；Task1工程验收通过，详见[实施进度与验证边界](implementation-chain-preparation-2026-09-11.md)。下一步同库扩展安装/重开和逐效果恢复，持久层尚未实现；保持一名Rust实施者、主控单Cargo队列。尚未改定时器，不代表误封日已修复或生产已切换。
 - [真实通知逐目标结果实施记录](implementation-notification-attempt-observation-2026-09-11.md)：初版bd143fe、最终de38876；旧send实际委托逐目标观察，保留Custom重复目标及任一弱成功投影，false/Err保留Unknown。修后16项定向测试通过、Clippy188条既有诊断无新增，初审唯一Important日志语义已修复且限定复审Approved，本前置Task完成。[盘后持久恢复设计](chain-post-close-recovery-design-2026-09-11.md)保留实际timer、同业务库准备/尝试进度、重启恢复和强完成cursor后续；普通飞书长报告截断仍待，不能说盘后误封日或完整Unit迁移已完成。
 
 当前审计基线：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；该批真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图已消费最终SHA，不混用审计初版ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。

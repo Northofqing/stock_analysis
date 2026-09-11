@@ -79,7 +79,22 @@
 4. 冻结发送目标快照及稳定身份，Custom重复配置项仍是独立目标。在现有发送循环内逐目标执行“持久begin→发送一次→持久result”，结果保存失败立即停后续目标；外层send_report结束后补写整批日志不合格。dispatch已开始的运行重启后不得盲补发未开始的剩余目标，零渠道保持零attempt。
 5. 用自有临时库/文件和合成目标验证每个关键崩溃点、旧lease/CAS拒绝、内容冲突及零重复外部效果。弱Accepted/Unknown不推进强完成游标。受保护根、生产认证facade、GlobalSchema扩展认证及真实必达渠道仍须后续明确；工程测试不替代这些条件。
 
+按Task1候选源码60e18ae核对的接线前提：普通来源不可用与持久记录/lease/fence失败必须区分。当前[准备流程](../../../src/pipeline/chain_analysis/preparation.rs)的宏观/候选/搜索会降级，模型深度/简化结果使用`.ok()`；这保留了旧业务政策，但Task2不能把存储或执行权限失败放进同一普通错误通道后继续下一个效果。Task2须以不可被这些可选分支吞掉的停止结果贯穿真实调用点，并验证“begin失败零调用、result提交失败零后续调用”。模型interface目前借用`&self`；持久adapter每次短事务必须先结束连接/可变借用再等待网络，不能为跨await方便开放raw connection或长期持有写事务。
+
 源码依据：[BusinessIntentStore](../../../src/push_foundation/intent_store.rs)、[现有授权范围](../../../src/push_foundation/activation_fence.rs)、[chain_daily DAO](../../../src/database/concepts.rs)、[真实通知循环](../../../src/notification/service.rs)。Task1最终interface冻结后再确定Task2可写文件与精确测试命令；当前不授予扩改生产schema或开启新owner的权限。
+
+### 首片范围：同连接扩展安装与重开校验
+
+Task1限定复审通过后才启动Rust。本片只是Task2的第一个可验证基础，不替代上面逐效果接线、真实通知循环和崩溃合同。
+
+- 首片只允许`src/push_foundation/intent_store.rs`声明子模块/窄入口，以及新增`src/push_foundation/intent_store/chain_post_close.rs`、`src/push_foundation/intent_store/chain_post_close_schema.rs`、`src/push_foundation/intent_store/chain_post_close_tests.rs`。子模块归现有BusinessIntentStore所有，不能独立选择/打开业务路径；若需要固定SQL资产，只能新增同目录`chain_post_close.v1.sql`并由主控先核对登记规则。后续pipeline/fetchers、DAO、notification/file接线逐片扩充允许范围，不提前大面积修改。
+- 先定义最小真实职责和安装/验证interface，交主控核对后写首例并冻结。先证明“同一BusinessIntentStore连接受控安装→关闭→重新打开并验证扩展”，再补半装/定义漂移/未来版本/伪造登记与实际定义一起变化的拒绝例。运行时验证不能偷偷安装或修复；缺失扩展是明确未安装，不是空进度。
+- 固定独立扩展版本及bundled定义，append-only事实与可变CAS head分别约束；安装一个短事务，版本和对象登记与全部对象一起提交。只在扩展自有表附加保护对象，不改Foundation v1对象/版本/DDL、全应用application_id/user_version或冻结GlobalSchema reference。原Foundation按独立bundled定义仍可验证，不把旧open的自登记一致性检查当成全部认证。
+- 首片所有安装试验仅在显式新建的自有临时库上，由合成Test上下文启动。生产安装/运行的许可构造必须保持拒绝，直到真实受保护连接、GlobalSchema扩展认证和owner facade接好；不能把自由传入Test namespace或路径相等当生产授权。不得为方便增加公开raw connection、任意SQL/事务callback或能自行打开路径的新store。
+- 测试fixture用`tempfile`独占目录和显式SQLite连接，装入已校验的固定Foundation DDL及本片所需最少业务表。不得调用忽略路径参数的全局DatabaseManager::init，不调用实际sqlite CLI/provider/环境配置；如需复用现有fixture，先由主控核对其完整效果闭包。独立期望应来自固定字面合同/SQLite实际目录与持久字节，不由被测校验器生成自己的预期。
+- 首例只有缺接口时记录编译RED，不人为制造错误；主控审核测试后单队列运行`cargo test --offline --lib <实际声明的完整测试名> -- --exact --test-threads=1`。实现后同名GREEN，随后逐片补故障和重开证据。禁止全库/全仓suite；每次源码冻结且日志与前后摘要保留。首片和后续Task2审查均不作生产迁移或全Unit完成声明。
+
+实施者继续一名Rust writer，不执行Cargo/Git/生产命令、不派子代理。主控独占Cargo/Git、公共文档和进度；完整实施报告写本计划私有目录`task-2-report.md`。Task2初始BASE在实际派发前固定；使用本Task摘录brief及只读存储设计，不读取其他计划私有文件。
 
 ## Task 3: 实际定时器、启动恢复和窗口资格
 
