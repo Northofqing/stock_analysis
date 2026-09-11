@@ -32,11 +32,15 @@ fn observe_attempt(
     let outcome = match result {
         Ok(true) => WeakOutcomeKind::Accepted,
         Ok(false) => {
-            error!("[{}] 发送失败", channel.name());
+            error!("[{}] 渠道方法返回 false，投递状态未知", channel.name());
             WeakOutcomeKind::Unknown
         }
         Err(error) => {
-            error!("[{}] 发送出错: {}", channel.name(), error);
+            error!(
+                "[{}] 渠道方法返回错误，投递状态未知: {}",
+                channel.name(),
+                error
+            );
             WeakOutcomeKind::Unknown
         }
     };
@@ -218,15 +222,15 @@ impl NotificationService {
         }
 
         let report = NotificationSendReport::from_attempts(attempts);
-        let success_count = report
+        let accepted_count = report
             .attempts()
             .iter()
             .filter(|attempt| attempt.outcome() == WeakOutcomeKind::Accepted)
             .count();
-        let fail_count = report.attempts().len() - success_count;
+        let unknown_count = report.attempts().len() - accepted_count;
         info!(
-            "通知发送完成：成功 {} 个，失败 {} 个",
-            success_count, fail_count
+            "通知发送完成：弱成功 {} 个，状态未知 {} 个",
+            accepted_count, unknown_count
         );
         report
     }
