@@ -1,5 +1,6 @@
 //! 通知渠道 / SMTP / 顶层配置（原 notification.rs 前部）
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotificationChannel {
     /// 企业微信
     Wechat,
