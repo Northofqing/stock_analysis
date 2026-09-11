@@ -34,7 +34,7 @@ pub(super) struct BusinessRole {
     hooks: TestHooks,
 }
 
-fn only_intent(database: &Path) -> IntentId {
+pub(super) fn only_intent(database: &Path) -> IntentId {
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
@@ -103,7 +103,7 @@ fn literal_bytes(domain: &str, value: &impl Serialize) -> Vec<u8> {
     bytes
 }
 
-fn assert_result_matches_business(
+pub(super) fn assert_result_matches_business(
     fixture: &Fixture,
     operation: &EffectRequest,
     fact: &OperationFact,
@@ -197,7 +197,11 @@ fn assert_result_matches_business(
     );
 }
 
-fn assert_completion_proof(fixture: &Fixture, operation: &EffectRequest, fact: &OperationFact) {
+pub(super) fn assert_completion_proof(
+    fixture: &Fixture,
+    operation: &EffectRequest,
+    fact: &OperationFact,
+) {
     assert_result_matches_business(fixture, operation, fact);
     let Some(EffectResult::BusinessRecovery(result)) = &fact.result else {
         unreachable!()

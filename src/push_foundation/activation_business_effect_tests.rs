@@ -816,11 +816,11 @@ fn effect_has_independent_full_literal_golden_and_actual_encoder_variants() {
             7 => changed.database = changed.database.with_extension("other"),
             8 => changed.business_device += 1,
             9 => changed.business_inode += 1,
-            10 => changed.durable_binding.0.push('x'),
-            11 => changed.durable_binding.1 += 1,
-            12 => changed.durable_binding.2 += 1,
-            13 => changed.durable_binding.3.push('x'),
-            14 => changed.durable_binding.4.push('x'),
+            10 => changed.source.coordinator_binding_mut().0.push('x'),
+            11 => changed.source.coordinator_binding_mut().1 += 1,
+            12 => changed.source.coordinator_binding_mut().2 += 1,
+            13 => changed.source.coordinator_binding_mut().3.push('x'),
+            14 => changed.source.coordinator_binding_mut().4.push('x'),
             15 => {
                 changed.template = TerminalTemplateBinding::new(
                     TemplateId::try_new("different".into()).unwrap(),

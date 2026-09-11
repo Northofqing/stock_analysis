@@ -979,6 +979,36 @@ pub(crate) fn requery_news_flash_window_terminal_with(
 ) -> Result<NewsFlashWindowTerminalQuery, NewsFlashReconcileError> {
     use chrono::Datelike;
 
+    let envelopes = dispatcher
+        .read_authoritative_year(business_date.year())
+        .map_err(NewsFlashReconcileError::InvalidChain)?;
+    requery_news_flash_window_terminal_from_envelopes(envelopes, business_date, window)
+}
+
+pub(crate) fn requery_news_flash_window_terminal_bound_with(
+    dispatcher: &AuditDispatcher,
+    binding: &dispatcher::AuditAuthorityResourceBinding,
+    business_date: chrono::NaiveDate,
+    window: NewsFlashWindow,
+) -> Result<NewsFlashWindowTerminalQuery, NewsFlashReconcileError> {
+    use chrono::Datelike;
+
+    if binding.year != business_date.year() {
+        return Err(NewsFlashReconcileError::AuthorityUnavailable(
+            "bound NewsFlash authority year mismatch".to_owned(),
+        ));
+    }
+    let envelopes = dispatcher
+        .read_authoritative_year_bound(binding)
+        .map_err(NewsFlashReconcileError::InvalidChain)?;
+    requery_news_flash_window_terminal_from_envelopes(envelopes, business_date, window)
+}
+
+fn requery_news_flash_window_terminal_from_envelopes(
+    envelopes: Vec<EventEnvelope>,
+    business_date: chrono::NaiveDate,
+    window: NewsFlashWindow,
+) -> Result<NewsFlashWindowTerminalQuery, NewsFlashReconcileError> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TerminalState {
         Accepted,
@@ -992,9 +1022,6 @@ pub(crate) fn requery_news_flash_window_terminal_with(
         terminal: Option<(EventEnvelope, TerminalState)>,
     }
 
-    let envelopes = dispatcher
-        .read_authoritative_year(business_date.year())
-        .map_err(NewsFlashReconcileError::InvalidChain)?;
     let target_key = window.decision_key();
     let mut attempts = std::collections::BTreeMap::<String, AttemptState>::new();
     let mut attempt_order = Vec::<String>::new();

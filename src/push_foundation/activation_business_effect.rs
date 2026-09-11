@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::activation_business_source::ActivationBusinessSource;
 use super::activation_fence::{EffectRequest, ExecutionContext, FenceError, Scope, WorkClass};
-use super::generic_transport::GenericTerminalAuthorityAdapter;
 use super::intent_store::{
     AttestedReadyIntent, BusinessIntentStore, IntentSnapshot, TransitionReceipt,
 };
@@ -21,12 +22,17 @@ use super::terminal_authority::{
     AuthorityDescriptor, AuthorityQuery, AuthorityQueryFailure, TerminalAuthorityPort,
     TerminalTemplateBinding,
 };
+#[cfg(test)]
 use crate::durable_delivery::DurableDeliveryCoordinator;
 #[cfg(test)]
-use crate::monitor::push_job::AuthorityClass;
+use crate::event::{AuditDispatcher, NewsFlashWindow};
 use crate::monitor::push_job::{
-    canonical_preimage, derive_decision_id, raw_digest, CanonicalValue, CompletionPolicy,
-    DecisionId, IntentId, Sha256Digest,
+    canonical_preimage, derive_decision_id, raw_digest, AuthorityClass, CanonicalValue,
+    CompletionPolicy, DecisionId, IntentId, Sha256Digest,
+};
+#[cfg(test)]
+use crate::monitor::push_job::{
+    derive_occurrence_id, ChannelId, OccurrenceFamily, OccurrenceIdentityMaterial, OccurrenceKey,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,8 +183,7 @@ pub(super) struct BusinessEffect {
     database: PathBuf,
     business_device: u64,
     business_inode: u64,
-    coordinator: Arc<DurableDeliveryCoordinator>,
-    durable_binding: (String, u64, u64, String, String),
+    source: ActivationBusinessSource,
     snapshot: IntentSnapshot,
     template: TerminalTemplateBinding,
     completion_policy: CompletionPolicy,
@@ -224,7 +229,6 @@ impl BusinessExecution<'_> {
 }
 
 struct FixedAuthority<'a> {
-    adapter: GenericTerminalAuthorityAdapter<'a>,
     execution: &'a BusinessExecution<'a>,
     #[cfg(test)]
     queries: std::cell::Cell<usize>,
@@ -232,7 +236,7 @@ struct FixedAuthority<'a> {
 
 impl TerminalAuthorityPort for FixedAuthority<'_> {
     fn descriptor(&self) -> &AuthorityDescriptor {
-        self.adapter.descriptor()
+        self.execution.effect.source.descriptor()
     }
     fn requery_terminal(
         &self,
@@ -265,7 +269,7 @@ impl TerminalAuthorityPort for FixedAuthority<'_> {
                     .map_err(|_| AuthorityQueryFailure)?;
             }
         }
-        self.adapter.requery_terminal(decision_id)
+        effect.source.requery(&effect.snapshot, decision_id)
     }
 }
 
@@ -295,6 +299,49 @@ impl BusinessEffect {
     }
 
     pub(super) fn canonical_bytes(&self) -> Result<Vec<u8>, FenceError> {
+        if self.source.class() != AuthorityClass::GenericCounted {
+            return self.dedicated_canonical_bytes();
+        }
+        let mut fields = self.common_canonical_fields()?;
+        let durable_binding = self
+            .source
+            .coordinator_binding()
+            .ok_or(FenceError::EffectMismatch)?;
+        for (key, value) in [
+            ("durable_store_path", durable_binding.0.as_str()),
+            ("durable_environment", durable_binding.3.as_str()),
+            ("durable_owner", durable_binding.4.as_str()),
+        ] {
+            fields.insert(key, CanonicalValue::String(value.into()));
+        }
+        for (key, value) in [
+            ("durable_store_device", durable_binding.1),
+            ("durable_store_inode", durable_binding.2),
+        ] {
+            fields.insert(key, CanonicalValue::Unsigned(value));
+        }
+        Ok(canonical_preimage(
+            "ActivationBusinessRecoveryEffect/v1",
+            &fields,
+        ))
+    }
+
+    fn dedicated_canonical_bytes(&self) -> Result<Vec<u8>, FenceError> {
+        let mut fields = self.common_canonical_fields()?;
+        fields.extend(
+            self.source
+                .dedicated_canonical_fields()
+                .map_err(|_| FenceError::EffectMismatch)?,
+        );
+        Ok(canonical_preimage(
+            "ActivationDedicatedBusinessRecoveryEffect/v1",
+            &fields,
+        ))
+    }
+
+    fn common_canonical_fields(
+        &self,
+    ) -> Result<BTreeMap<&'static str, CanonicalValue>, FenceError> {
         let mut fields = self.scope.canonical_fields();
         for (key, value) in [
             ("effect_id", "business-reconcile"),
@@ -305,9 +352,6 @@ impl BusinessEffect {
                 "business_store_path",
                 self.database.to_str().ok_or(FenceError::Store)?,
             ),
-            ("durable_store_path", self.durable_binding.0.as_str()),
-            ("durable_environment", self.durable_binding.3.as_str()),
-            ("durable_owner", self.durable_binding.4.as_str()),
             ("template_id", self.template.template_id().as_str()),
             (
                 "template_version",
@@ -320,8 +364,6 @@ impl BusinessEffect {
         for (key, value) in [
             ("business_store_device", self.business_device),
             ("business_store_inode", self.business_inode),
-            ("durable_store_device", self.durable_binding.1),
-            ("durable_store_inode", self.durable_binding.2),
         ] {
             fields.insert(key, CanonicalValue::Unsigned(value));
         }
@@ -339,24 +381,17 @@ impl BusinessEffect {
                 self.completion_policy
                     .activation_binding_bytes()
                     .into_iter()
-                    .map(|v| CanonicalValue::Unsigned(u64::from(v)))
+                    .map(|value| CanonicalValue::Unsigned(u64::from(value)))
                     .collect(),
             ),
         );
-        Ok(canonical_preimage(
-            "ActivationBusinessRecoveryEffect/v1",
-            &fields,
-        ))
+        Ok(fields)
     }
 
     fn check_resources(&self) -> Result<(), FenceError> {
         let metadata = std::fs::metadata(&self.database).map_err(|_| FenceError::Store)?;
         if (metadata.dev(), metadata.ino()) != (self.business_device, self.business_inode)
-            || self
-                .coordinator
-                .activation_storage_binding()
-                .map_err(|_| FenceError::Store)?
-                != self.durable_binding
+            || self.source.check_resources().is_err()
             || raw_digest(&self.canonical_bytes()?).as_str() != self.digest
         {
             return Err(FenceError::EffectMismatch);
@@ -389,8 +424,6 @@ impl BusinessEffect {
             effect: self,
         };
         let authority = FixedAuthority {
-            adapter: GenericTerminalAuthorityAdapter::try_new(&self.coordinator)
-                .map_err(|_| FenceError::Store)?,
             execution: &execution,
             #[cfg(test)]
             queries: std::cell::Cell::new(0),
@@ -453,35 +486,149 @@ impl BusinessEffect {
         if !scope.namespace.starts_with("Test:") {
             return Err(FenceError::ProductionRefused);
         }
-        let intent = fixture
+        let source = ActivationBusinessSource::generic(Arc::clone(&fixture.coordinator))
+            .map_err(|_| FenceError::Store)?;
+        Self::bind_fixture_source(
+            scope,
+            fixture.database,
+            fixture.snapshot,
+            fixture.template,
+            fixture.completion_policy,
+            fixture.config,
+            source,
+            AuthorityClass::GenericCounted,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn bind_p01_fixture(
+        scope: &Scope,
+        fixture: BusinessEffectFixture,
+        required_channel: ChannelId,
+    ) -> Result<Self, FenceError> {
+        if !scope.namespace.starts_with("Test:") {
+            return Err(FenceError::ProductionRefused);
+        }
+        let source = ActivationBusinessSource::p01(
+            Arc::clone(&fixture.coordinator),
+            fixture.template.clone(),
+            required_channel,
+        )
+        .map_err(|_| FenceError::EffectMismatch)?;
+        Self::bind_fixture_source(
+            scope,
+            fixture.database,
+            fixture.snapshot,
+            fixture.template,
+            fixture.completion_policy,
+            fixture.config,
+            source,
+            AuthorityClass::P01Dedicated,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn bind_n02_fixture(
+        scope: &Scope,
+        fixture: N02BusinessEffectFixture,
+    ) -> Result<Self, FenceError> {
+        use chrono::Datelike;
+
+        if !scope.namespace.starts_with("Test:") {
+            return Err(FenceError::ProductionRefused);
+        }
+        let business_date = fixture
             .snapshot
             .attested_ready_binding()
+            .map_err(|_| FenceError::EffectMismatch)?
+            .business_date;
+        let year = chrono::NaiveDate::parse_from_str(business_date.as_str(), "%Y-%m-%d")
+            .map_err(|_| FenceError::EffectMismatch)?
+            .year();
+        let source = ActivationBusinessSource::n02(
+            Arc::clone(&fixture.audit),
+            fixture.template.clone(),
+            fixture.required_channel,
+            fixture.window,
+            year,
+        )
+        .map_err(|_| FenceError::EffectMismatch)?;
+        Self::bind_fixture_source(
+            scope,
+            fixture.database,
+            fixture.snapshot,
+            fixture.template,
+            fixture.completion_policy,
+            fixture.config,
+            source,
+            AuthorityClass::N02Dedicated,
+        )
+    }
+
+    #[cfg(test)]
+    fn bind_fixture_source(
+        scope: &Scope,
+        fixture_database: PathBuf,
+        fixture_snapshot: IntentSnapshot,
+        fixture_template: TerminalTemplateBinding,
+        fixture_completion_policy: CompletionPolicy,
+        fixture_config: RecoveryConfig,
+        source: ActivationBusinessSource,
+        expected_class: AuthorityClass,
+    ) -> Result<Self, FenceError> {
+        let intent = fixture_snapshot
+            .attested_ready_binding()
             .map_err(|_| FenceError::EffectMismatch)?;
-        let database = std::fs::canonicalize(&fixture.database).map_err(|_| FenceError::Store)?;
+        let database = std::fs::canonicalize(&fixture_database).map_err(|_| FenceError::Store)?;
         let metadata = std::fs::metadata(&database).map_err(|_| FenceError::Store)?;
-        let durable_binding = fixture
-            .coordinator
-            .activation_storage_binding()
-            .map_err(|_| FenceError::Store)?;
         let store = BusinessIntentStore::open(&database).map_err(|_| FenceError::Store)?;
-        if fixture.snapshot.namespace() != scope.namespace
+        if fixture_snapshot.namespace() != scope.namespace
             || intent.unit_id.as_str() != scope.unit
-            || durable_binding.3 != scope.namespace
-            || fixture.template.sha256() != &intent.template_sha256
-            || fixture.completion_policy.completion_owner().unit_id() != &intent.unit_id
-            || fixture
-                .completion_policy
+            || source.namespace() != scope.namespace
+            || fixture_template.sha256() != &intent.template_sha256
+            || fixture_completion_policy.completion_owner().unit_id() != &intent.unit_id
+            || fixture_completion_policy
                 .completion_owner()
                 .completion_owner()
                 != &intent.completion_owner
-            || !fixture
-                .completion_policy
-                .allows_authority(AuthorityClass::GenericCounted)
+            || !fixture_completion_policy.allows_authority(expected_class)
+            || source.class() != expected_class
             || store
                 .inspect(&intent.intent_id)
                 .map_err(|_| FenceError::Store)?
                 .as_ref()
-                != Some(&fixture.snapshot)
+                != Some(&fixture_snapshot)
+        {
+            return Err(FenceError::EffectMismatch);
+        }
+        if expected_class == AuthorityClass::P01Dedicated {
+            let expected_occurrence = derive_occurrence_id(&OccurrenceIdentityMaterial::new(
+                intent.business_date.clone(),
+                OccurrenceFamily::try_new("p01-business-date".to_owned())
+                    .map_err(|_| FenceError::EffectMismatch)?,
+                OccurrenceKey::try_new(intent.business_date.as_str().to_owned())
+                    .map_err(|_| FenceError::EffectMismatch)?,
+            ));
+            if intent.unit_id.as_str() != "MU-p01"
+                || intent.subject != crate::monitor::push_job::SubjectId::Global
+                || intent.occurrence != expected_occurrence
+            {
+                return Err(FenceError::EffectMismatch);
+            }
+        } else if expected_class == AuthorityClass::N02Dedicated {
+            let window = source.n02_window().ok_or(FenceError::EffectMismatch)?;
+            if intent.unit_id.as_str() != "MU-news-flash-aggregate"
+                || intent.subject != crate::monitor::push_job::SubjectId::Global
+                || !fixture_snapshot.sla_n02_occurrence_supported()
+                || !fixture_snapshot.sla_n02_window_matches(window.label())
+            {
+                return Err(FenceError::EffectMismatch);
+            }
+        }
+        if expected_class != AuthorityClass::GenericCounted
+            && source
+                .requery(&fixture_snapshot, &intent.decision_id)
+                .is_err()
         {
             return Err(FenceError::EffectMismatch);
         }
@@ -491,12 +638,11 @@ impl BusinessEffect {
             database,
             business_device: metadata.dev(),
             business_inode: metadata.ino(),
-            coordinator: fixture.coordinator,
-            durable_binding,
-            snapshot: fixture.snapshot,
-            template: fixture.template,
-            completion_policy: fixture.completion_policy,
-            config: fixture.config,
+            source,
+            snapshot: fixture_snapshot,
+            template: fixture_template,
+            completion_policy: fixture_completion_policy,
+            config: fixture_config,
         };
         effect.digest = raw_digest(&effect.canonical_bytes()?).as_str().into();
         Ok(effect)
@@ -543,5 +689,21 @@ pub(super) struct BusinessEffectFixture {
 }
 
 #[cfg(test)]
+pub(super) struct N02BusinessEffectFixture {
+    pub(super) database: PathBuf,
+    pub(super) audit: Arc<AuditDispatcher>,
+    pub(super) snapshot: IntentSnapshot,
+    pub(super) template: TerminalTemplateBinding,
+    pub(super) completion_policy: CompletionPolicy,
+    pub(super) config: RecoveryConfig,
+    pub(super) required_channel: ChannelId,
+    pub(super) window: NewsFlashWindow,
+}
+
+#[cfg(test)]
 #[path = "activation_business_effect_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "activation_dedicated_business_effect_tests.rs"]
+mod dedicated_tests;

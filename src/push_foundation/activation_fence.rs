@@ -926,6 +926,53 @@ impl EffectBroker {
     }
 
     #[cfg(test)]
+    pub(super) fn test_p01_business_fixture(
+        control: &Path,
+        scope: Scope,
+        epoch: String,
+        fixture: super::activation_business_effect::BusinessEffectFixture,
+        required_channel: crate::monitor::push_job::ChannelId,
+        clients: Vec<TestClient>,
+        hooks: TestHooks,
+    ) -> Result<Self, FenceError> {
+        let effect = BusinessEffect::bind_p01_fixture(&scope, fixture, required_channel)?;
+        Self::test_bound_fixture(
+            control,
+            scope,
+            epoch,
+            BTreeMap::from([(
+                "business-reconcile".into(),
+                Arc::new(FixedEffect::BusinessRecovery(Box::new(effect))),
+            )]),
+            clients,
+            hooks,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_n02_business_fixture(
+        control: &Path,
+        scope: Scope,
+        epoch: String,
+        fixture: super::activation_business_effect::N02BusinessEffectFixture,
+        clients: Vec<TestClient>,
+        hooks: TestHooks,
+    ) -> Result<Self, FenceError> {
+        let effect = BusinessEffect::bind_n02_fixture(&scope, fixture)?;
+        Self::test_bound_fixture(
+            control,
+            scope,
+            epoch,
+            BTreeMap::from([(
+                "business-reconcile".into(),
+                Arc::new(FixedEffect::BusinessRecovery(Box::new(effect))),
+            )]),
+            clients,
+            hooks,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn test_business_request(&self, operation: &str) -> EffectRequest {
         self.test_effect_request(operation, "business-reconcile")
     }

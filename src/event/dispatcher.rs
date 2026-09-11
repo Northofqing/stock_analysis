@@ -187,6 +187,8 @@ pub struct AuditDispatcher {
     base_dir: PathBuf,
     capability: std::result::Result<Arc<PinnedAuditRoot>, String>,
     chain_state: Mutex<AuditChainState>,
+    #[cfg(test)]
+    activation_read_pause: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +209,28 @@ struct AuditObjectIdentity {
     is_file: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuditAuthorityResourceBinding {
+    pub(crate) namespace: String,
+    pub(crate) root_path: String,
+    pub(crate) root_device: u64,
+    pub(crate) root_inode: u64,
+    pub(crate) root_mode: u32,
+    pub(crate) root_uid: u32,
+    pub(crate) root_links: u64,
+    pub(crate) year: i32,
+    pub(crate) lock_device: u64,
+    pub(crate) lock_inode: u64,
+    pub(crate) lock_mode: u32,
+    pub(crate) lock_uid: u32,
+    pub(crate) lock_links: u64,
+    pub(crate) jsonl_device: u64,
+    pub(crate) jsonl_inode: u64,
+    pub(crate) jsonl_mode: u32,
+    pub(crate) jsonl_uid: u32,
+    pub(crate) jsonl_links: u64,
+}
+
 #[derive(Debug)]
 struct RetainedAuditDirectory {
     path: PathBuf,
@@ -218,6 +242,7 @@ struct RetainedAuditDirectory {
 struct PinnedAuditRoot {
     directories: Vec<RetainedAuditDirectory>,
     root_path: PathBuf,
+    authority_namespace: String,
 }
 
 impl PinnedAuditRoot {
@@ -240,7 +265,8 @@ impl PinnedAuditRoot {
                 ));
             }
         }
-        let rebound = bind_absolute_audit_root(&self.root_path, None)?;
+        let rebound =
+            bind_absolute_audit_root(&self.root_path, None, self.authority_namespace.clone())?;
         if rebound.directories.len() != self.directories.len()
             || rebound
                 .directories
@@ -280,6 +306,8 @@ impl AuditDispatcher {
                 poisoned: None,
                 health: AuditHealth::Unverified,
             }),
+            #[cfg(test)]
+            activation_read_pause: Mutex::new(None),
         }
     }
 
@@ -330,7 +358,39 @@ impl AuditDispatcher {
                 poisoned: Some(error.clone()),
                 health: AuditHealth::Degraded { reason_code: error },
             }),
+            #[cfg(test)]
+            activation_read_pause: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_activation_read_pause(&self, socket: PathBuf) {
+        *self.activation_read_pause.lock().unwrap() = Some(socket);
+    }
+
+    #[cfg(test)]
+    fn pause_activation_bound_read(&self, marker: u8) -> Result<(), String> {
+        let socket = self
+            .activation_read_pause
+            .lock()
+            .map_err(|_| "activation read pause lock poisoned".to_owned())?
+            .clone();
+        let Some(socket) = socket else {
+            return Ok(());
+        };
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)
+            .map_err(|_| "activation read pause unavailable".to_owned())?;
+        stream
+            .write_all(&[marker])
+            .map_err(|_| "activation read pause marker failed".to_owned())?;
+        let mut release = [0_u8];
+        stream
+            .read_exact(&mut release)
+            .map_err(|_| "activation read pause release failed".to_owned())?;
+        if release != *b"G" {
+            return Err("activation read pause release invalid".to_owned());
+        }
+        Ok(())
     }
 
     /// Returns the number of envelopes this dispatcher has handled.
@@ -783,11 +843,70 @@ impl AuditDispatcher {
         Ok(expected_record)
     }
 
+    /// Project the already-retained root plus one existing year's lock and JSONL objects.
+    /// This never creates authority files, and its error does not expose authority paths.
+    pub(crate) fn activation_authority_binding(
+        &self,
+        year: i32,
+    ) -> Result<AuditAuthorityResourceBinding, String> {
+        use fs2::FileExt;
+
+        let result = (|| {
+            if !(1..=9999).contains(&year) {
+                return Err("invalid audit authority year".to_owned());
+            }
+            let capability = self.capability.as_ref().map_err(Clone::clone)?;
+            let _process_guard = audit_process_mutex()
+                .lock()
+                .map_err(|_| "audit process mutex poisoned".to_owned())?;
+            capability.validate_complete_chain()?;
+            let lock_name = format!("{year}.lock");
+            let (lock, lock_identity) =
+                open_existing_audit_file(capability, OsStr::new(&lock_name), false)?;
+            FileExt::lock_exclusive(&lock)
+                .map_err(|error| format!("lock activation audit binding: {error}"))?;
+            capability.validate_complete_chain()?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+
+            let jsonl_name = format!("{year}.jsonl");
+            let jsonl_path = self.base_dir.join(&jsonl_name);
+            let (jsonl, jsonl_identity) =
+                open_existing_audit_file(capability, OsStr::new(&jsonl_name), false)?;
+            validate_existing_chain_file(&jsonl, &jsonl_path)?;
+            capability.validate_complete_chain()?;
+            revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
+            revalidate_audit_leaf(capability, OsStr::new(&jsonl_name), &jsonl_identity)?;
+
+            let binding =
+                project_audit_authority_binding(capability, year, &lock_identity, &jsonl_identity)?;
+            FileExt::unlock(&lock)
+                .map_err(|error| format!("unlock activation audit binding: {error}"))?;
+            Ok(binding)
+        })();
+        result.map_err(|_| "W16 audit authority resource is unavailable".to_owned())
+    }
+
     /// Read one year's authoritative envelopes under the same retained-root,
     /// full-chain and cross-process lock used by append. This never creates or
     /// writes the JSONL authority; the retained lock file must already exist
     /// and is the coordination seam shared with writers.
     pub(crate) fn read_authoritative_year(&self, year: i32) -> Result<Vec<EventEnvelope>, String> {
+        self.read_authoritative_year_inner(year, None)
+    }
+
+    pub(crate) fn read_authoritative_year_bound(
+        &self,
+        expected: &AuditAuthorityResourceBinding,
+    ) -> Result<Vec<EventEnvelope>, String> {
+        self.read_authoritative_year_inner(expected.year, Some(expected))
+            .map_err(|_| "W16 bound audit authority read failed".to_owned())
+    }
+
+    fn read_authoritative_year_inner(
+        &self,
+        year: i32,
+        expected: Option<&AuditAuthorityResourceBinding>,
+    ) -> Result<Vec<EventEnvelope>, String> {
         use fs2::FileExt;
 
         let capability = self.capability.as_ref().map_err(Clone::clone)?;
@@ -805,9 +924,26 @@ impl AuditDispatcher {
 
         let json_name = format!("{year}.jsonl");
         let path = self.base_dir.join(&json_name);
+        #[cfg(test)]
+        if expected.is_some() {
+            self.pause_activation_bound_read(b'B')?;
+        }
         let (jsonl, json_identity) =
             open_existing_audit_file(capability, OsStr::new(&json_name), false)?;
+        #[cfg(test)]
+        if expected.is_some() {
+            self.pause_activation_bound_read(b'O')?;
+        }
         validate_existing_chain_file(&jsonl, &path)?;
+        if let Some(expected) = expected {
+            require_audit_authority_binding(
+                capability,
+                year,
+                &lock_identity,
+                &json_identity,
+                expected,
+            )?;
+        }
         let mut reader = jsonl
             .try_clone()
             .map_err(|error| format!("clone NewsFlash reconcile {}: {error}", path.display()))?;
@@ -851,6 +987,15 @@ impl AuditDispatcher {
         capability.validate_complete_chain()?;
         revalidate_audit_leaf(capability, OsStr::new(&lock_name), &lock_identity)?;
         revalidate_audit_leaf(capability, OsStr::new(&json_name), &json_identity)?;
+        if let Some(expected) = expected {
+            require_audit_authority_binding(
+                capability,
+                year,
+                &lock_identity,
+                &json_identity,
+                expected,
+            )?;
+        }
         FileExt::unlock(&lock)
             .map_err(|error| format!("unlock NewsFlash reconcile {lock_name}: {error}"))?;
         Ok(envelopes)
@@ -938,6 +1083,56 @@ impl AuditDispatcher {
     }
 }
 
+fn project_audit_authority_binding(
+    capability: &PinnedAuditRoot,
+    year: i32,
+    lock: &AuditObjectIdentity,
+    jsonl: &AuditObjectIdentity,
+) -> Result<AuditAuthorityResourceBinding, String> {
+    let root = &capability
+        .directories
+        .last()
+        .ok_or_else(|| "audit root capability is empty".to_owned())?
+        .identity;
+    Ok(AuditAuthorityResourceBinding {
+        namespace: capability.authority_namespace.clone(),
+        root_path: capability
+            .root_path
+            .to_str()
+            .ok_or_else(|| "audit root path is not UTF-8".to_owned())?
+            .to_owned(),
+        root_device: root.device,
+        root_inode: root.inode,
+        root_mode: root.mode,
+        root_uid: root.uid,
+        root_links: root.links,
+        year,
+        lock_device: lock.device,
+        lock_inode: lock.inode,
+        lock_mode: lock.mode,
+        lock_uid: lock.uid,
+        lock_links: lock.links,
+        jsonl_device: jsonl.device,
+        jsonl_inode: jsonl.inode,
+        jsonl_mode: jsonl.mode,
+        jsonl_uid: jsonl.uid,
+        jsonl_links: jsonl.links,
+    })
+}
+
+fn require_audit_authority_binding(
+    capability: &PinnedAuditRoot,
+    year: i32,
+    lock: &AuditObjectIdentity,
+    jsonl: &AuditObjectIdentity,
+    expected: &AuditAuthorityResourceBinding,
+) -> Result<(), String> {
+    if &project_audit_authority_binding(capability, year, lock, jsonl)? != expected {
+        return Err("W16 audit authority resource binding changed".to_owned());
+    }
+    Ok(())
+}
+
 fn audit_process_mutex() -> &'static Mutex<()> {
     static PROCESS_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     PROCESS_MUTEX.get_or_init(|| Mutex::new(()))
@@ -960,7 +1155,11 @@ fn validate_audit_test_code(test_code: &str) -> Result<(), String> {
 fn classify_and_bind_audit_root(path: &Path) -> Result<PinnedAuditRoot, String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     if path == manifest.join(PRODUCTION_AUDIT_DIR) {
-        return bind_absolute_audit_root(path, Some(&manifest.join("data")));
+        return bind_absolute_audit_root(
+            path,
+            Some(&manifest.join("data")),
+            "Production".to_owned(),
+        );
     }
     let test_parent = manifest.join("data/test");
     let relative = path.strip_prefix(&test_parent).map_err(|_| {
@@ -989,12 +1188,17 @@ fn classify_and_bind_audit_root(path: &Path) -> Result<PinnedAuditRoot, String> 
     // itself so a fresh checkout does not depend on a pre-created `data/test`
     // directory.  Every component below `data/` is still owner/mode/link
     // validated before it becomes authority.
-    bind_absolute_audit_root(path, Some(&manifest.join("data")))
+    bind_absolute_audit_root(
+        path,
+        Some(&manifest.join("data")),
+        format!("Test:{test_code}"),
+    )
 }
 
 fn bind_absolute_audit_root(
     path: &Path,
     creation_boundary: Option<&Path>,
+    authority_namespace: String,
 ) -> Result<PinnedAuditRoot, String> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
@@ -1119,6 +1323,7 @@ fn bind_absolute_audit_root(
     Ok(PinnedAuditRoot {
         directories,
         root_path: path.to_path_buf(),
+        authority_namespace,
     })
 }
 

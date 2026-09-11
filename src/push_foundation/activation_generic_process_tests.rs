@@ -42,6 +42,9 @@ pub(super) enum Role {
     },
     Requester(Envelope),
     BusinessBroker(super::activation_business_process_tests::BusinessRole),
+    DedicatedBusinessBroker(
+        super::activation_dedicated_business_process_tests::DedicatedBusinessRole,
+    ),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -593,6 +596,16 @@ fn w16_generic_process_child() {
                 }
                 Role::BusinessBroker(role) => {
                     super::activation_business_process_tests::run_broker(
+                        &input.root,
+                        &input.test_code,
+                        &input.socket,
+                        &input.signal,
+                        role,
+                    )
+                    .await;
+                }
+                Role::DedicatedBusinessBroker(role) => {
+                    super::activation_dedicated_business_process_tests::run_broker(
                         &input.root,
                         &input.test_code,
                         &input.socket,

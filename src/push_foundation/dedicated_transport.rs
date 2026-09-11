@@ -9,12 +9,14 @@ use crate::durable_delivery::{
     FoundationTerminalDisposition, P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PushKind,
     TypedReceipt,
 };
+use crate::event::dispatcher::AuditAuthorityResourceBinding;
 use crate::event::envelope::{
     news_flash_evidence_sha256, NewsFlashTransactionStage, NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION,
 };
 use crate::event::{
-    requery_news_flash_window_terminal_with, AuditDispatcher, EventEnvelope, NewsFlashWindow,
-    NewsFlashWindowTerminalQuery, NewsFlashWindowTerminalRecord, PushRecord,
+    requery_news_flash_window_terminal_bound_with, requery_news_flash_window_terminal_with,
+    AuditDispatcher, EventEnvelope, NewsFlashWindow, NewsFlashWindowTerminalQuery,
+    NewsFlashWindowTerminalRecord, PushRecord,
 };
 use crate::monitor::push_job::{
     raw_digest, AttemptId, AuthorityClass, BusinessDate, ChannelId, CompletionPolicy, DecisionId,
@@ -80,6 +82,39 @@ pub(crate) struct DedicatedConformanceRoute {
 }
 
 impl DedicatedConformanceRoute {
+    pub(super) fn authority_class(&self) -> AuthorityClass {
+        match self.specialty {
+            DedicatedSpecialty::P01 => AuthorityClass::P01Dedicated,
+            DedicatedSpecialty::N02 => AuthorityClass::N02Dedicated,
+        }
+    }
+
+    pub(super) fn authority_descriptor(
+        &self,
+    ) -> Result<AuthorityDescriptor, DedicatedConformanceError> {
+        let version = match self.specialty {
+            DedicatedSpecialty::P01 => format!(
+                "p01-durable-v{}",
+                crate::durable_delivery::DURABLE_SCHEMA_VERSION
+            ),
+            DedicatedSpecialty::N02 => N02_DURABLE_SCHEMA_VERSION.to_owned(),
+        };
+        Ok(AuthorityDescriptor {
+            authority_class: self.authority_class(),
+            durable_schema_version: DurableSchemaVersion::try_new(version)
+                .map_err(|_| DedicatedConformanceError::InvalidRoute)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn template(&self) -> &TerminalTemplateBinding {
+        &self.template
+    }
+
+    pub(super) fn required_channel(&self) -> &ChannelId {
+        &self.required_channel
+    }
+
     pub(crate) fn matches_sla_route(
         &self,
         class: AuthorityClass,
@@ -107,6 +142,61 @@ impl DedicatedConformanceRoute {
             template,
             required_channel,
         })
+    }
+}
+
+pub(super) fn requery_p01_dedicated_authority(
+    snapshot: &IntentSnapshot,
+    route: &DedicatedConformanceRoute,
+    source: &DurableDeliveryCoordinator,
+) -> Result<AuthorityQuery, AuthorityQueryFailure> {
+    match inspect_p01_dedicated(snapshot, route, source) {
+        Ok(record) => Ok(AuthorityQuery::Terminal(Box::new(record))),
+        Err(DedicatedConformanceError::TerminalMissing) => Ok(AuthorityQuery::Missing),
+        Err(DedicatedConformanceError::TerminalPendingSeal) => Ok(AuthorityQuery::PendingSeal),
+        Err(_) => Err(AuthorityQueryFailure),
+    }
+}
+
+pub(super) fn requery_n02_dedicated_authority(
+    snapshot: &IntentSnapshot,
+    window: NewsFlashWindow,
+    route: &DedicatedConformanceRoute,
+    source: &AuditDispatcher,
+    binding: &AuditAuthorityResourceBinding,
+) -> Result<AuthorityQuery, AuthorityQueryFailure> {
+    let bound_source = BoundN02AuthoritySource {
+        dispatcher: source,
+        binding,
+    };
+    match inspect_n02_dedicated(snapshot, window, route, &bound_source) {
+        Ok(record) => Ok(AuthorityQuery::Terminal(Box::new(record))),
+        Err(DedicatedConformanceError::TerminalMissing) => Ok(AuthorityQuery::Missing),
+        Err(DedicatedConformanceError::TerminalPendingSeal) => Ok(AuthorityQuery::PendingSeal),
+        Err(_) => Err(AuthorityQueryFailure),
+    }
+}
+
+struct BoundN02AuthoritySource<'a> {
+    dispatcher: &'a AuditDispatcher,
+    binding: &'a AuditAuthorityResourceBinding,
+}
+
+impl N02DedicatedTerminalSource for BoundN02AuthoritySource<'_> {
+    fn requery_n02(
+        &self,
+        business_date: &BusinessDate,
+        window: NewsFlashWindow,
+    ) -> Result<NewsFlashWindowTerminalQuery, DedicatedSourceFailure> {
+        let business_date = chrono::NaiveDate::parse_from_str(business_date.as_str(), "%Y-%m-%d")
+            .map_err(|_| DedicatedSourceFailure)?;
+        requery_news_flash_window_terminal_bound_with(
+            self.dispatcher,
+            self.binding,
+            business_date,
+            window,
+        )
+        .map_err(|_| DedicatedSourceFailure)
     }
 }
 
