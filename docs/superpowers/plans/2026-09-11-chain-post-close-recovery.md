@@ -34,7 +34,7 @@
 
 工作目录：`/Users/zhangzhen/Desktop/Quant/stock_analysis/.worktrees/push-reliability-20260905`。主控负责Cargo、Git、公开文档；实施者不运行Cargo/Git写入/生产命令、不派子代理。测试不读环境或生产数据，只能显式合成配置/输入、临时自有数据库或经主控批准的loopback。只读本任务brief，不读其他计划私有目录。
 
-可编辑：`src/pipeline/chain_analysis/mod.rs`、`src/pipeline/chain_analysis/fetchers.rs`；新增同目录`preparation.rs`、`preparation_tests.rs`。额外路径须先解释并由主控更新边界。不改app/modes.rs、timer、通知、Foundation或生产schema。本Task结果是后续持久准备的真实输入，不宣称已实现重启恢复。
+可编辑：`src/pipeline/chain_analysis/mod.rs`、`src/pipeline/chain_analysis/fetchers.rs`；新增同目录`preparation.rs`、`preparation_tests.rs`；`src/gate_d_chain_analysis_regression.rs`仅迁移其旧renderer失败协议测试至同一新公开interface，不删除文件或降低真实loopback Gemini协议覆盖。额外路径须先解释并由主控更新边界。不改app/modes.rs、timer、通知、Foundation或生产schema。本Task结果是后续持久准备的真实输入，不宣称已实现重启恢复。
 
 ### 行为合同
 
@@ -43,7 +43,7 @@
 3. 准备结果保留pipeline实际消费的涨停股、概念映射、聚类/孤立股、持仓诊断、补涨候选及来源状态、龙虎榜背景、宏观/逐簇/盘后催化背景和首次报告。不能只保留hash或由渲染文本反推这些事实。没有源时间/批次证据的旧来源显式标识未提供，不写当前时间冒充来源时间，不把普通空Vec认证成VerifiedEmpty。
 4. 对本流程实际模型调用保留发送到analyzer的prompt/system/mode以及其返回文本或失败/未调用状态，包括用于生成检索词的调用。这些是本地调用材料，不冒充底层真实provider选择/模型版本或远端原始wire；无法取得的身份明确缺失。不要为了凑字段扩改整个GeminiAnalyzer。
 5. 首次报告、模型响应及文本保留原字节/空白；序列化artifact须明确版本，确定性编码自身拥有的映射，不改原报告/选集的排序。拒绝未知版本、截断/不合法输入；解码不得触发外部调用。Debug/诊断只展示安全元数据，不输出持仓/报告/提示词/模型内容或凭据。字段私有、getter只读；序列化artifact本身包含业务内容，只能由后续受保护存储消费，不当日志。
-6. 保持现有成功/失败/降级政策及副作用次序：核心概念/DB失败仍阻断，补涨不可用保留真实原因而不清空核心分析；新闻/模型可选失败仍按原路径降级。chain_daily及概念缓存仍是原适配器中的真实副作用，必须在说明中标明；本Task不把含写库的准备假称为纯函数或已持久checkpoint。能在产生观察处保留的错误/缺失不得再次压成空String；被上游接口已丢失的信息明确标识Unknown，不伪造恢复。
+6. 保持现有成功/失败/降级政策及副作用次序：核心概念/DB失败仍阻断，补涨不可用保留真实原因而不清空核心分析；新闻/模型可选失败仍按原路径降级。龙虎榜当前按请求时Local自然日取数，不擅改成pipeline业务日；应保存实际请求日期与本地观察时间，不冒充provider时间。chain_daily及概念缓存仍是原适配器中的真实副作用，必须在说明中标明；本Task不把含写库的准备假称为纯函数或已持久checkpoint。能在产生观察处保留的错误/缺失不得再次压成空String；被上游接口已丢失的信息明确标识Unknown，不伪造恢复。
 7. 下一Task将把持久begin/result围绕这些实际外部效果放置。保留可明确定位的stage职责（概念、聚类业务写入/生命周期、候选、持仓、龙虎榜、宏观、搜索/模型、首次报告）；不新增通用工作流引擎、任意JSON事件总线、第三DB、全局可变测试开关或自动重试器。
 
 ### TDD与可观察验收
@@ -57,6 +57,8 @@
 - 首次artifact序列化→反序列化：精确报告/模型文本含空白/Unicode仍一致，未知schema/截断拒绝，零外部调用；Debug不含TEST_CODE敏感正文/持仓等标记。不从被测编码函数生成“独立期望”。
 - 核心概念/写库/持仓失败：不继续模型/通知，保留错误；固定业务日不由后续时钟改变。已发生效果与首次准备结果分别标识，不以Result<Prepared>冒充已落盘。
 
+旧resolved测试迁移要求：`resolved_chain_facts_persist_match_and_render_without_external_sources`的真实SQLite写入/streak及板块exact/substring/missing断言保留，只将render职责迁至新公开流程；原成功深度/简化/overview及gate_d模型失败保留真实loopback Gemini协议覆盖，不能全换成fake返回值。新准备interface的过渡实现不得在受控非空测试中回落真实legacy I/O；先取缺失interface的编译RED，GREEN前接通所有受控外部效果。
+
 主控基线仅先跑已审计的`pipeline::chain_analysis::tests::empty_limit_up_batch_returns_explicit_empty_report_without_external_calls`，以及按实际影响选择的纯聚类/报告/模型协议测试；不运行整个chain或全仓suite（含环境/全局DB测试）。新组计划为`pipeline::chain_analysis::preparation_tests::`，过滤器以真实声明为准。覆盖关键外部效果次数是防重复合同验收，不用内部helper调用次数替代业务结果。
 
 报告：`.superpowers/sdd/2026-09-11-chain-post-close-recovery/task-1-report.md`。列精确变更、实际命令/RED/GREEN、未执行项、源码冻结点、准备结果哪些只是观察/哪些仍需持久化。主控固定源码后独立Spec/Quality review，重要发现回原作者修复，保留完整Task2–4。
@@ -64,6 +66,8 @@
 ## Task 2: 同业务库检查点、原字节和逐目标发送进度
 
 依赖Task1。实施前按实际接口细化本Task合同和brief，不更改完成目标。受控schema扩展位于既有业务SQLite和独立版本登记；复用Foundation验证/不可变intent、CAS/lease，不修改冻结v1 DDL。包含原准备artifact、报告/chain_daily效果进度、通知目标快照与网络前begin、逐目标结果记录。对每个外部效果开始/结果提交之间的崩溃保留未决；已保存结果只读取原字节。必须接入Task1真实调用位置，不能只有store测试。文件异内容冲突不覆盖，Unknown/部分弱成功/开始后未确认重启零补发；无渠道不伪造attempt。验证真实临时库重开、CAS冲突、损坏/漂移拒绝及所有关键崩溃点。
+
+2026-09-11实际存储核对补充：扩展须由BusinessIntentStore同一连接持有事务，不在rusqlite事务内调用另取Diesel连接的自提交DAO；chain_daily仍保留原upsert语义，不能借P-01整日替换。Foundation独立对象校验不代表GlobalSchema整库catalog已登记，须补批准的扩展认证。现有BusinessExecution仅授权强恢复且production broker拒绝，准备/文件/弱发送需真实窄facade。概念缓存内部逐provider/逐写入、通知循环逐目标begin/result均须实际接线，不可整批执行完才写journal。这些缺口由Task2–4继续实现，不因Task1固定内存结果而消失。
 
 ## Task 3: 实际定时器、启动恢复和窗口资格
 
