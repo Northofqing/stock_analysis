@@ -46,6 +46,8 @@
 6. 保持现有成功/失败/降级政策及副作用次序：核心概念/DB失败仍阻断，补涨不可用保留真实原因而不清空核心分析；新闻/模型可选失败仍按原路径降级。龙虎榜当前按请求时Local自然日取数，不擅改成pipeline业务日；应保存实际请求日期与本地观察时间，不冒充provider时间。chain_daily及概念缓存仍是原适配器中的真实副作用，必须在说明中标明；本Task不把含写库的准备假称为纯函数或已持久checkpoint。能在产生观察处保留的错误/缺失不得再次压成空String；被上游接口已丢失的信息明确标识Unknown，不伪造恢复。
 7. 下一Task将把持久begin/result围绕这些实际外部效果放置。保留可明确定位的stage职责（概念、聚类业务写入/生命周期、候选、持仓、龙虎榜、宏观、搜索/模型、首次报告）；不新增通用工作流引擎、任意JSON事件总线、第三DB、全局可变测试开关或自动重试器。
 
+2026-09-11编码细化：artifact仅接收本编码器产生的版本化、确定性紧凑原字节；解码后重编码须逐字节相同，不接受任意等义JSON。以此拒绝重复字段、省略Option/default、未知字段及非确定性表示；全嵌套非有限数值须显式拒绝，有限数值不能准确往返时安全失败。此格式只是后续受保护存储的原材料，不是Foundation canonical身份、Ready、持久检查点或真实性认证；解码错误不回显业务正文。
+
 ### TDD与可观察验收
 
 先增加一个通过新真实准备interface验证空涨停池固定日期/原报告字节且零外部效果的测试，交主控运行RED。若仅因缺少接口编译失败，明确记为接口RED而非生产事故复现；主控确认后实现并冻结GREEN。其后沿相同公开interface逐项扩展，不能一次写整组假想测试再补实现。
@@ -68,6 +70,16 @@
 依赖Task1。实施前按实际接口细化本Task合同和brief，不更改完成目标。受控schema扩展位于既有业务SQLite和独立版本登记；复用Foundation验证/不可变intent、CAS/lease，不修改冻结v1 DDL。包含原准备artifact、报告/chain_daily效果进度、通知目标快照与网络前begin、逐目标结果记录。对每个外部效果开始/结果提交之间的崩溃保留未决；已保存结果只读取原字节。必须接入Task1真实调用位置，不能只有store测试。文件异内容冲突不覆盖，Unknown/部分弱成功/开始后未确认重启零补发；无渠道不伪造attempt。验证真实临时库重开、CAS冲突、损坏/漂移拒绝及所有关键崩溃点。
 
 2026-09-11实际存储核对补充：扩展须由BusinessIntentStore同一连接持有事务，不在rusqlite事务内调用另取Diesel连接的自提交DAO；chain_daily仍保留原upsert语义，不能借P-01整日替换。Foundation独立对象校验不代表GlobalSchema整库catalog已登记，须补批准的扩展认证。现有BusinessExecution仅授权强恢复且production broker拒绝，准备/文件/弱发送需真实窄facade。概念缓存内部逐provider/逐写入、通知循环逐目标begin/result均须实际接线，不可整批执行完才写journal。这些缺口由Task2–4继续实现，不因Task1固定内存结果而消失。
+
+后续实施顺序及验收边界（尚未实现）：
+
+1. 由现有BusinessIntentStore拥有盘后专用子模块和同一业务连接，独立登记扩展schema/codec。准备前固定run/input/owner，不能等完整pipeline返回后才开始记账。冻结Foundation v1原样保留；临时库重开、半装/定义漂移/未来版本均须拒绝，不能以真实生产库试迁移。
+2. 在每次实际外部效果前提交begin，返回后立即保存完整result；概念内部每个provider与缓存写入也必须可区分。chain_daily原upsert、当次生命周期结果和阶段进度由同一个事务提交；崩溃或提交确认丢失时按固定效果身份只读查证，不重跑整段pipeline。
+3. 首次完整artifact与Ready绑定必须同事务封存；原record_initial自提交入口不能被外层事务伪装包住。报告文件只用原字节，在受保护目录拒绝符号链接/越界，异内容冲突不覆盖；文件系统与数据库之间的未确认间隙显式保留。
+4. 冻结发送目标快照及稳定身份，Custom重复配置项仍是独立目标。在现有发送循环内逐目标执行“持久begin→发送一次→持久result”，结果保存失败立即停后续目标；外层send_report结束后补写整批日志不合格。dispatch已开始的运行重启后不得盲补发未开始的剩余目标，零渠道保持零attempt。
+5. 用自有临时库/文件和合成目标验证每个关键崩溃点、旧lease/CAS拒绝、内容冲突及零重复外部效果。弱Accepted/Unknown不推进强完成游标。受保护根、生产认证facade、GlobalSchema扩展认证及真实必达渠道仍须后续明确；工程测试不替代这些条件。
+
+源码依据：[BusinessIntentStore](../../../src/push_foundation/intent_store.rs)、[现有授权范围](../../../src/push_foundation/activation_fence.rs)、[chain_daily DAO](../../../src/database/concepts.rs)、[真实通知循环](../../../src/notification/service.rs)。Task1最终interface冻结后再确定Task2可写文件与精确测试命令；当前不授予扩改生产schema或开启新owner的权限。
 
 ## Task 3: 实际定时器、启动恢复和窗口资格
 
