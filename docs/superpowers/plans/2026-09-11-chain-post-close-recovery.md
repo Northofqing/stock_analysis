@@ -2,6 +2,8 @@
 
 日期：2026-09-11。初始源码42ce098，隔离分支codex/push-reliability-20260905。状态：执行中，尚未完成。
 
+最新用户范围调整：[单用户本地模式](../../push-system/single-user-local-scope-2026-09-11.md)优先适用。本次不再以复杂可信身份、外部发行方、多角色审批或认证broker为前置；旧条款中的此类要求已排除本次范围，而非标为实现完成。同库事务、任务/效果身份、任务锁、防重、数据校验和实际切换授权不变。当前旧ProductionRefused是代码现状，新本地入口待接线，不能直接改成无条件放行。
+
 ## 目标与规范
 
 整体目标仍为W15–W21与全部52个Unit交付。本计划落实MU-chain-post-close的真实业务流程，不以新helper、内存日期位、局部兼容观察或测试数量替代完整接管。
@@ -91,18 +93,33 @@ Task1限定复审通过后才启动Rust。本片只是Task2的第一个可验证
 - 先定义最小真实职责和安装/验证interface，交主控核对后写首例并冻结。先证明“同一BusinessIntentStore连接受控安装→关闭→重新打开并验证扩展”，再补半装/定义漂移/未来版本/伪造登记与实际定义一起变化的拒绝例。运行时验证不能偷偷安装或修复；缺失扩展是明确未安装，不是空进度。
 - 固定独立扩展版本及bundled定义，append-only事实与可变CAS head分别约束；安装一个短事务，版本和对象登记与全部对象一起提交。只在扩展自有表附加保护对象，不改Foundation v1对象/版本/DDL、全应用application_id/user_version或冻结GlobalSchema reference。原Foundation按独立bundled定义仍可验证，不把旧open的自登记一致性检查当成全部认证。
 - 首片所有安装试验仅在显式新建的自有临时库上，由合成Test上下文启动。生产安装/运行的许可构造必须保持拒绝，直到真实受保护连接、GlobalSchema扩展认证和owner facade接好；不能把自由传入Test namespace或路径相等当生产授权。不得为方便增加公开raw connection、任意SQL/事务callback或能自行打开路径的新store。
+- 首片interface采用`ChainPostClose<'_>`私有借用现有store，提供专用`install_schema`/`verify_schema`和安全receipt；生产`BusinessIntentStore::chain_post_close`固定`ProductionRefused`。成功借用仅来自自己持有临时目录/文件/store且无路径或外部store参数的cfg(test) fixture。连接级FK/recursive_triggers/synchronous/busy_timeout在事务前设置和复核，事务内再核关键值；不能指望事务内切换FK或synchronous。bundled认证临时改变query_only后只恢复进入前能力；失败时结束事务并检查恢复结果，不能悄悄把原只读连接提升成可写。
 - 测试fixture用`tempfile`独占目录和显式SQLite连接，装入已校验的固定Foundation DDL及本片所需最少业务表。不得调用忽略路径参数的全局DatabaseManager::init，不调用实际sqlite CLI/provider/环境配置；如需复用现有fixture，先由主控核对其完整效果闭包。独立期望应来自固定字面合同/SQLite实际目录与持久字节，不由被测校验器生成自己的预期。
 - 首例只有缺接口时记录编译RED，不人为制造错误；主控审核测试后单队列运行`cargo test --offline --lib <实际声明的完整测试名> -- --exact --test-threads=1`。实现后同名GREEN，随后逐片补故障和重开证据。禁止全库/全仓suite；每次源码冻结且日志与前后摘要保留。首片和后续Task2审查均不作生产迁移或全Unit完成声明。
 
+首例完整名称：`push_foundation::intent_store::chain_post_close::tests::installed_schema_survives_owned_business_database_reopen`。初始扩展缺失须返回NotInstalled且无自动DDL；安装后schema/codec字面版本1，关闭并重开后只验证原记录。核对Foundation字面v1/25个对象及实际catalog，保留application_id/user_version；源码/SQL未确定的bundle摘要不预编造，GREEN实现前提交具体固定定义供主控核对。
+
+主控已核对首片固定SQL：`chain_post_close_schema`、`chain_post_close_objects`两张登记表及六个保护trigger，共八个有SQL定义的对象；只使用扩展自己的表。安装事务先填固定reference的八条定义，最后写唯一header封存，之后插入/更新/删除/替换拒绝。该首版只认证安装完整性，不含run/target/effect表或业务进度，不声称已保存artifact。后续真实业务表必须通过明确的新版本/受控迁移合同加入，不能在同一v1摘要下静默扩对象；版本迁移和保留既有事实的验收仍属于Task2后续工作。
+
 实施者继续一名Rust writer，不执行Cargo/Git/生产命令、不派子代理。主控独占Cargo/Git、公共文档和进度；完整实施报告写本计划私有目录`task-2-report.md`。Task2初始BASE在实际派发前固定；使用本Task摘录brief及只读存储设计，不读取其他计划私有文件。
+
+### 实际进度
+
+Task2 BASE为4da61ad。首例session38308取得缺ChainPostClose/ChainPostCloseError的接口RED后，同连接安装/校验及固定八对象SQL已实现。SQL SHA独立核对为cfaedcafa3bda35942404b874e954a3b88c764a1600e9060a496163721742cb5；session19835单例GREEN：1通过、3405过滤，编译3分02秒/运行0.06秒，Rust/SQL摘要前后未变。当前只有安装登记基础，未实现业务run/阶段/发送恢复。四个相关Rust文件格式差异已修正且检查通过；测试编译45条告警比原43条新增两个未调用入口告警，故障覆盖及完整Task2验收仍在后续。
+
+损坏反例session11762取得实际RED：小写半装、缺保护trigger、未登记附着index、live registry与实际定义一起伪造四例均被拒绝；最后的大写半装被误报NotInstalled，应为SchemaRejected。仅修改目录发现的大小写识别，保留固定定义的精确比较及不自动修复规则；session31606修后2例通过、3405过滤，编译2分52秒/运行0.45秒，源码前后未变。五种损坏的verify/install均拒绝且不改原文件。当前批量补充生产入口拒绝、未来版本类别、只读/既有事务、不可变写保护和真实COMMIT锁冲突验收，不由首例成功代替。
+
+后续业务schema采用显式版本迁移：保留原chain v1八对象和登记行，一次新增可按布局版本追加封存的metadata，此后复用该组表，不为每代复制一套registry。业务对象按实际完整切片定版；验证/重开不得自动升级，不修改Foundation v1或GlobalSchema冻结reference。旧reader须拒绝新布局，迁移须保存既有事实；当前尚未实施该迁移。
+
+持久接线的停止合同已细化，尚未实施：普通来源失败与存储/lease/fence失败用类型区分；可选降级和模型`.ok()`不得吞必须停止。begin确认后在外部await前设置取消保护，只有result持久确认才解除；超时取消留下未决时停止后续效果，Drop不写数据库。原普通失败/15秒宏观、15秒簇搜索、8秒盘后搜索期限保持。model仍可用&self，但store可变借用仅围同步短事务，不跨await；公开prepare保留可识别的结构化停止，而非转成字符串。整个prepare被取消无法返回错误时，以先前固定run及库中原begin/result只读恢复，不承诺存储故障时还能成功补写原因。
 
 ## Task 3: 实际定时器、启动恢复和窗口资格
 
-依赖Task2及可信运行context的实际提供接口；修改app和monitor真实入口，不借盘前/CLI/R03 identity。新工作在交易日15:30≤当前时间<15:35检查，进入前重新读时钟；固定业务日与自然日分开，窗口外仅恢复已有事实。替换仅凭Ok封日的完成推导，返回准备/保存/弱观察/权威完成不同事实。无认证不得绕过构造器或静默启用新owner；上线前旧路径不被测试fixture替换。以实际timer消费的interface测延迟过窗、跨日同业务日、重启、部分发送、未决恢复和不重跑模型，保持CLI/盘前黄金外部行为。
+依赖Task2及单用户本地运行context的实际提供接口；修改app和monitor真实入口，不借盘前/CLI/R03的运行/完成编号。新工作在交易日15:30≤当前时间<15:35检查，进入前重新读时钟；固定业务日与自然日分开，窗口外仅恢复已有事实。替换仅凭Ok封日的完成推导，返回准备/保存/弱观察/权威完成不同事实。本地显式配置与任务锁须接在真实路径，不能用测试fixture替换旧路径或静默切换执行者；不等待外部身份认证。以实际timer消费的interface测延迟过窗、跨日同业务日、重启、部分发送、未决恢复和不重跑模型，保持CLI/盘前黄金外部行为。
 
 ## Task 4: 强完成cursor、六门禁与切换材料
 
-依赖真实注册、必达渠道/authority及W15/W16当前认证/fence接线。复用已批准强投递/重验/finalizer，不将弱观察提升；同业务事务提交独立cursor、Completed与稳定事件。接受后仅恢复最终化，Unknown隔离、Rejected只按显式授权新attempt。完成unit/failure/crash/shadow/dedup/rollback六门禁；准备绑定实际Unit/build/generation/窗口/evidence的切换/回滚命令。生产身份/迁移/调用/owner切换必须有具体批准，测试不能替代自然观察或远端接受。全局W18–W21和余下51 Unit仍保留，不以本Unit覆盖。
+依赖实际本地注册、必达渠道/authority及W15/W16本地就绪检查与任务锁接线，不再依赖复杂可信身份认证。复用已有强投递/重验/finalizer，不将弱观察提升；同业务事务提交独立cursor、Completed与稳定事件。接受后仅恢复最终化，Unknown隔离、Rejected只按显式授权新attempt。完成unit/failure/crash/shadow/dedup/rollback六门禁；准备绑定实际Unit/build/generation/窗口/evidence的切换/回滚命令。部署迁移、实际渠道调用和执行者切换仍须用户明确授权，测试不能替代自然观察或远端接受。全局W18–W21按单用户调整后的范围及余下51 Unit仍保留，不以本Unit覆盖。
 
 ## 回退与记录
 
