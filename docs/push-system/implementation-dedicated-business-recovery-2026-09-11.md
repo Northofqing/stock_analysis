@@ -1,6 +1,6 @@
-# P-01 / N-02 专用业务恢复接线：实施中
+# P-01 / N-02 专用业务恢复接线：本任务完成
 
-日期：2026-09-11。状态：修后10项专用测试通过，另37项相关代码未变的回归保留通过证据；三处测试运行失败均已修正并覆盖验证，最终Clippy相对基线无新增诊断。源码已提交为 `3fed7aa7990cba79aebdb248017b1c5dfb21839f`，独立规格/质量审查进行中。隔离分支为 `codex/push-reliability-20260905`，开发 BASE 为 `6836d18d4b4d1c6377eb10a981f3533258c8784a`；不能据此关闭完整 Task、W16 或 Unit 迁移。
+日期：2026-09-11。状态：本任务完成；修后10项专用测试通过，另37项相关代码未变的回归保留通过证据；三处测试运行失败均已修正并覆盖验证，最终Clippy相对基线无新增诊断。源码为 `3fed7aa7990cba79aebdb248017b1c5dfb21839f`，独立规格/质量审查通过，0项严重/重要问题；2项低优先级建议保留，3项跨任务补核已由主控完成。隔离分支为 `codex/push-reliability-20260905`，开发 BASE 为 `6836d18d4b4d1c6377eb10a981f3533258c8784a`；这不关闭完整W16或Unit迁移。
 
 ## 这次实际接什么
 
@@ -52,8 +52,16 @@ N02的 `root_links` 是固定目录能力时保留的观察值，不是每次当
 | event/mod.rs | `d4b1588c3b03981de317edfd6d52917e524cfaf48571d6b3875d84045e7d2fa5` |
 | activation_dedicated_business_effect_tests.rs | `8d1fea364a76058e531268b1e057f23e85542cc91033144848faadafff8b8f32` |
 
-## 本任务还没完成什么
+## 独立审查与主控补核
 
-独立Spec/Quality审查与审查中不可直接验证事项的核对；如发现问题，按实际改动补验证并限定复审。上述测试与源码提交不能代替独立审查或生产部署证据。
+独立审查覆盖固定 `6836d18..3fed7aa` 差异、实际失败/修后测试记录与Clippy诊断比较，结论为Spec compliant / Task quality Approved。审查没有重跑测试或扩大到生产。主控另完成以下补核：
+
+- P01连接级对象防护、同日once claim、Scheduled/Compensation及专用字段映射：复核当前真实读取入口；coordinator相对[已审阅的运行期防护](implementation-durable-runtime-schema-guard-2026-09-10.md)源码8ee1e13未变，保留[不确定终态读取](implementation-recovered-uncertain-read-2026-09-08.md)与本次W13/W19回归证据，不重新宣称全面生产认证。
+- W09/finalizer、完整业务链、worker寿命、Replay/Unresolved：沿用[W16已验收的T4B/T4C/T4D](implementation-w16-results-2026-09-08.md)与本次实际进程证据。reconciler/finalizer/IPC相对667ee4a未变；intent_store后来只增加SLA/库存读取接口，主控已核对对应差异，旧写入/全链算法未被改写。生产身份和broker拒绝入口也已重新核对。
+- 文档、格式与差异：公开材料已纳管，链接、最终12源文件摘要、定向rustfmt和暂存/非暂存差异检查通过；这是主控完成的检查，不归为审查者执行。
+
+两项低优先级建议保留到后续整体审查：P01进程测试可从attempt/result计数增强为稳定排序的完整逻辑行快照；43条测试/188条Clippy既有告警仍需单独治理。当前未发现恢复路径写入source，但不把计数断言夸大为全字段不变证明。
+
+## 完整目标仍未完成的范围
 
 生产身份和 broker 构造继续拒绝，测试装配不提供生产权限。这一恢复任务也不交付专用物理发送、P01 once claim/N02 settle 等具体 Unit 完成标记、全库启动恢复、完整四角色切换或52 Unit迁移。[完整 W16 剩余范围](implementation-w16-results-2026-09-08.md#完整剩余范围)及[全目标迁移证据边界](remaining-migration-evidence-2026-09-08.md)保持有效。

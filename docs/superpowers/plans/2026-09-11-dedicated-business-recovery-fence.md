@@ -1,6 +1,6 @@
 # P01/N02 专用终态接入 W16 业务恢复 worker
 
-日期：2026-09-11。状态：实施中。BASE=`6836d18d4b4d1c6377eb10a981f3533258c8784a`。
+日期：2026-09-11。状态：本Task完成；源码3fed7aa，10项修后专用验证＋37项相关代码未变的回归通过，独立Spec/Quality通过，3项主控补核完成、2项Minor保留。BASE=`6836d18d4b4d1c6377eb10a981f3533258c8784a`。完整W16与总目标仍未完成。
 
 依据：[W16 设计](../specs/2026-09-08-push-foundation-w16-activation-design.md)与[完整实施计划 T4](2026-09-08-push-foundation-w16-activation.md#task-4--t4-四类-actor-的共同-fence-与真实-owner-adapter)。当前实际 BusinessEffect 只消费 Generic authority；两种专用 reader 已由 W13/W19 使用，但尚未进入该 worker 的真实重查、业务写入与完成证明链。本计划完成这一具体效果接线，不缩减完整 W16/W15–W21/52 Unit 目标。
 
