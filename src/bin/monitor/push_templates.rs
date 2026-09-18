@@ -402,12 +402,26 @@ impl Intent {
     }
 }
 
+/// 价格和成本只能描述盈亏；亏损本身不构成加仓证据。
+pub fn holding_snapshot_assessment(price: f64, cost: f64) -> (Intent, String) {
+    if !price.is_finite() || !cost.is_finite() || price <= 0.0 || cost <= 0.0 {
+        return (Intent::Hold, "价格或成本无效，暂不能形成操作建议".into());
+    }
+    let pnl = (price / cost - 1.0) * 100.0;
+    let label = if pnl < 0.0 { "浮亏" } else { "浮盈" };
+    if price <= cost * 0.92 {
+        (Intent::Reduce, format!("{label} {:.1}%，已低于成本8%参考风险线；需结合趋势复核减仓条件，不因亏损自动加仓", pnl.abs()))
+    } else {
+        (Intent::Hold, format!("{label} {:.1}%；当前仅有价格和成本，缺少支持加仓或止盈的趋势证据", pnl.abs()))
+    }
+}
+
 /// T-03 持仓操作建议
 /// v12 §14.1 T-03 HoldingPlan 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) -> String {
     let hhmm = params.hhmm;
     let mut out = format!(
-        "{}\n🎯 持仓建议 {}({})（{}）\n动作倾向: {} | 现价{} 成本{} 可用{}股",
+        "{}\n🎯 持仓建议 {}({})（{}）\n动作倾向: {} | 现价{} 成本{} 可用{}",
         banner.render(),
         params.name,
         params.code,
@@ -415,7 +429,7 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
         params.intent.label(),
         fmt_price(params.price),
         fmt_price(params.cost),
-        params.avail,
+        params.avail.map(|quantity| format!("{quantity}股")).unwrap_or_else(|| "未核实".into()),
     );
     if let Some((lo, hi)) = params.reduce_zone {
         out.push_str(&format!(
@@ -426,9 +440,9 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
     }
     out.push_str(&format!(
         "\n支撑{} | 压力{} | 硬止损{}",
-        fmt_price(params.support),
-        fmt_price(params.pressure),
-        fmt_price(params.stop),
+        params.support.map(fmt_price).unwrap_or_else(|| "暂无".into()),
+        params.pressure.map(fmt_price).unwrap_or_else(|| "暂无".into()),
+        params.stop.map(fmt_price).unwrap_or_else(|| "暂无".into()),
     ));
     if !params.invalidations.is_empty() {
         out.push_str("\n无效条件:");
@@ -451,11 +465,11 @@ pub struct HoldingPlanParams<'a> {
     pub intent: Intent,
     pub price: f64,
     pub cost: f64,
-    pub avail: u32,
+    pub avail: Option<u32>,
     pub reduce_zone: Option<(f64, f64)>,
-    pub support: f64,
-    pub pressure: f64,
-    pub stop: f64,
+    pub support: Option<f64>,
+    pub pressure: Option<f64>,
+    pub stop: Option<f64>,
     pub invalidations: &'a [String],
     pub reasons: &'a [String],
 }
@@ -535,6 +549,7 @@ pub fn render_t0_advice(banner: &BannerCtx, p: T0AdviceParams<'_>) -> String {
          触发: {}\n\
          失效: {}\n\
          说明: 总持仓{}股；观察腿由用户确认持仓计算，不代表券商已验证可卖数量；执行前必须另取≤30秒券商可用持仓并校验T+1。\n\
+         未读取卖出成交回执，接回状态仅表示价格条件；区间按常规涨跌幅估算校验，执行前核实当日实际限制。\n\
          仅观察建议，不自动下单。",
         banner.render(),
         plan.name,
@@ -2793,24 +2808,77 @@ fn fetch_realtime_quote_batch_strict(
 /// 实时行情 5s 红线 (BR-218) 盘中不变; 收市后 (21:00 晚间装配) 最后成交
 /// 时间必然超龄, 但价格=当日收盘价, 走 settled-close 准入
 /// (source_at 日期==trading_date 且该时段已收盘; 盘中误调 fail-closed)。
-fn fetch_settled_close_batch_strict(
-    codes: &[&str],
+///
+/// 2026-09-02 修复 (R-07 只剩做T持仓根因): settled_close_quotes 在 remote
+/// transport 下是 fail-closed stub (恒 Err) → 9/1+9/2 龙虎榜/涨停链候选
+/// 全部因「缺少同日收盘价」被 BR-222 排除。settled-close 通道本身已死,
+/// 收盘价改走 HistoricalBarsGateway (tdx-smart 日线, 与 15:05 归因修复
+/// 同源): bar.date == trading_date 才是同日收盘价, BR-222 红线 2.2 不变。
+/// 任一 code 缺目标日 bar → 整批 Err (与旧 project_settled_close_records
+/// 批不全即错的 fail-closed 语义一致) → 调用方回退 closes 视图。
+async fn fetch_same_day_closes(
+    codes: &[String],
     trading_date: chrono::NaiveDate,
-) -> Result<
-    std::collections::HashMap<String, stock_analysis::data_gateway::RealtimeMarketQuote>,
-    String,
-> {
+) -> Result<std::collections::HashMap<String, f64>, String> {
     if codes.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let requested: Vec<String> = codes.iter().map(|code| (*code).to_string()).collect();
-    let batch = stock_analysis::data_gateway::MarketDataGateway::new()
-        .settled_close_quotes(&requested, trading_date)
-        .map_err(|error| format!("盘后收盘快照 Gateway 不可用: {error}"))?;
-    if batch.is_verified_empty() {
-        return Err("盘后收盘快照 Gateway 返回不允许的 verified-empty".to_string());
+    let gateway = stock_analysis::data_gateway::HistoricalBarsGateway::new();
+    let mut closes = std::collections::HashMap::with_capacity(codes.len());
+    for code in codes {
+        let admitted = gateway
+            .required_daily_bars_async(code, 5)
+            .await
+            .map_err(|error| format!("历史日线不可用 (R-07 {trading_date} 收盘快照): {error}"))?;
+        let bar = admitted
+            .records()
+            .iter()
+            .find(|bar| bar.date == trading_date)
+            .ok_or_else(|| {
+                let dates: Vec<String> = admitted
+                    .records()
+                    .iter()
+                    .map(|bar| bar.date.to_string())
+                    .collect();
+                format!(
+                    "{code}: 目标日 {trading_date} 无日线记录 (可用: {})",
+                    dates.join(",")
+                )
+            })?;
+        closes.insert(code.clone(), bar.close);
     }
-    project_settled_close_records(&requested, batch.records())
+    Ok(closes)
+}
+
+/// R-07 名称补齐 (display-only): BR-225 证券身份统一 Gateway
+/// (news_ai BR-250 卡片标的名同源, 24/7 静态目录, 无收盘/新鲜度门)。
+/// 目录不可用或缺 code → 该 code 缺席 → 调用方回退 closes 视图 → code,
+/// 名称缺失不阻断候选 (与 BR-250 降级仅代码同一容错哲学)。
+async fn fetch_security_names(
+    codes: &[String],
+) -> std::collections::HashMap<String, String> {
+    if codes.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    use stock_analysis::data_gateway::{GatewayBatch, MarketCapabilitiesGateway};
+    let batch = match MarketCapabilitiesGateway::new()
+        .security_identities(codes)
+        .await
+    {
+        Ok(batch) => batch,
+        Err(error) => {
+            log::warn!("[R-07][BR-233] 证券身份目录不可用, 名称回退 closes/code: {error}");
+            return std::collections::HashMap::new();
+        }
+    };
+    let records = match batch {
+        GatewayBatch::Available { records, .. } => records,
+        GatewayBatch::VerifiedEmpty(_) => return std::collections::HashMap::new(),
+    };
+    records
+        .into_iter()
+        .map(|identity| (identity.code.clone(), identity.name.clone()))
+        .collect()
 }
 
 /// BR-164/BR-233: preserve the exact requested identity set when projecting an
@@ -8156,32 +8224,43 @@ async fn dispatch_tomorrow_watch_after_preflight(
                     .partial_cmp(&a.ranking_net_amount_yuan)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
-            // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
+            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间必然超龄,
+            // 5s 红线不可用)。2026-09-02 修复: settled-close 通道 remote stub
+            // 已死, 收盘价改走 tdx 日线 (bar.date==trading_date), 名称走
+            // BR-225 证券身份目录 (display-only)。
             // 失败/缺失 → closes 视图兜底；仍缺失则排除 (fail-closed, 红线 2.2)。
             let strong_codes: Vec<String> = strong
                 .iter()
                 .take(5)
                 .map(|record| record.code.clone())
                 .collect();
-            let strong_quotes = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = strong_codes.iter().map(|code| code.as_str()).collect();
-                fetch_settled_close_batch_strict(&refs, trading_date)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
+            let (strong_closes, strong_names) = tokio::join!(
+                fetch_same_day_closes(&strong_codes, trading_date),
+                fetch_security_names(&strong_codes),
+            );
             for record in strong.iter().take(5) {
-                let resolved = strong_quotes
-                    .as_ref()
-                    .ok()
-                    .and_then(|quotes| quotes.get(&record.code))
-                    .map(|quote| (quote.name.clone(), quote.price))
-                    .or_else(|| {
-                        closes
+                let resolved = match strong_closes {
+                    Ok(ref closes_map) => closes_map.get(&record.code).map(|close| {
+                        let name = strong_names
                             .get(&record.code)
-                            .map(|(name, close)| (name.clone(), *close))
-                    })
-                    .filter(|(_, price)| price.is_finite() && *price > 0.0);
+                            .cloned()
+                            .or_else(|| closes.get(&record.code).map(|(name, _)| name.clone()))
+                            .unwrap_or_else(|| record.code.clone());
+                        (name, *close)
+                    }),
+                    Err(ref error) => {
+                        log::warn!(
+                            "[R-07][BR-233] 龙虎榜收盘价拉取失败, 回退收盘估值视图: {error}"
+                        );
+                        None
+                    }
+                }
+                .or_else(|| {
+                    closes
+                        .get(&record.code)
+                        .map(|(name, close)| (name.clone(), *close))
+                })
+                .filter(|(_, price)| price.is_finite() && *price > 0.0);
                 let Some((name, base)) = resolved else {
                     log::warn!(
                         "[R-07][BR-222] 龙虎榜 {} 缺少 {} 同日有限正收盘价, 排除该条目",
@@ -8236,38 +8315,45 @@ async fn dispatch_tomorrow_watch_after_preflight(
             };
             let chains = stock_analysis::market_analyzer::limit_chain_review::aggregate(&input);
             // BR-233: 盘后收盘快照补名补价; leader_name 优先, 缺失才查行情。
+            // 2026-09-02 修复同龙虎榜: 收盘价走 tdx 日线, 名称走身份目录。
             let leader_codes: Vec<String> = chains
                 .iter()
                 .take(3)
                 .filter(|chain| chain.leader_name.is_empty())
                 .map(|chain| chain.leader_code.clone())
                 .collect();
-            let leader_quotes = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = leader_codes.iter().map(|code| code.as_str()).collect();
-                fetch_settled_close_batch_strict(&refs, trading_date)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("R-07 涨停链收盘快照 join 失败: {error}")));
+            let (leader_closes, leader_names) = tokio::join!(
+                fetch_same_day_closes(&leader_codes, trading_date),
+                fetch_security_names(&leader_codes),
+            );
+            let leader_close_view = leader_closes.as_ref().ok();
             for chain in chains.iter().take(3) {
-                // name 优先级 leader_name → 实时行情 → 收盘估值视图 → code
+                // name 优先级 leader_name → 身份目录 → 收盘估值视图 → code
                 let name = if !chain.leader_name.is_empty() {
                     chain.leader_name.clone()
-                } else {
-                    leader_quotes
-                        .as_ref()
-                        .ok()
-                        .and_then(|quotes| quotes.get(&chain.leader_code))
-                        .map(|quote| quote.name.clone())
+                } else if leader_close_view.is_some() {
+                    leader_names
+                        .get(&chain.leader_code)
+                        .cloned()
                         .or_else(|| closes.get(&chain.leader_code).map(|(name, _)| name.clone()))
                         .unwrap_or_else(|| chain.leader_code.clone())
+                } else {
+                    closes
+                        .get(&chain.leader_code)
+                        .map(|(name, _)| name.clone())
+                        .unwrap_or_else(|| chain.leader_code.clone())
                 };
-                let base = leader_quotes
-                    .as_ref()
-                    .ok()
-                    .and_then(|quotes| quotes.get(&chain.leader_code))
-                    .map(|quote| quote.price)
-                    .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
-                    .filter(|price| price.is_finite() && *price > 0.0);
+                let base = match leader_closes {
+                    Ok(ref closes_map) => closes_map.get(&chain.leader_code).copied(),
+                    Err(ref error) => {
+                        log::warn!(
+                            "[R-07][BR-233] 涨停链收盘价拉取失败, 回退收盘估值视图: {error}"
+                        );
+                        None
+                    }
+                }
+                .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
+                .filter(|price| price.is_finite() && *price > 0.0);
                 let Some(base) = base else {
                     log::warn!(
                         "[R-07][BR-222] 涨停链龙头 {} 缺少 {} 同日有限正收盘价, 排除该条目",
@@ -15467,11 +15553,11 @@ pub fn build_test_template_catalog(
                 intent: Intent::Reduce,
                 price: 10.80,
                 cost: 9.50,
-                avail: 500,
+                avail: Some(500),
                 reduce_zone: Some((10.70, 10.95)),
-                support: 10.20,
-                pressure: 11.00,
-                stop: 9.90,
+                support: Some(10.20),
+                pressure: Some(11.00),
+                stop: Some(9.90),
                 invalidations: &invalidations,
                 reasons: &reasons,
             },
@@ -17184,6 +17270,22 @@ mod tests {
     // ---- T-03 持仓建议 ----
 
     #[test]
+    fn holding_snapshot_does_not_turn_losses_into_add_orders() {
+        assert_eq!(holding_snapshot_assessment(9.5, 10.0).0, Intent::Hold);
+        assert_eq!(holding_snapshot_assessment(12.92, 17.867).0, Intent::Reduce);
+        assert_eq!(holding_snapshot_assessment(11.0, 10.0).0, Intent::Hold);
+        let (intent, reason) = holding_snapshot_assessment(9.8, 10.0);
+        let text = render_holding_plan(&banner_normal(), HoldingPlanParams {
+            name: "测试", code: "TEST_CODE_000001", hhmm: "14:00", intent,
+            price: 9.8, cost: 10.0, avail: None, reduce_zone: None,
+            support: None, pressure: None, stop: None, invalidations: &[], reasons: &[reason],
+        });
+        assert!(text.contains("浮亏 2.0%"));
+        assert!(text.contains("支撑暂无 | 压力暂无 | 硬止损暂无"));
+        assert!(text.contains("可用未核实"));
+    }
+
+    #[test]
     fn t03_holding_plan_full() {
         let s = render_holding_plan(
             &banner_normal(),
@@ -17194,11 +17296,11 @@ mod tests {
                 intent: Intent::Reduce,
                 price: 12.30,
                 cost: 11.80,
-                avail: 3000,
+                avail: Some(3000),
                 reduce_zone: Some((12.45, 12.60)),
-                support: 11.95,
-                pressure: 12.70,
-                stop: 11.95,
+                support: Some(11.95),
+                pressure: Some(12.70),
+                stop: Some(11.95),
                 invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },
@@ -17226,11 +17328,11 @@ mod tests {
                 intent: Intent::Hold,
                 price: 10.0,
                 cost: 9.5,
-                avail: 1000,
+                avail: Some(1000),
                 reduce_zone: None,
-                support: 9.6,
-                pressure: 10.5,
-                stop: 9.4,
+                support: Some(9.6),
+                pressure: Some(10.5),
+                stop: Some(9.4),
                 invalidations: &[],
                 reasons: &["暂无催化".to_string()],
             },
@@ -20399,11 +20501,11 @@ mod tests {
                 intent: Intent::Reduce,
                 price: 12.30,
                 cost: 11.80,
-                avail: 3000,
+                avail: Some(3000),
                 reduce_zone: Some((12.45, 12.60)),
-                support: 11.95,
-                pressure: 12.70,
-                stop: 11.95,
+                support: Some(11.95),
+                pressure: Some(12.70),
+                stop: Some(11.95),
                 invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },

@@ -62,6 +62,8 @@ pub struct PaperSellResult {
     /// 净收益率（未扣往返交易成本，展示用）
     pub return_rate_pct: f64,
     pub reason: String,
+    pub quote_observed_at: chrono::DateTime<chrono::Utc>,
+    pub executed_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ============================================================================
@@ -101,14 +103,14 @@ fn store_indicators(code: &str, indicators: Indicators) {
     }
 }
 
-/// ATR14：最近 14 个交易日 high−low 的均值（K 线降序，最新在前）。
+/// ATR14：最近14日真实波幅的简单均值，单位为元（最新K线在前）。
 fn atr14(data: &[KlineData]) -> Option<f64> {
-    let window = data.iter().take(14).collect::<Vec<_>>();
-    if window.len() < 14 {
-        return None;
-    }
-    let sum: f64 = window.iter().map(|bar| bar.high - bar.low).sum();
-    Some(sum / 14.0)
+    let bars = data
+        .iter()
+        .take(15)
+        .map(|bar| (bar.high, bar.low, bar.close))
+        .collect::<Vec<_>>();
+    crate::monitor::risk::average_true_range(&bars, 14)
 }
 
 /// 拉取并缓存日K指标（MA5/20/60、ATR14、布林+MACD）。
@@ -134,6 +136,50 @@ fn fetch_indicators(code: &str) -> Result<Indicators, String> {
     };
     store_indicators(code, indicators.clone());
     Ok(indicators)
+}
+
+/// 买入前使用与卖出相同的日K条件；持有期规则不会在入场时触发。
+pub struct PaperEntryConditions(Indicators);
+
+impl PaperEntryConditions {
+    pub fn check(
+        &self,
+        code: &str,
+        name: &str,
+        price: f64,
+        today: chrono::NaiveDate,
+    ) -> Result<(), String> {
+        let indicators = &self.0;
+        if !price.is_finite()
+            || price <= 0.0
+            || [indicators.ma20, indicators.ma60, indicators.atr]
+                .iter()
+                .any(|value| value.is_none_or(|v| !v.is_finite() || v <= 0.0))
+        {
+            return Err("入场缺少有效价格/MA20/MA60/ATR证据".into());
+        }
+        let eval = SellEvaluation {
+            code,
+            name,
+            buy_price: price,
+            buy_date: today,
+            current_price: price,
+            ma5: indicators.ma5,
+            ma20: indicators.ma20,
+            ma60: indicators.ma60,
+            atr: indicators.atr,
+            boll_macd: Some(&indicators.boll_macd),
+            today,
+        };
+        if let Some(reason) = evaluate_sell_rules(&eval) {
+            return Err(format!("当前价格已触发退出条件，拒绝新买入: {reason}"));
+        }
+        Ok(())
+    }
+}
+
+pub fn entry_conditions(code: &str) -> Result<PaperEntryConditions, String> {
+    fetch_indicators(code).map(PaperEntryConditions)
 }
 
 // ============================================================================
@@ -351,20 +397,26 @@ fn in_trading_session() -> bool {
 
 /// 盘中卖出扫描（30s tick）：带交易时段守卫。
 pub fn scan_and_sell(risk_context: PaperRiskContext) -> Result<Vec<PaperSellResult>, String> {
-    if !in_trading_session() {
-        return Ok(Vec::new());
-    }
-    scan_and_sell_inner(risk_context)
+    scan_and_sell_streaming(risk_context, false, |_| {})
 }
 
 /// 收盘后卖出扫描（15:30 evening_review）：无交易时段守卫。
 pub fn scan_and_sell_post_close(
     risk_context: PaperRiskContext,
 ) -> Result<Vec<PaperSellResult>, String> {
-    scan_and_sell_inner(risk_context)
+    scan_and_sell_streaming(risk_context, true, |_| {})
 }
 
-fn scan_and_sell_inner(risk_context: PaperRiskContext) -> Result<Vec<PaperSellResult>, String> {
+/// 每笔成交立即交给通知消费者，不等待其余持仓的行情/日K请求。
+/// callback 只处理已经落库的 Filled；失败仍保留订单审计，不改变只推成交约定。
+pub fn scan_and_sell_streaming(
+    risk_context: PaperRiskContext,
+    post_close: bool,
+    mut on_fill: impl FnMut(PaperSellResult),
+) -> Result<Vec<PaperSellResult>, String> {
+    if !post_close && !in_trading_session() {
+        return Ok(Vec::new());
+    }
     let today = chrono::Local::now().date_naive();
     let positions = aggregate_open_positions_at(today)?;
     if positions.is_empty() {
@@ -373,7 +425,10 @@ fn scan_and_sell_inner(risk_context: PaperRiskContext) -> Result<Vec<PaperSellRe
     let mut sold = Vec::new();
     for pos in &positions {
         match evaluate_and_sell(pos, risk_context, today) {
-            Ok(Some(result)) => sold.push(result),
+            Ok(Some(result)) => {
+                on_fill(result.clone());
+                sold.push(result);
+            }
             Ok(None) => {}
             Err(error) => warn!("[paper_sell] {} 评估失败: {error}", pos.code),
         }
@@ -395,18 +450,18 @@ fn evaluate_and_sell(
         ));
     }
 
+    // 日K请求可能较慢，先准备指标，再读取执行报价。
+    let indicators = fetch_indicators(&pos.code).map_err(|error| {
+        warn!("[paper_sell] {error}，本 tick 跳过");
+        error
+    })?;
+
     // 2. 实时价（BR-218 5s 门；超龄 fail-closed，下 tick 重试）
     let quote = crate::broker::execution_quote(&pos.code).map_err(|error| {
         warn!(
             "[paper_sell] {} 实时价不可用，本 tick 跳过: {error}",
             pos.code
         );
-        error
-    })?;
-
-    // 3. 日K指标（15min 缓存）
-    let indicators = fetch_indicators(&pos.code).map_err(|error| {
-        warn!("[paper_sell] {error}，本 tick 跳过");
         error
     })?;
 
@@ -478,6 +533,8 @@ fn evaluate_and_sell(
         price: quote.price,
         return_rate_pct: gross_pct,
         reason,
+        quote_observed_at: quote.observed_at,
+        executed_at: chrono::Utc::now(),
     }))
 }
 
@@ -842,8 +899,27 @@ mod tests {
     }
 
     #[test]
+    fn entry_refuses_a_price_already_below_structural_exit() {
+        let indicators = Indicators {
+            ma5: Some(52.0),
+            ma20: Some(56.21),
+            ma60: Some(57.0),
+            atr: Some(2.0),
+            boll_macd: crate::strategy::detect_boll_macd_signal(&[]),
+        };
+        let conditions = PaperEntryConditions(indicators);
+        let error = conditions
+            .check("TEST_CODE_300346", "测试", 51.80, date(2026, 9, 8))
+            .unwrap_err();
+        assert!(error.contains("退出条件"));
+        assert!(conditions
+            .check("TEST_CODE_300346", "测试", 58.0, date(2026, 9, 8))
+            .is_ok());
+    }
+
+    #[test]
     fn atr14_computes_window_mean() {
-        let bars: Vec<KlineData> = (0..14)
+        let bars: Vec<KlineData> = (0..15)
             .map(|_| KlineData {
                 date: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
                 open: 10.0,
@@ -877,7 +953,7 @@ mod tests {
                 adjust: crate::data_provider::AdjustType::None,
             })
             .collect();
-        // 每根 high-low = 2.0，14 根均值 = 2.0
+        // 15根K线提供14个真实波幅，均为2元。
         assert_eq!(atr14(&bars), Some(2.0));
         let short: Vec<KlineData> = bars[..5].to_vec();
         assert_eq!(atr14(&short), None);

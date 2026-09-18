@@ -106,6 +106,10 @@ pub enum PushKind {
     PaperTrade,
     /// 虚拟盘卖出 (BR-234, ℹ️ 5min批, 默认降级) [MVP-1]
     PaperSell,
+    /// 虚拟盘买入执行 (2026-09-03, ℹ️ 5min批, 默认降级, 仅 Filled 卡)
+    PaperBuy,
+    /// 系统死信哨兵 (P0 2026-09-03: watchdog_deadline 逾期触发, 幂等 1次/轨道/日)
+    Watchdog,
     /// 持仓快照过期提醒 (任务#3, ℹ️ 每日1次, 默认降级) [MVP-1]
     SnapshotStale,
     /// 虚拟盘绩效归因日推 (交付物 A, 每日 1 次, 默认出声) [2026-08-20]
@@ -362,6 +366,8 @@ impl PushKind {
                 | PushKind::ForbiddenOps
                 | PushKind::PaperTrade
                 | PushKind::PaperSell
+                | PushKind::PaperBuy
+                | PushKind::Watchdog
                 | PushKind::SnapshotStale
                 | PushKind::CloseCall
                 | PushKind::ReviewMarket
@@ -400,6 +406,8 @@ impl PushKind {
             PushKind::PaperTrade => Some(300),
             // 5 min / 票 (BR-234 虚拟盘卖出)
             PushKind::PaperSell => Some(300),
+            // 5 min / 票 (2026-09-03 虚拟盘买入执行卡, 同 PaperSell)
+            PushKind::PaperBuy => Some(300),
             // 每日快照提醒 (调用方已按日去重)
             PushKind::SnapshotStale => Some(300),
             // 1次/日
@@ -474,6 +482,7 @@ impl PushKind {
             | ForbiddenOps
             | PaperTrade
             | PaperSell
+            | PaperBuy
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -519,6 +528,8 @@ impl PushKind {
             PushKind::ForbiddenOps => "禁止操作",
             PushKind::PaperTrade => "虚拟盘",
             PushKind::PaperSell => "虚拟盘卖出",
+            PushKind::PaperBuy => "虚拟盘买入",
+            PushKind::Watchdog => "系统哨兵",
             PushKind::SnapshotStale => "快照过期提醒",
             PushKind::CloseCall => "尾盘决策",
             PushKind::ReviewMarket => "盘面走向",
@@ -855,6 +866,28 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::PerTicket,
             label: "虚拟盘卖出",
             stable_template_id: "papersell_v1",
+        },
+    ),
+    // ============== 2026-09-03: 虚拟盘买入执行卡 ==============
+    (
+        PushKind::PaperBuy,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "虚拟盘买入",
+            stable_template_id: "paperbuy_v1",
+        },
+    ),
+    // ============== P0 (2026-09-03): 系统死信哨兵 ==============
+    (
+        PushKind::Watchdog,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: None,
+            cooldown_scope: CooldownScope::Global,
+            label: "系统哨兵",
+            stable_template_id: "watchdog_v1",
         },
     ),
     // ============== 任务#3: 持仓快照过期提醒 ==============
@@ -3100,6 +3133,7 @@ fn requires_ticket_code(kind: PushKind) -> bool {
             | ForbiddenOps
             | PaperTrade
             | PaperSell
+            | PaperBuy
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -6749,14 +6783,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 19 rows 完整性 (BR-234 + 任务#3 + R-12 + R-13) ==============
+    // ============== v17.x: DISPATCH_TABLE 完整性 (BR-234 + 任务#3 + R-12 + R-13 + PaperBuy + Watchdog) ==============
 
     #[test]
-    fn dispatch_table_size_is_twenty() {
+    fn dispatch_table_size() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            21,
-            "v17.x DISPATCH_TABLE 应 21 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A + 1 G5b)"
+            23,
+            "v17.x DISPATCH_TABLE 应 23 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A + 1 G5b + 1 PaperBuy + 1 Watchdog)"
         );
     }
 
@@ -6771,7 +6805,8 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 + 任务#3 1 + R-12 1 = 18
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 + 任务#3 1 +
+        // R-12 1 + R-13 1 + 交付物A 1 + G5b 1 + PaperBuy 1 + Watchdog 1 = 22
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -6789,12 +6824,14 @@ mod tests {
             PushKind::BlockTradeIntradayConfirm,
             PushKind::BlockTradePriceRange,
             PushKind::PaperSell,
+            PushKind::PaperBuy,
+            PushKind::Watchdog,
             PushKind::SnapshotStale,
             PushKind::ReviewBacktest,
             PushKind::WatchlistTracking,
             PushKind::G5bAttribution,
         ];
-        assert_eq!(expected.len(), 20);
+        assert_eq!(expected.len(), 22);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }

@@ -4,6 +4,8 @@
 >
 > **主轴：** 把现有 A 股监控系统闭合为可复现的研究—模拟交易平台，再以独立证据申请受控实盘能力。
 
+> **2026-09-02 覆盖审计：** 当前实现吸收了部分回测、paper ledger、归因和预测回填能力，但 v18.0 的四个共同领域合同仍未按原设计落地。以 [项目架构蓝图 §25](../Project_Architecture_Blueprint.md#25-v18x--v19x-设计覆盖审计与落位) 的 `CURRENT/PARTIAL/PROPOSED/CONFLICT` 裁决为准。
+
 ## 推荐入口
 
 [v18.0 量化平台闭环中文整合设计](v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md) 是当前中文权威入口。它统一了评估结论、总体架构、四核心模块、实施路线、Gate 和回滚要求。
@@ -23,10 +25,10 @@ v17.x 继续完成事件与推送迁移；v18.x 不替代该工作。v18.x 为�
 | | | |
 | **战略设计 (v18.1-v18.5)** | | |
 | [v18.1 战略差距分析](v18.1-strategic-gap-analysis.md) | 对接量化机构缺什么？真正挣钱缺什么？ | 新增 |
-| [v18.2 回测体系设计](v18.2-backtest-direction.md) | 事件驱动引擎、成本模型、4层回测架构 | 新增 |
-| [v18.3 回测引擎实现](v18.3-backtest-implementation.md) | 引擎核心、事件类型、成本/涨跌停 ~1150行 Rust | 新增 |
-| [v18.4 因子库设计](v18.4-factor-zoo-design.md) | 55因子×7类×5种回测模式，polars批量引擎 | 新增 |
-| [v18.5 生产就绪设计](v18.5-production-readiness-design.md) | Gateway联邦、熔断、监控、API、部署 | 新增 |
+| [v18.2 回测体系设计](v18.2-backtest-direction.md) | 文件标题实际为 v20.x；事件驱动引擎、成本模型、4层回测架构 | 误归档的未来提案 |
+| [v18.3 回测引擎实现](v18.3-backtest-implementation.md) | 文件标题实际为 v20.x；约 1150 行实现草案，当前无 `src/backtest/` | 误归档的未来提案 |
+| [v18.4 因子库设计](v18.4-factor-zoo-design.md) | 文件标题实际为 v20.x；55 因子×7 类×5 种回测模式 | 误归档的未来提案 |
+| [v18.5 生产就绪设计](v18.5-production-readiness-design.md) | 文件标题实际为 v20.0；Gateway 联邦、API、Redis/K8s 等扩容草案 | 误归档的未来提案 |
 
 ## 不可妥协的边界
 

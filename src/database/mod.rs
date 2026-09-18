@@ -2415,6 +2415,8 @@ pub mod selection_v2_read_model;
 pub mod selection_v2_repository;
 pub mod user_account_summary;
 pub mod user_position_snapshot;
+// P0 死信哨兵 (2026-09-03)
+pub mod watchdog_deadline;
 
 /// BR-180 migration operator façade.
 ///
@@ -3357,6 +3359,8 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // BR-172: NewsAI assessments plus exact reservation/sink/delivery/
         // prediction-link events are independently immutable SHA-256 chains.
         news_ai::create_schema(&mut *conn)?;
+        // P0 (2026-09-03): 死信哨兵 deadline 注册表 (可更新 — 满足/触发都改行)。
+        watchdog_deadline::create_schema(&mut *conn)?;
 
         // ledger 表（v3 每日净值快照）
         diesel::sql_query(

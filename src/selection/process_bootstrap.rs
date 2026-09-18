@@ -288,18 +288,25 @@ fn classify_parsed_invocation(
             parsed,
         };
     }
+    let verdict = crate::selection::activation_gate::evaluate_production_selection_v2_activation();
+    let selection = match verdict {
+        crate::selection::activation_gate::SelectionV2ActivationVerdict::Enabled => {
+            SelectionCapabilityState::Enabled
+        }
+        crate::selection::activation_gate::SelectionV2ActivationVerdict::Disabled { reason_code } => {
+            SelectionCapabilityState::Disabled { reason_code }
+        }
+    };
+    // BR-183 dual-gate (2026-09-03): the config-domain gate verdict above is
+    // final; the executable domain only reports drift (WARN banner) — a stale
+    // banner domain must never flip the verdict, and a fresh one cannot
+    // override Disabled. Spawn is a no-op until the activation file carries
+    // expected_executable_revision.
+    crate::selection::config_activation_v2::spawn_executable_drift_banner();
     BoundSelectionProcess::Operational {
         generation: 1,
         parsed,
-        selection:
-            match crate::selection::activation_gate::evaluate_production_selection_v2_activation() {
-                crate::selection::activation_gate::SelectionV2ActivationVerdict::Enabled => {
-                    SelectionCapabilityState::Enabled
-                }
-                crate::selection::activation_gate::SelectionV2ActivationVerdict::Disabled {
-                    reason_code,
-                } => SelectionCapabilityState::Disabled { reason_code },
-            },
+        selection,
     }
 }
 

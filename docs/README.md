@@ -11,6 +11,8 @@
 
 | 文档 | 用途 |
 | --- | --- |
+| [`Project_Architecture_Blueprint.md`](Project_Architecture_Blueprint.md) | Implementation-Ready 项目架构蓝图；§24 为全部推送项逐项审计、方案与周期，§25 为 v18/v19 设计覆盖、冲突和落位裁决 |
+| [`Project_Architecture_Blueprint.html`](Project_Architecture_Blueprint.html) | 上述蓝图的自包含浏览版（目录、搜索、折叠与 Mermaid 图） |
 | [`business_rules.md`](business_rules.md) | 业务规则注册表 |
 | [`operations/2026-08-18-data-grpc-known-issues.md`](operations/2026-08-18-data-grpc-known-issues.md) | 数据源与 gRPC 故障活清单（证据、影响、状态、验收） |
 | [`superpowers/specs/2026-07-25-unified-data-final-cutover-design.md`](superpowers/specs/2026-07-25-unified-data-final-cutover-design.md) | 统一金融/新闻 Gateway 最终切换设计 |

@@ -22,4 +22,7 @@
 /tests
 /tools
 /skills-lock.json
-
+/backups
+.env.bak-*
+.brooks-lint-history.json
+scripts/__pycache__/

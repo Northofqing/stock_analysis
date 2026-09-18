@@ -37,6 +37,30 @@ pub struct Signal {
     pub source: &'static str,
     pub code: String,
     pub score: f64,
+    /// 策略输出摘要 (StrategyOutput.reason) — 买入卡「原因」的兜底文本
+    pub reason: String,
+}
+
+/// 单次 tick 的完整产出 (2026-09-03: 原 usize 扩展为携带 Filled 执行明细)
+#[derive(Debug, Clone, Default)]
+pub struct TickReport {
+    /// 已消费候选数 (原返回语义)
+    pub consumed: usize,
+    /// Filled 买入执行 (仅 Filled 有卡; NotFilled 仍无卡仅日志)
+    pub fills: Vec<VirtualBuyFill>,
+}
+
+/// 虚拟盘买入执行卡数据 (镜像 PaperSellResult → [虚拟盘买入] 卡)
+#[derive(Debug, Clone)]
+pub struct VirtualBuyFill {
+    pub code: String,
+    pub name: String,
+    pub quantity: u32,
+    pub price: f64,
+    /// signal.source (如 NewsCatalyst / VolumeSurge)
+    pub source: &'static str,
+    /// 买入原因 (卡上「原因:」; D-01 = LLM 归因 headline, 其余 = 策略摘要)
+    pub reason: String,
 }
 
 #[derive(diesel::QueryableByName, Debug, Clone)]
@@ -104,7 +128,7 @@ impl IntradayMonitor {
     /// （portfolio_state_snapshot：user_account_summary + user_position_snapshot，
     /// upsert 当日 ledger）。实时账户模式（portfolio_state，30s 券商门）在生产
     /// 无盘中刷新者，恒拦虚拟盘成交（7/17 起零成交缺陷，2026-08-10 修复）。
-    pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
+    pub fn tick(&self, risk_context: PaperRiskContext) -> Result<TickReport, String> {
         // 无条件刷新当日 ledger（BR-097 结构门 age≤30s）——候选到达前 ledger
         // 即已新鲜。无候选 tick 也必须刷新：ledger 门要求 date==today 且
         // created_at 新（7/17 起零成交根因之一：ledger 无生产写入者）。
@@ -118,7 +142,7 @@ impl IntradayMonitor {
         &self,
         risk_context: PaperRiskContext,
         mut portfolio_state: F,
-    ) -> Result<usize, String>
+    ) -> Result<TickReport, String>
     where
         F: FnMut(&str, f64) -> Result<(f64, f64, f64), String>,
     {
@@ -134,6 +158,8 @@ impl IntradayMonitor {
              FROM pushed_stocks \
              WHERE consumed_at IS NULL AND push_time < ? \
              AND push_time > ? \
+             AND (push_kind <> 'D-01' OR CASE WHEN json_valid(metric_json) \
+                  THEN json_extract(metric_json, '$.news_direct_mention') = 1 ELSE 0 END) \
              ORDER BY push_time DESC LIMIT ?",
         )
         .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
@@ -143,6 +169,7 @@ impl IntradayMonitor {
         .map_err(|e| format!("query pushed_stocks: {}", e))?;
 
         let mut emitted = 0;
+        let mut fills: Vec<VirtualBuyFill> = Vec::new();
         let candidate_count = candidates.len();
 
         // 2. 4 步过滤
@@ -171,6 +198,19 @@ impl IntradayMonitor {
                     continue;
                 }
 
+                // 日K先于执行报价获取，避免慢查询使报价失效。
+                let entry_conditions = if signal.source == "NewsCatalyst" {
+                    match crate::trading::paper_sell::entry_conditions(&cand.code) {
+                        Ok(conditions) => Some(conditions),
+                        Err(error) => {
+                            log::warn!("[intraday_monitor] {} 入场风控证据不可用: {error}", cand.code);
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // 3. risk_adapter 4 项检查 (复用 Commit 1)
                 let execution_quote = match crate::broker::execution_quote(&cand.code) {
                     Ok(quote) => quote,
@@ -184,6 +224,16 @@ impl IntradayMonitor {
                         continue;
                     }
                 };
+                if let Some(conditions) = entry_conditions {
+                    if !execution_quote.change_percent.is_finite() || execution_quote.change_percent > 5.0 {
+                        log::info!("[intraday_monitor] {} 新闻买入跳过：涨幅不可用或已超过5%，不追涨", cand.code);
+                        continue;
+                    }
+                    if let Err(error) = conditions.check(&cand.code, &cand.name, execution_quote.price, now.date_naive()) {
+                        log::info!("[intraday_monitor] {} {error}", cand.code);
+                        continue;
+                    }
+                }
                 let (is_limit_up, is_limit_down) = paper_limit_flags(&execution_quote);
                 let paper_signal = PaperSignal {
                     plan_id: format!("intraday-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
@@ -191,7 +241,7 @@ impl IntradayMonitor {
                     name: cand.name.clone(),
                     direction: Direction::Buy,
                     price: execution_quote.price,
-                    quantity: 100,
+                    quantity: crate::trading::order_safety::minimum_buy_quantity(&cand.code),
                     virtual_reason: signal.source.to_string(),
                     is_limit_up,
                     is_limit_down,
@@ -222,7 +272,24 @@ impl IntradayMonitor {
                     total,
                     pos_pct,
                 ) {
-                    Ok(_) => {
+                    Ok(paper_outcome) => {
+                        // 2026-09-03: 仅 Filled 收集执行卡数据 (NotFilled 仍仅日志,
+                        // 用户决策「只推成交」, 镜像 paper_sell)
+                        if paper_outcome.result.status
+                            == paper_trade::PaperTradeStatus::Filled
+                        {
+                            fills.push(VirtualBuyFill {
+                                code: cand.code.clone(),
+                                name: cand.name.clone(),
+                                quantity: paper_signal.quantity,
+                                price: paper_outcome
+                                    .result
+                                    .fill_price
+                                    .unwrap_or(execution_quote.price),
+                                source: signal.source,
+                                reason: Self::fill_reason(&cand, &signal),
+                            });
+                        }
                         // 4. 标记 consumed (review fix Issue #4: 参数化绑定)
                         let outcome = signal.source;
                         diesel::sql_query(
@@ -262,7 +329,79 @@ impl IntradayMonitor {
                 cutoff.format("%H:%M:%S")
             );
         }
-        Ok(emitted)
+        Ok(TickReport {
+            consumed: emitted,
+            fills,
+        })
+    }
+
+    /// 买入卡「原因」文本 (2026-09-04 用户反馈: 卡上不能只写来源):
+    /// - NewsCatalyst (D-01 候选入池): metric_json.headline = LLM 归因原文
+    ///   (真实催化内容, 如「美国柴油价格创新高…惠博普为油气田装备及服务商」);
+    ///   headline 缺失回落 theme (产业链催化); 追加技术面句 (判分公式语义镜像,
+    ///   与 score_candidate 共用同一 metric_json 快照, 基准自洽)
+    /// - LLMSelect: llm_verdict
+    /// - 其余来源: 策略摘要 (Signal.reason, StrategyOutput.reason)
+    fn fill_reason(cand: &Candidate, signal: &Signal) -> String {
+        let value = serde_json::from_str::<serde_json::Value>(&cand.metric_json)
+            .unwrap_or(serde_json::Value::Null);
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        match signal.source {
+            "NewsCatalyst" => {
+                let main = field("source_title").or_else(|| field("headline")).or_else(|| {
+                    field("theme").map(|theme| format!("{theme} 产业链催化"))
+                });
+                let tech = Self::metric_field_f64(&value, "price_chg_pct")
+                    .and_then(Self::news_tech_suffix);
+                match (main, tech) {
+                    (Some(main), Some(tech)) => Some(format!("{main}；{tech}")),
+                    (Some(main), None) => Some(main),
+                    // 无主文 → 策略摘要本身已含 chg
+                    (None, _) => Some(signal.reason.clone()),
+                }
+            }
+            "LLMSelect" => field("llm_verdict"),
+            _ => None,
+        }
+        .unwrap_or_else(|| signal.reason.clone())
+    }
+
+    /// metric_json 数字字段: 缺失/Null/非数字/非有限 → None
+    /// (与 strategy/v16_4/_helpers.rs 数字可选语义一致)
+    fn metric_field_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
+        match value.get(key) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(raw) => raw.as_f64().filter(|number| number.is_finite()),
+        }
+    }
+
+    /// NewsCatalyst 技术面句: 判分公式语义中文镜像
+    /// (7.0 base; chg<0 低吸 +min(|chg|,2)*0.3; chg<-2 急跌另 +0.5; 封顶 9.0)
+    fn news_tech_suffix(chg: f64) -> Option<String> {
+        if !chg.is_finite() {
+            return None;
+        }
+        let abs = chg.abs();
+        if abs < 0.05 {
+            Some("现价平盘".to_string())
+        } else if chg >= 9.5 {
+            Some(format!("现价涨 {abs:.1}%，接近涨停"))
+        } else if chg > 5.0 {
+            Some(format!("现价涨 {abs:.1}%，冲高勿追"))
+        } else if chg > 0.0 {
+            Some(format!("现价涨 {abs:.1}%，催化温和"))
+        } else if chg < -2.0 {
+            Some(format!("现价急跌 {abs:.1}%，超跌低吸"))
+        } else {
+            Some(format!("现价跌 {abs:.1}%，低吸窗口"))
+        }
     }
 
     /// 4 步过滤: (a) metric_json (b) 时间窗 (c) VirtualReason 命中 (d) 计算综合分
@@ -291,6 +430,7 @@ impl IntradayMonitor {
             source: label,
             code: cand.code.clone(),
             score: output.score,
+            reason: output.reason.clone(),
         }))
     }
 
@@ -350,7 +490,21 @@ impl IntradayMonitor {
                     .filter(|text| !text.trim().is_empty())
                     .ok_or_else(|| format!("{} 缺少有效 llm_verdict", cand.code))?;
             }
-            "NewsCatalyst" => {}
+            "NewsCatalyst" => {
+                let value: serde_json::Value = serde_json::from_str(&cand.metric_json)
+                    .map_err(|error| format!("{} 新闻证据解析失败: {error}", cand.code))?;
+                let verified_name = value.get("verified_name").and_then(serde_json::Value::as_str);
+                let title = value.get("source_title").and_then(serde_json::Value::as_str);
+                if value.get("news_direct_mention").and_then(serde_json::Value::as_bool) != Some(true)
+                    || verified_name != Some(cand.name.as_str())
+                    || !title.is_some_and(|title| title.contains(&cand.code) || (!cand.name.is_empty() && title.contains(&cand.name)))
+                {
+                    return Ok(None); // 原文/名称证据不足的产业链推断仅观察。
+                }
+                if metrics.price_chg_pct.is_some_and(|change| change > 5.0) {
+                    return Ok(None); // 入池时已注明“勿追”的信号不能生成买入卡。
+                }
+            }
             _ => return Ok(None),
         }
 
@@ -553,7 +707,9 @@ mod tests {
     fn br134_paper_limit_flags_preserve_real_quote_boundaries() {
         let observed_at = chrono::Utc::now();
         let quote = |price| crate::broker::ExecutionQuote {
+            name: "测试".into(),
             price,
+            change_percent: 0.0,
             limit_down_price: 9.0,
             limit_up_price: 11.0,
             observed_at,
@@ -561,6 +717,150 @@ mod tests {
         assert_eq!(paper_limit_flags(&quote(10.0)), (false, false));
         assert_eq!(paper_limit_flags(&quote(11.0)), (true, false));
         assert_eq!(paper_limit_flags(&quote(9.0)), (false, true));
+    }
+
+    #[test]
+    fn fill_reason_news_catalyst_prefers_llm_headline_and_falls_back() {
+        let cand = |metric_json: &str| Candidate {
+            id: 1,
+            push_time: "2026-09-04 10:35:01.766".to_string(),
+            push_kind: "D-01".to_string(),
+            code: "002554".to_string(),
+            name: "惠博普".to_string(),
+            push_price: 2.91,
+            metric_json: metric_json.to_string(),
+        };
+        let news_signal = |strategy_reason: &str| Signal {
+            source: "NewsCatalyst",
+            code: "002554".to_string(),
+            score: 7.0,
+            reason: strategy_reason.to_string(),
+        };
+        // 生产 002554 实样: headline 优先 (LLM 归因 = 买入原因)
+        let live = cand(r#"{"push_subkind":"NewsCatalyst","theme":"油气服务","headline":"美国柴油价格创新高，油气服务及设备需求预期提升，惠博普为油气田装备及服务商","llm_importance":4}"#);
+        assert_eq!(
+            IntradayMonitor::fill_reason(&live, &news_signal("新闻驱动 chg=暂无")),
+            "美国柴油价格创新高，油气服务及设备需求预期提升，惠博普为油气田装备及服务商"
+        );
+        // headline 缺失 → theme 产业链兜底
+        let no_headline = cand(r#"{"push_subkind":"NewsCatalyst","theme":"油气服务","llm_importance":4}"#);
+        assert_eq!(
+            IntradayMonitor::fill_reason(&no_headline, &news_signal("新闻驱动 chg=暂无")),
+            "油气服务 产业链催化"
+        );
+        // metric_json 非 JSON → 回落策略摘要
+        assert_eq!(
+            IntradayMonitor::fill_reason(&cand("not-json"), &news_signal("新闻驱动 chg=暂无")),
+            "新闻驱动 chg=暂无"
+        );
+        // 非 NewsCatalyst/LLMSelect → 策略摘要 reason
+        let volume_signal = Signal {
+            source: "VolumeSurge",
+            code: "600000".to_string(),
+            score: 7.0,
+            reason: "放量异动: 量比 3.2".to_string(),
+        };
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"VolumeSurge","vol_ratio":3.2}"#),
+                &volume_signal
+            ),
+            "放量异动: 量比 3.2"
+        );
+        // LLMSelect → llm_verdict
+        let llm_signal = Signal {
+            source: "LLMSelect",
+            code: "600000".to_string(),
+            score: 8.0,
+            reason: "LLM 摘要兜底".to_string(),
+        };
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"LLMSelect","llm_verdict":"低估值 + 产能释放","llm_confidence":0.9}"#),
+                &llm_signal
+            ),
+            "低估值 + 产能释放"
+        );
+    }
+
+    #[test]
+    fn fill_reason_news_catalyst_appends_tech_sentence() {
+        let cand = |metric_json: &str| Candidate {
+            id: 1,
+            push_time: "2026-09-04 10:35:01.766".to_string(),
+            push_kind: "D-01".to_string(),
+            code: "002554".to_string(),
+            name: "惠博普".to_string(),
+            push_price: 2.91,
+            metric_json: metric_json.to_string(),
+        };
+        let news_signal = |strategy_reason: &str| Signal {
+            source: "NewsCatalyst",
+            code: "002554".to_string(),
+            score: 7.0,
+            reason: strategy_reason.to_string(),
+        };
+        let headline = "美国柴油价格创新高，油气服务及设备需求预期提升，惠博普为油气田装备及服务商";
+        // chg 缺失 → 不追加 (负向守卫: 历史行零回归)
+        let plain = cand(r#"{"push_subkind":"NewsCatalyst","headline":"X"}"#);
+        let got = IntradayMonitor::fill_reason(&plain, &news_signal("新闻驱动 chg=暂无"));
+        assert_eq!(got, "X");
+        assert!(!got.contains('；'), "无 chg 不得追加技术句");
+        // 急跌 <-2 → 超跌低吸句
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(&format!(
+                    r#"{{"push_subkind":"NewsCatalyst","headline":"{headline}","price_chg_pct":-2.5}}"#
+                )),
+                &news_signal("新闻驱动 chg=-2.5%")
+            ),
+            "美国柴油价格创新高，油气服务及设备需求预期提升，惠博普为油气田装备及服务商；现价急跌 2.5%，超跌低吸"
+        );
+        // -2≤chg<0 → 低吸窗口句
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","headline":"X","price_chg_pct":-1.0}"#),
+                &news_signal("x")
+            ),
+            "X；现价跌 1.0%，低吸窗口"
+        );
+        // theme 兜底与技术句并存
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","theme":"油气服务","price_chg_pct":-1.0}"#),
+                &news_signal("x")
+            ),
+            "油气服务 产业链催化；现价跌 1.0%，低吸窗口"
+        );
+        // 平盘 / 温和涨 / 冲高 / 接近涨停
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","headline":"X","price_chg_pct":0.0}"#),
+                &news_signal("x")
+            ),
+            "X；现价平盘"
+        );
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","headline":"X","price_chg_pct":1.5}"#),
+                &news_signal("x")
+            ),
+            "X；现价涨 1.5%，催化温和"
+        );
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","headline":"X","price_chg_pct":6.0}"#),
+                &news_signal("x")
+            ),
+            "X；现价涨 6.0%，冲高勿追"
+        );
+        assert_eq!(
+            IntradayMonitor::fill_reason(
+                &cand(r#"{"push_subkind":"NewsCatalyst","headline":"X","price_chg_pct":10.2}"#),
+                &news_signal("x")
+            ),
+            "X；现价涨 10.2%，接近涨停"
+        );
     }
 
     fn test_risk_context() -> PaperRiskContext {
@@ -727,6 +1027,9 @@ mod tests {
             "main_net_yi": 1.0,
             "sector": "测试板块",
             "push_subkind": subkind,
+            "news_direct_mention": true,
+            "source_title": "测试发布订单公告",
+            "verified_name": "测试",
         })
         .to_string();
         Candidate {
@@ -774,6 +1077,24 @@ mod tests {
             .evaluate_candidate(&c, Local::now())
             .expect("valid candidate");
         assert!(s.is_none(), "推送 2h 前应跳过");
+    }
+
+    #[test]
+    fn news_inference_without_original_title_is_observation_only() {
+        let mut c = candidate("D-01", "NewsCatalyst", 0.0);
+        c.metric_json = serde_json::json!({"headline":"农化龙头受益", "price_chg_pct":-0.9}).to_string();
+        assert!(IntradayMonitor.evaluate_candidate(&c, Local::now()).unwrap().is_none());
+        c.metric_json = serde_json::json!({"news_direct_mention":true, "source_title":"尿素涨价", "verified_name":"测试"}).to_string();
+        assert!(IntradayMonitor.evaluate_candidate(&c, Local::now()).unwrap().is_none());
+    }
+
+    #[test]
+    fn news_marked_do_not_chase_is_not_a_buy_signal() {
+        let mut c = candidate("D-01", "NewsCatalyst", 0.0);
+        let mut metrics: serde_json::Value = serde_json::from_str(&c.metric_json).unwrap();
+        metrics["price_chg_pct"] = serde_json::json!(9.4);
+        c.metric_json = metrics.to_string();
+        assert!(IntradayMonitor.evaluate_candidate(&c, Local::now()).unwrap().is_none());
     }
 
     #[test]
@@ -890,6 +1211,9 @@ mod tests {
                 "main_net_yi": main_net_yi,
                 "sector": "测试板块",
                 "push_subkind": expected_reason,
+                "news_direct_mention": true,
+                "source_title": "测试发布订单公告",
+                "verified_name": "测试",
             })
             .to_string();
             let output = IntradayMonitor::score_candidate(&cand)
@@ -986,7 +1310,8 @@ mod tests {
         assert_eq!(
             IntradayMonitor
                 .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
-                .expect("intraday tick"),
+                .expect("intraday tick")
+                .consumed,
             1
         );
         let good = consumption(good_id);
@@ -1000,7 +1325,8 @@ mod tests {
         assert_eq!(
             IntradayMonitor
                 .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
-                .expect("idempotent follow-up tick"),
+                .expect("idempotent follow-up tick")
+                .consumed,
             0
         );
     }
@@ -1046,7 +1372,8 @@ mod tests {
         assert_eq!(
             IntradayMonitor
                 .tick_with_portfolio_state(context, admitted_test_portfolio_state)
-                .expect("risk-gated tick"),
+                .expect("risk-gated tick")
+                .consumed,
             0
         );
         let row = consumption(id);
@@ -1148,7 +1475,8 @@ mod tests {
         assert_eq!(
             IntradayMonitor
                 .tick(test_risk_context())
-                .expect("low-score tick"),
+                .expect("low-score tick")
+                .consumed,
             0
         );
         assert!(consumption(id).consumed_at.is_none());

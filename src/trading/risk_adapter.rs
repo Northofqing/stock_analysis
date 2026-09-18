@@ -130,26 +130,32 @@ pub fn pre_trade_check(
         }
     }
 
-    // 2. 单票仓位硬线 (仅 Buy 触发)
-    if signal.direction == Direction::Buy && current_position_pct > *MAX_POSITION_PCT {
+    // 2. 单票仓位硬线：包含本次买入金额，卖出不受集中度限制。
+    let projected_position_pct =
+        current_position_pct + signal.price * f64::from(signal.quantity) / total_value * 100.0;
+    if signal.direction == Direction::Buy && projected_position_pct > *MAX_POSITION_PCT {
         log::warn!(
-            "[risk_adapter] 拒 {}({}): 单票仓位 {:.1}% > 限 {}%",
+            "[risk_adapter] 拒 {}({}): 买后单票仓位 {:.1}% > 限 {}%",
             signal.name,
             signal.code,
-            current_position_pct,
+            projected_position_pct,
             *MAX_POSITION_PCT
         );
         return Err(format!(
-            "单票仓位 {:.1}% 超限 {}%",
-            current_position_pct, *MAX_POSITION_PCT
+            "买后单票仓位 {:.1}% 超限 {}%",
+            projected_position_pct, *MAX_POSITION_PCT
         ));
     }
 
-    // 3. 现金底
+    // 3. 买入后现金底；卖出补充现金，不应被买入资金门阻断。
     let guard = CashGuard {
         floor_pct: *CASH_FLOOR_PCT,
     };
-    if let Some(alert) = check_cash(current_cash, total_value, &guard) {
+    let projected_cash = current_cash - signal.price * f64::from(signal.quantity);
+    if let Some(alert) = (signal.direction == Direction::Buy)
+        .then(|| check_cash(projected_cash, total_value, &guard))
+        .flatten()
+    {
         if alert.below_floor {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): 现金占比 {:.1}% < 底 {}%",
@@ -159,7 +165,7 @@ pub fn pre_trade_check(
                 *CASH_FLOOR_PCT
             );
             return Err(format!(
-                "现金占比 {:.1}% 不足底限 {}%",
+                "买后现金占比 {:.1}% 不足底限 {}%",
                 alert.cash_pct, *CASH_FLOOR_PCT
             ));
         }
@@ -229,10 +235,12 @@ pub fn pre_trade_check_snapshot(
     if signal.risk_context.data_mode != DataMode::Full {
         return Err("BR-146 snapshot paper requires Full settled data".into());
     }
-    if signal.direction == Direction::Buy && current_position_pct > *MAX_POSITION_PCT {
+    let projected_position_pct =
+        current_position_pct + signal.price * f64::from(signal.quantity) / total_value * 100.0;
+    if signal.direction == Direction::Buy && projected_position_pct > *MAX_POSITION_PCT {
         return Err(format!(
-            "snapshot paper position {:.1}% exceeds limit",
-            current_position_pct
+            "snapshot paper post-buy position {:.1}% exceeds limit",
+            projected_position_pct
         ));
     }
     Ok(())
@@ -247,7 +255,7 @@ mod tests {
     fn signal(account_mode: AccountMode, data_mode: DataMode, direction: Direction) -> PaperSignal {
         PaperSignal {
             plan_id: "plan-test-001".to_string(),
-            code: "TEST_CODE_688001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             direction,
             price: 50.0,
@@ -302,6 +310,13 @@ mod tests {
     // ---- 2. 单票仓位硬线 ----
 
     #[test]
+    fn rejects_buy_that_would_cross_position_limit() {
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
+        assert!(pre_trade_check(&s, 50.0, 50_000.0, 100_000.0, 6.0).is_err());
+        assert!(pre_trade_check_snapshot(&s, 50.0, 50_000.0, 100_000.0, 6.0).is_err());
+    }
+
+    #[test]
     fn rejects_buy_when_position_exceeds_10pct() {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 12.0);
@@ -312,14 +327,14 @@ mod tests {
     #[test]
     fn allows_buy_at_position_boundary_10pct() {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
-        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
+        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_ok());
     }
 
     #[test]
     fn allows_buy_at_position_exactly_10pct() {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
-        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
+        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_ok());
     }
 
@@ -331,6 +346,15 @@ mod tests {
     }
 
     // ---- 3. 现金底 ----
+
+    #[test]
+    fn checks_cash_after_buy_and_does_not_block_cash_replenishing_sell() {
+        let buy = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
+        assert!(pre_trade_check(&buy, 50.0, 19_000.0, 100_000.0, 0.0).is_err());
+        assert!(pre_trade_check(&buy, 50.0, 20_000.0, 100_000.0, 0.0).is_ok());
+        let sell = signal(AccountMode::Normal, DataMode::Full, Direction::Sell);
+        assert!(pre_trade_check(&sell, 50.0, 1_000.0, 100_000.0, 20.0).is_ok());
+    }
 
     #[test]
     fn rejects_when_cash_below_15pct() {
@@ -446,7 +470,7 @@ mod tests {
     #[test]
     fn snapshot_path_accepts_only_full_valid_paper_evidence() {
         let valid = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
-        assert!(pre_trade_check_snapshot(&valid, 50.0, 50_000.0, 100_000.0, 10.0).is_ok());
+        assert!(pre_trade_check_snapshot(&valid, 50.0, 50_000.0, 100_000.0, 5.0).is_ok());
 
         for mode in [DataMode::Degraded, DataMode::Unsafe] {
             let degraded = signal(AccountMode::Frozen, mode, Direction::Sell);

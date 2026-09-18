@@ -10,8 +10,10 @@
 //!     校验现有材料, 输出 expected_config_hash + 可直接落盘的
 //!     selection_activation.v1.json (到 stdout)。
 //!
-//! 仪式: executable_revision 覆盖全部 src/+config/ 文件 — 任何代码/配置改动
-//! 都会使 expected_config_hash 失效, 需重新 prepare + 人工 review。
+//! 仪式 (BR-183 dual-gate, 2026-09-03):
+//!   - expected_config_hash 只覆盖 config/** 域 (真 gate) — src 改动不再使其失效
+//!   - expected_executable_revision 覆盖全部 src/+config/ 文件 (banner-only,
+//!     启动时 WARN 比对, 不 gate)。两者都需人工 review 后才落盘。
 
 use chrono::{DateTime, Utc};
 use std::path::Path;
@@ -153,20 +155,39 @@ fn cmd_print_activation(args: &[String]) -> i32 {
     match stock_analysis::selection::config_activation_v2::prepare_activation_config_hash(root, now)
     {
         Ok(materials) => {
+            eprintln!("[激活] 计算全树 executable revision (banner-only 域, 约 7 分钟 sha2)…");
+            let full_tree = match stock_analysis::selection::config_activation_v2::
+                compute_full_tree_executable_revision(root)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!(
+                        "[激活] 全树 revision 计算失败: code={} detail={} (activation 未输出)",
+                        error.code, error.detail
+                    );
+                    return 1;
+                }
+            };
             let reviewed_at = rfc3339(now);
             let json = format!(
                 "{{\"schema_version\":\"selection-config-activation-v1\",\
                  \"expected_config_hash\":\"{}\",\
+                 \"expected_executable_revision\":\"{}\",\
                  \"effective_from\":\"{}\",\
                  \"reviewed_by\":\"{}\",\
                  \"reviewed_at\":\"{}\"}}",
                 materials.config_hash,
+                full_tree.hash,
                 rfc3339(effective_from),
                 json_escape(reviewed_by),
                 reviewed_at
             );
             println!("{json}");
             eprintln!("[激活] config_hash={}", materials.config_hash);
+            eprintln!(
+                "[激活] executable_revision={} (banner-only, 不计入门)",
+                &full_tree.hash[..12]
+            );
             eprintln!("[激活] 请人工 review 后写入 config/selection/selection_activation.v1.json (紧凑 JSON + 单 LF)");
             0
         }
