@@ -615,17 +615,12 @@ fn position_risk_evidence(
 ) -> Option<(crate::monitor::risk::MarketRegime, Option<f64>)> {
     let latest = data.first()?;
     let regime = crate::monitor::risk::classify_market(0.5, latest.pct_chg);
-    let ranges: Vec<f64> = data
+    let bars: Vec<_> = data
         .iter()
-        .take(14)
-        .map(|bar| bar.high - bar.low)
-        .filter(|range| range.is_finite() && *range > 0.0)
+        .take(15)
+        .map(|bar| (bar.high, bar.low, bar.close))
         .collect();
-    let atr = if ranges.is_empty() {
-        None
-    } else {
-        Some(ranges.iter().sum::<f64>() / ranges.len() as f64)
-    };
+    let atr = crate::monitor::risk::average_true_range(&bars, 14);
     Some((regime, atr))
 }
 
@@ -1873,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn position_risk_inputs_use_only_positive_finite_ranges() {
+    fn position_risk_inputs_require_complete_finite_true_ranges() {
         assert!(position_risk_evidence(&[]).is_none());
         let mut bars = analysis_bars();
         bars[0].high = 10.5;
@@ -1882,12 +1877,14 @@ mod tests {
         bars[1].low = 10.0;
         bars[2].high = f64::NAN;
         let (_, atr) = position_risk_evidence(&bars).expect("nonempty evidence");
-        assert!(atr.is_some_and(|value| value > 0.0 && value.is_finite()));
+        assert_eq!(atr, None, "非法K线不应被丢弃后缩短ATR窗口");
 
         for bar in &mut bars {
-            bar.high = bar.low;
+            bar.high = 10.0;
+            bar.low = 10.0;
+            bar.close = 10.0;
         }
-        assert_eq!(position_risk_evidence(&bars).unwrap().1, None);
+        assert_eq!(position_risk_evidence(&bars).unwrap().1, Some(0.0));
     }
 
     #[tokio::test]

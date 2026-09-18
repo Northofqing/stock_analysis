@@ -683,6 +683,7 @@ mod tests {
             evidence_field: "private/request/payload".to_owned(),
             record_index: 42,
             has_record_index: false,
+            provider_attempts: Vec::new(),
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -749,6 +750,7 @@ mod tests {
             evidence_field: "records[2].identity".to_owned(),
             record_index: 2,
             has_record_index: true,
+            provider_attempts: Vec::new(),
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -797,6 +799,7 @@ mod tests {
             evidence_field: "records[0].published_at".to_owned(),
             record_index: 0,
             has_record_index: true,
+            provider_attempts: Vec::new(),
         };
         let mut status = tonic::Status::new(Code::FailedPrecondition, "rejected");
         status.metadata_mut().insert_bin(

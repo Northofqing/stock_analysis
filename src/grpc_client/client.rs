@@ -433,6 +433,8 @@ mod tests {
                 live: true,
                 ready: true,
                 state: "RUNNING".into(),
+                observability: None,
+                build_identity: None,
             }))
         }
         async fn get_capabilities(
@@ -551,6 +553,9 @@ mod tests {
         upper_limit_pool_review,
         chain_batch,
         benchmark_bars,
+        current_auction_observations,
+        economic_release_observations,
+        economic_release_schedule,
     );
 
     async fn spawn_mock() -> String {

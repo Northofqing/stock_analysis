@@ -547,8 +547,15 @@ pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
         || signal.price <= 0.0
         || !quote_price.is_finite()
         || quote_price <= 0.0
-        || signal.quantity == 0
-        || !signal.quantity.is_multiple_of(100)
+        || crate::trading::order_safety::validate_quantity(
+            &signal.code,
+            match signal.direction {
+                Direction::Buy => crate::trading::order_safety::SafetySide::Buy,
+                Direction::Sell => crate::trading::order_safety::SafetySide::Sell,
+            },
+            u64::from(signal.quantity),
+        )
+        .is_err()
     {
         return PaperResult {
             status: PaperTradeStatus::Invalidated,
@@ -1157,7 +1164,7 @@ mod tests {
     fn signal_default(is_limit_up: bool, is_limit_down: bool, is_suspended: bool) -> PaperSignal {
         PaperSignal {
             plan_id: "plan-001".to_string(),
-            code: "TEST_CODE_688001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             direction: Direction::Buy,
             price: 50.0,

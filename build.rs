@@ -1,8 +1,10 @@
 //! 编译 magic.market.v1 proto (合同唯一源, 不得修改):
 //! - 上游合同: client-bundle/market.proto (用户维护, 原样引用);
 //! - 本地扩展 / 旧 bundle 兼容声明:
-//!   * 当前上游已发布 Operation/RPC 56-60；旧 bundle 缺失时仍按精确声明补入;
-//!   * Operation 61 CHAIN_BATCH 与 62 BENCHMARK_BARS 仍仅供本地 grpc_market_server 使用;
+//!   * 当前上游已发布 Operation/RPC 56-63；旧 bundle 缺失时仍按精确声明补入;
+//!   * Operation 64 CHAIN_BATCH 与 65 BENCHMARK_BARS 仍仅供本地 grpc_market_server 使用
+//!     (2026-09-19: 上游发布 61/62 CurrentAuctionObservations/EconomicReleaseObservations
+//!     与本地扩展号冲突, 本地扩展后移至 64/65, 不改上游合同);
 //!   * QueryResponse.source = 11 (证据链 source 透传, 上游用字段 10 做 diagnostic_blocker);
 //!   * 当前上游已发布前 5 个派生 RPC；ChainBatch RPC 仍为本地扩展。
 //!
@@ -42,9 +44,11 @@ const EXT_OPERATIONS: &[&str] = &[
     "  OPERATION_OUTCOME_DAILY_BARS = 59;",
     "  OPERATION_UPPER_LIMIT_POOL_REVIEW = 60;",
     // M4c: A-10 题材链完整 batch (monitor 复盘消费, 44/45 视图不可重建 VisibleChainBatch)。
-    "  OPERATION_CHAIN_BATCH = 61;",
+    // 2026-09-19: 原 61 与上游新发布的 OPERATION_CURRENT_AUCTION_OBSERVATIONS 冲突, 后移至 64。
+    "  OPERATION_CHAIN_BATCH = 64;",
     // BR-251: 指数专用历史基准批次；不得复用 equity HistoricalBars/TechnicalBars。
-    "  OPERATION_BENCHMARK_BARS = 62;",
+    // 2026-09-19: 原 62 与上游新发布的 OPERATION_ECONOMIC_RELEASE_OBSERVATIONS 冲突, 后移至 65。
+    "  OPERATION_BENCHMARK_BARS = 65;",
 ];
 
 const EXT_QUERY_RESPONSE_FIELD: &[&str] = &[

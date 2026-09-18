@@ -1,6 +1,6 @@
 //! Operation ↔ proto 方法名映射 + 已实现集合。
-//! 全部 op 列出 (client-bundle/market.proto 上游 0-55 + build.rs 本地扩展 56-62,
-//! 合并后共 63 个); 生产未用到的 op 不进 implemented。
+//! 全部 op 列出 (client-bundle/market.proto 上游 0-63 + build.rs 本地扩展 64-65,
+//! 合并后共 66 个); 生产未用到的 op 不进 implemented。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 
 /// proto 方法名 (MarketDataService 的 RPC 名, 与 market.proto 一一对应)。
@@ -69,6 +69,11 @@ pub fn method_name(op: Operation) -> &'static str {
         UpperLimitPoolReview => "UpperLimitPoolReview",
         ChainBatch => "ChainBatch",
         BenchmarkBars => "BenchmarkBars",
+        // 2026-09-17 上游新发布 (grpc_handoffs/2026-09-17-grpc-owner-response.md);
+        // 服务端已 ADMITTED 并有真实样本, 本项目暂无消费者, 不进 implemented。
+        CurrentAuctionObservations => "CurrentAuctionObservations",
+        EconomicReleaseObservations => "EconomicReleaseObservations",
+        EconomicReleaseSchedule => "EconomicReleaseSchedule",
         Unspecified => "OPERATION_UNSPECIFIED",
     }
 }
@@ -137,10 +142,10 @@ mod tests {
     use crate::grpc_client::pb::magic::market::v1::Operation;
 
     #[test]
-    fn method_name_covers_all_62_operations() {
-        // 从 proto 的 Operation 枚举全量遍历 (0..=62), 每个都映射到非空方法名。
+    fn method_name_covers_all_66_operations() {
+        // 从 proto 的 Operation 枚举全量遍历 (0..=65), 每个都映射到非空方法名。
         // prost 0.14 标记 from_i32 deprecated → 用 TryFrom<i32> (语义等价)。
-        for value in 0..=62 {
+        for value in 0..=65 {
             let op =
                 Operation::try_from(value).unwrap_or_else(|_| panic!("op {value} 缺少冻结枚举值"));
             assert!(!method_name(op).is_empty(), "op {value} 缺少方法名映射");
@@ -148,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn implemented_set_is_40_and_within_62() {
+    fn implemented_set_is_40_and_within_66() {
         assert_eq!(implemented_operations().len(), 40);
         assert!(implemented_operations()
             .iter()
