@@ -155,6 +155,40 @@ mod data_mode_probe;
 mod manual_push;
 mod market_data; // BR-148: capability probes remain independent from governance DataMode
 
+/// paper 决策循环的 tick 节奏。循环尾部的 sleep 与 g5b 无 provider 的退避
+/// 共用此常量, 避免两处 30s 字面量各自漂移。
+const PAPER_DECISION_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// g5b 无可用 LLM provider 时的退避: 出声后消耗一个 tick, 再由调用方跳过本
+/// tick 的归因。抽成独立异步函数是为了能用暂停时钟做行为测试 —— 常驻循环里的
+/// 空转无法直接观察, 而"是否消耗了一个 tick"可以。
+async fn g5b_no_provider_backoff() {
+    log::warn!("[g5b] 深链归因: 无可用 LLM provider (未配置 DeepSeek/MiniMax?), 本次跳过");
+    tokio::time::sleep(PAPER_DECISION_TICK).await;
+}
+
+#[cfg(test)]
+mod g5b_no_provider_backoff_tests {
+    use super::{g5b_no_provider_backoff, PAPER_DECISION_TICK};
+
+    /// 行为测试 (非源码形状): 该分支必须真的消耗一个 tick。
+    /// sleep 被删除、被缩短、或被挪出本函数 (例如挪到 continue 之后) 时本测试失败。
+    #[tokio::test(start_paused = true)]
+    async fn no_provider_backoff_consumes_one_tick() {
+        let before = tokio::time::Instant::now();
+        g5b_no_provider_backoff().await;
+        let elapsed = before.elapsed();
+        assert!(
+            elapsed >= PAPER_DECISION_TICK,
+            "g5b 无 provider 退避必须消耗一个完整 tick, 实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < PAPER_DECISION_TICK * 2,
+            "g5b 无 provider 退避不应超过一个 tick, 实际 {elapsed:?}"
+        );
+    }
+}
+
 fn audit_full_market_rankings_unavailable(owner: &str) {
     market_data::log_full_market_rankings_unavailable(owner);
     push_templates::log_dispatcher_attempt(
@@ -9079,14 +9113,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
                         let Some(provider) = LlmRegistry::from_env().select("g5b") else {
                             // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
-                            // 以便用户补配 DEEPSEEK_API_KEY 后窗口内自愈。
-                            log::warn!(
-                                "[g5b] 深链归因: 无可用 LLM provider (DEEPSEEK_API_KEY 未配置?), 本次跳过"
-                            );
-                            // 跳过归因不等于跳过本循环尾部的 sleep: 直接 continue 会绕过
-                            // sleep(30s) 回到 loop 头部, 造成无退避空转 (日志与 CPU 双刷)。
-                            // 保留原意 (每 tick 提示), tick 节奏即该 sleep 的长度。
-                            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                            // 以便用户补配 provider 后窗口内自愈。退避消耗一个 tick:
+                            // 裸 continue 会绕过循环尾部的 sleep, 造成无退避空转。
+                            g5b_no_provider_backoff().await;
                             continue;
                         };
                         let analyzer = DeepAttributionAnalyzer::new(provider);
@@ -9342,7 +9371,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(PAPER_DECISION_TICK).await;
         }
     };
 
