@@ -31,11 +31,11 @@
 
 ## 3. 进度与下一步
 
-**2026-09-20 续 (用户指令: 剩下全部接完, 分流规则已裁决): 已完成 3/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (待复审, 未提交)。**
+**2026-09-20 续 (用户指令: 剩下全部接完, 分流规则已裁决): 已完成 3/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0)。下一 Unit: IntradayMarket (4 调用点, 900s L4, 身份需按时间槽设计)。**
 
 - 决策规则 (用户 2026-09-20 裁决): 每日必达类豁免预算 (BR-237 语义); 4 个结构性源缺陷 Unit (OrderAlert/FrozenSide/VirtualWatch/PaperSell) 跳过待修源、单独成批。
 - 下一批接线顺序: G5b → IntradayMarket → registered-template 类 (BlockConfirm/IpoCatalyst/NewsCatalyst 等, 逐一核实源健康) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
-- **G5b 设计要点 (已实现, 待复审提交)**: 每事件粒度 identity `g5b-attribution:{业务日}:{code}:{sha256(triggered_at|code|category|message)}`; policy (Global, None, WindowMode::None) 镜像 HoldingEvent 先例 (无冷却, 每事件放行只靠内容寻址去重); 豁免预算 (盘后归因类); canonical=row 事实+rendered sha256; binding 在分析后构造。⚠️ LLM 非确定 → 窗口内 push 失败后重跑分析 = 新 decision, 旧 pending 启动对账补发 → 潜在同事件双文本, 待复审裁定 commit message 措辞。
+- **G5b 设计要点 (已提交 8f68fc0)**: 每事件粒度 identity `g5b-attribution:{业务日}:{code}:{sha256(triggered_at|code|category|message)}`; policy (Global, None, WindowMode::None) 镜像 HoldingEvent 先例 (无冷却, 每事件放行只靠内容寻址去重); 豁免预算 (盘后归因类); canonical=row 事实+rendered sha256; binding 在分析后构造。⚠️ LLM 非确定 → 窗口内 push 失败后重跑分析 = 新 decision, 旧 pending 启动对账补发 → 潜在同事件双文本, 待复审裁定 commit message 措辞。
 - 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-t16-st-price-wiring/t16-wiring-evidence.log`。
 - **经验补充 (A-12 轮)**: ① schema.rs seed 计数改消息串必须同步改比较常量 (否则 panic "must have N rows, got N" 自相矛盾); ② include_str!("main.rs") 源码扫描守卫存在 (attribution_epoch_runtime.rs), 改调用点必须同步守卫 seam; ③ LAST_RUN 类无条件设置语义要保真, 推送失败补偿靠 durable 决策而非进程内重试; ④ 复审核实: Uncertain 需人工裁定 (启动对账只补 Reserved/Rejected-retry), commit message 别写错。
 - gRPC 数据问题记录约定 (用户指令): 记入 `grpc_handoffs/` 目录。
