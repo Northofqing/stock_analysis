@@ -6118,6 +6118,49 @@ pub fn build_st_price_counted_binding(
 /// A-12 归因日推 counted binding: occurrence = attribution-daily:{业务日},
 /// Global BusinessDateOnce (每日必达, 豁免日预算 — 2026-09-20 分流规则)。
 /// canonical = 业务日 + 渲染文本 sha256 (同事实同字节, decision 回放稳定)。
+/// G5b 深链归因 counted binding: 每事件一推 (≤3/日), occurrence =
+/// g5b-attribution:{业务日}:{code}:{事件事实 hash} — identity 与真实事件粒度对齐
+/// (v14 event_id 每事件稳定, 且为未来 Rolling 每事件冷却迁移预留)。
+/// canonical = row 事实 + 渲染 sha256; Global scope (告警 code 不强制解析证券身份),
+/// WindowMode::None 无冷却 (镜像 HoldingEvent 先例)。
+pub fn build_g5b_counted_binding(
+    business_date: chrono::NaiveDate,
+    record: &stock_analysis::monitor::alert_log::AlertRecord,
+    summary: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let event_facts = format!(
+        "{}|{}|{}|{}",
+        record.triggered_at, record.code, record.category, record.message
+    );
+    let event_hash = hex::encode(Sha256::digest(event_facts.as_bytes()));
+    let rendered_sha256 = hex::encode(Sha256::digest(summary.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "g5b-attribution-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": record.code,
+        "triggered_at": record.triggered_at,
+        "category": record.category,
+        "level": record.level,
+        "message": record.message,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("g5b-attribution:{business_date}:{}:{event_hash}", record.code),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("G5b counted binding 构造失败: {error}"))
+}
+
 pub fn build_attribution_daily_counted_binding(
     business_date: chrono::NaiveDate,
     text: &str,
@@ -21582,6 +21625,62 @@ mod tests {
         assert_eq!(
             other_binding.schedule_occurrence_identity(),
             "st-price:2026-09-20:600002"
+        );
+    }
+
+    #[test]
+    fn g5b_counted_binding_is_per_event_per_day() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let record = stock_analysis::monitor::alert_log::AlertRecord {
+            origin: Default::default(),
+            triggered_at: "2026-09-20T15:02:00".to_string(),
+            code: "600001".to_string(),
+            name: "示例".to_string(),
+            level: "important".to_string(),
+            category: "资金".to_string(),
+            message: "主力净流入".to_string(),
+            price: None,
+            change_pct: None,
+            main_flow_yi: None,
+            news_title: None,
+            news_importance: None,
+            attribution_decision: None,
+            routed_external_id: None,
+            t1_locked: false,
+        };
+        let summary = "深链归因摘要";
+        let binding = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+        assert!(binding.retry_authorized());
+        assert!(
+            binding
+                .schedule_occurrence_identity()
+                .starts_with("g5b-attribution:2026-09-20:600001:")
+        );
+        // 同事件同日 → 同 occurrence; 同票不同事件 → 不同 occurrence (不互杀)
+        let again = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        let mut second = record.clone();
+        second.message = "另一条告警".to_string();
+        let other = build_g5b_counted_binding(date, &second, summary).expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next_binding = build_g5b_counted_binding(next, &record, summary).expect("valid binding");
+        assert!(
+            next_binding
+                .schedule_occurrence_identity()
+                .starts_with("g5b-attribution:2026-09-21:600001:")
         );
     }
 

@@ -9194,9 +9194,34 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         row.elapsed_ms
                                     );
                                     let summary = render_deep_attribution_summary(&row);
-                                    let outcome =
-                                        push_governor_v3(&summary, PushKind::G5bAttribution, None)
-                                            .await;
+                                    // 2026-09-20: G5b 升级 counted 持久投递 (MU-g5b-attribution)。
+                                    // binding 在分析后构造 (LLM 结果非确定, 重试分析=新事件);
+                                    // 推送失败决策落盘, 启动对账补发原文本。
+                                    let outcome = match push_templates::build_g5b_counted_binding(
+                                        today,
+                                        &row.record,
+                                        &summary,
+                                    )
+                                    .and_then(|binding| {
+                                        crate::presentation_registry::acquire_token(
+                                            "G5b-attribution-deep",
+                                            PushKind::G5bAttribution,
+                                            "g5b_attribution_dispatcher",
+                                            "render_deep_attribution",
+                                        )
+                                        .map(|token| (token, binding))
+                                    }) {
+                                        Ok((token, binding)) => {
+                                            crate::notify::push_counted_with_binding(
+                                                token, &summary, None, binding,
+                                            )
+                                            .await
+                                        }
+                                        Err(reason) => {
+                                            log::error!("[g5b][BR-192][BR-196] counted 准备失败: {reason}");
+                                            crate::notify::PushOutcome::Denied(reason)
+                                        }
+                                    };
                                     log::info!("[g5b] 深链归因推送完成: {:?}", outcome);
                                     done += 1;
                                 }

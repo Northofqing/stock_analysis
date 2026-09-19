@@ -198,10 +198,11 @@ pub enum PushKind {
     PreopenNewsHot,
     StPriceLimitChanged,
     AttributionDaily,
+    G5bAttribution,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -227,6 +228,7 @@ impl PushKind {
         Self::PreopenNewsHot,
         Self::StPriceLimitChanged,
         Self::AttributionDaily,
+        Self::G5bAttribution,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -256,6 +258,7 @@ impl PushKind {
             Self::PreopenNewsHot => "PreopenNewsHot",
             Self::StPriceLimitChanged => "StPriceLimitChanged",
             Self::AttributionDaily => "AttributionDaily",
+            Self::G5bAttribution => "G5bAttribution",
         }
     }
 
@@ -286,6 +289,7 @@ impl PushKind {
             Self::PreopenNewsHot => "preopen_news_hot_v1",
             Self::StPriceLimitChanged => "st_price_limit_changed_v1",
             Self::AttributionDaily => "attribution_daily_v1",
+            Self::G5bAttribution => "g5b_attribution_v1",
         }
     }
 
@@ -444,6 +448,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // (与 BR-237 复盘类同语义)。occurrence = attribution-daily:{业务日},
         // 15:05 一次, BusinessDateOnce 防跨日 Rolling 头误杀。
         (AttributionDaily, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: G5b 深链归因升级 counted — 每事件一推 (≤3/日, LLM 非确定),
+        // 无冷却 (WindowMode::None, 镜像 HoldingEvent 先例); 盘后归因类豁免日预算
+        // (分流规则: 复盘/归因不被盘中信号饿死)。
+        (G5bAttribution, Global, std::option::Option::None, WindowMode::None),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -498,6 +506,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::CatalystReview
                     | PushKind::PreopenNewsHot
                     | PushKind::AttributionDaily
+                    | PushKind::G5bAttribution
             ),
             policy_version: POLICY_VERSION,
         },

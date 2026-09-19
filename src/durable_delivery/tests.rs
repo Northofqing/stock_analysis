@@ -5891,6 +5891,23 @@ fn t16_st_price_policy_is_per_ticket_rolling_and_budget_counted() {
     assert_eq!(row.push_kind.stable_template_id(), "st_price_limit_changed_v1");
 }
 #[test]
+fn g5b_policy_is_global_no_cooldown_and_budget_exempt() {
+    // 2026-09-20: G5b 每事件一推 (≤3/日), 无冷却 (WindowMode::None, HoldingEvent
+    // 先例); 盘后归因类豁免日预算 (分流规则)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::G5bAttribution)
+        .expect("G5b durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "g5b_attribution_v1");
+}
+
+#[test]
 fn a12_attribution_daily_policy_is_global_business_date_once_and_budget_exempt() {
     // 2026-09-20 用户决策 (分流规则): 每日必达类豁免日预算 — 15:05 归因日推
     // 与复盘类同语义 (BR-237), 不被盘中信号饿死。
@@ -7119,7 +7136,7 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_twenty_five_kinds_and_twenty_eight_rows() {
+fn policy_catalog_has_twenty_six_kinds_and_twenty_nine_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
@@ -7127,16 +7144,17 @@ fn policy_catalog_has_twenty_five_kinds_and_twenty_eight_rows() {
     // 2026-08-18: BR-241 P-01 durable owner → 23 kind/26 row。
     // 2026-09-19: T-16 ST 涨跌幅变更提醒升级 counted → 24 kind/27 row。
     // 2026-09-20: A-12 归因日推升级 counted → 25 kind/28 row。
+    // 2026-09-20: G5b 深链归因升级 counted → 26 kind/29 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        28
+        29
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        25
+        26
     );
-    assert_eq!(compiled_policy_catalog().len(), 28);
+    assert_eq!(compiled_policy_catalog().len(), 29);
 }
 
 #[test]

@@ -2289,6 +2289,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::StPriceLimitChanged => (D::StPriceLimitChanged, DeliverySubKind::None),
         // 2026-09-20: A-12 归因日推升级 counted (MU-attribution-daily 接线)。
         K::AttributionDaily => (D::AttributionDaily, DeliverySubKind::None),
+        // 2026-09-20: G5b 深链归因升级 counted (MU-g5b-attribution 接线)。
+        K::G5bAttribution => (D::G5bAttribution, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3213,6 +3215,15 @@ mod tests {
         );
         assert!(is_counted_kind(PushKind::StPriceLimitChanged));
     }
+    #[test]
+    fn g5b_attribution_kind_maps_to_durable_g5b() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::G5bAttribution),
+            Some((DurablePushKind::G5bAttribution, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::G5bAttribution));
+    }
+
     #[test]
     fn a12_attribution_daily_kind_maps_to_durable_attribution_daily() {
         assert_eq!(
