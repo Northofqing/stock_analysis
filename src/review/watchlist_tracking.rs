@@ -532,6 +532,31 @@ mod tests {
             text.ends_with("结论: 前排扩散 1/1 兑现，题材情绪延续"),
             "结论必须只统计真正属于前排且已核对的成员, actual={text}"
         );
+        // 按身份过滤前排不得漏掉「其余」成员: 它仍须出现在卡片正文与计数里。
+        assert!(text.contains("· 600833 第一医药 +1.40%"), "actual={text}");
+        assert!(text.contains("昨日关注 2 只"), "actual={text}");
+    }
+
+    #[test]
+    fn all_leading_skipped_falls_back_to_global_conclusion() {
+        let snapshot = WatchlistSnapshot {
+            watch_date: NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            leading: vec![
+                entry("600721", "百花医药", 1),
+                entry("603758", "秦安股份", 1),
+            ],
+            other: vec![entry("600833", "第一医药", 1)],
+        };
+        // 两个前排成员都被跳过 (例如停牌/数据不可用), 只有「其余」核对成功。
+        let outcomes = vec![outcome("600833", "第一医药", 1.40, false, "", 0, Some(10.40))];
+        let text = render_watchlist_tracking(&snapshot, &outcomes);
+        // 前排一只都没核对到 → 不再输出 "前排 X/N" (那会是伪造的前排口径),
+        // 改走 conclusion 的全局兜底分支; 涨停 0 只 → 退潮。
+        assert!(
+            text.ends_with("结论: 题材退潮，关注接力风险"),
+            "actual={text}"
+        );
+        assert!(text.contains("· 600833 第一医药 +1.40%"), "actual={text}");
     }
 
     #[test]
