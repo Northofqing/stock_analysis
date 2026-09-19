@@ -94,7 +94,11 @@ impl OpportunitySchedule {
         if now_secs == preopen_secs {
             return PushWindow::Preopen;
         }
-        if self.push_intraday.contains(&now) {
+        if self
+            .push_intraday
+            .iter()
+            .any(|t| t.num_seconds_from_midnight() as u64 == now_secs)
+        {
             return PushWindow::Intraday;
         }
         if now_secs == evening_secs {
@@ -170,6 +174,30 @@ mod tests {
     }
 
     // v22: push_window 测试
+    #[test]
+    fn test_push_window_intraday_matches_by_second_not_nanosecond() {
+        let s = OpportunitySchedule::default();
+        // 同一秒内的非零纳秒也必须落入 Intraday —— 与 Preopen/Evening 的秒级
+        // 判据一致。真实调用方传入 Local::now().time(), 纳秒恒非零。
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_nano_opt(10, 30, 0, 500_000_000).unwrap()),
+            PushWindow::Intraday
+        );
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_nano_opt(11, 0, 0, 1).unwrap()),
+            PushWindow::Intraday
+        );
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_nano_opt(14, 30, 0, 999_999_999).unwrap()),
+            PushWindow::Intraday
+        );
+        // 相邻秒仍为窗口外 —— 本修法只对齐到秒, 不扩大为分钟窗口。
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_opt(10, 30, 1).unwrap()),
+            PushWindow::Outside
+        );
+    }
+
     #[test]
     fn test_push_window_default() {
         let s = OpportunitySchedule::default();
