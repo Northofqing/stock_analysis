@@ -38,7 +38,8 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
         format!("【今日】合计 {:<12}", fmt_money(today_total)),
         format!(
-            "【30天】已实现 {:<8} 期末浮盈 {}",
+            "【{}天】已实现 {:<8} 期末浮盈 {}",
+            window.days,
             fmt_money(win_realized),
             fmt_money(win_unreal)
         ),
@@ -154,7 +155,7 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
         ));
     }
     out.push(String::new());
-    out.push("## 30 天滚动窗口".to_string());
+    out.push(format!("## {} 天滚动窗口", window.days));
     out.push("| 信号族 | 已实现累计 | 期末浮盈 | 合计 | 胜率 |".to_string());
     out.push("|---|---|---|---|---|".to_string());
     for f in &window.families {
@@ -278,6 +279,27 @@ mod tests {
         assert!(text.contains("27"));
         assert!(text.contains("+582,000")); // spec §4.4.2 影响金额 (已实现口径, 正数带 "+")
         assert!(text.contains("未估值"));
+    }
+
+    #[test]
+    fn window_label_reports_actual_clamped_day_count() {
+        // BR-255: epoch 生效首月窗口被截断到 effective, WindowAttribution.days
+        // 同步为真实跨度 (compute_epoch_window 注释: "首月报告天数诚实")。
+        let mut clamped = window();
+        clamped.days = 8;
+        let text = render_summary(&daily(), &clamped);
+        assert!(
+            text.contains("【8天】"),
+            "推送卡窗口标签必须反映实际天数, actual={text}"
+        );
+        assert!(!text.contains("【30天】"), "actual={text}");
+
+        let md = render_full_markdown(&daily(), &clamped);
+        assert!(
+            md.contains("## 8 天滚动窗口"),
+            "Markdown 标题必须反映实际天数, actual={md}"
+        );
+        assert!(!md.contains("30 天滚动窗口"), "actual={md}");
     }
 
     #[test]
