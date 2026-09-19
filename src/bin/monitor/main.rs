@@ -9083,6 +9083,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             log::warn!(
                                 "[g5b] 深链归因: 无可用 LLM provider (DEEPSEEK_API_KEY 未配置?), 本次跳过"
                             );
+                            // 跳过归因不等于跳过本循环尾部的 sleep: 直接 continue 会绕过
+                            // sleep(30s) 回到 loop 头部, 造成无退避空转 (日志与 CPU 双刷)。
+                            // 保留原意 (每 tick 提示), tick 节奏即该 sleep 的长度。
+                            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                             continue;
                         };
                         let analyzer = DeepAttributionAnalyzer::new(provider);
