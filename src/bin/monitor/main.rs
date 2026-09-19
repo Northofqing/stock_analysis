@@ -9010,7 +9010,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 与 PerformanceEngine 同点运行, 当日一次, 失败出声。
             // 重试窗口 15:05-15:20: 失败后每个 tick 重试直到成功 (2026-08-22 实测
             // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
-            // 成功才记 ATTRIBUTION_LAST_RUN → 窗口内失败持续重试, 跨日不重复成功推送。
+            // 计算成功 (Ok(text)) 即记 ATTRIBUTION_LAST_RUN — 推送结果不门控
+            // (推送失败由 durable 决策补偿, 见 Ok 臂注释); 计算失败窗口内持续重试。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::performance::attribution::{
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
@@ -9065,8 +9066,36 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         Ok(render_summary(daily.daily(), window.window()))
                     })() {
                         Ok(text) => {
-                            let outcome =
-                                push_governor_v3(&text, PushKind::AttributionDaily, None).await;
+                            // 2026-09-20: A-12 升级 counted 持久投递 (MU-attribution-daily 接线)。
+                            // 业务计算 (compute_epoch_daily/persist/md 落盘) 与 LAST_RUN 语义
+                            // 均不变; 仅投递层增加 durable 决策 owner — sink 失败落盘
+                            // RejectedDurable(retry)/Uncertain, 下次启动对账重发
+                            // Reserved/Rejected-retry (可跨日补发原 15:05 文本);
+                            // Uncertain 需人工裁定; binding/token 准备失败无 durable 行
+                            // 与原路径等价。原路径推送失败即永久丢, 新路径可补偿。
+                            let outcome = match push_templates::build_attribution_daily_counted_binding(
+                                today, &text,
+                            )
+                            .and_then(|binding| {
+                                crate::presentation_registry::acquire_token(
+                                    "A-12-attribution-daily",
+                                    PushKind::AttributionDaily,
+                                    "attribution_daily_dispatcher",
+                                    "render_attribution_daily",
+                                )
+                                .map(|token| (token, binding))
+                            }) {
+                                Ok((token, binding)) => {
+                                    crate::notify::push_counted_with_binding(
+                                        token, &text, None, binding,
+                                    )
+                                    .await
+                                }
+                                Err(reason) => {
+                                    log::error!("[attribution][BR-192][BR-196] counted 准备失败: {reason}");
+                                    crate::notify::PushOutcome::Denied(reason)
+                                }
+                            };
                             log::info!("[attribution] 15:05 归因推送完成: {:?}", outcome);
                             *ATTRIBUTION_LAST_RUN
                                 .lock()

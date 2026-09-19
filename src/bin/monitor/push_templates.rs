@@ -6115,6 +6115,36 @@ pub fn build_st_price_counted_binding(
     .map_err(|error| format!("T-16 counted binding 构造失败 code={}: {error}", params.code))
 }
 
+/// A-12 归因日推 counted binding: occurrence = attribution-daily:{业务日},
+/// Global BusinessDateOnce (每日必达, 豁免日预算 — 2026-09-20 分流规则)。
+/// canonical = 业务日 + 渲染文本 sha256 (同事实同字节, decision 回放稳定)。
+pub fn build_attribution_daily_counted_binding(
+    business_date: chrono::NaiveDate,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "attribution-daily-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("attribution-daily:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("A-12 counted binding 构造失败: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -21552,6 +21582,38 @@ mod tests {
         assert_eq!(
             other_binding.schedule_occurrence_identity(),
             "st-price:2026-09-20:600002"
+        );
+    }
+
+    #[test]
+    fn a12_counted_binding_is_global_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "归因摘要 (固定内容)";
+        let binding = build_attribution_daily_counted_binding(date, text).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-20"
+        );
+        // 同业务日 → 同 occurrence (每日必达一次, 第二次同日推送被 policy 拒)
+        let again = build_attribution_daily_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 文本变化不改变 occurrence (当日一次不变式), 只改变 canonical
+        let other_text = "不同内容的摘要";
+        let other = build_attribution_daily_counted_binding(date, other_text).expect("valid binding");
+        assert_eq!(
+            other.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-20"
+        );
+        // 不同业务日 → 不同 occurrence
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next_binding = build_attribution_daily_counted_binding(next, text).expect("valid binding");
+        assert_eq!(
+            next_binding.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-21"
         );
     }
 

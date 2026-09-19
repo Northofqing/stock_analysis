@@ -197,10 +197,11 @@ pub enum PushKind {
     CatalystReview,
     PreopenNewsHot,
     StPriceLimitChanged,
+    AttributionDaily,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -225,6 +226,7 @@ impl PushKind {
         Self::CatalystReview,
         Self::PreopenNewsHot,
         Self::StPriceLimitChanged,
+        Self::AttributionDaily,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -253,6 +255,7 @@ impl PushKind {
             Self::CatalystReview => "CatalystReview",
             Self::PreopenNewsHot => "PreopenNewsHot",
             Self::StPriceLimitChanged => "StPriceLimitChanged",
+            Self::AttributionDaily => "AttributionDaily",
         }
     }
 
@@ -282,6 +285,7 @@ impl PushKind {
             Self::CatalystReview => "catalyst_review_v1",
             Self::PreopenNewsHot => "preopen_news_hot_v1",
             Self::StPriceLimitChanged => "st_price_limit_changed_v1",
+            Self::AttributionDaily => "attribution_daily_v1",
         }
     }
 
@@ -436,6 +440,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 镜像旧 L4 (st_price_limit_changed,code,"") 86400s 语义;
         // 计入 30 条/日预算 (盘中信息卡, 非资金动作, 与 T0Advice 同待遇)。
         (StPriceLimitChanged, PerTicket, Some(86_400), Rolling),
+        // 2026-09-20 用户决策 (分流规则): A-12 归因日推 = 每日必达 → 豁免日预算
+        // (与 BR-237 复盘类同语义)。occurrence = attribution-daily:{业务日},
+        // 15:05 一次, BusinessDateOnce 防跨日 Rolling 头误杀。
+        (AttributionDaily, Global, Some(86_400), BusinessDateOnce),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -489,6 +497,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::WatchlistTracking
                     | PushKind::CatalystReview
                     | PushKind::PreopenNewsHot
+                    | PushKind::AttributionDaily
             ),
             policy_version: POLICY_VERSION,
         },

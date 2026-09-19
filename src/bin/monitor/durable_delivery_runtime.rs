@@ -2287,6 +2287,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::ForbiddenOps => (D::ForbiddenOps, DeliverySubKind::None),
         // 2026-09-19: T-16 ST 涨跌幅变更提醒升级 counted (MU-st-price 接线)。
         K::StPriceLimitChanged => (D::StPriceLimitChanged, DeliverySubKind::None),
+        // 2026-09-20: A-12 归因日推升级 counted (MU-attribution-daily 接线)。
+        K::AttributionDaily => (D::AttributionDaily, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3210,6 +3212,14 @@ mod tests {
             ))
         );
         assert!(is_counted_kind(PushKind::StPriceLimitChanged));
+    }
+    #[test]
+    fn a12_attribution_daily_kind_maps_to_durable_attribution_daily() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AttributionDaily),
+            Some((DurablePushKind::AttributionDaily, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AttributionDaily));
     }
 
     #[tokio::test]
