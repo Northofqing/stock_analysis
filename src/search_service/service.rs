@@ -12,12 +12,12 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use crate::config::get_monitor_config;
+use crate::data_gateway::grpc_source::{GrpcSource, LocalSemanticSearchConnectionState};
 use crate::data_gateway::{
-    EconomicCalendarGateway, GatewayBatch, GatewayError, GeneralWebResearchProvider,
-    GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord,
+    GatewayBatch, GatewayError, GeneralWebResearchProvider, GlobalNewsGateway, GlobalNewsProvider,
+    GlobalNewsRecord,
 };
 
-use super::macro_news::render_gateway_sections;
 use super::providers::GeneralWebSearchProvider;
 use super::types::{
     FlashFactBatch, FlashFactsUnavailable, FlashSourceStatus, FreshFlashFact, SearchProvider,
@@ -141,8 +141,87 @@ fn project_gateway_flash_outcome(
 /// 1. 管理多个搜索引擎
 /// 2. 自动故障转移
 /// 3. 结果聚合和格式化
+pub(super) struct RegisteredProvider {
+    legacy: Box<dyn SearchProvider>,
+    pub(super) general_web_identity: Option<GeneralWebResearchProvider>,
+}
+
+impl RegisteredProvider {
+    fn general_web(
+        provider: GeneralWebResearchProvider,
+        factory: fn(GeneralWebResearchProvider) -> GeneralWebSearchProvider,
+    ) -> Self {
+        Self {
+            legacy: Box::new(factory(provider)),
+            general_web_identity: Some(provider),
+        }
+    }
+
+    #[cfg(test)]
+    fn legacy(provider: Box<dyn SearchProvider>) -> Self {
+        Self {
+            legacy: provider,
+            general_web_identity: None,
+        }
+    }
+}
+
+impl std::ops::Deref for RegisteredProvider {
+    type Target = dyn SearchProvider;
+
+    fn deref(&self) -> &Self::Target {
+        self.legacy.as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MacroWebDecision {
+    registration_ordinal: u32,
+    provider: GeneralWebResearchProvider,
+    supported: bool,
+    local_transport: LocalSemanticSearchConnectionState,
+}
+
+impl MacroWebDecision {
+    pub(crate) fn registration_ordinal(&self) -> u32 {
+        self.registration_ordinal
+    }
+
+    pub(crate) fn provider(&self) -> GeneralWebResearchProvider {
+        self.provider
+    }
+
+    pub(crate) fn supported(&self) -> bool {
+        self.supported
+    }
+
+    pub(crate) fn local_transport(&self) -> &LocalSemanticSearchConnectionState {
+        &self.local_transport
+    }
+}
+
+pub(crate) struct MacroWebSnapshot {
+    decisions: Vec<MacroWebDecision>,
+    local_transport: LocalSemanticSearchConnectionState,
+}
+
+impl MacroWebSnapshot {
+    pub(crate) fn local_transport(&self) -> &LocalSemanticSearchConnectionState { &self.local_transport }
+    pub(crate) fn decisions(&self) -> &[MacroWebDecision] {
+        &self.decisions
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum MacroWebSnapshotError {
+    #[error("Macro general-web registry Local SemanticSearch connection state is busy")]
+    LocalConnectionStateBusy,
+    #[error("Macro general-web registry entry {ordinal} claims capability without typed identity")]
+    UntypedGeneralWebRegistration { ordinal: u32 },
+}
+
 pub struct SearchService {
-    providers: Vec<Box<dyn SearchProvider>>,
+    providers: Vec<RegisteredProvider>,
     /// 最近入选主题新闻标题特征（用于抑制重复推送）
     recent_topic_signatures: Mutex<VecDeque<String>>,
     /// 新闻源健康统计（成功/超时/失败/空结果）
@@ -181,16 +260,17 @@ impl SearchService {
         tavily_keys: Option<Vec<String>>,
         serpapi_keys: Option<Vec<String>>,
     ) -> Self {
-        let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
+        let mut providers: Vec<RegisteredProvider> = Vec::new();
 
         // BR-164: this registry is only generic, user-authorized web research.
         // Governed financial facts are acquired exclusively by data_gateway.
         if let Some(keys) = serpapi_keys {
             if !keys.is_empty() {
                 info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(GeneralWebSearchProvider::new(
+                providers.push(RegisteredProvider::general_web(
                     GeneralWebResearchProvider::SerpApi,
-                )));
+                    GeneralWebSearchProvider::new,
+                ));
             }
         }
 
@@ -198,9 +278,10 @@ impl SearchService {
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(GeneralWebSearchProvider::new(
+                providers.push(RegisteredProvider::general_web(
                     GeneralWebResearchProvider::Bocha,
-                )));
+                    GeneralWebSearchProvider::new,
+                ));
             }
         }
 
@@ -208,9 +289,10 @@ impl SearchService {
         if let Some(keys) = tavily_keys {
             if !keys.is_empty() {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(GeneralWebSearchProvider::new(
+                providers.push(RegisteredProvider::general_web(
                     GeneralWebResearchProvider::Tavily,
-                )));
+                    GeneralWebSearchProvider::new,
+                ));
             }
         }
 
@@ -232,16 +314,19 @@ impl SearchService {
     /// Production factory. BR-175 keeps credential names and parsing inside
     /// `GeneralWebResearchGateway`.
     pub fn from_environment() -> Self {
-        let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
+        let mut providers: Vec<RegisteredProvider> = Vec::new();
         for provider in [
             GeneralWebResearchProvider::SerpApi,
             GeneralWebResearchProvider::Bocha,
             GeneralWebResearchProvider::Tavily,
         ] {
-            let adapter = GeneralWebSearchProvider::from_environment(provider);
-            if adapter.is_available() {
-                info!("已配置 {} 通用网页研究 Gateway", adapter.name());
-                providers.push(Box::new(adapter));
+            let registered = RegisteredProvider::general_web(
+                provider,
+                GeneralWebSearchProvider::from_environment,
+            );
+            if registered.is_available() {
+                info!("已配置 {} 通用网页研究 Gateway", registered.name());
+                providers.push(registered);
             }
         }
         if providers.is_empty() {
@@ -253,6 +338,88 @@ impl SearchService {
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
                 cfg.topic_history_memory_size.max(50),
             )),
+            source_health: Mutex::new(HashMap::new()),
+            source_health_ticks: Mutex::new(0),
+        }
+    }
+
+    pub(crate) fn macro_web_snapshot(
+        &self,
+        source: &GrpcSource,
+    ) -> Result<MacroWebSnapshot, MacroWebSnapshotError> {
+        let mut entries = Vec::new();
+        for (index, registered) in self.providers.iter().enumerate() {
+            let ordinal = u32::try_from(index + 1).map_err(|_| {
+                MacroWebSnapshotError::UntypedGeneralWebRegistration { ordinal: u32::MAX }
+            })?;
+            let supported = registered.supports_general_web_search();
+            match registered.general_web_identity {
+                Some(provider) => entries.push((ordinal, provider, supported)),
+                None if supported => {
+                    return Err(MacroWebSnapshotError::UntypedGeneralWebRegistration { ordinal });
+                }
+                None => {}
+            }
+        }
+
+        let local_transport = source.local_semantic_search_connection_state();
+        if entries.is_empty() {
+            return Ok(MacroWebSnapshot {
+                decisions: Vec::new(),
+                local_transport,
+            });
+        }
+
+        if matches!(local_transport, LocalSemanticSearchConnectionState::Busy) {
+            return Err(MacroWebSnapshotError::LocalConnectionStateBusy);
+        }
+        Ok(MacroWebSnapshot {
+            local_transport: local_transport.clone(),
+            decisions: entries
+                .into_iter()
+                .map(
+                    |(registration_ordinal, provider, supported)| MacroWebDecision {
+                        registration_ordinal,
+                        provider,
+                        supported,
+                        local_transport: local_transport.clone(),
+                    },
+                )
+                .collect(),
+        })
+    }
+
+    pub(super) fn macro_registrations(&self) -> &[RegisteredProvider] {
+        &self.providers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_general_web_providers_for_test(
+        providers: &[GeneralWebResearchProvider],
+    ) -> Self {
+        Self {
+            providers: providers
+                .iter()
+                .copied()
+                .map(|provider| {
+                    RegisteredProvider::general_web(provider, GeneralWebSearchProvider::new)
+                })
+                .collect(),
+            recent_topic_signatures: Mutex::new(VecDeque::with_capacity(50)),
+            source_health: Mutex::new(HashMap::new()),
+            source_health_ticks: Mutex::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_untyped_general_web_provider_for_test(
+        provider: GeneralWebResearchProvider,
+    ) -> Self {
+        Self {
+            providers: vec![RegisteredProvider::legacy(Box::new(
+                GeneralWebSearchProvider::new(provider),
+            ))],
+            recent_topic_signatures: Mutex::new(VecDeque::with_capacity(50)),
             source_health: Mutex::new(HashMap::new()),
             source_health_ticks: Mutex::new(0),
         }
@@ -1364,122 +1531,7 @@ impl SearchService {
     /// 3. 美股 / 欧股 / 大宗商品今日行情
     /// 4. 国内宏观政策（央行、财政、产业）
     pub async fn search_macro_news(&self, max_results: usize) -> String {
-        let today = chrono::Local::now().format("%Y年%m月%d日").to_string();
-
-        let mut sections: Vec<String> = Vec::new();
-
-        // ── 第一步：统一 Gateway 的独立真实批次 ──
-        let news_gateway = GlobalNewsGateway::new();
-        let economic_gateway = EconomicCalendarGateway::new();
-        let (eastmoney, cls, jin10, thepaper, releases) = tokio::join!(
-            news_gateway.global_news(GlobalNewsProvider::Eastmoney, 20),
-            news_gateway.global_news(GlobalNewsProvider::Cailianpress, 20),
-            news_gateway.global_news(GlobalNewsProvider::Jin10, 20),
-            news_gateway.global_news(GlobalNewsProvider::ThePaper, 20),
-            economic_gateway.latest_releases(20, None),
-        );
-        sections.extend(render_gateway_sections(
-            [
-                (GlobalNewsProvider::Eastmoney, eastmoney),
-                (GlobalNewsProvider::Cailianpress, cls),
-                (GlobalNewsProvider::Jin10, jin10),
-                (GlobalNewsProvider::ThePaper, thepaper),
-            ],
-            releases,
-        ));
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // ── 第二步：搜索引擎多维度查询 ──
-        // (维度key, 查询关键词, 展示标题)
-        let search_dims: Vec<(&str, String, &str)> = vec![
-            (
-                "a_market",
-                format!("{}A股 大盘 股市 最新动态", today),
-                "### 🇨🇳 A股市场动态",
-            ),
-            (
-                "global",
-                format!("{}国际财经 地缘政治 最新消息", today),
-                "### 🌍 国际财经 / 地缘政治",
-            ),
-            (
-                "us_market",
-                format!("{}美股 美联储 大宗商品 今日", today),
-                "### 🇺🇸 美股 / 大宗商品",
-            ),
-            (
-                "cn_policy",
-                format!("{}中国 央行 财政 产业政策 重要新闻", today),
-                "### 📋 宏观政策",
-            ),
-            (
-                "institution",
-                format!(
-                    "{}高盛 摩根 大摩 美银 JPMorgan 中国A股 市场观点 研报",
-                    today
-                ),
-                "### 🏦 投行观点（高盛/摩根/美银）",
-            ),
-            (
-                "fin_media",
-                format!("{}证券时报 第一财经 21世纪经济报道 重要财经", today),
-                "### 📰 财经媒体要闻",
-            ),
-        ];
-
-        for (dim, query, header) in &search_dims {
-            let mut found = false;
-            for provider in &self.providers {
-                if !provider.supports_general_web_search() || !provider.is_available() {
-                    continue;
-                }
-                let resp = provider.search(query, max_results.min(3)).await;
-                let lines: Vec<String> = if resp.success {
-                    resp.results
-                        .iter()
-                        .filter(|result| result.evidence.is_research_only())
-                        .take(3)
-                        .map(|r| {
-                            let date_tag = r.published_date.as_deref().unwrap_or("");
-                            let snippet_short: String = r.snippet.chars().take(150).collect();
-                            format!("- **{}** {}  \n  {}", r.title, date_tag, snippet_short)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if !lines.is_empty() {
-                    sections.push(format!(
-                        "### 🔎 通用网页研究发现（ResearchOnly；不得作为金融事实）\n{}\n{}",
-                        header,
-                        lines.join("\n")
-                    ));
-                    info!(
-                        "[宏观新闻][{}] {} 获取 {} 条",
-                        dim,
-                        resp.provider,
-                        resp.results.len()
-                    );
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                warn!("[宏观新闻][{}] 所有引擎均失败，跳过该维度", dim);
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-
-        if sections.is_empty() {
-            return String::new();
-        }
-
-        format!(
-            "## 📡 今日宏观 / 市场背景（{}）\n\n{}",
-            today,
-            sections.join("\n\n")
-        )
+        super::macro_news::legacy::search(self, max_results).await
     }
 
     /// 批量搜索多只股票新闻
@@ -1589,6 +1641,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct FixtureProvider {
         available: bool,
@@ -1643,9 +1696,110 @@ mod tests {
         }
     }
 
+    struct RegistryFixtureProvider {
+        supports: bool,
+        legacy_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SearchProvider for RegistryFixtureProvider {
+        fn name(&self) -> &str {
+            "TEST_CODE_display_name_is_not_identity"
+        }
+
+        fn is_available(&self) -> bool {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("TEST_CODE registry must not call legacy availability")
+        }
+
+        fn supports_general_web_search(&self) -> bool {
+            self.supports
+        }
+
+        async fn search(&self, _query: &str, _max_results: usize) -> SearchResponse {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("TEST_CODE registry must not call legacy search")
+        }
+    }
+
+    fn registry_service(providers: Vec<RegisteredProvider>) -> SearchService {
+        SearchService {
+            providers,
+            recent_topic_signatures: Mutex::new(VecDeque::with_capacity(50)),
+            source_health: Mutex::new(HashMap::new()),
+            source_health_ticks: Mutex::new(0),
+        }
+    }
+
+    #[test]
+    fn macro_web_snapshot_preserves_typed_slots_and_never_calls_legacy_bridge() {
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let provider = |supports| RegistryFixtureProvider {
+            supports,
+            legacy_calls: Arc::clone(&legacy_calls),
+        };
+        let service = registry_service(vec![
+            RegisteredProvider::legacy(Box::new(provider(false))),
+            RegisteredProvider {
+                legacy: Box::new(provider(false)),
+                general_web_identity: Some(GeneralWebResearchProvider::Tavily),
+            },
+            RegisteredProvider::general_web(
+                GeneralWebResearchProvider::Bocha,
+                GeneralWebSearchProvider::new,
+            ),
+        ]);
+        let source = GrpcSource::from_external_macro_bundle_for_test(
+            "/TEST_CODE/explicit-external-bundle.toml".into(),
+        );
+        let snapshot = service.macro_web_snapshot(&source).unwrap();
+        assert_eq!(snapshot.decisions().len(), 2);
+        assert_eq!(snapshot.decisions()[0].registration_ordinal(), 2);
+        assert_eq!(
+            snapshot.decisions()[0].provider(),
+            GeneralWebResearchProvider::Tavily
+        );
+        assert!(!snapshot.decisions()[0].supported());
+        assert_eq!(snapshot.decisions()[1].registration_ordinal(), 3);
+        assert_eq!(
+            snapshot.decisions()[1].provider(),
+            GeneralWebResearchProvider::Bocha
+        );
+        assert!(snapshot.decisions()[1].supported());
+        assert!(snapshot.decisions().iter().all(|decision| matches!(
+            decision.local_transport(),
+            LocalSemanticSearchConnectionState::Disconnected
+        )));
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let untyped_calls = Arc::new(AtomicUsize::new(0));
+        let untyped = registry_service(vec![RegisteredProvider::legacy(Box::new(
+            RegistryFixtureProvider {
+                supports: true,
+                legacy_calls: Arc::clone(&untyped_calls),
+            },
+        ))]);
+        assert!(matches!(
+            untyped.macro_web_snapshot(&source),
+            Err(MacroWebSnapshotError::UntypedGeneralWebRegistration { ordinal: 1 })
+        ));
+        assert_eq!(untyped_calls.load(Ordering::SeqCst), 0);
+
+        let busy_service = SearchService::from_general_web_providers_for_test(&[
+            GeneralWebResearchProvider::SerpApi,
+        ]);
+        let _held = source.hold_local_connection_state_for_test();
+        assert!(matches!(
+            busy_service.macro_web_snapshot(&source),
+            Err(MacroWebSnapshotError::LocalConnectionStateBusy)
+        ));
+    }
+
     fn fixture_service() -> SearchService {
         let mut service = SearchService::new(None, None, None);
-        service.providers = vec![Box::new(FixtureProvider::available())];
+        service.providers = vec![RegisteredProvider::legacy(Box::new(
+            FixtureProvider::available(),
+        ))];
         service
     }
 
@@ -1980,11 +2134,11 @@ mod tests {
     #[tokio::test]
     async fn unavailable_provider_and_empty_reports_remain_explicit() {
         let mut service = SearchService::new(None, None, None);
-        service.providers = vec![Box::new(FixtureProvider {
+        service.providers = vec![RegisteredProvider::legacy(Box::new(FixtureProvider {
             available: false,
             topic: false,
             calls: AtomicUsize::new(0),
-        })];
+        }))];
         assert!(!service.is_available());
         assert!(service.search_topic("TEST_CODE_主题", 3).await.is_empty());
         assert!(service

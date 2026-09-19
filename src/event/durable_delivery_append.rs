@@ -213,7 +213,7 @@ impl DurableDeliveryImmutableAppend {
 
     pub fn for_production() -> DurableResult<Self> {
         Self::bind_fixed(
-            Path::new(env!("CARGO_MANIFEST_DIR")),
+            crate::production_root::production_root(),
             Path::new(PRODUCTION_BASE_DIR),
         )
     }

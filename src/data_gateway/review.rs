@@ -1,6 +1,7 @@
 //! Registered business rules: BR-158, BR-159, BR-213, BR-238.
 //! Unified A-01/R-03 provider admission, evidence retention and acquisition audit.
 
+use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
 use crate::market_domain::ProviderId;
 use crate::market_domain::{LimitPoolEntry, LimitPoolKind, PositiveU32};
 use chrono::NaiveDate;
@@ -350,7 +351,7 @@ impl GatewayError {
     pub(super) fn audit_failure(
         capability: &'static str,
         provider: ProviderId,
-        original_reason_code: &'static str,
+        original_reason_code: &str,
         message: impl Into<String>,
     ) -> Self {
         Self::classified(
@@ -1218,6 +1219,175 @@ pub(super) fn acquisition_request_hash(
     hex::encode(hasher.finalize())
 }
 
+pub(crate) fn board_membership_request_hash(code: &str) -> String {
+    acquisition_request_hash("board-memberships", code)
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct StoredGatewayError {
+    pub(crate) capability: String,
+    pub(crate) provider: Option<ProviderId>,
+    pub(crate) audit_outcome: String,
+    pub(crate) reason_code: String,
+    pub(crate) retryable: bool,
+    pub(crate) message: String,
+}
+
+pub(crate) fn store_gateway_error(error: &GatewayError) -> StoredGatewayError {
+    StoredGatewayError {
+        capability: error.capability().to_owned(),
+        provider: error.provider(),
+        audit_outcome: error.audit_outcome().to_owned(),
+        reason_code: error.reason_code().to_owned(),
+        retryable: error.retryable(),
+        message: error.message().to_owned(),
+    }
+}
+
+pub(crate) fn restore_gateway_error(stored: &StoredGatewayError) -> Result<GatewayError, ()> {
+    let (capability, audit_outcome, reason_code) = match (
+        stored.capability.as_str(),
+        stored.audit_outcome.as_str(),
+        stored.reason_code.as_str(),
+    ) {
+        ("GrpcBridge", "invalid_request", "invalid_request")
+            if stored.provider.is_none() && !stored.retryable =>
+        {
+            ("GrpcBridge", "invalid_request", "invalid_request")
+        }
+        ("GrpcBridge", "unavailable", reason) => (
+            "GrpcBridge",
+            "unavailable",
+            crate::grpc_client::errors::known_wire_reason_code(reason).ok_or(())?,
+        ),
+        ("BoardDirectory", "partial", "invalid_evidence")
+            if stored.provider.is_none() && !stored.retryable =>
+        {
+            ("BoardDirectory", "partial", "invalid_evidence")
+        }
+        ("BoardConstituents", "partial", "invalid_evidence")
+            if stored.provider.is_none() && !stored.retryable =>
+        {
+            ("BoardConstituents", "partial", "invalid_evidence")
+        }
+        _ => return Err(()),
+    };
+    Ok(GatewayError::classified(
+        capability,
+        stored.provider,
+        audit_outcome,
+        reason_code,
+        stored.retryable,
+        stored.message.clone(),
+    ))
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct OwnedGatewayAuditRecord {
+    pub(crate) provider: String,
+    pub(crate) source: String,
+    pub(crate) request_hash: String,
+    pub(crate) source_at: Option<String>,
+    pub(crate) observed_at: String,
+    pub(crate) batch_id: Option<String>,
+    pub(crate) outcome: String,
+    pub(crate) request_count: i64,
+    pub(crate) accepted_count: i64,
+    pub(crate) rejected_count: i64,
+    pub(crate) reason_code: String,
+    pub(crate) retryable: bool,
+}
+
+impl OwnedGatewayAuditRecord {
+    pub(crate) fn borrowed(&self, capability: &'static str) -> DataAcquisitionAuditRecord<'_> {
+        DataAcquisitionAuditRecord {
+            capability,
+            provider: &self.provider,
+            source: &self.source,
+            request_hash: &self.request_hash,
+            source_at: self.source_at.as_deref(),
+            observed_at: &self.observed_at,
+            batch_id: self.batch_id.as_deref(),
+            outcome: &self.outcome,
+            request_count: self.request_count,
+            accepted_count: self.accepted_count,
+            rejected_count: self.rejected_count,
+            reason_code: &self.reason_code,
+            retryable: self.retryable,
+        }
+    }
+}
+
+pub(crate) fn map_gateway_audit_record<T>(
+    capability: &'static str,
+    provider: ProviderId,
+    request_hash: &str,
+    result: &Result<GatewayBatch<T>, GatewayError>,
+    observed_fallback: &str,
+) -> Result<OwnedGatewayAuditRecord, GatewayError> {
+    if result
+        .as_ref()
+        .is_ok_and(|batch| batch.evidence().provider != provider)
+    {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(provider),
+            "Gateway batch provider differs from the admitted provider",
+        ));
+    }
+    match result {
+        Ok(batch) => {
+            let evidence = batch.evidence();
+            let accepted_count = i64::try_from(batch.records().len()).map_err(|_| {
+                GatewayError::audit_failure(
+                    capability,
+                    provider,
+                    "accepted_count_overflow",
+                    "accepted record count exceeds SQLite INTEGER",
+                )
+            })?;
+            Ok(OwnedGatewayAuditRecord {
+                provider: format!("{provider:?}"),
+                source: evidence.source.clone(),
+                request_hash: request_hash.to_owned(),
+                source_at: evidence.source_at.clone(),
+                observed_at: evidence.observed_at.clone(),
+                batch_id: Some(evidence.batch_id.clone()),
+                outcome: if batch.is_verified_empty() {
+                    "verified_empty"
+                } else {
+                    "available"
+                }
+                .to_owned(),
+                request_count: 1,
+                accepted_count,
+                rejected_count: 0,
+                reason_code: if batch.is_verified_empty() {
+                    "verified_empty"
+                } else {
+                    "accepted"
+                }
+                .to_owned(),
+                retryable: false,
+            })
+        }
+        Err(error) => Ok(OwnedGatewayAuditRecord {
+            provider: format!("{provider:?}"),
+            source: "review-data-gateway".to_owned(),
+            request_hash: request_hash.to_owned(),
+            source_at: None,
+            observed_at: observed_fallback.to_owned(),
+            batch_id: None,
+            outcome: error.audit_outcome().to_owned(),
+            request_count: 1,
+            accepted_count: 0,
+            rejected_count: 1,
+            reason_code: error.reason_code().to_owned(),
+            retryable: error.retryable(),
+        }),
+    }
+}
+
 #[derive(Debug)]
 enum GatewayAuditFailure {
     Persisted(GatewayError),
@@ -1252,8 +1422,6 @@ fn audit_gateway_result_with_receipt_state_in<T>(
     ),
     GatewayAuditFailure,
 > {
-    use crate::database::data_acquisition_audit::DataAcquisitionAuditRecord;
-
     let result = result.and_then(|batch| {
         if batch.evidence().provider != provider {
             return Err(GatewayError::invalid_evidence(
@@ -1266,76 +1434,16 @@ fn audit_gateway_result_with_receipt_state_in<T>(
     });
 
     let observed_fallback = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let (
-        source,
-        source_at,
-        observed_at,
-        batch_id,
-        outcome,
-        accepted_count,
-        rejected_count,
-        reason_code,
-        retryable,
-    ) = match &result {
-        Ok(batch) => {
-            let evidence = batch.evidence();
-            let accepted_count = i64::try_from(batch.records().len()).map_err(|_| {
-                GatewayAuditFailure::AppendFailed(GatewayError::audit_failure(
-                    capability,
-                    provider,
-                    "accepted_count_overflow",
-                    "accepted record count exceeds SQLite INTEGER",
-                ))
-            })?;
-            (
-                evidence.source.as_str(),
-                evidence.source_at.as_deref(),
-                evidence.observed_at.as_str(),
-                Some(evidence.batch_id.as_str()),
-                if batch.is_verified_empty() {
-                    "verified_empty"
-                } else {
-                    "available"
-                },
-                accepted_count,
-                0,
-                if batch.is_verified_empty() {
-                    "verified_empty"
-                } else {
-                    "accepted"
-                },
-                false,
-            )
-        }
-        Err(error) => (
-            "review-data-gateway",
-            None,
-            observed_fallback.as_str(),
-            None,
-            error.audit_outcome,
-            0,
-            1,
-            error.reason_code,
-            error.retryable,
-        ),
-    };
-    let provider_label = format!("{provider:?}");
-    let record = DataAcquisitionAuditRecord {
+    let owned = map_gateway_audit_record(
         capability,
-        provider: &provider_label,
-        source,
+        provider,
         request_hash,
-        source_at,
-        observed_at,
-        batch_id,
-        outcome,
-        request_count: 1,
-        accepted_count,
-        rejected_count,
-        reason_code,
-        retryable,
-    };
-    let original_reason_code = reason_code;
+        &result,
+        &observed_fallback,
+    )
+    .map_err(GatewayAuditFailure::AppendFailed)?;
+    let record = owned.borrowed(capability);
+    let original_reason_code = record.reason_code;
     let receipt = database.record_data_acquisition(&record).map_err(|error| {
         GatewayAuditFailure::AppendFailed(GatewayError::audit_failure(
             capability,
@@ -1346,12 +1454,19 @@ fn audit_gateway_result_with_receipt_state_in<T>(
     })?;
 
     log::info!(
-        "[DataGateway][{capability}][BR-159] outcome={outcome} provider={provider:?} \
-         source={source} observed_at={observed_at} source_at={} batch_id={} \
-         requested=1 accepted={accepted_count} rejected={rejected_count} \
-         reason_code={reason_code} retryable={retryable} audit_id={} record_hash={}",
-        source_at.unwrap_or("absent"),
-        batch_id.unwrap_or("absent"),
+        "[DataGateway][{capability}][BR-159] outcome={} provider={provider:?} \
+         source={} observed_at={} source_at={} batch_id={} \
+         requested=1 accepted={} rejected={} \
+         reason_code={} retryable={} audit_id={} record_hash={}",
+        record.outcome,
+        record.source,
+        record.observed_at,
+        record.source_at.unwrap_or("absent"),
+        record.batch_id.unwrap_or("absent"),
+        record.accepted_count,
+        record.rejected_count,
+        record.reason_code,
+        record.retryable,
         receipt.audit_id,
         receipt.record_hash
     );
@@ -2298,14 +2413,16 @@ mod tests {
         let provider_before = count("BenchmarkBars");
         let transport_before = count("BenchmarkBarsGrpcTransport");
         let malformed = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE_unverified_envelope".to_owned(),
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
             records: Vec::new(),
-            source: "TEST_CODE_unverified_provider_response".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE_unverified_provider_response".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 
@@ -2415,21 +2532,23 @@ mod tests {
         let transport_before = count("BenchmarkBarsGrpcTransport");
         let consumer_before = count("BenchmarkBarsGrpcConsumerAdmission");
         let response = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE persisted request A batch".to_owned(),
             complete: true,
             observed_at,
             source_at: String::new(),
             records: vec![
-                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                crate::grpc_client::envelope::CanonicalRecord {
                     schema: "market.benchmark_bars".to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
                     data: serde_json::to_vec(&replayed).expect("TEST_CODE replay payload"),
                 },
             ],
-            source: "TEST_CODE persisted request A provider".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE persisted request A provider".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 
@@ -2526,21 +2645,23 @@ mod tests {
         let transport_before = count("BenchmarkBarsGrpcTransport");
         let consumer_before = count("BenchmarkBarsGrpcConsumerAdmission");
         let response = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE persisted request A bad OHLC batch".to_owned(),
             complete: true,
             observed_at,
             source_at: String::new(),
             records: vec![
-                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                crate::grpc_client::envelope::CanonicalRecord {
                     schema: "market.benchmark_bars".to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
                     data: serde_json::to_vec(&replayed).expect("TEST_CODE bad OHLC replay payload"),
                 },
             ],
-            source: "TEST_CODE persisted request A bad OHLC replay".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE persisted request A bad OHLC replay".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 
@@ -2614,21 +2735,23 @@ mod tests {
             super::super::grpc_source::BenchmarkGrpcResponseWire::from_audited(&request, &forged)
                 .expect("TEST_CODE structurally valid forged wire");
         let response = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE forged receipt".to_owned(),
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
             records: vec![
-                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                crate::grpc_client::envelope::CanonicalRecord {
                     schema: "market.benchmark_bars".to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
                     data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
                 },
             ],
-            source: "TEST_CODE forged provider response".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE forged provider response".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 
@@ -2702,21 +2825,23 @@ mod tests {
             super::super::grpc_source::BenchmarkGrpcResponseWire::from_audited(&request, &forged)
                 .expect("TEST_CODE structurally valid forged wire with bad OHLC");
         let response = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE forged bad OHLC receipt".to_owned(),
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
             records: vec![
-                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                crate::grpc_client::envelope::CanonicalRecord {
                     schema: "market.benchmark_bars".to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
                     data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
                 },
             ],
-            source: "TEST_CODE forged bad OHLC response".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE forged bad OHLC response".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 
@@ -2796,21 +2921,23 @@ mod tests {
         let mut wire_json = serde_json::to_value(wire).expect("TEST_CODE benchmark JSON");
         wire_json["bars"][0]["close"] = serde_json::json!(0.0);
         let response = crate::grpc_client::envelope::QueryResult {
-            admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::Admitted,
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE verified provider receipt".to_owned(),
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
             records: vec![
-                crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+                crate::grpc_client::envelope::CanonicalRecord {
                     schema: "market.benchmark_bars".to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
                     data: serde_json::to_vec(&wire_json).expect("TEST_CODE benchmark payload"),
                 },
             ],
-            source: "TEST_CODE benchmark provider".to_owned(),
+            provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE benchmark provider".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         };
 

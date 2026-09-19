@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -289,7 +290,26 @@ pub(super) fn attest_bundled_connection(
     let rejected = || FoundationMigrationError::AttestationFailed {
         check: "bundled_object_definitions",
     };
-    // The exact artifact has one CLI command. Its SHA was checked above; never interpret
+    let expected = bundled_registered_definitions()?;
+    let actual = registered_definitions(connection)?;
+    if actual.as_slice() != expected {
+        return Err(rejected());
+    }
+    Ok(receipt)
+}
+
+type RegisteredDefinition = (String, String, Vec<u8>);
+static BUNDLED_REGISTERED_DEFINITIONS: OnceLock<Vec<RegisteredDefinition>> = OnceLock::new();
+
+fn bundled_registered_definitions(
+) -> Result<&'static [RegisteredDefinition], FoundationMigrationError> {
+    if let Some(expected) = BUNDLED_REGISTERED_DEFINITIONS.get() {
+        return Ok(expected.as_slice());
+    }
+    let rejected = || FoundationMigrationError::AttestationFailed {
+        check: "bundled_object_definitions",
+    };
+    // The exact artifact has one CLI command. Its SHA was checked by the caller; never interpret
     // caller-provided SQL, and never strip arbitrary dot commands from a different script.
     let sql = DDL_BYTES.strip_prefix(b".bail on\n").ok_or_else(rejected)?;
     let sql = std::str::from_utf8(sql).map_err(|_| rejected())?;
@@ -299,13 +319,13 @@ pub(super) fn attest_bundled_connection(
         .map_err(|_| rejected())?;
     reference.execute_batch(sql).map_err(|_| rejected())?;
     let expected = registered_definitions(&reference)?;
-    if expected.len() != MANAGED_OBJECT_COUNT || registered_definitions(connection)? != expected {
+    if expected.len() != MANAGED_OBJECT_COUNT {
         return Err(rejected());
     }
-    Ok(receipt)
+    Ok(BUNDLED_REGISTERED_DEFINITIONS
+        .get_or_init(|| expected)
+        .as_slice())
 }
-
-type RegisteredDefinition = (String, String, Vec<u8>);
 
 fn registered_definitions(
     connection: &Connection,
@@ -344,3 +364,7 @@ fn parse_digest(value: &str) -> Result<Sha256Digest, FoundationMigrationError> {
     Sha256Digest::parse("push_foundation_ddl_sha256", value)
         .map_err(|_| FoundationMigrationError::InvalidBundledDigest)
 }
+
+#[cfg(test)]
+#[path = "migration_reference_cache_tests.rs"]
+mod reference_cache_tests;

@@ -7,7 +7,7 @@ use super::{GatewayBatch, GatewayError};
 use crate::market_domain::{ProviderId, SourceEvidence};
 use chrono::{DateTime, Utc};
 
-const CAPABILITY: &str = "EconomicCalendar-Jin10";
+pub(crate) const CAPABILITY: &str = "EconomicCalendar-Jin10";
 const SOURCE: &str = "jin10-flash-v1";
 const MAX_LIMIT: u32 = 20;
 
@@ -46,33 +46,31 @@ impl EconomicCalendarGateway {
         country: Option<&str>,
     ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
         let country = country.map(str::to_owned);
-        let request_hash = acquisition_request_hash(
-            CAPABILITY,
-            format!(
-                "limit={limit}:country={}",
-                country.as_deref().unwrap_or("*")
-            ),
-        );
         // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("EconomicCalendar") {
             Ok(bridge) => {
                 let result = bridge.economic_calendar_async().await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Jin10);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_macro_query(limit, country.as_deref(), result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Jin10,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_macro_query(limit, country.as_deref(), Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
     }
+}
+
+pub(crate) fn macro_request_hash(limit: u32, country: Option<&str>) -> String {
+    acquisition_request_hash(CAPABILITY, format!("limit={limit}:country={}", country.unwrap_or("*")))
+}
+
+pub(crate) fn audit_macro_query(
+    limit: u32,
+    country: Option<&str>,
+    result: Result<GatewayBatch<EconomicReleaseFact>, GatewayError>,
+) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
+    let provider = result.as_ref().map(|batch| batch.evidence().provider)
+        .unwrap_or(ProviderId::Jin10);
+    audit_gateway_result(CAPABILITY, provider, &macro_request_hash(limit, country), result)
 }

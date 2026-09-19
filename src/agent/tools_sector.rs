@@ -1,5 +1,5 @@
 use crate::agent::tool::Tool;
-use crate::data_gateway::{BoardDataGateway, BoardKind, GatewayBatch};
+use crate::data_gateway::{BoardDataGateway, BoardKind, BoardMembershipRecord, GatewayBatch};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -10,6 +10,64 @@ impl FetchSectorTool {
     pub const fn new() -> Self {
         Self
     }
+}
+
+pub(crate) fn render_membership_batch(
+    code: &str,
+    batch: GatewayBatch<BoardMembershipRecord>,
+) -> anyhow::Result<String> {
+    let evidence = batch.evidence();
+    let rows = match &batch {
+        GatewayBatch::Available { records, .. } => records,
+        GatewayBatch::VerifiedEmpty(_) => {
+            anyhow::bail!(
+                "Magic TDX 板块归属已验证为空: code={code} provider={:?} source={} \
+                 observed_at={} batch_id={}",
+                evidence.provider,
+                evidence.source,
+                evidence.observed_at,
+                evidence.batch_id
+            )
+        }
+    };
+
+    let industries = rows
+        .iter()
+        .filter(|row| row.kind == BoardKind::Industry)
+        .map(|row| row.board_name.clone())
+        .collect::<Vec<_>>();
+    let concepts = rows
+        .iter()
+        .filter(|row| row.kind == BoardKind::Concept)
+        .map(|row| row.board_name.clone())
+        .collect::<Vec<_>>();
+    let all_boards = rows
+        .iter()
+        .map(|row| row.board_name.clone())
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "fetched": true,
+        "secucode": code,
+        "primary_boards": industries,
+        "secondary_boards": concepts,
+        "all_boards": all_boards,
+        "board_count": rows.len(),
+        "memberships": rows.iter().map(|row| json!({
+            "board_code": row.board_code,
+            "board_name": row.board_name,
+            "category": format!("{:?}", row.kind),
+        })).collect::<Vec<_>>(),
+        "evidence": {
+            "provider": format!("{:?}", evidence.provider),
+            "source": evidence.source,
+            "source_at": evidence.source_at,
+            "observed_at": evidence.observed_at,
+            "batch_id": evidence.batch_id,
+        },
+        "note": "统一 Magic TDX 板块归属；行业/概念使用源类别，不再按列表位置猜测。",
+    })
+    .to_string())
 }
 
 #[async_trait]
@@ -41,58 +99,7 @@ impl Tool for FetchSectorTool {
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
         let batch = BoardDataGateway::new().memberships(code).await?;
-        let evidence = batch.evidence();
-        let rows = match &batch {
-            GatewayBatch::Available { records, .. } => records,
-            GatewayBatch::VerifiedEmpty(_) => {
-                anyhow::bail!(
-                    "Magic TDX 板块归属已验证为空: code={code} provider={:?} source={} \
-                     observed_at={} batch_id={}",
-                    evidence.provider,
-                    evidence.source,
-                    evidence.observed_at,
-                    evidence.batch_id
-                )
-            }
-        };
-
-        let industries = rows
-            .iter()
-            .filter(|row| row.kind == BoardKind::Industry)
-            .map(|row| row.board_name.clone())
-            .collect::<Vec<_>>();
-        let concepts = rows
-            .iter()
-            .filter(|row| row.kind == BoardKind::Concept)
-            .map(|row| row.board_name.clone())
-            .collect::<Vec<_>>();
-        let all_boards = rows
-            .iter()
-            .map(|row| row.board_name.clone())
-            .collect::<Vec<_>>();
-
-        Ok(json!({
-            "fetched": true,
-            "secucode": code,
-            "primary_boards": industries,
-            "secondary_boards": concepts,
-            "all_boards": all_boards,
-            "board_count": rows.len(),
-            "memberships": rows.iter().map(|row| json!({
-                "board_code": row.board_code,
-                "board_name": row.board_name,
-                "category": format!("{:?}", row.kind),
-            })).collect::<Vec<_>>(),
-            "evidence": {
-                "provider": format!("{:?}", evidence.provider),
-                "source": evidence.source,
-                "source_at": evidence.source_at,
-                "observed_at": evidence.observed_at,
-                "batch_id": evidence.batch_id,
-            },
-            "note": "统一 Magic TDX 板块归属；行业/概念使用源类别，不再按列表位置猜测。",
-        })
-        .to_string())
+        render_membership_batch(code, batch)
     }
 }
 

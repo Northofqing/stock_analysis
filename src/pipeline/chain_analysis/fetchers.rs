@@ -84,15 +84,24 @@ pub(super) async fn fetch_boards_via_tool(
     tool: &FetchSectorTool,
     code: &str,
 ) -> Result<Vec<String>, String> {
-    let raw = tool
-        .call(json!({ "code": code }))
-        .await
-        .map_err(|error| format!("产业链 {code} 板块拉取失败: {error}"))?;
+    let raw = fetch_boards_raw(tool, code).await?;
     parse_tool_boards(&raw, code)
 }
 
+/// Fetch one provider response without parsing it so durable callers can first
+/// preserve the exact returned bytes. The legacy path immediately parses it.
+pub(super) async fn fetch_boards_raw(tool: &FetchSectorTool, code: &str) -> Result<String, String> {
+    tool.call(json!({ "code": code }))
+        .await
+        .map_err(|error| format_membership_fetch_failure(code, &error))
+}
+
+pub(crate) fn format_membership_fetch_failure(code: &str, error: &dyn std::fmt::Display) -> String {
+    format!("产业链 {code} 板块拉取失败: {error}")
+}
+
 /// BR-114: validate a complete sector-tool response before it enters the cache.
-fn parse_tool_boards(raw: &str, code: &str) -> Result<Vec<String>, String> {
+pub(super) fn parse_tool_boards(raw: &str, code: &str) -> Result<Vec<String>, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("产业链 {code} 板块 JSON 非法: {error}"))?;
     let rows = value
@@ -129,33 +138,7 @@ pub(super) async fn fetch_board_code_map() -> Result<BoardCodeMapBatch, String> 
             .directory(kind, 10_000)
             .await
             .map_err(|error| format!("产业链板块目录不可用 ({kind:?}): {error}"))?;
-        let records = match batch {
-            GatewayBatch::Available {
-                records,
-                evidence: batch_evidence,
-            } => {
-                evidence.push(batch_evidence);
-                records
-            }
-            GatewayBatch::VerifiedEmpty(evidence) => {
-                return Err(format!(
-                    "产业链板块目录已验证为空 ({kind:?}): provider={:?} source={} \
-                     observed_at={} batch_id={}",
-                    evidence.provider, evidence.source, evidence.observed_at, evidence.batch_id
-                ));
-            }
-        };
-        for record in records {
-            match map.insert(record.name.clone(), record.code.clone()) {
-                Some(previous) if previous != record.code => {
-                    return Err(format!(
-                        "产业链板块名称跨类别冲突: {} => {previous}/{}",
-                        record.name, record.code
-                    ));
-                }
-                _ => {}
-            }
-        }
+        fold_board_directory_kind(&mut map, &mut evidence, kind, batch)?;
     }
     if map.is_empty() {
         Err("Magic TDX 板块目录没有可用记录".to_string())
@@ -165,6 +148,42 @@ pub(super) async fn fetch_board_code_map() -> Result<BoardCodeMapBatch, String> 
             evidence,
         })
     }
+}
+
+pub(crate) fn fold_board_directory_kind(
+    map: &mut HashMap<String, String>,
+    evidence: &mut Vec<BatchEvidence>,
+    kind: BoardKind,
+    batch: GatewayBatch<crate::data_gateway::BoardDirectoryFact>,
+) -> Result<(), String> {
+    let records = match batch {
+        GatewayBatch::Available {
+            records,
+            evidence: batch_evidence,
+        } => {
+            evidence.push(batch_evidence);
+            records
+        }
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(format!(
+                "产业链板块目录已验证为空 ({kind:?}): provider={:?} source={} \
+                 observed_at={} batch_id={}",
+                evidence.provider, evidence.source, evidence.observed_at, evidence.batch_id
+            ));
+        }
+    };
+    for record in records {
+        match map.insert(record.name.clone(), record.code.clone()) {
+            Some(previous) if previous != record.code => {
+                return Err(format!(
+                    "产业链板块名称跨类别冲突: {} => {previous}/{}",
+                    record.name, record.code
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// 当前发布的 Magic TDX 成分合同没有同批次价格、涨幅和证券名称。
@@ -224,7 +243,9 @@ pub(super) async fn fetch_lhb_observed(
     }
 }
 
-fn map_lhb_reviews(records: Vec<DragonTigerStockReview>) -> Result<HashMap<String, f64>, String> {
+pub(crate) fn map_lhb_reviews(
+    records: Vec<DragonTigerStockReview>,
+) -> Result<HashMap<String, f64>, String> {
     let mut out = HashMap::new();
     for record in records {
         if record.code.trim().is_empty() || !record.ranking_net_amount_yuan.is_finite() {

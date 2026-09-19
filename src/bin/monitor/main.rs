@@ -147,6 +147,9 @@ mod v13_diag; // v13.27: 端到端诊断
 
 mod attribution_epoch_runtime;
 mod blocking_market_data;
+#[cfg(test)]
+mod paper_scan_runtime_tests;
+use stock_analysis::trading::paper_sell::{PaperScanFailure, PaperScanPhase, PaperScanSession, PaperSellResult};
 mod closing_valuation_runtime;
 mod data_mode_probe;
 mod manual_push;
@@ -1117,6 +1120,7 @@ mod virtual_observation_tests {
         supervise_long_running_lifecycle(
             &bus,
             &mut writer,
+            &PaperScanSession::new(),
             vec![("TEST_CODE producer", producer)],
             std::future::pending::<()>(),
             async { Ok(()) },
@@ -1153,6 +1157,7 @@ mod virtual_observation_tests {
         let error = supervise_long_running_lifecycle(
             &bus,
             &mut writer,
+            &PaperScanSession::new(),
             vec![("TEST_CODE producer", producer)],
             std::future::pending::<()>(),
             std::future::pending::<Result<(), String>>(),
@@ -1178,6 +1183,7 @@ mod virtual_observation_tests {
         let error = supervise_long_running_lifecycle(
             &bus,
             &mut writer,
+            &PaperScanSession::new(),
             Vec::new(),
             async {},
             std::future::pending::<Result<(), String>>(),
@@ -1667,32 +1673,76 @@ fn build_banner(
             .join("/")
     });
 
-    // User-confirmed snapshots are display-only account facts until a real
-    // broker is connected. Keep `account_metrics_complete` false so risk
-    // gates remain conservative, but do not label known values as missing.
-    let user_summary = stock_analysis::database::DatabaseManager::try_get().and_then(|_| {
-        stock_analysis::database::user_account_summary::latest()
-            .ok()
-            .flatten()
-    });
-    let display_total_pos = am_metrics.total_pos_cheng.or_else(|| {
-        user_summary
-            .as_ref()
-            .map(|summary| (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8)
-    });
-    let display_today_pnl = am_metrics.today_pnl_pct.or_else(|| {
-        user_summary.as_ref().and_then(|summary| {
-            (summary.total_assets > 0.0).then(|| summary.daily_pnl / summary.total_assets * 100.0)
-        })
-    });
-
     push_templates::BannerCtx {
         account_mode,
-        total_pos: display_total_pos,
-        today_pnl: display_today_pnl,
+        total_pos: am_metrics.total_pos_cheng,
+        today_pnl: am_metrics.today_pnl_pct,
         account_metrics_complete: am_metrics.is_complete(),
         data_mode,
         data_missing_note,
+    }
+}
+
+#[cfg(test)]
+mod tests_account_banner_values {
+    use super::build_banner;
+    use stock_analysis::monitor::data_mode::{DataHealth, DataMode};
+    use stock_analysis::risk::account_mode::PortfolioMetrics;
+    use stock_analysis::risk::action_gate::AccountMode;
+
+    #[test]
+    fn build_banner_keeps_only_supplied_metric_values() {
+        let cases = [
+            (
+                PortfolioMetrics::complete(1.25, 2, 6),
+                AccountMode::Normal,
+                DataMode::Full,
+                Some(6),
+                Some(1.25),
+                true,
+            ),
+            (
+                PortfolioMetrics::incomplete(),
+                AccountMode::ReduceOnly,
+                DataMode::Degraded,
+                None,
+                None,
+                false,
+            ),
+            (
+                PortfolioMetrics {
+                    today_pnl_pct: Some(-2.5),
+                    consecutive_stop_loss_n: None,
+                    total_pos_cheng: Some(7),
+                },
+                AccountMode::Frozen,
+                DataMode::Unsafe,
+                Some(7),
+                Some(-2.5),
+                false,
+            ),
+        ];
+
+        for (metrics, account_mode, data_mode, total_pos, today_pnl, complete) in cases {
+            let account_mode_label = match account_mode {
+                AccountMode::Normal => "Normal",
+                AccountMode::ReduceOnly => "ReduceOnly",
+                AccountMode::Frozen => "Frozen",
+            };
+            let data_health = DataHealth {
+                mode: data_mode,
+                missing: Vec::new(),
+                prev_mode: None,
+                eta: None,
+            };
+            let banner = build_banner(&metrics, account_mode, &data_health);
+
+            assert_eq!(banner.total_pos, total_pos);
+            assert_eq!(banner.today_pnl, today_pnl);
+            assert_eq!(banner.account_metrics_complete, complete);
+            assert_eq!(banner.account_mode.label(), account_mode_label);
+            assert_eq!(banner.data_mode.label(), data_mode.label());
+        }
     }
 }
 
@@ -1826,76 +1876,62 @@ fn trading_days_since(start: chrono::NaiveDate, end: chrono::NaiveDate) -> i64 {
     days
 }
 
-/// BR-236 Fix A (2026-08-12): 快照过期时昨日盈亏按持仓市值差自算。
-/// - 估值日 > 快照日（快照后未上传）→ 自算 = 估值总市值 − 快照确认市值，
-///   出声标注「按持仓市值差」口径（未计交易/现金变动；上传新快照即恢复确认值）。
-/// - 否则（估值日 ≤ 快照日）→ 用快照确认值 account.daily_pnl（当日精确）。
-///
-/// 纯函数，可单测。
+/// 用户确认账户快照只陈述自身时间点的事实；估值日期和市值不改变账户口径。
 fn closing_valuation_account_note(
     account: &stock_analysis::database::user_account_summary::UserAccountSummary,
-    valuation_price_date: chrono::NaiveDate,
-    valuation_market_value: Option<f64>,
+    _valuation_price_date: chrono::NaiveDate,
+    _valuation_market_value: Option<f64>,
 ) -> String {
-    let snapshot_date = account
-        .effective_at
-        .get(..10)
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-    match snapshot_date {
-        Some(snapshot_date) if valuation_price_date > snapshot_date => {
-            match valuation_market_value {
-                Some(mv) => format!(
-                    "用户确认账户 {:.1}%仓位，昨日盈亏自算 {:+.2}（快照 {snapshot_date} 后未上传，按持仓市值差）",
-                    account.position_ratio_pct, mv - account.securities_market_value
-                ),
-                None => format!(
-                    "用户确认账户 {:.1}%仓位，昨日盈亏自算不可用（估值市值缺失）",
-                    account.position_ratio_pct
-                ),
-            }
-        }
-        _ => format!(
-            "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}",
-            account.position_ratio_pct, account.daily_pnl
-        ),
-    }
+    push_templates::format_user_confirmed_account_note(account)
 }
 
 fn refresh_closing_valuation_note() {
-    let account = stock_analysis::database::user_account_summary::latest()
-        .ok()
-        .flatten();
-    let note = match stock_analysis::database::closing_valuation::latest_persisted_valuation_view()
-    {
-        Ok(Some(view)) => {
-            let account_note = match account.as_ref() {
-                Some(account) => closing_valuation_account_note(
-                    account,
-                    view.valuation.price_date,
-                    view.valuation.total_market_value,
-                ),
-                None => "用户确认账户摘要缺失（仓位/昨日盈亏不可用）".to_string(),
-            };
-            Some(format!(
-                "{}；收盘估值 {} 覆盖 {}/{}，来源 {}{}",
-                account_note,
-                view.valuation.price_date,
-                view.valuation.covered,
-                view.valuation.total,
-                view.valuation.provider,
-                view.valuation
-                    .total_unrealized_pnl
-                    .map(|p| format!("，持仓未实现盈亏 {p:+.2}"))
-                    .unwrap_or_default()
-            ))
-        }
-        Ok(None) => None,
-        Err(error) => {
-            log::warn!("[BR-147] closing valuation unavailable: {error}");
-            None
-        }
-    };
-    push_templates::set_closing_valuation_note(note);
+    let china_offset = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid China offset");
+    let observed_at = chrono::Utc::now()
+        .with_timezone(&china_offset)
+        .naive_local();
+    let target_price_date =
+        stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
+
+    let account = stock_analysis::database::user_account_summary::latest();
+    let compared_position =
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot();
+    let valuation = stock_analysis::database::closing_valuation::persisted_valuation_view_for_date(
+        target_price_date,
+    );
+    let rechecked_position =
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot();
+
+    if account.is_err() {
+        log::warn!("[BR-147] account summary read failed");
+    }
+    if compared_position.is_err() {
+        log::warn!("[BR-147] compared position snapshot read failed");
+    }
+    if valuation.is_err() {
+        log::warn!("[BR-147] target-date closing valuation read failed");
+    }
+    if rechecked_position.is_err() {
+        log::warn!("[BR-147] rechecked position snapshot read failed");
+    }
+
+    let note = push_templates::format_bound_closing_valuation_note(
+        account.as_ref().ok().and_then(|value| value.as_ref()),
+        compared_position
+            .as_ref()
+            .map(|value| value.as_ref())
+            .map_err(|_| "position_snapshot_read_failed"),
+        rechecked_position
+            .as_ref()
+            .map(|value| value.as_ref())
+            .map_err(|_| "position_snapshot_recheck_failed"),
+        valuation
+            .as_ref()
+            .map(|value| value.as_ref())
+            .map_err(|_| "closing_valuation_read_failed"),
+        target_price_date,
+    );
+    push_templates::set_closing_valuation_note(Some(note));
 }
 
 #[cfg(test)]
@@ -1903,9 +1939,9 @@ mod tests_br236_valuation_note {
     use super::closing_valuation_account_note;
     use chrono::NaiveDate;
 
-    /// 快照 8/10 确认 -426.05；估值日 8/11 市值 49399 → 自算 49399-50269 = -870
+    /// 快照 8/10 确认 -426.05；后续估值输入不改变该快照事实。
     #[test]
-    fn stale_snapshot_self_calcs_daily_pnl() {
+    fn stale_snapshot_keeps_dated_pnl_without_market_value_subtraction() {
         let account = stock_analysis::database::user_account_summary::UserAccountSummary {
             effective_at: "2026-08-10T15:00:00+08:00".to_string(),
             total_assets: 50269.0,
@@ -1920,14 +1956,13 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             Some(49399.0),
         );
-        assert!(
-            note.contains("昨日盈亏自算 -870.00"),
-            "unexpected note: {note}"
-        );
-        assert!(
-            note.contains("快照 2026-08-10 后未上传，按持仓市值差"),
-            "unexpected note: {note}"
-        );
+        assert!(note.contains("2026-08-10T15:00:00+08:00"), "{note}");
+        assert!(note.contains("source=user_upload"), "{note}");
+        assert!(note.contains("2026-08-10 当日盈亏 -426.05"), "{note}");
+        assert!(note.contains("截至快照，非实时账户"), "{note}");
+        assert!(!note.contains("-870.00"), "{note}");
+        assert!(!note.contains("自算"), "{note}");
+        assert!(!note.contains("昨日"), "{note}");
     }
 
     /// 同日（快照 8/10 确认 -426.05，估值日 8/10）→ 用确认值
@@ -1947,11 +1982,11 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 10).expect("date"),
             Some(44741.0),
         );
-        assert!(note.contains("昨日盈亏 -426.05"), "unexpected note: {note}");
-        assert!(
-            !note.contains("自算"),
-            "same-day snapshot must not self-calc: {note}"
-        );
+        assert!(note.contains("2026-08-10T15:00:00+08:00"), "{note}");
+        assert!(note.contains("source=user_upload"), "{note}");
+        assert!(note.contains("2026-08-10 当日盈亏 -426.05"), "{note}");
+        assert!(note.contains("截至快照，非实时账户"), "{note}");
+        assert!(!note.contains("昨日"), "{note}");
     }
 
     /// 快照新于估值日（当天新上传快照，估值还是昨天）→ 确认值
@@ -1971,12 +2006,16 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             Some(49399.0),
         );
-        assert!(note.contains("昨日盈亏 +123.45"), "unexpected note: {note}");
+        assert!(note.contains("2026-08-12T09:00:00+08:00"), "{note}");
+        assert!(note.contains("source=user_upload"), "{note}");
+        assert!(note.contains("2026-08-12 当日盈亏 +123.45"), "{note}");
+        assert!(note.contains("截至快照，非实时账户"), "{note}");
+        assert!(!note.contains("昨日"), "{note}");
     }
 
-    /// 快照过期 + 估值市值缺失 → 出声「自算不可用」，不静默回落确认值
+    /// 估值市值缺失不抹掉独立、有效的账户快照事实。
     #[test]
-    fn stale_snapshot_without_valuation_value_announces_unavailable() {
+    fn missing_valuation_keeps_independent_dated_account_pnl() {
         let account = stock_analysis::database::user_account_summary::UserAccountSummary {
             effective_at: "2026-08-10T15:00:00+08:00".to_string(),
             total_assets: 50269.0,
@@ -1991,15 +2030,16 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             None,
         );
-        assert!(
-            note.contains("昨日盈亏自算不可用（估值市值缺失）"),
-            "unexpected note: {note}"
-        );
+        assert!(note.contains("2026-08-10T15:00:00+08:00"), "{note}");
+        assert!(note.contains("source=user_upload"), "{note}");
+        assert!(note.contains("2026-08-10 当日盈亏 -426.05"), "{note}");
+        assert!(note.contains("截至快照，非实时账户"), "{note}");
+        assert!(!note.contains("自算"), "{note}");
     }
 
-    /// effective_at 非标准格式 → 回落确认值（不出 panic）
+    /// effective_at 非标准格式 → 明确不可用，不泄露无法可靠定日的数值。
     #[test]
-    fn malformed_effective_at_falls_back_to_confirmed() {
+    fn malformed_effective_at_is_explicitly_unavailable() {
         let account = stock_analysis::database::user_account_summary::UserAccountSummary {
             effective_at: "garbage".to_string(),
             total_assets: 50269.0,
@@ -2014,7 +2054,50 @@ mod tests_br236_valuation_note {
             NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
             Some(49399.0),
         );
-        assert!(note.contains("昨日盈亏 -426.05"), "unexpected note: {note}");
+        assert_eq!(note, "用户确认账户摘要不可用：快照时间格式无效");
+        assert!(!note.contains("67.2"), "{note}");
+        assert!(!note.contains("-426.05"), "{note}");
+        assert!(!note.contains("昨日"), "{note}");
+        assert!(!note.contains("当日"), "{note}");
+
+        let invalid_time = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-08-10Tnot-rfc3339".to_string(),
+            ..account
+        };
+        assert_eq!(
+            closing_valuation_account_note(
+                &invalid_time,
+                NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"),
+                Some(49399.0),
+            ),
+            "用户确认账户摘要不可用：快照时间格式无效"
+        );
+    }
+
+    #[test]
+    fn historical_snapshot_pnl_keeps_its_effective_date() {
+        let account = stock_analysis::database::user_account_summary::UserAccountSummary {
+            effective_at: "2026-09-14T18:50:00+08:00".to_string(),
+            total_assets: 10_000.0,
+            securities_market_value: 6_000.0,
+            available_cash: 4_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: -12.50,
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+        };
+        let note = closing_valuation_account_note(
+            &account,
+            NaiveDate::from_ymd_opt(2026, 9, 11).expect("TEST_CODE price date"),
+            Some(6_000.0),
+        );
+        assert!(
+            note.contains("2026-09-14T18:50:00+08:00"),
+            "historical snapshot timestamp must be explicit: {note}"
+        );
+        assert!(note.contains("source=TEST_CODE_USER_CONFIRMED"), "{note}");
+        assert!(note.contains("2026-09-14 当日盈亏 -12.50"), "{note}");
+        assert!(!note.contains("昨日盈亏"), "{note}");
+        assert!(!note.contains("自算"), "{note}");
     }
 }
 
@@ -2060,8 +2143,10 @@ pub async fn refresh_banner_state() -> Result<(), String> {
     let account_mode =
         stock_analysis::risk::account_mode::evaluate(&am_metrics, prev_mode, &thresholds).mode;
     let data_health = evaluated_data_health()?;
+    if !am_metrics.is_complete() {
+        refresh_closing_valuation_note();
+    }
     store_banner(build_banner(&am_metrics, account_mode, &data_health))?;
-    refresh_closing_valuation_note();
     Ok(())
 }
 
@@ -2083,7 +2168,9 @@ pub async fn refresh_banner_state_with_metrics(
     // actually take. Without refreshing the note here the cached slot stays
     // None for the whole process, so a persisted valuation is rendered as
     // "收盘估值不可用" — reporting known data as missing.
-    refresh_closing_valuation_note();
+    if !am_metrics.is_complete() {
+        refresh_closing_valuation_note();
+    }
     store_banner(build_banner(am_metrics, lib_mode, &data_health))
 }
 
@@ -3386,7 +3473,7 @@ struct MonitorInstanceLease {
 }
 
 fn monitor_instance_lease_path(test_mode: bool) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    stock_analysis::production_root::root_for_mode(test_mode)
         .join("data")
         .join("locks")
         .join(if test_mode { "test" } else { "production" })
@@ -3527,7 +3614,7 @@ fn install_mode_owned_core_database(test_mode: bool) -> Result<std::path::PathBu
     let database_path = if test_mode {
         allocate_test_core_database_path()?
     } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        stock_analysis::production_root::production_root()
             .join("data")
             .join("stock_analysis.db")
     };
@@ -3936,7 +4023,7 @@ mod tests_br238_opening_readiness {
         assert!(!production.contains(&blocking_call));
         assert_eq!(production.matches(&resident_spawn).count(), 1);
         assert!(production.contains(&p01_resident));
-        assert!(production.contains("monitor_loop()"));
+        assert!(production.contains("monitor_loop(&paper_scans)"));
         assert!(production.contains(&news_resident));
         assert!(production.contains("data_mode_monitor_loop()"));
         assert!(production.contains("opening_readiness=not_applicable mode=test"));
@@ -4088,6 +4175,7 @@ enum LongRunningTrigger {
 async fn supervise_long_running_lifecycle<MainLoops, ShutdownSignal>(
     bus: &stock_analysis::event::EventBus,
     writer_handle: &mut Option<JsonlWriterTask>,
+    paper_scans: &PaperScanSession,
     background_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
     main_loops: MainLoops,
     shutdown_signal: ShutdownSignal,
@@ -4096,26 +4184,42 @@ where
     MainLoops: std::future::Future<Output = ()>,
     ShutdownSignal: std::future::Future<Output = Result<(), String>>,
 {
+    if writer_handle.is_none() {
+        paper_scans.cancel();
+        drop(main_loops);
+        let paper_shutdown = observe_paper_scan_drain(paper_scans.close_and_drain().await);
+        let producer_shutdown = quiesce_background_tasks(background_tasks).await;
+        bus.shutdown();
+        let mut error = "BR-141 writer handle is missing while monitor is running".to_owned();
+        for failure in [paper_shutdown.err(), producer_shutdown.err()].into_iter().flatten() {
+            error.push_str(&format!("; shutdown failed: {failure}"));
+        }
+        return Err(error);
+    }
     let trigger = {
-        let writer = writer_handle.as_mut().ok_or_else(|| {
-            "BR-141 writer handle is missing while monitor is running".to_string()
-        })?;
+        let writer = writer_handle.as_mut().expect("writer presence checked above");
         tokio::pin!(main_loops);
         tokio::pin!(shutdown_signal);
-        tokio::select! {
+        let trigger = tokio::select! {
             _ = &mut main_loops => LongRunningTrigger::MainLoopsCompleted,
             signal = &mut shutdown_signal => LongRunningTrigger::ShutdownSignal(signal),
             result = writer => LongRunningTrigger::WriterCompleted(result),
-        }
+        };
+        paper_scans.cancel();
+        trigger
     };
 
+    // Main futures have dropped; the session still owns any blocking scan.
+    // Keep the writer/bus and the instance lease alive until this join ends.
+    let paper_shutdown = observe_paper_scan_drain(paper_scans.close_and_drain().await);
     let producer_shutdown = quiesce_background_tasks(background_tasks).await;
     let trigger = match trigger {
         LongRunningTrigger::WriterCompleted(result) => {
             writer_handle.take();
             bus.shutdown();
             let writer_error = unexpected_jsonl_writer_completion(result);
-            return match producer_shutdown {
+            let shutdown = paper_shutdown.and(producer_shutdown);
+            return match shutdown {
                 Ok(()) => Err(writer_error),
                 Err(producer_error) => Err(format!(
                     "{writer_error}; producer shutdown failed: {producer_error}"
@@ -4126,6 +4230,7 @@ where
     };
 
     let writer_shutdown = shutdown_jsonl_writer(bus, writer_handle).await;
+    paper_shutdown?;
     producer_shutdown?;
     writer_shutdown?;
 
@@ -4135,6 +4240,20 @@ where
             Err("long-running monitor loops completed unexpectedly".to_string())
         }
         LongRunningTrigger::WriterCompleted(_) => unreachable!("handled before writer drain"),
+    }
+}
+
+fn log_completed_paper_sales(sold: &[PaperSellResult]) {
+    for result in sold {
+        log::warn!("[paper_sell] retained completed sale code={} quantity={} price={} reason={}",
+            result.code, result.quantity, result.price, result.reason);
+    }
+}
+
+fn observe_paper_scan_drain(result: Result<Vec<PaperSellResult>, PaperScanFailure>) -> Result<(), String> {
+    match result {
+        Ok(sold) => { log_completed_paper_sales(&sold); Ok(()) }
+        Err(error) => { log_completed_paper_sales(&error.sold); Err(error.to_string()) }
     }
 }
 
@@ -4417,6 +4536,11 @@ async fn main() {
         return;
     }
     let test_mode = selection_cli.is_test();
+    log::info!(
+        "[monitor] bound root mode={} path={}",
+        if test_mode { "test" } else { "production" },
+        stock_analysis::production_root::root_for_mode(test_mode).display()
+    );
     // BR-192/Rule 2.5: reject a production dry-run configuration before the
     // singleton lease or any durable runtime can be opened. This check is
     // intentionally process-local and side-effect free so a running production
@@ -5346,12 +5470,13 @@ async fn main() {
         // 任务#3: 启动时快照过期检查（stale 则推提醒；每日去重）
         check_snapshot_staleness_and_notify().await;
 
+        let paper_scans = PaperScanSession::new();
         let main_loops = async {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2)；统一新闻 Gateway
             // 已由 news_monitor_loop 消费，旧 loop 会重复取数。
             tokio::join!(
                 p01::p01_scheduler_loop(),
-                monitor_loop(),
+                monitor_loop(&paper_scans),
                 news_monitor_loop(selection_v2_enabled),
                 data_mode_monitor_loop()
             );
@@ -5418,6 +5543,7 @@ async fn main() {
         if let Err(error) = supervise_long_running_lifecycle(
             bus,
             &mut jsonl_writer_handle,
+            &paper_scans,
             background_tasks,
             main_loops,
             shutdown_signal,
@@ -8518,7 +8644,7 @@ mod tests_br211_paper_exit_containment {
     fn br211_monitor_loop_has_one_containment_banner_and_no_legacy_entry_call() {
         let source = include_str!("main.rs");
         let monitor_loop = source
-            .rsplit_once("async fn monitor_loop()")
+            .rsplit_once("async fn monitor_loop(paper_scans: &PaperScanSession)")
             .map(|(_, body)| body)
             .expect("monitor loop declaration")
             .split("fn render_board_flow_market_view(")
@@ -8577,7 +8703,7 @@ fn overlay_net_yi(
         .unwrap_or(0.0)
 }
 
-async fn monitor_loop() {
+async fn monitor_loop(paper_scans: &PaperScanSession) {
     // 全天候循环：非交易日等待，交易日自动进入扫描
 
     // BR-211: legacy paper_engine::run_once lacks the BR-201 committed
@@ -8630,9 +8756,10 @@ async fn monitor_loop() {
                 // 卖出含 3 笔收益率 >100% (最高 +22751% 为买价记录错误), 11 笔当日
                 // 买入即卖, 7 笔买入后 60s 内卖出。暂停投递直到批次账本重建。
                 if !paper_sell_paused("盘中") {
-                    match stock_analysis::trading::paper_sell::scan_and_sell(risk_context) {
+                    match paper_scans.scan(PaperScanPhase::Intraday, risk_context).await {
                         Ok(sold) if !sold.is_empty() => {
                             for result in &sold {
+                                if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
                                 let text =
                                     format!(
                                     "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
@@ -8655,7 +8782,7 @@ async fn monitor_loop() {
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => log::warn!("[paper_sell] 盘中扫描失败: {}", e),
+                        Err(e) => { log_completed_paper_sales(&e.sold); log::warn!("[paper_sell] 盘中扫描失败: {}", e); },
                     }
                 }
             }
@@ -8720,11 +8847,10 @@ async fn monitor_loop() {
                         // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
                         // (盘后卖出: FIFO 账本已重建 2026-08-23, gate 已解除 2026-09-01, 见 paper_sell_paused)
                         if !paper_sell_paused("盘后") {
-                            match stock_analysis::trading::paper_sell::scan_and_sell_post_close(
-                                risk_context,
-                            ) {
+                            match paper_scans.scan(PaperScanPhase::PostClose, risk_context).await {
                                 Ok(sold) if !sold.is_empty() => {
                                     for result in &sold {
+                                        if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
                                         let text = format!(
                                         "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
                                         result.name, result.code, result.quantity, result.price,
@@ -8746,7 +8872,7 @@ async fn monitor_loop() {
                                     }
                                 }
                                 Ok(_) => {}
-                                Err(e) => log::warn!("[paper_sell] 收盘后扫描失败: {}", e),
+                                Err(e) => { log_completed_paper_sales(&e.sold); log::warn!("[paper_sell] 收盘后扫描失败: {}", e); },
                             }
                         }
                     }
@@ -12109,7 +12235,7 @@ mod tests_post_session_review_scheduler {
             .find("p01::p01_scheduler_loop()")
             .expect("P-01 resident owner");
         let market_loop = production
-            .find("monitor_loop(),")
+            .find("monitor_loop(&paper_scans),")
             .expect("market resident owner");
         assert!(
             scheduler < market_loop,

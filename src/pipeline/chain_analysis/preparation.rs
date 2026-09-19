@@ -1,15 +1,17 @@
 //! Fixed in-memory preparation of the actual chain report. This is not a durable checkpoint.
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{ChainCluster, PositionDiag};
+use crate::agent::tools_sector::FetchSectorTool;
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::data_gateway::{BatchEvidence, GatewayBatch};
 use crate::market_data::TopStock;
+use crate::monitor::push_job::UtcMicros;
 use crate::search_service::SearchResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +21,157 @@ pub enum SourceStatus {
     VerifiedEmpty,
     Unavailable,
     NotRequested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnmigratedStage {
+    ConceptCacheWrite,
+    ConceptCacheConsumption,
+    ClusterConfiguration,
+    BoardDirectory,
+    Positions,
+    PositionConceptProvider,
+    DragonTiger,
+    Macro,
+    ModelsSearchAndReport,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct FixedClusterConfiguration {
+    min_cluster_size: usize,
+}
+
+pub(crate) fn build_cluster_material(
+    stocks: &[TopStock],
+    concepts: &HashMap<String, Vec<String>>,
+    min_cluster_size: usize,
+) -> (Vec<ChainCluster>, Vec<TopStock>) {
+    super::cluster_by_concept(stocks, concepts, min_cluster_size)
+}
+
+impl FixedClusterConfiguration {
+    pub(crate) fn resolve(configured: Option<&str>) -> Self {
+        Self {
+            min_cluster_size: super::resolve_min_cluster_size(configured),
+        }
+    }
+
+    pub(crate) fn min_cluster_size(self) -> usize {
+        self.min_cluster_size
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PreparationStop {
+    #[error("chain preparation stage is not migrated")]
+    StageNotMigrated { next: UnmigratedStage },
+    #[error("chain preparation result commit is unconfirmed")]
+    ResultUnconfirmed { intent_id: String },
+    #[error("chain preparation has an incomplete effect on reopen")]
+    IncompleteOnReopen { intent_id: String },
+    #[error("chain preparation authority rejected")]
+    AuthorityRejected { intent_id: String },
+    #[error("Macro deadline observed after a confirmed commit")]
+    DeadlineAfterConfirmedCommit { receipt: MacroConfirmedCommit },
+}
+
+/// Evidence returned only after SQLite COMMIT reported success. This records
+/// the confirmed fact range, not an estimate of the physical commit instant.
+#[derive(Debug)]
+pub(crate) struct MacroConfirmedCommit {
+    pub(crate) intent_id: String,
+    pub(crate) first_version: u64,
+    pub(crate) last_version: u64,
+    pub(crate) last_fact_sha256: String,
+    pub(crate) audit_receipts:
+        Vec<crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt>,
+}
+
+pub(crate) trait ConceptEffectClock {
+    fn now(&self) -> UtcMicros;
+}
+
+pub(crate) struct PositionCacheObservation {
+    pub(crate) observed_local: DateTime<FixedOffset>,
+    pub(crate) cutoff_local: DateTime<FixedOffset>,
+}
+
+pub(crate) trait PositionObservationClock: ConceptEffectClock {
+    fn cache_observation(&self) -> PositionCacheObservation;
+}
+
+pub(crate) trait DragonTigerObservationClock: PositionObservationClock {
+    fn dragon_tiger_request_observation(&self) -> DateTime<FixedOffset>;
+}
+
+pub(crate) trait MacroObservationClock: DragonTigerObservationClock {
+    fn macro_request_observation(&self) -> DateTime<FixedOffset>;
+}
+
+/// Local wall observation the after-market section is rendered against. It is
+/// journaled once per run so a replay renders the same date label.
+pub(crate) trait ModelsObservationClock: MacroObservationClock {
+    fn models_local_observation(&self) -> DateTime<FixedOffset>;
+}
+
+#[async_trait::async_trait(?Send)]
+pub(crate) trait ConceptProviderRawIo {
+    async fn call_raw(&self, code: &str) -> std::result::Result<String, String>;
+}
+
+/// Production raw delegate shared with the legacy FetchSectorTool path. Durable
+/// callers store the returned String bytes before invoking the same parser.
+pub(crate) struct FetchSectorConceptProvider {
+    tool: FetchSectorTool,
+}
+
+impl FetchSectorConceptProvider {
+    pub(crate) fn new() -> Self {
+        Self {
+            tool: FetchSectorTool::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ConceptProviderRawIo for FetchSectorConceptProvider {
+    async fn call_raw(&self, code: &str) -> std::result::Result<String, String> {
+        super::fetchers::fetch_boards_raw(&self.tool, code).await
+    }
+}
+
+pub(crate) struct SystemConceptEffectClock;
+
+impl ConceptEffectClock for SystemConceptEffectClock {
+    fn now(&self) -> UtcMicros {
+        // chrono timestamps in supported production dates are non-negative.
+        UtcMicros::try_new(chrono::Utc::now().timestamp_micros())
+            .expect("system clock predates Unix epoch")
+    }
+}
+
+impl PositionObservationClock for SystemConceptEffectClock {
+    fn cache_observation(&self) -> PositionCacheObservation {
+        let observed = chrono::Local::now();
+        let cutoff = observed - chrono::Duration::days(7);
+        PositionCacheObservation {
+            observed_local: observed.fixed_offset(),
+            cutoff_local: cutoff.fixed_offset(),
+        }
+    }
+}
+
+impl DragonTigerObservationClock for SystemConceptEffectClock {
+    fn dragon_tiger_request_observation(&self) -> DateTime<FixedOffset> {
+        chrono::Local::now().fixed_offset()
+    }
+}
+
+pub(crate) fn parse_concept_provider_raw(
+    raw: &str,
+    code: &str,
+) -> std::result::Result<Vec<String>, String> {
+    super::fetchers::parse_tool_boards(raw, code)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +328,24 @@ pub struct SourceObservation {
 }
 
 impl SourceObservation {
+    pub(crate) fn from_batch_for_request(
+        status: SourceStatus,
+        evidence: BatchEvidence,
+        date: NaiveDate,
+        observed_at: String,
+    ) -> std::result::Result<Self, &'static str> {
+        if !matches!(
+            status,
+            SourceStatus::Available | SourceStatus::VerifiedEmpty
+        ) || evidence.source.trim().is_empty()
+            || evidence.batch_id.trim().is_empty()
+            || evidence.observed_at.trim().is_empty()
+            || observed_at.trim().is_empty()
+        {
+            return Err("incomplete source observation");
+        }
+        Ok(Self::batch(status, &evidence).requested(date, observed_at))
+    }
     pub fn unknown() -> Self {
         Self {
             status: SourceStatus::Unknown,
@@ -206,7 +377,7 @@ impl SourceObservation {
             ..Self::unknown()
         }
     }
-    pub(super) fn requested(mut self, date: NaiveDate, observed_at: String) -> Self {
+    pub(crate) fn requested(mut self, date: NaiveDate, observed_at: String) -> Self {
         self.request_date = Some(date);
         self.request_observed_at = Some(observed_at);
         self
@@ -607,6 +778,9 @@ impl PreparationFailure {
     pub fn macro_input(&self) -> Option<&str> {
         self.observed.macro_input()
     }
+    pub fn macro_context(&self) -> &str {
+        self.observed.macro_context()
+    }
     pub fn concepts(&self) -> &BTreeMap<String, Vec<String>> {
         self.observed.concepts()
     }
@@ -681,6 +855,14 @@ fn observe_stage<T>(
             Ok(value)
         }
         Err(error) => {
+            if error.downcast_ref::<PreparationStop>().is_some() {
+                let failure = PreparationFailure {
+                    stage,
+                    reason: format!("{error:#}"),
+                    observed: prepared.clone(),
+                };
+                return Err(error.context(failure));
+            }
             log::warn!("[产业链] 核心准备阶段 {:?} 失败，停止后续分析", stage);
             Err(PreparationFailure {
                 stage,
@@ -705,10 +887,40 @@ impl std::fmt::Debug for PreparedChainAnalysis {
 /// External concepts/cache I/O. Clustering and report construction remain in the module.
 #[async_trait::async_trait(?Send)]
 pub trait ChainPreparationIo {
+    fn validate_fixed_input(
+        &mut self,
+        _business_date: NaiveDate,
+        _limit_ups: &[TopStock],
+        _macro_news: &Option<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn concepts(&mut self, codes: &[String]) -> Result<HashMap<String, Vec<String>>>;
+    async fn position_concepts(
+        &mut self,
+        codes: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        self.concepts(codes).await
+    }
+    fn before_cluster_configuration(
+        &mut self,
+        _concepts: &HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        Ok(())
+    }
     // Default methods fail closed. A partial controlled adapter can never fall through to live I/O.
     fn min_cluster_size(&mut self) -> usize {
         panic!("cluster configuration I/O not supplied")
+    }
+    fn cluster_material(
+        &mut self,
+        stocks: &[TopStock],
+        concepts: &HashMap<String, Vec<String>>,
+    ) -> Result<(usize, Vec<ChainCluster>, Vec<TopStock>)> {
+        self.before_cluster_configuration(concepts)?;
+        let min_size = self.min_cluster_size();
+        let (clusters, isolated) = build_cluster_material(stocks, concepts, min_size);
+        Ok((min_size, clusters, isolated))
     }
     async fn persist_clusters(
         &mut self,
@@ -727,6 +939,14 @@ pub trait ChainPreparationIo {
     ) -> Result<GatewayBatch<TopStock>> {
         panic!("candidate I/O not supplied")
     }
+    fn resolve_board_code(
+        &mut self,
+        _cluster_ordinal: usize,
+        cluster: &ChainCluster,
+        board_map: &HashMap<String, String>,
+    ) -> Result<String> {
+        super::resolve_cluster_board_code_owned(cluster, board_map)
+    }
     async fn positions(&mut self) -> Result<Vec<PositionInput>> {
         panic!("position database I/O not supplied")
     }
@@ -736,11 +956,30 @@ pub trait ChainPreparationIo {
     async fn macro_search(&mut self) -> Result<String> {
         panic!("macro search I/O not supplied")
     }
+    async fn macro_search_with_budget(
+        &mut self,
+    ) -> std::result::Result<Result<String>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), self.macro_search()).await
+    }
+    fn before_models_search_and_report(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn model_available(&mut self) -> bool {
         panic!("model configuration I/O not supplied")
     }
     async fn model(&self, _prompt: &str, _system: &str, _mode: AgentMode) -> Result<String> {
         panic!("model I/O not supplied")
+    }
+    /// Same call as `model`, with the stable in-stage identity a durable adapter
+    /// needs to journal the effect. Defaults delegate to `model`.
+    async fn model_effect(
+        &mut self,
+        _effect: ModelEffect<'_>,
+        prompt: &str,
+        system: &str,
+        mode: AgentMode,
+    ) -> Result<String> {
+        self.model(prompt, system, mode).await
     }
     fn search_available(&mut self) -> bool {
         panic!("search configuration I/O not supplied")
@@ -748,9 +987,33 @@ pub trait ChainPreparationIo {
     async fn search_topic(&mut self, _query: &str, _limit: usize) -> Result<Vec<SearchResult>> {
         panic!("topic search I/O not supplied")
     }
+    /// Same call as `search_topic`, with the stage identity and the outer
+    /// budget the renderer will enforce. Defaults delegate to `search_topic`.
+    async fn search_effect(
+        &mut self,
+        _stage: SearchStage,
+        query: &str,
+        limit: usize,
+        _budget: std::time::Duration,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_topic(query, limit).await
+    }
     fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
         panic!("clock I/O not supplied")
     }
+    /// Called once with the fully assembled preparation before it is returned.
+    /// A durable adapter commits the artifact here; an error fails the
+    /// ModelsSearchAndReport stage.
+    fn commit_prepared(&mut self, _prepared: &PreparedChainAnalysis) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Stable identity of one model call inside the ModelsSearchAndReport stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelEffect<'a> {
+    pub stage: ModelStage,
+    pub concept: Option<&'a str>,
 }
 
 struct ProductionIo {
@@ -865,6 +1128,7 @@ pub async fn prepare_chain_analysis_with_io(
     macro_news: Option<String>,
     io: &mut impl ChainPreparationIo,
 ) -> Result<PreparedChainAnalysis> {
+    io.validate_fixed_input(business_date, &limit_ups, &macro_news)?;
     let mut prepared = PreparedChainAnalysis {
         data: PreparedData {
             business_date,
@@ -942,10 +1206,9 @@ pub async fn prepare_chain_analysis_with_io(
     )?;
     prepared.data.concepts = concepts.clone().into_iter().collect();
     prepared.data.concept_source = SourceObservation::unknown();
-    let min_size = io.min_cluster_size();
+    let (min_size, mut clusters, isolated) =
+        io.cluster_material(&prepared.data.limit_ups, &concepts)?;
     prepared.data.min_cluster_size = Some(min_size);
-    let (mut clusters, isolated) =
-        super::cluster_by_concept(&prepared.data.limit_ups, &concepts, min_size);
     prepared.data.clusters = clusters.clone();
     prepared.data.isolated = isolated.clone();
     let rows = clusters
@@ -976,7 +1239,12 @@ pub async fn prepare_chain_analysis_with_io(
         &mut prepared,
     )?;
 
-    let candidates = prepare_candidates(io, &mut clusters, &prepared.data.limit_ups).await;
+    let candidate_result = prepare_candidates(io, &mut clusters, &prepared.data.limit_ups).await;
+    let candidates = observe_stage(
+        candidate_result,
+        PreparationStage::Candidates,
+        &mut prepared,
+    )?;
     let candidate_statuses = candidates.statuses;
     prepared.data.clusters = clusters.clone();
     prepared.data.candidate_sources = candidates.sources;
@@ -984,10 +1252,6 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.board_directory = candidates.board_directory;
     prepared.data.board_source = candidates.board_source;
     prepared.data.candidate_board_codes = candidates.selected_boards;
-    prepared
-        .data
-        .completed_stages
-        .push(PreparationStage::Candidates);
     let positions = observe_stage(
         io.positions().await,
         PreparationStage::Positions,
@@ -999,7 +1263,7 @@ pub async fn prepare_chain_analysis_with_io(
         HashMap::new()
     } else {
         observe_stage(
-            io.concepts(&positions.iter().map(|p| p.code.clone()).collect::<Vec<_>>())
+            io.position_concepts(&positions.iter().map(|p| p.code.clone()).collect::<Vec<_>>())
                 .await,
             PreparationStage::PositionConcepts,
             &mut prepared,
@@ -1025,11 +1289,14 @@ pub async fn prepare_chain_analysis_with_io(
         prepared.data.macro_source = SourceObservation::unknown();
         text.clone()
     } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(15), io.macro_search()).await {
+        match io.macro_search_with_budget().await {
             Ok(Ok(text)) => {
                 // Upstream returns text without source status, even when internally degraded.
                 prepared.data.macro_source = SourceObservation::unknown();
                 text
+            }
+            Ok(Err(error)) if error.downcast_ref::<PreparationStop>().is_some() => {
+                observe_stage(Err(error), PreparationStage::Macro, &mut prepared)?
             }
             Ok(Err(error)) => {
                 log::warn!("[产业链] 宏观搜索失败，降级为空背景");
@@ -1046,7 +1313,14 @@ pub async fn prepare_chain_analysis_with_io(
     };
     prepared.data.macro_context = macro_context.clone();
     prepared.data.completed_stages.push(PreparationStage::Macro);
-    let rendered = render_with_io(
+    if let Err(error) = io.before_models_search_and_report() {
+        observe_stage::<()>(
+            Err(error),
+            PreparationStage::ModelsSearchAndReport,
+            &mut prepared,
+        )?;
+    }
+    let render_result = render_with_io(
         io,
         &business_date.to_string(),
         &prepared.data.limit_ups,
@@ -1058,7 +1332,17 @@ pub async fn prepare_chain_analysis_with_io(
         &lhb_map,
         &macro_context,
     )
-    .await?;
+    .await;
+    let rendered = match render_result {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return observe_stage(
+                Err(error),
+                PreparationStage::ModelsSearchAndReport,
+                &mut prepared,
+            );
+        }
+    };
     prepared.data.report = rendered.report;
     prepared.data.model_calls = rendered.model_calls;
     prepared.data.cluster_news = rendered.cluster_news;
@@ -1067,10 +1351,6 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.after_market_source = rendered.after_market_source;
     prepared.data.after_market_observed_at = rendered.after_market_observed_at;
     prepared.data.search_observations = rendered.searches;
-    prepared
-        .data
-        .completed_stages
-        .push(PreparationStage::ModelsSearchAndReport);
     prepared.data.concepts = concepts.into_iter().collect();
     prepared.data.clusters = clusters;
     prepared.data.isolated = isolated;
@@ -1080,6 +1360,20 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.lhb_map = lhb_map.into_iter().collect();
     prepared.data.lhb_source = lhb_source;
     prepared.data.macro_context = macro_context;
+    // The adapter commits the exact bytes a completed preparation will report,
+    // so the stage is marked complete before the commit and unmarked on refusal.
+    prepared
+        .data
+        .completed_stages
+        .push(PreparationStage::ModelsSearchAndReport);
+    if let Err(error) = io.commit_prepared(&prepared) {
+        prepared.data.completed_stages.pop();
+        return observe_stage(
+            Err(error),
+            PreparationStage::ModelsSearchAndReport,
+            &mut prepared,
+        );
+    }
     Ok(prepared)
 }
 
@@ -1096,7 +1390,7 @@ async fn prepare_candidates(
     io: &mut impl ChainPreparationIo,
     clusters: &mut [ChainCluster],
     limit_ups: &[TopStock],
-) -> CandidatePreparation {
+) -> Result<CandidatePreparation> {
     let mut statuses = super::CandidateSupplementStatuses::new();
     let mut sources = BTreeMap::new();
     let mut board_evidence = Vec::new();
@@ -1116,13 +1410,19 @@ async fn prepare_candidates(
                 status: SourceStatus::Available,
                 ..SourceObservation::unknown()
             };
-            for cluster in clusters.iter_mut().take(limit) {
-                let result = match super::resolve_cluster_board_code(cluster, &codes) {
+            for (ordinal, cluster) in clusters.iter_mut().take(limit).enumerate() {
+                let result = match io.resolve_board_code(ordinal, cluster, &codes) {
                     Ok(board) => {
-                        selected_boards.insert(cluster.concept.clone(), board.to_owned());
-                        io.candidates(board, &excluded)
-                            .await
-                            .map_err(|e| e.to_string())
+                        selected_boards.insert(cluster.concept.clone(), board.clone());
+                        match io.candidates(&board, &excluded).await {
+                            Err(error) if error.downcast_ref::<PreparationStop>().is_some() => {
+                                return Err(error);
+                            }
+                            result => result.map_err(|error| error.to_string()),
+                        }
+                    }
+                    Err(error) if error.downcast_ref::<PreparationStop>().is_some() => {
+                        return Err(error);
                     }
                     Err(error) => Err(error.to_string()),
                 };
@@ -1147,6 +1447,7 @@ async fn prepare_candidates(
                 statuses.insert(cluster.concept.clone(), status);
             }
         }
+        Err(error) if error.downcast_ref::<PreparationStop>().is_some() => return Err(error),
         Err(error) => {
             log::warn!("[产业链] 补涨候选板块目录不可用，继续核心分析");
             board_source = SourceObservation::unavailable(error.to_string());
@@ -1174,14 +1475,14 @@ async fn prepare_candidates(
             .entry(concept.clone())
             .or_insert_with(|| candidate_observation(status));
     }
-    CandidatePreparation {
+    Ok(CandidatePreparation {
         statuses,
         sources,
         board_evidence,
         board_directory,
         board_source,
         selected_boards,
-    }
+    })
 }
 
 fn candidate_observation(status: &super::CandidateSupplementStatus) -> SourceObservation {
@@ -1216,7 +1517,7 @@ impl ChainModel for GeminiAnalyzer {
 }
 
 struct IoModel<'a, I> {
-    io: &'a I,
+    io: RefCell<&'a mut I>,
     observations: &'a RefCell<Vec<ModelCall>>,
     stage: ModelStage,
     concept: Option<&'a str>,
@@ -1225,7 +1526,21 @@ struct IoModel<'a, I> {
 #[async_trait::async_trait(?Send)]
 impl<I: ChainPreparationIo> ChainModel for IoModel<'_, I> {
     async fn call_api_mode(&self, prompt: &str, system: &str, mode: AgentMode) -> Result<String> {
-        let result = self.io.model(prompt, system, mode).await;
+        // Render is sequential: no other borrow of the adapter is live while
+        // this call awaits.
+        let result = self
+            .io
+            .borrow_mut()
+            .model_effect(
+                ModelEffect {
+                    stage: self.stage,
+                    concept: self.concept,
+                },
+                prompt,
+                system,
+                mode,
+            )
+            .await;
         let outcome = match &result {
             Ok(text) => ModelOutcome::Returned(text.clone()),
             Err(error) => {
@@ -1287,12 +1602,13 @@ async fn render_with_io(
             if count >= super::TIER1_MIN && available && deep_count < super::MAX_DEEP_ANALYSIS {
                 deep_count += 1;
                 let (news, source) =
-                    cluster_news_with_io(io, cluster, concepts, &observations, &mut searches).await;
+                    cluster_news_with_io(io, cluster, concepts, &observations, &mut searches)
+                        .await?;
                 cluster_news.insert(cluster.concept.clone(), news.clone());
                 cluster_news_sources.insert(cluster.concept.clone(), source);
-                super::analyze_cluster_deep(
+                match super::analyze_cluster_deep(
                     &IoModel {
-                        io: &*io,
+                        io: RefCell::new(&mut *io),
                         observations: &observations,
                         stage: ModelStage::Deep,
                         concept: Some(&cluster.concept),
@@ -1308,15 +1624,21 @@ async fn render_with_io(
                     },
                 )
                 .await
-                .ok()
+                {
+                    Ok(analysis) => Some(analysis),
+                    Err(error) if error.downcast_ref::<PreparationStop>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(_) => None,
+                }
             } else if count >= super::TIER2_MIN
                 && available
                 && simple_count < super::MAX_SIMPLE_ANALYSIS
             {
                 simple_count += 1;
-                super::analyze_cluster_simple(
+                match super::analyze_cluster_simple(
                     &IoModel {
-                        io: &*io,
+                        io: RefCell::new(&mut *io),
                         observations: &observations,
                         stage: ModelStage::Simple,
                         concept: Some(&cluster.concept),
@@ -1328,7 +1650,13 @@ async fn render_with_io(
                     candidate_statuses.get(&cluster.concept),
                 )
                 .await
-                .ok()
+                {
+                    Ok(analysis) => Some(analysis),
+                    Err(error) if error.downcast_ref::<PreparationStop>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(_) => None,
+                }
             } else {
                 observations.borrow_mut().push(ModelCall::not_called(
                     ModelStage::UnselectedCluster,
@@ -1355,7 +1683,7 @@ async fn render_with_io(
         .map(|c| c.concept.as_str())
         .collect::<Vec<_>>();
     let (after_market, after_market_source, after_market_observed_at) = if available {
-        after_market_with_io(io, &themes, &mut searches).await
+        after_market_with_io(io, &themes, &mut searches).await?
     } else {
         (
             String::new(),
@@ -1370,7 +1698,7 @@ async fn render_with_io(
     let overview = if available && !sections.is_empty() {
         super::synthesize_overview(
             &IoModel {
-                io: &*io,
+                io: RefCell::new(&mut *io),
                 observations: &observations,
                 stage: ModelStage::Overview,
                 concept: None,
@@ -1381,7 +1709,7 @@ async fn render_with_io(
             date,
             &after_market,
         )
-        .await
+        .await?
     } else {
         observations.borrow_mut().push(ModelCall::not_called(
             ModelStage::Overview,
@@ -1424,21 +1752,21 @@ async fn cluster_news_with_io(
     concepts: &HashMap<String, Vec<String>>,
     observations: &RefCell<Vec<ModelCall>>,
     searches: &mut Vec<SearchObservation>,
-) -> (String, SourceObservation) {
+) -> Result<(String, SourceObservation)> {
     if !io.search_available() {
         observations.borrow_mut().push(ModelCall::not_called(
             ModelStage::SearchTerms,
             Some(cluster.concept.clone()),
             "新闻搜索未配置，未生成检索词",
         ));
-        return (
+        return Ok((
             String::new(),
             SourceObservation::unavailable("新闻搜索未配置".into()),
-        );
+        ));
     }
     let (mut queries, prompt) = super::fetchers::build_cluster_query_context(cluster, concepts);
-    if let Ok(text) = (IoModel {
-        io: &*io,
+    match (IoModel {
+        io: RefCell::new(&mut *io),
         observations,
         stage: ModelStage::SearchTerms,
         concept: Some(&cluster.concept),
@@ -1450,34 +1778,36 @@ async fn cluster_news_with_io(
     )
     .await
     {
-        super::fetchers::append_generated_cluster_queries(&mut queries, &text);
+        Ok(text) => super::fetchers::append_generated_cluster_queries(&mut queries, &text),
+        Err(error) if error.downcast_ref::<PreparationStop>().is_some() => return Err(error),
+        Err(_) => {}
     }
     let (mut seen, mut items) = (HashSet::new(), Vec::new());
     let first_search = searches.len();
     for query in queries {
-        let results = observed_search(io, SearchStage::Cluster, query, 4, 15, searches).await;
+        let results = observed_search(io, SearchStage::Cluster, query, 4, 15, searches).await?;
         super::fetchers::append_cluster_news_items(&mut seen, &mut items, results);
         if items.len() >= 10 {
             break;
         }
     }
-    (
+    Ok((
         items.join("\n"),
         aggregate_search_source(&searches[first_search..]),
-    )
+    ))
 }
 
 async fn after_market_with_io(
     io: &mut impl ChainPreparationIo,
     themes: &[&str],
     searches: &mut Vec<SearchObservation>,
-) -> (String, SourceObservation, Option<String>) {
+) -> Result<(String, SourceObservation, Option<String>)> {
     if !io.search_available() {
-        return (
+        return Ok((
             String::new(),
             SourceObservation::unavailable("新闻搜索未配置".into()),
             None,
-        );
+        ));
     }
     let now = io.local_now();
     let today = now.format("%m月%d日").to_string();
@@ -1490,14 +1820,14 @@ async fn after_market_with_io(
             break;
         }
         let query = format!("{today} {theme} 最新 突发 催化");
-        let results = observed_search(io, SearchStage::AfterMarket, query, 2, 8, searches).await;
+        let results = observed_search(io, SearchStage::AfterMarket, query, 2, 8, searches).await?;
         super::fetchers::append_after_market_items(&mut items, theme, results);
     }
-    (
+    Ok((
         super::fetchers::render_after_market_section(&today, time_label, &items),
         aggregate_search_source(&searches[first_search..]),
         Some(now.to_rfc3339()),
-    )
+    ))
 }
 
 async fn observed_search(
@@ -1507,10 +1837,11 @@ async fn observed_search(
     limit: usize,
     timeout_seconds: u64,
     searches: &mut Vec<SearchObservation>,
-) -> Vec<SearchResult> {
+) -> Result<Vec<SearchResult>> {
+    let budget = std::time::Duration::from_secs(timeout_seconds);
     let (results, source) = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_seconds),
-        io.search_topic(&query, limit),
+        budget,
+        io.search_effect(stage, &query, limit, budget),
     )
     .await
     {
@@ -1528,6 +1859,9 @@ async fn observed_search(
                     ..SourceObservation::unknown()
                 },
             )
+        }
+        Ok(Err(error)) if error.downcast_ref::<PreparationStop>().is_some() => {
+            return Err(error);
         }
         Ok(Err(error)) => {
             log::warn!("[产业链] 搜索阶段 {:?} 失败，降级为空背景", stage);
@@ -1551,7 +1885,7 @@ async fn observed_search(
         results: results.clone(),
         source,
     });
-    results
+    Ok(results)
 }
 
 fn aggregate_search_source(searches: &[SearchObservation]) -> SourceObservation {

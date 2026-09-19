@@ -9,6 +9,107 @@ use crate::schema::stock_position;
 use super::DatabaseManager;
 use super::DbConnection;
 
+#[derive(Clone)]
+pub(crate) struct OwnedPositionSourceRow {
+    pub(crate) id: i32,
+    pub(crate) code: String,
+    pub(crate) name: String,
+    pub(crate) buy_date: String,
+    pub(crate) buy_price: f64,
+    pub(crate) quantity: i32,
+    pub(crate) status: String,
+    pub(crate) sell_date: Option<String>,
+    pub(crate) sell_price: Option<f64>,
+    pub(crate) return_rate: Option<f64>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) chain_name: Option<String>,
+    pub(crate) st_type: Option<String>,
+}
+
+pub(crate) fn valid_sqlite_timestamp(value: &str) -> bool {
+    const FORMATS: [&str; 18] = [
+        "%F %T%.f",
+        "%F %T%.f%:z",
+        "%F %T",
+        "%F %T%:z",
+        "%F %R",
+        "%F %RZ",
+        "%F %R%:z",
+        "%F %TZ",
+        "%F %T%.fZ",
+        "%FT%R",
+        "%FT%RZ",
+        "%FT%R%:z",
+        "%FT%T",
+        "%FT%TZ",
+        "%FT%T%:z",
+        "%FT%T%.f",
+        "%FT%T%.fZ",
+        "%FT%T%.f%:z",
+    ];
+    if FORMATS
+        .iter()
+        .any(|format| chrono::NaiveDateTime::parse_from_str(value, format).is_ok())
+    {
+        return true;
+    }
+    const JULIAN_EPOCH: f64 = 2_440_587.5;
+    value.parse::<f64>().ok().is_some_and(|days| {
+        let timestamp = (days - JULIAN_EPOCH) * 86_400.0;
+        #[allow(clippy::cast_possible_truncation)]
+        let seconds = timestamp.trunc() as i64;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let nanos = (timestamp.fract() * 1E9) as u32;
+        #[allow(deprecated)]
+        chrono::NaiveDateTime::from_timestamp_opt(seconds, nanos).is_some()
+    })
+}
+
+pub(crate) fn read_open_position_rows(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Vec<OwnedPositionSourceRow>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id,code,name,buy_date,buy_price,quantity,status,sell_date,sell_price,\
+                    return_rate,CAST(created_at AS TEXT),CAST(updated_at AS TEXT),chain_name,st_type \
+             FROM stock_position WHERE status='open' ORDER BY buy_date DESC",
+        )
+        .map_err(|error| format!("持仓查询准备失败: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(OwnedPositionSourceRow {
+                id: row.get(0)?,
+                code: row.get(1)?,
+                name: row.get(2)?,
+                buy_date: row.get(3)?,
+                buy_price: row.get(4)?,
+                quantity: row.get(5)?,
+                status: row.get(6)?,
+                sell_date: row.get(7)?,
+                sell_price: row.get(8)?,
+                return_rate: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                chain_name: row.get(12)?,
+                st_type: row.get(13)?,
+            })
+        })
+        .map_err(|error| format!("持仓查询失败: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("持仓查询失败: {error}"))?;
+    if rows.iter().any(|row| {
+        !row.buy_price.is_finite()
+            || row.sell_price.is_some_and(|value| !value.is_finite())
+            || row.return_rate.is_some_and(|value| !value.is_finite())
+            || !valid_sqlite_timestamp(&row.created_at)
+            || !valid_sqlite_timestamp(&row.updated_at)
+    }) {
+        return Err("持仓包含不可逆字段".to_string());
+    }
+    Ok(rows)
+}
+
 fn env_reject_error(msg: String) -> Box<dyn std::error::Error> {
     Box::new(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,

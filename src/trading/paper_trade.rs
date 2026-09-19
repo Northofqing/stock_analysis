@@ -691,6 +691,19 @@ fn account_snapshot_summary() -> Result<(f64, f64, f64, f64), String> {
 /// - 快照过期 → `estimate_ledger_from_positions`：持仓明细 × 实时行情估值 +
 ///   快照现金；daily_pnl = 今日总资产 − 昨日 ledger（自动计算每日收益）。
 pub fn refresh_account_ledger_from_snapshot() -> Result<(), String> {
+    refresh_account_ledger_from_snapshot_with_cancel(&std::sync::atomic::AtomicBool::new(false))
+}
+
+fn check_scan_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        Err("paper scan cancelled".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    check_scan_cancelled(cancelled)?;
     let (snapshot_total, available_cash, snapshot_market, snapshot_pnl) =
         account_snapshot_summary()?;
     let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
@@ -710,10 +723,11 @@ pub fn refresh_account_ledger_from_snapshot() -> Result<(), String> {
                 snapshot_pnl,
             )
         } else {
-            estimate_ledger_from_positions(&mut conn, available_cash, today)?
+            estimate_ledger_from_positions(&mut conn, available_cash, today, cancelled)?
         };
 
     // upsert 当日 ledger（created_at 每 tick 刷新 → age≤30s 结构门通过）
+    check_scan_cancelled(cancelled)?;
     diesel::sql_query(
         "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at) \
          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
@@ -769,25 +783,50 @@ fn estimate_ledger_from_positions(
     conn: &mut SqliteConnection,
     cash: f64,
     today: NaiveDate,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(f64, f64, f64, f64), String> {
     let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
         .ok_or_else(|| "无持仓快照，无法自算估值 (BR-234b)".to_string())?;
-    estimate_ledger_from_snapshot(&snapshot, conn, cash, today)
+    estimate_ledger_from_snapshot_with_cancel(&snapshot, conn, cash, today, cancelled)
 }
 
 /// 估值纯函数（自算口径主体）：给定持仓快照 → (total, cash, market, daily_pnl)。
 /// 与 DB 读取解耦，便于不落库的确定性测试。
+#[cfg(test)]
 fn estimate_ledger_from_snapshot(
     snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
     conn: &mut SqliteConnection,
     cash: f64,
     today: NaiveDate,
 ) -> Result<(f64, f64, f64, f64), String> {
+    estimate_ledger_from_snapshot_with_cancel(snapshot, conn, cash, today, &std::sync::atomic::AtomicBool::new(false))
+}
+
+fn estimate_ledger_from_snapshot_with_cancel(
+    snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
+    conn: &mut SqliteConnection,
+    cash: f64,
+    today: NaiveDate,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(f64, f64, f64, f64), String> {
+    estimate_ledger_from_snapshot_with_reads(snapshot, conn, cash, today, cancelled, &ProductionValuationReads)
+}
+
+fn estimate_ledger_from_snapshot_with_reads(
+    snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
+    conn: &mut SqliteConnection,
+    cash: f64,
+    today: NaiveDate,
+    cancelled: &std::sync::atomic::AtomicBool,
+    reads: &impl ValuationReads,
+) -> Result<(f64, f64, f64, f64), String> {
     let mut market_value = 0.0;
     for item in &snapshot.items {
-        market_value += item.quantity as f64 * valuation_price(&item.code)?;
+        check_scan_cancelled(cancelled)?;
+        market_value += item.quantity as f64 * valuation_price_with_reads(&item.code, cancelled, reads)?;
     }
+    check_scan_cancelled(cancelled)?;
     let total = market_value + cash;
 
     #[derive(QueryableByName)]
@@ -809,19 +848,40 @@ fn estimate_ledger_from_snapshot(
 /// 单只估值价：实时价优先（broker::quote_price，BR-218 5s 门）；
 /// 失败降级日K最新收盘价（warn 出声说明口径降级，K 线 5 根即可取最新收盘）；
 /// 两者都失败 → Err（fail-closed，不写失真估值，成本价永不作估值价）。
+#[cfg(test)]
 fn valuation_price(code: &str) -> Result<f64, String> {
-    match crate::broker::quote_price(code) {
+    valuation_price_with_reads(code, &std::sync::atomic::AtomicBool::new(false), &ProductionValuationReads)
+}
+
+trait ValuationReads {
+    fn quote_price(&self, code: &str) -> Result<f64, String>;
+    fn daily_close(&self, code: &str) -> Result<Option<f64>, String>;
+}
+
+struct ProductionValuationReads;
+
+impl ValuationReads for ProductionValuationReads {
+    fn quote_price(&self, code: &str) -> Result<f64, String> {
+        crate::broker::quote_price(code)
+    }
+    fn daily_close(&self, code: &str) -> Result<Option<f64>, String> {
+        crate::data_gateway::historical_bars::HistoricalBarsGateway::new()
+            .daily_bars(code, 5)
+            .map(|bars| bars.records().first().map(|bar| bar.close))
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn valuation_price_with_reads(code: &str, cancelled: &std::sync::atomic::AtomicBool, reads: &impl ValuationReads) -> Result<f64, String> {
+    check_scan_cancelled(cancelled)?;
+    match reads.quote_price(code) {
         Ok(price) => Ok(price),
         Err(realtime_error) => {
-            let bars = crate::data_gateway::historical_bars::HistoricalBarsGateway::new()
-                .daily_bars(code, 5)
+            check_scan_cancelled(cancelled)?;
+            let close = reads.daily_close(code)
                 .map_err(|error| {
                     format!("{code} 估值价获取失败: 实时={realtime_error}, 日K={error}")
-                })?;
-            let close = bars
-                .records()
-                .first()
-                .map(|bar| bar.close)
+                })?
                 .filter(|p| p.is_finite() && *p > 0.0)
                 .ok_or_else(|| {
                     format!("{code} 估值价获取失败: 实时={realtime_error}, 日K无有效收盘价")
@@ -854,12 +914,22 @@ fn require_confirmed_position_snapshot(
 }
 
 pub fn portfolio_state_snapshot(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
+    portfolio_state_snapshot_with_cancel(code, quote_price, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub(crate) fn portfolio_state_snapshot_with_cancel(
+    code: &str,
+    quote_price: f64,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(f64, f64, f64), String> {
+    check_scan_cancelled(cancelled)?;
     if !quote_price.is_finite() || quote_price <= 0.0 {
         return Err(format!(
             "invalid quote price for portfolio state: {quote_price}"
         ));
     }
-    refresh_account_ledger_from_snapshot()?;
+    refresh_account_ledger_from_snapshot_with_cancel(cancelled)?;
+    check_scan_cancelled(cancelled)?;
 
     // 权威口径：当日 ledger（refresh 刚写入；cash/total_value 为快照或自算值）
     let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
@@ -968,6 +1038,40 @@ fn persist_paper_trade_with_audit(
 ///
 /// v16.3 Commit 1 BREAKING: 签名加 4 参数 (quote_price, current_cash, total_value, current_position_pct)
 /// 调用方: push_templates:3073 (D-01), push_templates:6223 (盘后资金)
+pub(crate) trait PaperTradeStore {
+    fn reserve(&self, plan_id: &str) -> Result<bool, String>;
+    fn record_audit(&self, record: &crate::database::order_audit::OrderAuditRecord<'_>) -> Result<(), String>;
+    fn persist(
+        &self, sql: &str, signal: &PaperSignal, result: &PaperResult,
+        observed_at: &str, evidence: Option<&PaperAuditEvidence>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String>;
+}
+
+impl PaperTradeStore for DatabaseManager {
+    fn reserve(&self, plan_id: &str) -> Result<bool, String> {
+        self.reserve_business_order_id(plan_id)
+    }
+    fn record_audit(&self, record: &crate::database::order_audit::OrderAuditRecord<'_>) -> Result<(), String> {
+        self.record_order_audit(record)
+    }
+    fn persist(&self, sql: &str, signal: &PaperSignal, result: &PaperResult, observed_at: &str, evidence: Option<&PaperAuditEvidence>, cancelled: &std::sync::atomic::AtomicBool) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String> {
+        let mut conn = self.get_conn().map_err(|e| format!("DB 连接失败: {}", e))?;
+        persist_paper_trade_if_active(&mut conn, sql, signal, result, observed_at, evidence, cancelled)
+    }
+}
+
+fn persist_paper_trade_if_active(
+    conn: &mut SqliteConnection, sql: &str, signal: &PaperSignal, result: &PaperResult,
+    observed_at: &str, evidence: Option<&PaperAuditEvidence>, cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String> {
+    // Checkout may have blocked while shutdown was requested. The transaction
+    // starts only after checking cancellation with the actual connection held.
+    check_scan_cancelled(cancelled)?;
+    persist_paper_trade_with_audit(conn, sql, signal, result, observed_at, evidence)
+        .map_err(|error| format!("BR-086 audited paper trade transaction: {error}"))
+}
+
 fn simulate_with_scope(
     signal: &PaperSignal,
     quote_price: f64,
@@ -977,6 +1081,21 @@ fn simulate_with_scope(
     snapshot_scope: bool,
     audit_evidence: Option<&PaperAuditEvidence>,
 ) -> Result<PaperOutcome, String> {
+    simulate_with_scope_and_store(signal, quote_price, current_cash, total_value,
+        current_position_pct, snapshot_scope, audit_evidence, None, &std::sync::atomic::AtomicBool::new(false))
+}
+
+fn simulate_with_scope_and_store(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+    snapshot_scope: bool,
+    audit_evidence: Option<&PaperAuditEvidence>,
+    store: Option<&dyn PaperTradeStore>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<PaperOutcome, String> {
     if snapshot_scope {
         return Err(
             "settled daily PaperTrade capability_unavailable: daily close cannot authorize a realtime terminal transition"
@@ -985,10 +1104,14 @@ fn simulate_with_scope(
     }
     validate_realtime_quote_freshness(signal.quote_observed_at, chrono::Utc::now())?;
 
-    let db = DatabaseManager::try_get()
-        .ok_or_else(|| "BR-086 paper-order audit database is not initialized".to_string())?;
+    let db: &dyn PaperTradeStore = match store {
+        Some(store) => store,
+        None => DatabaseManager::try_get()
+            .ok_or_else(|| "BR-086 paper-order audit database is not initialized".to_string())?,
+    };
+    check_scan_cancelled(cancelled)?;
     if !db
-        .reserve_business_order_id(&signal.plan_id)
+        .reserve(&signal.plan_id)
         .map_err(|error| format!("BR-086 paper-order idempotency reservation: {error}"))?
     {
         let reason = "duplicate business order id within 60 seconds".to_string();
@@ -1007,7 +1130,7 @@ fn simulate_with_scope(
             outcome: "Rejected",
             failure_reason: Some(&reason),
         };
-        db.record_order_audit(&audit)
+        db.record_audit(&audit)
             .map_err(|error| format!("{reason}; BR-086 duplicate audit failed: {error}"))?;
         return Err(reason);
     }
@@ -1035,16 +1158,12 @@ fn simulate_with_scope(
             outcome: "Rejected",
             failure_reason: Some(&reason),
         };
-        db.record_order_audit(&audit)
+        db.record_audit(&audit)
             .map_err(|audit_error| format!("{reason}; BR-086 audit failed: {audit_error}"))?;
         return Err(reason);
     }
 
     let result = evaluate(signal, quote_price);
-    let mut conn = DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB 连接失败: {}", e))?;
-
     let esc = |s: &str| s.replace('\'', "''");
     let fill_price = result
         .fill_price
@@ -1075,15 +1194,15 @@ fn simulate_with_scope(
         signal.risk_context.data_mode.label(),
     );
     let observed_at = signal.quote_observed_at.to_rfc3339();
-    let (rows, terminal_receipt) = persist_paper_trade_with_audit(
-        &mut conn,
+    check_scan_cancelled(cancelled)?;
+    let (rows, terminal_receipt) = db.persist(
         &sql,
         signal,
         &result,
         &observed_at,
         audit_evidence,
-    )
-    .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
+        cancelled,
+    )?;
 
     Ok(PaperOutcome {
         result,
@@ -1110,23 +1229,11 @@ pub fn simulate(
     )
 }
 
-pub(crate) fn simulate_with_audit_evidence(
-    signal: &PaperSignal,
-    quote_price: f64,
-    current_cash: f64,
-    total_value: f64,
-    current_position_pct: f64,
-    audit_evidence: &PaperAuditEvidence,
+pub(crate) fn simulate_with_audit_evidence_controlled(
+    signal: &PaperSignal, quote_price: f64, cash: f64, total: f64, position_pct: f64,
+    evidence: &PaperAuditEvidence, store: Option<&dyn PaperTradeStore>, cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<PaperOutcome, String> {
-    simulate_with_scope(
-        signal,
-        quote_price,
-        current_cash,
-        total_value,
-        current_position_pct,
-        false,
-        Some(audit_evidence),
-    )
+    simulate_with_scope_and_store(signal, quote_price, cash, total, position_pct, false, Some(evidence), store, cancelled)
 }
 
 /// BR-146/147: paper-only execution from a confirmed closing snapshot.
@@ -1149,6 +1256,10 @@ pub fn simulate_snapshot(
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+#[path = "paper_trade_runtime_tests.rs"]
+pub(crate) mod runtime_tests;
 
 #[cfg(test)]
 mod tests {

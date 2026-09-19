@@ -602,6 +602,166 @@ fn legacy_catalog_ddl_entries_v1() -> Result<Vec<CheckedInDdlStatement>, GlobalS
     parse_legacy_ddl_fixture_rows(LEGACY_DDL_V1_FIXTURE, &registry)
 }
 
+/// Compare the BR-159 acquisition subset against the frozen legacy catalog on
+/// the same SQLite runtime. This is read-only and never repairs the caller's DB.
+pub(crate) fn verify_br159_acquisition_catalog(
+    connection: &Connection,
+) -> Result<(), GlobalSchemaCatalogError> {
+    const TABLES: [&str; 2] = ["data_acquisition_audit", "data_acquisition_audit_chain"];
+    let registry = legacy_catalog_registry_entries_v1()?;
+    let ddl = legacy_catalog_ddl_entries_v1()?;
+    let reference = Connection::open_in_memory()
+        .map_err(|error| sqlite_reference_build_error("br159-open-reference", None, error))?;
+    reference
+        .execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(|error| sqlite_reference_build_error("br159-reference-pragmas", None, error))?;
+    for (registered, statement) in registry.iter().zip(&ddl) {
+        if TABLES.contains(&registered.identity.table_name.as_str()) {
+            reference
+                .execute_batch(&statement.exact_sql)
+                .map_err(|error| {
+                    sqlite_reference_build_error(
+                        "br159-execute-reference",
+                        Some(statement.ddl_id.as_str()),
+                        error,
+                    )
+                })?;
+        }
+    }
+
+    type Object = (String, String, String, Option<String>);
+    type ForeignKey = (String, i64, i64, String, String, String, String, String);
+    type IndexTerm = (i64, i64, Option<String>, i64, Option<String>, i64);
+    type Index = (String, String, i64, String, i64, Vec<IndexTerm>);
+    fn capture(
+        connection: &Connection,
+    ) -> Result<(Vec<Object>, Vec<ForeignKey>, Vec<Index>), GlobalSchemaCatalogError> {
+        let databases = connection
+            .prepare("PRAGMA database_list")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| sqlite_reference_build_error("br159-database-list", None, error))?;
+        if databases
+            .iter()
+            .any(|name| name != "main" && name != "temp")
+        {
+            return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
+                catalog: "br159-caller",
+                detail: "attached schema present during BR-159 admission".to_owned(),
+            });
+        }
+        let temp_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM temp.sqlite_schema WHERE \
+                 lower(name) IN ('data_acquisition_audit','data_acquisition_audit_chain') \
+                 OR lower(tbl_name) IN ('data_acquisition_audit','data_acquisition_audit_chain')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| sqlite_reference_build_error("br159-temp-catalog", None, error))?;
+        if temp_count != 0 {
+            return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
+                catalog: "br159-caller",
+                detail: "TEMP object shadows BR-159 catalog".to_owned(),
+            });
+        }
+        let objects = connection
+            .prepare(
+                "SELECT type,name,tbl_name,sql FROM main.sqlite_schema \
+                 WHERE lower(name) IN ('data_acquisition_audit','data_acquisition_audit_chain') \
+                    OR lower(tbl_name) IN ('data_acquisition_audit','data_acquisition_audit_chain') \
+                 ORDER BY type,name,tbl_name",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| sqlite_reference_build_error("br159-catalog", None, error))?;
+        let mut foreign_keys = Vec::new();
+        let mut indexes = Vec::new();
+        for table in TABLES {
+            let rows = connection
+                .prepare(
+                    "SELECT ?1,id,seq,\"table\",\"from\",\"to\",on_update,on_delete \
+                     FROM pragma_foreign_key_list(?1) ORDER BY id,seq",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([table], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|error| sqlite_reference_build_error("br159-foreign-keys", None, error))?;
+            foreign_keys.extend(rows);
+            let listed = connection
+                .prepare(
+                    "SELECT name,\"unique\",origin,partial FROM pragma_index_list(?1) ORDER BY seq",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([table], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|error| sqlite_reference_build_error("br159-index-list", None, error))?;
+            for (name, unique, origin, partial) in listed {
+                let terms = connection
+                    .prepare(
+                        "SELECT seqno,cid,name,\"desc\",coll,\"key\" \
+                         FROM pragma_index_xinfo(?1) ORDER BY seqno",
+                    )
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([name.as_str()], |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .map_err(|error| {
+                        sqlite_reference_build_error("br159-index-xinfo", None, error)
+                    })?;
+                indexes.push((table.to_owned(), name, unique, origin, partial, terms));
+            }
+        }
+        Ok((objects, foreign_keys, indexes))
+    }
+
+    if capture(connection)? != capture(&reference)? {
+        return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
+            catalog: "br159-caller",
+            detail: "BR-159 catalog differs from frozen same-runtime reference".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn parse_legacy_ddl_fixture_rows(
     fixture: &str,
     expected_registry: &[FrozenCatalogRegistryEntry],

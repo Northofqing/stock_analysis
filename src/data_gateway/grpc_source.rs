@@ -8,6 +8,10 @@
 //! 同步方法 (realtime_quotes/daily_bars) 在 spawn_blocking 线程里调用 →
 //! Handle::block_on; 纯同步线程 → 静态 BRIDGE_RUNTIME。
 pub mod convert;
+#[path = "grpc_source_macro_legacy.rs"]
+pub(crate) mod macro_legacy;
+#[path = "grpc_source_macro.rs"]
+pub(crate) mod macro_queries;
 
 // BR-251 server/client share this exact wire model without exposing the private
 // benchmark acquisition module as a general construction API.
@@ -15,6 +19,7 @@ pub mod convert;
 pub(crate) use super::benchmark::BenchmarkGrpcResponseWire;
 pub(crate) use super::benchmark::BenchmarkRequestWire;
 
+use crate::data_gateway::board_runtime::MembershipRequest;
 use crate::data_gateway::market_capabilities::MarketSecurityIdentity;
 use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcomeFetch};
 use crate::data_gateway::{
@@ -28,10 +33,20 @@ use crate::data_gateway::{
     ResearchReportFact, SinaInstrumentNewsRecord, T0Batch, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, KlineData};
-use crate::grpc_client::client::GrpcMarketClient;
+pub(crate) use crate::grpc_client::client::board_attempt::{
+    BoardAttemptCompletion, BoardContinuation, BoardQuerySession, BoardTrailerMaterial,
+};
+use crate::grpc_client::client::{ContractProfile, GrpcMarketClient};
 use crate::grpc_client::envelope::QueryResult;
 use crate::grpc_client::errors::GrpcError;
-use crate::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
+use crate::grpc_client::external_pb::magic::market::v1::{
+    AdmissionState as ExternalAdmissionState, Capability as ExternalCapability,
+    HealthResponse as ExternalHealthResponse, Operation as ExternalOperation,
+};
+use crate::grpc_client::pb::magic::market::v1::{
+    AdmissionState, Operation, QueryRequest, QueryResponse,
+};
+use crate::grpc_contract::methods::{ExternalMethod, MethodIdentity};
 use crate::market_domain::SecurityBar;
 use crate::market_domain::{
     FinancialStatement, FlowInterval, InstrumentId, MarketStatistics, NorthboundChannel,
@@ -714,7 +729,11 @@ fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
     }
 }
 
-fn map_external_connection_error(error: GrpcError) -> GatewayError {
+pub(crate) fn map_external_connection_error(error: GrpcError) -> GatewayError {
+    map_external_connection_error_ref(&error)
+}
+
+pub(crate) fn map_external_connection_error_ref(error: &GrpcError) -> GatewayError {
     let details = error.details();
     let provider = details
         .provider
@@ -774,7 +793,7 @@ fn map_external_connection_error(error: GrpcError) -> GatewayError {
     )
 }
 
-fn map_external_query_error(operation: Operation, error: &GrpcError) -> GatewayError {
+pub(crate) fn map_external_query_error(operation: Operation, error: &GrpcError) -> GatewayError {
     let details = error.details();
     let provider = details
         .provider
@@ -830,20 +849,21 @@ fn map_external_query_error(operation: Operation, error: &GrpcError) -> GatewayE
 }
 
 fn require_external_capability_family(
-    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
-    family: &'static str,
-    operations: &[Operation],
+    capabilities: &[ExternalCapability],
+    family: &str,
+    operations: &[ExternalOperation],
 ) -> Result<(), GatewayError> {
     let matching = capabilities
         .iter()
         .filter(|capability| {
             operations
                 .iter()
-                .any(|operation| capability.operation == *operation as i32)
+                .filter_map(|operation| ExternalMethod::try_from_operation(*operation).ok())
+                .any(|method| ExternalMethod::try_from_raw(capability.operation) == Ok(method))
         })
         .collect::<Vec<_>>();
     if matching.iter().any(|capability| {
-        capability.repository_admission == AdmissionState::Admitted as i32
+        capability.repository_admission == ExternalAdmissionState::Admitted as i32
             && capability.runtime_available
     }) {
         return Ok(());
@@ -856,10 +876,9 @@ fn require_external_capability_family(
             false,
             "服务端没有发布该语义族合同",
         )
-    } else if !matching
-        .iter()
-        .any(|capability| capability.repository_admission == AdmissionState::Admitted as i32)
-    {
+    } else if !matching.iter().any(|capability| {
+        capability.repository_admission == ExternalAdmissionState::Admitted as i32
+    }) {
         (
             "invalid_request",
             "external_capability_unadmitted",
@@ -884,44 +903,95 @@ fn require_external_capability_family(
     ))
 }
 
-fn require_external_capability(
-    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
-    operation: Operation,
+pub(crate) fn require_external_capability(
+    capabilities: &[ExternalCapability],
+    method: ExternalMethod,
 ) -> Result<(), GatewayError> {
+    let operation = method.native_operation();
+    let family = format!("{operation:?}");
     require_external_capability_family(
         capabilities,
-        crate::grpc_contract::ops::method_name(operation),
+        &family,
         std::slice::from_ref(&operation),
     )
 }
 
-const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[Operation])] = &[
-    ("SecurityMetadata", &[Operation::SecurityMetadata]),
-    ("InstrumentNews", &[Operation::InstrumentNews]),
-    ("GlobalNews", &[Operation::GlobalNews]),
+fn known_external_method(operation: ExternalOperation) -> ExternalMethod {
+    ExternalMethod::try_from_operation(operation)
+        .expect("known External generated operation is nonzero")
+}
+
+fn external_query_method(operation: Operation) -> Result<ExternalMethod, GatewayError> {
+    match MethodIdentity::from_client_operation(ContractProfile::ExternalV1, operation) {
+        Ok(MethodIdentity::External(method)) => Ok(method),
+        _ => Err(GatewayError::classified(
+            "GrpcExternalV1",
+            None,
+            "invalid_request",
+            "external_contract_rejected",
+            false,
+            "ExternalV1 operation 未在当前三项 query allowlist 中",
+        )),
+    }
+}
+
+pub(crate) fn external_health_ready(response: &ExternalHealthResponse) -> bool {
+    response.live && response.ready
+}
+
+pub(crate) fn require_external_health_ready(
+    response: &ExternalHealthResponse,
+) -> Result<(), GatewayError> {
+    if external_health_ready(response) {
+        Ok(())
+    } else {
+        Err(GatewayError::classified(
+            "GrpcExternalV1",
+            None,
+            "unavailable",
+            "external_health_not_ready",
+            true,
+            "ExternalV1 health 未达到 live+ready",
+        ))
+    }
+}
+
+const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[ExternalOperation])] = &[
+    ("SecurityMetadata", &[ExternalOperation::SecurityMetadata]),
+    ("InstrumentNews", &[ExternalOperation::InstrumentNews]),
+    ("GlobalNews", &[ExternalOperation::GlobalNews]),
     (
         "Announcements",
-        &[Operation::Announcements, Operation::MarketAnnouncements],
+        &[
+            ExternalOperation::Announcements,
+            ExternalOperation::MarketAnnouncements,
+        ],
     ),
     (
         "BoardMemberships",
-        &[Operation::BoardConstituents, Operation::BoardMemberships],
+        &[
+            ExternalOperation::BoardConstituents,
+            ExternalOperation::BoardMemberships,
+        ],
     ),
     (
         "UpperLimitReview",
-        &[Operation::UpperLimitPoolReview, Operation::LimitPools],
+        &[
+            ExternalOperation::UpperLimitPoolReview,
+            ExternalOperation::LimitPools,
+        ],
     ),
 ];
 
-const LIVE_OPENING_CAPABILITY_FAMILIES: &[(&str, &[Operation])] = &[
-    ("RealtimeQuotes", &[Operation::RealtimeQuotes]),
-    ("OrderBooks", &[Operation::OrderBooks]),
-    ("T0Evidence", &[Operation::T0Evidence]),
+const LIVE_OPENING_CAPABILITY_FAMILIES: &[(&str, &[ExternalOperation])] = &[
+    ("RealtimeQuotes", &[ExternalOperation::RealtimeQuotes]),
+    ("OrderBooks", &[ExternalOperation::OrderBooks]),
+    ("T0Evidence", &[ExternalOperation::T0Evidence]),
 ];
 
 fn require_external_capability_families(
-    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
-    families: &[(&'static str, &[Operation])],
+    capabilities: &[ExternalCapability],
+    families: &[(&'static str, &[ExternalOperation])],
 ) -> Result<(), GatewayError> {
     for &(family, operations) in families {
         require_external_capability_family(capabilities, family, operations)?;
@@ -930,13 +1000,13 @@ fn require_external_capability_families(
 }
 
 fn require_external_static_capabilities(
-    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
+    capabilities: &[ExternalCapability],
 ) -> Result<(), GatewayError> {
     require_external_capability_families(capabilities, STATIC_OPENING_CAPABILITY_FAMILIES)
 }
 
 fn require_external_live_capabilities(
-    capabilities: &[crate::grpc_client::pb::magic::market::v1::Capability],
+    capabilities: &[ExternalCapability],
 ) -> Result<(), GatewayError> {
     require_external_capability_families(capabilities, LIVE_OPENING_CAPABILITY_FAMILIES)
 }
@@ -1080,6 +1150,8 @@ pub fn bridge_for(_op: &str) -> Result<Arc<GrpcSource>, GatewayError> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
         external_client: AsyncMutex::new(None),
+        local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+        external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
     });
     *cell
         .lock()
@@ -1731,17 +1803,17 @@ fn required_opening_bridge(op_name: &'static str) -> Result<Arc<GrpcSource>, Gat
 
 async fn current_external_opening_capabilities(
     source: &GrpcSource,
-) -> Result<Vec<crate::grpc_client::pb::magic::market::v1::Capability>, GatewayError> {
+) -> Result<Vec<ExternalCapability>, GatewayError> {
     let mut guard = source.external_client.lock().await;
     let state = guard
         .as_mut()
         .expect("ensure_external_connected 后必有 external client");
     let health = state
         .client
-        .get_health()
+        .get_external_health()
         .await
         .map_err(map_external_connection_error)?;
-    if !health.live || !health.ready {
+    if !external_health_ready(&health) {
         return Err(GatewayError::classified(
             "GrpcExternalV1",
             None,
@@ -1753,7 +1825,7 @@ async fn current_external_opening_capabilities(
     }
     state
         .client
-        .get_capabilities()
+        .get_external_capabilities()
         .await
         .map_err(map_external_connection_error)
 }
@@ -2039,7 +2111,7 @@ pub async fn external_static_opening_diagnostics() -> Result<OpeningDiagnosticRe
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("SecurityMetadata")?;
     source
-        .ensure_external_connected(Operation::SecurityMetadata)
+        .ensure_external_connected(known_external_method(ExternalOperation::SecurityMetadata))
         .await?;
     let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_static_capabilities(&capabilities)?;
@@ -2116,7 +2188,7 @@ pub async fn external_static_opening_readiness() -> Result<OpeningReadinessRepor
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("SecurityMetadata")?;
     source
-        .ensure_external_connected(Operation::SecurityMetadata)
+        .ensure_external_connected(known_external_method(ExternalOperation::SecurityMetadata))
         .await?;
     let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_static_capabilities(&capabilities)?;
@@ -2220,7 +2292,7 @@ pub async fn external_live_opening_readiness() -> Result<OpeningReadinessReport,
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("RealtimeQuotes")?;
     source
-        .ensure_external_connected(Operation::RealtimeQuotes)
+        .ensure_external_connected(known_external_method(ExternalOperation::RealtimeQuotes))
         .await?;
     let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_live_capabilities(&capabilities)?;
@@ -2366,23 +2438,299 @@ where
 pub struct GrpcSource {
     addr: String,
     /// 连接态缓存: None = 尚未连接成功 (失败不缓存, 下次调用重试)。
-    /// tokio Mutex: 跨 await 持有 (Send) — delegate JoinSet spawn 要求。
+    /// The cache lock is released before connection/control/query awaits.
     client: AsyncMutex<Option<GrpcMarketClient>>,
     /// Optional authenticated ExternalV1 bundle. The path is never logged.
     external_bundle: Option<PathBuf>,
     /// ExternalV1 has a separate channel/profile from the normalized local bridge.
     external_client: AsyncMutex<Option<ExternalClientState>>,
+    local_initialization: Arc<tokio::sync::Semaphore>,
+    external_initialization: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum LocalSemanticSearchConnectionState {
+    Connected { endpoint: String },
+    Disconnected,
+    Busy,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectedBoardQueries {
+    client: GrpcMarketClient,
+}
+
+pub(crate) struct RestoredMembershipRequest {
+    code: String,
+    request_id: String,
+    request: QueryRequest,
+    profile: ContractProfile,
+    acquisition_authority: Option<String>,
+    retry_policy: (u32, u64, u64, u64),
+    next_attempt: u32,
+}
+
+impl RestoredMembershipRequest {
+    pub(crate) fn new(
+        code: String,
+        request_id: String,
+        request: QueryRequest,
+        profile: ContractProfile,
+        acquisition_authority: Option<String>,
+        retry_policy: (u32, u64, u64, u64),
+        next_attempt: u32,
+    ) -> Self {
+        Self {
+            code,
+            request_id,
+            request,
+            profile,
+            acquisition_authority,
+            retry_policy,
+            next_attempt,
+        }
+    }
+}
+
+pub(crate) struct RestoredDragonTigerRequest {
+    date: NaiveDate,
+    disclosure_limit: u32,
+    stock_limit: usize,
+    request_id: String,
+    request: QueryRequest,
+    profile: ContractProfile,
+    acquisition_authority: Option<String>,
+    retry_policy: (u32, u64, u64, u64),
+    next_attempt: u32,
+}
+
+impl RestoredDragonTigerRequest {
+    pub(crate) fn new(
+        date: NaiveDate,
+        disclosure_limit: u32,
+        stock_limit: usize,
+        request_id: String,
+        request: QueryRequest,
+        profile: ContractProfile,
+        acquisition_authority: Option<String>,
+        retry_policy: (u32, u64, u64, u64),
+        next_attempt: u32,
+    ) -> Self {
+        Self {
+            date,
+            disclosure_limit,
+            stock_limit,
+            request_id,
+            request,
+            profile,
+            acquisition_authority,
+            retry_policy,
+            next_attempt,
+        }
+    }
+}
+
+impl ConnectedBoardQueries {
+    pub(crate) fn directory_session(
+        &self,
+        kind: BoardKind,
+        limit: u32,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.client
+            .board_directory_query(
+                serde_json::json!({ "kind": format!("{kind:?}"), "limit": limit }),
+            )
+            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))
+    }
+
+    pub(crate) fn resume_directory_session(
+        &self,
+        request: QueryRequest,
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        retry_policy: (u32, u64, u64, u64),
+        next_attempt: u32,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.client
+            .resume_board_directory_query(
+                request,
+                profile,
+                acquisition_authority,
+                retry_policy,
+                next_attempt,
+            )
+            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))
+    }
+
+    pub(crate) fn memberships_session(
+        &self,
+        code: &str,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        let request = MembershipRequest::try_new(code)?;
+        self.client
+            .board_memberships_query(request.code().to_owned())
+            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))
+    }
+
+    pub(crate) fn resume_memberships_session(
+        &self,
+        restored: RestoredMembershipRequest,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        let request = MembershipRequest::try_new(&restored.code)?;
+        self.client
+            .resume_board_memberships_query(
+                request.code().to_owned(),
+                &restored.request_id,
+                restored.request,
+                restored.profile,
+                restored.acquisition_authority.as_deref(),
+                restored.retry_policy,
+                restored.next_attempt,
+            )
+            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))
+    }
+
+    pub(crate) fn directory_completion(
+        completion: BoardAttemptCompletion,
+    ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+        let query = completion
+            .processed
+            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))?;
+        convert::board_directory(&query)
+    }
+
+    pub(crate) fn restore_directory_response(
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        request_id: &str,
+        response: QueryResponse,
+    ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+        let query = crate::grpc_client::client::board_attempt::project_board_response(
+            profile,
+            acquisition_authority,
+            request_id,
+            response,
+        )
+        .map_err(|error| map_query_error(Operation::BoardDirectory, &error))?;
+        convert::board_directory(&query)
+    }
+
+    pub(crate) fn restore_directory_status(
+        profile: ContractProfile,
+        request_id: &str,
+        code: i32,
+        details: &[u8],
+        trailer: crate::grpc_client::errors::PersistedErrorDetailTrailer<'_>,
+        diagnostic: Option<&str>,
+    ) -> Option<GatewayError> {
+        let method = crate::grpc_contract::methods::MethodIdentity::from_client_operation(
+            profile,
+            Operation::BoardDirectory,
+        )
+        .ok()?;
+        crate::grpc_client::errors::restore_persisted_status_error(
+            code,
+            details,
+            trailer,
+            diagnostic,
+            crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
+        )
+        .map(|error| map_query_error(Operation::BoardDirectory, &error))
+    }
+
+    pub(crate) fn memberships_completion(
+        completion: BoardAttemptCompletion,
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        let query = completion
+            .processed
+            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))?;
+        convert::board_constituents(&query)
+    }
+
+    pub(crate) fn restore_memberships_response(
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        request_id: &str,
+        response: QueryResponse,
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        let query = crate::grpc_client::client::board_attempt::project_board_membership_response(
+            profile,
+            acquisition_authority,
+            request_id,
+            response,
+        )
+        .map_err(|error| map_query_error(Operation::BoardConstituents, &error))?;
+        convert::board_constituents(&query)
+    }
+
+    pub(crate) fn restore_memberships_status(
+        profile: ContractProfile,
+        request_id: &str,
+        code: i32,
+        details: &[u8],
+        trailer: crate::grpc_client::errors::PersistedErrorDetailTrailer<'_>,
+        diagnostic: Option<&str>,
+    ) -> Option<GatewayError> {
+        let method = crate::grpc_contract::methods::MethodIdentity::from_client_operation(
+            profile,
+            Operation::BoardConstituents,
+        )
+        .ok()?;
+        crate::grpc_client::errors::restore_persisted_status_error(
+            code,
+            details,
+            trailer,
+            diagnostic,
+            crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
+        )
+        .map(|error| map_query_error(Operation::BoardConstituents, &error))
+    }
 }
 
 struct ExternalClientState {
     client: GrpcMarketClient,
-    ready_operations: HashSet<i32>,
+    ready_operations: HashSet<ExternalMethod>,
+    prepared: crate::grpc_client::client::PreparedExternalEndpoint,
 }
 
 impl GrpcSource {
+    #[cfg(test)]
+    pub(crate) fn from_macro_loopback_test_client(client: GrpcMarketClient, addr: String) -> Self {
+        Self {
+            addr,
+            client: AsyncMutex::new(Some(client)),
+            external_bundle: None,
+            external_client: AsyncMutex::new(None),
+            local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+            external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_board_loopback_test_client(client: GrpcMarketClient) -> Self {
+        Self {
+            addr: "http://127.0.0.1:board-loopback-test".to_owned(),
+            client: AsyncMutex::new(Some(client)),
+            external_bundle: None,
+            external_client: AsyncMutex::new(None),
+            local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+            external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
     async fn ensure_connected(&self) -> Result<(), GatewayError> {
-        let mut guard = self.client.lock().await;
-        if guard.is_some() {
+        let _qualification = Arc::clone(&self.local_initialization)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    "GrpcBridge",
+                    None,
+                    false,
+                    "Local initialization qualification closed",
+                )
+            })?;
+        if self.client.lock().await.is_some() {
             return Ok(());
         }
         let client = GrpcMarketClient::connect(&self.addr).await.map_err(|e| {
@@ -2394,8 +2742,22 @@ impl GrpcSource {
             )
         })?;
         log::info!("[data_gateway] gRPC 桥已连接: server={}", self.addr);
-        *guard = Some(client);
+        *self.client.lock().await = Some(client);
         Ok(())
+    }
+
+    pub(crate) async fn connected_board_queries(
+        &self,
+    ) -> Result<ConnectedBoardQueries, GatewayError> {
+        self.ensure_connected().await?;
+        let client = {
+            let guard = self.client.lock().await;
+            guard
+                .as_ref()
+                .expect("ensure_connected 后必有 client")
+                .clone()
+        };
+        Ok(ConnectedBoardQueries { client })
     }
 
     pub fn addr(&self) -> &str {
@@ -2418,6 +2780,183 @@ impl GrpcSource {
             .query(op, params)
             .await
             .map_err(|e| map_query_error(op, &e))
+    }
+
+    pub(crate) async fn board_directory_query_session(
+        &self,
+        kind: BoardKind,
+        limit: u32,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.connected_board_queries()
+            .await?
+            .directory_session(kind, limit)
+    }
+
+    pub(crate) async fn resume_board_directory_query_session(
+        &self,
+        request: QueryRequest,
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        retry_policy: (u32, u64, u64, u64),
+        next_attempt: u32,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.connected_board_queries()
+            .await?
+            .resume_directory_session(
+                request,
+                profile,
+                acquisition_authority,
+                retry_policy,
+                next_attempt,
+            )
+    }
+
+    pub(crate) async fn dragon_tiger_query_session(
+        &self,
+        date: NaiveDate,
+        disclosure_limit: u32,
+        stock_limit: usize,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.ensure_connected().await?;
+        let client = {
+            let guard = self.client.lock().await;
+            guard
+                .as_ref()
+                .expect("ensure_connected 后必有 client")
+                .clone()
+        };
+        client
+            .dragon_tiger_query(
+                date.format("%Y-%m-%d").to_string(),
+                disclosure_limit,
+                stock_limit,
+            )
+            .map_err(|error| map_query_error(Operation::DragonTiger, &error))
+    }
+
+    pub(crate) async fn resume_dragon_tiger_query_session(
+        &self,
+        restored: RestoredDragonTigerRequest,
+    ) -> Result<BoardQuerySession, GatewayError> {
+        self.ensure_connected().await?;
+        let client = {
+            let guard = self.client.lock().await;
+            guard
+                .as_ref()
+                .expect("ensure_connected 后必有 client")
+                .clone()
+        };
+        let RestoredDragonTigerRequest {
+            date,
+            disclosure_limit,
+            stock_limit,
+            request_id,
+            request,
+            profile,
+            acquisition_authority,
+            retry_policy,
+            next_attempt,
+        } = restored;
+        let date = date.format("%Y-%m-%d").to_string();
+        client
+            .resume_dragon_tiger_query(
+                &date,
+                disclosure_limit,
+                stock_limit,
+                &request_id,
+                request,
+                profile,
+                acquisition_authority.as_deref(),
+                retry_policy,
+                next_attempt,
+            )
+            .map_err(|error| map_query_error(Operation::DragonTiger, &error))
+    }
+
+    pub(crate) fn dragon_tiger_completion(
+        completion: BoardAttemptCompletion,
+    ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+        let query = completion
+            .processed
+            .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+        convert::dragon_tiger(&query)
+    }
+
+    pub(crate) fn restore_dragon_tiger_response(
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        request_id: &str,
+        response: QueryResponse,
+    ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+        let query = crate::grpc_client::client::board_attempt::project_dragon_tiger_response(
+            profile,
+            acquisition_authority,
+            request_id,
+            response,
+        )
+        .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+        convert::dragon_tiger(&query)
+    }
+
+    pub(crate) fn restore_dragon_tiger_status(
+        profile: ContractProfile,
+        request_id: &str,
+        code: i32,
+        details: &[u8],
+        trailer: crate::grpc_client::errors::PersistedErrorDetailTrailer<'_>,
+        diagnostic: Option<&str>,
+    ) -> Option<GatewayError> {
+        let method = crate::grpc_contract::methods::MethodIdentity::from_client_operation(
+            profile,
+            Operation::DragonTiger,
+        )
+        .ok()?;
+        crate::grpc_client::errors::restore_persisted_status_error(
+            code,
+            details,
+            trailer,
+            diagnostic,
+            crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
+        )
+        .map(|error| map_query_error(Operation::DragonTiger, &error))
+    }
+
+    pub(crate) fn board_directory_completion(
+        completion: BoardAttemptCompletion,
+    ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+        ConnectedBoardQueries::directory_completion(completion)
+    }
+
+    pub(crate) fn restore_board_directory_response(
+        profile: ContractProfile,
+        acquisition_authority: Option<&str>,
+        request_id: &str,
+        response: QueryResponse,
+    ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
+        ConnectedBoardQueries::restore_directory_response(
+            profile,
+            acquisition_authority,
+            request_id,
+            response,
+        )
+    }
+
+    pub(crate) fn restore_board_directory_status(
+        profile: ContractProfile,
+        request_id: &str,
+        code: i32,
+        details: &[u8],
+        trailer: crate::grpc_client::errors::PersistedErrorDetailTrailer<'_>,
+        diagnostic: Option<&str>,
+    ) -> Option<GatewayError> {
+        ConnectedBoardQueries::restore_directory_status(
+            profile,
+            request_id,
+            code,
+            details,
+            trailer,
+            diagnostic,
+        )
     }
 
     /// BR-251 has a local-only generated RPC that is intentionally absent from
@@ -2486,19 +3025,47 @@ impl GrpcSource {
         parse_benchmark_query_response(&request_id, response)
     }
 
-    async fn ensure_external_connected(&self, operation: Operation) -> Result<(), GatewayError> {
-        let mut guard = self.external_client.lock().await;
-        if let Some(state) = guard.as_mut() {
-            if state.ready_operations.contains(&(operation as i32)) {
+    async fn ensure_external_connected(&self, method: ExternalMethod) -> Result<(), GatewayError> {
+        let _qualification = Arc::clone(&self.external_initialization)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    "GrpcExternalV1",
+                    None,
+                    false,
+                    "External initialization qualification closed",
+                )
+            })?;
+        let cached = self
+            .external_client
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| (state.client.clone(), state.ready_operations.clone()));
+        if let Some((mut client, ready_operations)) = cached {
+            if ready_operations.contains(&method) {
                 return Ok(());
             }
-            let capabilities = state
-                .client
-                .get_capabilities()
+            let capabilities = client
+                .get_external_capabilities()
                 .await
                 .map_err(map_external_connection_error)?;
-            require_external_capability(&capabilities, operation)?;
-            state.ready_operations.insert(operation as i32);
+            require_external_capability(&capabilities, method)?;
+            self.external_client
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(|| {
+                    GatewayError::unavailable(
+                        "GrpcExternalV1",
+                        None,
+                        false,
+                        "External cache disappeared during initialization",
+                    )
+                })?
+                .ready_operations
+                .insert(method);
             return Ok(());
         }
         let bundle = self.external_bundle.as_ref().ok_or_else(|| {
@@ -2522,34 +3089,30 @@ impl GrpcSource {
             ));
         }
 
-        let mut client = GrpcMarketClient::connect_client_bundle(bundle)
+        let prepared = GrpcMarketClient::prepare_client_bundle(bundle)
+            .map_err(map_external_connection_error)?;
+        let mut client = prepared
+            .connect_once()
             .await
             .map_err(map_external_connection_error)?;
         let health = client
-            .get_health()
+            .get_external_health()
             .await
             .map_err(map_external_connection_error)?;
-        if !health.live || !health.ready {
-            return Err(GatewayError::classified(
-                "GrpcExternalV1",
-                None,
-                "unavailable",
-                "external_health_not_ready",
-                true,
-                "ExternalV1 health 未达到 live+ready",
-            ));
-        }
+        require_external_health_ready(&health)?;
         let capabilities = client
-            .get_capabilities()
+            .get_external_capabilities()
             .await
             .map_err(map_external_connection_error)?;
-        require_external_capability(&capabilities, operation)?;
+        require_external_capability(&capabilities, method)?;
         log::info!(
-            "[data_gateway] ExternalV1 已通过 health/capability gate: operation={operation:?}"
+            "[data_gateway] ExternalV1 已通过 health/capability gate: method={}",
+            method.as_str_name()
         );
-        *guard = Some(ExternalClientState {
+        *self.external_client.lock().await = Some(ExternalClientState {
             client,
-            ready_operations: HashSet::from([operation as i32]),
+            prepared,
+            ready_operations: HashSet::from([method]),
         });
         Ok(())
     }
@@ -2559,6 +3122,7 @@ impl GrpcSource {
         operation: Operation,
         params: Value,
     ) -> Result<QueryResult, GatewayError> {
+        let method = external_query_method(operation)?;
         crate::grpc_client::external_v1::build_external_query_request(operation, params.clone())
             .map_err(|_| {
                 GatewayError::classified(
@@ -2570,13 +3134,16 @@ impl GrpcSource {
                     "ExternalV1 operation 或参数未在交付合同中冻结",
                 )
             })?;
-        self.ensure_external_connected(operation).await?;
-        let mut guard = self.external_client.lock().await;
-        let state = guard
-            .as_mut()
-            .expect("ensure_external_connected 后必有 external client");
-        state
+        self.ensure_external_connected(method).await?;
+        let mut client = self
+            .external_client
+            .lock()
+            .await
+            .as_ref()
+            .expect("ensure_external_connected 后必有 external client")
             .client
+            .clone();
+        client
             .query(operation, params)
             .await
             .map_err(|error| map_external_query_error(operation, &error))
@@ -2800,10 +3367,19 @@ impl GrpcSource {
         } else {
             self.query_op(Operation::GlobalNews, params).await?
         };
+        Self::global_news_query_result(provider, limit, external, &q)
+    }
+
+    pub(crate) fn global_news_query_result(
+        provider: GlobalNewsProvider,
+        limit: u32,
+        external: bool,
+        q: &QueryResult,
+    ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
         let batch = if external {
-            convert::external_global_news(provider, &q)?
+            convert::external_global_news(provider, q)?
         } else {
-            convert::global_news(&q)?
+            convert::global_news(q)?
         };
         if batch.evidence().provider != provider.provider_id()
             || batch.evidence().source != provider.source()
@@ -2859,17 +3435,23 @@ impl GrpcSource {
         disclosure_limit: u32,
         stock_limit: usize,
     ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
-        let q = self
-            .query_op(
-                Operation::DragonTiger,
-                serde_json::json!({
-                    "date": trading_date.format("%Y-%m-%d").to_string(),
-                    "disclosure_limit": disclosure_limit,
-                    "stock_limit": stock_limit,
-                }),
-            )
+        let mut session = self
+            .dragon_tiger_query_session(trading_date, disclosure_limit, stock_limit)
             .await?;
-        convert::dragon_tiger(&q)
+        loop {
+            let authorized = session
+                .authorize_next()
+                .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+            let completion = authorized.execute().await;
+            match completion.continuation {
+                BoardContinuation::Retry { backoff_ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+                BoardContinuation::Terminal => {
+                    return Self::dragon_tiger_completion(completion);
+                }
+            }
+        }
     }
 
     pub async fn market_dragon_tiger_async(
@@ -3661,7 +4243,6 @@ mod tests {
             details: Box::new(ErrorDetail {
                 code: "internal".to_string(),
                 request_id: Some("req-1".to_string()),
-                operation: Some(8),
                 provider: Some("Tdx".to_string()),
                 reason_code: Some("no_verified_batch".to_string()),
                 retryable: Some(true),
@@ -4134,11 +4715,151 @@ mod tests {
         );
     }
 
+    fn br238_external_capability_row(
+        provider: &str,
+        admission: ExternalAdmissionState,
+        runtime_available: bool,
+    ) -> ExternalCapability {
+        ExternalCapability {
+            operation: ExternalOperation::GlobalNews as i32,
+            repository_admission: admission as i32,
+            runtime_available,
+            provider: provider.to_owned(),
+            exact_scope: format!("TEST_CODE_{provider}_scope"),
+            blocker: String::new(),
+            diagnostic_available: admission == ExternalAdmissionState::Unadmitted,
+        }
+    }
+
+    #[test]
+    fn br238_external_capability_duplicate_rows_accept_ready_provider_in_either_order() {
+        let method = known_external_method(ExternalOperation::GlobalNews);
+        let unadmitted = br238_external_capability_row(
+            "diagnostic",
+            ExternalAdmissionState::Unadmitted,
+            false,
+        );
+        let ready = br238_external_capability_row(
+            "ready",
+            ExternalAdmissionState::Admitted,
+            true,
+        );
+
+        for rows in [
+            vec![ready.clone(), unadmitted.clone()],
+            vec![unadmitted.clone(), ready.clone()],
+        ] {
+            require_external_capability(&rows, method)
+                .expect("any admitted runtime provider authorizes the External method");
+        }
+    }
+
+    #[test]
+    fn br238_external_capability_duplicate_rows_accept_later_runtime_provider() {
+        let method = known_external_method(ExternalOperation::GlobalNews);
+        let runtime_unavailable = br238_external_capability_row(
+            "cold",
+            ExternalAdmissionState::Admitted,
+            false,
+        );
+        let ready = br238_external_capability_row(
+            "ready",
+            ExternalAdmissionState::Admitted,
+            true,
+        );
+
+        for rows in [
+            vec![ready.clone(), runtime_unavailable.clone()],
+            vec![runtime_unavailable.clone(), ready.clone()],
+        ] {
+            require_external_capability(&rows, method)
+                .expect("a later runtime provider must not be hidden by an unavailable row");
+        }
+    }
+
+    #[test]
+    fn br238_external_capability_duplicate_failures_classify_across_all_rows() {
+        let method = known_external_method(ExternalOperation::GlobalNews);
+        let unadmitted = br238_external_capability_row(
+            "diagnostic",
+            ExternalAdmissionState::Unadmitted,
+            false,
+        );
+        let runtime_unavailable = br238_external_capability_row(
+            "cold",
+            ExternalAdmissionState::Admitted,
+            false,
+        );
+
+        for rows in [
+            vec![runtime_unavailable.clone(), unadmitted.clone()],
+            vec![unadmitted.clone(), runtime_unavailable.clone()],
+        ] {
+            let error = require_external_capability(&rows, method)
+                .expect_err("mixed failed rows have no ready provider");
+            assert_eq!(
+                error.reason_code(),
+                "external_capability_runtime_unavailable"
+            );
+            assert!(error.retryable());
+            assert_eq!(
+                error.message(),
+                "ExternalV1 GlobalNews: 已准入语义族的 runtime provider 暂不可用"
+            );
+        }
+
+        let error = require_external_capability(&[], method)
+            .expect_err("an absent method remains missing");
+        assert_eq!(error.reason_code(), "external_capability_missing");
+        assert!(!error.retryable());
+        assert_eq!(
+            error.message(),
+            "ExternalV1 GlobalNews: 服务端没有发布该语义族合同"
+        );
+
+        let all_unadmitted = [
+            unadmitted.clone(),
+            br238_external_capability_row(
+                "diagnostic_two",
+                ExternalAdmissionState::Unadmitted,
+                false,
+            ),
+        ];
+        let error = require_external_capability(&all_unadmitted, method)
+            .expect_err("diagnostic-only rows remain unadmitted");
+        assert_eq!(error.reason_code(), "external_capability_unadmitted");
+        assert!(!error.retryable());
+        assert_eq!(
+            error.message(),
+            "ExternalV1 GlobalNews: 该语义族只有未准入或诊断能力"
+        );
+
+        let all_runtime_unavailable = [
+            runtime_unavailable,
+            br238_external_capability_row(
+                "cold_two",
+                ExternalAdmissionState::Admitted,
+                false,
+            ),
+        ];
+        let error = require_external_capability(&all_runtime_unavailable, method)
+            .expect_err("admitted rows without a runtime provider remain unavailable");
+        assert_eq!(
+            error.reason_code(),
+            "external_capability_runtime_unavailable"
+        );
+        assert!(error.retryable());
+        assert_eq!(
+            error.message(),
+            "ExternalV1 GlobalNews: 已准入语义族的 runtime provider 暂不可用"
+        );
+    }
+
     #[test]
     fn br238_static_readiness_accepts_one_admitted_runtime_alias_per_family() {
-        let admitted = |operation: Operation| pb::Capability {
+        let admitted = |operation: ExternalOperation| ExternalCapability {
             operation: operation as i32,
-            repository_admission: AdmissionState::Admitted as i32,
+            repository_admission: ExternalAdmissionState::Admitted as i32,
             runtime_available: true,
             provider: "TEST_CODE_provider".to_string(),
             exact_scope: "TEST_CODE_scope".to_string(),
@@ -4146,12 +4867,12 @@ mod tests {
             diagnostic_available: false,
         };
         let mut capabilities = [
-            Operation::SecurityMetadata,
-            Operation::InstrumentNews,
-            Operation::GlobalNews,
-            Operation::Announcements,
-            Operation::BoardMemberships,
-            Operation::LimitPools,
+            ExternalOperation::SecurityMetadata,
+            ExternalOperation::InstrumentNews,
+            ExternalOperation::GlobalNews,
+            ExternalOperation::Announcements,
+            ExternalOperation::BoardMemberships,
+            ExternalOperation::LimitPools,
         ]
         .into_iter()
         .map(admitted)
@@ -4159,14 +4880,14 @@ mod tests {
         require_external_static_capabilities(&capabilities)
             .expect("one admitted runtime alias per static family is ready");
 
-        capabilities.retain(|row| row.operation != Operation::InstrumentNews as i32);
+        capabilities.retain(|row| row.operation != ExternalOperation::InstrumentNews as i32);
         let error = require_external_static_capabilities(&capabilities)
             .expect_err("a missing semantic family must fail closed");
         assert_eq!(error.reason_code(), "external_capability_missing");
         assert!(!error.retryable());
 
-        let mut diagnostic_only = admitted(Operation::InstrumentNews);
-        diagnostic_only.repository_admission = AdmissionState::Unadmitted as i32;
+        let mut diagnostic_only = admitted(ExternalOperation::InstrumentNews);
+        diagnostic_only.repository_admission = ExternalAdmissionState::Unadmitted as i32;
         diagnostic_only.diagnostic_available = true;
         capabilities.push(diagnostic_only);
         let error = require_external_static_capabilities(&capabilities)
@@ -4177,9 +4898,9 @@ mod tests {
 
     #[test]
     fn br238_live_readiness_requires_all_three_live_semantic_families() {
-        let admitted = |operation: Operation| pb::Capability {
+        let admitted = |operation: ExternalOperation| ExternalCapability {
             operation: operation as i32,
-            repository_admission: AdmissionState::Admitted as i32,
+            repository_admission: ExternalAdmissionState::Admitted as i32,
             runtime_available: true,
             provider: "TEST_CODE_provider".to_string(),
             exact_scope: "TEST_CODE_scope".to_string(),
@@ -4187,9 +4908,9 @@ mod tests {
             diagnostic_available: false,
         };
         let mut capabilities = [
-            Operation::RealtimeQuotes,
-            Operation::OrderBooks,
-            Operation::T0Evidence,
+            ExternalOperation::RealtimeQuotes,
+            ExternalOperation::OrderBooks,
+            ExternalOperation::T0Evidence,
         ]
         .into_iter()
         .map(admitted)
@@ -4197,7 +4918,7 @@ mod tests {
         require_external_live_capabilities(&capabilities)
             .expect("all three admitted runtime live families are ready");
 
-        capabilities.retain(|row| row.operation != Operation::T0Evidence as i32);
+        capabilities.retain(|row| row.operation != ExternalOperation::T0Evidence as i32);
         let error = require_external_live_capabilities(&capabilities)
             .expect_err("missing T0 evidence authority must remain fail-closed");
         assert_eq!(error.reason_code(), "external_capability_missing");
@@ -4257,20 +4978,23 @@ mod tests {
     }
 
     fn br238_query(schema: &str, version: u32, data: serde_json::Value) -> QueryResult {
+        use crate::grpc_client::envelope::{
+            AcquisitionProvenance, CanonicalRecord, QueryAdmission,
+        };
         QueryResult {
-            admission: pb::AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE_OPENING_BATCH".to_owned(),
             complete: true,
             observed_at: "2026-08-17T01:30:00.250Z".to_owned(),
             source_at: "2026-08-17T01:30:00Z".to_owned(),
-            records: vec![pb::CanonicalPayload {
+            records: vec![CanonicalRecord {
                 schema: schema.to_owned(),
                 schema_version: version,
                 content_type: "application/json; charset=utf-8".to_owned(),
                 data: serde_json::to_vec(&data).expect("TEST_CODE canonical payload"),
             }],
-            source: "TEST_CODE_tdx".to_owned(),
+            provenance: AcquisitionProvenance::LocalWireSource("TEST_CODE_tdx".to_owned()),
             diagnostic_blocker: String::new(),
         }
     }
@@ -5072,7 +5796,10 @@ mod tests {
         reset_bridge();
 
         let bridge = bridge_for("SecurityMetadata").expect("bridge config");
-        let error = block_on(bridge.ensure_external_connected(Operation::SecurityMetadata))
+        let error =
+            block_on(bridge.ensure_external_connected(known_external_method(
+                ExternalOperation::SecurityMetadata,
+            )))
             .expect_err("identity must not fall back to the local bridge contract");
         assert_eq!(error.capability(), "GrpcExternalV1");
         assert_eq!(error.reason_code(), "external_bundle_unconfigured");

@@ -312,7 +312,7 @@ impl AuditDispatcher {
     }
 
     pub fn for_production() -> Result<Self, String> {
-        let base_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(PRODUCTION_AUDIT_DIR);
+        let base_dir = crate::production_root::production_root().join(PRODUCTION_AUDIT_DIR);
         let dispatcher = Self::new(base_dir);
         dispatcher.capability.as_ref().map_err(Clone::clone)?;
         Ok(dispatcher)
@@ -1154,10 +1154,11 @@ fn validate_audit_test_code(test_code: &str) -> Result<(), String> {
 
 fn classify_and_bind_audit_root(path: &Path) -> Result<PinnedAuditRoot, String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if path == manifest.join(PRODUCTION_AUDIT_DIR) {
+    let production = crate::production_root::production_root();
+    if path == production.join(PRODUCTION_AUDIT_DIR) {
         return bind_absolute_audit_root(
             path,
-            Some(&manifest.join("data")),
+            Some(&production.join("data")),
             "Production".to_owned(),
         );
     }

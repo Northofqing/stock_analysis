@@ -41,6 +41,78 @@ fn feishu_business_accepted(body: &serde_json::Value) -> Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("飞书响应 {field} 不是整数: {body}"))
 }
 
+fn feishu_page_marker(page: usize, total: usize) -> String {
+    format!("\n\n📄 ({page}/{total})")
+}
+
+fn split_feishu_content(
+    content: &str,
+    content_budget: usize,
+    max_bytes: usize,
+) -> Result<Vec<&str>> {
+    let mut chunks = Vec::new();
+    let mut remaining = content;
+
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(content_budget);
+        while end > 0 && !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            let scalar_bytes = remaining
+                .chars()
+                .next()
+                .map_or(0, |scalar| scalar.len_utf8());
+            return Err(anyhow::anyhow!(
+                "飞书正文预算 {max_bytes} 字节扣除分页标记后仅剩 \
+                 {content_budget} 字节，无法容纳 {scalar_bytes} 字节的 Unicode 字符"
+            ));
+        }
+
+        let (chunk, rest) = remaining.split_at(end);
+        chunks.push(chunk);
+        remaining = rest;
+    }
+
+    Ok(chunks)
+}
+
+fn plan_feishu_messages(content: &str, max_bytes: usize) -> Result<Vec<String>> {
+    if max_bytes == 0 {
+        return Err(anyhow::anyhow!("飞书正文预算必须大于 0 字节"));
+    }
+    if content.len() <= max_bytes {
+        return Ok(vec![content.to_owned()]);
+    }
+
+    let mut total_hint = 2;
+    loop {
+        let reserved_marker_bytes = feishu_page_marker(total_hint, total_hint).len();
+        let content_budget = max_bytes
+            .checked_sub(reserved_marker_bytes)
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("飞书正文预算 {max_bytes} 字节不足以容纳分页标记和消息内容")
+            })?;
+        let chunks = split_feishu_content(content, content_budget, max_bytes)?;
+        let total = chunks.len();
+        let required_marker_bytes = feishu_page_marker(total, total).len();
+
+        if required_marker_bytes <= reserved_marker_bytes {
+            return Ok(chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let marker = feishu_page_marker(index + 1, total);
+                    format!("{chunk}{marker}")
+                })
+                .collect());
+        }
+
+        total_hint = total;
+    }
+}
+
 impl NotificationService {
     /// 发送到飞书
     pub async fn send_to_feishu(&self, content: &str) -> Result<bool> {
@@ -52,6 +124,10 @@ impl NotificationService {
 
         let formatted = self.format_feishu_markdown(content);
         let max_bytes = self.config.feishu_max_bytes;
+
+        if max_bytes == 0 {
+            return Err(anyhow::anyhow!("飞书正文预算必须大于 0 字节"));
+        }
 
         if formatted.len() > max_bytes {
             info!("飞书消息内容超长，将分批发送");
@@ -113,21 +189,12 @@ impl NotificationService {
         content: &str,
         max_bytes: usize,
     ) -> Result<bool> {
-        let chunks = self.chunk_by_sections(content, max_bytes);
-        let total = chunks.len();
+        let messages = plan_feishu_messages(content, max_bytes)?;
+        let total = messages.len();
         let mut success = 0;
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let marker = if total > 1 {
-                format!("\n\n📄 ({}/{})", i + 1, total)
-            } else {
-                String::new()
-            };
-
-            if self
-                .send_feishu_message(url, &format!("{}{}", chunk, marker))
-                .await?
-            {
+        for (i, message) in messages.iter().enumerate() {
+            if self.send_feishu_message(url, message).await? {
                 success += 1;
             }
 

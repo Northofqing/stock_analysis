@@ -9,6 +9,45 @@ use chrono::NaiveDate;
 
 const CAPABILITY: &str = "R-04";
 
+pub(crate) fn dragon_tiger_request_hash(
+    trading_date: NaiveDate,
+    disclosure_limit: u32,
+    stock_limit: usize,
+) -> String {
+    acquisition_request_hash(
+        CAPABILITY,
+        format!("{trading_date}:{disclosure_limit}:{stock_limit}"),
+    )
+}
+
+pub(crate) fn restore_dragon_tiger_gateway_error(
+    stored: &super::review::StoredGatewayError,
+) -> Result<GatewayError, ()> {
+    if let Ok(error) = super::review::restore_gateway_error(stored) {
+        return Ok(error);
+    }
+    if matches!(stored.capability.as_str(), "DragonTiger" | "GrpcBridge")
+        && stored.provider.is_none()
+        && stored.audit_outcome == "partial"
+        && stored.reason_code == "invalid_evidence"
+        && !stored.retryable
+    {
+        return Ok(GatewayError::classified(
+            match stored.capability.as_str() {
+                "DragonTiger" => "DragonTiger",
+                "GrpcBridge" => "GrpcBridge",
+                _ => return Err(()),
+            },
+            None,
+            "partial",
+            "invalid_evidence",
+            false,
+            stored.message.clone(),
+        ));
+    }
+    Err(())
+}
+
 /// One exact source seat from a complete buy-five/sell-five disclosure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DragonTigerSeatReview {
@@ -58,10 +97,7 @@ impl DragonTigerGateway {
         disclosure_limit: u32,
         stock_limit: usize,
     ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
-        let request_hash = acquisition_request_hash(
-            CAPABILITY,
-            format!("{trading_date}:{disclosure_limit}:{stock_limit}"),
-        );
+        let request_hash = dragon_tiger_request_hash(trading_date, disclosure_limit, stock_limit);
         // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("DragonTiger") {
             Ok(bridge) => {

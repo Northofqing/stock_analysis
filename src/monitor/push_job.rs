@@ -13,6 +13,10 @@ mod shadow;
 pub(crate) use canonical::{canonical_digest, canonical_preimage, raw_digest, CanonicalValue};
 pub(crate) use identity::{namespace_value, subject_value};
 
+pub(crate) use context::{
+    build_single_user_local_chain_post_close_context, LocalChainPostCloseConfig,
+    LocalChainPostCloseContext, LocalChainPostCloseRunInput,
+};
 pub use context::{
     AuthenticatedOperatorRef, CalendarDate, CommandId, GitSha40, PhaseEpic, RunContext, ScheduleId,
     Trigger, TriggerView,

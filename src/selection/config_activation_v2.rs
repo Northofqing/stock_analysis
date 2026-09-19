@@ -181,7 +181,7 @@ impl From<crate::selection::schema_v2::SchemaV2Error> for ConfigActivationPrepar
 pub(crate) fn prepare_checked_in_config_activation(
     context: ConfigActivationPreparationContext,
 ) -> Result<PreparedConfigActivation, ConfigActivationPreparationError> {
-    prepare_config_activation_from_root(Path::new(env!("CARGO_MANIFEST_DIR")), context)
+    prepare_config_activation_from_root(crate::production_root::production_root(), context)
 }
 
 /// BR-183/193 release-gate materials: stages 1-4 of the full activation

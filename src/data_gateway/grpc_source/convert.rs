@@ -149,7 +149,7 @@ fn evidence_of(q: &QueryResult, capability: &'static str) -> Result<BatchEvidenc
     }
     let provider = parse_provider(&q.selected_provider)
         .map_err(|e| err(capability, format!("selected_provider 无法解析: {e}")))?;
-    if q.source.is_empty() {
+    if q.source().is_empty() {
         return Err(err(capability, "source 空 (服务端未回填证据链)"));
     }
     if q.batch_id.is_empty() {
@@ -157,7 +157,7 @@ fn evidence_of(q: &QueryResult, capability: &'static str) -> Result<BatchEvidenc
     }
     Ok(BatchEvidence {
         provider,
-        source: q.source.clone(),
+        source: q.source().to_owned(),
         source_at: if q.source_at.is_empty() {
             None
         } else {
@@ -1234,7 +1234,7 @@ fn validate_identity_source_freshness(
 }
 
 fn validate_identity_payload(
-    payload: &crate::grpc_client::pb::magic::market::v1::CanonicalPayload,
+    payload: &crate::grpc_client::envelope::CanonicalRecord,
     schema: &str,
     capability: &'static str,
 ) -> Result<(), GatewayError> {
@@ -3209,7 +3209,7 @@ fn external_instrument_news_with_range(
 }
 
 fn validate_external_news_payload(
-    payload: &crate::grpc_client::pb::magic::market::v1::CanonicalPayload,
+    payload: &crate::grpc_client::envelope::CanonicalRecord,
     capability: &'static str,
 ) -> Result<(), GatewayError> {
     if payload.schema != EXTERNAL_INSTRUMENT_NEWS_SCHEMA
@@ -3970,17 +3970,17 @@ pub fn semantic_search(
             ),
         ));
     }
-    if q.source != requested_provider.source() {
+    if q.source() != requested_provider.source() {
         return Err(err(
             capability,
             format!(
                 "response source {:?} differs from requested provider source {:?}",
-                q.source,
+                q.source(),
                 requested_provider.source()
             ),
         ));
     }
-    if q.source.is_empty() {
+    if q.source().is_empty() {
         return Err(err(capability, "source 空 (服务端未回填证据链)"));
     }
     if q.batch_id.is_empty() {
@@ -3988,7 +3988,7 @@ pub fn semantic_search(
     }
     let evidence = GeneralWebResearchBatchEvidence {
         provider,
-        source: q.source.clone(),
+        source: q.source().to_owned(),
         query: query.to_string(),
         // SemanticSearch is not a financial ProviderId route. Its delegate
         // serializes GeneralWebResearchEvidence.observed_at with to_rfc3339(),
@@ -4188,24 +4188,26 @@ pub fn outcome_daily_bars(q: &QueryResult) -> Result<RawOutcomeFetch, OutcomeTra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc_client::pb::magic::market::v1::{AdmissionState, CanonicalPayload};
+    use crate::grpc_client::envelope::{
+        AcquisitionProvenance, CanonicalRecord, QueryAdmission,
+    };
     use chrono::TimeZone;
 
     fn mk_q(data: &str, provider: &str, source: &str) -> QueryResult {
         QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: provider.to_string(),
             batch_id: "b-1".to_string(),
             complete: true,
             observed_at: "2026-08-15T10:00:00+08:00".to_string(),
             source_at: "2026-08-15T09:35:00+08:00".to_string(),
-            records: vec![CanonicalPayload {
+            records: vec![CanonicalRecord {
                 schema: "x".to_string(),
                 schema_version: 1,
                 content_type: "application/json; charset=utf-8".to_string(),
                 data: data.as_bytes().to_vec(),
             }],
-            source: source.to_string(),
+            provenance: AcquisitionProvenance::LocalWireSource(source.to_string()),
             diagnostic_blocker: String::new(),
         }
     }
@@ -4253,19 +4255,21 @@ mod tests {
         )
         .expect("TEST_CODE benchmark wire");
         QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: "Tdx".to_owned(),
             batch_id: "TEST_CODE_benchmark_batch".to_owned(),
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
-            records: vec![CanonicalPayload {
+            records: vec![CanonicalRecord {
                 schema: "market.benchmark_bars".to_owned(),
                 schema_version: 1,
                 content_type: "application/json; charset=utf-8".to_owned(),
                 data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark JSON"),
             }],
-            source: "TEST_CODE_magic-tdx-index-bars".to_owned(),
+            provenance: AcquisitionProvenance::LocalWireSource(
+                "TEST_CODE_magic-tdx-index-bars".to_owned(),
+            ),
             diagnostic_blocker: String::new(),
         }
     }
@@ -4821,7 +4825,7 @@ mod tests {
         assert_eq!(error.reason_code(), "invalid_evidence");
     }
 
-    fn external_identity_record(code: &str, listed_and_limit_fields: bool) -> CanonicalPayload {
+    fn external_identity_record(code: &str, listed_and_limit_fields: bool) -> CanonicalRecord {
         let mut data = serde_json::json!({
             "instrument": {
                 "exchange": "Shanghai",
@@ -4845,7 +4849,7 @@ mod tests {
                 serde_json::json!({"percent": null, "version": null}),
             );
         }
-        CanonicalPayload {
+        CanonicalRecord {
             schema: "magic.market.security_metadata".to_string(),
             schema_version: 1,
             content_type: "application/json; charset=utf-8".to_string(),
@@ -4855,7 +4859,7 @@ mod tests {
 
     fn external_identity_q() -> QueryResult {
         QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: "Tencent".to_string(),
             batch_id: "TEST_CODE_external_security_batch".to_string(),
             complete: false,
@@ -4865,7 +4869,9 @@ mod tests {
                 external_identity_record("TEST_CODE_SECURITY_001", true),
                 external_identity_record("TEST_CODE_SECURITY_002", false),
             ],
-            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            provenance: AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:TEST_CODE_market.local".to_string(),
+            ),
             diagnostic_blocker: String::new(),
         }
     }
@@ -4885,13 +4891,13 @@ mod tests {
 
     fn external_news_q() -> QueryResult {
         QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: "Sina".to_string(),
             batch_id: "TEST_CODE_external_news_batch".to_string(),
             complete: true,
             observed_at: "2026-08-17T10:00:01+08:00".to_string(),
             source_at: "2026-08-17T09:59:00+08:00".to_string(),
-            records: vec![CanonicalPayload {
+            records: vec![CanonicalRecord {
                 schema: "magic.market.news_item".to_string(),
                 schema_version: 2,
                 content_type: "application/json; charset=utf-8".to_string(),
@@ -4919,20 +4925,22 @@ mod tests {
                 }))
                 .expect("external news fixture JSON"),
             }],
-            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            provenance: AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:TEST_CODE_market.local".to_string(),
+            ),
             diagnostic_blocker: String::new(),
         }
     }
 
     fn external_global_news_v2_q() -> QueryResult {
         QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: QueryAdmission::Admitted,
             selected_provider: "Jin10".to_string(),
             batch_id: "TEST_CODE_external_global_news_batch".to_string(),
             complete: true,
             observed_at: "1787127606.533354000".to_string(),
             source_at: "2026-08-19 16:15:37".to_string(),
-            records: vec![CanonicalPayload {
+            records: vec![CanonicalRecord {
                 schema: "magic.market.news_item".to_string(),
                 schema_version: 2,
                 content_type: "application/json; charset=utf-8".to_string(),
@@ -4956,7 +4964,9 @@ mod tests {
                 }))
                 .expect("TEST_CODE external GlobalNews v2 JSON"),
             }],
-            source: "grpc-mtls:TEST_CODE_market.local".to_string(),
+            provenance: AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:TEST_CODE_market.local".to_string(),
+            ),
             diagnostic_blocker: String::new(),
         }
     }
@@ -5014,7 +5024,7 @@ mod tests {
         newer["url"] = Value::String("https://example.com/TEST_CODE_GLOBAL_NEWS_002".to_string());
         newer["published_at"] = Value::String("2026-08-19T16:15:38+08:00".to_string());
         newer["evidence"]["source_at"] = Value::String("2026-08-19 16:15:38".to_string());
-        response.records.push(CanonicalPayload {
+        response.records.push(CanonicalRecord {
             data: serde_json::to_vec(&newer).expect("TEST_CODE external GlobalNews v2 JSON"),
             ..response.records[0].clone()
         });
@@ -5864,7 +5874,7 @@ mod tests {
         assert!(realtime_quotes(&partial).is_err());
 
         let mut unadmitted = mk_q(data, "Tdx", "tdx");
-        unadmitted.admission = AdmissionState::Unadmitted;
+        unadmitted.admission = QueryAdmission::Unadmitted;
         assert!(realtime_quotes(&unadmitted).is_err());
 
         let mut diagnostic = mk_q(data, "Tdx", "tdx");
@@ -6686,7 +6696,7 @@ mod tests {
     #[test]
     fn br242_semantic_search_rejects_unadmitted_local_bridge_envelope() {
         let mut q = mk_q("[]", "Bocha", "bocha-general-web");
-        q.admission = AdmissionState::Unadmitted;
+        q.admission = QueryAdmission::Unadmitted;
 
         let error = semantic_search(&q, "TEST_CODE query", GeneralWebResearchProvider::Bocha, 10)
             .expect_err("SemanticSearch must reject a repository-unadmitted response");

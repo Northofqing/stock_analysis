@@ -2392,7 +2392,11 @@ impl DurableDeliveryCoordinator {
 
     pub fn open(config: CoordinatorConfig) -> Result<Self> {
         config.validate()?;
-        Self::open_at_repository_root(config, Path::new(env!("CARGO_MANIFEST_DIR")))
+        let root = crate::production_root::root_for_mode(matches!(
+            &config.environment,
+            super::model::StoreEnvironment::Test { .. }
+        ));
+        Self::open_at_repository_root(config, root)
     }
 
     fn open_at_repository_root(config: CoordinatorConfig, repository_root: &Path) -> Result<Self> {

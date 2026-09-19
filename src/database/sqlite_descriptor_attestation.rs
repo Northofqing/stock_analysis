@@ -236,6 +236,17 @@ impl ProcessDescriptorSnapshot {
         Ok(Self { descriptors })
     }
 
+    pub(super) fn identity_of(&self, descriptor: RawFd) -> Option<FileObjectIdentity> {
+        self.descriptors.get(&descriptor).copied()
+    }
+
+    pub(super) fn count_matching(&self, identity: FileObjectIdentity) -> usize {
+        self.descriptors
+            .values()
+            .filter(|&&candidate| candidate == identity)
+            .count()
+    }
+
     fn delta(&self, after: &Self) -> Vec<DescriptorCandidate> {
         after
             .descriptors
@@ -265,7 +276,6 @@ pub(super) struct RetainedSqliteHandle {
 }
 
 impl RetainedSqliteHandle {
-    #[cfg(test)]
     pub(super) fn descriptor(&self) -> RawFd {
         self.descriptor
     }
@@ -313,28 +323,68 @@ impl AttestedSqliteHandles {
         after: &ProcessDescriptorSnapshot,
         expected: &PinnedSqliteObjectSet,
     ) -> Result<Self, DescriptorAttestationError> {
-        Self::from_candidates(before.delta(after), expected, None)
+        Self::from_candidates(before.delta(after), expected, None, None)
     }
 
     /// SQLite opens a WAL-index SHM file only once per process. The first
     /// connection therefore supplies the process-shared retained SHM pin;
     /// later connections still must introduce exact main and WAL descriptors
     /// but may reuse that already-attested SHM descriptor.
+    ///
+    /// The unix VFS also parks the main descriptor of a closed connection on
+    /// its inode while other connections of the same inode still hold locks
+    /// (WAL connections always do) and hands that descriptor, most recently
+    /// parked first, to the next open of the inode. Such a reopen produces no
+    /// main delta at all. `reusable_main` lists descriptors this process has
+    /// itself released from attested connections, most recent first; the
+    /// first one still present with an unchanged main identity across the
+    /// open is the descriptor SQLite handed to this connection.
     pub(super) fn from_delta_with_shared_shm(
         before: &ProcessDescriptorSnapshot,
         after: &ProcessDescriptorSnapshot,
         expected: &PinnedSqliteObjectSet,
         shared_shm: Option<&File>,
+        reusable_main: &[RawFd],
     ) -> Result<Self, DescriptorAttestationError> {
-        Self::from_candidates(before.delta(after), expected, shared_shm)
+        let reused_main = reusable_main.iter().copied().find(|&descriptor| {
+            let expected_main = Some(expected.identity(SqliteObjectRole::Main));
+            before.identity_of(descriptor) == expected_main
+                && after.identity_of(descriptor) == expected_main
+        });
+        Self::from_candidates(before.delta(after), expected, shared_shm, reused_main)
+    }
+
+    /// Number of descriptors that newly carry the pinned main identity across
+    /// the open. Zero means SQLite reissued a parked descriptor.
+    pub(super) fn exact_main_candidates(
+        before: &ProcessDescriptorSnapshot,
+        after: &ProcessDescriptorSnapshot,
+        expected: &PinnedSqliteObjectSet,
+    ) -> usize {
+        let expected_main = expected.identity(SqliteObjectRole::Main);
+        before
+            .delta(after)
+            .iter()
+            .filter(|candidate| candidate.identity == expected_main)
+            .count()
     }
 
     fn from_candidates(
         candidates: Vec<DescriptorCandidate>,
         expected: &PinnedSqliteObjectSet,
         shared_shm: Option<&File>,
+        reused_main: Option<RawFd>,
     ) -> Result<Self, DescriptorAttestationError> {
-        let main = exact_candidate(SqliteObjectRole::Main, &candidates, expected)?;
+        let main = match exact_candidate(SqliteObjectRole::Main, &candidates, expected) {
+            Err(DescriptorAttestationError::Unavailable { .. }) if reused_main.is_some() => {
+                let descriptor = reused_main.expect("guarded by is_some");
+                RetainedSqliteHandle {
+                    descriptor,
+                    identity: FileObjectIdentity::from_descriptor(descriptor)?,
+                }
+            }
+            other => other?,
+        };
         let wal = exact_candidate(SqliteObjectRole::Wal, &candidates, expected)?;
         let shm = exact_or_process_shared_shm_candidate(&candidates, expected, shared_shm)?;
         Ok(Self { main, wal, shm })
@@ -349,7 +399,6 @@ impl AttestedSqliteHandles {
         self.shm.validate(SqliteObjectRole::Shm, expected.shm)
     }
 
-    #[cfg(test)]
     pub(super) fn main(&self) -> &RetainedSqliteHandle {
         &self.main
     }
@@ -654,6 +703,50 @@ mod tests {
             .expect_err("missing SQLite descriptors must fail closed");
 
         assert_eq!(error.code(), "descriptor_attestation_unavailable");
+    }
+
+    #[test]
+    fn released_main_descriptor_retained_across_open_is_reattested() {
+        let fixture = TestCodeDescriptorFixture::new();
+        let expected = fixture.expected();
+        let parked_main = File::open(fixture.root.join("TEST_CODE_selection.db"))
+            .expect("open TEST_CODE main standing in for a VFS-parked descriptor");
+        let before = ProcessDescriptorSnapshot::capture().expect("capture before snapshot");
+        let wal = File::open(fixture.root.join("TEST_CODE_selection.db-wal"))
+            .expect("open TEST_CODE wal duplicate");
+        let shm = File::open(fixture.root.join("TEST_CODE_selection.db-shm"))
+            .expect("open TEST_CODE shm duplicate");
+        let after = ProcessDescriptorSnapshot::capture().expect("capture after snapshot");
+
+        let without_release = AttestedSqliteHandles::from_delta_with_shared_shm(
+            &before,
+            &after,
+            &expected,
+            None,
+            &[],
+        )
+        .expect_err("no main delta and no released descriptor must fail closed");
+        assert_eq!(without_release.code(), "descriptor_attestation_unavailable");
+
+        let stale = File::open(fixture.root.join("TEST_CODE_selection.db-wal"))
+            .expect("open stale non-main descriptor");
+        let proof = AttestedSqliteHandles::from_delta_with_shared_shm(
+            &before,
+            &after,
+            &expected,
+            None,
+            &[stale.as_raw_fd(), parked_main.as_raw_fd()],
+        )
+        .expect("released main descriptor retained across the open is this connection's");
+        assert_eq!(proof.main().descriptor(), parked_main.as_raw_fd());
+        assert_eq!(proof.main().identity(), expected.main);
+        assert_eq!(proof.wal().descriptor(), wal.as_raw_fd());
+        assert_eq!(proof.shm().descriptor(), shm.as_raw_fd());
+        proof
+            .validate(&expected)
+            .expect("reattested TEST_CODE descriptors remain valid");
+        drop(stale);
+        drop((wal, shm, parked_main));
     }
 
     #[test]

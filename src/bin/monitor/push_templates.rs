@@ -65,15 +65,913 @@ fn closing_valuation_note() -> Option<String> {
     CLOSING_VALUATION_NOTE.get()?.lock().ok()?.clone()
 }
 
+pub(super) fn format_user_confirmed_account_note(
+    summary: &stock_analysis::database::user_account_summary::UserAccountSummary,
+) -> String {
+    let Ok(effective_at) = chrono::DateTime::parse_from_rfc3339(&summary.effective_at) else {
+        return "用户确认账户摘要不可用：快照时间格式无效".to_string();
+    };
+    let effective_date = effective_at.date_naive();
+    format!(
+        "用户确认账户快照（截至 {}，source={}）：快照仓位{:.1}%，{} 当日盈亏 {:+.2}（截至快照，非实时账户）",
+        summary.effective_at,
+        summary.source,
+        summary.position_ratio_pct,
+        effective_date,
+        summary.daily_pnl
+    )
+}
+
+pub(super) fn format_bound_closing_valuation_note(
+    account: Option<&stock_analysis::database::user_account_summary::UserAccountSummary>,
+    compared_position: Result<
+        Option<&stock_analysis::database::user_position_snapshot::UserPositionSnapshot>,
+        &str,
+    >,
+    rechecked_position: Result<
+        Option<&stock_analysis::database::user_position_snapshot::UserPositionSnapshot>,
+        &str,
+    >,
+    valuation: Result<
+        Option<&stock_analysis::database::closing_valuation::ClosingValuationView>,
+        &str,
+    >,
+    target_price_date: chrono::NaiveDate,
+) -> String {
+    let account_note = account.map_or_else(
+        || "用户确认账户摘要缺失".to_string(),
+        format_user_confirmed_account_note,
+    );
+
+    let position = match compared_position {
+        Err(_) => {
+            return format!(
+                "{account_note}；持仓快照读取失败，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(None) => return format!("{account_note}；持仓快照缺失，收盘估值不可用"),
+        Ok(Some(position)) => position,
+    };
+    let position_context = format!(
+        "用于本次核验的持仓快照（截至 {}，source={}）",
+        position.effective_at.to_rfc3339(),
+        position.source
+    );
+    if position.confirm_empty || position.items.is_empty() {
+        return format!("{account_note}；{position_context}；持仓快照为空，收盘估值不可用");
+    }
+    let rechecked_position = match rechecked_position {
+        Err(_) => {
+            return format!(
+                "{account_note}；{position_context}；持仓快照无法复核，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(None) => {
+            return format!(
+                "{account_note}；{position_context}；持仓在校验期间变化，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(Some(rechecked_position)) => rechecked_position,
+    };
+    if position.snapshot_row_id != rechecked_position.snapshot_row_id
+        || position.snapshot_id != rechecked_position.snapshot_id
+        || position.evidence_sha256 != rechecked_position.evidence_sha256
+    {
+        return format!(
+            "{account_note}；{position_context}；持仓在校验期间变化，收盘估值不可用，等待按当前持仓重算"
+        );
+    }
+
+    let valuation = match valuation {
+        Err(_) => {
+            return format!("{account_note}；{position_context}；收盘估值不可用（读取失败）")
+        }
+        Ok(None) => {
+            return format!(
+                "{account_note}；{position_context}；收盘估值不可用（目标日无记录）"
+            )
+        }
+        Ok(Some(valuation)) => valuation,
+    };
+    let (total_market_value, total_unrealized_pnl) =
+        match validated_valuation_totals(position, valuation, target_price_date) {
+            Ok(totals) => totals,
+            Err(BoundValuationError::WrongPriceDate) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值价格日 {} 与目标日 {target_price_date} 不符，等待按当前持仓重算",
+                    valuation.valuation.price_date
+                )
+            }
+            Err(BoundValuationError::IncompleteCoverage) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值覆盖不完整，等待按当前持仓重算"
+                )
+            }
+            Err(BoundValuationError::HoldingsMismatch) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值与当前持仓不匹配，等待按当前持仓重算"
+                )
+            }
+            Err(BoundValuationError::InvalidAmounts) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值金额不完整或无效，等待按当前持仓重算"
+                )
+            }
+        };
+
+    format!(
+        "{}；持仓快照（截至 {}，source={}）；收盘估值价格日 {}，目标日覆盖 {}/{}，provider={}，系统估值市值 {:.2}，系统按显示成本计算的未实现盈亏 {:+.2}",
+        account_note,
+        position.effective_at.to_rfc3339(),
+        position.source,
+        valuation.valuation.price_date,
+        valuation.valuation.covered,
+        valuation.valuation.total,
+        valuation.valuation.provider,
+        total_market_value,
+        total_unrealized_pnl,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundValuationError {
+    WrongPriceDate,
+    IncompleteCoverage,
+    HoldingsMismatch,
+    InvalidAmounts,
+}
+
+fn validated_valuation_totals(
+    position: &stock_analysis::database::user_position_snapshot::UserPositionSnapshot,
+    valuation: &stock_analysis::database::closing_valuation::ClosingValuationView,
+    target_price_date: chrono::NaiveDate,
+) -> Result<(f64, f64), BoundValuationError> {
+    let valuation = &valuation.valuation;
+    if valuation.price_date != target_price_date {
+        return Err(BoundValuationError::WrongPriceDate);
+    }
+    if valuation.total == 0
+        || valuation.covered != valuation.total
+        || valuation.total != valuation.items.len()
+    {
+        return Err(BoundValuationError::IncompleteCoverage);
+    }
+    if valuation.total != position.items.len() {
+        return Err(BoundValuationError::HoldingsMismatch);
+    }
+
+    let mut positions = std::collections::HashMap::with_capacity(position.items.len());
+    for item in &position.items {
+        if item.code.trim().is_empty()
+            || item.quantity == 0
+            || !item.cost_price.is_finite()
+            || item.cost_price <= 0.0
+            || positions.insert(item.code.as_str(), item).is_some()
+        {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+    }
+    let mut valuation_codes = std::collections::HashSet::with_capacity(valuation.items.len());
+    for item in &valuation.items {
+        if item.code.trim().is_empty()
+            || item.quantity == 0
+            || !item.cost_price.is_finite()
+            || item.cost_price <= 0.0
+            || !valuation_codes.insert(item.code.as_str())
+        {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+        let Some(position_item) = positions.get(item.code.as_str()) else {
+            return Err(BoundValuationError::HoldingsMismatch);
+        };
+        if item.quantity != position_item.quantity || item.cost_price != position_item.cost_price {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+        let (Some(close), Some(market_value), Some(unrealized_pnl)) =
+            (item.close, item.market_value, item.unrealized_pnl)
+        else {
+            return Err(BoundValuationError::InvalidAmounts);
+        };
+        if !close.is_finite()
+            || close <= 0.0
+            || !market_value.is_finite()
+            || market_value <= 0.0
+            || !unrealized_pnl.is_finite()
+        {
+            return Err(BoundValuationError::InvalidAmounts);
+        }
+    }
+
+    let (Some(total_market_value), Some(total_unrealized_pnl)) =
+        (valuation.total_market_value, valuation.total_unrealized_pnl)
+    else {
+        return Err(BoundValuationError::InvalidAmounts);
+    };
+    if !total_market_value.is_finite()
+        || total_market_value <= 0.0
+        || !total_unrealized_pnl.is_finite()
+    {
+        return Err(BoundValuationError::InvalidAmounts);
+    }
+    Ok((total_market_value, total_unrealized_pnl))
+}
+
 fn user_confirmed_account_note() -> Option<String> {
     stock_analysis::database::DatabaseManager::try_get()?;
     let summary = stock_analysis::database::user_account_summary::latest()
         .ok()
         .flatten()?;
-    Some(format!(
-        "用户确认持仓可用；仓位{:.1}%，日盈亏{:+.2}",
-        summary.position_ratio_pct, summary.daily_pnl
-    ))
+    Some(format_user_confirmed_account_note(&summary))
+}
+
+#[cfg(test)]
+mod tests_account_valuation_binding {
+    use super::format_bound_closing_valuation_note;
+    use chrono::{DateTime, NaiveDate};
+    use stock_analysis::database::closing_valuation::ClosingValuationView;
+    use stock_analysis::database::user_account_summary::UserAccountSummary;
+    use stock_analysis::database::user_position_snapshot::UserPositionSnapshot;
+    use stock_analysis::portfolio::closing_valuation::{
+        ClosingValuationItem, ClosingValuationView as PortfolioValuationView,
+    };
+    use stock_analysis::portfolio::user_position_snapshot::UserPositionItemInput;
+
+    #[test]
+    fn changed_quantity_hides_old_valuation_amounts() {
+        let position = UserPositionSnapshot {
+            snapshot_row_id: 1,
+            snapshot_id: "TEST_CODE_SNAPSHOT_V1".to_string(),
+            effective_at: DateTime::parse_from_rfc3339("2026-09-15T15:08:09+08:00")
+                .expect("position effective_at"),
+            confirmed_at: DateTime::parse_from_rfc3339("2026-09-15T15:09:00+08:00")
+                .expect("position confirmed_at"),
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "a".repeat(64),
+            items: vec![
+                UserPositionItemInput {
+                    code: "TEST_CODE_000001".to_string(),
+                    name: "TEST_NAME_000001".to_string(),
+                    quantity: 100,
+                    cost_price: 10.000_000_1,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000002".to_string(),
+                    name: "TEST_NAME_000002".to_string(),
+                    quantity: 200,
+                    cost_price: 12.34,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000003".to_string(),
+                    name: "TEST_NAME_000003".to_string(),
+                    quantity: 300,
+                    cost_price: 38.125,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000004".to_string(),
+                    name: "TEST_NAME_000004".to_string(),
+                    quantity: 40,
+                    cost_price: 210.75,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000005".to_string(),
+                    name: "TEST_NAME_000005".to_string(),
+                    quantity: 500,
+                    cost_price: 9.876_543_2,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000006".to_string(),
+                    name: "TEST_NAME_000006".to_string(),
+                    quantity: 6,
+                    cost_price: 1_500.125,
+                },
+            ],
+        };
+        let account = UserAccountSummary {
+            effective_at: "2026-09-14T18:50:00+08:00".to_string(),
+            total_assets: 10_000.0,
+            securities_market_value: 6_000.0,
+            available_cash: 4_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: -12.50,
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+        };
+        let target = NaiveDate::from_ymd_opt(2026, 9, 15).expect("target price date");
+        let valuation = ClosingValuationView {
+            persisted_run_row_id: 1,
+            run_id: "TEST_CODE_VALUATION_V1".to_string(),
+            valuation: PortfolioValuationView {
+                price_date: target,
+                provider: "TEST_CODE_VALIDATED_CLOSE".to_string(),
+                covered: 6,
+                total: 6,
+                items: vec![
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000001".to_string(),
+                        name: "TEST_NAME_000001".to_string(),
+                        quantity: 100,
+                        cost_price: 10.000_000_1,
+                        close: Some(11.0),
+                        market_value: Some(1_100.0),
+                        unrealized_pnl: Some(99.999_99),
+                        unrealized_return_pct: Some(9.999_999),
+                        daily_price_pnl: Some(10.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000002".to_string(),
+                        name: "TEST_NAME_000002".to_string(),
+                        quantity: 200,
+                        cost_price: 12.34,
+                        close: Some(13.0),
+                        market_value: Some(2_600.0),
+                        unrealized_pnl: Some(132.0),
+                        unrealized_return_pct: Some(5.348_46),
+                        daily_price_pnl: Some(20.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000003".to_string(),
+                        name: "TEST_NAME_000003".to_string(),
+                        quantity: 300,
+                        cost_price: 38.125,
+                        close: Some(39.0),
+                        market_value: Some(11_700.0),
+                        unrealized_pnl: Some(262.5),
+                        unrealized_return_pct: Some(2.295_082),
+                        daily_price_pnl: Some(30.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000004".to_string(),
+                        name: "TEST_NAME_000004".to_string(),
+                        quantity: 41,
+                        cost_price: 210.75,
+                        close: Some(220.0),
+                        market_value: Some(9_020.0),
+                        unrealized_pnl: Some(379.25),
+                        unrealized_return_pct: Some(4.389_087),
+                        daily_price_pnl: Some(41.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000005".to_string(),
+                        name: "TEST_NAME_000005".to_string(),
+                        quantity: 500,
+                        cost_price: 9.876_543_2,
+                        close: Some(10.0),
+                        market_value: Some(5_000.0),
+                        unrealized_pnl: Some(61.728_4),
+                        unrealized_return_pct: Some(1.25),
+                        daily_price_pnl: Some(50.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000006".to_string(),
+                        name: "TEST_NAME_000006".to_string(),
+                        quantity: 6,
+                        cost_price: 1_500.125,
+                        close: Some(1_520.0),
+                        market_value: Some(9_120.0),
+                        unrealized_pnl: Some(119.25),
+                        unrealized_return_pct: Some(1.324_889),
+                        daily_price_pnl: Some(60.0),
+                    },
+                ],
+                total_market_value: Some(654_321.98),
+                total_unrealized_pnl: Some(123_456.78),
+            },
+        };
+
+        let note = format_bound_closing_valuation_note(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+            target,
+        );
+
+        assert!(note.contains("与当前持仓不匹配"), "{note}");
+        assert!(note.contains("等待按当前持仓重算"), "{note}");
+        assert!(!note.contains("654321.98"), "{note}");
+        assert!(!note.contains("123456.78"), "{note}");
+    }
+
+    fn valid_account() -> UserAccountSummary {
+        UserAccountSummary {
+            effective_at: "2026-09-14T18:50:00+08:00".to_string(),
+            total_assets: 10_000.0,
+            securities_market_value: 6_000.0,
+            available_cash: 4_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: -12.50,
+            source: "TEST_CODE_ACCOUNT".to_string(),
+        }
+    }
+
+    fn valid_position() -> UserPositionSnapshot {
+        UserPositionSnapshot {
+            snapshot_row_id: 11,
+            snapshot_id: "TEST_CODE_VALID_POSITION".to_string(),
+            effective_at: DateTime::parse_from_rfc3339("2026-09-15T15:08:09+08:00")
+                .expect("position effective_at"),
+            confirmed_at: DateTime::parse_from_rfc3339("2026-09-15T15:09:00+08:00")
+                .expect("position confirmed_at"),
+            source: "TEST_CODE_POSITION".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "b".repeat(64),
+            items: vec![
+                UserPositionItemInput {
+                    code: "TEST_CODE_000011".to_string(),
+                    name: "TEST_NAME_000011".to_string(),
+                    quantity: 100,
+                    cost_price: 10.0,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000012".to_string(),
+                    name: "TEST_NAME_000012".to_string(),
+                    quantity: 200,
+                    cost_price: 20.0,
+                },
+            ],
+        }
+    }
+
+    fn valid_valuation() -> ClosingValuationView {
+        ClosingValuationView {
+            persisted_run_row_id: 12,
+            run_id: "TEST_CODE_VALID_VALUATION".to_string(),
+            valuation: PortfolioValuationView {
+                price_date: NaiveDate::from_ymd_opt(2026, 9, 15).expect("price date"),
+                provider: "TEST_CODE_VALIDATED_CLOSE".to_string(),
+                covered: 2,
+                total: 2,
+                items: vec![
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000011".to_string(),
+                        name: "TEST_NAME_000011".to_string(),
+                        quantity: 100,
+                        cost_price: 10.0,
+                        close: Some(11.0),
+                        market_value: Some(1_100.0),
+                        unrealized_pnl: Some(100.0),
+                        unrealized_return_pct: Some(10.0),
+                        daily_price_pnl: Some(10.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000012".to_string(),
+                        name: "TEST_NAME_000012".to_string(),
+                        quantity: 200,
+                        cost_price: 20.0,
+                        close: Some(19.0),
+                        market_value: Some(3_800.0),
+                        unrealized_pnl: Some(-200.0),
+                        unrealized_return_pct: Some(-5.0),
+                        daily_price_pnl: Some(-20.0),
+                    },
+                ],
+                total_market_value: Some(4_900.0),
+                total_unrealized_pnl: Some(-100.0),
+            },
+        }
+    }
+
+    fn render(
+        account: Option<&UserAccountSummary>,
+        position: Result<Option<&UserPositionSnapshot>, &str>,
+        rechecked: Result<Option<&UserPositionSnapshot>, &str>,
+        valuation: Result<Option<&ClosingValuationView>, &str>,
+    ) -> String {
+        format_bound_closing_valuation_note(
+            account,
+            position,
+            rechecked,
+            valuation,
+            NaiveDate::from_ymd_opt(2026, 9, 15).expect("target price date"),
+        )
+    }
+
+    fn assert_totals_hidden(note: &str) {
+        assert!(!note.contains("4900.00"), "{note}");
+        assert!(!note.contains("-100.00"), "{note}");
+    }
+
+    #[test]
+    fn costs_must_match_exactly_and_be_finite_positive() {
+        for (case, position_cost, valuation_cost) in [
+            ("sub_mill", 10.0, 10.000_000_1),
+            ("nan", f64::NAN, f64::NAN),
+            ("infinity", f64::INFINITY, f64::INFINITY),
+            ("zero", 0.0, 0.0),
+            ("negative", -1.0, -1.0),
+        ] {
+            let account = valid_account();
+            let mut position = valid_position();
+            position.items[0].cost_price = position_cost;
+            let rechecked = position.clone();
+            let mut valuation = valid_valuation();
+            valuation.valuation.items[0].cost_price = valuation_cost;
+
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&rechecked)),
+                Ok(Some(&valuation)),
+            );
+
+            assert!(note.contains("与当前持仓不匹配"), "case={case}: {note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn structure_coverage_and_price_date_rejections_hide_totals() {
+        let mut cases = Vec::new();
+
+        let mut missing = valid_valuation();
+        missing.valuation.items.pop();
+        missing.valuation.covered = 1;
+        missing.valuation.total = 1;
+        cases.push((
+            "missing_code",
+            valid_position(),
+            missing,
+            "与当前持仓不匹配",
+        ));
+
+        let mut extra = valid_valuation();
+        let mut extra_item = extra.valuation.items[0].clone();
+        extra_item.code = "TEST_CODE_000013".to_string();
+        extra.valuation.items.push(extra_item);
+        extra.valuation.covered = 3;
+        extra.valuation.total = 3;
+        cases.push((
+            "extra_code",
+            valid_position(),
+            extra,
+            "与当前持仓不匹配",
+        ));
+
+        let mut duplicate = valid_valuation();
+        duplicate.valuation.items[1].code = "TEST_CODE_000011".to_string();
+        cases.push((
+            "duplicate_valuation_code",
+            valid_position(),
+            duplicate,
+            "与当前持仓不匹配",
+        ));
+
+        let mut duplicate_position = valid_position();
+        duplicate_position.items[1].code = "TEST_CODE_000011".to_string();
+        cases.push((
+            "duplicate_position_code",
+            duplicate_position,
+            valid_valuation(),
+            "与当前持仓不匹配",
+        ));
+
+        let mut empty_code = valid_valuation();
+        empty_code.valuation.items[0].code.clear();
+        cases.push((
+            "empty_code",
+            valid_position(),
+            empty_code,
+            "与当前持仓不匹配",
+        ));
+
+        let mut whitespace_code = valid_valuation();
+        whitespace_code.valuation.items[0].code = "   ".to_string();
+        cases.push((
+            "whitespace_code",
+            valid_position(),
+            whitespace_code,
+            "与当前持仓不匹配",
+        ));
+
+        let mut zero_quantity = valid_valuation();
+        zero_quantity.valuation.items[0].quantity = 0;
+        cases.push((
+            "zero_quantity",
+            valid_position(),
+            zero_quantity,
+            "与当前持仓不匹配",
+        ));
+
+        let mut uncovered = valid_valuation();
+        uncovered.valuation.covered = 1;
+        cases.push((
+            "coverage",
+            valid_position(),
+            uncovered,
+            "覆盖不完整",
+        ));
+
+        let mut length_mismatch = valid_valuation();
+        length_mismatch.valuation.items.pop();
+        cases.push((
+            "valuation_length",
+            valid_position(),
+            length_mismatch,
+            "覆盖不完整",
+        ));
+
+        for day in [(2026, 9, 12), (2026, 9, 16)] {
+            let mut wrong_day = valid_valuation();
+            wrong_day.valuation.price_date =
+                NaiveDate::from_ymd_opt(day.0, day.1, day.2).expect("wrong price date");
+            cases.push((
+                "wrong_price_date",
+                valid_position(),
+                wrong_day,
+                "与目标日 2026-09-15 不符",
+            ));
+        }
+
+        for (case, position, valuation, expected_reason) in cases {
+            let account = valid_account();
+            let rechecked = position.clone();
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&rechecked)),
+                Ok(Some(&valuation)),
+            );
+            assert!(
+                note.contains(expected_reason),
+                "case={case}, expected={expected_reason}: {note}"
+            );
+            assert!(note.contains("等待按当前持仓重算"), "case={case}: {note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn quantity_and_price_date_rejections_keep_both_snapshot_dates() {
+        let account = valid_account();
+        let position = valid_position();
+
+        let mut quantity_changed = valid_valuation();
+        quantity_changed.valuation.items[0].quantity = 101;
+        let mut wrong_price_date = valid_valuation();
+        wrong_price_date.valuation.price_date =
+            NaiveDate::from_ymd_opt(2026, 9, 12).expect("wrong price date");
+
+        for valuation in [quantity_changed, wrong_price_date] {
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&position)),
+                Ok(Some(&valuation)),
+            );
+
+            assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+            assert!(note.contains("source=TEST_CODE_ACCOUNT"), "{note}");
+            assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+            assert!(note.contains("source=TEST_CODE_POSITION"), "{note}");
+            assert!(note.contains("用于本次核验的持仓快照"), "{note}");
+            assert!(note.contains("等待按当前持仓重算"), "{note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn missing_changed_or_unreadable_facts_hide_totals() {
+        let account = valid_account();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let notes = [
+            (
+                render(
+                    Some(&account),
+                    Err("TEST_CODE_POSITION_READ"),
+                    Ok(Some(&position)),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照读取失败",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(None),
+                    Ok(None),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照缺失",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Err("TEST_CODE_RECHECK_READ"),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照无法复核",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(None),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓在校验期间变化",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(Some(&position)),
+                    Ok(None),
+                ),
+                "收盘估值不可用（目标日无记录）",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(Some(&position)),
+                    Err("TEST_CODE_INVALID_STORED_DATE"),
+                ),
+                "收盘估值不可用（读取失败）",
+            ),
+        ];
+        for (note, expected_reason) in notes {
+            assert!(note.contains(expected_reason), "{note}");
+            assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+            assert!(!note.contains("TEST_CODE_POSITION_READ"), "{note}");
+            assert!(!note.contains("TEST_CODE_RECHECK_READ"), "{note}");
+            assert!(!note.contains("TEST_CODE_INVALID_STORED_DATE"), "{note}");
+            assert_totals_hidden(&note);
+        }
+
+        let mut empty = valid_position();
+        empty.confirm_empty = true;
+        empty.items.clear();
+        let empty_note = render(
+            Some(&account),
+            Ok(Some(&empty)),
+            Ok(Some(&empty)),
+            Ok(Some(&valuation)),
+        );
+        assert!(empty_note.contains("持仓快照为空"), "{empty_note}");
+        assert_totals_hidden(&empty_note);
+
+        for identity_field in ["row_id", "snapshot_id", "evidence"] {
+            let mut changed = position.clone();
+            match identity_field {
+                "row_id" => changed.snapshot_row_id += 1,
+                "snapshot_id" => changed.snapshot_id.push_str("_CHANGED"),
+                "evidence" => changed.evidence_sha256 = "c".repeat(64),
+                _ => unreachable!(),
+            }
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&changed)),
+                Ok(Some(&valuation)),
+            );
+            assert!(note.contains("持仓在校验期间变化"), "{note}");
+            assert!(note.contains("等待按当前持仓重算"), "{note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn missing_or_non_finite_valuation_amounts_are_rejected() {
+        let mut cases = Vec::new();
+
+        let mut close_missing = valid_valuation();
+        close_missing.valuation.items[0].close = None;
+        cases.push(("close_missing", close_missing));
+        let mut close_non_finite = valid_valuation();
+        close_non_finite.valuation.items[0].close = Some(f64::NAN);
+        cases.push(("close_non_finite", close_non_finite));
+        let mut close_non_positive = valid_valuation();
+        close_non_positive.valuation.items[0].close = Some(0.0);
+        cases.push(("close_non_positive", close_non_positive));
+
+        let mut market_missing = valid_valuation();
+        market_missing.valuation.items[0].market_value = None;
+        cases.push(("market_missing", market_missing));
+        let mut market_non_finite = valid_valuation();
+        market_non_finite.valuation.items[0].market_value = Some(f64::INFINITY);
+        cases.push(("market_non_finite", market_non_finite));
+        let mut market_non_positive = valid_valuation();
+        market_non_positive.valuation.items[0].market_value = Some(0.0);
+        cases.push(("market_non_positive", market_non_positive));
+
+        let mut pnl_missing = valid_valuation();
+        pnl_missing.valuation.items[0].unrealized_pnl = None;
+        cases.push(("pnl_missing", pnl_missing));
+        let mut pnl_non_finite = valid_valuation();
+        pnl_non_finite.valuation.items[0].unrealized_pnl = Some(f64::NAN);
+        cases.push(("pnl_non_finite", pnl_non_finite));
+
+        let mut total_market_missing = valid_valuation();
+        total_market_missing.valuation.total_market_value = None;
+        cases.push(("total_market_missing", total_market_missing));
+        let mut total_market_non_finite = valid_valuation();
+        total_market_non_finite.valuation.total_market_value = Some(f64::INFINITY);
+        cases.push(("total_market_non_finite", total_market_non_finite));
+        let mut total_market_non_positive = valid_valuation();
+        total_market_non_positive.valuation.total_market_value = Some(0.0);
+        cases.push(("total_market_non_positive", total_market_non_positive));
+
+        let mut total_pnl_missing = valid_valuation();
+        total_pnl_missing.valuation.total_unrealized_pnl = None;
+        cases.push(("total_pnl_missing", total_pnl_missing));
+        let mut total_pnl_non_finite = valid_valuation();
+        total_pnl_non_finite.valuation.total_unrealized_pnl = Some(f64::NAN);
+        cases.push(("total_pnl_non_finite", total_pnl_non_finite));
+
+        for (case, valuation) in cases {
+            let account = valid_account();
+            let position = valid_position();
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&position)),
+                Ok(Some(&valuation)),
+            );
+            assert!(
+                note.contains("金额不完整或无效"),
+                "case={case}: {note}"
+            );
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn valid_valuation_keeps_independent_dates_and_system_cost_basis() {
+        let account = valid_account();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let note = render(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+
+        assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+        assert!(note.contains("source=TEST_CODE_ACCOUNT"), "{note}");
+        assert!(note.contains("2026-09-14 当日盈亏 -12.50"), "{note}");
+        assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+        assert!(note.contains("source=TEST_CODE_POSITION"), "{note}");
+        assert!(note.contains("收盘估值价格日 2026-09-15"), "{note}");
+        assert!(note.contains("目标日覆盖 2/2"), "{note}");
+        assert!(note.contains("provider=TEST_CODE_VALIDATED_CLOSE"), "{note}");
+        assert!(note.contains("系统估值市值 4900.00"), "{note}");
+        assert!(
+            note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{note}"
+        );
+        assert!(!note.contains("昨日"), "{note}");
+        assert!(!note.contains("券商截图原值"), "{note}");
+    }
+
+    #[test]
+    fn invalid_account_date_does_not_hide_valid_position_valuation() {
+        let mut account = valid_account();
+        account.effective_at = "2026-09-14Tnot-rfc3339".to_string();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let note = render(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+
+        assert!(
+            note.contains("用户确认账户摘要不可用：快照时间格式无效"),
+            "{note}"
+        );
+        assert!(!note.contains("快照仓位60.0%"), "{note}");
+        assert!(!note.contains("当日盈亏 -12.50"), "{note}");
+        assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+        assert!(
+            note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{note}"
+        );
+
+        let missing_account_note = render(
+            None,
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+        assert!(
+            missing_account_note.contains("用户确认账户摘要缺失"),
+            "{missing_account_note}"
+        );
+        assert!(
+            missing_account_note.contains("2026-09-15T15:08:09+08:00"),
+            "{missing_account_note}"
+        );
+        assert!(
+            missing_account_note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{missing_account_note}"
+        );
+    }
 }
 
 trait BannerExternalNoteSource {
@@ -107,7 +1005,10 @@ fn account_status_note_from_values(
 }
 
 fn account_status_note() -> String {
-    let source = LiveBannerExternalNoteSource;
+    account_status_note_with_source(&LiveBannerExternalNoteSource)
+}
+
+fn account_status_note_with_source(source: &impl BannerExternalNoteSource) -> String {
     let closing_valuation = source.closing_valuation_note();
     let user_confirmed_account = closing_valuation
         .is_none()
@@ -261,19 +1162,21 @@ impl BannerCtx {
         &self,
         source: &impl BannerExternalNoteSource,
     ) -> CapturedBanner {
-        let closing_valuation = source.closing_valuation_note();
+        let closing_valuation = (!self.account_metrics_complete)
+            .then(|| source.closing_valuation_note())
+            .flatten();
         let user_confirmed_account = (!self.account_metrics_complete
             && closing_valuation.is_none())
         .then(|| source.user_confirmed_account_note())
         .flatten();
         let position = if !self.account_metrics_complete && self.total_pos.is_some() {
-            "仓位已确认".to_string()
+            "仓位批次不完整".to_string()
         } else {
             self.total_pos
                 .map_or_else(|| "仓位缺失".to_string(), |value| format!("仓位{value}成"))
         };
         let pnl = if !self.account_metrics_complete && self.today_pnl.is_some() {
-            "日盈亏已确认".to_string()
+            "日盈亏批次不完整".to_string()
         } else {
             self.today_pnl.map_or_else(
                 || "日盈亏缺失".to_string(),
@@ -294,18 +1197,18 @@ impl BannerCtx {
                 user_confirmed_account.as_deref(),
             )
         });
-        let rendered = match (self.data_missing_note.as_deref(), account_note) {
-            (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
-                format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
-            }
-            (_, Some(note)) => format!("{}\n[ℹ️ {}]", line1, note),
-            _ => line1,
-        };
-        CapturedBanner {
-            rendered: closing_valuation.map_or(rendered.clone(), |note| {
-                format!("{}\n[ℹ️ {}]", rendered, note)
-            }),
+        let mut rendered = line1;
+        if let Some(note) = self
+            .data_missing_note
+            .as_deref()
+            .filter(|note| !note.is_empty() && self.data_mode != DataMode::Full)
+        {
+            rendered.push_str(&format!("\n[⚠️ {note}: 本条不含承接判断]"));
         }
+        if let Some(note) = account_note {
+            rendered.push_str(&format!("\n[ℹ️ {note}]"));
+        }
+        CapturedBanner { rendered }
     }
 }
 
@@ -430,6 +1333,48 @@ fn append_data_mode_eta_footer(out: &mut String, eta: Option<&str>) {
     }
 }
 
+struct DataModeTextParams<'a> {
+    hhmm: &'a str,
+    old: Option<DataMode>,
+    new: DataMode,
+    missing_items: &'a str,
+    restrictions: &'a [String],
+    eta: Option<&'a str>,
+}
+
+fn render_data_mode_body(
+    params: &DataModeTextParams<'_>,
+    account_status: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
+        params.hhmm,
+        params.old.map(DataMode::label).unwrap_or("未建立"),
+        params.new.label(),
+        params.missing_items,
+    );
+    append_data_mode_restrictions(&mut out, params.restrictions);
+    if let Some(account_status) = account_status {
+        out.push_str(&format!("\n账户状态: {}", account_status));
+    }
+    append_data_mode_eta_footer(&mut out, params.eta);
+    out
+}
+
+fn render_data_mode_message(
+    banner: Option<&BannerCtx>,
+    params: &DataModeTextParams<'_>,
+    source: &impl BannerExternalNoteSource,
+) -> String {
+    if let Some(banner) = banner {
+        let mut text = format!("{}\n", banner.capture_with_external_notes(source).render());
+        text.push_str(&render_data_mode_body(params, None));
+        return text;
+    }
+    let account_status = account_status_note_with_source(source);
+    render_data_mode_body(params, Some(&account_status))
+}
+
 pub fn render_data_mode(
     hhmm: &str,
     old: Option<DataMode>,
@@ -438,17 +1383,18 @@ pub fn render_data_mode(
     restrictions: &[String],
     eta: Option<&str>,
 ) -> String {
-    let mut out = format!(
-        "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
-        hhmm,
-        old.map(DataMode::label).unwrap_or("未建立"),
-        new.label(),
-        missing_items,
-    );
-    append_data_mode_restrictions(&mut out, restrictions);
-    out.push_str(&format!("\n账户状态: {}", account_status_note()));
-    append_data_mode_eta_footer(&mut out, eta);
-    out
+    let account_status = account_status_note();
+    render_data_mode_body(
+        &DataModeTextParams {
+            hhmm,
+            old,
+            new,
+            missing_items,
+            restrictions,
+            eta,
+        },
+        Some(&account_status),
+    )
 }
 
 /// 持仓建议动作倾向
@@ -14850,22 +15796,20 @@ pub async fn push_data_mode_change(
         LibDM::Unsafe => DataMode::Unsafe,
     };
 
-    let mut text = if let Some(b) = banner {
-        format!("{}\n", b.render())
-    } else {
-        String::new()
-    };
-    let mode_text = match dispatch_reason {
-        DataModeDispatchReason::Transition => render_data_mode(
-            &hhmm,
-            prev_tmpl,
-            new_tmpl,
-            &missing_str,
-            &restrictions,
-            health.eta.as_deref(),
+    let text = match dispatch_reason {
+        DataModeDispatchReason::Transition => render_data_mode_message(
+            banner,
+            &DataModeTextParams {
+                hhmm: &hhmm,
+                old: prev_tmpl,
+                new: new_tmpl,
+                missing_items: &missing_str,
+                restrictions: &restrictions,
+                eta: health.eta.as_deref(),
+            },
+            &LiveBannerExternalNoteSource,
         ),
     };
-    text.push_str(&mode_text);
 
     // 2. dispatch (code="" 全局键; BR-116 uses the committed mode as exact dedup state)
     let outcome = match dispatch_reason {
@@ -17444,27 +18388,71 @@ mod tests {
     }
 
     #[test]
-    fn banner_capture_complete_account_does_not_read_user_summary() {
-        use std::cell::Cell;
+    fn banner_capture_unsafe_incomplete_preserves_dated_account_without_confirmation() {
+        struct HistoricalAccountNotes;
 
-        struct CountingExternalNotes<'a> {
-            user_summary_reads: &'a Cell<usize>,
-        }
-
-        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+        impl BannerExternalNoteSource for HistoricalAccountNotes {
             fn closing_valuation_note(&self) -> Option<String> {
                 None
             }
 
             fn user_confirmed_account_note(&self) -> Option<String> {
-                self.user_summary_reads
-                    .set(self.user_summary_reads.get() + 1);
-                None
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
             }
         }
 
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let captured = banner.capture_with_external_notes(&HistoricalAccountNotes);
+        let text = captured.render();
+
+        assert!(!text.contains("仓位已确认"), "false confirmation: {text}");
+        assert!(!text.contains("日盈亏已确认"), "false confirmation: {text}");
+        assert!(!text.contains("仓位7成"), "incomplete batch: {text}");
+        assert!(!text.contains("日盈亏-2.5%"), "incomplete batch: {text}");
+        assert!(text.contains("[⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]"), "{text}");
+        assert!(text.contains("2026-09-14T18:50:00+08:00"), "{text}");
+        assert!(text.contains("source=TEST_CODE_USER_CONFIRMED"), "{text}");
+        assert!(text.contains("2026-09-14 当日盈亏 -12.50"), "{text}");
+        assert_eq!(text.matches("用户确认账户快照").count(), 1, "{text}");
+        assert!(paper_risk_context_from_banner(&banner).is_err());
+    }
+
+    #[test]
+    fn banner_capture_complete_account_does_not_read_external_notes() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes<'a> {
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CODE_OLD_CLOSING".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some("TEST_CODE_OLD_ACCOUNT".to_string())
+            }
+        }
+
+        let closing_reads = Cell::new(0);
         let user_summary_reads = Cell::new(0);
         let captured = banner_normal().capture_with_external_notes(&CountingExternalNotes {
+            closing_reads: &closing_reads,
             user_summary_reads: &user_summary_reads,
         });
 
@@ -17472,6 +18460,9 @@ mod tests {
             captured.render(),
             "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"
         );
+        assert!(!captured.render().contains("TEST_CODE_OLD_CLOSING"));
+        assert!(!captured.render().contains("TEST_CODE_OLD_ACCOUNT"));
+        assert_eq!(closing_reads.get(), 0);
         assert_eq!(user_summary_reads.get(), 0);
     }
 
@@ -17515,8 +18506,7 @@ mod tests {
         assert_eq!(
             captured.render(),
             "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据Full]\n\
-             [ℹ️ 实时账户未接入；TEST_CLOSING]\n\
-             [ℹ️ TEST_CLOSING]"
+             [ℹ️ 实时账户未接入；TEST_CLOSING]"
         );
         assert_eq!(closing_reads.get(), 1);
         assert_eq!(user_summary_reads.get(), 0);
@@ -17565,7 +18555,7 @@ mod tests {
             data_missing_note: None,
         };
         let captured = banner.capture_with_external_notes(&source);
-        let expected = "[🔴 Frozen | 仓位已确认 | 日盈亏已确认 | 数据Full]\n\
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Full]\n\
                         [ℹ️ 实时账户未接入；FIRST_ACCOUNT_NOTE；收盘估值不可用]";
 
         assert_eq!(captured.render(), expected);
@@ -17585,7 +18575,7 @@ mod tests {
     }
 
     #[test]
-    fn banner_capture_preserves_full_degraded_and_unsafe_note_priority() {
+    fn banner_capture_preserves_warnings_and_account_dates() {
         struct FixedExternalNotes {
             closing: Option<String>,
             user_summary: Option<String>,
@@ -17633,7 +18623,8 @@ mod tests {
                     .render(),
                 format!(
                     "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据{}]\n\
-                     [⚠️ TEST_DATA_MISSING: 本条不含承接判断]",
+                     [⚠️ TEST_DATA_MISSING: 本条不含承接判断]\n\
+                     [ℹ️ 实时账户未接入；TEST_ACCOUNT；收盘估值不可用]",
                     data_mode.label()
                 )
             );
@@ -17650,7 +18641,8 @@ mod tests {
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
-        let text = banner.render();
+        let captured = banner.capture_with_external_notes(&NoBannerExternalNotes);
+        let text = captured.render();
         assert!(text.contains("仓位缺失"));
         assert!(text.contains("日盈亏缺失"));
     }
@@ -17665,9 +18657,12 @@ mod tests {
             data_mode: DataMode::Unsafe,
             data_missing_note: None,
         };
-        let text = banner.render();
-        assert!(text.contains("仓位已确认"));
-        assert!(text.contains("日盈亏已确认"));
+        let captured = banner.capture_with_external_notes(&NoBannerExternalNotes);
+        let text = captured.render();
+        assert!(text.contains("仓位批次不完整"));
+        assert!(text.contains("日盈亏批次不完整"));
+        assert!(!text.contains("仓位已确认"));
+        assert!(!text.contains("日盈亏已确认"));
         assert!(!text.contains("仓位7成"));
         assert!(!text.contains("日盈亏+2.5%"));
     }
@@ -17780,6 +18775,279 @@ mod tests {
     }
 
     // ---- T-02 数据模式 ----
+
+    #[test]
+    fn t02_message_keeps_one_dated_account_snapshot() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
+            }
+        }
+
+        let source = CountingExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "10:59",
+                old: Some(DataMode::Degraded),
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+            },
+            &source,
+        );
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+                        [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
+                        [ℹ️ 实时账户未接入；用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）；收盘估值不可用]\n\
+                        📡 数据状态变更（10:59）\n\
+                        Degraded → Unsafe\n\
+                        受影响: TEST_CODE_QUOTE_MISSING\n\
+                        输出限制:\n\
+                        · 禁出价格型建议\n\
+                        · 仅保留风险类推送\n\
+                        恢复预计: TEST_CODE_FRESHNESS_RECOVERY\n\
+                        辅助建议, 非下单指令";
+
+        assert_eq!(text.matches("用户确认账户快照").count(), 1, "{text}");
+        assert_eq!(text, expected);
+        assert!(!text.contains("账户状态:"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 1);
+    }
+
+    #[test]
+    fn t02_message_complete_account_does_not_read_historical_notes() {
+        use std::cell::Cell;
+
+        struct HistoricalExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for HistoricalExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CODE_OLD_CLOSING：收盘估值价格日 2026-09-14".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_OLD_ACCOUNT）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
+            }
+        }
+
+        let source = HistoricalExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: Some(5),
+            today_pnl: Some(0.3),
+            account_metrics_complete: true,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "11:00",
+                old: Some(DataMode::Unsafe),
+                new: DataMode::Full,
+                missing_items: "(无)",
+                restrictions: &[],
+                eta: None,
+            },
+            &source,
+        );
+
+        assert_eq!(
+            text,
+            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n\
+             📡 数据状态变更（11:00）\n\
+             Unsafe → Full\n\
+             受影响: (无)\n\
+             输出限制:\n\
+             辅助建议, 非下单指令"
+        );
+        assert!(!text.contains("TEST_CODE_OLD_CLOSING"), "{text}");
+        assert!(!text.contains("TEST_CODE_OLD_ACCOUNT"), "{text}");
+        assert!(!text.contains("账户状态:"), "{text}");
+        assert_eq!(source.closing_reads.get(), 0);
+        assert_eq!(source.user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn t02_message_without_banner_keeps_explicit_unavailable_account_status() {
+        use std::cell::Cell;
+
+        struct EmptyExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for EmptyExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                None
+            }
+        }
+
+        let source = EmptyExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let text = render_data_mode_message(
+            None,
+            &DataModeTextParams {
+                hhmm: "11:01",
+                old: None,
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: None,
+            },
+            &source,
+        );
+
+        assert_eq!(
+            text,
+            "📡 数据状态变更（11:01）\n\
+             未建立 → Unsafe\n\
+             受影响: TEST_CODE_QUOTE_MISSING\n\
+             输出限制:\n\
+             · 禁出价格型建议\n\
+             · 仅保留风险类推送\n\
+             账户状态: 实时账户未接入；用户确认账户摘要不可用\n\
+             辅助建议, 非下单指令"
+        );
+        assert_eq!(text.matches("账户状态:").count(), 1);
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 1);
+    }
+
+    #[test]
+    fn t02_message_captures_closing_note_once_and_stays_frozen() {
+        use std::cell::{Cell, RefCell};
+
+        struct MutableExternalNotes {
+            closing: RefCell<Option<String>>,
+            user_summary: RefCell<Option<String>>,
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for MutableExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                self.closing.borrow().clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                self.user_summary.borrow().clone()
+            }
+        }
+
+        let source = MutableExternalNotes {
+            closing: RefCell::new(Some(
+                "TEST_CODE_FIRST_CLOSING：收盘估值价格日 2026-09-15".to_string(),
+            )),
+            user_summary: RefCell::new(Some("TEST_CODE_FIRST_ACCOUNT".to_string())),
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "11:02",
+                old: Some(DataMode::Degraded),
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+            },
+            &source,
+        );
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+                        [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
+                        [ℹ️ 实时账户未接入；TEST_CODE_FIRST_CLOSING：收盘估值价格日 2026-09-15]\n\
+                        📡 数据状态变更（11:02）\n\
+                        Degraded → Unsafe\n\
+                        受影响: TEST_CODE_QUOTE_MISSING\n\
+                        输出限制:\n\
+                        · 禁出价格型建议\n\
+                        · 仅保留风险类推送\n\
+                        恢复预计: TEST_CODE_FRESHNESS_RECOVERY\n\
+                        辅助建议, 非下单指令";
+
+        assert_eq!(text, expected);
+        assert_eq!(text.matches("TEST_CODE_FIRST_CLOSING").count(), 1);
+        assert!(!text.contains("TEST_CODE_FIRST_ACCOUNT"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 0);
+
+        source
+            .closing
+            .replace(Some("TEST_CODE_SECOND_CLOSING".to_string()));
+        source
+            .user_summary
+            .replace(Some("TEST_CODE_SECOND_ACCOUNT".to_string()));
+
+        assert_eq!(text, expected);
+        assert!(!text.contains("TEST_CODE_SECOND_CLOSING"), "{text}");
+        assert!(!text.contains("TEST_CODE_SECOND_ACCOUNT"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 0);
+    }
 
     #[test]
     fn t02_data_mode_full_to_degraded() {

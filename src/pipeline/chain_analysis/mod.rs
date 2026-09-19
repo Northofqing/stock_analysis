@@ -18,6 +18,8 @@ pub mod preparation;
 #[cfg(test)]
 mod preparation_tests;
 // 兄弟模块 fetchers.rs 内 fetch_* 用 pub(super) 暴露, 这里 use 让 mod.rs 直接调用
+pub(crate) use fetchers::format_membership_fetch_failure;
+pub(crate) use fetchers::map_lhb_reviews;
 use fetchers::{fetch_board_code_map, fetch_concepts_cached, fetch_laggard_candidates};
 
 use crate::analyzer::AgentMode;
@@ -124,10 +126,12 @@ const GENERIC_BOARD_PATTERNS: &[&str] = &[
 
 /// 主线簇判定的最小涨停家数（可用 CHAIN_MIN_CLUSTER 环境变量覆盖）。
 fn min_cluster_size() -> usize {
-    std::env::var("CHAIN_MIN_CLUSTER")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
+    let configured = std::env::var("CHAIN_MIN_CLUSTER").ok();
+    resolve_min_cluster_size(configured.as_deref())
+}
+
+pub(super) fn resolve_min_cluster_size(configured: Option<&str>) -> usize {
+    configured.and_then(|value| value.parse().ok()).unwrap_or(3)
 }
 
 /// 主线分级阈值：涨停数 >= TIER1_MIN 为深度分析，TIER2_MIN..TIER1_MIN 为简化分析，其余汇入速览。
@@ -365,31 +369,97 @@ fn candidate_supplement_summary(
     }
 }
 
-fn resolve_cluster_board_code<'a>(
+struct BoardCodeResolution<'a> {
+    preferred: &'a String,
+    accepted: Vec<&'a String>,
+}
+
+impl BoardCodeResolution<'_> {
+    fn accepts(&self, code: &str) -> bool {
+        self.accepted
+            .iter()
+            .any(|candidate| candidate.as_str() == code)
+    }
+}
+
+fn one_board_code(code: &String) -> BoardCodeResolution<'_> {
+    BoardCodeResolution {
+        preferred: code,
+        accepted: vec![code],
+    }
+}
+
+fn matching_board_codes<'a>(
+    board_map: &'a HashMap<String, String>,
+    mut matches: impl FnMut(&str) -> bool,
+) -> Option<BoardCodeResolution<'a>> {
+    let accepted = board_map
+        .iter()
+        .filter_map(|(name, code)| matches(name).then_some(code))
+        .collect::<Vec<_>>();
+    accepted
+        .first()
+        .copied()
+        .map(|preferred| BoardCodeResolution {
+            preferred,
+            accepted,
+        })
+}
+
+fn resolve_cluster_board_codes<'a>(
     cluster: &ChainCluster,
     board_map: &'a HashMap<String, String>,
-) -> Result<&'a str> {
+) -> Result<BoardCodeResolution<'a>> {
     let concept_head = cluster
         .concept
         .split_once('(')
         .map(|(head, _)| head)
         .unwrap_or(&cluster.concept);
-    board_map
-        .get(cluster.concept.as_str())
-        .or_else(|| board_map.get(concept_head))
-        .or_else(|| {
-            board_map.iter().find_map(|(name, code)| {
-                if name.contains(concept_head) || concept_head.contains(name.as_str()) {
-                    Some(code)
-                } else {
-                    None
-                }
-            })
-        })
-        .or_else(|| resolve_concept_alias(&cluster.concept, board_map))
-        .map(String::as_str)
+    if let Some(code) = board_map.get(cluster.concept.as_str()) {
+        return Ok(one_board_code(code));
+    }
+    if let Some(code) = board_map.get(concept_head) {
+        return Ok(one_board_code(code));
+    }
+    if let Some(resolution) = matching_board_codes(board_map, |name| {
+        name.contains(concept_head) || concept_head.contains(name)
+    }) {
+        return Ok(resolution);
+    }
+    resolve_concept_alias_codes(&cluster.concept, board_map)
         .ok_or_else(|| anyhow::anyhow!("产业链主线「{}」未匹配到概念板块代码", cluster.concept))
 }
+
+fn resolve_cluster_board_code<'a>(
+    cluster: &ChainCluster,
+    board_map: &'a HashMap<String, String>,
+) -> Result<&'a str> {
+    resolve_cluster_board_codes(cluster, board_map).map(|value| value.preferred.as_str())
+}
+
+pub(crate) fn resolve_cluster_board_code_owned(
+    cluster: &ChainCluster,
+    board_map: &HashMap<String, String>,
+) -> Result<String> {
+    resolve_cluster_board_code(cluster, board_map).map(str::to_owned)
+}
+
+pub(crate) fn stored_cluster_board_selection_is_valid(
+    cluster: &ChainCluster,
+    board_map: &HashMap<String, String>,
+    selected_code: Option<&str>,
+) -> bool {
+    match (
+        resolve_cluster_board_codes(cluster, board_map),
+        selected_code,
+    ) {
+        (Ok(resolution), Some(code)) => resolution.accepts(code),
+        (Err(_), None) => true,
+        _ => false,
+    }
+}
+
+pub(crate) use fetchers::fold_board_directory_kind;
 
 /// 入口：对当日涨停池做产业链联动分析，返回完整 Markdown 报告。
 pub async fn run_chain_analysis(
@@ -425,7 +495,7 @@ pub(super) fn is_generic_board(name: &str) -> bool {
 ///
 /// 贪心去重：按家数降序选簇，若某概念成员与已选簇重合度 >= 70% 则并入别名。
 /// 返回 (主线簇列表, 未进入任何簇的孤立涨停)。
-fn cluster_by_concept(
+pub(super) fn cluster_by_concept(
     stocks: &[TopStock],
     concepts: &HashMap<String, Vec<String>>,
     min_size: usize,
@@ -523,10 +593,18 @@ fn cluster_by_concept(
 // ============================================================================
 
 /// 概念名 → 东财板块名的同义词/简称映射。
+#[cfg(test)]
 fn resolve_concept_alias<'a>(
     concept: &str,
     board_map: &'a HashMap<String, String>,
 ) -> Option<&'a String> {
+    resolve_concept_alias_codes(concept, board_map).map(|value| value.preferred)
+}
+
+fn resolve_concept_alias_codes<'a>(
+    concept: &str,
+    board_map: &'a HashMap<String, String>,
+) -> Option<BoardCodeResolution<'a>> {
     let concept_clean = concept.trim();
     // 常见同义词映射
     let aliases: &[&str] = match concept_clean {
@@ -573,16 +651,12 @@ fn resolve_concept_alias<'a>(
     };
     for alias in aliases {
         if let Some(code) = board_map.get(*alias) {
-            return Some(code);
+            return Some(one_board_code(code));
         }
     }
     // 最后尝试子串匹配
-    board_map.iter().find_map(|(k, v)| {
-        if k.contains(concept_clean) || concept_clean.contains(k.as_str()) {
-            Some(v)
-        } else {
-            None
-        }
+    matching_board_codes(board_map, |name| {
+        name.contains(concept_clean) || concept_clean.contains(name)
     })
 }
 
@@ -948,7 +1022,7 @@ async fn synthesize_overview(
     position_diags: &[PositionDiag],
     date: &str,
     after_market_section: &str,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let mut ctx = String::new();
     for ((concept, analysis), cluster) in sections.iter().zip(clusters.iter()) {
         ctx.push_str(&format!(
@@ -1041,11 +1115,18 @@ async fn synthesize_overview(
         .call_api_mode(&prompt, CHAIN_SYSTEM_PROMPT, AgentMode::Quick)
         .await
     {
-        Ok(text) if !text.trim().is_empty() => Some(text),
-        Ok(_) => None,
+        Ok(text) if !text.trim().is_empty() => Ok(Some(text)),
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<preparation::PreparationStop>()
+                .is_some() =>
+        {
+            Err(error)
+        }
         Err(_) => {
             warn!("[产业链] 全景研判失败，保留缺失分析");
-            None
+            Ok(None)
         }
     }
 }
@@ -1539,6 +1620,90 @@ mod tests {
         let map: HashMap<String, String> = HashMap::new();
         let result = resolve_concept_alias("不存在的概念", &map);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn stored_board_selection_preserves_resolution_priority_and_ambiguity() {
+        let cluster = |concept: &str| ChainCluster {
+            concept: concept.to_string(),
+            aliases: Vec::new(),
+            stocks: Vec::new(),
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+
+        let exact_cluster = cluster("光刻机(胶)");
+        let exact = HashMap::from([
+            ("光刻机(胶)".to_string(), "BK_EXACT".to_string()),
+            ("光刻机".to_string(), "BK_HEAD".to_string()),
+        ]);
+        assert_eq!(
+            resolve_cluster_board_code_owned(&exact_cluster, &exact).unwrap(),
+            "BK_EXACT"
+        );
+        assert!(stored_cluster_board_selection_is_valid(
+            &exact_cluster,
+            &exact,
+            Some("BK_EXACT")
+        ));
+        assert!(!stored_cluster_board_selection_is_valid(
+            &exact_cluster,
+            &exact,
+            Some("BK_HEAD")
+        ));
+
+        let head = HashMap::from([("光刻机".to_string(), "BK_HEAD".to_string())]);
+        assert!(stored_cluster_board_selection_is_valid(
+            &exact_cluster,
+            &head,
+            Some("BK_HEAD")
+        ));
+
+        let ambiguous_cluster = cluster("机器人");
+        let ambiguous = HashMap::from([
+            ("工业机器人".to_string(), "BK_INDUSTRIAL".to_string()),
+            ("服务机器人".to_string(), "BK_SERVICE".to_string()),
+        ]);
+        let preferred = resolve_cluster_board_code_owned(&ambiguous_cluster, &ambiguous).unwrap();
+        assert!(matches!(preferred.as_str(), "BK_INDUSTRIAL" | "BK_SERVICE"));
+        for code in ["BK_INDUSTRIAL", "BK_SERVICE"] {
+            assert!(stored_cluster_board_selection_is_valid(
+                &ambiguous_cluster,
+                &ambiguous,
+                Some(code)
+            ));
+        }
+
+        let alias_cluster = cluster("电池技术");
+        let aliases = HashMap::from([
+            ("固态电池".to_string(), "BK_SOLID".to_string()),
+            ("锂电池".to_string(), "BK_LITHIUM".to_string()),
+        ]);
+        assert!(stored_cluster_board_selection_is_valid(
+            &alias_cluster,
+            &aliases,
+            Some("BK_SOLID")
+        ));
+        assert!(!stored_cluster_board_selection_is_valid(
+            &alias_cluster,
+            &aliases,
+            Some("BK_LITHIUM")
+        ));
+
+        let missing = HashMap::new();
+        assert!(stored_cluster_board_selection_is_valid(
+            &cluster("不存在的概念"),
+            &missing,
+            None
+        ));
+        assert!(!stored_cluster_board_selection_is_valid(
+            &cluster("不存在的概念"),
+            &missing,
+            Some("BK_FAKE")
+        ));
     }
 
     #[test]
@@ -2384,6 +2549,7 @@ mod tests {
             "盘后真实催化",
         )
         .await
+        .expect("ordinary model failure stays optional")
         .is_none());
     }
 
@@ -2437,6 +2603,7 @@ mod tests {
             "",
         )
         .await
+        .expect("ordinary model failure stays optional")
         .is_none());
     }
 }

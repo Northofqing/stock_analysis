@@ -14,7 +14,6 @@
 //! 都会使 expected_config_hash 失效, 需重新 prepare + 人工 review。
 
 use chrono::{DateTime, Utc};
-use std::path::Path;
 
 fn main() {
     // BR-159: TDX gateway 审计需要 core 数据库 (gateway_result 落库)。
@@ -68,7 +67,7 @@ fn cmd_seal_board(args: &[String]) -> i32 {
         return 2;
     }
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = stock_analysis::production_root::production_root();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let concept = match runtime.block_on(fetch_first(kind_concept())) {
         Ok(fact) => fact,
@@ -148,7 +147,7 @@ fn cmd_print_activation(args: &[String]) -> i32 {
         eprintln!("effective_from 必须在未来 (门未生效前不能提前激活): {effective_from}");
         return 2;
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = stock_analysis::production_root::production_root();
     // 生成激活文件用 stages 1-3 (config hash) — 文件不能要求自身已存在。
     match stock_analysis::selection::config_activation_v2::prepare_activation_config_hash(root, now)
     {

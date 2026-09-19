@@ -1604,7 +1604,10 @@ impl PinnedPushLogWriter {
                 namespace: namespace.label(),
             });
         }
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = stock_analysis::production_root::root_for_mode(matches!(
+            namespace,
+            crate::durable_delivery_runtime::RuntimeNamespace::Test { .. }
+        ));
         let (namespace_label, relative_root) = match namespace {
             crate::durable_delivery_runtime::RuntimeNamespace::Production => (
                 "production".to_owned(),

@@ -1,6 +1,6 @@
 use super::preparation::{
-    prepare_chain_analysis_with_io, ChainPreparationIo, PositionInput, SourceObservation,
-    SourceStatus,
+    prepare_chain_analysis_with_io, ChainPreparationIo, PositionInput, PreparationStop,
+    SourceObservation, SourceStatus,
 };
 use crate::data_gateway::{BatchEvidence, GatewayBatch};
 use crate::market_data::TopStock;
@@ -993,6 +993,19 @@ struct SyntheticIo {
     candidate_batch: Option<GatewayBatch<TopStock>>,
 }
 
+#[derive(Debug)]
+struct SyntheticStorageCause {
+    operation: &'static str,
+}
+
+impl std::fmt::Display for SyntheticStorageCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("synthetic storage failure")
+    }
+}
+
+impl std::error::Error for SyntheticStorageCause {}
+
 #[async_trait::async_trait(?Send)]
 impl ChainPreparationIo for SyntheticIo {
     async fn concepts(&mut self, codes: &[String]) -> anyhow::Result<HashMap<String, Vec<String>>> {
@@ -1047,6 +1060,15 @@ impl ChainPreparationIo for SyntheticIo {
         &mut self,
     ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
         self.events.push("board_codes");
+        if self.fail_at == Some("board_stop") {
+            return Err(anyhow::Error::new(SyntheticStorageCause {
+                operation: "candidate directory",
+            })
+            .context(PreparationStop::AuthorityRejected {
+                intent_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            }));
+        }
         if self.candidate_batch.is_some() {
             return Ok((
                 HashMap::from([("TEST_CODE_产业".into(), "TEST_CODE_BK".into())]),
@@ -1069,6 +1091,18 @@ impl ChainPreparationIo for SyntheticIo {
         excluded: &std::collections::HashSet<String>,
     ) -> anyhow::Result<GatewayBatch<TopStock>> {
         self.events.push("candidates");
+        if self.fail_at == Some("candidate_stop") {
+            return Err(anyhow::Error::new(SyntheticStorageCause {
+                operation: "candidate request",
+            })
+            .context(PreparationStop::AuthorityRejected {
+                intent_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+            }));
+        }
+        if self.fail_at == Some("candidate_error") {
+            anyhow::bail!("TEST_CODE_普通候选失败");
+        }
         assert_eq!(board, "TEST_CODE_BK");
         assert_eq!(excluded.len(), 4);
         assert!(excluded.contains("TEST_CODE_A"));
@@ -1265,6 +1299,89 @@ async fn core_failure_retains_stage_and_prior_observations_without_continuing_ef
     }
 }
 
+#[tokio::test]
+async fn candidate_typed_stops_propagate_while_ordinary_errors_remain_unavailable() {
+    for (fail_at, expected_events, operation) in [
+        (
+            "board_stop",
+            vec!["concepts", "chain_daily", "board_codes"],
+            "candidate directory",
+        ),
+        (
+            "candidate_stop",
+            vec!["concepts", "chain_daily", "board_codes", "candidates"],
+            "candidate request",
+        ),
+    ] {
+        let mut io = SyntheticIo {
+            events: Vec::new(),
+            fail_at: Some(fail_at),
+            candidate_batch: Some(GatewayBatch::VerifiedEmpty(candidate_evidence(
+                "TEST_CODE_候选来源",
+                "TEST_CODE_CANDIDATE_STOP",
+                None,
+            ))),
+        };
+        let error = prepare_chain_analysis_with_io(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+            synthetic_input(),
+            Some("TEST_CODE_候选停止宏观".into()),
+            &mut io,
+        )
+        .await
+        .expect_err("typed candidate stop must abort preparation");
+        assert!(matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { .. })
+        ));
+        assert!(matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation: actual }) if *actual == operation
+        ));
+        assert_eq!(io.events, expected_events);
+        assert!(!error.to_string().contains(operation));
+    }
+
+    let mut io = SyntheticIo {
+        events: Vec::new(),
+        fail_at: Some("candidate_error"),
+        candidate_batch: Some(GatewayBatch::VerifiedEmpty(candidate_evidence(
+            "TEST_CODE_候选来源",
+            "TEST_CODE_CANDIDATE_ERROR",
+            None,
+        ))),
+    };
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        synthetic_input(),
+        Some("TEST_CODE_普通候选错误宏观".into()),
+        &mut io,
+    )
+    .await
+    .expect("ordinary candidate errors retain the existing optional policy");
+    assert_eq!(
+        prepared.candidate_sources()["TEST_CODE_产业"].status(),
+        &SourceStatus::Unavailable
+    );
+    assert!(prepared.candidate_sources()["TEST_CODE_产业"]
+        .reason()
+        .unwrap()
+        .contains("TEST_CODE_普通候选失败"));
+    assert_eq!(
+        io.events,
+        vec![
+            "concepts",
+            "chain_daily",
+            "board_codes",
+            "candidates",
+            "positions",
+            "concepts",
+            "lhb",
+            "model_availability",
+        ]
+    );
+}
+
 fn candidate_evidence(source: &str, batch_id: &str, source_at: Option<&str>) -> BatchEvidence {
     BatchEvidence {
         provider: crate::market_domain::ProviderId::Custom,
@@ -1411,3 +1528,1321 @@ async fn empty_preparation_fixes_business_date_and_original_report_without_exter
         Some(" TEST_CODE_调用方宏观上下文\n")
     );
 }
+
+#[tokio::test]
+async fn macro_typed_stop_aborts_before_models_and_retains_prior_observations() {
+    use super::preparation::{PreparationFailure, PreparationStage};
+
+    const INTENT: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    struct MacroStopIo {
+        base: SyntheticIo,
+        macro_calls: usize,
+        model_available_calls: usize,
+        model_calls: std::cell::Cell<usize>,
+        search_available_calls: usize,
+        search_calls: usize,
+        clock_calls: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for MacroStopIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.base.concepts(codes).await
+        }
+
+        fn min_cluster_size(&mut self) -> usize {
+            self.base.min_cluster_size()
+        }
+
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.base.persist_clusters(date, rows).await
+        }
+
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.base.board_codes().await
+        }
+
+        async fn candidates(
+            &mut self,
+            _board: &str,
+            _excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.base.events.push("candidates");
+            Ok(GatewayBatch::VerifiedEmpty(candidate_evidence(
+                "TEST_CODE_宏观停止候选来源",
+                "TEST_CODE_MACRO_STOP_CANDIDATE",
+                None,
+            )))
+        }
+
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            self.base.positions().await
+        }
+
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.base.lhb().await
+        }
+
+        async fn macro_search(&mut self) -> anyhow::Result<String> {
+            self.base.events.push("macro_search");
+            self.macro_calls += 1;
+            Err(anyhow::Error::new(SyntheticStorageCause {
+                operation: "macro checkpoint",
+            })
+            .context(PreparationStop::AuthorityRejected {
+                intent_id: INTENT.to_owned(),
+            }))
+        }
+
+        fn model_available(&mut self) -> bool {
+            self.model_available_calls += 1;
+            true
+        }
+
+        async fn model(
+            &self,
+            prompt: &str,
+            system: &str,
+            _mode: crate::analyzer::AgentMode,
+        ) -> anyhow::Result<String> {
+            assert!(!prompt.is_empty());
+            assert!(!system.is_empty());
+            self.model_calls.set(self.model_calls.get() + 1);
+            Ok("TEST_CODE_受控模型非空合成文本".to_owned())
+        }
+
+        fn search_available(&mut self) -> bool {
+            self.search_available_calls += 1;
+            false
+        }
+
+        async fn search_topic(
+            &mut self,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<crate::search_service::SearchResult>> {
+            self.search_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.clock_calls += 1;
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T16:00:00+08:00").unwrap()
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let input = synthetic_input();
+    assert_eq!(input.len(), 4);
+    let mut io = MacroStopIo {
+        base: SyntheticIo {
+            events: Vec::new(),
+            fail_at: None,
+            candidate_batch: None,
+        },
+        macro_calls: 0,
+        model_available_calls: 0,
+        model_calls: std::cell::Cell::new(0),
+        search_available_calls: 0,
+        search_calls: 0,
+        clock_calls: 0,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        prepare_chain_analysis_with_io(date, input, None, &mut io),
+    )
+    .await
+    .expect("TEST_CODE macro typed-stop bounded preparation");
+
+    let result_kind = if result.is_ok() { "Ok" } else { "Err" };
+    let model_available_calls = io.model_available_calls;
+    let model_calls = io.model_calls.get();
+    let search_available_calls = io.search_available_calls;
+    let search_calls = io.search_calls;
+    let clock_calls = io.clock_calls;
+    assert_eq!(io.macro_calls, 1);
+    assert_eq!(
+        io.base.events,
+        vec![
+            "concepts",
+            "chain_daily",
+            "board_codes",
+            "positions",
+            "concepts",
+            "lhb",
+            "macro_search",
+        ]
+    );
+
+    let typed_stop = result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { intent_id }) if intent_id == INTENT
+        ) && matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation }) if *operation == "macro checkpoint"
+        )
+    });
+    if typed_stop {
+        let error = result.as_ref().unwrap_err();
+        let failure = error
+            .downcast_ref::<PreparationFailure>()
+            .expect("TEST_CODE typed macro stop retains PreparationFailure");
+        assert_eq!(failure.business_date(), date);
+        assert_eq!(failure.stage(), PreparationStage::Macro);
+        assert_eq!(
+            failure.completed_stages(),
+            [
+                PreparationStage::Concepts,
+                PreparationStage::ClusterWritesAndLifecycle,
+                PreparationStage::Candidates,
+                PreparationStage::Positions,
+                PreparationStage::PositionConcepts,
+                PreparationStage::DragonTiger,
+            ]
+        );
+        assert_eq!(failure.limit_ups().len(), 4);
+        assert_eq!(
+            failure.concepts()["TEST_CODE_A"],
+            ["TEST_CODE_产业", "昨日涨停"]
+        );
+        assert_eq!(failure.clusters().len(), 1);
+        assert_eq!(failure.clusters()[0].concept, "TEST_CODE_产业");
+        assert_eq!(failure.positions().len(), 1);
+        assert_eq!(failure.positions()[0].code(), "TEST_CODE_持仓");
+        assert_eq!(
+            failure.position_concepts()["TEST_CODE_持仓"],
+            ["TEST_CODE_产业"]
+        );
+        assert_eq!(
+            failure.candidate_sources()["TEST_CODE_产业"].status(),
+            &SourceStatus::Unavailable
+        );
+        assert!(failure.candidate_sources()["TEST_CODE_产业"]
+            .reason()
+            .unwrap()
+            .contains("TEST_CODE_目录不可用原因"));
+        assert_eq!(failure.lhb_map()["TEST_CODE_A"], 123.0);
+        assert_eq!(failure.macro_input(), None);
+    }
+
+    assert!(
+        typed_stop
+            && model_available_calls == 0
+            && model_calls == 0
+            && search_available_calls == 0
+            && search_calls == 0
+            && clock_calls == 0,
+        "TEST_CODE macro typed stop must abort before later effects: result={result_kind}; macro_calls={}; model_available_calls={model_available_calls}; model_calls={model_calls}; search_available_calls={search_available_calls}; search_calls={search_calls}; clock_calls={clock_calls}",
+        io.macro_calls
+    );
+}
+
+#[tokio::test]
+async fn deep_model_typed_stop_aborts_before_remaining_models_and_retains_prior_facts() {
+    use super::preparation::{PreparationFailure, PreparationStage};
+
+    const INTENT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const MACRO_INPUT: &str = "TEST_CODE_固定宏观输入";
+
+    struct DeepStopIo {
+        base: CoverageIo,
+        model_available_calls: usize,
+        model_stages: std::cell::RefCell<Vec<&'static str>>,
+        search_available_calls: usize,
+        search_calls: usize,
+        clock_calls: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for DeepStopIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.base.concepts(codes).await
+        }
+
+        fn min_cluster_size(&mut self) -> usize {
+            self.base.min_cluster_size()
+        }
+
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.base.persist_clusters(date, rows).await
+        }
+
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.base.board_codes().await
+        }
+
+        async fn candidates(
+            &mut self,
+            board: &str,
+            excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.base.candidates(board, excluded).await
+        }
+
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            Ok(vec![PositionInput::new(
+                "TEST_CODE_协议持仓".into(),
+                "TEST_CODE_持仓敏感正文".into(),
+                Some(1.5),
+            )])
+        }
+
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.base.protocol.lhb().await
+        }
+
+        async fn macro_search(&mut self) -> anyhow::Result<String> {
+            self.base.macro_search().await
+        }
+
+        fn model_available(&mut self) -> bool {
+            self.model_available_calls += 1;
+            true
+        }
+
+        async fn model(
+            &self,
+            prompt: &str,
+            system: &str,
+            mode: crate::analyzer::AgentMode,
+        ) -> anyhow::Result<String> {
+            let stage = if mode == crate::analyzer::AgentMode::Deep
+                && system.contains("A 股产业链结构分析专家")
+                && prompt.contains("概念「TEST_CODE_深度主线」")
+                && prompt.contains("聚集了 8 只涨停股")
+            {
+                "Deep"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("概念「TEST_CODE_简化主线」")
+                && prompt.contains("聚集了 4 只涨停股")
+            {
+                "Simple"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("以下是今日各涨停主线的产业链分析摘要")
+            {
+                "Overview"
+            } else {
+                "Unexpected"
+            };
+            let call = {
+                let mut stages = self.model_stages.borrow_mut();
+                stages.push(stage);
+                stages.len()
+            };
+            if call == 1 {
+                return Err(anyhow::Error::new(SyntheticStorageCause {
+                    operation: "deep model checkpoint",
+                })
+                .context(PreparationStop::AuthorityRejected {
+                    intent_id: INTENT.to_owned(),
+                }));
+            }
+            Ok(match stage {
+                "Simple" => "【简评】阶段=发酵｜参与=谨慎｜候选=无\nTEST_CODE_受控简化模型正文",
+                "Overview" => "TEST_CODE_受控总览模型正文",
+                _ => "TEST_CODE_受控后续模型正文",
+            }
+            .to_owned())
+        }
+
+        fn search_available(&mut self) -> bool {
+            self.search_available_calls += 1;
+            false
+        }
+
+        async fn search_topic(
+            &mut self,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<crate::search_service::SearchResult>> {
+            self.search_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.clock_calls += 1;
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T16:00:00+08:00").unwrap()
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let (stocks, concepts) = protocol_inputs();
+    assert_eq!(stocks.len(), 12);
+    let mut io = DeepStopIo {
+        base: coverage_io(concepts, None),
+        model_available_calls: 0,
+        model_stages: std::cell::RefCell::new(Vec::new()),
+        search_available_calls: 0,
+        search_calls: 0,
+        clock_calls: 0,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        prepare_chain_analysis_with_io(date, stocks, Some(MACRO_INPUT.to_owned()), &mut io),
+    )
+    .await
+    .expect("TEST_CODE deep typed-stop bounded preparation");
+
+    let result_kind = if result.is_ok() { "Ok" } else { "Err" };
+    let model_stages = io.model_stages.borrow().clone();
+    let model_available_calls = io.model_available_calls;
+    let search_available_calls = io.search_available_calls;
+    let search_calls = io.search_calls;
+    let clock_calls = io.clock_calls;
+    let macro_calls = io.base.macro_calls;
+    let candidate_calls = io.base.candidate_boards.len();
+
+    let typed_stop = result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { intent_id }) if intent_id == INTENT
+        ) && matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation }) if *operation == "deep model checkpoint"
+        )
+    });
+    if typed_stop {
+        let failure = result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<PreparationFailure>()
+            .expect("TEST_CODE deep typed stop retains PreparationFailure");
+        assert_eq!(failure.business_date(), date);
+        assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
+        assert_eq!(
+            failure.completed_stages(),
+            [
+                PreparationStage::Concepts,
+                PreparationStage::ClusterWritesAndLifecycle,
+                PreparationStage::Candidates,
+                PreparationStage::Positions,
+                PreparationStage::PositionConcepts,
+                PreparationStage::DragonTiger,
+                PreparationStage::Macro,
+            ]
+        );
+        assert_eq!(failure.limit_ups().len(), 12);
+        assert_eq!(failure.concepts().len(), 12);
+        assert_eq!(
+            failure.concepts()["TEST_CODE_DEEP_0"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.clusters().len(), 2);
+        let deep = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_深度主线")
+            .expect("TEST_CODE retained deep cluster");
+        let simple = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_简化主线")
+            .expect("TEST_CODE retained simple cluster");
+        assert_eq!(deep.stocks.len(), 8);
+        assert_eq!(simple.stocks.len(), 4);
+        assert_eq!(failure.positions().len(), 1);
+        assert_eq!(failure.positions()[0].code(), "TEST_CODE_协议持仓");
+        assert_eq!(
+            failure.position_concepts()["TEST_CODE_协议持仓"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.lhb_map()["TEST_CODE_DEEP_0"], 321.0);
+        assert_eq!(failure.lhb_source().status(), &SourceStatus::Unknown);
+        assert_eq!(failure.macro_input(), Some(MACRO_INPUT));
+        assert_eq!(
+            failure
+                .candidate_sources()
+                .values()
+                .filter(|source| source.status() == &SourceStatus::VerifiedEmpty)
+                .count(),
+            2
+        );
+    }
+
+    assert!(
+        typed_stop
+            && model_stages == ["Deep"]
+            && model_available_calls == 1
+            && search_available_calls == 1
+            && search_calls == 0
+            && clock_calls == 0
+            && macro_calls == 0
+            && candidate_calls == 2,
+        "TEST_CODE deep typed stop must abort before remaining models: result={result_kind}; model_stages={model_stages:?}; model_available_calls={model_available_calls}; search_available_calls={search_available_calls}; search_calls={search_calls}; clock_calls={clock_calls}; macro_calls={macro_calls}; candidate_calls={candidate_calls}"
+    );
+}
+
+#[tokio::test]
+async fn simple_model_typed_stop_aborts_before_overview_and_retains_prior_facts() {
+    use super::preparation::{PreparationFailure, PreparationStage};
+
+    const INTENT: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const MACRO_INPUT: &str = "TEST_CODE_固定宏观输入";
+
+    struct SimpleStopIo {
+        base: CoverageIo,
+        effect_calls: Vec<&'static str>,
+        model_available_calls: usize,
+        model_stages: std::cell::RefCell<Vec<&'static str>>,
+        search_available_calls: usize,
+        search_calls: usize,
+        clock_calls: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for SimpleStopIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.effect_calls.push("concepts");
+            self.base.concepts(codes).await
+        }
+
+        fn min_cluster_size(&mut self) -> usize {
+            self.base.min_cluster_size()
+        }
+
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.effect_calls.push("chain_daily");
+            self.base.persist_clusters(date, rows).await
+        }
+
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.effect_calls.push("board_codes");
+            self.base.board_codes().await
+        }
+
+        async fn candidates(
+            &mut self,
+            board: &str,
+            excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.effect_calls.push("candidates");
+            self.base.candidates(board, excluded).await
+        }
+
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            self.effect_calls.push("positions");
+            Ok(vec![PositionInput::new(
+                "TEST_CODE_协议持仓".into(),
+                "TEST_CODE_持仓敏感正文".into(),
+                Some(1.5),
+            )])
+        }
+
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.effect_calls.push("lhb");
+            self.base.protocol.lhb().await
+        }
+
+        async fn macro_search(&mut self) -> anyhow::Result<String> {
+            self.base.macro_search().await
+        }
+
+        fn model_available(&mut self) -> bool {
+            self.model_available_calls += 1;
+            true
+        }
+
+        async fn model(
+            &self,
+            prompt: &str,
+            system: &str,
+            mode: crate::analyzer::AgentMode,
+        ) -> anyhow::Result<String> {
+            let stage = if mode == crate::analyzer::AgentMode::Deep
+                && system.contains("A 股产业链结构分析专家")
+                && prompt.contains("概念「TEST_CODE_深度主线」")
+                && prompt.contains("聚集了 8 只涨停股")
+            {
+                "Deep"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("概念「TEST_CODE_简化主线」")
+                && prompt.contains("聚集了 4 只涨停股")
+            {
+                "Simple"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("以下是今日各涨停主线的产业链分析摘要")
+            {
+                "Overview"
+            } else {
+                "Unexpected"
+            };
+            self.model_stages.borrow_mut().push(stage);
+            if stage == "Simple" {
+                return Err(anyhow::Error::new(SyntheticStorageCause {
+                    operation: "simple model checkpoint",
+                })
+                .context(PreparationStop::AuthorityRejected {
+                    intent_id: INTENT.to_owned(),
+                }));
+            }
+            Ok(match stage {
+                "Deep" => "【结论】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\nTEST_CODE_受控深度模型正文",
+                "Overview" => "TEST_CODE_受控总览模型正文",
+                _ => "TEST_CODE_受控后续模型正文",
+            }
+            .to_owned())
+        }
+
+        fn search_available(&mut self) -> bool {
+            self.search_available_calls += 1;
+            false
+        }
+
+        async fn search_topic(
+            &mut self,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<crate::search_service::SearchResult>> {
+            self.search_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.clock_calls += 1;
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T16:00:00+08:00").unwrap()
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let (stocks, concepts) = protocol_inputs();
+    assert_eq!(stocks.len(), 12);
+    let mut io = SimpleStopIo {
+        base: coverage_io(concepts, None),
+        effect_calls: Vec::new(),
+        model_available_calls: 0,
+        model_stages: std::cell::RefCell::new(Vec::new()),
+        search_available_calls: 0,
+        search_calls: 0,
+        clock_calls: 0,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        prepare_chain_analysis_with_io(date, stocks, Some(MACRO_INPUT.to_owned()), &mut io),
+    )
+    .await
+    .expect("TEST_CODE simple typed-stop bounded preparation");
+
+    let result_kind = if result.is_ok() { "Ok" } else { "Err" };
+    let model_stages = io.model_stages.borrow().clone();
+    let model_available_calls = io.model_available_calls;
+    let search_available_calls = io.search_available_calls;
+    let search_calls = io.search_calls;
+    let clock_calls = io.clock_calls;
+    let macro_calls = io.base.macro_calls;
+    let candidate_calls = io.base.candidate_boards.len();
+    let effect_calls = io.effect_calls.clone();
+
+    let typed_stop = result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { intent_id }) if intent_id == INTENT
+        ) && matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation }) if *operation == "simple model checkpoint"
+        )
+    });
+    if typed_stop {
+        let failure = result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<PreparationFailure>()
+            .expect("TEST_CODE simple typed stop retains PreparationFailure");
+        assert_eq!(failure.business_date(), date);
+        assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
+        assert_eq!(
+            failure.completed_stages(),
+            [
+                PreparationStage::Concepts,
+                PreparationStage::ClusterWritesAndLifecycle,
+                PreparationStage::Candidates,
+                PreparationStage::Positions,
+                PreparationStage::PositionConcepts,
+                PreparationStage::DragonTiger,
+                PreparationStage::Macro,
+            ]
+        );
+        assert_eq!(failure.limit_ups().len(), 12);
+        assert_eq!(failure.concepts().len(), 12);
+        assert_eq!(
+            failure.concepts()["TEST_CODE_DEEP_0"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.clusters().len(), 2);
+        let deep = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_深度主线")
+            .expect("TEST_CODE retained deep cluster");
+        let simple = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_简化主线")
+            .expect("TEST_CODE retained simple cluster");
+        assert_eq!(deep.stocks.len(), 8);
+        assert_eq!(simple.stocks.len(), 4);
+        assert_eq!(failure.positions().len(), 1);
+        assert_eq!(failure.positions()[0].code(), "TEST_CODE_协议持仓");
+        assert_eq!(failure.positions()[0].name(), "TEST_CODE_持仓敏感正文");
+        assert_eq!(failure.positions()[0].return_rate(), Some(1.5));
+        assert_eq!(failure.position_concepts().len(), 1);
+        assert_eq!(
+            failure.position_concepts()["TEST_CODE_协议持仓"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.lhb_map().len(), 1);
+        assert_eq!(failure.lhb_map()["TEST_CODE_DEEP_0"], 321.0);
+        assert_eq!(failure.lhb_source().status(), &SourceStatus::Unknown);
+        assert_eq!(failure.macro_input(), Some(MACRO_INPUT));
+        assert_eq!(failure.candidate_sources().len(), 2);
+        assert_eq!(
+            failure
+                .candidate_sources()
+                .values()
+                .filter(|source| source.status() == &SourceStatus::VerifiedEmpty)
+                .count(),
+            2
+        );
+    }
+
+    assert!(
+        typed_stop
+            && model_stages == ["Deep", "Simple"]
+            && model_available_calls == 1
+            && search_available_calls == 1
+            && search_calls == 0
+            && clock_calls == 0
+            && macro_calls == 0
+            && candidate_calls == 2
+            && effect_calls == [
+                "concepts", "chain_daily", "board_codes", "candidates", "candidates",
+                "positions", "concepts", "lhb",
+            ],
+        "TEST_CODE simple typed stop must abort before overview: result={result_kind}; model_stages={model_stages:?}; model_available_calls={model_available_calls}; search_available_calls={search_available_calls}; search_calls={search_calls}; clock_calls={clock_calls}; macro_calls={macro_calls}; candidate_calls={candidate_calls}; effect_calls={effect_calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_terms_model_typed_stop_aborts_before_search_and_preserves_prior_facts() {
+    use super::preparation::{PreparationFailure, PreparationStage};
+
+    const INTENT: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const MACRO_INPUT: &str = "TEST_CODE_固定宏观输入";
+
+    struct SearchTermsStopIo {
+        base: CoverageIo,
+        effect_calls: Vec<&'static str>,
+        model_available_calls: usize,
+        model_stages: std::cell::RefCell<Vec<&'static str>>,
+        search_available_calls: usize,
+        search_calls: usize,
+        clock_calls: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for SearchTermsStopIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.effect_calls.push("concepts");
+            self.base.concepts(codes).await
+        }
+
+        fn min_cluster_size(&mut self) -> usize {
+            self.base.min_cluster_size()
+        }
+
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.effect_calls.push("chain_daily");
+            self.base.persist_clusters(date, rows).await
+        }
+
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.effect_calls.push("board_codes");
+            self.base.board_codes().await
+        }
+
+        async fn candidates(
+            &mut self,
+            board: &str,
+            excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.effect_calls.push("candidates");
+            self.base.candidates(board, excluded).await
+        }
+
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            self.effect_calls.push("positions");
+            Ok(vec![PositionInput::new(
+                "TEST_CODE_协议持仓".into(),
+                "TEST_CODE_持仓敏感正文".into(),
+                Some(1.5),
+            )])
+        }
+
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.effect_calls.push("lhb");
+            self.base.protocol.lhb().await
+        }
+
+        async fn macro_search(&mut self) -> anyhow::Result<String> {
+            self.base.macro_search().await
+        }
+
+        fn model_available(&mut self) -> bool {
+            self.model_available_calls += 1;
+            true
+        }
+
+        async fn model(
+            &self,
+            prompt: &str,
+            system: &str,
+            mode: crate::analyzer::AgentMode,
+        ) -> anyhow::Result<String> {
+            let stage = if mode == crate::analyzer::AgentMode::Quick
+                && system == "你是A股题材挖掘专家，只输出新闻搜索词，每行一条。"
+                && prompt.contains("今日 A 股「TEST_CODE_深度主线」概念 8 只股票集体涨停")
+                && prompt.contains("输出 2-3 条具体的中文新闻搜索词，每行一条")
+            {
+                "SearchTerms"
+            } else if mode == crate::analyzer::AgentMode::Deep
+                && system.contains("A 股产业链结构分析专家")
+                && prompt.contains("概念「TEST_CODE_深度主线」")
+                && prompt.contains("聚集了 8 只涨停股")
+            {
+                "Deep"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("概念「TEST_CODE_简化主线」")
+                && prompt.contains("聚集了 4 只涨停股")
+            {
+                "Simple"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && prompt.contains("以下是今日各涨停主线的产业链分析摘要")
+            {
+                "Overview"
+            } else {
+                "Unexpected"
+            };
+            self.model_stages.borrow_mut().push(stage);
+            if stage == "SearchTerms" {
+                return Err(anyhow::Error::new(SyntheticStorageCause {
+                    operation: "search terms model checkpoint",
+                })
+                .context(PreparationStop::AuthorityRejected {
+                    intent_id: INTENT.to_owned(),
+                }));
+            }
+            Ok(match stage {
+                "Deep" => "【结论】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\nTEST_CODE_受控深度模型正文",
+                "Simple" => "【简评】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\nTEST_CODE_受控简化模型正文",
+                "Overview" => "TEST_CODE_受控总览模型正文",
+                _ => "TEST_CODE_受控后续模型正文",
+            }
+            .to_owned())
+        }
+
+        fn search_available(&mut self) -> bool {
+            self.search_available_calls += 1;
+            true
+        }
+
+        async fn search_topic(
+            &mut self,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<crate::search_service::SearchResult>> {
+            self.search_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.clock_calls += 1;
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T16:00:00+08:00").unwrap()
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let (stocks, concepts) = protocol_inputs();
+    assert_eq!(stocks.len(), 12);
+    let mut io = SearchTermsStopIo {
+        base: coverage_io(concepts, None),
+        effect_calls: Vec::new(),
+        model_available_calls: 0,
+        model_stages: std::cell::RefCell::new(Vec::new()),
+        search_available_calls: 0,
+        search_calls: 0,
+        clock_calls: 0,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        prepare_chain_analysis_with_io(date, stocks, Some(MACRO_INPUT.to_owned()), &mut io),
+    )
+    .await
+    .expect("TEST_CODE search-terms typed-stop bounded preparation");
+
+    let result_kind = if result.is_ok() { "Ok" } else { "Err" };
+    let model_stages = io.model_stages.borrow().clone();
+    let model_available_calls = io.model_available_calls;
+    let search_available_calls = io.search_available_calls;
+    let search_calls = io.search_calls;
+    let clock_calls = io.clock_calls;
+    let macro_calls = io.base.macro_calls;
+    let candidate_calls = io.base.candidate_boards.len();
+    let effect_calls = io.effect_calls.clone();
+
+    let typed_stop = result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { intent_id }) if intent_id == INTENT
+        ) && matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation }) if *operation == "search terms model checkpoint"
+        )
+    });
+    if typed_stop {
+        let failure = result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<PreparationFailure>()
+            .expect("TEST_CODE search-terms typed stop retains PreparationFailure");
+        assert_eq!(failure.business_date(), date);
+        assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
+        assert_eq!(
+            failure.completed_stages(),
+            [
+                PreparationStage::Concepts,
+                PreparationStage::ClusterWritesAndLifecycle,
+                PreparationStage::Candidates,
+                PreparationStage::Positions,
+                PreparationStage::PositionConcepts,
+                PreparationStage::DragonTiger,
+                PreparationStage::Macro,
+            ]
+        );
+        assert_eq!(failure.limit_ups().len(), 12);
+        assert_eq!(failure.concepts().len(), 12);
+        assert_eq!(
+            failure.concepts()["TEST_CODE_DEEP_0"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.clusters().len(), 2);
+        let deep = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_深度主线")
+            .expect("TEST_CODE retained deep cluster");
+        let simple = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_简化主线")
+            .expect("TEST_CODE retained simple cluster");
+        assert_eq!(deep.stocks.len(), 8);
+        assert_eq!(simple.stocks.len(), 4);
+        assert_eq!(failure.positions().len(), 1);
+        assert_eq!(failure.positions()[0].code(), "TEST_CODE_协议持仓");
+        assert_eq!(failure.positions()[0].name(), "TEST_CODE_持仓敏感正文");
+        assert_eq!(failure.positions()[0].return_rate(), Some(1.5));
+        assert_eq!(failure.position_concepts().len(), 1);
+        assert_eq!(
+            failure.position_concepts()["TEST_CODE_协议持仓"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.lhb_map().len(), 1);
+        assert_eq!(failure.lhb_map()["TEST_CODE_DEEP_0"], 321.0);
+        assert_eq!(failure.lhb_source().status(), &SourceStatus::Unknown);
+        assert_eq!(failure.macro_input(), Some(MACRO_INPUT));
+        assert_eq!(failure.candidate_sources().len(), 2);
+        assert_eq!(
+            failure
+                .candidate_sources()
+                .values()
+                .filter(|source| source.status() == &SourceStatus::VerifiedEmpty)
+                .count(),
+            2
+        );
+    }
+
+    assert!(
+        typed_stop
+            && model_stages == ["SearchTerms"]
+            && model_available_calls == 1
+            && search_available_calls == 1
+            && search_calls == 0
+            && clock_calls == 0
+            && macro_calls == 0
+            && candidate_calls == 2
+            && effect_calls == [
+                "concepts", "chain_daily", "board_codes", "candidates", "candidates",
+                "positions", "concepts", "lhb",
+            ],
+        "TEST_CODE search-terms typed stop must abort before search: result={result_kind}; model_stages={model_stages:?}; model_available_calls={model_available_calls}; search_available_calls={search_available_calls}; search_calls={search_calls}; clock_calls={clock_calls}; macro_calls={macro_calls}; candidate_calls={candidate_calls}; effect_calls={effect_calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn overview_model_typed_stop_rejects_completed_report_and_retains_prior_facts() {
+    use super::preparation::{PreparationFailure, PreparationStage};
+
+    const INTENT: &str = "abababababababababababababababababababababababababababababababab";
+    const MACRO_INPUT: &str = "TEST_CODE_固定宏观输入";
+
+    struct OverviewStopIo {
+        base: CoverageIo,
+        effect_calls: Vec<&'static str>,
+        model_available_calls: usize,
+        model_stages: std::cell::RefCell<Vec<&'static str>>,
+        search_available_calls: usize,
+        search_calls: usize,
+        clock_calls: usize,
+        queries: Vec<(String, usize)>,
+        render_calls: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChainPreparationIo for OverviewStopIo {
+        async fn concepts(
+            &mut self,
+            codes: &[String],
+        ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+            self.effect_calls.push("concepts");
+            self.base.concepts(codes).await
+        }
+
+        fn min_cluster_size(&mut self) -> usize {
+            self.base.min_cluster_size()
+        }
+
+        async fn persist_clusters(
+            &mut self,
+            date: chrono::NaiveDate,
+            rows: &[(String, Vec<String>, i32)],
+        ) -> anyhow::Result<HashMap<String, i64>> {
+            self.effect_calls.push("chain_daily");
+            self.base.persist_clusters(date, rows).await
+        }
+
+        async fn board_codes(
+            &mut self,
+        ) -> anyhow::Result<(HashMap<String, String>, Vec<BatchEvidence>)> {
+            self.effect_calls.push("board_codes");
+            self.base.board_codes().await
+        }
+
+        async fn candidates(
+            &mut self,
+            board: &str,
+            excluded: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<GatewayBatch<TopStock>> {
+            self.effect_calls.push("candidates");
+            self.base.candidates(board, excluded).await
+        }
+
+        async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
+            self.effect_calls.push("positions");
+            Ok(vec![PositionInput::new(
+                "TEST_CODE_协议持仓".into(),
+                "TEST_CODE_持仓敏感正文".into(),
+                Some(1.5),
+            )])
+        }
+
+        async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
+            self.effect_calls.push("lhb");
+            self.base.protocol.lhb().await
+        }
+
+        async fn macro_search(&mut self) -> anyhow::Result<String> {
+            self.base.macro_search().await
+        }
+
+        fn model_available(&mut self) -> bool {
+            self.model_available_calls += 1;
+            true
+        }
+
+        async fn model(
+            &self,
+            prompt: &str,
+            system: &str,
+            mode: crate::analyzer::AgentMode,
+        ) -> anyhow::Result<String> {
+            let stage = if mode == crate::analyzer::AgentMode::Quick
+                && system == "你是A股题材挖掘专家，只输出新闻搜索词，每行一条。"
+                && prompt.contains("今日 A 股「TEST_CODE_深度主线」概念 8 只股票集体涨停")
+                && prompt.contains("输出 2-3 条具体的中文新闻搜索词，每行一条")
+            {
+                "SearchTerms"
+            } else if mode == crate::analyzer::AgentMode::Deep
+                && system == super::CHAIN_SYSTEM_PROMPT
+                && prompt.contains("概念「TEST_CODE_深度主线」")
+                && prompt.contains("聚集了 8 只涨停股")
+                && prompt.contains(MACRO_INPUT)
+            {
+                "Deep"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && system == super::CHAIN_SYSTEM_PROMPT
+                && prompt.contains("概念「TEST_CODE_简化主线」")
+                && prompt.contains("聚集了 4 只涨停股")
+            {
+                "Simple"
+            } else if mode == crate::analyzer::AgentMode::Quick
+                && system == super::CHAIN_SYSTEM_PROMPT
+                && prompt.contains("今天是 2026-07-21。以下是今日各涨停主线的产业链分析摘要")
+                && prompt.contains("主线「TEST_CODE_深度主线」（8 只涨停，昨日涨停标签 0 家，近 10 个自然日上榜 2 天）")
+                && prompt.contains("主线「TEST_CODE_简化主线」（4 只涨停，昨日涨停标签 0 家，近 10 个自然日上榜 2 天）")
+                && prompt.contains("TEST_CODE_受控深度模型正文")
+                && prompt.contains("TEST_CODE_受控简化模型正文")
+                && prompt.contains("| TEST_CODE_协议持仓 | TEST_CODE_持仓敏感正文 | 1.50 | TEST_CODE_深度主线（上榜2天） | 否 |")
+                && prompt.contains("<盘后催化追踪（收盘后至现在的最新消息，时效性最高，优先参考）>")
+                && prompt.contains("（无盘后催化信息）")
+                && prompt.contains("</盘后催化追踪>")
+            {
+                "Overview"
+            } else {
+                "Unexpected"
+            };
+            self.model_stages.borrow_mut().push(stage);
+            self.render_calls.borrow_mut().push(stage);
+            if stage == "Overview" {
+                return Err(anyhow::Error::new(SyntheticStorageCause {
+                    operation: "overview model checkpoint",
+                })
+                .context(PreparationStop::AuthorityRejected {
+                    intent_id: INTENT.to_owned(),
+                }));
+            }
+            Ok(match stage {
+                "Deep" => "【结论】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\nTEST_CODE_受控深度模型正文",
+                "Simple" => "【简评】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\nTEST_CODE_受控简化模型正文",
+                "SearchTerms" => "TEST_CODE_供给变化\nTEST_CODE_终端需求",
+                _ => "TEST_CODE_受控后续模型正文",
+            }
+            .to_owned())
+        }
+
+        fn search_available(&mut self) -> bool {
+            self.search_available_calls += 1;
+            true
+        }
+
+        async fn search_topic(
+            &mut self,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<crate::search_service::SearchResult>> {
+            self.search_calls += 1;
+            self.queries.push((query.to_owned(), limit));
+            self.render_calls
+                .borrow_mut()
+                .push(if query.contains("最新 突发 催化") {
+                    "AfterMarketSearch"
+                } else {
+                    "ClusterSearch"
+                });
+            Ok(Vec::new())
+        }
+
+        fn local_now(&mut self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.clock_calls += 1;
+            self.render_calls.borrow_mut().push("Clock");
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T16:00:00+08:00").unwrap()
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let (stocks, concepts) = protocol_inputs();
+    assert_eq!(stocks.len(), 12);
+    let expected_stocks = stocks.clone();
+    let mut io = OverviewStopIo {
+        base: coverage_io(concepts, None),
+        effect_calls: Vec::new(),
+        model_available_calls: 0,
+        model_stages: std::cell::RefCell::new(Vec::new()),
+        search_available_calls: 0,
+        search_calls: 0,
+        clock_calls: 0,
+        queries: Vec::new(),
+        render_calls: std::cell::RefCell::new(Vec::new()),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        prepare_chain_analysis_with_io(date, stocks, Some(MACRO_INPUT.to_owned()), &mut io),
+    )
+    .await
+    .expect("TEST_CODE overview typed-stop bounded preparation");
+
+    let result_kind = if result.is_ok() { "Ok" } else { "Err" };
+    let model_stages = io.model_stages.borrow().clone();
+    let model_available_calls = io.model_available_calls;
+    let search_available_calls = io.search_available_calls;
+    let search_calls = io.search_calls;
+    let clock_calls = io.clock_calls;
+    let macro_calls = io.base.macro_calls;
+    let candidate_calls = io.base.candidate_boards.len();
+    let effect_calls = io.effect_calls.clone();
+    let render_calls = io.render_calls.borrow().clone();
+    let queries = io.queries.clone();
+
+    let typed_stop = result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::AuthorityRejected { intent_id }) if intent_id == INTENT
+        ) && matches!(
+            error.downcast_ref::<SyntheticStorageCause>(),
+            Some(SyntheticStorageCause { operation }) if *operation == "overview model checkpoint"
+        )
+    });
+    if typed_stop {
+        let failure = result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<PreparationFailure>()
+            .expect("TEST_CODE overview typed stop retains PreparationFailure");
+        assert_eq!(failure.business_date(), date);
+        assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
+        assert!(failure.failed_stage_may_have_effects());
+        assert!(failure.reason().contains("synthetic storage failure"));
+        assert_eq!(
+            failure.completed_stages(),
+            [
+                PreparationStage::Concepts,
+                PreparationStage::ClusterWritesAndLifecycle,
+                PreparationStage::Candidates,
+                PreparationStage::Positions,
+                PreparationStage::PositionConcepts,
+                PreparationStage::DragonTiger,
+                PreparationStage::Macro,
+            ]
+        );
+        assert_eq!(failure.limit_ups().len(), 12);
+        assert_eq!(
+            serde_json::to_value(failure.limit_ups()).unwrap(),
+            serde_json::to_value(&expected_stocks).unwrap()
+        );
+        assert_eq!(failure.concepts().len(), 12);
+        assert_eq!(
+            failure.concepts()["TEST_CODE_DEEP_0"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(
+            failure.concepts()["TEST_CODE_SIMPLE_0"],
+            ["TEST_CODE_简化主线"]
+        );
+        assert_eq!(failure.clusters().len(), 2);
+        let deep = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_深度主线")
+            .expect("TEST_CODE retained deep cluster");
+        let simple = failure
+            .clusters()
+            .iter()
+            .find(|cluster| cluster.concept == "TEST_CODE_简化主线")
+            .expect("TEST_CODE retained simple cluster");
+        assert_eq!(deep.stocks.len(), 8);
+        assert_eq!(simple.stocks.len(), 4);
+        assert_eq!(deep.streak_days, 2);
+        assert_eq!(simple.streak_days, 2);
+        assert_eq!(deep.continuation_count, 0);
+        assert_eq!(simple.continuation_count, 0);
+        assert!(deep.candidates.is_empty());
+        assert!(simple.candidates.is_empty());
+        assert!(failure.isolated().is_empty());
+        assert_eq!(failure.positions().len(), 1);
+        assert_eq!(failure.positions()[0].code(), "TEST_CODE_协议持仓");
+        assert_eq!(failure.positions()[0].name(), "TEST_CODE_持仓敏感正文");
+        assert_eq!(failure.positions()[0].return_rate(), Some(1.5));
+        assert_eq!(failure.position_diags().len(), 1);
+        assert_eq!(failure.position_diags()[0].code, "TEST_CODE_协议持仓");
+        assert_eq!(
+            failure.position_diags()[0].mainline,
+            Some(("TEST_CODE_深度主线".to_owned(), 2))
+        );
+        assert!(!failure.position_diags()[0].in_limit_pool);
+        assert_eq!(failure.position_concepts().len(), 1);
+        assert_eq!(
+            failure.position_concepts()["TEST_CODE_协议持仓"],
+            ["TEST_CODE_深度主线"]
+        );
+        assert_eq!(failure.lhb_map().len(), 1);
+        assert_eq!(failure.lhb_map()["TEST_CODE_DEEP_0"], 321.0);
+        assert_eq!(failure.lhb_source().status(), &SourceStatus::Unknown);
+        assert_eq!(failure.macro_input(), Some(MACRO_INPUT));
+        assert_eq!(failure.candidate_sources().len(), 2);
+        assert_eq!(
+            failure
+                .candidate_sources()
+                .values()
+                .filter(|source| source.status() == &SourceStatus::VerifiedEmpty)
+                .count(),
+            2
+        );
+    }
+
+    assert!(
+        typed_stop
+            && model_stages == ["SearchTerms", "Deep", "Simple", "Overview"]
+            && model_available_calls == 1
+            && search_available_calls == 2
+            && search_calls == 5
+            && clock_calls == 1
+            && render_calls == [
+                "SearchTerms", "ClusterSearch", "ClusterSearch", "ClusterSearch",
+                "Deep", "Simple", "Clock",
+                "AfterMarketSearch", "AfterMarketSearch", "Overview",
+            ]
+            && queries == [
+                ("TEST_CODE_深度主线 板块 集体涨停 原因 TEST_CODE_名称DEEP0 TEST_CODE_名称DEEP1".to_owned(), 4),
+                ("TEST_CODE_供给变化".to_owned(), 4),
+                ("TEST_CODE_终端需求".to_owned(), 4),
+                ("07月21日 TEST_CODE_深度主线 最新 突发 催化".to_owned(), 2),
+                ("07月21日 TEST_CODE_简化主线 最新 突发 催化".to_owned(), 2),
+            ]
+            && macro_calls == 0
+            && candidate_calls == 2
+            && effect_calls == [
+                "concepts", "chain_daily", "board_codes", "candidates", "candidates",
+                "positions", "concepts", "lhb",
+            ],
+        "TEST_CODE overview typed stop must reject a completed report: result={result_kind}; model_stages={model_stages:?}; model_available_calls={model_available_calls}; search_available_calls={search_available_calls}; search_calls={search_calls}; clock_calls={clock_calls}; macro_calls={macro_calls}; candidate_calls={candidate_calls}; effect_calls={effect_calls:?}; render_calls={render_calls:?}; queries={queries:?}"
+    );
+}
+
+#[path = "preparation_search_typed_stop_tests.rs"]
+mod search_typed_stop_tests;

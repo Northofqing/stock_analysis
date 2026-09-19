@@ -1732,7 +1732,7 @@ struct ModeBoundPaths {
 
 impl ModeBoundPaths {
     fn production() -> Self {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = crate::production_root::production_root().to_path_buf();
         let database = root.join(PRODUCTION_DATABASE_RELATIVE_PATH);
         let wal = sidecar_path(&database, "-wal");
         let shm = sidecar_path(&database, "-shm");
@@ -1792,7 +1792,7 @@ impl ModeBoundPaths {
 
         match self.mode {
             BoundMode::Production => {
-                let fixed = Path::new(env!("CARGO_MANIFEST_DIR"));
+                let fixed = crate::production_root::production_root();
                 let fixed_database = fixed.join(PRODUCTION_DATABASE_RELATIVE_PATH);
                 if self.root != fixed
                     || self.database != fixed_database
@@ -1805,7 +1805,7 @@ impl ModeBoundPaths {
                             .join(GLOBAL_MAINTENANCE_LOCK_FILE)
                 {
                     return Err(GlobalSchemaV1Error::ModeBindingViolation {
-                        detail: "production paths differ from manifest-root fixed identities"
+                        detail: "production paths differ from build-time fixed identities"
                             .to_owned(),
                     });
                 }

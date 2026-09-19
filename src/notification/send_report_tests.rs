@@ -29,6 +29,10 @@ impl WebhookFixture {
         self.url.clone()
     }
 
+    fn recorded_requests(&self) -> Vec<Vec<u8>> {
+        self.requests.lock().expect("fixture requests").clone()
+    }
+
     fn finish(mut self) -> Vec<Vec<u8>> {
         let result = self
             .handle
@@ -53,6 +57,13 @@ impl Drop for WebhookFixture {
 }
 
 fn spawn_webhook_fixture(responses: Vec<ScriptedResponse>) -> WebhookFixture {
+    spawn_webhook_fixture_with_lifetime(responses, FIXTURE_LIFETIME)
+}
+
+fn spawn_webhook_fixture_with_lifetime(
+    responses: Vec<ScriptedResponse>,
+    lifetime: Duration,
+) -> WebhookFixture {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind random loopback port");
     listener
         .set_nonblocking(true)
@@ -64,7 +75,7 @@ fn spawn_webhook_fixture(responses: Vec<ScriptedResponse>) -> WebhookFixture {
     let thread_stop = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
-        let deadline = Instant::now() + FIXTURE_LIFETIME;
+        let deadline = Instant::now() + lifetime;
         for response in responses {
             let (mut stream, _) = loop {
                 if thread_stop.load(Ordering::Acquire) {
@@ -81,6 +92,11 @@ fn spawn_webhook_fixture(responses: Vec<ScriptedResponse>) -> WebhookFixture {
                     Err(error) => return Err(format!("fixture accept failed: {error}")),
                 }
             };
+            // The listener is nonblocking so accept can be stopped, but the complete HTTP
+            // reader needs a blocking connection bounded by its deadline.
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| format!("set fixture stream blocking: {error}"))?;
             let request = read_complete_http_request(&mut stream, deadline)?;
             thread_requests
                 .lock()
@@ -209,6 +225,28 @@ fn assert_attempts(
         assert_eq!(attempt.target_index(), *target_index);
         assert_eq!(attempt.outcome(), *outcome);
     }
+}
+
+fn feishu_payload(request: &[u8]) -> serde_json::Value {
+    let body_start = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("captured request must contain an HTTP body");
+    serde_json::from_slice(&request[body_start..]).expect("Feishu request body must be JSON")
+}
+
+fn feishu_payload_content(request: &[u8]) -> String {
+    let payload = feishu_payload(request);
+    let content = match payload.get("msg_type").and_then(serde_json::Value::as_str) {
+        Some("interactive") => payload.pointer("/card/elements/0/text/content"),
+        Some("text") => payload.pointer("/content/text"),
+        other => panic!("unexpected Feishu payload type: {other:?}"),
+    };
+    content
+        .and_then(serde_json::Value::as_str)
+        .expect("Feishu payload must contain message text")
+        .to_owned()
 }
 
 #[tokio::test]
@@ -440,22 +478,124 @@ async fn feishu_empty_heading_reaches_two_chunks_but_one_unknown_target() {
 }
 
 #[tokio::test]
-async fn feishu_regular_long_report_keeps_existing_single_truncated_chunk() {
-    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"code":0}"#)]);
+async fn feishu_regular_long_report_is_lossless_through_observed_public_entry() {
+    const FEISHU_MAX_BYTES: usize = 384;
+    const MARKDOWN: &str = "# TEST_CODE 普通长报告\n> 风险提示🙂\n---\n- 第一项\n- 第二项\n\n连续长段开始：甲乙丙丁戊己庚辛壬癸，行情快照保持原序；研究摘要跨越边界仍需连续；emoji🚀与中文测试🙂不能拆坏；资金流、公告、财务指标、风险提示依次完整保留；这是没有旧标题或分隔符可借用的普通正文，分片不能以截断换取成功；再补一段连续字符ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz，确保正文确定超过预算；末端附近还有中文字符壹贰叁肆伍陆柒捌玖拾与emoji🧭。\n\n中间空行必须保留。\n\nTEST_CODE_TAIL_UNIQUE";
+    const FORMATTED: &str = "**TEST_CODE 普通长报告**\n💬 风险提示🙂\n────────\n• 第一项\n• 第二项\n\n连续长段开始：甲乙丙丁戊己庚辛壬癸，行情快照保持原序；研究摘要跨越边界仍需连续；emoji🚀与中文测试🙂不能拆坏；资金流、公告、财务指标、风险提示依次完整保留；这是没有旧标题或分隔符可借用的普通正文，分片不能以截断换取成功；再补一段连续字符ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz，确保正文确定超过预算；末端附近还有中文字符壹贰叁肆伍陆柒捌玖拾与emoji🧭。\n\n中间空行必须保留。\n\nTEST_CODE_TAIL_UNIQUE";
+
+    assert!(FORMATTED.len() > FEISHU_MAX_BYTES);
+    let fixture = spawn_webhook_fixture(
+        (0..8)
+            .map(|_| ScriptedResponse::Http(r#"{"code":0}"#))
+            .collect(),
+    );
     let service = test_service(
         NotificationConfig {
             feishu_webhook_url: Some(fixture.url()),
-            feishu_max_bytes: 512,
+            feishu_max_bytes: FEISHU_MAX_BYTES,
             ..NotificationConfig::default()
         },
         vec![NotificationChannel::Feishu],
     );
-    let content = format!(
-        "# TEST_CODE heading\n{}\n---\n### TEST_CODE section\nTEST_CODE_TAIL_SECRET",
-        "A".repeat(600)
+
+    let report = service.send_report(MARKDOWN).await;
+
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
+    );
+    let requests = fixture.recorded_requests();
+    drop(fixture);
+    assert!(
+        requests.len() > 1,
+        "an over-budget ordinary report must use more than one request"
     );
 
-    let report = service.send_report(&content).await;
+    let total = requests.len();
+    let mut reconstructed = String::new();
+    for (index, request) in requests.iter().enumerate() {
+        let body = feishu_payload_content(request);
+        assert!(
+            body.len() <= FEISHU_MAX_BYTES,
+            "Feishu body {} is {} bytes, over configured {}-byte budget",
+            index + 1,
+            body.len(),
+            FEISHU_MAX_BYTES
+        );
+        let marker = format!("\n\n📄 ({}/{})", index + 1, total);
+        let content = body
+            .strip_suffix(&marker)
+            .unwrap_or_else(|| panic!("Feishu body {} has wrong page marker", index + 1));
+        reconstructed.push_str(content);
+    }
+
+    assert_eq!(reconstructed, FORMATTED);
+    assert!(reconstructed.ends_with("TEST_CODE_TAIL_UNIQUE"));
+}
+
+#[tokio::test]
+async fn feishu_invalid_budgets_fail_before_first_http_request() {
+    let cases = [
+        (0, "A".to_owned(), "必须大于 0"),
+        (12, "A".repeat(13), "不足以容纳分页标记和消息内容"),
+        (
+            14,
+            format!("{}🧭", "A".repeat(11)),
+            "无法容纳 4 字节的 Unicode 字符",
+        ),
+    ];
+
+    for (max_bytes, content, expected_error) in cases {
+        let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"code":0}"#)]);
+        let service = test_service(
+            NotificationConfig {
+                feishu_webhook_url: Some(fixture.url()),
+                feishu_max_bytes: max_bytes,
+                ..NotificationConfig::default()
+            },
+            vec![NotificationChannel::Feishu],
+        );
+
+        let error = service
+            .send_to_feishu(&content)
+            .await
+            .expect_err("invalid Feishu budget must fail locally");
+        assert!(
+            error.to_string().contains(expected_error),
+            "budget {max_bytes} returned unexpected error: {error}"
+        );
+
+        let report = service.send_report(&content).await;
+        assert_attempts(
+            &report,
+            &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Unknown)],
+        );
+        assert!(!report.has_success());
+        assert!(
+            fixture.recorded_requests().is_empty(),
+            "budget {max_bytes} must be rejected before the first HTTP request"
+        );
+        drop(fixture);
+    }
+}
+
+#[tokio::test]
+async fn feishu_exact_short_body_is_one_unmarked_request() {
+    const CONTENT: &str = "测试🙂";
+    const FEISHU_MAX_BYTES: usize = 10;
+    assert_eq!(CONTENT.len(), FEISHU_MAX_BYTES);
+
+    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"code":0}"#)]);
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: FEISHU_MAX_BYTES,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+
+    let report = service.send_report(CONTENT).await;
 
     assert_attempts(
         &report,
@@ -463,7 +603,85 @@ async fn feishu_regular_long_report_keeps_existing_single_truncated_chunk() {
     );
     let requests = fixture.finish();
     assert_eq!(requests.len(), 1);
-    assert!(!String::from_utf8_lossy(&requests[0]).contains("TEST_CODE_TAIL_SECRET"));
+    let payload = feishu_payload(&requests[0]);
+    assert_eq!(
+        payload.get("msg_type").and_then(serde_json::Value::as_str),
+        Some("interactive")
+    );
+    let body = payload
+        .pointer("/card/elements/0/text/content")
+        .and_then(serde_json::Value::as_str)
+        .expect("interactive Feishu card must contain message text");
+    assert_eq!(body.as_bytes(), CONTENT.as_bytes());
+    assert!(!body.contains("\n\n📄 ("));
+}
+
+#[tokio::test]
+async fn feishu_two_digit_pages_stay_bounded_and_lossless() {
+    const CONTENT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const FEISHU_MAX_BYTES: usize = 16;
+    const MAX_RESPONSES: usize = 40;
+    const LONG_FIXTURE_LIFETIME: Duration = Duration::from_secs(50);
+    const OUTER_TIMEOUT: Duration = Duration::from_secs(55);
+    assert_eq!(CONTENT.len(), 40);
+
+    let fixture = spawn_webhook_fixture_with_lifetime(
+        (0..MAX_RESPONSES)
+            .map(|_| ScriptedResponse::Http(r#"{"code":0}"#))
+            .collect(),
+        LONG_FIXTURE_LIFETIME,
+    );
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: FEISHU_MAX_BYTES,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+
+    let (report, requests) = tokio::time::timeout(OUTER_TIMEOUT, async move {
+        let report = service.send_report(CONTENT).await;
+        let requests = fixture.recorded_requests();
+        drop(fixture);
+        (report, requests)
+    })
+    .await
+    .expect("two-digit Feishu paging must finish within 55 seconds");
+
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
+    );
+    let total = requests.len();
+    assert!(
+        total >= 10,
+        "fixture must exercise two-digit page-number markers, got {total} pages"
+    );
+
+    let mut reconstructed = String::new();
+    for (index, request) in requests.iter().enumerate() {
+        let body = feishu_payload_content(request);
+        assert!(
+            body.len() <= FEISHU_MAX_BYTES,
+            "Feishu body {} is {} bytes, over configured {}-byte budget",
+            index + 1,
+            body.len(),
+            FEISHU_MAX_BYTES
+        );
+        let marker = format!("\n\n📄 ({}/{})", index + 1, total);
+        let content = body
+            .strip_suffix(&marker)
+            .unwrap_or_else(|| panic!("Feishu body {} has wrong page marker", index + 1));
+        assert!(
+            !content.is_empty(),
+            "Feishu page {} has no report body",
+            index + 1
+        );
+        reconstructed.push_str(content);
+    }
+
+    assert_eq!(reconstructed.as_bytes(), CONTENT.as_bytes());
 }
 
 #[tokio::test]

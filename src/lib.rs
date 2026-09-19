@@ -43,6 +43,7 @@ pub mod opportunity;
 pub mod performance; // v16.4 #4: PerformanceSnapshot 独立表
 pub mod pipeline;
 pub mod portfolio;
+pub mod production_root;
 pub mod review;
 // v16.4 Commit 1: StrategyRegistry 动态注册 (替代 v16.3 8 enum 硬编码)
 pub mod registry;

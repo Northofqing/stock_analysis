@@ -2,6 +2,7 @@
 
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+use rusqlite::OptionalExtension as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -126,6 +127,82 @@ pub(crate) fn read_acquisition_in_transaction(
     let chain =
         load_chain_rows_in_transaction(transaction).map_err(|_| AcquisitionAuditReadError)?;
     verify_loaded_acquisition(audits, chain, receipt).map_err(|_| AcquisitionAuditReadError)
+}
+
+/// Validate the complete existing BR-159 chain in a caller-owned snapshot.
+/// Schema/source admission remains the caller's separate prerequisite.
+pub(crate) fn validate_acquisition_chain_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AcquisitionAuditReadError> {
+    let audits =
+        load_audit_rows_in_transaction(transaction).map_err(|_| AcquisitionAuditReadError)?;
+    let chain =
+        load_chain_rows_in_transaction(transaction).map_err(|_| AcquisitionAuditReadError)?;
+    validate_data_acquisition_audit_chain_rows(&audits, &chain)
+        .map(|_| ())
+        .map_err(|_| AcquisitionAuditReadError)
+}
+
+/// Verify one already-admitted BR-159 receipt without rescanning the complete history.
+pub(crate) fn verify_acquisition_receipt_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &DataAcquisitionAuditReceipt,
+    expected: &DataAcquisitionAuditRecord<'_>,
+) -> Result<(), AcquisitionAuditReadError> {
+    validate_record(expected).map_err(|_| AcquisitionAuditReadError)?;
+    let audit = transaction
+        .query_row(
+            "SELECT id, schema_version, capability, provider, source, request_hash, \
+                    source_at, observed_at, batch_id, outcome, request_count, \
+                    accepted_count, rejected_count, reason_code, retryable, created_at \
+             FROM data_acquisition_audit WHERE id=?1",
+            [receipt.audit_id],
+            persisted_acquisition_audit_from_row,
+        )
+        .map_err(|_| AcquisitionAuditReadError)?;
+    let chain = transaction
+        .query_row(
+            "SELECT acquisition_audit_id,previous_hash,record_hash \
+             FROM data_acquisition_audit_chain WHERE acquisition_audit_id=?1",
+            [receipt.audit_id],
+            audit_chain_row_from_row,
+        )
+        .map_err(|_| AcquisitionAuditReadError)?;
+    let previous_outcome = transaction
+        .query_row(
+            "SELECT outcome FROM data_acquisition_audit \
+             WHERE id<?1 AND capability=?2 AND provider=?3 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![receipt.audit_id, expected.capability, expected.provider],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| AcquisitionAuditReadError)?;
+    let expected_hash = calculate_record_hash(&chain.previous_hash, &audit)
+        .map_err(|_| AcquisitionAuditReadError)?;
+    let actual = audit.record();
+    if actual.capability != expected.capability
+        || actual.provider != expected.provider
+        || actual.source != expected.source
+        || actual.request_hash != expected.request_hash
+        || actual.source_at != expected.source_at
+        || actual.observed_at != expected.observed_at
+        || actual.batch_id != expected.batch_id
+        || actual.outcome != expected.outcome
+        || actual.request_count != expected.request_count
+        || actual.accepted_count != expected.accepted_count
+        || actual.rejected_count != expected.rejected_count
+        || actual.reason_code != expected.reason_code
+        || actual.retryable != expected.retryable
+        || chain.acquisition_audit_id != audit.id
+        || chain.record_hash != expected_hash
+        || receipt.audit_id != audit.id
+        || receipt.record_hash != chain.record_hash
+        || receipt.previous_outcome != previous_outcome
+        || receipt.current_outcome != audit.outcome
+    {
+        return Err(AcquisitionAuditReadError);
+    }
+    Ok(())
 }
 
 fn verify_loaded_acquisition(
@@ -291,41 +368,47 @@ fn load_audit_rows_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<Vec<PersistedAcquisitionAudit>> {
     let mut statement = transaction.prepare(LOAD_AUDIT_ROWS_SQL)?;
-    let rows = statement.query_map([], |row| {
-        Ok(PersistedAcquisitionAudit {
-            id: row.get(0)?,
-            schema_version: row.get(1)?,
-            capability: row.get(2)?,
-            provider: row.get(3)?,
-            source: row.get(4)?,
-            request_hash: row.get(5)?,
-            source_at: row.get(6)?,
-            observed_at: row.get(7)?,
-            batch_id: row.get(8)?,
-            outcome: row.get(9)?,
-            request_count: row.get(10)?,
-            accepted_count: row.get(11)?,
-            rejected_count: row.get(12)?,
-            reason_code: row.get(13)?,
-            retryable: row.get(14)?,
-            created_at: row.get(15)?,
-        })
-    })?;
+    let rows = statement.query_map([], persisted_acquisition_audit_from_row)?;
     rows.collect()
+}
+
+fn persisted_acquisition_audit_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedAcquisitionAudit> {
+    Ok(PersistedAcquisitionAudit {
+        id: row.get(0)?,
+        schema_version: row.get(1)?,
+        capability: row.get(2)?,
+        provider: row.get(3)?,
+        source: row.get(4)?,
+        request_hash: row.get(5)?,
+        source_at: row.get(6)?,
+        observed_at: row.get(7)?,
+        batch_id: row.get(8)?,
+        outcome: row.get(9)?,
+        request_count: row.get(10)?,
+        accepted_count: row.get(11)?,
+        rejected_count: row.get(12)?,
+        reason_code: row.get(13)?,
+        retryable: row.get(14)?,
+        created_at: row.get(15)?,
+    })
 }
 
 fn load_chain_rows_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<Vec<AuditChainRow>> {
     let mut statement = transaction.prepare(LOAD_CHAIN_ROWS_SQL)?;
-    let rows = statement.query_map([], |row| {
-        Ok(AuditChainRow {
-            acquisition_audit_id: row.get(0)?,
-            previous_hash: row.get(1)?,
-            record_hash: row.get(2)?,
-        })
-    })?;
+    let rows = statement.query_map([], audit_chain_row_from_row)?;
     rows.collect()
+}
+
+fn audit_chain_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditChainRow> {
+    Ok(AuditChainRow {
+        acquisition_audit_id: row.get(0)?,
+        previous_hash: row.get(1)?,
+        record_hash: row.get(2)?,
+    })
 }
 
 fn load_audit_tail(
@@ -469,7 +552,14 @@ fn verify_data_acquisition_receipt_snapshot(
 fn validate_data_acquisition_audit_tail(
     conn: &mut SqliteConnection,
 ) -> diesel::QueryResult<String> {
-    match (load_audit_tail(conn)?, load_chain_tail(conn)?) {
+    validate_data_acquisition_audit_tail_rows(load_audit_tail(conn)?, load_chain_tail(conn)?)
+}
+
+fn validate_data_acquisition_audit_tail_rows(
+    audit: Option<PersistedAcquisitionAudit>,
+    chain: Option<AuditChainRow>,
+) -> diesel::QueryResult<String> {
+    match (audit, chain) {
         (None, None) => Ok(AUDIT_CHAIN_GENESIS.to_string()),
         (Some(audit), Some(chain))
             if audit.id == chain.acquisition_audit_id
@@ -586,6 +676,13 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> diesel::QueryResult<
     validate_data_acquisition_audit_chain(conn).map(|_| ())
 }
 
+#[cfg(test)]
+pub(crate) fn install_acquisition_schema_for_test(
+    connection: &mut SqliteConnection,
+) -> diesel::QueryResult<()> {
+    create_schema(connection)
+}
+
 fn insert_acquisition_audit_query(
     conn: &mut SqliteConnection,
     record: &DataAcquisitionAuditRecord<'_>,
@@ -648,6 +745,134 @@ fn insert_acquisition_audit_query(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("acquisition audit append failed during {operation}")]
+pub(crate) struct AcquisitionAuditAppendError {
+    operation: &'static str,
+}
+
+impl AcquisitionAuditAppendError {
+    fn at(operation: &'static str) -> Self {
+        Self { operation }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn operation(&self) -> &'static str {
+        self.operation
+    }
+}
+
+/// Append BR-159 audit and chain rows through a caller-owned transaction.
+///
+/// Before calling, the owner must verify the existing schema and complete
+/// history chain, then hold an IMMEDIATE transaction. On any error the owner
+/// must roll back its entire business transaction: a chain-row failure can
+/// leave an uncommitted audit row in that transaction. A returned receipt is
+/// only a candidate, not proof of commit, until the owner commits. This function
+/// does not open a connection, change pragmas, or end the transaction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn append_acquisition_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &DataAcquisitionAuditRecord<'_>,
+) -> Result<DataAcquisitionAuditReceipt, AcquisitionAuditAppendError> {
+    validate_record(record).map_err(|_| AcquisitionAuditAppendError::at("record validation"))?;
+
+    let audit_tail = transaction
+        .query_row(
+            "SELECT id, schema_version, capability, provider, source, request_hash,
+                    source_at, observed_at, batch_id, outcome, request_count,
+                    accepted_count, rejected_count, reason_code, retryable, created_at
+             FROM data_acquisition_audit ORDER BY id DESC LIMIT 1",
+            [],
+            persisted_acquisition_audit_from_row,
+        )
+        .optional()
+        .map_err(|_| AcquisitionAuditAppendError::at("audit tail read"))?;
+    let chain_tail = transaction
+        .query_row(
+            "SELECT acquisition_audit_id, previous_hash, record_hash
+             FROM data_acquisition_audit_chain ORDER BY acquisition_audit_id DESC LIMIT 1",
+            [],
+            audit_chain_row_from_row,
+        )
+        .optional()
+        .map_err(|_| AcquisitionAuditAppendError::at("chain tail read"))?;
+    let previous_hash = validate_data_acquisition_audit_tail_rows(audit_tail, chain_tail)
+        .map_err(|_| AcquisitionAuditAppendError::at("tail validation"))?;
+
+    let previous_outcome = transaction
+        .query_row(
+            "SELECT outcome FROM data_acquisition_audit
+             WHERE capability = ?1 AND provider = ?2 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![record.capability, record.provider],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| AcquisitionAuditAppendError::at("provider state read"))?;
+
+    let rows = transaction
+        .execute(
+            "INSERT INTO data_acquisition_audit (
+                schema_version, capability, provider, source, request_hash, source_at,
+                observed_at, batch_id, outcome, request_count, accepted_count,
+                rejected_count, reason_code, retryable
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                AUDIT_SCHEMA_VERSION,
+                record.capability,
+                record.provider,
+                record.source,
+                record.request_hash,
+                record.source_at,
+                record.observed_at,
+                record.batch_id,
+                record.outcome,
+                record.request_count,
+                record.accepted_count,
+                record.rejected_count,
+                record.reason_code,
+                i32::from(record.retryable),
+            ],
+        )
+        .map_err(|_| AcquisitionAuditAppendError::at("audit row insert"))?;
+    if rows != 1 {
+        return Err(AcquisitionAuditAppendError::at("audit row insert"));
+    }
+
+    let audit_id = transaction.last_insert_rowid();
+    let audit = transaction
+        .query_row(
+            "SELECT id, schema_version, capability, provider, source, request_hash,
+                    source_at, observed_at, batch_id, outcome, request_count,
+                    accepted_count, rejected_count, reason_code, retryable, created_at
+             FROM data_acquisition_audit WHERE id = ?1",
+            [audit_id],
+            persisted_acquisition_audit_from_row,
+        )
+        .map_err(|_| AcquisitionAuditAppendError::at("inserted audit read"))?;
+    let record_hash = calculate_record_hash(&previous_hash, &audit)
+        .map_err(|_| AcquisitionAuditAppendError::at("record hash"))?;
+    let rows = transaction
+        .execute(
+            "INSERT INTO data_acquisition_audit_chain
+             (acquisition_audit_id, previous_hash, record_hash)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![audit.id, &previous_hash, &record_hash],
+        )
+        .map_err(|_| AcquisitionAuditAppendError::at("chain row insert"))?;
+    if rows != 1 {
+        return Err(AcquisitionAuditAppendError::at("chain row insert"));
+    }
+
+    Ok(DataAcquisitionAuditReceipt {
+        audit_id: audit.id,
+        record_hash,
+        previous_outcome,
+        current_outcome: audit.outcome,
+    })
+}
+
 impl DatabaseManager {
     pub fn record_data_acquisition(
         &self,
@@ -684,6 +909,10 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod transaction_tests {
+        include!("data_acquisition_audit_transaction_tests.rs");
+    }
 
     #[derive(Debug, QueryableByName)]
     struct CountRow {

@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 
-#[cfg(test)]
 use super::canonical::canonical_preimage;
 use super::canonical::{canonical_digest, CanonicalValue};
 use super::delivery::TemplateVersion;
@@ -317,6 +316,99 @@ pub struct RunContext {
 }
 
 impl RunContext {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_preimage("RunContext/v1", &run_context_fields(self))
+    }
+
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        let json = bytes
+            .strip_prefix(b"RunContext/v1\0")
+            .ok_or(PushJobError::InvalidRunContext("context codec domain"))?;
+        let value: serde_json::Value = serde_json::from_slice(json)
+            .map_err(|_| PushJobError::InvalidRunContext("context codec json"))?;
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(PushJobError::InvalidRunContext("context codec field"))
+        };
+        let unsigned = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(PushJobError::InvalidRunContext("context codec field"))
+        };
+        let namespace = match value
+            .get("namespace")
+            .and_then(|item| item.get("kind"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("Production") => Namespace::Production,
+            _ => return Err(PushJobError::InvalidRunContext("context namespace")),
+        };
+        let trigger = match value
+            .get("trigger")
+            .and_then(|item| item.get("kind"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("Scheduled") => Trigger::scheduled(ScheduleId::try_new(
+                value
+                    .get("trigger")
+                    .and_then(|item| item.get("schedule_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(PushJobError::InvalidRunContext("context trigger"))?
+                    .to_owned(),
+            )?),
+            _ => return Err(PushJobError::InvalidRunContext("context trigger")),
+        };
+        let occurrence = Sha256Digest::parse("occurrence", text("occurrence")?)?;
+        let context = Self {
+            schema_version: u32::try_from(unsigned("schema_version")?)
+                .map_err(|_| PushJobError::InvalidRunContext("context schema"))?,
+            run_id: RunId::try_new(text("run_id")?.to_owned())?,
+            unit_id: UnitId::try_new(text("unit_id")?.to_owned())?,
+            namespace,
+            business_date: BusinessDate::parse(text("business_date")?)?,
+            calendar_date: CalendarDate::parse(text("calendar_date")?)?,
+            phase: match text("phase")? {
+                "Postclose" => PhaseEpic::Postclose,
+                _ => return Err(PushJobError::InvalidRunContext("context phase")),
+            },
+            trigger,
+            occurrence: OccurrenceId::from_digest(&occurrence),
+            captured_business_time: UtcMicros::try_new(
+                i64::try_from(unsigned("captured_business_time")?)
+                    .map_err(|_| PushJobError::InvalidRunContext("context time"))?,
+            )?,
+            activation_generation: unsigned("activation_generation")?,
+            build_commit: GitSha40::parse(text("build_commit")?)?,
+            catalog_sha256: Sha256Digest::parse("catalog_sha256", text("catalog_sha256")?)?,
+            source_contract_version: SourceContractVersion::try_new(
+                text("source_contract_version")?.to_owned(),
+            )?,
+            template_version: TemplateVersion::try_new(text("template_version")?.to_owned())?,
+        };
+        let fixed_trigger = matches!(
+            context.trigger(),
+            TriggerView::Scheduled { schedule_id }
+                if schedule_id.as_str() == "chain-post-close-timer"
+        );
+        if context.schema_version != RUN_CONTEXT_SCHEMA_VERSION
+            || context.activation_generation == 0
+            || context.namespace != Namespace::Production
+            || context.unit_id.as_str() != "MU-chain-post-close"
+            || context.phase != PhaseEpic::Postclose
+            || !fixed_trigger
+            || context.source_contract_version.as_str() != "1"
+            || context.template_version.as_str() != "chain-analysis-prepared-v1"
+            || context.canonical_bytes() != bytes
+        {
+            return Err(PushJobError::InvalidRunContext(
+                "context codec canonical bytes",
+            ));
+        }
+        Ok(context)
+    }
     pub fn schema_version(&self) -> u32 {
         self.schema_version
     }
@@ -380,6 +472,158 @@ impl RunContext {
     pub fn canonical_sha256(&self) -> Sha256Digest {
         canonical_digest("RunContext/v1", &run_context_fields(self))
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LocalChainPostCloseConfig {
+    expected_catalog_sha256: Sha256Digest,
+    build_commit: GitSha40,
+    activation_generation: u64,
+}
+
+impl LocalChainPostCloseConfig {
+    pub(crate) fn try_new(
+        expected_catalog_sha256: Sha256Digest,
+        build_commit: GitSha40,
+        activation_generation: u64,
+    ) -> Result<Self> {
+        if activation_generation == 0 {
+            return Err(PushJobError::InvalidRunContext(
+                "activation generation must be positive",
+            ));
+        }
+        Ok(Self {
+            expected_catalog_sha256,
+            build_commit,
+            activation_generation,
+        })
+    }
+
+    pub(crate) fn expected_catalog_sha256(&self) -> &Sha256Digest {
+        &self.expected_catalog_sha256
+    }
+
+    pub(crate) fn accepts(&self, context: &RunContext) -> bool {
+        context.catalog_sha256 == self.expected_catalog_sha256
+            && context.build_commit == self.build_commit
+            && context.activation_generation == self.activation_generation
+    }
+}
+
+pub(crate) struct LocalChainPostCloseRunInput {
+    run_id: RunId,
+    calendar_date: CalendarDate,
+    business_date: BusinessDate,
+    captured_at: UtcMicros,
+}
+
+impl LocalChainPostCloseRunInput {
+    pub(crate) fn try_new(
+        run_id: RunId,
+        calendar_date: CalendarDate,
+        business_date: BusinessDate,
+        captured_at: UtcMicros,
+    ) -> Result<Self> {
+        Ok(Self {
+            run_id,
+            calendar_date,
+            business_date,
+            captured_at,
+        })
+    }
+}
+
+pub(crate) struct LocalChainPostCloseContext {
+    run_context: RunContext,
+    occurrence_family: OccurrenceFamily,
+    occurrence_key: super::OccurrenceKey,
+    source_contract_id: SourceContractId,
+}
+
+impl LocalChainPostCloseContext {
+    pub(crate) fn run_context(&self) -> &RunContext {
+        &self.run_context
+    }
+
+    pub(crate) fn occurrence_family(&self) -> &OccurrenceFamily {
+        &self.occurrence_family
+    }
+
+    pub(crate) fn occurrence_key(&self) -> &super::OccurrenceKey {
+        &self.occurrence_key
+    }
+
+    pub(crate) fn source_contract_id(&self) -> &SourceContractId {
+        &self.source_contract_id
+    }
+}
+
+pub(crate) fn build_single_user_local_chain_post_close_context(
+    config: &LocalChainPostCloseConfig,
+    input: LocalChainPostCloseRunInput,
+) -> Result<LocalChainPostCloseContext> {
+    let catalog = super::MachineCatalog::bundled()
+        .map_err(|_| PushJobError::InvalidRunContext("bundled catalog rejected"))?;
+    if catalog.catalog_sha256() != &config.expected_catalog_sha256 {
+        return Err(PushJobError::InvalidRunContext("catalog digest mismatch"));
+    }
+    let producer_id = ProducerId::try_new("chain-post-close-timer".to_owned())?;
+    let producer = catalog
+        .producer(&producer_id)
+        .ok_or(PushJobError::InvalidRunContext(
+            "chain post-close producer missing",
+        ))?;
+    if producer.unit_id().as_str() != "MU-chain-post-close"
+        || producer.phase_epics() != [PhaseEpic::Postclose]
+        || producer.occurrence_family().as_str()
+            != "calendar date / 15:30≤t<15:35 / latest completed business date"
+        || producer.completion_owner().as_str() != "monitor_loop::CHAIN_POST_LAST[calendar_date]"
+    {
+        return Err(PushJobError::InvalidRunContext(
+            "chain post-close catalog mapping mismatch",
+        ));
+    }
+    let source_contract_id =
+        SourceContractId::try_new("chain-post-close-passed-input-v1".to_owned())?;
+    let occurrence_key = super::OccurrenceKey::try_new(format!(
+        "{}/15:30-15:35/{}",
+        input.calendar_date.as_str(),
+        input.business_date.as_str()
+    ))?;
+    let occurrence_family = producer.occurrence_family().clone();
+    let binding = CatalogRunBinding {
+        namespace: Namespace::Production,
+        unit_id: producer.unit_id().clone(),
+        trigger: RegisteredTrigger::Scheduled(ScheduleId::try_new(
+            "chain-post-close-timer".to_owned(),
+        )?),
+        occurrence_family: occurrence_family.clone(),
+        activation_generation: config.activation_generation,
+        build_commit: config.build_commit.clone(),
+        catalog_sha256: config.expected_catalog_sha256.clone(),
+        source_contract_id: source_contract_id.clone(),
+        source_contract_version: SourceContractVersion::try_new("1".to_owned())?,
+        template_version: TemplateVersion::try_new("chain-analysis-prepared-v1".to_owned())?,
+    };
+    let occurrence = OccurrenceIdentityMaterial::new(
+        input.business_date,
+        occurrence_family.clone(),
+        occurrence_key.clone(),
+    );
+    let run_context = RunContextFactory::new(binding).build_context(RunContextInput {
+        run_id: input.run_id,
+        calendar_date: input.calendar_date,
+        phase: PhaseEpic::Postclose,
+        trigger: Trigger::scheduled(ScheduleId::try_new("chain-post-close-timer".to_owned())?),
+        occurrence,
+        captured_business_time: input.captured_at,
+    })?;
+    Ok(LocalChainPostCloseContext {
+        run_context,
+        occurrence_family,
+        occurrence_key,
+        source_contract_id,
+    })
 }
 
 fn run_context_fields(context: &RunContext) -> BTreeMap<&'static str, CanonicalValue> {
