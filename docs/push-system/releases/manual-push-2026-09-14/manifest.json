@@ -1,0 +1,151 @@
+{
+  "format_version": 1,
+  "status": "reference_verified_not_deployable",
+  "patch_sha256": "443625e605903d86b737d3b7eefdd2da3265b2160764b115baf3f817977f7954",
+  "patch_bytes": 34007,
+  "source_base": "43f48933de599acd9c8207d72d6610ded2a08ba4",
+  "source_final": "41e7762301498302266b8780866e9fa47c5315a5",
+  "reference_source_revision": "a673043acb9390605d2a43fc3ee2ad01488f633e",
+  "paths": [
+    "src/bin/monitor/main.rs",
+    "src/bin/monitor/manual_push.rs"
+  ],
+  "final_files": {
+    "src/bin/monitor/main.rs": {
+      "sha256": "3e3623363f19111cebb0dc8795851cb8d49f1d3a3b2f58af99a170f63cc1ae03",
+      "bytes": 531449
+    },
+    "src/bin/monitor/manual_push.rs": {
+      "sha256": "d4613908df2f24ed241d5d528cb20032be96b786877554afd3cc587c94a1d7e2",
+      "bytes": 24660
+    }
+  },
+  "reference_apply_check": {
+    "result": "passed",
+    "reference_main_blob": "328f55a34e0553595c9392595bc3b5bd831cb582",
+    "directory": "/private/tmp/manual-push-base-check.JcYyys",
+    "note": "git apply --check on owned exact Git-blob copy; not a build or production test"
+  },
+  "original_workspace": {
+    "head": "a673043acb9390605d2a43fc3ee2ad01488f633e",
+    "unmerged_paths": 160,
+    "modified_files_preserved": true
+  },
+  "existing_binaries": {
+    "release": {
+      "path": "/Users/zhangzhen/Desktop/Quant/stock_analysis/target/release/monitor",
+      "sha256": "d27b52f532b86ee393124b3d944949279c7ceedadd5ee29f9ec05461e86e78ed",
+      "source_revision_verified": false,
+      "compile_root_evidence": {
+        "root": "/Users/zhangzhen/Desktop/Quant/stock_analysis",
+        "classification": "consistent_local_build_records_not_source_snapshot",
+        "dep_info_sha256": "def6bed04b4c55443875da51eada386575f3cc20d7daf670c4fb443637957a5c",
+        "fingerprint_json_sha256": "23db6726b527411305dc6880de59f5797b585a1720fe84275d8677feea48ee97",
+        "source_checksums_recorded": false,
+        "source_revision_verified": false
+      }
+    },
+    "debug": {
+      "path": "/Users/zhangzhen/Desktop/Quant/stock_analysis/target/debug/monitor",
+      "sha256": "b05c81d1020a7f44d84df9c8684447c679937132facadb244a64c5c8871091fa",
+      "source_revision_verified": false
+    }
+  },
+  "ddl_changes": false,
+  "current_chain_recovery_included": false,
+  "build_verified": true,
+  "tests_verified_on_reference_revision": true,
+  "rollback_verified": false,
+  "production_configuration_read": false,
+  "production_files_replaced": false,
+  "monitor_started": false,
+  "reference_build": {
+    "directory": "/private/tmp/manual-push-reference-build.prqW42",
+    "head": "a673043acb9390605d2a43fc3ee2ad01488f633e",
+    "main_sha256": "af706bcccf577a1b16e566de19e7e3500eaf172ed226556d875ac4e853e59a0f",
+    "manual_sha256": "d4613908df2f24ed241d5d528cb20032be96b786877554afd3cc587c94a1d7e2",
+    "cargo_toml_sha256": "6091d8f7e8951ed9e2b28283883b3d6b3a33d96763e11529ab80ae8d35712586",
+    "cargo_lock_sha256": "7ddc73291d20c7247021547769eac81fa67f51f7ad6544875046d439e5a33315",
+    "build_rs_sha256": "a961d271509b9d3f99e864912536150cb25017f54aeb7fc63ccaae028c07bf57",
+    "external_proto_sha256": "8730bce3c20e170cf8f58047336ae06d3a5e9080d81568dee71e7b0882063332",
+    "only_two_source_files_changed": true,
+    "reverse_patch_check": "passed",
+    "manual_tests": {
+      "capture": "reference-manual-tests",
+      "session": 68190,
+      "pid": 22761,
+      "started_at": "2026-09-13T16:22:10Z",
+      "result": "passed",
+      "ended_at": "2026-09-13T16:24:20Z",
+      "exit_code": 0,
+      "passed": 10,
+      "failed": 0,
+      "filtered_out": 713,
+      "input_count": 834,
+      "source_before_after_current_equal": true,
+      "log_sha256": "c84ca497ae98dffb285e166c825ab0e7a45481d216432002c16d89814ecbeacf"
+    },
+    "scheduler_tests": {
+      "capture": "reference-scheduler-tests",
+      "session": 96976,
+      "pid": 24575,
+      "started_at": "2026-09-13T16:30:23Z",
+      "ended_at": "2026-09-13T16:32:52Z",
+      "result": "passed",
+      "exit_code": 0,
+      "passed": 7,
+      "failed": 0,
+      "filtered_out": 2840,
+      "input_count": 834,
+      "source_before_after_current_equal": true,
+      "log_sha256": "563b602cc78e85f8aeb37139dc69ba7eb0b460f2cd10e30e0a5a399286673823"
+    },
+    "executable_build": {
+      "capture": "reference-monitor-build",
+      "session": 17117,
+      "pid": 26005,
+      "started_at": "2026-09-13T16:37:38Z",
+      "profile": "dev",
+      "result": "passed",
+      "deployable": false,
+      "ended_at": "2026-09-13T16:39:49Z",
+      "exit_code": 0,
+      "input_count": 834,
+      "source_before_after_current_equal": true,
+      "log_sha256": "1c890358689382ddc4494dd6e5dbbf5a29dcabee60da9b4822f8093a63f4ddac",
+      "artifact_path": "/Users/zhangzhen/Desktop/Quant/stock_analysis/.worktrees/push-reliability-20260905/.superpowers/sdd/2026-09-14-first-incremental-release/reference-monitor",
+      "artifact_sha256": "3d4e494ffaf94114418d282e8ee27d326d555a59ac024083cf5c393434d6967f",
+      "artifact_bytes": 97835952,
+      "artifact_format": "Mach-O 64-bit executable x86_64",
+      "executed": false
+    },
+    "previous_development_binary_backup": {
+      "path": "/Users/zhangzhen/Desktop/Quant/stock_analysis/.worktrees/push-reliability-20260905/.superpowers/sdd/2026-09-14-first-incremental-release/reference-monitor-before-build",
+      "sha256": "c7cd5ad33da53bdff2a373a4fd63ebc0a70f3b467880a47d2e8f131171d2e3da",
+      "note": "backup of development worktree target/debug/monitor; not the original checkout binary or a verified production rollback artifact"
+    }
+  },
+  "verified_test_scope": {
+    "manual_runner": 10,
+    "original_scheduler": 7,
+    "real_cli_executed": false,
+    "provider_or_sink_executed": false,
+    "production_readiness_verified": false
+  },
+  "deployment_blockers": [
+    "原 release 的实际源码构建身份尚未认证；a673043 仅为干净兼容性参考。",
+    "实例锁、core/durable DB、production audit 和 activation materials 绑定编译源码根；临时树产物不可直接替换原程序。",
+    "原目录 160 个未合并路径及用户修改须保留；正式基线、备份回滚和受控切换尚未完成。"
+  ],
+  "preserved_known_risks": [
+    "盘中窗口仍用完整 NaiveTime 精确相等；17 项回归不证明真实时钟路由已修复。",
+    "既有 dispatcher 的 dedup/no-data 返回语义不统一；退出 2 不授权整批自动重发。"
+  ],
+  "build_verification_scope": "clean a673043 reference plus two-file patch; non-test dev-profile monitor executable only; not a release build or production validation",
+  "proposed_followup": {
+    "description": "运行数据目录与构建目录分离；保持原DB、实例锁和审计身份；不自动覆盖冲突目录或默认选定部署源码基线",
+    "changes_two_file_package_scope": true,
+    "scope_confirmation_received": false,
+    "implemented": false
+  }
+}
