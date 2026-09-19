@@ -29,9 +29,16 @@
 - **交易所解析**：`resolve_production_equity` + `require_a_share`（`instrument_identity.rs:302`），比 holding_plan 的 `starts_with('6')` 启发式正确（BJ/别名码 fail-closed）。
 - **lib 套件 flaky 甄别法**：同环境 `git diff > patch; git checkout -- <files>; 跑套件; git apply` 做基线对照（勿用 stash — 共享栈）。本次基线 15 失败 vs 改动后 11/19，同家族不同集合 = 预存顺序依赖。
 
-## 3. 下一步（按优先级）
+## 3. 进度与下一步
 
-1. **接第 2 个 Unit**（候选：MU-virtual-watch 有结构性 STARVED 源缺陷先修源；MU-g5b-attribution 复杂；MU-snapshot-stale 简单）。走同一模板：先两决策问用户 → RED → 实现 → 回归 → 复审 → 提交。
+**2026-09-20 续 (用户指令: 剩下全部接完, 分流规则已裁决): 已完成 2/52 — T-16 (47cf502) + A-12 (a892b85)。**
+
+- 决策规则 (用户 2026-09-20 裁决): 每日必达类豁免预算 (BR-237 语义); 4 个结构性源缺陷 Unit (OrderAlert/FrozenSide/VirtualWatch/PaperSell) 跳过待修源、单独成批。
+- 下一批接线顺序: G5b → IntradayMarket → registered-template 类 (BlockConfirm/IpoCatalyst/NewsCatalyst 等, 逐一核实源健康) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
+- **G5b 设计要点 (已核实)**: 每事件一推 (≤3/日, code=None), AlertRecord 有 triggered_at/code/category/message 可作身份; LLM 结果非确定 → binding 须在分析后构造 (canonical=row 事实+渲染 sha256); identity 需每事件粒度 = `g5b-attribution:{业务日}:{code}:{record 事实 hash}` (同票双告警不被互杀), 或用户另裁。
+- 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-t16-st-price-wiring/t16-wiring-evidence.log`。
+- **经验补充 (A-12 轮)**: ① schema.rs seed 计数改消息串必须同步改比较常量 (否则 panic "must have N rows, got N" 自相矛盾); ② include_str!("main.rs") 源码扫描守卫存在 (attribution_epoch_runtime.rs), 改调用点必须同步守卫 seam; ③ LAST_RUN 类无条件设置语义要保真, 推送失败补偿靠 durable 决策而非进程内重试; ④ 复审核实: Uncertain 需人工裁定 (启动对账只补 Reserved/Rejected-retry), commit message 别写错。
+- gRPC 数据问题记录约定 (用户指令): 记入 `grpc_handoffs/` 目录。
 2. 配方 §6 的**单一事实源收敛**（触点 6 计数常量从 descriptors() 派生）— 接第 2 个 Unit 前做能省一半维护成本。
 3. 52 Unit 全部接线后：上线决策（`EffectBroker::production()` 恒 `ProductionRefused`，需发布决策 + 制品 + 回滚 + 启动对账）— 仍是未授权项。
 
