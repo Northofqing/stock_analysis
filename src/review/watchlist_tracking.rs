@@ -194,8 +194,19 @@ pub fn render_watchlist_tracking(
     snapshot: &WatchlistSnapshot,
     outcomes: &[WatchOutcome],
 ) -> String {
-    let leading_len = snapshot.leading.len();
-    let leading = &outcomes[..leading_len.min(outcomes.len())];
+    // 按身份选取前排成员: outcomes 已排除被跳过的票 (check_watchlist_today
+    // 返回 (outcomes, skipped)), 因此不能按 snapshot.leading.len() 取位置前缀
+    // —— 那会把「其余」的成员顶进前排, 使结论误报为前排分歧 (原缺陷)。
+    let leading_codes: std::collections::HashSet<&str> = snapshot
+        .leading
+        .iter()
+        .map(|entry| entry.code.as_str())
+        .collect();
+    let leading: Vec<WatchOutcome> = outcomes
+        .iter()
+        .filter(|outcome| leading_codes.contains(outcome.code.as_str()))
+        .cloned()
+        .collect();
     let limit_up_count = outcomes.iter().filter(|o| o.limit_up).count();
     let avg_change = outcomes.iter().map(|o| o.change_pct).sum::<f64>() / outcomes.len() as f64;
     let checked_date = outcomes[0].checked_date.format("%m-%d");
@@ -234,7 +245,7 @@ pub fn render_watchlist_tracking(
             o.code, o.name, o.change_pct, desc
         ));
     }
-    text.push_str(&format!("结论: {}", conclusion(leading, outcomes)));
+    text.push_str(&format!("结论: {}", conclusion(&leading, outcomes)));
     text
 }
 
@@ -496,6 +507,31 @@ mod tests {
         // 冲高回落: high 10.40 vs close 10.00 → 回落 4%
         assert!(text.contains("· 600833 第一医药 +1.40% 未板（冲高回落 高10.40）"));
         assert!(text.ends_with("结论: 前排扩散 2/2 兑现，题材情绪延续"));
+    }
+
+    #[test]
+    fn leading_is_selected_by_identity_not_by_prefix_position() {
+        // 前排 2 只 + 其余 1 只; 但前排成员 600721 被跳过, 未进入 outcomes
+        // (check_watchlist_today 返回的 outcomes 已排除 skipped)。
+        let snapshot = WatchlistSnapshot {
+            watch_date: NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            leading: vec![
+                entry("600721", "百花医药", 1),
+                entry("603758", "秦安股份", 1),
+            ],
+            other: vec![entry("600833", "第一医药", 1)],
+        };
+        let outcomes = vec![
+            outcome("603758", "秦安股份", 10.02, true, "一字", 2, Some(12.98)),
+            outcome("600833", "第一医药", 1.40, false, "", 0, Some(10.40)),
+        ];
+        let text = render_watchlist_tracking(&snapshot, &outcomes);
+        // 按位置取前缀会把「其余」的 600833 顶进前排, 得出错误的 "前排 1/2"
+        // (600833 未涨停 → 被当成前排分歧)。前排实际被核对的只有 603758 一只。
+        assert!(
+            text.ends_with("结论: 前排扩散 1/1 兑现，题材情绪延续"),
+            "结论必须只统计真正属于前排且已核对的成员, actual={text}"
+        );
     }
 
     #[test]
