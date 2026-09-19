@@ -1,5 +1,8 @@
 //! Attested business-intent storage. This module selects no default database and has no sink.
 
+#[path = "intent_store/chain_post_close.rs"]
+pub(crate) mod chain_post_close;
+
 #[path = "readiness_occurrence.rs"]
 pub(crate) mod readiness_occurrence;
 #[cfg(test)]
