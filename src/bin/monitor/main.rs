@@ -1639,10 +1639,9 @@ async fn dispatch_st_price_limit_batch(hhmm: &str) -> Result<usize, String> {
         ));
     }
 
-    let banner = current_banner()?;
     let mut pushed = 0;
     for (position, now_price, holding_qty, new_stop, new_take_profit, st_type) in prepared {
-        let ok = push_templates::dispatch_st_price_limit_changed(
+        let outcome = push_templates::dispatch_st_price_limit_changed(
             hhmm,
             &position.name,
             &position.code,
@@ -1654,16 +1653,24 @@ async fn dispatch_st_price_limit_batch(hhmm: &str) -> Result<usize, String> {
             now_price,
             Some(new_stop),
             Some(new_take_profit),
-            &banner,
         )
         .await;
-        if !ok {
-            return Err(format!(
-                "T-16 dispatch rejected after {pushed} successes for {}",
-                position.code
-            ));
+        // 重试可越过已成功前缀: 同 occurrence 且同事实字节 → decision_identity
+        // 回放返回 Pushed (durable 层无 Deduped 状态); Deduped 臂为防御性分支
+        // (与其他 counted dispatcher 的成功集合一致)。若事实漂移 (now_price 变)
+        // 则新 decision_identity 命中 Rolling 冷却头 → Denied → 仍在首票中止 —
+        // 内容寻址 86400s 的固有语义, 严格优于旧 L4 (旧路径对任何同日内重试全挡)。
+        match outcome {
+            crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped => {
+                pushed += 1;
+            }
+            other => {
+                return Err(format!(
+                    "T-16 dispatch rejected after {pushed} successes for {}: {other:?}",
+                    position.code
+                ));
+            }
         }
-        pushed += 1;
     }
     Ok(pushed)
 }

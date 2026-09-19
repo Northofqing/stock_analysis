@@ -196,10 +196,11 @@ pub enum PushKind {
     WatchlistTracking,
     CatalystReview,
     PreopenNewsHot,
+    StPriceLimitChanged,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -223,6 +224,7 @@ impl PushKind {
         Self::WatchlistTracking,
         Self::CatalystReview,
         Self::PreopenNewsHot,
+        Self::StPriceLimitChanged,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -250,6 +252,7 @@ impl PushKind {
             Self::WatchlistTracking => "WatchlistTracking",
             Self::CatalystReview => "CatalystReview",
             Self::PreopenNewsHot => "PreopenNewsHot",
+            Self::StPriceLimitChanged => "StPriceLimitChanged",
         }
     }
 
@@ -278,6 +281,7 @@ impl PushKind {
             Self::WatchlistTracking => "watchlist_tracking_v1",
             Self::CatalystReview => "catalyst_review_v1",
             Self::PreopenNewsHot => "preopen_news_hot_v1",
+            Self::StPriceLimitChanged => "st_price_limit_changed_v1",
         }
     }
 
@@ -427,6 +431,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 拒绝。改 PerTicket 与 T-03 HoldingPlan 语义一致。
         (CloseCall, PerTicket, Some(86_400), Rolling),
         (ForbiddenOps, PerTicket, Some(3_600), Rolling),
+        // 2026-09-19 用户决策: T-16 ST 涨跌幅变更提醒升级 counted
+        // (MU-st-price 接线)。occurrence = st-price:{业务日}:{code} 每票每日一次,
+        // 镜像旧 L4 (st_price_limit_changed,code,"") 86400s 语义;
+        // 计入 30 条/日预算 (盘中信息卡, 非资金动作, 与 T0Advice 同待遇)。
+        (StPriceLimitChanged, PerTicket, Some(86_400), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

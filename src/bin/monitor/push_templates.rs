@@ -6068,6 +6068,53 @@ async fn dispatch_post_fixed_price_fill_outcome(
     clippy::too_many_arguments,
     reason = "stable ST rule-change protocol boundary mirrors the documented template fields"
 )]
+/// T-16 ST 涨跌幅变更提醒 counted binding: occurrence = st-price:{业务日}:{code}。
+/// canonical 只含业务事实 (name/hhmm 为展示字段, 不进 identity/hash — BR-250 纪律)。
+pub fn build_st_price_counted_binding(
+    business_date: chrono::NaiveDate,
+    params: &StPriceLimitChangedParams<'_>,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "st-price-limit-changed-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": params.code,
+        "st_type": format!("{:?}", params.st_type),
+        "old_limit": params.old_limit,
+        "new_limit": params.new_limit,
+        "holding_qty": params.holding_qty,
+        "cost": params.cost,
+        "now_price": params.now_price,
+        "new_stop_loss": params.new_stop_loss,
+        "new_take_profit": params.new_take_profit,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (BJ/ETF 安全, 不用 starts_with('6') 启发式 — 配方 §4)。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        params.code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("T-16 证券身份解析失败 code={}: {error}", params.code))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("st-price:{business_date}:{}", params.code),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("T-16 counted binding 构造失败 code={}: {error}", params.code))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -6080,8 +6127,7 @@ pub async fn dispatch_st_price_limit_changed(
     now_price: f64,
     new_stop_loss: Option<f64>,
     new_take_profit: Option<f64>,
-    banner: &BannerCtx,
-) -> bool {
+) -> crate::notify::PushOutcome {
     let params = StPriceLimitChangedParams {
         hhmm,
         name,
@@ -6095,29 +6141,43 @@ pub async fn dispatch_st_price_limit_changed(
         new_stop_loss,
         new_take_profit,
     };
-    let text = render_st_price_limit_changed(params);
-    let result = dispatch_registered_outcome!(
+    let attempt_note = format!(
+        "st_type={:?} {}→{}%",
+        st_type,
+        old_limit * 100.0,
+        new_limit * 100.0
+    );
+    let business_date = chrono::Local::now().date_naive();
+    let binding = match build_st_price_counted_binding(business_date, &params) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            log::error!("[T-16][BR-192] {reason}");
+            log_dispatcher_attempt("T-16", false, 1, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let presentation_token = match crate::presentation_registry::acquire_token(
         "T-16-st-price-limit-changed",
         crate::notify::PushKind::StPriceLimitChanged,
         "st_price_limit_dispatcher",
         "render_st_price_limit_changed",
-        code,
-        Some(banner),
-        text
-    )
-    .is_pushed();
-    log_dispatcher_attempt(
-        "T-16",
-        result,
-        1,
-        &format!(
-            "st_type={:?} {}→{}%",
-            st_type,
-            old_limit * 100.0,
-            new_limit * 100.0
-        ),
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!("[T-16][BR-196] st-price presentation token rejected: {reason}");
+            log_dispatcher_attempt("T-16", false, 1, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let text = render_st_price_limit_changed(params);
+    let outcome =
+        crate::notify::push_counted_with_binding(presentation_token, &text, None, binding).await;
+    let handled = matches!(
+        outcome,
+        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
     );
-    result
+    log_dispatcher_attempt("T-16", handled, 1, &attempt_note);
+    outcome
 }
 
 /// v47: T-17 ETF 收盘集合竞价 dispatcher
@@ -21434,6 +21494,86 @@ mod tests {
             crate::notify::PushKind::StPriceLimitChanged.level(),
             crate::notify::PushLevel::Important
         );
+    }
+
+    // ====== T-16 counted binding (MU-st-price 接线, 2026-09-19) ======
+    #[test]
+    fn t16_counted_binding_is_per_ticket_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let params = StPriceLimitChangedParams {
+            hhmm: "09:30",
+            name: "示例ST",
+            code: "600001",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 100,
+            cost: 8.0,
+            now_price: 7.5,
+            new_stop_loss: Some(6.8),
+            new_take_profit: Some(9.6),
+        };
+        let binding = build_st_price_counted_binding(date, &params).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600001"
+        );
+        // 同票同日同事实 → 同 occurrence (durable dedup 键稳定)
+        let again = build_st_price_counted_binding(date, &params).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 展示字段 (name/hhmm) 不进 identity (BR-250 纪律)
+        let renamed = StPriceLimitChangedParams {
+            name: "另一个名字",
+            hhmm: "10:00",
+            ..params
+        };
+        let rebinding = build_st_price_counted_binding(date, &renamed).expect("valid binding");
+        assert_eq!(
+            rebinding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600001"
+        );
+        // 不同业务日 → 不同 occurrence
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_st_price_counted_binding(next_day, &params).expect("valid binding");
+        assert_eq!(
+            next.schedule_occurrence_identity(),
+            "st-price:2026-09-21:600001"
+        );
+        // 不同票 → 不同 occurrence
+        let other = StPriceLimitChangedParams {
+            code: "600002",
+            ..params
+        };
+        let other_binding = build_st_price_counted_binding(date, &other).expect("valid binding");
+        assert_eq!(
+            other_binding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600002"
+        );
+    }
+
+    #[test]
+    fn t16_counted_binding_rejects_test_and_non_equity_codes() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let test_code = StPriceLimitChangedParams {
+            hhmm: "09:30",
+            name: "A",
+            code: "TEST_CODE_600000",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 100,
+            cost: 8.0,
+            now_price: 7.5,
+            new_stop_loss: None,
+            new_take_profit: None,
+        };
+        assert!(build_st_price_counted_binding(date, &test_code).is_err());
+        let malformed = StPriceLimitChangedParams { code: "12345", ..test_code };
+        assert!(build_st_price_counted_binding(date, &malformed).is_err());
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======

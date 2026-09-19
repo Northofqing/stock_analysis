@@ -2285,6 +2285,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::PreopenNewsHot => (D::PreopenNewsHot, DeliverySubKind::None),
         K::CloseCall => (D::CloseCall, DeliverySubKind::None),
         K::ForbiddenOps => (D::ForbiddenOps, DeliverySubKind::None),
+        // 2026-09-19: T-16 ST 涨跌幅变更提醒升级 counted (MU-st-price 接线)。
+        K::StPriceLimitChanged => (D::StPriceLimitChanged, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3196,6 +3198,18 @@ mod tests {
             Some((DurablePushKind::PreopenNewsHot, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::PreopenNewsHot));
+    }
+
+    #[test]
+    fn t16_st_price_kind_maps_to_durable_st_price_limit_changed() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::StPriceLimitChanged),
+            Some((
+                DurablePushKind::StPriceLimitChanged,
+                DeliverySubKind::None
+            ))
+        );
+        assert!(is_counted_kind(PushKind::StPriceLimitChanged));
     }
 
     #[tokio::test]
