@@ -2,11 +2,64 @@
 
 状态：`PROVISIONAL`。本批输入冻结日期为 `2026-09-06`。源码接线、历史统计、原工作区文档和拟议设计必须分开阅读；它们不等于部署证明、远端 `TransportAccepted` 或用户已读。
 
-## 当前开发入口（更新至2026-09-11）
+## 当前开发入口（更新至2026-09-16北京时间；运行记录按各自日期阅读）
 
-- **最新范围调整：[单用户本地模式](single-user-local-scope-2026-09-11.md)**。按用户决定，本次取消复杂可信身份、角色授权/双人审批及外部身份发行方前置；保留任务锁、运行编号、同库事务、原字节恢复和防重复推送。旧认证缺口文档保留为历史，不再据此阻塞本地接线；本地准入代码尚未实现，不冒称生产已切换。
-- [盘后产业链持久恢复实施计划](../superpowers/plans/2026-09-11-chain-post-close-recovery.md)：基线42ce098，Task1最终源码40b0a63。固定事实/模型/候选证据、版本化原字节封存已接真实准备入口，旧回归已迁移，生产/旧持仓回归共用匹配实现。修后19项回归、另两个真实SQLite单例、CLI/monitor编译及格式检查通过，独立初审与限定修复复审完成；Task1工程验收通过，详见[实施进度与验证边界](implementation-chain-preparation-2026-09-11.md)。Task2同库安装/重开及大小写损坏拒绝两例已通过，新增五例尚未执行，业务阶段/原报告/发送恢复仍待；保持一名Rust实施者、主控单Cargo队列，后续按单用户本地模式接线。尚未改定时器，不代表误封日已修复或生产已切换。
-- [真实通知逐目标结果实施记录](implementation-notification-attempt-observation-2026-09-11.md)：初版bd143fe、最终de38876；旧send实际委托逐目标观察，保留Custom重复目标及任一弱成功投影，false/Err保留Unknown。修后16项定向测试通过、Clippy188条既有诊断无新增，初审唯一Important日志语义已修复且限定复审Approved，本前置Task完成。[盘后持久恢复设计](chain-post-close-recovery-design-2026-09-11.md)保留实际timer、同业务库准备/尝试进度、重启恢复和强完成cursor后续；普通飞书长报告截断仍待，不能说盘后误封日或完整Unit迁移已完成。
+- [账户截图与推送错配修复](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/account-snapshot-push-mismatch-2026-09-16.md)：最新持仓已导入；日期/来源、横幅、估值绑定和T-02整条消息开发验收完成，35项回归、monitor编译及独立审查通过；尚未部署，不能据此认定用户已收到修正消息。
+
+- [午盘/日终复盘与归因四项](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/review-attribution-call-chain-2026-09-16.md)、[交易/风控五项](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/trade-risk-call-chain-2026-09-16.md)、[新闻/虚拟/盘后侧路五项](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/news-virtual-side-routes-call-chain-2026-09-16.md)：最后14项已复核，23/24/25项快照实核；52个Unit均有主要调用链/完成门静态记录，不是整仓逐行审查或迁移完成。
+- [gRPC下游交接（原项目根）](/Users/zhangzhen/Desktop/Quant/stock_analysis/grpc_handoffs/README.md)：独立agent按用户要求整理原13项，主控新增公告/大宗交易2项，当前15项数据问题/验收项；运行事实、协议待确认、投影丢失、业务口径及账户来源分别列证据，不作已修复声明。
+- [市场/板块四Unit（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/market-sector-call-chain-2026-09-16.md)与[T0/CloseCall/PaperTrade三Unit（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/ticket-t0-close-call-paper-trade-call-chain-2026-09-16.md)：21/20项快照实核，该片完成时38/14，当前52项静态覆盖见顶部；不等于实现、部署或迁移完成。
+- [本机gRPC当前故障与数据充分性（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/grpc-data-readiness-assessment-2026-09-16.md)：00:47日志描述符耗尽/数据库打开失败，两次健康连接超时；未取得最新能力/批次、不自动重启，也不据此宣布所有External来源不可用。
+- [模型/搜索/首次报告后继准备（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/chain-models-search-recovery-preparation-2026-09-16.md)：9项源码/合同摘要已核，真实调用序列及窄同库恢复方向明确；待完整Macro验收后实施。
+- 当前开发：[盘后Macro恢复进度（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/chain-macro-recovery-progress-2026-09-14.md)、[完整Macro实施合同](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/chain-macro-full-implementation-2026-09-15.md)与[实施计划](../superpowers/plans/2026-09-14-chain-macro-recovery.md)。首来源Task2的50不同修正用例/消费者和独立复审已通过；完整Task3首条贯通已取得真实行为RED，正在实现共享runner/v12/真实prepare，不重做已验收片。完整Macro及后继业务仍未完成，未部署本Macro改动。
+
+- 最新实际运行版本：[扫描修复发布验收（原物理 docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/releases/monitor-scan-release-2026-09-14.md)。PID 92715 已于12:15:12完成启动对账、12:15:13取得真实飞书回执；扫描Task1的8+14定向测试、独立审查、消费者检查与release已完成。前一PID30370已优雅退出；下面旧部署/尚未部署条目保留其历史时间含义。SQLite生产修复、盘后后续恢复与全部52Unit仍未完成。
+
+- 最新实际部署优先读[原物理 docs 的启动验收](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/releases/monitor-start-2026-09-14.md)：完整开发树构建的优化 release 已运行，非下文两文件临时参考包。生产根/正文根修复、真实飞书回执已验证；完整迁移未完成。现在继续[运行期阻塞与连接校验修复](../superpowers/plans/2026-09-14-monitor-runtime-reliability.md)，隔离开发，不停止现有 monitor。下文“尚未启动/范围待确认”只对应各自历史切片。
+
+- 当前优先交付[首批手动推送独立源码包](releases/manual-push-2026-09-14/README.md)：仅两文件，原目录HEAD a673043的干净参考树已通过正反向检查、10项手动测试、7项原调度测试及非测试dev可执行文件构建；三次各834项输入和日志摘要核对一致，参考制品SHA3d4e494f…6967f。尚未部署：原release构建源待认证，临时编译根会绑定另一份数据库/实例锁/审计，不能直接复制替换。原目录160个冲突及旧二进制保持。详见[参考验证与切换缺口](releases/manual-push-2026-09-14/reference-validation.md)；盘后全链恢复不再作为此首包前置，[独立交付计划](../superpowers/plans/2026-09-14-first-incremental-release.md)保留正式制品、回滚和启动验收。
+
+- [CLI replay/single/summary三个Unit（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/cli-replay-single-summary-call-chain-2026-09-16.md)：23项快照已核，三分析入口及历史再发的调度、输入、弱回执和通知后审计边界补齐。该片完成时31/21，当前累计见顶部，不等于迁移完成。
+- [业绩/评级三个独立Unit（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/earnings-analyst-call-chain-2026-09-16.md)：26项源码快照经主控核验，报告期/issuer、空评级报告、发送前状态推进及保守恢复边界已记录。该片完成时28/24，当前累计见上条。
+- [公告/D01/新闻催化三个独立Unit（原物理docs）](/Users/zhangzhen/Desktop/Quant/stock_analysis/docs/push-system/announcement-d01-catalyst-call-chain-2026-09-16.md)：自动/手动/恢复、claim/冷却及通知后失败已核；该片完成时25/27，当前累计见上条。
+- [R03产业链复盘三个独立入口](review-r03-call-chain-2026-09-14.md)：自动/手动新消息均被无条件AccountMetricsIncomplete阻断，启动只恢复既存信封；Terminal不等于Delivered。该片完成时22/30，当前累计见上条，不等于迁移完成。
+- [R13名单核对 / A10催化复盘入口与恢复缺口](review-r13-a10-call-chain-2026-09-13.md)：已核通知后业务保存裂缝、R13前排名单错位与部分成功、A10历史来源和--push窗口差异。该片完成时19/33，当前累计见上条，不等于迁移完成。
+- [R11持仓复盘四入口与恢复缺口](review-r11-call-chain-2026-09-13.md)：空持仓首次可投递，但dispatcher复用Delivered时零快照被拒绝；历史来源绑定与通知前AI文件效果待修。该片完成时为17/35，当前累计见上条。
+
+- [龙虎榜真实效果与恢复验收](dragon-tiger-recovery-validation-2026-09-13.md)：逐次RPC、自然日事实、同库journal/审计及公开prepare真重开已取得局部通过证据；最新F2损坏反例、修复和整体验收边界见下方状态，不把session重建当SQLite重启验收。
+
+- [龙虎榜复盘四入口调用链](review-r04-call-chain-2026-09-13.md)：自动/手动/补推/启动恢复共用原业务日通知claim，但不与盘后chain来源共用完成权；自动manual override及补推附带侧路已按源码记录，不计算迁移完成率。
+- [R09来源榜单复盘四入口](review-r09-call-chain-2026-09-13.md)：实际单次RPC仅传date，两份limit/filter证据由本地构造并校验返回行；来源硬失败发生在decision之前的父任务恢复缺口仍待修复。此片完成时为16/36，当前累计见顶部最新追链条目，不等于迁移完成。
+- [R07明日观察 / R08事件日历四入口调用链](review-r07-r08-call-chain-2026-09-13.md)：R07同日手动/自动均等21点，四源正文不等于统一来源快照；R08为Rolling、CFFEX硬门，来源失败先于decision的持久任务缺口保留。此片完成时为15/37，当前累计见上一条。
+
+- [逐步替换：首批候选与切换条件](incremental-replacement-readiness-2026-09-12.md)：优先准备手动初始化/失败结果的两文件历史切片；明确竞价后续依赖与持仓身份兼容风险。尚未生成发布制品或切换monitor，不把整个dirty分支当首批包。
+
+- 最新开发状态（2026-09-14北京时间）：已修复龙虎榜历史结果时间校验缺口。70992真实反例后，80508同四项、80583原范围166项回归及87868消费者Clippy均通过；限定独立Spec/Quality通过。源码/日志摘要已核，保留56条测试告警和233条消费者告警，不冒称全仓无告警或完整Task2通过。完整历史身份/Status/重试/提交矩阵、Task2–4/W15–W21/52Unit仍未完成。首批手动包不等待本片，运行根方案尚待确认，本轮未启动或替换monitor。详见[龙虎榜恢复验收](dragon-tiger-recovery-validation-2026-09-13.md)。
+
+- 前次板块Retry续接验证（2026-09-12）：session50677于11:47:38Z退出0，105项全部通过；编译5m00s/测试65.22s、49告警，585项源码前后/当前与日志SHA一致。真实Retry确认后取消/重开，完整退避后以原request/次数/策略续接，原首组事实不改、跨代引用保持、最终总3RPC与两条原字段BR159均通过，关闭68550反例。6个正常文件修改，原测试/Cargo/固定SQL/codec形状保持。消费者Clippy session64389于11:52:07Z退出0，3m58s、lib202/monitor2告警，585项及日志核一致，较17868无新增/移除诊断种类；仅编译未运行monitor。该冻结点尚未覆盖随后新增的实际授权失败用例，当前结果以上条为准。完整授权/故障/兼容矩阵、错误终结材料、Task2/真实调度和52Unit仍未完成。
+
+- 前次成功Response提交恢复验证（2026-09-12）：session25581于10:56:05Z退出0，104项全部通过，编译5m56s/测试72.74s、49条告警；585项before/after/当次当前与日志SHA独立一致。真实Concept最终COMMIT争用后回滚，关闭重开换代后只用原Response补最终事务；总RPC仍3、原begin/result及Industry旧审计不改，两条最终BR159的完整原字段/时间/批次均保持。消费者Clippy session17868已于11:01:11Z退出0，编译3m54s，lib202/monitor2告警；585项源码前后/当前与日志SHA一致。仅编译未运行二进制，新增三类诊断已记实施台账，非零告警验收。ConfirmedRetry、错误终结及其他故障/兼容矩阵、完整Task2/真实调度/全部52Unit仍未完成。详见[板块验收矩阵](board-directory-recovery-validation-2026-09-12.md)。
+
+## 历史进展与证据索引
+
+以下按各次冻结版本保留过程证据；“待验”“最新”等措辞只对应该条记录当时的状态，当前结果以上方板块进度为准。
+
+- 最新盘后验证：session76721 于07:34:22Z退出0，90项全部通过（审计19+原盘后71），47条告警；579项源码前后/当次当前与日志摘要已核。BR159同事务追加、真实SQL/COMMIT故障回滚、新旧writer/reader、跨能力/来源前态、坏尾/缺表/只读拒绝均通过，原盘后恢复保持。消费者Clippy1348已于07:41:10Z退出0（lib199/monitor2告警），579项源码及日志摘要一致，较31234无新增或移除诊断种类；仅编译、未运行monitor；板块schema/全链准入、实际RPC与后续来源/模型/报告发送仍待。以下为历史验证点，测试数不是Unit迁移数。
+- 最新盘后验证：session85939于06:43:43Z退出0，71项全部通过、47条告警，578项源码前后/当次当前及日志SHA一致。新增真实prepare的候选硬停止与普通Unavailable政策、实际v3→v4旧事实保持、迁移COMMIT整体回滚/重开重试、异名index/trigger拒绝不修复均已验证。首轮E0603仅为测试引用私有类型，修正测试私有cause后通过，生产/SQL/codec未改。[v4维护测试](../../src/push_foundation/intent_store/chain_post_close_v4_migration_tests.rs)只使用自有临时库。同一源码消费者Clippy31234退出0（lib199/monitor2告警，较75032新增两类诊断）；后续来源/模型/报告发送、真实timer、强完成及52个Unit仍未完成，以下为历史阶段证据。
+- 当前聚类修后验证：session43450于2026-09-12 06:12:16Z退出0，同67项全部通过、47条告警；577项源码前后/当次当前与日志摘要均独立核对一致。上一轮三个反例已关闭：业务应用在同事务内绑定原完整概念图，两条父子事实关系拒绝代次倒退和同代执行者矛盾，合法跨代恢复保持。全部67项预期及冻结SQL/codec未改。下一组继续候选硬停止/普通降级和v4旧事实迁移、真实提交回滚维护；后续来源/模型、报告/逐目标发送、实际timer及强完成仍待。以下session是各自历史冻结点的证据，不能把测试数当52个Unit迁移数。
+- 聚类维护最新结果：session28463同67项64通过、3失败，47条告警；577项源码前后/当前及日志摘要一致。三个反例暴露业务应用前未绑定原完整概念图、父子事实代次与同代执行者关联校验缺口；正在最小修复，不能将下一条原53项通过当本轮全绿。其余新增配置/完整图/跨代/空与重叠簇、真实业务SQL和COMMIT回滚/重开维护已通过。只使用自有临时库，不是生产事故或生产切换。
+- 最新盘后聚类验证：session79018于2026-09-12 05:18:00Z退出0，53项定向测试全部通过、47条告警；576项源码前后与当前摘要、日志SHA均核对一致。新增实际prepare贯通了固定阈值、原聚类/别名/孤立股票、chain_daily同库应用及原生命周期重开恢复，现时业务修改不被恢复覆盖。聚类边界/故障/关联损坏和v4旧事实迁移补验仍待；后面的来源/模型、报告/逐目标发送、真实timer与强完成状态尚未完成。下列各session为历史阶段证据，53项不是52个Unit迁移完成，消费者Clippy仍是v4改动前的证据。
+- **最新范围调整：[单用户本地模式](single-user-local-scope-2026-09-11.md)**。按用户决定，本次取消复杂可信身份、角色授权/双人审批及外部身份发行方前置；保留任务锁、运行编号、同库事务、原字节恢复和防重复推送。旧认证缺口文档保留为历史，不再据此阻塞本地接线；本地准入正在开发，尚未验收，不冒称生产已切换。
+- [盘后产业链持久恢复实施计划](../superpowers/plans/2026-09-11-chain-post-close-recovery.md)：基线42ce098，Task1最终源码40b0a63。固定事实/模型/候选证据、版本化原字节封存已接真实准备入口，旧回归已迁移，生产/旧持仓回归共用匹配实现。修后19项回归、另两个真实SQLite单例、CLI/monitor编译及格式检查通过，独立初审与限定修复复审完成；Task1工程验收通过，详见[实施进度与验证边界](implementation-chain-preparation-2026-09-11.md)。2026-09-12 Task2已实现单用户本地入口、固定输入/缓存、任务锁及首个概念查询的持久记录；跨运行凭据绑定修复后session64782合并32项全部通过，保留48条编译告警。此前旧版本任务锁分类、真实取消、输入有限精度、7项安装基础及首阶段结果重开不重复查询均有证据；后续完整概念批次/缓存写、业务落库、原报告和发送恢复仍待。保持一名Rust实施者、主控单Cargo队列；尚未改定时器，不代表误封日已修复或生产已切换。
+- 盘后完整概念批次/同库缓存进度首轮贯通验证通过：session60795发现旧v2第二请求被意外放行，恢复“v2仅首阶段、v3才完整批次”的实际布局边界后，session49295同33项全部通过，保留48条告警。原断言/SQL未改，新批次原结果与缓存进度重开后零查询/零重写已有实测。后续补验进度见下一条；此33项只对应该冻结版本，不代表后续新增测试或完整Task2验收通过。
+- 最新补验session14534：40项全部通过、47条告警。覆盖全命中完整图/更新时间保持、8请求最多6在途及乱序逐结果持久、普通错误/空raw收齐后按顺序停止缓存、多在途取消和读锁故障停止、缓存业务行/事实/head回滚、三态partial恢复。此前测试错误的原因读取和Result解包均已修正，生产脱敏未改。读锁回滚不冒充公开错误已有底层operation诊断；该诊断、持久关联拒绝、独立SQL写故障与迁移补验仍待，整个Task2及生产切换未完成。
+- 后续事实关联反例session20424：45项38通过、7失败，47条告警。两个故障例未保留底层存储cause；五个保持原schema的异常关联例被读取错误接受（code/ordinal串用、跨事实版本碰撞、owner/代次/时间矛盾）。修后证据见下一条；测试只使用自有临时库，不是生产事故。原40项通过属于上一冻结版本，不能代替本轮新增断言验收。
+- 最新修后session70253：同45项全部通过，47条告警。仅facade补真实cause保留和原请求/结果/缓存的关系校验，原停止分类、SQL、codec及测试预期不变；合法跨代缓存恢复仍通过。两个真实读锁故障现已直接核到commit操作类别，五个异常关联例均拒绝。继续旧事实迁移/v3迁移回滚与封存拒绝、独立SQL写故障补验；不代表完整盘后流程、Task2或生产切换完成。
+- 迁移维护组合批session58384：52条定向测试50通过、2失败，47条告警。独立cache SQL写入失败/cause与回滚、未来/孤立/未封存拒绝、封存写保护及异名index/trigger独立拒绝已通过；两例被测试快照错误列名阻断，尚未到实际迁移/迁移COMMIT断言，正在只修测试查询。52是用例数，不是52个推送单元已迁移。
+- 最新session44708：修正测试快照列名后，同52项全部通过、47条告警；573项源码前后/当前及日志摘要一致。两份真实旧v2运行无损迁移、旧reader拒绝、重开零provider，以及实际迁移COMMIT失败完整回滚/重开仍v2/后续正常迁移均已执行通过，生产实现与冻结SQL未为此次修正改变。当前继续消费者编译和聚类/业务落库恢复；整个Task2、定时器误封日与生产切换仍未完成。
+- 同一源码消费者检查session75032退出0，lib、stock_analysis及monitor编译通过（未运行二进制）；库197条、monitor 2条告警。与前次97458按告警标题和源码路径比较无新增/移除诊断种类，不称全仓零告警。聚类/chain_daily下一片开始测试先行，旧52项证据不代替后续新增代码验收。
+- 聚类首例session87295取得9个缺接口编译错误，574项源码前后/当前及日志摘要一致，未执行业务断言。新增测试要求真实prepare固定阈值/原成员别名与孤立股票、chain_daily原upsert/10自然日生命周期及重开零重写。v4存储候选已纠正配置与概念图的先后关系、历史事实版本与当前head的区分；聚类恢复正在实现，尚未验收，不将上一冻结点52项通过说成当前新增测试已通过。
+- [真实通知逐目标结果实施记录](implementation-notification-attempt-observation-2026-09-11.md)：初版bd143fe、最终de38876；旧send实际委托逐目标观察，保留Custom重复目标及任一弱成功投影，false/Err保留Unknown。原修后16项定向测试与独立复审通过，本前置Task完成。2026-09-12另修普通飞书长报告截断，session76293已验证原文完整分片与旧通知兼容，预算边界继续补验。[盘后持久恢复设计](chain-post-close-recovery-design-2026-09-11.md)仍保留真实timer、同业务库进度、重启恢复与强完成cursor；不能说误封日或完整Unit迁移已完成。
 
 当前审计基线：后续蓝图发现的MU-auction-volume旧摘要已由当前审计Task2在047b4ab修正；该批真实draft0、strict仅七项发布条件、610项只读与独立Spec/Quality均通过，新增问题已关闭。新版蓝图已消费最终SHA，不混用审计初版ff94eca身份。另撤回“v18/v19实际仅九份文件”的结论：Git跟踪16份，其中九份属于固定source catalog，另七份已完整读取并单列原文证据，不扩张冻结来源权威。
 
@@ -28,7 +81,8 @@
 - [持仓计划同快照、同行情批次来源接线](implementation-holding-plan-frozen-source-2026-09-10.md)：源码112ff8f；实际manual/periodic共用准备固定一份持仓、按其代码请求行情并保留完整batch evidence，单次本地时间驱动正文/业务日/本地observed_at。来源实际RED后修复，27项最终定向测试及静态检查通过，独立Spec/Quality通过；既有告警Minor保留。日表与durable统一、有效修订/再次发送资格及来源认证仍待，不是完整Unit迁移或生产切换。
 - [恢复分类不确定投递读取修复](implementation-recovered-uncertain-read-2026-09-08.md)：源码a2429b3、修复fb55d32/61e9d16；真实过期恢复贯通Generic/P01及SLA/指标。自环与跳链均实际RED后修复，最终55项/静态检查/限定复审通过；无盲重发或状态提升，不等于完整Q39/W19完成。
 - [CI 映射式触发识别修复](implementation-ci-mapping-trigger-2026-09-08.md)：源码80d0fb2；95项定向测试、614条断言通过，独立复审已关闭排除项取消全部正向匹配漏洞；识别当前真实CI触发格式，不改CI配置，也不代表HTML/统一checker/实际CI已交付。
-- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-10最新补充后，10个Unit已定位实际旧业务入口及主要完成门，42个尚未逐链完成；原9/43、8/44等历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
+- [52个迁移单元的当前完成证据](remaining-migration-evidence-2026-09-08.md)：2026-09-13补齐R09四入口后，16个Unit已定位实际旧业务入口及主要完成门，36个尚未逐链完成；原15/37、13/39等历史口径保留，不以注册表、调用链或测试数计算迁移完成率。
+- [盘前与CLI产业链调用链](chain-preopen-cli-call-chain-2026-09-13.md)：核对09:05–09:15/自然日日期门、CLI分派与dry-run未消费、最近已完成交易日、财联社20取15、报告先保存和弱发送bool。盘前失败误封日/CLI失败仍正常返回/同名覆盖均为源码条件反例；逐目标弱观察已经存在，持久恢复与实际切换未完成。
 - [集合竞价候选单元调用链](auction-candidates-call-chain-2026-09-10.md)：源码409dbaf；A-02/P-05分时成功与同轮双bool外门不匹配，P-05在主卡发送前推进快照并忽略失效通知结果。仅源码反例与后续接线约束，不是生产复现或已修复，不扩大当前P-02量能诊断任务。
 - [盘中连板单元调用链](limit-boards-call-chain-2026-09-10.md)：源码1931014；上游主力净流None与下游Some过滤导致当前选集为空；正式接源后还需解决发送前封口、Top10前推进集合及三形态共享冷却。仅静态分析，尚未修复或生产验证，不混入当前P-02诊断任务。
 - [盘后产业链单元调用链](chain-post-close-call-chain-2026-09-10.md)：源码20f215d；通知false/异常被mode吞成Ok后封日，跨自然日可重复同业务日，报告先落盘且同名覆盖，多渠道bool不等于强回执。保留快讯回退与龙虎榜独立日期/降级边界；只读分析，未修复或生产复现。
