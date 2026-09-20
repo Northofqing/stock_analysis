@@ -31,7 +31,7 @@
 
 ## 3. 进度与下一步
 
-**2026-09-20 续 (用户指令: 剩下全部接完 → 改自主连续模式「直接干完, 不要一直输入继续」): 已完成 17/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0) + I-01 盘中轮动 (cc828b7) + I-02 新闻催化 (0277cc9) + BR-033 大宗盘中确认 (00128fd) + A-11 IPO 阶段催化 (f5226e9) + SnapshotStale 快照过期提醒 (9a05561) + LimitBoards 涨停板板数榜 (2941664) + DataMode 数据模式卡 (7e2a806) + A-02 竞价重推 (e90201e) + T-08 候选失效 (7fba9f3) + S-01 公告源事实 (a9cb117) + S-05 分析师上调 (c833c18) + D-01 新闻到灵感 (753c0b3) + P-02 竞价量能 (c45e96c) + I-03 盘中涨停扩散 (7ed55a8)。剩余完整清单: .superpowers/sdd/2026-09-20-remaining-unit-inventory.md (A 类 9 个接线单元 / B 类缺陷源批次锁定跳过 / C 类已覆盖或 INACTIVE)。**
+**2026-09-20 续 (用户指令: 剩下全部接完 → 改自主连续模式「直接干完, 不要一直输入继续」): **已完成 18/52 — A 类接线单元全部完成** (N-02 新闻聚合 147ac6f 收官)。剩余 = 缺陷源批次 (B 类锁定跳过待修源) + 上线决策 (未授权) + 收尾清理。详细清单: .superpowers/sdd/2026-09-20-remaining-unit-inventory.md (最终版)。剩余完整清单: .superpowers/sdd/2026-09-20-remaining-unit-inventory.md (A 类 9 个接线单元 / B 类缺陷源批次锁定跳过 / C 类已覆盖或 INACTIVE)。**
 
 - 决策规则 (用户 2026-09-20 裁决): 每日必达类豁免预算 (BR-237 语义); 4 个结构性源缺陷 Unit (OrderAlert/FrozenSide/VirtualWatch/PaperSell) 跳过待修源、单独成批。
 - 下一批接线顺序: registered-template 类 (BlockConfirm/IpoCatalyst 等) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
