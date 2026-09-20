@@ -6627,6 +6627,52 @@ pub fn build_announcement_counted_binding(
     .map_err(|error| format!("S-01 counted binding 构造失败: {error}"))
 }
 
+/// MU-analyst: S-05 分析师上调 counted binding (2026-09-20): occurrence
+/// analyst-upgrade:{业务日}:{source}:{event_id} (event_id 为 provider-
+/// scoped, 加 source 段防跨源碰撞 — S-01 同形); canonical = 业务日 +
+/// event 事实 + 渲染 sha256; Global scope; retry_authorized=true (历史
+/// 事实 + 旧轮询 dedup 后不重发, durable 唯一恢复路径 — S-01 同论据)。
+pub fn build_analyst_upgrade_counted_binding(
+    business_date: chrono::NaiveDate,
+    event_id: &str,
+    code: Option<&str>,
+    title: &str,
+    source: &str,
+    strength: u8,
+    certainty: u8,
+    stale: bool,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "analyst-upgrade-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "event_id": event_id,
+        "code": code,
+        "title": title,
+        "source": source,
+        "strength": strength,
+        "certainty": certainty,
+        "stale": stale,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("analyst-upgrade:{business_date}:{source}:{event_id}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("S-05 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -22840,6 +22886,68 @@ mod tests {
             60,
             false,
             "公告样本二",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 历史事实 + 唯一恢复路径 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u15_counted_binding_is_per_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            Some("600001"),
+            "上调评级",
+            "em",
+            75,
+            85,
+            false,
+            "分析师上调样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "analyst-upgrade:2026-09-20:em:upg-001"
+        );
+        // 同 event 同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            Some("600001"),
+            "上调评级",
+            "em",
+            75,
+            85,
+            false,
+            "分析师上调样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 source 同 event_id → 不同 occurrence (跨源防碰撞)
+        let other = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            None,
+            "上调评级",
+            "cninfo",
+            75,
+            85,
+            false,
+            "分析师上调样本",
         )
         .expect("valid binding");
         assert_ne!(

@@ -7672,8 +7672,13 @@ mod tests {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
         let now = chrono::Local::now();
+        // 2026-09-20 (MU-announcement counted): Announcement 已 counted,
+        // v14_gate_source_fact 对 counted kind 恒拒 counted_binding_required
+        // — 此测试验证的是 v14 源事实门本身的 L4 去重/审计回滚语义, 按
+        // seam 轮换纪律改用未 counted 的 PolicyHit 作代表 kind (I-01/I-02
+        // 轮先例)。
         let evidence = crate::v14_adapter::SourceFactEvidence::new(
-            PushKind::Announcement,
+            PushKind::PolicyHit,
             "TEST_CODE_POST_AUDIT_RETRY_ID".to_string(),
             Some("TEST_CODE_POST_AUDIT_RETRY".to_string()),
             "后置审计失败后允许重试".to_string(),
@@ -7690,14 +7695,14 @@ mod tests {
             other => panic!("first attempt must reserve: {other:?}"),
         };
 
-        settle_dedup_after_delivery(&first, PushKind::Announcement, None, None, true, false)
+        settle_dedup_after_delivery(&first, PushKind::PolicyHit, None, None, true, false)
             .expect("failed post-delivery audit must roll back L4 identity");
 
         let retry = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
             crate::v14_adapter::V14Gate::Approved(event) => *event,
             other => panic!("audit failure must leave the source fact retryable: {other:?}"),
         };
-        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::Announcement, None, None)
+        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::PolicyHit, None, None)
             .expect("test cleanup rollback");
     }
 

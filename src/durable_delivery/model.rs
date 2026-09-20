@@ -219,10 +219,12 @@ pub enum PushKind {
     CandidateInvalidated,
     // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
     Announcement,
+    // 2026-09-20: 分析师上调升级 counted (MU-analyst 接线)。
+    AnalystUpgrade,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -259,6 +261,7 @@ impl PushKind {
         Self::AuctionRepush,
         Self::CandidateInvalidated,
         Self::Announcement,
+        Self::AnalystUpgrade,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -299,6 +302,7 @@ impl PushKind {
             Self::AuctionRepush => "AuctionRepush",
             Self::CandidateInvalidated => "CandidateInvalidated",
             Self::Announcement => "Announcement",
+            Self::AnalystUpgrade => "AnalystUpgrade",
         }
     }
 
@@ -340,6 +344,7 @@ impl PushKind {
             Self::AuctionRepush => "auction_repush_v1",
             Self::CandidateInvalidated => "candidate_invalidated_v1",
             Self::Announcement => "announcement_v1",
+            Self::AnalystUpgrade => "analyst_upgrade_v1",
         }
     }
 
@@ -556,6 +561,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // DataMode 先例: event_id 精确去重是旧语义, 批量公告同日全达 —
         // 8/30 周日 19 条实证)。
         (Announcement, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: S-05 分析师上调升级 counted (MU-analyst 接线)。
+        // 盘中信息卡计入预算 (分流规则); Rolling 86400s 镜像显式 L4
+        // (notify.rs:448 "1次/日" — 旧 kind-全局日级 throttle 保真)。
+        (AnalystUpgrade, Global, Some(86_400), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

@@ -779,6 +779,33 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
                     }
                 }
             }
+            PushKind::AnalystUpgrade => {
+                match crate::push_templates::build_analyst_upgrade_counted_binding(
+                    event.observed_at.date_naive(),
+                    &event.event_id,
+                    event.code.as_deref(),
+                    &event.title,
+                    &event.source,
+                    event.strength,
+                    event.certainty,
+                    event.stale,
+                    &rendered,
+                ) {
+                    Ok(binding) => {
+                        crate::notify::push_counted_with_binding(
+                            presentation_token,
+                            &rendered,
+                            None,
+                            binding,
+                        )
+                        .await
+                    }
+                    Err(reason) => {
+                        log::error!("[v17.7][BR-137] counted 准备失败: {reason}");
+                        PushOutcome::Denied(reason)
+                    }
+                }
+            }
             _ => PushOutcome::Denied("counted_source_kind_not_wired".to_owned()),
         }
     } else if matches!(

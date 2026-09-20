@@ -2311,6 +2311,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::CandidateInvalidated => (D::CandidateInvalidated, DeliverySubKind::None),
         // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
         K::Announcement => (D::Announcement, DeliverySubKind::None),
+        // 2026-09-20: 分析师上调升级 counted (MU-analyst 接线)。
+        K::AnalystUpgrade => (D::AnalystUpgrade, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3344,6 +3346,15 @@ mod tests {
             Some((DurablePushKind::Announcement, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::Announcement));
+    }
+
+    #[test]
+    fn analyst_upgrade_kind_maps_to_durable_analyst_upgrade() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AnalystUpgrade),
+            Some((DurablePushKind::AnalystUpgrade, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AnalystUpgrade));
     }
 
     #[tokio::test]
