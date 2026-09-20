@@ -837,11 +837,7 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
         }
     } else if matches!(
         kind,
-        PushKind::Announcement
-            | PushKind::PolicyHit
-            | PushKind::EarningsBeat
-            | PushKind::EarningsMiss
-            | PushKind::AnalystUpgrade
+        PushKind::PolicyHit | PushKind::EarningsBeat | PushKind::EarningsMiss
     ) {
         match crate::v14_adapter::SourceFactEvidence::new(
             kind,
