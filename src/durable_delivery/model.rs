@@ -199,10 +199,12 @@ pub enum PushKind {
     StPriceLimitChanged,
     AttributionDaily,
     G5bAttribution,
+    // 2026-09-20: I-01 盘中轮动升级 counted (MU-intraday-market 接线)。
+    IntradayMarket,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -229,6 +231,7 @@ impl PushKind {
         Self::StPriceLimitChanged,
         Self::AttributionDaily,
         Self::G5bAttribution,
+        Self::IntradayMarket,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -259,6 +262,7 @@ impl PushKind {
             Self::StPriceLimitChanged => "StPriceLimitChanged",
             Self::AttributionDaily => "AttributionDaily",
             Self::G5bAttribution => "G5bAttribution",
+            Self::IntradayMarket => "IntradayMarket",
         }
     }
 
@@ -290,6 +294,7 @@ impl PushKind {
             Self::StPriceLimitChanged => "st_price_limit_changed_v1",
             Self::AttributionDaily => "attribution_daily_v1",
             Self::G5bAttribution => "g5b_attribution_v1",
+            Self::IntradayMarket => "intraday_market_v1",
         }
     }
 
@@ -452,6 +457,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 无冷却 (WindowMode::None, 镜像 HoldingEvent 先例); 盘后归因类豁免日预算
         // (分流规则: 复盘/归因不被盘中信号饿死)。
         (G5bAttribution, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: I-01 盘中轮动升级 counted — R-02 盘面走向每 5 分钟硬推,
+        // Rolling 900s 镜像旧 L4 (notify cooldown_secs 900, per-kind 全局头);
+        // 盘中信息卡计入 30 条/日预算 (分流规则)。同 kind 两个每日一次借用点
+        // (BR-226 快照提醒/盘前预检) 同样计预算 — per-kind 粒度无法拆分。
+        (IntradayMarket, Global, Some(900), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

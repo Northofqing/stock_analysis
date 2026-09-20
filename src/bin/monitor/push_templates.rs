@@ -6188,6 +6188,79 @@ pub fn build_attribution_daily_counted_binding(
     .map_err(|error| format!("A-12 counted binding 构造失败: {error}"))
 }
 
+/// I-01 盘中轮动 counted binding 的 occurrence 生产者区分。同 kind 四个语义:
+/// 每日一次健康提醒 (BR-226 快照/盘前预检)、5 分钟周期信息卡 (R-02 盘面走向)
+/// 与手工工具轮动总览, 各自独立 occurrence, 互不挤占身份; 冷却仍共享
+/// per-kind 900s 全局头 (镜像旧 L4)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntradayProducer {
+    /// BR-226 持仓快照新鲜度提醒 (15:05, 每日一次)
+    SnapshotReminder,
+    /// 开盘前行情源预检失败 (9:10-9:20, 每日一次, 仅失败时出声)
+    PreopenProbe,
+    /// R-02 盘中盘面走向 (每 5 分钟硬推, 每时间槽独立 occurrence)
+    MarketView { hhmm: String },
+    /// I-01 板块轮动总览 (仅 --push 手工工具经 dispatch_intraday_market_daily;
+    /// 生产盘中轮动已由 R-02 盘面走向替代, 每时间槽独立 occurrence)
+    SectorRotation { hhmm: String },
+}
+
+impl IntradayProducer {
+    fn identity_suffix(&self) -> String {
+        match self {
+            Self::SnapshotReminder => "snapshot-reminder".to_owned(),
+            Self::PreopenProbe => "preopen-probe".to_owned(),
+            Self::MarketView { hhmm } => format!("market-view:{hhmm}"),
+            Self::SectorRotation { hhmm } => format!("sector-rotation:{hhmm}"),
+        }
+    }
+
+    /// 旧语义保真: 各生产者自有进程内补偿 (BR-226 次日再检 / 预检窗口即弃 /
+    /// R-02 5 分钟循环新渲染重试 / 轮动总览手工重跑), durable 补发只会推送
+    /// 过时时间戳内容 (R-02 全天失败时重启 flood 风险) — 故 sink 失败不授权
+    /// 重试, 只留审计。
+    fn retry_authorized(&self) -> bool {
+        match self {
+            Self::SnapshotReminder
+            | Self::PreopenProbe
+            | Self::MarketView { .. }
+            | Self::SectorRotation { .. } => false,
+        }
+    }
+}
+
+/// I-01 counted binding: canonical = 业务日 + 生产者 + 渲染文本 sha256
+/// (A-12/G5b 模式, 同事实同字节 decision 回放稳定); Global scope (盘面为
+/// 市场级事实, 无票维度); policy 行 Rolling 900s 镜像旧 L4 全局冷却。
+pub fn build_intraday_counted_binding(
+    business_date: chrono::NaiveDate,
+    producer: IntradayProducer,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "intraday-market-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "producer": producer.identity_suffix(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("intraday:{business_date}:{}", producer.identity_suffix()),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        producer.retry_authorized(),
+    )
+    .map_err(|error| format!("I-01 counted binding 构造失败: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -15544,20 +15617,40 @@ pub async fn push_intraday_market(
 }
 
 async fn push_intraday_market_outcome(
-    code: &str,
+    _code: &str,
     banner: &BannerCtx,
     params: IntradayMarketParams<'_>,
 ) -> crate::notify::PushOutcome {
     let text = render_intraday_market(banner, params);
-    dispatch_registered_outcome!(
-        "I-01-intraday-market",
-        crate::notify::PushKind::IntradayMarket,
-        "intraday_market_dispatcher",
-        "render_intraday_market",
-        code,
-        Some(banner),
-        text
+    // 2026-09-20: I-01 轮动总览升级 counted (MU-intraday-market)。生产盘中
+    // 轮动已由 R-02 盘面走向替代, 此 dispatcher 仅 --push 手工工具经
+    // dispatch_intraday_market_daily 调用; counted 门 (v14_gate_counted_binding,
+    // CountedCombinedAccount) 内部取 banner 并评估 mode/dm, 与 T-16 同形态。
+    // 每时间槽独立 occurrence; retry_authorized=false (手工重跑即补偿)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_intraday_counted_binding(
+        today,
+        IntradayProducer::SectorRotation { hhmm },
+        &text,
     )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "I-01-intraday-market",
+            crate::notify::PushKind::IntradayMarket,
+            "intraday_market_dispatcher",
+            "render_intraday_market",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-01][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.2 I-02 新闻催化映射 (⚡交易建议类, 带 banner)
@@ -21735,6 +21828,88 @@ mod tests {
         assert!(build_st_price_counted_binding(date, &test_code).is_err());
         let malformed = StPriceLimitChangedParams { code: "12345", ..test_code };
         assert!(build_st_price_counted_binding(date, &malformed).is_err());
+    }
+
+    #[test]
+    fn i01_counted_binding_identity_is_per_producer_and_per_time_slot() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "盘中盘面走向样本";
+
+        // R-02 周期卡: 每时间槽独立 occurrence (跨槽重试不互杀身份)
+        let slot_a = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            slot_a.schedule_occurrence_identity(),
+            "intraday:2026-09-20:market-view:10:15"
+        );
+        let slot_b = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:20".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            slot_b.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+
+        // 每日一次提醒: 同业务日同生产者 → 同 occurrence
+        let reminder = build_intraday_counted_binding(
+            date,
+            IntradayProducer::SnapshotReminder,
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            reminder.schedule_occurrence_identity(),
+            "intraday:2026-09-20:snapshot-reminder"
+        );
+        let probe = build_intraday_counted_binding(date, IntradayProducer::PreopenProbe, text)
+            .expect("valid binding");
+        assert_eq!(
+            probe.schedule_occurrence_identity(),
+            "intraday:2026-09-20:preopen-probe"
+        );
+        assert_ne!(
+            reminder.schedule_occurrence_identity(),
+            probe.schedule_occurrence_identity()
+        );
+
+        // 手工工具轮动总览: 同样每时间槽独立
+        let rotation = build_intraday_counted_binding(
+            date,
+            IntradayProducer::SectorRotation { hhmm: "10:30".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            rotation.schedule_occurrence_identity(),
+            "intraday:2026-09-20:sector-rotation:10:30"
+        );
+        assert_ne!(
+            rotation.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+    }
+
+    #[test]
+    fn i01_counted_binding_is_global_scope_without_replay_authorization() {
+        // 旧语义保真: 三个生产者各有进程内补偿 (次日再检/窗口即弃/5 分钟循环),
+        // durable 补发只会推过时时间戳内容 → retry_authorized=false, 只留审计。
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            "盘中盘面走向样本",
+        )
+        .expect("valid binding");
+        assert_eq!(binding.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======

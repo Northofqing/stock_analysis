@@ -9285,7 +9285,33 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     };
                     if let Some(text) = reminder {
                         log::warn!("[BR-226] {text}");
-                        let outcome = push_governor_v3(&text, PushKind::IntradayMarket, None).await;
+                        // 2026-09-20: I-01 升级 counted 持久投递 (MU-intraday-market)。
+                        // 旧注释 "推送失败不重试 (次日再检)" 语义保真: binding
+                        // retry_authorized=false, sink 失败只留审计不补发 (内容含
+                        // age_hours, 补发即过时); 次日快照仍过期则再检。
+                        let outcome = match push_templates::build_intraday_counted_binding(
+                            today,
+                            push_templates::IntradayProducer::SnapshotReminder,
+                            &text,
+                        )
+                        .and_then(|binding| {
+                            crate::presentation_registry::acquire_token(
+                                "I-01-intraday-market",
+                                PushKind::IntradayMarket,
+                                "intraday_market_dispatcher",
+                                "render_intraday_market",
+                            )
+                            .map(|token| (token, binding))
+                        }) {
+                            Ok((token, binding)) => {
+                                crate::notify::push_counted_with_binding(token, &text, None, binding)
+                                    .await
+                            }
+                            Err(reason) => {
+                                log::error!("[BR-226][BR-196] counted 准备失败: {reason}");
+                                crate::notify::PushOutcome::Denied(reason)
+                            }
+                        };
                         log::info!(
                             "[BR-226] 持仓快照预警推送: outcome={:?} pushed={}",
                             outcome,
@@ -9664,9 +9690,36 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         let text = "⚠️ 开盘前行情源预检失败: 统一实时行情返回空批次 (9:10)。\n若 9:20 竞价时行情未恢复, A-02 竞价优选/P-05 候选台将在窗口内重试。"
                                             .to_string();
                                         log::warn!("[预检][行情源] {text}");
-                                        let outcome =
-                                            push_governor_v3(&text, PushKind::IntradayMarket, None)
-                                                .await;
+                                        // 2026-09-20: I-01 升级 counted 持久投递
+                                        // (MU-intraday-market)。窗口即弃语义保真:
+                                        // retry_authorized=false (9:20 后补发无意义)。
+                                        let outcome = match push_templates::build_intraday_counted_binding(
+                                            probe_today,
+                                            push_templates::IntradayProducer::PreopenProbe,
+                                            &text,
+                                        )
+                                        .and_then(|binding| {
+                                            crate::presentation_registry::acquire_token(
+                                                "I-01-intraday-market",
+                                                PushKind::IntradayMarket,
+                                                "intraday_market_dispatcher",
+                                                "render_intraday_market",
+                                            )
+                                            .map(|token| (token, binding))
+                                        }) {
+                                            Ok((token, binding)) => {
+                                                crate::notify::push_counted_with_binding(
+                                                    token, &text, None, binding,
+                                                )
+                                                .await
+                                            }
+                                            Err(reason) => {
+                                                log::error!(
+                                                    "[预检][行情源][BR-196] counted 准备失败: {reason}"
+                                                );
+                                                crate::notify::PushOutcome::Denied(reason)
+                                            }
+                                        };
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
@@ -9677,9 +9730,36 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             "⚠️ 开盘前行情源预检失败 (9:10): {error}\n若 9:20 竞价时行情未恢复, A-02/P-05 将在窗口内重试。"
                                         );
                                         log::warn!("[预检][行情源] {text}");
-                                        let outcome =
-                                            push_governor_v3(&text, PushKind::IntradayMarket, None)
-                                                .await;
+                                        // 2026-09-20: I-01 升级 counted 持久投递
+                                        // (MU-intraday-market)。窗口即弃语义保真:
+                                        // retry_authorized=false (9:20 后补发无意义)。
+                                        let outcome = match push_templates::build_intraday_counted_binding(
+                                            probe_today,
+                                            push_templates::IntradayProducer::PreopenProbe,
+                                            &text,
+                                        )
+                                        .and_then(|binding| {
+                                            crate::presentation_registry::acquire_token(
+                                                "I-01-intraday-market",
+                                                PushKind::IntradayMarket,
+                                                "intraday_market_dispatcher",
+                                                "render_intraday_market",
+                                            )
+                                            .map(|token| (token, binding))
+                                        }) {
+                                            Ok((token, binding)) => {
+                                                crate::notify::push_counted_with_binding(
+                                                    token, &text, None, binding,
+                                                )
+                                                .await
+                                            }
+                                            Err(reason) => {
+                                                log::error!(
+                                                    "[预检][行情源][BR-196] counted 准备失败: {reason}"
+                                                );
+                                                crate::notify::PushOutcome::Denied(reason)
+                                            }
+                                        };
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
@@ -10815,12 +10895,43 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                             match market_view {
                                 Ok(Ok(text)) if !text.is_empty() => {
-                                    let outcome = notify::push_governor_v3(
+                                    // 2026-09-20: R-02 升级 counted 持久投递
+                                    // (MU-intraday-market)。每时间槽独立 occurrence;
+                                    // Rolling 900s 全局头镜像旧 L4 冷却 (5 分钟循环
+                                    // 实际每 15 分钟一推)。失败 retry_authorized=false
+                                    // — 5 分钟循环新渲染重试即进程内补偿, durable
+                                    // 不补发过时时间戳卡 (防全天失败重启 flood)。
+                                    let view_hhmm = chrono::Local::now().format("%H:%M").to_string();
+                                    let view_date = chrono::Local::now().date_naive();
+                                    let outcome = match push_templates::build_intraday_counted_binding(
+                                        view_date,
+                                        push_templates::IntradayProducer::MarketView {
+                                            hhmm: view_hhmm,
+                                        },
                                         &text,
-                                        notify::PushKind::IntradayMarket,
-                                        None,
                                     )
-                                    .await;
+                                    .and_then(|binding| {
+                                        crate::presentation_registry::acquire_token(
+                                            "I-01-intraday-market",
+                                            notify::PushKind::IntradayMarket,
+                                            "intraday_market_dispatcher",
+                                            "render_intraday_market",
+                                        )
+                                        .map(|token| (token, binding))
+                                    }) {
+                                        Ok((token, binding)) => {
+                                            crate::notify::push_counted_with_binding(
+                                                token, &text, None, binding,
+                                            )
+                                            .await
+                                        }
+                                        Err(reason) => {
+                                            log::error!(
+                                                "[BR-116][BR-196] 盘中盘面 counted 准备失败: {reason}"
+                                            );
+                                            crate::notify::PushOutcome::Denied(reason)
+                                        }
+                                    };
                                     if periodic_delivery_confirmed(&outcome) {
                                         last_market_view = std::time::Instant::now();
                                     } else {

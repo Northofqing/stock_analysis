@@ -1624,8 +1624,10 @@ mod tests {
             v14_gate(PushKind::PreopenNewsHot, None),
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
+        // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
+        // 已升级 counted → 换 NewsCatalyst; 后续接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::IntradayMarket, None),
+            v14_gate(PushKind::NewsCatalyst, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
 
@@ -1644,8 +1646,10 @@ mod tests {
             v14_gate(PushKind::PreopenNewsHot, None),
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
+        // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
+        // 已升级 counted → 换 NewsCatalyst; 后续接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::IntradayMarket, None),
+            v14_gate(PushKind::NewsCatalyst, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
     }
