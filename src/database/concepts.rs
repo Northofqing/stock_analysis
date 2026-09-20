@@ -20,6 +20,25 @@ struct ConceptRow {
     concepts: String,
 }
 
+pub(crate) fn parse_cached_concept_rows<I>(rows: I) -> Result<HashMap<String, Vec<String>>, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut map = HashMap::new();
+    for (code, concepts) in rows {
+        if code.trim().is_empty() {
+            return Err("概念缓存存在空 code".to_string());
+        }
+        let list = serde_json::from_str::<Vec<String>>(&concepts)
+            .map_err(|error| format!("概念缓存 {code} JSON 非法: {error}"))?;
+        if list.is_empty() || list.iter().any(|concept| concept.trim().is_empty()) {
+            return Err(format!("概念缓存 {code} 含空概念列表/字段"));
+        }
+        map.insert(code, list);
+    }
+    Ok(map)
+}
+
 /// chain_daily 行：某日某主线簇。
 #[derive(Debug, Clone, PartialEq, Eq, QueryableByName)]
 pub struct ChainDailyRow {
@@ -102,7 +121,6 @@ impl DatabaseManager {
         if max_age_days <= 0 {
             return Err(format!("概念缓存 max_age_days 非法: {max_age_days}"));
         }
-        let mut map = HashMap::new();
         let cutoff = (Local::now() - Duration::days(max_age_days))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
@@ -117,18 +135,7 @@ impl DatabaseManager {
                 .load(&mut conn)
                 .map_err(|error| format!("概念缓存查询失败: {error}"))?;
 
-        for row in rows {
-            if row.code.trim().is_empty() {
-                return Err("概念缓存存在空 code".to_string());
-            }
-            let list = serde_json::from_str::<Vec<String>>(&row.concepts)
-                .map_err(|error| format!("概念缓存 {} JSON 非法: {error}", row.code))?;
-            if list.is_empty() || list.iter().any(|concept| concept.trim().is_empty()) {
-                return Err(format!("概念缓存 {} 含空概念列表/字段", row.code));
-            }
-            map.insert(row.code, list);
-        }
-        Ok(map)
+        parse_cached_concept_rows(rows.into_iter().map(|row| (row.code, row.concepts)))
     }
 
     /// 写入/覆盖某只股票的概念标签缓存。

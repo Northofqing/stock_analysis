@@ -23,6 +23,11 @@ pub use model::{
     ScheduleHydrationState, StoreEnvironment, TaskBinding, TypedReceipt, TypedRejection,
     TypedUncertainty, WindowMode, DAILY_BUDGET_LIMIT, ENVELOPE_VERSION, POLICY_VERSION,
 };
+pub(crate) use model::{
+    FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
+    FoundationTerminalRecord, P01DedicatedTerminalQuery, P01DedicatedTerminalRecord,
+};
+pub(crate) use schema::SCHEMA_VERSION as DURABLE_SCHEMA_VERSION;
 
 #[cfg(test)]
 mod tests;

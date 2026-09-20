@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-status="PROVISIONAL" data-document-ready="pending">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><%= CGI.escapeHTML(document_title) %> · PROVISIONAL</title>
+  <style>
+    :root { color-scheme: light; --bg: #f4f1e8; --panel: #fffdf7; --ink: #17211b; --muted: #617064; --line: #c8cec5; --accent: #0c6b50; --code: #edf2ec; }
+    :root[data-theme="dark"] { color-scheme: dark; --bg: #111713; --panel: #19221c; --ink: #e7eee8; --muted: #a9b7ac; --line: #39463c; --accent: #79d8b4; --code: #202c24; }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; color: var(--ink); background: var(--bg); font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input { font: inherit; }
+    a { color: var(--accent); }
+    .status-banner { padding: .55rem 1rem; color: #fff; background: #835600; text-align: center; font-weight: 700; letter-spacing: .04em; }
+    .toolbar { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; gap: .5rem; padding: .75rem 1rem; background: var(--panel); border-bottom: 1px solid var(--line); }
+    .toolbar input { flex: 1 1 18rem; min-width: 12rem; padding: .45rem .65rem; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: .35rem; }
+    .toolbar button, .section-toggle, .diagram-toolbar button { padding: .38rem .65rem; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: .35rem; cursor: pointer; }
+    .layout { display: grid; grid-template-columns: minmax(15rem, 22rem) minmax(0, 1fr); gap: 1.5rem; max-width: 108rem; margin: 0 auto; padding: 1rem; }
+    nav { position: sticky; top: 4.5rem; align-self: start; max-height: calc(100vh - 6rem); overflow: auto; padding: 1rem; background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; }
+    nav ol { margin: 0; padding: 0; list-style: none; }
+    nav li { margin: .15rem 0; }
+    nav li[data-search-hidden="true"] { display: none; }
+    nav .toc-level-1 { font-weight: 700; }
+    nav .toc-level-2 { padding-left: .65rem; }
+    nav .toc-level-3 { padding-left: 1.3rem; }
+    nav .toc-level-4 { padding-left: 1.95rem; font-size: .92em; }
+    nav .toc-level-5 { padding-left: 2.6rem; font-size: .88em; }
+    nav .toc-level-6 { padding-left: 3.25rem; font-size: .84em; }
+    article { min-width: 0; padding: 1.5rem clamp(1rem, 3vw, 3rem); background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; }
+    h1, h2, h3, h4, h5, h6 { scroll-margin-top: 5rem; line-height: 1.25; }
+    h2 { margin-top: 2.4rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+    .section-toggle { margin-left: .6rem; padding: .05rem .35rem; font-size: .72em; vertical-align: middle; }
+    .search-match { outline: 2px solid var(--accent); outline-offset: .2rem; }
+    code { padding: .08rem .3rem; background: var(--code); border-radius: .25rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { overflow: auto; padding: 1rem; background: var(--code); border: 1px solid var(--line); border-radius: .45rem; white-space: pre; }
+    pre code { padding: 0; background: transparent; }
+    blockquote { margin-left: 0; padding: .2rem 1rem; color: var(--muted); border-left: .3rem solid var(--accent); white-space: pre-line; }
+    table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1rem 0; }
+    th, td { padding: .45rem .6rem; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--code); }
+    .diagram { --diagram-scale: 1; overflow: auto; margin: 1.25rem 0; padding: .8rem; border: 1px solid var(--line); border-radius: .5rem; }
+    .diagram-toolbar { display: flex; gap: .4rem; margin-bottom: .5rem; }
+    .mermaid-render { transform: scale(var(--diagram-scale)); transform-origin: top left; transition: transform .12s ease; }
+    .mermaid-render svg { max-width: 100%; height: auto; }
+    .diagram[data-diagram-state="error"] .mermaid-render { padding: .8rem; color: #b42318; border: 1px solid currentColor; }
+    .diagram.is-fullscreen { position: fixed; inset: 1rem; z-index: 100; background: var(--panel); }
+    .metadata { max-width: 108rem; margin: 1rem auto 2rem; padding: 0 1rem; color: var(--muted); }
+    @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } nav { position: static; max-height: 18rem; } }
+    @media print {
+      :root { color-scheme: light; --bg: #fff; --panel: #fff; --ink: #000; --line: #aaa; --code: #f4f4f4; }
+      .toolbar, .status-banner, nav, .section-toggle, .diagram-toolbar, .metadata { display: none !important; }
+      .layout { display: block; max-width: none; padding: 0; }
+      article { border: 0; padding: 0; }
+      [hidden] { display: block !important; }
+      .diagram { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="status-banner">PROVISIONAL · 尚未达到 Implementation-Ready</div>
+  <div class="toolbar" role="toolbar" aria-label="文档工具">
+    <input id="doc-search" type="search" placeholder="搜索目录标题" aria-label="搜索目录标题">
+    <button id="theme-toggle" type="button">切换主题</button>
+    <button id="collapse-all" type="button">折叠章节</button>
+    <button id="expand-all" type="button">展开章节</button>
+    <button id="print-document" type="button">打印</button>
+    <output id="search-status" aria-live="polite"></output>
+  </div>
+  <div class="layout">
+    <nav id="table-of-contents" aria-label="层级目录"><%= navigation_html %></nav>
+    <article id="document-content"><%= body_html %></article>
+  </div>
+  <aside class="metadata">
+    <details>
+      <summary>构建来源与许可证</summary>
+      <pre id="mermaid-license"><%= mermaid_license_html %></pre>
+    </details>
+  </aside>
+  <script id="build-metadata" type="application/json"><%= build_metadata_json %></script>
+  <script id="markdown-source" type="application/octet-stream"><%= source_base64 %></script>
+  <script>
+<%= mermaid_script %>
+  </script>
+  <script>
+  (() => {
+    'use strict';
+    const root = document.documentElement;
+    const content = document.getElementById('document-content');
+    const headings = Array.from(content.querySelectorAll('h1,h2,h3,h4,h5,h6'));
+
+    const setSectionCollapsed = (heading, collapsed) => {
+      const level = Number(heading.tagName.slice(1));
+      heading.dataset.collapsed = collapsed ? 'true' : 'false';
+      const button = heading.querySelector(':scope > .section-toggle');
+      if (button) {
+        button.textContent = collapsed ? '展开' : '折叠';
+        button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      }
+      let node = heading.nextElementSibling;
+      while (node) {
+        const match = /^H([1-6])$/.exec(node.tagName);
+        if (match && Number(match[1]) <= level) break;
+        node.hidden = collapsed;
+        node = node.nextElementSibling;
+      }
+    };
+
+    headings.forEach((heading, index) => {
+      if (index === 0) return;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'section-toggle';
+      button.textContent = '折叠';
+      button.setAttribute('aria-expanded', 'true');
+      button.addEventListener('click', () => setSectionCollapsed(heading, heading.dataset.collapsed !== 'true'));
+      heading.appendChild(button);
+    });
+
+    const setAllSections = collapsed => headings.slice(1).forEach(heading => setSectionCollapsed(heading, collapsed));
+    document.getElementById('collapse-all').addEventListener('click', () => setAllSections(true));
+    document.getElementById('expand-all').addEventListener('click', () => setAllSections(false));
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    });
+    document.getElementById('print-document').addEventListener('click', () => {
+      setAllSections(false);
+      window.print();
+    });
+    window.addEventListener('beforeprint', () => setAllSections(false));
+
+    const search = document.getElementById('doc-search');
+    const searchStatus = document.getElementById('search-status');
+    const tocLinks = Array.from(document.querySelectorAll('#table-of-contents a'));
+    search.addEventListener('input', () => {
+      const query = search.value.trim().toLocaleLowerCase();
+      let matches = 0;
+      headings.forEach(heading => heading.classList.remove('search-match'));
+      tocLinks.forEach(link => {
+        const match = !query || link.textContent.toLocaleLowerCase().includes(query);
+        link.parentElement.dataset.searchHidden = match ? 'false' : 'true';
+        if (match && query) {
+          matches += 1;
+          const target = document.getElementById(decodeURIComponent(link.hash.slice(1)));
+          if (target) target.classList.add('search-match');
+        }
+      });
+      searchStatus.textContent = query ? `${matches} 个标题` : '';
+    });
+
+    const sanitizeMermaidSvg = source => {
+      // Mermaid emits xlink:href without an xmlns:xlink declaration for link
+      // directives. Normalize the inert string before XML parsing; href is
+      // removed below before the SVG can enter the live document.
+      const normalized = source.replace(/\bxlink:href\s*=/gi, 'href=');
+      const parsed = new DOMParser().parseFromString(normalized, 'image/svg+xml');
+      if (parsed.querySelector('parsererror') || parsed.documentElement.localName !== 'svg') {
+        throw new Error('invalid Mermaid SVG');
+      }
+      parsed.querySelectorAll('script,img,image,foreignObject,iframe,object,embed').forEach(node => node.remove());
+      parsed.querySelectorAll('a').forEach(anchor => anchor.replaceWith(...Array.from(anchor.childNodes)));
+      parsed.querySelectorAll('*').forEach(element => {
+        Array.from(element.attributes).forEach(attribute => {
+          const name = attribute.name.toLowerCase();
+          if (name.startsWith('on') || ['href', 'xlink:href', 'src', 'target'].includes(name)) {
+            element.removeAttribute(attribute.name);
+          }
+        });
+      });
+      return new XMLSerializer().serializeToString(parsed.documentElement);
+    };
+
+    const renderDiagrams = async () => {
+      const figures = Array.from(document.querySelectorAll('.diagram'));
+      if (figures.length === 0) return;
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'htmlLabels', 'flowchart'],
+        htmlLabels: false,
+        flowchart: { htmlLabels: false },
+        sequence: { useMaxWidth: true }
+      });
+      await Promise.all(figures.map(async (figure, index) => {
+        const source = figure.querySelector('.mermaid-source code').textContent;
+        const target = figure.querySelector('.mermaid-render');
+        try {
+          const rendered = await mermaid.render(`offline-mermaid-${index + 1}`, source);
+          const safeSvg = sanitizeMermaidSvg(rendered.svg);
+          target.innerHTML = safeSvg;
+          figure.dataset.diagramState = 'rendered';
+        } catch (_error) {
+          target.textContent = '图表渲染失败；原始图源保留如下。';
+          figure.dataset.diagramState = 'error';
+        }
+      }));
+      figures.forEach(figure => {
+        let scale = 1;
+        figure.querySelector('[data-diagram-zoom="in"]').addEventListener('click', () => {
+          scale = Math.min(2.5, scale + 0.2);
+          figure.style.setProperty('--diagram-scale', scale.toFixed(1));
+        });
+        figure.querySelector('[data-diagram-zoom="out"]').addEventListener('click', () => {
+          scale = Math.max(0.4, scale - 0.2);
+          figure.style.setProperty('--diagram-scale', scale.toFixed(1));
+        });
+        figure.querySelector('[data-diagram-fullscreen]').addEventListener('click', () => {
+          if (figure.requestFullscreen) {
+            figure.requestFullscreen().catch(() => figure.classList.toggle('is-fullscreen'));
+          } else {
+            figure.classList.toggle('is-fullscreen');
+          }
+        });
+      });
+    };
+
+    const finish = async () => {
+      try {
+        await renderDiagrams();
+      } finally {
+        root.dataset.documentReady = 'complete';
+      }
+    };
+    finish();
+  })();
+  </script>
+</body>
+</html>

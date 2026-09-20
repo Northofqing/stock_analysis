@@ -158,7 +158,7 @@ pub struct SelectionBoardConfiguration {
 
 impl SelectionBoardConfiguration {
     pub fn load_default(now: DateTime<Utc>) -> Result<Self, BoardSelectionError> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = crate::production_root::production_root();
         let chain_bytes = read_required(&root.join(CHAIN_RULES_PATH), "chain_rules")?;
         let proposal_bytes = read_required(
             &root.join(BOARD_BINDING_PROPOSAL_PATH),
@@ -278,7 +278,7 @@ struct VerifiedBoardArtifactFileWire {
 pub fn load_verified_board_artifact_default(
     now: DateTime<Utc>,
 ) -> Result<VerifiedBoardArtifact, BoardSelectionError> {
-    load_verified_board_artifact_from_root(Path::new(env!("CARGO_MANIFEST_DIR")), now)
+    load_verified_board_artifact_from_root(crate::production_root::production_root(), now)
 }
 
 pub(crate) fn load_verified_board_artifact_from_root(
@@ -287,12 +287,13 @@ pub(crate) fn load_verified_board_artifact_from_root(
 ) -> Result<VerifiedBoardArtifact, BoardSelectionError> {
     #[cfg(not(test))]
     {
-        let fixed_root = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).map_err(|error| {
-            BoardSelectionError::invalid_config(
-                "fixed_repository_root_unavailable",
-                error.to_string(),
-            )
-        })?;
+        let fixed_root =
+            fs::canonicalize(crate::production_root::production_root()).map_err(|error| {
+                BoardSelectionError::invalid_config(
+                    "fixed_repository_root_unavailable",
+                    error.to_string(),
+                )
+            })?;
         if repository_root != fixed_root {
             return Err(BoardSelectionError::invalid_config(
                 "diagnostic_repository_root_release_forbidden",

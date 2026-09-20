@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "mermaid",
+  "version": "11.17.2",
+  "license": "MIT",
+  "source_url": "https://registry.npmjs.org/mermaid/-/mermaid-11.17.2.tgz",
+  "package_integrity": "sha512-V6K3C8EBdEsPFZXSKMJe6ppQOENxuHARr9GvHX4hh47lAbhMRD9qf4oEK7LoaRQxULMa80/qt5gHO73aCleBBg==",
+  "files": [
+    {
+      "path": "mermaid.min.js",
+      "package_path": "package/dist/mermaid.min.js",
+      "bytes": 3572661,
+      "sha256": "581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8"
+    },
+    {
+      "path": "mermaid.LICENSE",
+      "package_path": "package/LICENSE",
+      "bytes": 1089,
+      "sha256": "ec9fb67dcb25eccc416ed56e1aab819222c805a2a4bfe4cb19e7556bf2ffde80"
+    }
+  ]
+}

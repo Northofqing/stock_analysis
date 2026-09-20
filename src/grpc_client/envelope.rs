@@ -2,7 +2,7 @@
 //! request_id: 调用方生成的非空唯一请求 ID; 同一业务重试保留原 ID。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::grpc_client::pb::magic::market::v1::{
-    AdmissionState, CanonicalPayload, QueryRequest, QueryResponse, RequestContext,
+    CanonicalPayload, QueryRequest, QueryResponse, RequestContext,
 };
 use crate::grpc_contract::schema::schema_for;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,19 +57,92 @@ pub fn build_query_request(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryAdmission {
+    Unspecified,
+    Admitted,
+    Unadmitted,
+}
+
+impl From<crate::grpc_client::pb::magic::market::v1::AdmissionState> for QueryAdmission {
+    fn from(value: crate::grpc_client::pb::magic::market::v1::AdmissionState) -> Self {
+        use crate::grpc_client::pb::magic::market::v1::AdmissionState;
+        match value {
+            AdmissionState::Admitted => Self::Admitted,
+            AdmissionState::Unadmitted => Self::Unadmitted,
+            AdmissionState::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
+impl PartialEq<crate::grpc_client::pb::magic::market::v1::AdmissionState> for QueryAdmission {
+    fn eq(&self, other: &crate::grpc_client::pb::magic::market::v1::AdmissionState) -> bool {
+        *self == QueryAdmission::from(*other)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalRecord {
+    pub schema: String,
+    pub schema_version: u32,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+impl From<CanonicalPayload> for CanonicalRecord {
+    fn from(value: CanonicalPayload) -> Self {
+        Self {
+            schema: value.schema,
+            schema_version: value.schema_version,
+            content_type: value.content_type,
+            data: value.data,
+        }
+    }
+}
+
+impl PartialEq<CanonicalPayload> for CanonicalRecord {
+    fn eq(&self, other: &CanonicalPayload) -> bool {
+        self.schema == other.schema
+            && self.schema_version == other.schema_version
+            && self.content_type == other.content_type
+            && self.data == other.data
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcquisitionProvenance {
+    Missing,
+    LocalWireSource(String),
+    ExternalMtlsAuthority(String),
+}
+
+impl AcquisitionProvenance {
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Missing => "",
+            Self::LocalWireSource(value) | Self::ExternalMtlsAuthority(value) => value,
+        }
+    }
+}
+
 #[derive(Debug)] // unwrap_err 需要 Ok 类型 Debug
 pub struct QueryResult {
-    pub admission: AdmissionState,
+    pub admission: QueryAdmission,
     pub selected_provider: String,
     pub batch_id: String,
     pub complete: bool,
     pub observed_at: String,
     pub source_at: String,
-    pub records: Vec<CanonicalPayload>,
-    /// P4 M2: 证据链 source (服务端 Fetched.source; 旧 op 空串 = 缺证据)。
-    pub source: String,
+    pub records: Vec<CanonicalRecord>,
+    pub provenance: AcquisitionProvenance,
     /// 非空表示服务端执行的是诊断读取；生产消费者即使收到 records 也必须拒绝。
     pub diagnostic_blocker: String,
+}
+
+impl QueryResult {
+    pub fn source(&self) -> &str {
+        self.provenance.source()
+    }
 }
 
 pub fn parse_query_response(
@@ -94,14 +167,81 @@ pub fn parse_query_response(
     }
     Ok(QueryResult {
         // prost 0.14 from_i32 deprecated → try_from (语义等价, 未知值回落 Unspecified)。
-        admission: AdmissionState::try_from(resp.admission).unwrap_or(AdmissionState::Unspecified),
+        admission: crate::grpc_client::pb::magic::market::v1::AdmissionState::try_from(
+            resp.admission,
+        )
+        .unwrap_or(crate::grpc_client::pb::magic::market::v1::AdmissionState::Unspecified)
+        .into(),
         selected_provider: resp.selected_provider,
         batch_id: resp.batch_id,
         complete: resp.complete,
         observed_at: resp.observed_at,
         source_at: resp.source_at,
-        records: resp.records,
-        source: resp.source,
+        records: resp.records.into_iter().map(Into::into).collect(),
+        provenance: if resp.source.is_empty() {
+            AcquisitionProvenance::Missing
+        } else {
+            AcquisitionProvenance::LocalWireSource(resp.source)
+        },
+        diagnostic_blocker: resp.diagnostic_blocker,
+    })
+}
+
+pub(crate) fn parse_external_query_response(
+    expected_request_id: &str,
+    expected_operation: Operation,
+    authority: &str,
+    resp: crate::grpc_client::external_pb::magic::market::v1::QueryResponse,
+) -> Result<QueryResult, EnvelopeError> {
+    use crate::grpc_client::external_pb::magic::market::v1::{
+        AdmissionState as ExternalAdmission, Operation as ExternalOperation,
+    };
+    if resp.request_id.is_empty() {
+        return Err(EnvelopeError::MissingRequestId);
+    }
+    if resp.request_id != expected_request_id {
+        return Err(EnvelopeError::RequestIdMismatch(
+            expected_request_id.to_owned(),
+            resp.request_id,
+        ));
+    }
+    let expected_external = match expected_operation {
+        Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
+        Operation::GlobalNews => ExternalOperation::GlobalNews,
+        Operation::InstrumentNews => ExternalOperation::InstrumentNews,
+        _ => return Err(EnvelopeError::OperationMismatch(expected_operation as i32, resp.operation)),
+    };
+    if resp.operation != expected_external as i32 {
+        return Err(EnvelopeError::OperationMismatch(
+            expected_external as i32,
+            resp.operation,
+        ));
+    }
+    let admission = match ExternalAdmission::try_from(resp.admission)
+        .unwrap_or(ExternalAdmission::Unspecified)
+    {
+        ExternalAdmission::Admitted => QueryAdmission::Admitted,
+        ExternalAdmission::Unadmitted => QueryAdmission::Unadmitted,
+        ExternalAdmission::Unspecified => QueryAdmission::Unspecified,
+    };
+    Ok(QueryResult {
+        admission,
+        selected_provider: resp.selected_provider,
+        batch_id: resp.batch_id,
+        complete: resp.complete,
+        observed_at: resp.observed_at,
+        source_at: resp.source_at,
+        records: resp
+            .records
+            .into_iter()
+            .map(|record| CanonicalRecord {
+                schema: record.schema,
+                schema_version: record.schema_version,
+                content_type: record.content_type,
+                data: record.data,
+            })
+            .collect(),
+        provenance: AcquisitionProvenance::ExternalMtlsAuthority(authority.to_owned()),
         diagnostic_blocker: resp.diagnostic_blocker,
     })
 }
@@ -109,6 +249,7 @@ pub fn parse_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc_client::pb::magic::market::v1::AdmissionState;
 
     #[test]
     fn request_ids_are_unique_and_nonempty() {
@@ -168,7 +309,7 @@ mod tests {
         assert_eq!(result.admission, AdmissionState::Admitted);
         assert!(result.complete);
         assert_eq!(result.selected_provider, "tdx-dev");
-        assert_eq!(result.source, "tdx");
+        assert_eq!(result.source(), "tdx");
         assert_eq!(result.diagnostic_blocker, "TEST_CODE_diagnostic_blocker");
     }
 

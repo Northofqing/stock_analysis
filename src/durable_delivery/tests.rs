@@ -1,6 +1,6 @@
 use super::coordinator::{
     install_compound_commit_rollback_test_fault, install_database_bootstrap_test_hook,
-    install_process_descriptor_snapshot_test_fault, DatabaseBootstrapTestPhase,
+    install_process_descriptor_snapshot_test_fault, AttemptLease, DatabaseBootstrapTestPhase,
     DatabaseOperationTestPhase, DeliveredPrecommitTestFault, OpenFileDescriptionProof,
     OperationPostvalidationTestFault, ProcessDescriptorSnapshotTestFault,
 };
@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
@@ -706,7 +706,7 @@ fn downgrade_replay_schema_v4_for_test(connection: &mut Connection, replay_prese
                      'BusinessDateOnceClaimed','DecisionIdentityConflict',
                      'ScheduleHydrationApplied')),
                    predecessor_audit_identity TEXT
-                     REFERENCES immutable_audit_outbox_v4_historical(audit_identity),
+                     REFERENCES immutable_audit_outbox(audit_identity),
                    audit_canonical BLOB NOT NULL,
                    audit_sha256 TEXT NOT NULL,
                    append_state TEXT NOT NULL CHECK(append_state IN ('Pending','Appended')),
@@ -745,6 +745,261 @@ fn downgrade_replay_schema_v4_for_test(connection: &mut Connection, replay_prese
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .expect("enable FK enforcement for historical v4 migration");
+}
+
+fn real_v4_upgrade_target_snapshot(
+    connection: &Connection,
+    decision_identity: &str,
+) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    [
+        ("delivery_decisions", "decision_identity"),
+        ("daily_budget_reservations", "budget_reservation_identity"),
+        ("cooldown_reservations", "cooldown_reservation_identity"),
+        ("delivery_attempts", "attempt_identity"),
+        ("delivery_state_events", "state_event_identity"),
+        ("delivery_attempt_events", "attempt_event_identity"),
+        ("daily_budget_reservation_events", "event_identity"),
+        ("cooldown_reservation_events", "event_identity"),
+        ("immutable_audit_outbox", "audit_identity"),
+        ("sink_results", "result_event_identity"),
+        ("delivery_disposition_payloads", "disposition_identity"),
+        ("task_transition_payloads", "transition_identity"),
+    ]
+    .into_iter()
+    .map(|(table, stable_order)| {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE decision_identity=?1 ORDER BY {stable_order}"
+            ))
+            .unwrap_or_else(|error| panic!("prepare target snapshot for {table}: {error}"));
+        let column_count = statement.column_count();
+        let rows = statement
+            .query_map([decision_identity], |row| {
+                (0..column_count)
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap_or_else(|error| panic!("query target snapshot for {table}: {error}"))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap_or_else(|error| panic!("collect target snapshot for {table}: {error}"));
+        (table.to_owned(), rows)
+    })
+    .collect()
+}
+
+fn audit_v4_upgrade_rowid_snapshot(connection: &Connection) -> BTreeMap<String, i64> {
+    let mut statement = connection
+        .prepare(
+            "SELECT audit_identity,rowid
+             FROM immutable_audit_outbox
+             ORDER BY audit_identity",
+        )
+        .expect("prepare immutable-audit rowid snapshot");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query immutable-audit rowid snapshot")
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        .expect("collect immutable-audit rowid snapshot")
+}
+
+fn audit_v4_upgrade_database_snapshot(
+    connection: &Connection,
+) -> (
+    i64,
+    Vec<(String, String, String)>,
+    BTreeMap<String, Vec<Vec<String>>>,
+    BTreeMap<String, i64>,
+) {
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read historical schema version snapshot");
+    let tables = {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare historical authority table list");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query historical authority table list")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect historical authority table list")
+    };
+    let rows = tables
+        .into_iter()
+        .map(|table| {
+            let contents = authority_table_rows(connection, &table);
+            (table, contents)
+        })
+        .collect();
+    let manifest = {
+        let mut statement = connection
+            .prepare(
+                "SELECT type,name,COALESCE(sql,'')
+                 FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex_%'
+                 ORDER BY type,name",
+            )
+            .expect("prepare raw historical schema manifest");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query raw historical schema manifest")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect raw historical schema manifest")
+    };
+    (
+        version,
+        manifest,
+        rows,
+        audit_v4_upgrade_rowid_snapshot(connection),
+    )
+}
+
+fn real_audit_logical_tail(connection: &Connection, decision_identity: &str) -> (String, usize) {
+    let mut statement = connection
+        .prepare(
+            "SELECT audit_identity,predecessor_audit_identity,audit_canonical,audit_sha256
+             FROM immutable_audit_outbox
+             WHERE decision_identity=?1
+             ORDER BY audit_identity",
+        )
+        .expect("prepare real audit chain");
+    let links = statement
+        .query_map([decision_identity], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query real audit chain")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect real audit chain");
+    assert!(!links.is_empty(), "real decision must have an audit chain");
+    let identities = links
+        .iter()
+        .map(|(identity, _, _, _)| identity.clone())
+        .collect::<BTreeSet<_>>();
+    let predecessors = links
+        .iter()
+        .filter_map(|(_, predecessor, _, _)| predecessor.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        links
+            .iter()
+            .filter(|(_, predecessor, _, _)| predecessor.is_none())
+            .count(),
+        1,
+        "the real pre-upgrade audit chain must have one root"
+    );
+    for (identity, predecessor, canonical, digest) in &links {
+        assert_eq!(
+            sha256_hex(canonical),
+            *digest,
+            "audit {identity} must retain its exact canonical-byte digest"
+        );
+        if let Some(predecessor) = predecessor {
+            assert!(
+                identities.contains(predecessor),
+                "audit {identity} must reference this decision's real chain"
+            );
+        }
+    }
+    let tails = identities
+        .difference(&predecessors)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tails.len(),
+        1,
+        "the real pre-upgrade chain must have one tail"
+    );
+    let tail = tails[0].clone();
+    let by_identity = links
+        .iter()
+        .map(|(identity, predecessor, _, _)| (identity.as_str(), predecessor.as_deref()))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    let mut cursor = Some(tail.as_str());
+    while let Some(identity) = cursor {
+        assert!(visited.insert(identity), "real audit chain must be acyclic");
+        cursor = *by_identity
+            .get(identity)
+            .expect("every predecessor must resolve in the real decision chain");
+    }
+    assert_eq!(
+        visited.len(),
+        links.len(),
+        "the independently traversed real chain must include every target audit"
+    );
+    (tail, links.len())
+}
+
+fn foreign_key_violation_details(connection: &Connection) -> Vec<String> {
+    let violations = {
+        let mut statement = connection
+            .prepare(
+                "SELECT \"table\",rowid,parent,fkid
+                 FROM pragma_foreign_key_check
+                 ORDER BY \"table\",rowid,parent,fkid",
+            )
+            .expect("prepare exact foreign-key violation rows");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query exact foreign-key violation rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect exact foreign-key violation rows")
+    };
+    violations
+        .into_iter()
+        .map(|(table, rowid, reported_parent, fkid)| {
+            let declared_links = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT id,seq,\"table\",\"from\",\"to\",on_update,on_delete,\"match\"
+                         FROM pragma_foreign_key_list(?1)
+                         WHERE id=?2
+                         ORDER BY seq",
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("prepare declared foreign key for {table}/{fkid}: {error}")
+                    });
+                statement
+                    .query_map(params![table.as_str(), fkid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("query declared foreign key for {table}/{fkid}: {error}")
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap_or_else(|error| {
+                        panic!("collect declared foreign key for {table}/{fkid}: {error}")
+                    })
+            };
+            format!(
+                "table={table} rowid={rowid:?} reported_parent={reported_parent} fkid={fkid} declared={declared_links:?}"
+            )
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2415,6 +2670,1266 @@ fn br194_schema_v5_migration_matrix_is_repeatable_and_rejects_newer_versions() {
 }
 
 #[test]
+fn runtime_schema_guard_rejects_visible_drift_before_read_and_write_callbacks() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_VISIBLE_DRIFT");
+    let existing = envelope(
+        "RUNTIME_SCHEMA_VISIBLE_DRIFT_EXISTING",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&existing, 1, now())
+        .expect("prepare actual decision before schema drift");
+
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let drift_connection =
+        Connection::open(&fixture.database_path).expect("open isolated schema drift connection");
+    drift_connection
+        .pragma_update(None, "user_version", drifted_version)
+        .expect("drift isolated database schema version");
+    drop(drift_connection);
+
+    let read = fixture
+        .coordinator
+        .decision_state(&existing.decision_identity);
+    let new_candidate = envelope(
+        "RUNTIME_SCHEMA_VISIBLE_DRIFT_NEW",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let write = fixture.coordinator.prepare(&new_candidate, 1, now());
+
+    assert!(matches!(
+        read,
+        Err(DurableDeliveryError::InvalidConfiguration(reason))
+            if reason.contains("schema version")
+    ));
+    assert!(matches!(
+        write,
+        Err(DurableDeliveryError::InvalidConfiguration(reason))
+            if reason.contains("schema version")
+    ));
+    assert_eq!(
+        fixture.query_i64(&format!(
+            "SELECT COUNT(*) FROM delivery_decisions WHERE decision_identity='{}'",
+            new_candidate.decision_identity
+        )),
+        0,
+        "visible drift must be rejected before the write callback changes business data"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rejects_zero_legacy_and_newer_versions_until_restored() {
+    for (label, drifted_version) in [
+        ("ZERO", 0),
+        ("LEGACY", 4),
+        ("NEWER", super::schema::SCHEMA_VERSION + 1),
+    ] {
+        let fixture = Fixture::new(&format!("RUNTIME_SCHEMA_MATRIX_{label}"));
+        let candidate = envelope(
+            &format!("RUNTIME_SCHEMA_MATRIX_{label}"),
+            PushKind::ReviewProviderTopN,
+            DeliverySubKind::None,
+            "2026-07-30",
+            true,
+        );
+        fixture
+            .coordinator
+            .prepare(&candidate, 1, now())
+            .expect("prepare actual decision before matrix drift");
+        set_isolated_schema_version(&fixture.database_path, drifted_version);
+
+        assert_schema_version_error(
+            fixture
+                .coordinator
+                .decision_state(&candidate.decision_identity),
+            drifted_version,
+        );
+
+        set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+        assert_eq!(
+            fixture
+                .coordinator
+                .decision_state(&candidate.decision_identity)
+                .expect("runtime read succeeds after restoring current schema version"),
+            DecisionState::Reserved
+        );
+    }
+}
+
+#[test]
+fn runtime_schema_guard_rechecks_after_operation_prevalidation_before_read_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_OPERATION_PREVALIDATION");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_OPERATION_PREVALIDATION",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare actual decision before prevalidation drift");
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let coordinator = fixture_coordinator_arc(&fixture);
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_by_probe = callback_count.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                coordinator.install_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+                    move || {
+                        callback_count_by_probe.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .expect("install drift after operation prevalidation");
+
+    assert_schema_version_error(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity),
+        drifted_version,
+    );
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        0,
+        "the read callback must not reach its post-SQL checkpoint after schema drift"
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let restored_state = fixture
+        .coordinator
+        .decision_state(&candidate.decision_identity)
+        .expect("read succeeds after restoring current schema version");
+    assert_eq!(restored_state, DecisionState::Reserved);
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        1,
+        "the restored read must prove the post-SQL checkpoint is reachable"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rechecks_after_begin_immediate_before_write_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_OUTER_CHECK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_OUTER_CHECK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let coordinator = fixture_coordinator_arc(&fixture);
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_by_probe = callback_count.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterConnectionSchemaValidationBeforeTransaction,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                coordinator.install_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePreCommitValidation,
+                    move || {
+                        callback_count_by_probe.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .expect("install drift after outer validation");
+
+    assert_schema_version_error(
+        fixture.coordinator.prepare(&candidate, 1, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        fixture.query_i64(&format!(
+            "SELECT COUNT(*) FROM delivery_decisions WHERE decision_identity='{}'",
+            candidate.decision_identity
+        )),
+        0,
+        "the transaction callback must not run after the post-BEGIN check rejects drift"
+    );
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        0,
+        "the write callback must not reach its post-SQL checkpoint after schema drift"
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let restored = fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare succeeds after restoring current schema version");
+    assert_eq!(restored.state, DecisionState::Reserved);
+    assert_eq!(
+        callback_count.load(Ordering::SeqCst),
+        1,
+        "the restored write must prove the post-SQL checkpoint is reachable"
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rolls_back_business_audit_and_version_drift_before_commit() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_PRECOMMIT_ROLLBACK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_PRECOMMIT_ROLLBACK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    let tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "daily_budget_reservations",
+    ];
+    let before_connection =
+        Connection::open(&fixture.database_path).expect("open precommit baseline connection");
+    let before = authority_snapshot(&before_connection, &tables);
+    drop(before_connection);
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    fixture
+        .coordinator
+        .install_operation_postvalidation_test_fault(
+            OperationPostvalidationTestFault::SchemaVersion(drifted_version),
+        )
+        .expect("install transaction-local schema drift");
+
+    assert_schema_version_error(
+        fixture.coordinator.prepare(&candidate, 1, now()),
+        drifted_version,
+    );
+
+    let after_connection =
+        Connection::open(&fixture.database_path).expect("open precommit rollback connection");
+    assert_eq!(
+        after_connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read schema version after rollback"),
+        super::schema::SCHEMA_VERSION,
+        "transaction-local schema drift must roll back"
+    );
+    assert_eq!(
+        authority_snapshot(&after_connection, &tables),
+        before,
+        "business rows, reservations, audit rows, and schema version must not partially commit"
+    );
+    drop(after_connection);
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .prepare(&candidate, 1, now())
+            .expect("same write succeeds after one-shot drift rollback")
+            .state,
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_rejects_read_when_version_drifts_after_callback() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_READ_POSTCHECK");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_READ_POSTCHECK",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare actual decision before read postcheck");
+    let database_path = fixture.database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                set_isolated_schema_version(&database_path, drifted_version);
+                Ok(())
+            },
+        )
+        .expect("install drift after read callback");
+
+    assert_schema_version_error(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity),
+        drifted_version,
+    );
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read succeeds after restoring current schema version"),
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_reconcile_visible_drift_has_no_database_or_append_effect() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_RECONCILE_VISIBLE_DRIFT");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_RECONCILE_VISIBLE_DRIFT",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare pending audit before visible drift");
+    let tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "daily_budget_reservations",
+    ];
+    let before_connection =
+        Connection::open(&fixture.database_path).expect("open reconcile baseline connection");
+    let before = authority_snapshot(&before_connection, &tables);
+    drop(before_connection);
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    set_isolated_schema_version(&fixture.database_path, drifted_version);
+    let append = MemoryAppendPort::default();
+
+    assert_schema_version_error(
+        fixture.coordinator.reconcile_all_pending(&append, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        append.record_count(),
+        0,
+        "visible drift must be rejected before any external append"
+    );
+    let after_connection =
+        Connection::open(&fixture.database_path).expect("open rejected reconcile snapshot");
+    assert_eq!(authority_snapshot(&after_connection, &tables), before);
+    drop(after_connection);
+
+    set_isolated_schema_version(&fixture.database_path, super::schema::SCHEMA_VERSION);
+    let retry = fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("reconcile succeeds after restoring current schema version");
+    assert!(retry.progress_count > 0);
+    assert!(append.record_count() > 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("public read succeeds after restored reconcile"),
+        DecisionState::Reserved
+    );
+}
+
+#[test]
+fn runtime_schema_guard_external_append_survives_rejected_database_ack() {
+    let fixture = Fixture::new("RUNTIME_SCHEMA_AFTER_EXTERNAL_APPEND");
+    let candidate = envelope(
+        "RUNTIME_SCHEMA_AFTER_EXTERNAL_APPEND",
+        PushKind::ReviewProviderTopN,
+        DeliverySubKind::None,
+        "2026-07-30",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&candidate, 1, now())
+        .expect("prepare pending audit before append boundary drift");
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let append = SchemaDriftAfterAppend::new(
+        fixture_coordinator_arc(&fixture),
+        "DecisionStateChanged",
+        drifted_version,
+    );
+
+    assert_schema_version_error(
+        fixture.coordinator.reconcile_all_pending(&append, now()),
+        drifted_version,
+    );
+    assert_eq!(
+        append.inner.count_kind("DecisionStateChanged"),
+        1,
+        "an already successful external append cannot be rolled back"
+    );
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox
+             WHERE audit_kind='DecisionStateChanged'
+               AND append_state='Pending' AND immutable_audit_ref IS NULL"
+        ),
+        1,
+        "the database acknowledgement and transaction-local version drift must roll back"
+    );
+    assert_eq!(
+        fixture.query_i64("PRAGMA user_version"),
+        super::schema::SCHEMA_VERSION
+    );
+
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("idempotent retry acknowledges the existing external append");
+    assert_eq!(
+        append.inner.count_kind("DecisionStateChanged"),
+        1,
+        "retry must reuse the same exact external append"
+    );
+}
+
+#[cfg(unix)]
+#[serial_test::serial(durable_physical_isolation)]
+#[test]
+fn runtime_schema_guard_final_open_boundary_rejects_version_drift() {
+    let test_code = format!(
+        "TEST_CODE_RUNTIME_SCHEMA_FINAL_OPEN_{}_{}",
+        std::process::id(),
+        NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
+    );
+    let fixture = PhysicalAliasFixture::new(&test_code);
+    fixture.ensure_test_root();
+    let database_path = fixture.test_database_path();
+    let callback_database_path = database_path.clone();
+    let drifted_version = super::schema::SCHEMA_VERSION - 1;
+    let _hook = install_database_bootstrap_test_hook(
+        DatabaseBootstrapTestPhase::AfterFinalParentSyncBeforeSuccessValidation,
+        move || {
+            set_isolated_schema_version(&callback_database_path, drifted_version);
+            Ok(())
+        },
+    )
+    .expect("install final-open schema drift");
+
+    assert_schema_version_error(fixture.open_test(), drifted_version);
+    assert_eq!(
+        Connection::open(&database_path)
+            .expect("open rejected final bootstrap database")
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read rejected final bootstrap version"),
+        drifted_version,
+        "the external version change occurs after bootstrap committed"
+    );
+}
+
+fn set_isolated_schema_version(database_path: &Path, version: i64) {
+    Connection::open(database_path)
+        .expect("open isolated schema-version connection")
+        .pragma_update(None, "user_version", version)
+        .expect("set isolated schema version");
+}
+
+fn assert_schema_version_error<T>(result: Result<T>, observed_version: i64) {
+    match result {
+        Err(DurableDeliveryError::InvalidConfiguration(reason)) => {
+            assert!(
+                reason.contains("schema version"),
+                "unexpected error: {reason}"
+            );
+            assert!(
+                reason.contains(&observed_version.to_string()),
+                "schema error must report observed version {observed_version}: {reason}"
+            );
+            assert!(
+                reason.contains(&super::schema::SCHEMA_VERSION.to_string()),
+                "schema error must report required version {}: {reason}",
+                super::schema::SCHEMA_VERSION
+            );
+        }
+        Err(error) => panic!("expected schema-version configuration error, got {error}"),
+        Ok(_) => panic!("schema version {observed_version} unexpectedly reached callback"),
+    }
+}
+
+#[test]
+fn audit_v4_upgrade_formal_open_rejects_missing_predecessor_and_rolls_back() {
+    let mut fixture = Fixture::new("AUDIT_V4_UPGRADE_MISSING_PREDECESSOR");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("AUDIT_V4_UPGRADE_MISSING_PREDECESSOR");
+    prepare_reserved(&fixture, &candidate, &append);
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated missing-predecessor TEST_CODE root")
+        .to_owned();
+    let config = CoordinatorConfig::test(
+        &fixture.database_path,
+        &test_code,
+        "TEST_CODE_V4_MISSING_PREDECESSOR_OWNER_0123456789ABCDEF",
+    );
+    let coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take coordinator before corrupt historical shaping");
+    assert_eq!(Arc::strong_count(&coordinator), 1);
+    drop(coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated missing-predecessor historical database");
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    historical
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable FK only while constructing missing-predecessor history");
+    assert_eq!(
+        historical
+            .execute(
+                "UPDATE immutable_audit_outbox
+                    SET predecessor_audit_identity='TEST_CODE_V4_MISSING_PREDECESSOR'
+                  WHERE audit_identity='TEST_CODE_V4_AUDIT_CHILD'",
+                [],
+            )
+            .expect("construct one missing historical predecessor"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("restore FK enforcement before formal open");
+    let violations_before = foreign_key_violation_details(&historical);
+    assert_eq!(violations_before.len(), 1);
+    assert!(violations_before[0].contains("table=immutable_audit_outbox"));
+    assert!(violations_before[0].contains("reported_parent=immutable_audit_outbox"));
+    let before = audit_v4_upgrade_database_snapshot(&historical);
+    assert_eq!(before.0, 4);
+    drop(historical);
+
+    let error = match DurableDeliveryCoordinator::open(config) {
+        Ok(_) => panic!("formal open must reject a missing historical predecessor"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DurableDeliveryError::InvalidConfiguration(reason)
+            if reason.contains("foreign-key violation")
+    ));
+
+    let rolled_back = Connection::open(&fixture.database_path)
+        .expect("inspect formal-open missing-predecessor rollback");
+    rolled_back
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enforce FK while inspecting missing-predecessor rollback");
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&rolled_back),
+        before,
+        "formal-open failure must preserve v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert_eq!(
+        foreign_key_violation_details(&rolled_back),
+        violations_before
+    );
+}
+
+#[test]
+fn audit_v4_upgrade_formal_open_rejects_non_outbox_foreign_key_and_rolls_back() {
+    let mut fixture = Fixture::new("AUDIT_V4_UPGRADE_NON_OUTBOX_FOREIGN_KEY");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "AUDIT_V4_UPGRADE_NON_OUTBOX_FOREIGN_KEY",
+        PushKind::HoldingPlan,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated non-outbox TEST_CODE root")
+        .to_owned();
+    let config = CoordinatorConfig::test(
+        &fixture.database_path,
+        &test_code,
+        "TEST_CODE_V4_NON_OUTBOX_OWNER_0123456789ABCDEF",
+    );
+    let coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take coordinator before corrupt non-outbox historical shaping");
+    assert_eq!(Arc::strong_count(&coordinator), 1);
+    drop(coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated non-outbox historical database");
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM cooldown_heads head
+                 JOIN cooldown_reservations reservation
+                   ON reservation.cooldown_reservation_identity=
+                      head.current_reservation_identity
+                 WHERE reservation.decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the real Rolling policy API created one cooldown head"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable FK only while constructing non-outbox corrupt history");
+    assert_eq!(
+        historical
+            .execute(
+                "UPDATE cooldown_heads
+                    SET current_reservation_identity='TEST_CODE_V4_MISSING_COOLDOWN_RESERVATION'
+                  WHERE current_reservation_identity=(
+                    SELECT current_cooldown_reservation_identity
+                    FROM delivery_decisions WHERE decision_identity=?1
+                  )",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("construct one non-outbox historical FK violation"),
+        1
+    );
+    historical
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("restore FK enforcement before formal non-outbox open");
+    let violations_before = foreign_key_violation_details(&historical);
+    assert_eq!(violations_before.len(), 1);
+    assert!(violations_before[0].contains("table=cooldown_heads"));
+    assert!(violations_before[0].contains("reported_parent=cooldown_reservations"));
+    let before = audit_v4_upgrade_database_snapshot(&historical);
+    assert_eq!(before.0, 4);
+    drop(historical);
+
+    let error = match DurableDeliveryCoordinator::open(config) {
+        Ok(_) => panic!("formal open must reject a non-outbox historical FK violation"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DurableDeliveryError::InvalidConfiguration(reason)
+            if reason.contains("foreign-key violation")
+    ));
+
+    let rolled_back =
+        Connection::open(&fixture.database_path).expect("inspect formal-open non-outbox rollback");
+    rolled_back
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enforce FK while inspecting non-outbox rollback");
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&rolled_back),
+        before,
+        "formal-open failure must preserve v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert_eq!(
+        foreign_key_violation_details(&rolled_back),
+        violations_before
+    );
+}
+
+#[test]
+fn audit_v4_upgrade_defer_reset_does_not_hide_later_commit_violation() {
+    let mut connection =
+        Connection::open_in_memory().expect("open isolated deferred-FK migration database");
+    initialize_test_schema(&mut connection).expect("materialize reference schema");
+    downgrade_replay_schema_v4_for_test(&mut connection, false);
+    let before = audit_v4_upgrade_database_snapshot(&connection);
+    assert_eq!(before.0, 4);
+    assert!(foreign_key_violation_details(&connection).is_empty());
+
+    let transaction = connection
+        .transaction()
+        .expect("begin direct schema migration transaction");
+    super::schema::initialize_schema(&transaction)
+        .expect("migrate valid v4 history and reset only its stale deferred counter");
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read migrated version inside transaction"),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+            .expect("verify FK enforcement stays enabled"),
+        1
+    );
+    assert_eq!(
+        transaction
+            .pragma_query_value(None, "defer_foreign_keys", |row| row.get::<_, i64>(0))
+            .expect("verify migration restores deferred enforcement"),
+        1
+    );
+    assert!(foreign_key_violation_details(&transaction).is_empty());
+
+    let canonical = br#"{"reason":"TEST_CODE_POST_RESET_DEFERRED_FK"}"#;
+    let digest = sha256_hex(canonical);
+    transaction
+        .execute(
+            "INSERT INTO immutable_audit_outbox(
+               audit_identity,decision_identity,attempt_identity,audit_kind,
+               predecessor_audit_identity,audit_canonical,audit_sha256,
+               append_state,immutable_audit_ref,created_at
+             ) VALUES(
+               'TEST_CODE_POST_RESET_DEFERRED_AUDIT','TEST_CODE_V4_DECISION',NULL,
+               'DecisionIdentityConflict','TEST_CODE_POST_RESET_MISSING_PREDECESSOR',
+               ?1,?2,'Pending',NULL,'2026-07-29T22:00:00Z'
+             )",
+            params![canonical.as_slice(), digest],
+        )
+        .expect("defer a new real FK violation after the guarded counter reset");
+    let deferred_violations = foreign_key_violation_details(&transaction);
+    assert_eq!(deferred_violations.len(), 1);
+    assert!(deferred_violations[0].contains("table=immutable_audit_outbox"));
+    assert!(deferred_violations[0].contains("reported_parent=immutable_audit_outbox"));
+
+    let commit_error = transaction
+        .execute_batch("COMMIT")
+        .expect_err("new deferred FK violation must still reject COMMIT");
+    assert!(matches!(
+        commit_error,
+        rusqlite::Error::SqliteFailure(error, _)
+            if error.extended_code == 787
+    ));
+    assert!(
+        !transaction.is_autocommit(),
+        "failed deferred-FK COMMIT must leave the transaction open for rollback"
+    );
+    transaction
+        .execute_batch("ROLLBACK")
+        .expect("roll back the rejected post-reset migration transaction");
+    drop(transaction);
+
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&connection),
+        before,
+        "rejected post-reset COMMIT must restore v4, raw DDL, every typed row, and every audit rowid"
+    );
+    assert!(foreign_key_violation_details(&connection).is_empty());
+}
+
+#[test]
+fn audit_logical_tail_recovers_after_real_v4_upgrade() {
+    const FIXED_OWNER: &str = "TEST_CODE_REAL_V4_UPGRADE_OWNER_0123456789ABCDEF";
+    const HEARTBEAT_SAMPLE_BOUND: i64 = 16;
+
+    let mut fixture = Fixture::new("AUDIT_LOGICAL_TAIL_REAL_V4_UPGRADE");
+    let test_code = fixture
+        .database_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .expect("isolated TEST_CODE root")
+        .to_owned();
+    let coordinator_config =
+        CoordinatorConfig::test(&fixture.database_path, &test_code, FIXED_OWNER);
+    let bootstrap = fixture
+        .coordinator
+        .take()
+        .expect("take bootstrap coordinator before fixed-owner reopen");
+    assert_eq!(
+        Arc::strong_count(&bootstrap),
+        1,
+        "the fixed-owner reopen must not retain a hidden coordinator Arc"
+    );
+    drop(bootstrap);
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(
+        DurableDeliveryCoordinator::open(coordinator_config.clone())
+            .expect("reopen isolated coordinator with a deterministic owner"),
+    )));
+
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("AUDIT_LOGICAL_TAIL_REAL_V4_UPGRADE");
+    prepare_reserved(&fixture, &candidate, &append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real Foundation-bound attempt")
+        .expect("real Foundation-bound attempt lease");
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let mut ordering_witness = None;
+    for offset_seconds in 1..=HEARTBEAT_SAMPLE_BOUND {
+        let heartbeat_at = now() + chrono::Duration::seconds(offset_seconds);
+        assert!(fixture
+            .coordinator
+            .heartbeat_attempt(
+                &candidate.decision_identity,
+                &attempt.attempt_identity,
+                attempt.fence_token,
+                heartbeat_at.clone(),
+            )
+            .expect("extend the real in-flight attempt with a fixed heartbeat sample"));
+        let connection = Connection::open(&fixture.database_path)
+            .expect("inspect bounded real heartbeat sample");
+        let (logical_tail, chain_len) =
+            real_audit_logical_tail(&connection, &candidate.decision_identity);
+        let migration_sorted_tail: String = connection
+            .query_row(
+                "SELECT audit_identity
+                 FROM immutable_audit_outbox
+                 WHERE decision_identity=?1
+                 ORDER BY
+                   CASE WHEN predecessor_audit_identity IS NULL THEN 0 ELSE 1 END ASC,
+                   predecessor_audit_identity ASC,
+                   audit_identity ASC
+                 LIMIT 1 OFFSET (
+                   SELECT COUNT(*) - 1 FROM immutable_audit_outbox
+                   WHERE decision_identity=?1
+                 )",
+                [candidate.decision_identity.as_str()],
+                |row| row.get(0),
+            )
+            .expect("derive the historical migration's target physical tail");
+        if migration_sorted_tail != logical_tail {
+            ordering_witness = Some((
+                heartbeat_at,
+                offset_seconds,
+                chain_len,
+                logical_tail,
+                migration_sorted_tail,
+            ));
+            break;
+        }
+    }
+    let (
+        last_heartbeat_at,
+        heartbeat_sample_count,
+        chain_len,
+        pre_upgrade_logical_tail,
+        migration_sorted_physical_tail,
+    ) = ordering_witness.unwrap_or_else(|| {
+        panic!(
+            "the fixed {HEARTBEAT_SAMPLE_BOUND}-heartbeat real API sample must expose a v4 migration ordering witness"
+        )
+    });
+    assert!(heartbeat_sample_count <= HEARTBEAT_SAMPLE_BOUND);
+    assert!(
+        chain_len > 2,
+        "the real audit witness must be a longer chain"
+    );
+    assert_ne!(
+        migration_sorted_physical_tail, pre_upgrade_logical_tail,
+        "the bounded real API sample must witness that the legacy migration sort would select the wrong target tail"
+    );
+
+    let pre_upgrade_reconcile = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("complete Foundation binding"),
+            &append,
+            last_heartbeat_at.clone(),
+        )
+        .expect("append the real heartbeat chain without expiring its lease");
+    assert!(pre_upgrade_reconcile.progress_count > 0);
+    assert_eq!(pre_upgrade_reconcile.provider_calls, 0);
+    assert_eq!(pre_upgrade_reconcile.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let old_coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take every old coordinator Arc before downgrade");
+    assert_eq!(
+        Arc::strong_count(&old_coordinator),
+        1,
+        "the formal upgrade must not overlap an old coordinator Arc"
+    );
+    drop(old_coordinator);
+
+    let mut historical = Connection::open(&fixture.database_path)
+        .expect("open isolated database for historical v4 shaping");
+    let (stable_logical_tail, stable_chain_len) =
+        real_audit_logical_tail(&historical, &candidate.decision_identity);
+    assert_eq!(stable_logical_tail, pre_upgrade_logical_tail);
+    assert_eq!(stable_chain_len, chain_len);
+    let target_before_downgrade =
+        real_v4_upgrade_target_snapshot(&historical, &candidate.decision_identity);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM immutable_audit_outbox
+                 WHERE decision_identity=?1 AND append_state!='Appended'",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the original real chain is durably appended before upgrade"),
+        0
+    );
+    let replay_references_before: (i64, i64) = historical
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM review_terminal_replay_attempts
+                 WHERE decision_identity=?1),
+               (SELECT COUNT(*) FROM review_terminal_replay_completions
+                 WHERE decision_identity=?1)",
+            [candidate.decision_identity.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prove target has no replay authority before historical shaping");
+    assert_eq!(replay_references_before, (0, 0));
+    let physical_tail_before_downgrade: String = historical
+        .query_row(
+            "SELECT audit_identity FROM immutable_audit_outbox
+             WHERE decision_identity=?1 ORDER BY rowid DESC LIMIT 1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get(0),
+        )
+        .expect("read target physical tail before historical shaping");
+    assert_eq!(physical_tail_before_downgrade, pre_upgrade_logical_tail);
+
+    downgrade_replay_schema_v4_for_test(&mut historical, false);
+    assert_eq!(
+        historical
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read exact historical schema version"),
+        4
+    );
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name LIKE 'review_terminal_replay_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("prove replay tables are absent from the historical shape"),
+        0
+    );
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('immutable_audit_outbox')
+                 WHERE \"table\"='immutable_audit_outbox'
+                   AND \"from\"='predecessor_audit_identity'
+                   AND \"to\"='audit_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify the historical shape retains its exact final-name self-FK"),
+        1
+    );
+    let historical_foreign_key_violations = foreign_key_violation_details(&historical);
+    assert!(
+        historical_foreign_key_violations.is_empty(),
+        "historical v4 shape must preserve every original FK before formal upgrade: {historical_foreign_key_violations:#?}"
+    );
+    assert_eq!(
+        real_v4_upgrade_target_snapshot(&historical, &candidate.decision_identity),
+        target_before_downgrade,
+        "historical table shaping may add its isolated Delivered sample but must preserve every target byte and reference"
+    );
+    let outbox_rowids_before_upgrade = audit_v4_upgrade_rowid_snapshot(&historical);
+    assert_eq!(
+        historical
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_decisions
+                 WHERE decision_identity='TEST_CODE_V4_DECISION' AND state='Delivered'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("identify the helper's isolated synthetic Delivered sample"),
+        1
+    );
+    drop(historical);
+
+    let schema_sql_reached = Arc::new(AtomicUsize::new(0));
+    let schema_sql_reached_by_hook = schema_sql_reached.clone();
+    let _schema_sql_hook = install_database_bootstrap_test_hook(
+        DatabaseBootstrapTestPhase::AfterSchemaSqlBeforeCommitValidation,
+        move || {
+            schema_sql_reached_by_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .expect("install read-only formal-upgrade schema checkpoint");
+    let formally_upgraded =
+        DurableDeliveryCoordinator::open(coordinator_config).unwrap_or_else(|error| {
+            panic!(
+                "formal v4-to-current open failed; after_schema_sql_hook_reached={}: {error}",
+                schema_sql_reached.load(Ordering::SeqCst)
+            )
+        });
+    assert_eq!(
+        schema_sql_reached.load(Ordering::SeqCst),
+        1,
+        "formal upgrade must pass all schema SQL before committing"
+    );
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(formally_upgraded)));
+    let upgraded = Connection::open(&fixture.database_path)
+        .expect("inspect the formally upgraded isolated database");
+    upgraded
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable FK enforcement on the independent upgrade inspector");
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read formally upgraded schema version"),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        upgraded
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("check formal upgrade foreign keys"),
+        0
+    );
+    assert_eq!(
+        upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('immutable_audit_outbox')
+                 WHERE \"table\"='immutable_audit_outbox'
+                   AND \"from\"='predecessor_audit_identity'
+                   AND \"to\"='audit_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("check formal upgrade predecessor self-FK"),
+        1
+    );
+    assert_eq!(
+        real_v4_upgrade_target_snapshot(&upgraded, &candidate.decision_identity),
+        target_before_downgrade,
+        "formal v4-to-current upgrade must preserve exact target authority rows"
+    );
+    assert_eq!(
+        audit_v4_upgrade_rowid_snapshot(&upgraded),
+        outbox_rowids_before_upgrade,
+        "formal v4-to-current upgrade must preserve every historical audit identity-to-rowid mapping"
+    );
+    let replay_references_after: (i64, i64) = upgraded
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM review_terminal_replay_attempts
+                 WHERE decision_identity=?1),
+               (SELECT COUNT(*) FROM review_terminal_replay_completions
+                 WHERE decision_identity=?1)",
+            [candidate.decision_identity.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("prove formal upgrade did not synthesize target replay authority");
+    assert_eq!(replay_references_after, (0, 0));
+    let actual_upgraded_physical_tail: String = upgraded
+        .query_row(
+            "SELECT audit_identity FROM immutable_audit_outbox
+             WHERE decision_identity=?1 ORDER BY rowid DESC LIMIT 1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get(0),
+        )
+        .expect("read actual target physical tail after formal v4 upgrade");
+    assert_eq!(
+        actual_upgraded_physical_tail, pre_upgrade_logical_tail,
+        "the upgraded physical append tail must remain the unique pre-upgrade logical tail"
+    );
+    drop(upgraded);
+
+    let recovered_at = last_heartbeat_at + chrono::Duration::seconds(121);
+    let recovery = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("exact recovery binding"),
+            &append,
+            recovered_at.clone(),
+        )
+        .expect("recover the single real expired Foundation attempt after formal upgrade");
+    assert!(recovery.progress_count > 0);
+    assert_eq!(recovery.provider_calls, 0);
+    assert_eq!(recovery.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read upgraded recovery state"),
+        DecisionState::UncertainManualReview
+    );
+
+    let terminal_after_recovery = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity);
+    let recovery_connection =
+        Connection::open(&fixture.database_path).expect("inspect the recovered upgraded target");
+    let fence_rows = recovery_connection
+        .query_row(
+            "SELECT COUNT(*),MIN(predecessor_audit_identity)
+             FROM immutable_audit_outbox
+             WHERE decision_identity=?1 AND attempt_identity=?2
+               AND audit_kind='FenceRevoked'",
+            params![
+                candidate.decision_identity.as_str(),
+                attempt.attempt_identity.as_str()
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .expect("read the real recovered FenceRevoked audit predecessor");
+    assert_eq!(
+        fence_rows.0, 1,
+        "single recovery must write one fence audit"
+    );
+    assert_eq!(
+        fence_rows.1.as_deref(),
+        Some(pre_upgrade_logical_tail.as_str()),
+        "the real post-upgrade recovery must append to the preserved unique logical tail"
+    );
+    let terminal = match terminal_after_recovery
+        .expect("real upgraded recovery must remain readable through the terminal inspector")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected upgraded recovered terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        terminal.durable_schema_version(),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        recovery_connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_decisions
+                 WHERE decision_identity='TEST_CODE_V4_DECISION' AND state='Delivered'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify scoped recovery isolates the helper's synthetic decision"),
+        1
+    );
+    let target_audit_count_after_recovery = recovery_connection
+        .query_row(
+            "SELECT COUNT(*) FROM immutable_audit_outbox WHERE decision_identity=?1",
+            [candidate.decision_identity.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count target audit rows after first recovery");
+    let recovery_facts = w16_recovery_facts(&fixture, Some(&candidate.decision_identity));
+    let append_records = append
+        .records
+        .lock()
+        .expect("read immutable append observations after first recovery")
+        .clone();
+    drop(recovery_connection);
+
+    let duplicate_recovery = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &candidate.decision_identity,
+            candidate
+                .foundation_binding()
+                .expect("duplicate recovery binding"),
+            &append,
+            recovered_at + chrono::Duration::seconds(1),
+        )
+        .expect("repeat completed upgraded recovery");
+    assert_eq!(duplicate_recovery.progress_count, 0);
+    assert_eq!(duplicate_recovery.provider_calls, 0);
+    assert_eq!(duplicate_recovery.sink_calls, 0);
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        recovery_facts,
+        "duplicate recovery must not alter target authority"
+    );
+    assert_eq!(
+        *append
+            .records
+            .lock()
+            .expect("read immutable append observations after duplicate recovery"),
+        append_records,
+        "duplicate recovery must not append a second audit"
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let completed_coordinator = fixture
+        .coordinator
+        .take()
+        .expect("take completed coordinator before restart");
+    assert_eq!(
+        Arc::strong_count(&completed_coordinator),
+        1,
+        "restart must release the only coordinator Arc"
+    );
+    drop(completed_coordinator);
+    let restarted = fixture.second_coordinator("AUDIT_V4_UPGRADE_RESTART");
+    let restarted_terminal = match restarted
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read upgraded terminal after coordinator restart")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected restarted upgraded terminal, got {other:?}"),
+    };
+    assert_eq!(restarted_terminal, terminal);
+    let restarted_connection = Connection::open(&fixture.database_path)
+        .expect("inspect restarted upgraded target without coordinator mutation");
+    assert_eq!(
+        restarted_connection
+            .query_row(
+                "SELECT COUNT(*) FROM immutable_audit_outbox WHERE decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count target audit rows after restart read"),
+        target_audit_count_after_recovery
+    );
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        recovery_facts,
+        "restart terminal inspection must not alter target authority"
+    );
+    assert_eq!(
+        *append
+            .records
+            .lock()
+            .expect("read immutable append observations after restart"),
+        append_records
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    drop(restarted_connection);
+    fixture.coordinator = FixtureCoordinator(Some(restarted));
+}
+
+#[test]
 fn br192_schema_v2_migration_rejects_historical_blank_manual_accepted_audit_refs() {
     for (label, whitespace) in [
         ("SPACE", " "),
@@ -3442,6 +4957,14 @@ struct RollbackAcknowledgementAfterAppend {
     armed: std::sync::atomic::AtomicBool,
 }
 
+struct SchemaDriftAfterAppend {
+    inner: MemoryAppendPort,
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    target_kind: &'static str,
+    drifted_version: i64,
+    armed: std::sync::atomic::AtomicBool,
+}
+
 struct EmptyAppendPort {
     inner: MemoryAppendPort,
     target_kind: &'static str,
@@ -3546,6 +5069,43 @@ impl ImmutableAppendPort for RollbackAcknowledgementAfterAppend {
     }
 }
 
+impl SchemaDriftAfterAppend {
+    fn new(
+        coordinator: Arc<DurableDeliveryCoordinator>,
+        target_kind: &'static str,
+        drifted_version: i64,
+    ) -> Self {
+        Self {
+            inner: MemoryAppendPort::default(),
+            coordinator,
+            target_kind,
+            drifted_version,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+impl ImmutableAppendPort for SchemaDriftAfterAppend {
+    fn append_exact(
+        &self,
+        record_kind: &str,
+        identity: &str,
+        canonical_bytes: &[u8],
+        sha256: &str,
+    ) -> Result<String> {
+        let immutable_ref =
+            self.inner
+                .append_exact(record_kind, identity, canonical_bytes, sha256)?;
+        if record_kind == self.target_kind && self.armed.swap(false, Ordering::SeqCst) {
+            self.coordinator
+                .install_operation_postvalidation_test_fault(
+                    OperationPostvalidationTestFault::SchemaVersion(self.drifted_version),
+                )?;
+        }
+        Ok(immutable_ref)
+    }
+}
+
 impl Default for FailScheduleHydrationAppliedOnce {
     fn default() -> Self {
         Self {
@@ -3556,6 +5116,10 @@ impl Default for FailScheduleHydrationAppliedOnce {
 }
 
 impl MemoryAppendPort {
+    fn record_count(&self) -> usize {
+        self.records.lock().expect("append records").len()
+    }
+
     fn count_kind(&self, kind: &str) -> usize {
         self.records
             .lock()
@@ -4308,6 +5872,416 @@ fn p01_policy_is_global_business_date_once_and_budget_exempt() {
     assert_eq!(row.base_cooldown_secs, Some(86_400));
     assert!(!row.counts_against_daily_budget);
     assert_eq!(row.push_kind.stable_template_id(), "preopen_news_hot_v1");
+}
+
+#[test]
+fn t16_st_price_policy_is_per_ticket_rolling_and_budget_counted() {
+    // 2026-09-19 用户决策: ST 涨跌幅变更提醒计入 30 条/日预算
+    // (盘中信息卡, 非资金动作; 与 T0Advice/HoldingPlan 同待遇)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::StPriceLimitChanged)
+        .expect("T-16 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "st_price_limit_changed_v1");
+}
+#[test]
+fn g5b_policy_is_global_no_cooldown_and_budget_exempt() {
+    // 2026-09-20: G5b 每事件一推 (≤3/日), 无冷却 (WindowMode::None, HoldingEvent
+    // 先例); 盘后归因类豁免日预算 (分流规则)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::G5bAttribution)
+        .expect("G5b durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "g5b_attribution_v1");
+}
+
+#[test]
+fn a12_attribution_daily_policy_is_global_business_date_once_and_budget_exempt() {
+    // 2026-09-20 用户决策 (分流规则): 每日必达类豁免日预算 — 15:05 归因日推
+    // 与复盘类同语义 (BR-237), 不被盘中信号饿死。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::AttributionDaily)
+        .expect("A-12 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "attribution_daily_v1");
+}
+
+#[test]
+fn intraday_market_policy_is_global_rolling_900_and_budget_counted() {
+    // 2026-09-20: I-01 盘中轮动升级 counted — R-02 盘面走向每 5 分钟硬推,
+    // Rolling 900s 镜像旧 L4 (notify cooldown_secs 900); 盘中信息卡计入
+    // 30 条/日预算 (分流规则)。同 kind 的两个每日一次借用点 (BR-226 快照
+    // 提醒/盘前预检) 同样计预算 — per-kind 粒度无法拆分, ≤3 槽/日残余行为
+    // 记入 commit message。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::IntradayMarket)
+        .expect("I-01 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(900));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "intraday_market_v1");
+}
+
+#[test]
+fn news_catalyst_policy_is_global_rolling_600_and_budget_counted() {
+    // 2026-09-20: I-02 新闻催化升级 counted — 事件驱动 (Important 公告非空
+    // 调一次), Rolling 600s 镜像旧 L4 (notify cooldown_secs 600); 盘中信息卡
+    // 计入 30 条/日预算 (分流规则)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::NewsCatalyst)
+        .expect("I-02 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(600));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "news_catalyst_v1");
+}
+
+#[test]
+fn block_trade_confirm_policy_is_per_ticket_business_date_once_and_budget_exempt() {
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted — 名称含 Intraday 实际是
+    // 19:00 盘后 review side route (BR-223), 每票每日一次历史成交记录;
+    // PerTicket 镜像旧 L4 逐票两层 300s 冷却 (批量多票互不阻塞);
+    // BusinessDateOnce 与 ReviewMarket 同语义 (按业务日幂等); 盘后复盘类
+    // 豁免日预算 (分流规则, BR-237 原理: 复盘不被盘中信号挤掉)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::BlockTradeIntradayConfirm)
+        .expect("BR-033 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "block_trade_intraday_confirm_v1"
+    );
+}
+
+#[test]
+fn ipo_catalyst_policy_is_global_business_date_once_and_budget_exempt() {
+    // 2026-09-20: A-11 IPO 阶段催化升级 counted — 19:00 盘后 review side
+    // route (BR-223), 每日一次全市场 digest, 空 code Global 形态;
+    // BusinessDateOnce 按业务日幂等 (ReviewMarket BR-214 先例) 并修复旧
+    // 「跨日期共享空code 1800s 冷却」缺陷; 盘后复盘类豁免日预算 (分流规则,
+    // BR-237 原理: 复盘不被盘中信号挤掉)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::IpoCatalyst)
+        .expect("A-11 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "ipo_catalyst_v1");
+}
+
+#[test]
+fn snapshot_stale_policy_is_global_business_date_once_and_budget_exempt() {
+    // 2026-09-20: 快照过期提醒升级 counted — 健康提醒类 (分流规则: 每日
+    // 必达/健康提醒豁免日预算, 不被盘中信号挤掉); 每日一次 (进程内
+    // SnapshotReminderGate 语义), Global BusinessDateOnce 按业务日幂等。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::SnapshotStale)
+        .expect("snapshot-stale durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "snapshot_stale_v1");
+}
+
+#[test]
+fn limit_boards_policy_is_global_rolling_1800_and_budget_counted() {
+    // 2026-09-20: 涨停板板数榜升级 counted — 盘中信息卡计入预算 (分流规则);
+    // Rolling 1800s 镜像旧 L4 默认 kind-全局冷却 (3 个 shape 共享头, 保真
+    // 旧互相阻塞语义)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::LimitBoards)
+        .expect("limit-boards durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(1_800));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "limit_boards_v1");
+}
+
+#[test]
+fn data_mode_policy_is_global_no_cooldown_and_budget_exempt() {
+    // 2026-09-20: T-02 数据模式变化卡升级 counted — 数据健康告警 =
+    // 健康提醒类 → 豁免日预算 (系统健康卡不被盘中信号挤掉, BR-237 精神);
+    // WindowMode::None 无冷却 (G5b 先例) — BR-116 语义: 已确认状态对本身
+    // 负责精确去重, 不设跨状态粗粒度冷却 (快速不同变迁必须双双送达,
+    // br116 行为测试为权威)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::DataMode)
+        .expect("data-mode durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "data_mode_v1");
+}
+
+#[test]
+fn auction_repush_policy_is_global_rolling_600_and_budget_counted() {
+    // 2026-09-20: A-02 竞价重推升级 counted — 盘中信息卡计入预算 (分流
+    // 规则); Rolling 600s 镜像显式 L4 (notify.rs:418 共用行)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::AuctionRepush)
+        .expect("auction-repush durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(600));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "auction_repush_v1");
+}
+
+#[test]
+fn candidate_invalidated_policy_is_per_ticket_rolling_1800_and_budget_counted() {
+    // 2026-09-20: T-08 候选失效升级 counted — 盘中信息卡计入预算 (分流
+    // 规则); PerTicket Rolling 1800s 镜像旧逐票 30 min 冷却 (批量 diff
+    // 多票互不阻塞)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::CandidateInvalidated)
+        .expect("candidate-invalidated durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(1_800));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "candidate_invalidated_v1"
+    );
+}
+
+#[test]
+fn announcement_policy_is_global_no_cooldown_and_budget_counted() {
+    // 2026-09-20: S-01 公告源事实升级 counted — 盘中信息卡计入预算
+    // (分流规则); WindowMode::None 无冷却 (event_id 精确去重是旧语义,
+    // 批量公告同日全达)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::Announcement)
+        .expect("announcement durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "announcement_v1");
+}
+
+#[test]
+fn analyst_upgrade_policy_is_global_rolling_86400_and_budget_counted() {
+    // 2026-09-20: S-05 分析师上调升级 counted — 盘中信息卡计入预算
+    // (分流规则); Rolling 86400s 镜像显式 L4 (notify.rs:448 1次/日)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::AnalystUpgrade)
+        .expect("analyst-upgrade durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "analyst_upgrade_v1");
+}
+
+#[test]
+fn news_to_idea_policy_is_per_ticket_rolling_1200_and_budget_counted() {
+    // 2026-09-20: D-01 新闻到灵感升级 counted — 盘中信息卡计入预算
+    // (分流规则); PerTicket Rolling 1200s 镜像显式 L4 (notify.rs:431
+    // 20 min/票)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::NewsToIdea)
+        .expect("news-to-idea durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(1_200));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "news_to_idea_v1");
+}
+
+#[test]
+fn auction_volume_policy_is_global_rolling_600_and_budget_counted() {
+    // 2026-09-20: P-02 竞价热点量能升级 counted — 盘中信息卡计入预算
+    // (分流规则); Rolling 600s 镜像显式 L4 (notify.rs:418 共用行)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::AuctionVolume)
+        .expect("auction-volume durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(600));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "auction_volume_v1");
+}
+
+#[test]
+fn industry_chain_intraday_policy_is_per_ticket_rolling_1800_and_budget_counted() {
+    // 2026-09-20: I-03 盘中涨停扩散升级 counted — 盘中信息卡计入预算
+    // (分流规则); PerTicket Rolling 1800s 镜像显式 L4 (notify.rs:433
+    // 30 min/票)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::IndustryChainIntraday)
+        .expect("industry-chain-intraday durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(1_800));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "industry_chain_intraday_v1"
+    );
+}
+
+#[test]
+fn news_flash_aggregated_policy_is_global_rolling_3600_and_budget_counted() {
+    // 2026-09-20: N-02 新闻聚合升级 counted — 盘中信息卡计入预算
+    // (分流规则); Rolling 3600s 镜像显式 L4 (notify.rs:452 1h/窗口)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::NewsFlashAggregated)
+        .expect("news-flash-aggregated durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(3_600));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "news_flash_aggregated_v1");
+}
+
+#[test]
+fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
+    let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
+    let append = MemoryAppendPort::default();
+    let p01_envelope = |mode: &str, label: &str| {
+        DeliveryEnvelope::new(
+            "2026-08-18",
+            PushKind::PreopenNewsHot,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            format!("TEST_CODE_W13_P01_EVIDENCE_{label}"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "P01_SOURCE_BINDING_V1",
+                "render_mode": mode,
+            }))
+            .expect("serialize W13 P01 source binding"),
+            "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
+            format!("TEST_CODE_W13_P01_RENDERED_{label}").into_bytes(),
+            false,
+            None,
+        )
+        .expect("valid W13 P01 envelope")
+    };
+    let scheduled = p01_envelope("Scheduled", "SCHEDULED");
+    prepare_reserved(&fixture, &scheduled, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&scheduled.decision_identity, &sinks, now())
+        .expect("deliver scheduled P01 authority");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &scheduled.decision_identity,
+    );
+
+    let compensation = p01_envelope("Compensation", "COMPENSATION");
+    let conflict = fixture
+        .coordinator
+        .prepare(&compensation, 1, now() + chrono::Duration::seconds(1))
+        .expect("same-day compensation remains the same P01 claim");
+    assert_eq!(conflict.sink_calls, 0);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM business_date_once_claims"),
+        1
+    );
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_p01_dedicated_terminal("2026-08-18")
+        .expect("inspect exact P01 dedicated authority")
+    {
+        P01DedicatedTerminalQuery::Terminal(record) => record,
+        other => panic!("expected exact P01 terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.legacy_decision_identity,
+        scheduled.decision_identity
+    );
+    assert_eq!(
+        terminal.envelope_canonical,
+        scheduled.canonical_bytes().unwrap()
+    );
+    assert_eq!(
+        terminal.disposition,
+        FoundationTerminalDisposition::Accepted
+    );
+    assert_eq!(
+        terminal.accepted_channel.as_deref(),
+        Some("TEST_CODE_CHANNEL")
+    );
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -5445,22 +7419,40 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_twenty_three_kinds_and_twenty_six_rows() {
+fn policy_catalog_has_forty_one_kinds_and_forty_four_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
     // (重启错过补偿重复推送修复) → 17 kind/20 row → 22 kind/25 row。
     // 2026-08-18: BR-241 P-01 durable owner → 23 kind/26 row。
+    // 2026-09-19: T-16 ST 涨跌幅变更提醒升级 counted → 24 kind/27 row。
+    // 2026-09-20: A-12 归因日推升级 counted → 25 kind/28 row。
+    // 2026-09-20: G5b 深链归因升级 counted → 26 kind/29 row。
+    // 2026-09-20: I-01 盘中轮动升级 counted → 27 kind/30 row。
+    // 2026-09-20: I-02 新闻催化升级 counted → 28 kind/31 row。
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted → 29 kind/32 row。
+    // 2026-09-20: A-11 IPO 阶段催化升级 counted → 30 kind/33 row。
+    // 2026-09-20: 快照过期提醒升级 counted → 31 kind/34 row。
+    // 2026-09-20: 涨停板板数榜升级 counted → 32 kind/35 row。
+    // 2026-09-20: 数据模式变化卡升级 counted → 33 kind/36 row。
+    // 2026-09-20: 竞价重推升级 counted → 34 kind/37 row。
+    // 2026-09-20: 候选失效升级 counted → 35 kind/38 row。
+    // 2026-09-20: 公告源事实升级 counted → 36 kind/39 row。
+    // 2026-09-20: 分析师上调升级 counted → 37 kind/40 row。
+    // 2026-09-20: 新闻到灵感升级 counted → 38 kind/41 row。
+    // 2026-09-20: 竞价热点量能升级 counted → 39 kind/42 row。
+    // 2026-09-20: 盘中涨停扩散升级 counted → 40 kind/43 row。
+    // 2026-09-20: 新闻聚合升级 counted → 41 kind/44 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        26
+        44
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        23
+        41
     );
-    assert_eq!(compiled_policy_catalog().len(), 26);
+    assert_eq!(compiled_policy_catalog().len(), 44);
 }
 
 #[test]
@@ -5831,6 +7823,7 @@ fn br237_review_kinds_exempt_from_daily_budget_signal_kinds_compete() {
         PushKind::SectorTop,
         PushKind::SectorAnomaly,
         PushKind::CloseCall,
+        PushKind::StPriceLimitChanged,
     ] {
         let row = catalog
             .iter()
@@ -7678,4 +9671,1906 @@ fn cooldown_projection_events_are_append_only() {
             "2".to_owned()
         ]
     );
+}
+
+#[test]
+fn w12_legacy_envelope_keeps_exact_identity_and_canonical_bytes() {
+    let legacy = envelope(
+        "W12_LEGACY_GOLDEN",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let canonical = legacy.canonical_bytes().expect("canonical legacy envelope");
+
+    assert_eq!(
+        legacy.decision_identity,
+        "fd2b10332c1a463dcd5e9fc74e85f388e695bd27679ba61b45878691f5803056"
+    );
+    assert_eq!(
+        sha256_hex(&canonical),
+        "5e431e42aa9db00e7a548d490fea575b8c8ba8f882d22d4ceb9ac1843f4fe32f"
+    );
+    assert!(!canonical
+        .windows(b"foundation_binding".len())
+        .any(|window| window == b"foundation_binding"));
+    assert!(legacy.foundation_binding().is_none());
+}
+
+#[test]
+fn w12_foundation_binding_owns_application_decision_and_exact_cross_fields() {
+    let mut candidate = envelope(
+        "W12_FOUNDATION",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    candidate.source_evidence_fingerprint = sha256_hex(b"TEST_CODE_W12_FOUNDATION_SOURCE_EVIDENCE");
+    candidate.schedule_occurrence_identity = sha256_hex(b"TEST_CODE_W12_OCCURRENCE");
+    candidate.delivery_subject_hash = sha256_hex(b"TEST_CODE_W12_SUBJECT");
+    let application_decision_id = sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION");
+    let binding = FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        application_decision_id.clone(),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        candidate.business_date.clone(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("valid W12 foundation binding");
+
+    let bound = candidate
+        .clone()
+        .with_foundation_binding(binding)
+        .expect("bind foundation decision");
+    let persisted = bound.foundation_binding().expect("foundation binding");
+
+    assert_eq!(bound.decision_identity, application_decision_id);
+    assert_eq!(persisted.intent_id(), sha256_hex(b"TEST_CODE_W12_INTENT"));
+    assert_eq!(persisted.required_channel(), "TEST_CODE_CHANNEL");
+    assert_eq!(
+        persisted.rendered_sha256(),
+        candidate.rendered_content_sha256
+    );
+    assert_eq!(
+        persisted
+            .canonical_sha256()
+            .expect("foundation binding canonical SHA")
+            .len(),
+        64
+    );
+    assert!(bound
+        .canonical_bytes()
+        .expect("foundation canonical envelope")
+        .windows(b"foundation_binding".len())
+        .any(|window| window == b"foundation_binding"));
+
+    let wrong_date = FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION_BAD_DATE"),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        "2026-07-31".to_owned(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("individually valid binding");
+    assert!(candidate.with_foundation_binding(wrong_date).is_err());
+    assert!(FoundationDeliveryBinding::try_new(
+        "Test:TEST_CODE_W12_RUN".to_owned(),
+        sha256_hex(b"TEST_CODE_W12_APPLICATION_DECISION_BAD_CHANNEL"),
+        sha256_hex(b"TEST_CODE_W12_INTENT"),
+        "MU-W12-generic".to_owned(),
+        sha256_hex(b"TEST_CODE_OCCURRENCE"),
+        "2026-07-30".to_owned(),
+        "Global".to_owned(),
+        sha256_hex(b"TEST_CODE_SUBJECT_HASH"),
+        "TEST_CODE_W12_AUDIENCE".to_owned(),
+        "holding_event_v1".to_owned(),
+        "v1".to_owned(),
+        sha256_hex(b"TEST_CODE_RENDERED"),
+        sha256_hex(b"TEST_CODE_SOURCE"),
+        " bad-channel ".to_owned(),
+    )
+    .is_err());
+}
+
+fn w12_foundation_envelope(label: &str) -> DeliveryEnvelope {
+    let mut candidate = envelope(
+        label,
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    candidate.source_evidence_fingerprint =
+        sha256_hex(format!("TEST_CODE_W12_SOURCE_{label}").as_bytes());
+    candidate.schedule_occurrence_identity =
+        sha256_hex(format!("TEST_CODE_W12_OCCURRENCE_{label}").as_bytes());
+    candidate.delivery_subject_hash =
+        sha256_hex(format!("TEST_CODE_W12_SUBJECT_{label}").as_bytes());
+    let binding = FoundationDeliveryBinding::try_new(
+        format!("Test:TEST_CODE_W12_RUN_{label}"),
+        sha256_hex(format!("TEST_CODE_W12_DECISION_{label}").as_bytes()),
+        sha256_hex(format!("TEST_CODE_W12_INTENT_{label}").as_bytes()),
+        "MU-W12-generic".to_owned(),
+        candidate.schedule_occurrence_identity.clone(),
+        candidate.business_date.clone(),
+        "Global".to_owned(),
+        candidate.delivery_subject_hash.clone(),
+        format!("TEST_CODE_W12_AUDIENCE_{label}"),
+        candidate.push_kind.stable_template_id().to_owned(),
+        "v1".to_owned(),
+        candidate.rendered_content_sha256.clone(),
+        candidate.source_evidence_fingerprint.clone(),
+        "TEST_CODE_CHANNEL".to_owned(),
+    )
+    .expect("valid W12 foundation binding");
+    candidate
+        .with_foundation_binding(binding)
+        .expect("foundation-bound envelope")
+}
+
+fn w19_p01_recovery_envelope(label: &str) -> DeliveryEnvelope {
+    DeliveryEnvelope::new(
+        "2026-08-18",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "GLOBAL",
+        "p01:2026-08-18",
+        format!("TEST_CODE_W19_P01_SOURCE_{label}"),
+        br#"{"render_mode":"Scheduled","schema_version":"P01_SOURCE_BINDING_V1"}"#.to_vec(),
+        format!("TEST_CODE_W19_P01_SUBJECT_{label}"),
+        format!("TEST_CODE_W19_P01_RENDERED_{label}").into_bytes(),
+        false,
+        None,
+    )
+    .expect("valid W19 P01 recovery envelope")
+}
+
+fn w19_recover_uncertain_candidate(
+    fixture: &Fixture,
+    append: &MemoryAppendPort,
+    candidate: &DeliveryEnvelope,
+) -> (AttemptLease, DateTime<Utc>) {
+    prepare_reserved(fixture, candidate, append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real W19 recovery attempt")
+        .expect("W19 recovery attempt created");
+    let recovered_at = now() + chrono::Duration::seconds(121);
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(append, recovered_at)
+        .expect("expire, classify and seal W19 recovery attempt");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read recovered decision state"),
+        DecisionState::UncertainManualReview
+    );
+    (attempt, recovered_at)
+}
+
+#[test]
+fn w12_terminal_read_model_distinguishes_missing_pending_and_accepted() {
+    let fixture = Fixture::new("W12_TERMINAL_READ");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("TERMINAL_READ");
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("missing query"),
+        FoundationTerminalQuery::Missing
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("pending query"),
+        FoundationTerminalQuery::PendingSeal {
+            state: DecisionState::Reserved
+        }
+    ));
+
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 accepted result");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let terminal = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("accepted terminal query")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected W12 terminal record, got {other:?}"),
+    };
+
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Accepted
+    );
+    assert_eq!(terminal.attempt_id().is_some(), true);
+    assert_eq!(terminal.required_channel(), "TEST_CODE_CHANNEL");
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(terminal.durable_schema_version(), 9);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    let exact: serde_json::Value =
+        serde_json::from_slice(terminal.evidence_bytes()).expect("exact typed result JSON");
+    assert_eq!(exact["kind"], "Accepted");
+    assert_eq!(exact["receipt"]["channel"], "TEST_CODE_CHANNEL");
+    assert!(!format!("{terminal:?}").contains("TEST_CODE_MESSAGE"));
+}
+
+fn w16_recovery_facts(
+    fixture: &Fixture,
+    decision: Option<&str>,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let connection = Connection::open(&fixture.database_path).expect("isolated recovery snapshot");
+    let mut result = Vec::new();
+    for table in [
+        "delivery_decisions",
+        "delivery_attempts",
+        "delivery_attempt_events",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "sink_results",
+        "delivery_disposition_payloads",
+        "task_transition_payloads",
+        "daily_budget_reservations",
+        "cooldown_reservations",
+        "business_date_once_claims",
+    ] {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE (?1 IS NULL OR decision_identity=?1) ORDER BY rowid"
+            ))
+            .expect("prepare recovery facts");
+        let columns = statement.column_count();
+        result.extend(
+            statement
+                .query_map([decision], |row| {
+                    (0..columns)
+                        .map(|index| row.get(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("read recovery facts")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect facts"),
+        );
+    }
+    result
+}
+
+fn w16_assert_empty_summary(summary: &ReconcileSummary) {
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert!(summary.locally_pending_decisions.is_empty());
+    assert!(summary.deliverable_decisions.is_empty());
+    assert!(summary.non_progressable_foreign_attempts.is_empty());
+    assert!(summary.non_progressable_manual_reviews.is_empty());
+    assert!(summary.schedule_hydrations.is_empty());
+}
+
+#[test]
+fn w16_scoped_recovery_preserves_other_attempts_payloads_and_hydrations() {
+    let fixture = Fixture::new("W16_SCOPE_MATRIX");
+    let append = MemoryAppendPort::default();
+    let hydrated = envelope(
+        "W16_HYDRATION",
+        PushKind::CandidateTriggered,
+        DeliverySubKind::None,
+        "2026-07-29",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&hydrated, 0, now())
+        .expect("other task denial");
+    let initial = fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("seal other task");
+    assert_eq!(initial.schedule_hydrations.len(), 1);
+    let expired = envelope(
+        "W16_EXPIRED_OTHER",
+        PushKind::CandidateTriggered,
+        DeliverySubKind::None,
+        "2026-07-29",
+        false,
+    );
+    fixture
+        .coordinator
+        .prepare(&expired, 1, now())
+        .expect("other reservation");
+    fixture
+        .coordinator
+        .begin_attempt(&expired.decision_identity, 1, now())
+        .expect("other attempt")
+        .expect("lease");
+    let pending = envelope(
+        "W16_PENDING_OTHER",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-29",
+        true,
+    );
+    fixture
+        .coordinator
+        .prepare(&pending, 0, now())
+        .expect("other frozen pending payload");
+    let reserved = envelope(
+        "W16_RESERVED_OTHER",
+        PushKind::CandidateTriggered,
+        DeliverySubKind::None,
+        "2026-07-29",
+        false,
+    );
+    fixture
+        .coordinator
+        .prepare(&reserved, 1, now())
+        .expect("other deliverable");
+    let target = w12_foundation_envelope("W16_SCOPE_TARGET");
+    fixture
+        .coordinator
+        .prepare(&target, 0, now())
+        .expect("target frozen payload");
+    let others = [&hydrated, &expired, &pending, &reserved];
+    let before: Vec<_> = others
+        .iter()
+        .map(|other| w16_recovery_facts(&fixture, Some(&other.decision_identity)))
+        .collect();
+    let previous_records = append
+        .records
+        .lock()
+        .expect("initial append records")
+        .clone();
+    let at = now() + chrono::Duration::seconds(121);
+    let summary = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            at,
+        )
+        .expect("scoped recovery bypasses earlier unrelated candidates");
+    w16_assert_empty_summary(&summary);
+    assert!(summary.progress_count > 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&target.decision_identity)
+            .expect("target state"),
+        DecisionState::RejectedDurable
+    );
+    for (other, facts) in others.iter().zip(&before) {
+        assert_eq!(
+            &w16_recovery_facts(&fixture, Some(&other.decision_identity)),
+            facts
+        );
+    }
+    let target_records = append
+        .records
+        .lock()
+        .expect("target exact append records")
+        .clone();
+    for (identity, record) in &target_records {
+        if !previous_records.contains_key(identity) {
+            assert!(String::from_utf8_lossy(&record.canonical_bytes)
+                .contains(&target.decision_identity));
+        }
+    }
+    let replay = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            at,
+        )
+        .expect("idempotent scoped recovery");
+    w16_assert_empty_summary(&replay);
+    assert_eq!(replay.progress_count, 0);
+    assert_eq!(
+        *append.records.lock().expect("replayed records"),
+        target_records
+    );
+    let global = fixture
+        .coordinator
+        .reconcile_all_pending(&append, at)
+        .expect("unchanged global recovery");
+    assert!(global
+        .non_progressable_manual_reviews
+        .contains(&expired.decision_identity));
+    assert!(global
+        .deliverable_decisions
+        .contains(&reserved.decision_identity));
+    assert_eq!(global.schedule_hydrations.len(), 2);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&pending.decision_identity)
+            .expect("other recovered payload"),
+        DecisionState::RejectedDurable
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&expired.decision_identity)
+            .expect("other recovered lease"),
+        DecisionState::UncertainManualReview
+    );
+}
+
+#[test]
+fn w16_scoped_recovery_revokes_only_the_target_expired_attempt_once() {
+    let fixture = Fixture::new("W16_SCOPED_EXPIRED");
+    let append = MemoryAppendPort::default();
+    let other = envelope(
+        "W16_EARLIER_EXPIRED",
+        PushKind::CandidateTriggered,
+        DeliverySubKind::None,
+        "2026-07-29",
+        false,
+    );
+    let target = w12_foundation_envelope("W16_EXPIRED_TARGET");
+    for candidate in [&other, &target] {
+        fixture
+            .coordinator
+            .prepare(candidate, 1, now())
+            .expect("prepare expired candidate");
+        fixture
+            .coordinator
+            .begin_attempt(&candidate.decision_identity, 1, now())
+            .expect("begin candidate")
+            .expect("candidate lease");
+    }
+    let before = w16_recovery_facts(&fixture, Some(&other.decision_identity));
+    let at = now() + chrono::Duration::seconds(121);
+    let summary = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            at,
+        )
+        .expect("recover target expired lease");
+    assert_eq!(
+        summary.non_progressable_manual_reviews,
+        vec![target.decision_identity.clone()]
+    );
+    assert!(summary.locally_pending_decisions.is_empty());
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&other.decision_identity)),
+        before
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&target.decision_identity)
+            .expect("target uncertainty"),
+        DecisionState::UncertainManualReview
+    );
+    let target_facts = w16_recovery_facts(&fixture, Some(&target.decision_identity));
+    let records = append.records.lock().expect("target records").clone();
+    let replay = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            at,
+        )
+        .expect("replay uncertainty");
+    assert_eq!(replay.progress_count, 0);
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&target.decision_identity)),
+        target_facts
+    );
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&other.decision_identity)),
+        before
+    );
+    assert_eq!(*append.records.lock().expect("exact records"), records);
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM delivery_attempt_events WHERE event_kind='FenceRevoked'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn w16_scoped_recovery_rejects_every_binding_mismatch_missing_and_legacy_without_writes() {
+    let fixture = Fixture::new("W16_BINDING_REJECTION");
+    let append = MemoryAppendPort::default();
+    let target = w12_foundation_envelope("W16_BINDING_TARGET");
+    let legacy = envelope(
+        "W16_LEGACY_REJECTION",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-29",
+        false,
+    );
+    for candidate in [&legacy, &target] {
+        fixture
+            .coordinator
+            .prepare(candidate, 0, now())
+            .expect("pending denied candidate");
+    }
+    let before = w16_recovery_facts(&fixture, None);
+    let binding = target.foundation_binding().expect("target binding");
+    for (field, replacement) in [
+        ("schema_version", serde_json::json!(2)),
+        (
+            "namespace",
+            serde_json::json!("Test:TEST_CODE_DIFFERENT_NAMESPACE"),
+        ),
+        (
+            "application_decision_id",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_DECISION")),
+        ),
+        (
+            "intent_id",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_INTENT")),
+        ),
+        ("unit_id", serde_json::json!("MU-W16-other")),
+        (
+            "occurrence_id",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_OCCURRENCE")),
+        ),
+        ("business_date", serde_json::json!("2026-07-29")),
+        ("subject", serde_json::json!("Entity:TEST_CODE_OTHER")),
+        (
+            "delivery_subject_hash",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_SUBJECT")),
+        ),
+        ("audience", serde_json::json!("TEST_CODE_OTHER_AUDIENCE")),
+        ("template_id", serde_json::json!("TEST_CODE_OTHER_TEMPLATE")),
+        ("template_version", serde_json::json!("v2")),
+        (
+            "rendered_sha256",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_RENDERED")),
+        ),
+        (
+            "source_evidence_fingerprint",
+            serde_json::json!(sha256_hex(b"TEST_CODE_WRONG_SOURCE")),
+        ),
+        (
+            "required_channel",
+            serde_json::json!("TEST_CODE_OTHER_CHANNEL"),
+        ),
+    ] {
+        let mut value = serde_json::to_value(binding).expect("binding fields");
+        value[field] = replacement;
+        let wrong: FoundationDeliveryBinding =
+            serde_json::from_value(value).expect("typed mismatched binding");
+        assert!(
+            matches!(
+                fixture.coordinator.reconcile_foundation_decision(
+                    &target.decision_identity,
+                    &wrong,
+                    &append,
+                    now()
+                ),
+                Err(DurableDeliveryError::PolicyMismatch(_))
+            ),
+            "must reject {field}"
+        );
+        assert_eq!(
+            w16_recovery_facts(&fixture, None),
+            before,
+            "zero writes for {field}"
+        );
+        assert!(append.records.lock().expect("zero append").is_empty());
+    }
+    assert!(matches!(
+        fixture.coordinator.reconcile_foundation_decision(
+            &sha256_hex(b"TEST_CODE_MISSING"),
+            binding,
+            &append,
+            now()
+        ),
+        Err(DurableDeliveryError::DecisionNotFound(_))
+    ));
+    assert!(matches!(
+        fixture.coordinator.reconcile_foundation_decision(
+            &legacy.decision_identity,
+            binding,
+            &append,
+            now()
+        ),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    assert_eq!(w16_recovery_facts(&fixture, None), before);
+    assert!(append
+        .records
+        .lock()
+        .expect("zero append for missing and legacy")
+        .is_empty());
+}
+
+#[test]
+fn w16_scoped_recovery_blocks_on_another_decisions_pending_audit_predecessor() {
+    let fixture = Fixture::new("W16_SCOPED_PREDECESSOR");
+    let other = w12_foundation_envelope("W16_PREDECESSOR_OTHER");
+    let target = w12_foundation_envelope("W16_PREDECESSOR_TARGET");
+    fixture
+        .coordinator
+        .prepare(&target, 0, now())
+        .expect("freeze target denial");
+    // A real append acknowledgement failure leaves the target payload pending
+    // after its existing audit chain has been appended through the coordinator.
+    let staging_append = EmptyAppendPort::new("DeliveryDisposition");
+    assert!(matches!(fixture.coordinator.reconcile_foundation_decision(
+        &target.decision_identity, target.foundation_binding().expect("binding"),
+        &staging_append, now()
+    ), Err(DurableDeliveryError::PolicyMismatch(reason))
+        if reason.contains("DeliveryDisposition immutable append returned an empty reference")));
+    let append = staging_append.inner;
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&target.decision_identity)
+            .expect("staged target"),
+        DecisionState::RejectedAuditPending
+    );
+    fixture
+        .coordinator
+        .prepare(&other, 0, now())
+        .expect("freeze pending predecessor decision");
+    let connection =
+        Connection::open(&fixture.database_path).expect("isolated predecessor fixture");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enforce fixture predecessor reference");
+    let predecessor: String = connection.query_row(
+        "SELECT audit_identity FROM immutable_audit_outbox WHERE decision_identity=?1 ORDER BY rowid LIMIT 1",
+        [&other.decision_identity], |row| row.get(0)
+    ).expect("other pending predecessor");
+    // Freeze the cross-decision dependency on INSERT. Existing immutable
+    // payloads and their predecessor links are never rewritten or removed.
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "decision_identity": target.decision_identity,
+        "predecessor_audit_identity": predecessor,
+        "reason": "TEST_CODE_W16_EXTERNAL_AUDIT_DEPENDENCY",
+    }))
+    .expect("frozen dependency bytes");
+    let digest = sha256_hex(&canonical);
+    let audit_identity = super::model::stable_identity(
+        "delivery-critical-audit-v1",
+        &[
+            &target.decision_identity,
+            "NONE",
+            "DecisionIdentityConflict",
+            &digest,
+        ],
+    );
+    connection
+        .execute(
+            "INSERT INTO immutable_audit_outbox(
+           audit_identity,decision_identity,attempt_identity,audit_kind,
+           predecessor_audit_identity,audit_canonical,audit_sha256,
+           append_state,immutable_audit_ref,created_at
+         ) VALUES (?1,?2,NULL,'DecisionIdentityConflict',?3,?4,?5,'Pending',NULL,?6)",
+            params![
+                audit_identity,
+                target.decision_identity,
+                predecessor,
+                canonical,
+                digest,
+                now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+            ],
+        )
+        .expect("freeze cross-decision prerequisite with immutable triggers active");
+    let before = w16_recovery_facts(&fixture, None);
+    let records_before = append
+        .records
+        .lock()
+        .expect("staged append observations")
+        .clone();
+    assert!(matches!(
+        fixture.coordinator.reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            now()
+        ),
+        Err(DurableDeliveryError::AuditPredecessorBlocked)
+    ));
+    assert_eq!(w16_recovery_facts(&fixture, None), before);
+    assert_eq!(
+        *append.records.lock().expect("blocked append observations"),
+        records_before
+    );
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now())
+        .expect("global recovery can append the prerequisite");
+    let records = append.records.lock().expect("global prerequisite evidence");
+    assert!(records.contains_key(&predecessor));
+    assert_eq!(
+        records
+            .get(&audit_identity)
+            .expect("dependent audit appended")
+            .canonical_bytes,
+        canonical
+    );
+    drop(records);
+    for candidate in [&other, &target] {
+        assert_eq!(
+            fixture
+                .coordinator
+                .decision_state(&candidate.decision_identity)
+                .expect("globally recovered"),
+            DecisionState::RejectedDurable
+        );
+    }
+    let replay = fixture
+        .coordinator
+        .reconcile_foundation_decision(
+            &target.decision_identity,
+            target.foundation_binding().expect("binding"),
+            &append,
+            now(),
+        )
+        .expect("already appended external predecessor permits scoped query");
+    assert_eq!(replay.progress_count, 0);
+}
+
+#[test]
+fn w12_terminal_read_model_rejects_legacy_unbound_authority() {
+    let fixture = Fixture::new("W12_LEGACY_AUTHORITY");
+    let append = MemoryAppendPort::default();
+    let candidate = establish_authoritative_delivered_projection(
+        &fixture,
+        "W12_LEGACY_AUTHORITY",
+        &append,
+        false,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
+
+fn w12_terminal_record(
+    fixture: &Fixture,
+    decision_identity: &str,
+) -> Box<FoundationTerminalRecord> {
+    match fixture
+        .coordinator
+        .inspect_foundation_terminal(decision_identity)
+        .expect("W12 terminal query")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected W12 terminal record, got {other:?}"),
+    }
+}
+
+#[test]
+fn w19_recovered_uncertain_terminal_is_readable_after_expiry() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_READ");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_READ");
+    prepare_reserved(&fixture, &candidate, &append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real W19 recovery attempt")
+        .expect("W19 recovery attempt created");
+    let recovered_at = now() + chrono::Duration::seconds(121);
+
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("expire, classify and seal the W19 recovery attempt");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .expect("read recovered decision state"),
+        DecisionState::UncertainManualReview
+    );
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("sealed recovery classification is a readable terminal")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered W19 terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        sha256_hex(terminal.evidence_bytes()),
+        terminal.evidence_sha256()
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_p01_terminal_uses_the_same_real_recovery_evidence() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_P01");
+    let append = MemoryAppendPort::default();
+    let candidate = w19_p01_recovery_envelope("P01");
+    let (attempt, _) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+
+    let terminal = match fixture
+        .coordinator
+        .inspect_p01_dedicated_terminal("2026-08-18")
+        .expect("read recovered P01 authority")
+    {
+        P01DedicatedTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered P01 terminal, got {other:?}"),
+    };
+    assert_eq!(
+        terminal.legacy_decision_identity,
+        candidate.decision_identity
+    );
+    assert_eq!(
+        terminal.disposition,
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert_eq!(
+        terminal.attempt_id.as_deref(),
+        Some(attempt.attempt_identity.as_str())
+    );
+    assert_eq!(
+        sha256_hex(&terminal.evidence_bytes),
+        terminal.evidence_sha256
+    );
+    assert!(terminal.accepted_channel.is_none());
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_late_nonauthoritative_result_and_restart_remain_read_only() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_LATE_RESTART");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_LATE_RESTART");
+    let (attempt, recovered_at) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let before_late = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read recovery before late result")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal before late result, got {other:?}"),
+    };
+
+    fixture
+        .coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            AuthoritativeSinkResult::Accepted(receipt(recovered_at)),
+            recovered_at,
+        )
+        .expect("persist a real late non-authoritative result");
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("seal late-result audits");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM sink_results
+             WHERE decision_identity=(SELECT decision_identity FROM delivery_decisions LIMIT 1)
+               AND authoritative_for_state=0 AND late_after_fence=1"
+        ),
+        1
+    );
+
+    let facts_before_reads = w16_recovery_facts(&fixture, Some(&candidate.decision_identity));
+    let append_before_reads = append.records.lock().expect("append records").clone();
+    let after_late = match fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("late non-authoritative result cannot replace recovery")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal after late result, got {other:?}"),
+    };
+    let restarted = fixture.second_coordinator("W19_RECOVERED_UNCERTAIN_RESTART");
+    let after_restart = match restarted
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read same recovery after restart")
+    {
+        FoundationTerminalQuery::Terminal(record) => record,
+        other => panic!("expected recovered terminal after restart, got {other:?}"),
+    };
+    assert_eq!(after_late, before_late);
+    assert_eq!(after_restart, before_late);
+    assert_eq!(
+        restarted
+            .decision_state(&candidate.decision_identity)
+            .expect("restarted recovery state"),
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(
+        w16_recovery_facts(&fixture, Some(&candidate.decision_identity)),
+        facts_before_reads
+    );
+    assert_eq!(
+        *append.records.lock().expect("unchanged append records"),
+        append_before_reads
+    );
+}
+
+#[test]
+fn w19_recovered_uncertain_pending_audit_remains_pending_seal() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_PENDING_SEAL");
+    let initial_append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_PENDING_SEAL");
+    prepare_reserved(&fixture, &candidate, &initial_append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin pending-seal recovery attempt")
+        .expect("pending-seal attempt created");
+    let empty_ref = EmptyAppendPort::new("FenceRevoked");
+    assert!(matches!(
+        fixture.coordinator.reconcile_all_pending(
+            &empty_ref,
+            now() + chrono::Duration::seconds(121)
+        ),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("immutable append returned an empty reference")
+    ));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect("unsealed recovery remains readable as pending"),
+        FoundationTerminalQuery::PendingSeal {
+            state: DecisionState::UncertainAuditPending
+        }
+    ));
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_missing_duplicate_wrong_binding_tamper_and_overflow() {
+    for corruption in [
+        "missing",
+        "duplicate",
+        "wrong-audit-binding",
+        "tampered-canonical",
+        "disposition-reference",
+        "fence-overflow",
+    ] {
+        let fixture = Fixture::new(&format!("W19_RECOVERED_UNCERTAIN_{corruption}"));
+        let append = MemoryAppendPort::default();
+        let candidate = w12_foundation_envelope(&format!("W19_RECOVERED_{corruption}"));
+        w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+        let connection = Connection::open(&fixture.database_path)
+            .expect("open isolated W19 recovery corruption database");
+        match corruption {
+            "missing" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_delete;")
+                    .expect("remove isolated event delete guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "DELETE FROM delivery_attempt_events
+                             WHERE decision_identity=?1 AND event_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("remove one isolated recovery event"),
+                    1
+                );
+            }
+            "duplicate" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_update;")
+                    .expect("remove isolated event update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempt_events SET event_kind='FenceRevoked'
+                             WHERE decision_identity=?1 AND event_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("duplicate isolated recovery kind"),
+                    1
+                );
+            }
+            "wrong-audit-binding" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+                    .expect("remove isolated audit update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE immutable_audit_outbox SET audit_kind='FenceRevoked'
+                             WHERE decision_identity=?1 AND audit_kind='RecoveryClassified'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("rebind isolated recovery audit"),
+                    1
+                );
+            }
+            "tampered-canonical" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_attempt_event_update;")
+                    .expect("remove isolated event update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempt_events SET event_canonical=x'7b7d'
+                             WHERE decision_identity=?1 AND event_kind='FenceRevoked'",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("tamper isolated recovery canonical"),
+                    1
+                );
+            }
+            "disposition-reference" => {
+                connection
+                    .execute_batch("DROP TRIGGER immutable_disposition_payload_update;")
+                    .expect("remove isolated disposition update guard");
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_disposition_payloads SET disposition_sha256=?1
+                             WHERE decision_identity=?2",
+                            params![
+                                sha256_hex(b"TEST_CODE_W19_WRONG_DISPOSITION_REFERENCE"),
+                                candidate.decision_identity
+                            ],
+                        )
+                        .expect("tamper isolated recovery disposition reference"),
+                    1
+                );
+            }
+            "fence-overflow" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE delivery_attempts SET fence_token=9223372036854775807
+                             WHERE decision_identity=?1",
+                            [candidate.decision_identity.as_str()],
+                        )
+                        .expect("inject isolated fence overflow"),
+                    1
+                );
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+
+        let error = fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect_err("corrupt recovery evidence must be rejected");
+        assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+        assert!(!error.to_string().contains("TEST_CODE"));
+        assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    }
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_broken_fence_audit_predecessor() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_FENCE_PREDECESSOR");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_FENCE_PREDECESSOR");
+    w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 fence predecessor corruption database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+        .expect("remove isolated audit immutability guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox SET predecessor_audit_identity=audit_identity
+                 WHERE decision_identity=?1 AND audit_kind='FenceRevoked'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("inject isolated FenceRevoked predecessor self-loop"),
+        1
+    );
+    drop(connection);
+
+    let error = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect_err("FenceRevoked audit predecessor self-loop must be rejected");
+    assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+    assert!(!error.to_string().contains("TEST_CODE"));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_logical_predecessor_chain_ignores_physical_rowid_order() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_ROWID_REORDER");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_ROWID_REORDER");
+    w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    let before = fixture
+        .query_strings("SELECT audit_identity FROM immutable_audit_outbox ORDER BY rowid ASC");
+    let expected_terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("read terminal before physical rowid reorder");
+    let connection =
+        Connection::open(&fixture.database_path).expect("open isolated W19 rowid reorder database");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox SET rowid=-rowid WHERE decision_identity=?1",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("reverse isolated audit physical rowids"),
+        before.len()
+    );
+    drop(connection);
+    let after = fixture
+        .query_strings("SELECT audit_identity FROM immutable_audit_outbox ORDER BY rowid ASC");
+    let mut reversed = before;
+    reversed.reverse();
+    assert_eq!(
+        after, reversed,
+        "the physical row order must actually change"
+    );
+
+    let actual_terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("logical predecessor chain survives physical rowid reorder");
+    assert_eq!(actual_terminal, expected_terminal);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_allows_a_real_intervening_conflict_audit() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_INTERVENING_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_INTERVENING_CONFLICT");
+    prepare_reserved(&fixture, &candidate, &append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real recovery attempt")
+        .expect("real recovery attempt created");
+    let mut conflicting = candidate.clone();
+    conflicting.replace_content_preserving_identity(
+        b"TEST_CODE_W19_INTERVENING_CONFLICTING_BODY".to_vec(),
+    );
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare(&conflicting, 1, now() + chrono::Duration::seconds(1)),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now() + chrono::Duration::seconds(121))
+        .expect("seal recovery after real intervening conflict audit");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.audit_identity=fence.predecessor_audit_identity
+             WHERE fence.audit_kind='FenceRevoked'
+               AND conflict.audit_kind='DecisionIdentityConflict'"
+        ),
+        1
+    );
+
+    let terminal = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("logical recovery chain accepts real intervening conflict audit");
+    assert!(matches!(terminal, FoundationTerminalQuery::Terminal(record)
+        if record.disposition() == FoundationTerminalDisposition::Uncertain));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_skipped_intervening_audit() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_SKIPPED_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_SKIPPED_CONFLICT");
+    prepare_reserved(&fixture, &candidate, &append);
+    fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .expect("begin real recovery attempt")
+        .expect("real recovery attempt created");
+    let mut conflicting = candidate.clone();
+    conflicting.replace_content_preserving_identity(
+        b"TEST_CODE_W19_SKIPPED_INTERVENING_CONFLICTING_BODY".to_vec(),
+    );
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare(&conflicting, 1, now() + chrono::Duration::seconds(1)),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, now() + chrono::Duration::seconds(121))
+        .expect("seal recovery after real intervening conflict audit");
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.audit_identity=fence.predecessor_audit_identity
+             WHERE fence.decision_identity=conflict.decision_identity
+               AND fence.audit_kind='FenceRevoked'
+               AND conflict.audit_kind='DecisionIdentityConflict'
+               AND conflict.predecessor_audit_identity IS NOT NULL"
+        ),
+        1,
+        "the real conflict must initially be the fence predecessor"
+    );
+
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 skipped-conflict corruption database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+        .expect("remove isolated audit payload guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE immutable_audit_outbox
+                 SET predecessor_audit_identity=(
+                   SELECT conflict.predecessor_audit_identity
+                   FROM immutable_audit_outbox conflict
+                   WHERE conflict.decision_identity=?1
+                     AND conflict.audit_kind='DecisionIdentityConflict')
+                 WHERE decision_identity=?1 AND audit_kind='FenceRevoked'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("skip the real intervening conflict in the isolated fence chain"),
+        1
+    );
+    drop(connection);
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox fence
+             JOIN immutable_audit_outbox conflict
+               ON conflict.decision_identity=fence.decision_identity
+              AND conflict.audit_kind='DecisionIdentityConflict'
+              AND conflict.predecessor_audit_identity=fence.predecessor_audit_identity
+             WHERE fence.audit_kind='FenceRevoked'
+               AND fence.audit_identity<>conflict.audit_identity"
+        ),
+        1,
+        "the tampered fence and skipped conflict must be distinct successors of one predecessor"
+    );
+
+    let error = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect_err("a skipped intervening audit must be rejected");
+    assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+    assert!(!error.to_string().contains("TEST_CODE"));
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn w19_recovered_uncertain_accepts_recovery_from_real_rejected_genesis_retry() {
+    struct PanicAfterAttemptSink;
+    impl AuthoritativeSinkPort for PanicAfterAttemptSink {
+        fn sink_identity(&self) -> &str {
+            "TEST_CODE_W19_PANIC_AFTER_ATTEMPT_SINK"
+        }
+
+        fn deliver(&self, _: &AuthoritativeDeliveryRequest) -> AuthoritativeSinkResult {
+            panic!("TEST_CODE_W19_SIMULATED_PROCESS_EXIT_AFTER_ATTEMPT")
+        }
+    }
+
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_REJECTED_GENESIS");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_REJECTED_GENESIS");
+    let denied = fixture
+        .coordinator
+        .prepare(&candidate, 0, now())
+        .expect("prepare real rejected genesis");
+    assert_eq!(denied.state, DecisionState::RejectedAuditPending);
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &candidate.decision_identity,
+    );
+    fixture
+        .coordinator
+        .authorize_rejected_retry(&candidate.decision_identity)
+        .expect("authorize real rejected decision retry");
+
+    let attempt_started_at = now() + chrono::Duration::seconds(10);
+    let recovered_at = attempt_started_at + chrono::Duration::seconds(121);
+    let panic_sink: AuthoritativeSink = Arc::new(PanicAfterAttemptSink);
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.coordinator.resume_deliverable(
+            &candidate.decision_identity,
+            &[panic_sink],
+            attempt_started_at,
+        )
+    }));
+    assert!(interrupted.is_err());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempts"),
+        1
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovered_at)
+        .expect("recover the expired authorized retry");
+    assert!(summary.progress_count > 0);
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    let recovered = fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .expect("rejected-genesis retry recovery is readable");
+    assert!(
+        matches!(recovered, FoundationTerminalQuery::Terminal(record)
+        if record.disposition() == FoundationTerminalDisposition::Uncertain)
+    );
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_truncated_wrong_decision_or_unsealed_predecessor() {
+    for corruption in ["truncated", "wrong-decision", "unsealed"] {
+        let fixture = Fixture::new(&format!("W19_RECOVERED_UNCERTAIN_PREDECESSOR_{corruption}"));
+        let append = MemoryAppendPort::default();
+        let candidate =
+            w12_foundation_envelope(&format!("W19_RECOVERED_UNCERTAIN_PREDECESSOR_{corruption}"));
+        w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+        let other = (corruption == "wrong-decision").then(|| {
+            let other = envelope(
+                "W19_RECOVERED_UNCERTAIN_OTHER_DECISION",
+                PushKind::CandidateTriggered,
+                DeliverySubKind::None,
+                "2026-07-30",
+                false,
+            );
+            fixture
+                .coordinator
+                .prepare(&other, 1, now())
+                .expect("prepare isolated other decision");
+            other
+        });
+        let connection = Connection::open(&fixture.database_path)
+            .expect("open isolated W19 predecessor corruption database");
+        connection
+            .execute_batch("DROP TRIGGER immutable_outbox_payload_update;")
+            .expect("remove isolated audit payload guard");
+        let changed = match corruption {
+            "truncated" => connection.execute(
+                "UPDATE immutable_audit_outbox SET predecessor_audit_identity=NULL
+                 WHERE decision_identity=?1 AND audit_kind='LeaseGranted'",
+                [candidate.decision_identity.as_str()],
+            ),
+            "wrong-decision" => connection.execute(
+                "UPDATE immutable_audit_outbox SET decision_identity=?1
+                 WHERE audit_identity=(
+                   SELECT predecessor_audit_identity FROM immutable_audit_outbox
+                   WHERE decision_identity=?2 AND audit_kind='FenceRevoked')",
+                params![
+                    other.as_ref().expect("other decision").decision_identity,
+                    candidate.decision_identity
+                ],
+            ),
+            "unsealed" => connection.execute(
+                "UPDATE immutable_audit_outbox SET append_state='Pending',immutable_audit_ref=NULL
+                 WHERE decision_identity=?1 AND audit_kind='LeaseGranted'",
+                [candidate.decision_identity.as_str()],
+            ),
+            _ => unreachable!(),
+        }
+        .expect("inject isolated predecessor corruption");
+        assert_eq!(changed, 1);
+        drop(connection);
+
+        let error = fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity)
+            .expect_err("broken logical predecessor chain must be rejected");
+        assert!(matches!(error, DurableDeliveryError::PolicyMismatch(_)));
+        assert!(!error.to_string().contains("TEST_CODE"));
+        assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    }
+}
+
+#[test]
+fn w19_recovered_uncertain_rejects_any_authoritative_sink_conflict() {
+    let fixture = Fixture::new("W19_RECOVERED_UNCERTAIN_AUTHORITY_CONFLICT");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("W19_RECOVERED_UNCERTAIN_AUTHORITY_CONFLICT");
+    let (attempt, recovered_at) = w19_recover_uncertain_candidate(&fixture, &append, &candidate);
+    fixture
+        .coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            AuthoritativeSinkResult::Accepted(receipt(recovered_at)),
+            recovered_at,
+        )
+        .expect("persist actual late Accepted before isolated authority corruption");
+    let connection = Connection::open(&fixture.database_path)
+        .expect("open isolated W19 authoritative conflict database");
+    connection
+        .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+        .expect("remove isolated sink immutability guard");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sink_results
+                 SET authoritative_for_state=1,late_after_fence=0,late_receipt_audit_identity=NULL
+                 WHERE decision_identity=?1 AND result_kind='Accepted'",
+                [candidate.decision_identity.as_str()],
+            )
+            .expect("inject isolated authoritative Accepted conflict"),
+        1
+    );
+    drop(connection);
+
+    assert!(matches!(
+        fixture
+            .coordinator
+            .inspect_foundation_terminal(&candidate.decision_identity),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason == "foundation uncertain terminal has conflicting authoritative sources"
+    ));
+}
+
+#[test]
+fn w12_terminal_read_model_preserves_all_durable_terminal_dispositions() {
+    let rejected_fixture = Fixture::new("W12_REJECTED_TERMINAL");
+    let rejected_append = MemoryAppendPort::default();
+    let rejected = w12_foundation_envelope("REJECTED_TERMINAL");
+    prepare_reserved(&rejected_fixture, &rejected, &rejected_append);
+    let rejected_sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let rejected_sinks: Vec<AuthoritativeSink> = vec![rejected_sink];
+    rejected_fixture
+        .coordinator
+        .resume_deliverable(&rejected.decision_identity, &rejected_sinks, now())
+        .expect("record W12 rejection");
+    reconcile_terminal(
+        &rejected_fixture,
+        &rejected_append,
+        DecisionState::RejectedDurable,
+        &rejected.decision_identity,
+    );
+    let rejected_terminal = w12_terminal_record(&rejected_fixture, &rejected.decision_identity);
+    assert_eq!(
+        rejected_terminal.disposition(),
+        FoundationTerminalDisposition::Rejected
+    );
+    assert!(rejected_terminal.attempt_id().is_some());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(rejected_terminal.evidence_bytes())
+            .expect("typed rejection")["kind"],
+        "Rejected"
+    );
+
+    let denial_fixture = Fixture::new("W12_DENIAL_TERMINAL");
+    let denial_append = MemoryAppendPort::default();
+    let denial = w12_foundation_envelope("DENIAL_TERMINAL");
+    denial_fixture
+        .coordinator
+        .prepare(&denial, 0, now())
+        .expect("record W12 pre-attempt denial");
+    reconcile_terminal(
+        &denial_fixture,
+        &denial_append,
+        DecisionState::RejectedDurable,
+        &denial.decision_identity,
+    );
+    let denial_terminal = w12_terminal_record(&denial_fixture, &denial.decision_identity);
+    assert_eq!(
+        denial_terminal.disposition(),
+        FoundationTerminalDisposition::Rejected
+    );
+    assert!(denial_terminal.attempt_id().is_none());
+
+    let uncertain_fixture = Fixture::new("W12_UNCERTAIN_TERMINAL");
+    let uncertain_append = MemoryAppendPort::default();
+    let uncertain = w12_foundation_envelope("UNCERTAIN_TERMINAL");
+    prepare_reserved(&uncertain_fixture, &uncertain, &uncertain_append);
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    uncertain_fixture
+        .coordinator
+        .resume_deliverable(&uncertain.decision_identity, &uncertain_sinks, now())
+        .expect("record W12 uncertainty");
+    reconcile_terminal(
+        &uncertain_fixture,
+        &uncertain_append,
+        DecisionState::UncertainManualReview,
+        &uncertain.decision_identity,
+    );
+    let uncertain_terminal = w12_terminal_record(&uncertain_fixture, &uncertain.decision_identity);
+    assert_eq!(
+        uncertain_terminal.disposition(),
+        FoundationTerminalDisposition::Uncertain
+    );
+    assert!(uncertain_terminal.attempt_id().is_some());
+
+    let manual_rejected_fixture = Fixture::new("W12_MANUAL_REJECTED_TERMINAL");
+    let manual_rejected_append = MemoryAppendPort::default();
+    let manual_rejected = w12_foundation_envelope("MANUAL_REJECTED_TERMINAL");
+    prepare_reserved(
+        &manual_rejected_fixture,
+        &manual_rejected,
+        &manual_rejected_append,
+    );
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    manual_rejected_fixture
+        .coordinator
+        .resume_deliverable(&manual_rejected.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before manual rejection");
+    reconcile_terminal(
+        &manual_rejected_fixture,
+        &manual_rejected_append,
+        DecisionState::UncertainManualReview,
+        &manual_rejected.decision_identity,
+    );
+    manual_rejected_fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: manual_rejected.decision_identity.clone(),
+                disposition: ManualDisposition::Rejected,
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_NOT_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_REJECTION_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &manual_rejected_append,
+        )
+        .expect("record W12 manual rejection");
+    reconcile_terminal(
+        &manual_rejected_fixture,
+        &manual_rejected_append,
+        DecisionState::ManualResolvedRejected,
+        &manual_rejected.decision_identity,
+    );
+    let manual_rejected_terminal =
+        w12_terminal_record(&manual_rejected_fixture, &manual_rejected.decision_identity);
+    assert_eq!(
+        manual_rejected_terminal.disposition(),
+        FoundationTerminalDisposition::ManualNotDelivered
+    );
+    assert!(manual_rejected_terminal.attempt_id().is_some());
+
+    let manual_accepted_fixture = Fixture::new("W12_MANUAL_ACCEPTED_TERMINAL");
+    let manual_accepted_append = MemoryAppendPort::default();
+    let manual_accepted = w12_foundation_envelope("MANUAL_ACCEPTED_TERMINAL");
+    prepare_reserved(
+        &manual_accepted_fixture,
+        &manual_accepted,
+        &manual_accepted_append,
+    );
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    manual_accepted_fixture
+        .coordinator
+        .resume_deliverable(&manual_accepted.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before manual acceptance");
+    reconcile_terminal(
+        &manual_accepted_fixture,
+        &manual_accepted_append,
+        DecisionState::UncertainManualReview,
+        &manual_accepted.decision_identity,
+    );
+    manual_accepted_fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: manual_accepted.decision_identity.clone(),
+                disposition: ManualDisposition::Accepted {
+                    receipt: Some(receipt(now())),
+                },
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_ACCEPTANCE_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &manual_accepted_append,
+        )
+        .expect("record W12 manual acceptance");
+    reconcile_terminal(
+        &manual_accepted_fixture,
+        &manual_accepted_append,
+        DecisionState::Delivered,
+        &manual_accepted.decision_identity,
+    );
+    let manual_accepted_terminal =
+        w12_terminal_record(&manual_accepted_fixture, &manual_accepted.decision_identity);
+    assert_eq!(
+        manual_accepted_terminal.disposition(),
+        FoundationTerminalDisposition::ManualAccepted
+    );
+    assert!(manual_accepted_terminal.attempt_id().is_some());
+}
+
+#[test]
+fn w12_terminal_read_model_fails_closed_on_corrupt_disposition_join() {
+    let fixture = Fixture::new("W12_CORRUPT_TERMINAL");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("CORRUPT_TERMINAL");
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 rejection before corruption");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &candidate.decision_identity,
+    );
+
+    let connection = Connection::open(&fixture.database_path).expect("open corruption connection");
+    connection
+        .execute_batch("DROP TRIGGER immutable_disposition_payload_update;")
+        .expect("drop TEST_CODE immutable trigger");
+    connection
+        .execute(
+            "UPDATE delivery_disposition_payloads SET disposition_sha256=?1 \
+             WHERE decision_identity=?2",
+            params![
+                sha256_hex(b"TEST_CODE_W12_CORRUPT"),
+                candidate.decision_identity
+            ],
+        )
+        .expect("inject TEST_CODE disposition corruption");
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
+
+fn w12_accepted_terminal_fixture(label: &str) -> (Fixture, DeliveryEnvelope) {
+    let fixture = Fixture::new(label);
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope(label);
+    prepare_reserved(&fixture, &candidate, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record W12 accepted result before corruption");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+    let terminal = w12_terminal_record(&fixture, &candidate.decision_identity);
+    assert_eq!(
+        terminal.disposition(),
+        FoundationTerminalDisposition::Accepted
+    );
+    (fixture, candidate)
+}
+
+#[test]
+fn w12_terminal_read_model_fails_closed_on_every_authority_join_corruption() {
+    let (envelope_fixture, envelope) = w12_accepted_terminal_fixture("W12_CORRUPT_ENVELOPE");
+    {
+        let connection = Connection::open(&envelope_fixture.database_path)
+            .expect("open envelope corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_decision_envelope_update;")
+            .expect("drop TEST_CODE immutable envelope trigger");
+        connection
+            .execute(
+                "UPDATE delivery_decisions SET envelope_sha256=?1 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_ENVELOPE"),
+                    envelope.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE envelope corruption");
+    }
+    assert!(envelope_fixture
+        .coordinator
+        .inspect_foundation_terminal(&envelope.decision_identity)
+        .is_err());
+
+    let (result_fixture, result) = w12_accepted_terminal_fixture("W12_CORRUPT_RESULT");
+    {
+        let connection = Connection::open(&result_fixture.database_path)
+            .expect("open result corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+            .expect("drop TEST_CODE immutable result trigger");
+        connection
+            .execute(
+                "UPDATE sink_results SET result_sha256=?1 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_RESULT"),
+                    result.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE result corruption");
+    }
+    assert!(result_fixture
+        .coordinator
+        .inspect_foundation_terminal(&result.decision_identity)
+        .is_err());
+
+    let (audit_fixture, audit) = w12_accepted_terminal_fixture("W12_CORRUPT_AUDIT");
+    {
+        let connection = Connection::open(&audit_fixture.database_path)
+            .expect("open audit corruption connection");
+        connection
+            .execute_batch("DROP TRIGGER immutable_sink_result_update;")
+            .expect("drop TEST_CODE immutable audit trigger");
+        connection
+            .execute(
+                "UPDATE sink_results SET frozen_delivery_audit_sha256=?1 \
+                 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_W12_CORRUPT_AUDIT"),
+                    audit.decision_identity
+                ],
+            )
+            .expect("inject TEST_CODE delivery audit corruption");
+    }
+    assert!(audit_fixture
+        .coordinator
+        .inspect_foundation_terminal(&audit.decision_identity)
+        .is_err());
+
+    let (attempt_fixture, attempt) = w12_accepted_terminal_fixture("W12_CORRUPT_ATTEMPT");
+    {
+        let connection = Connection::open(&attempt_fixture.database_path)
+            .expect("open attempt corruption connection");
+        connection
+            .execute(
+                "UPDATE delivery_attempts SET fence_token=fence_token+1000 \
+                 WHERE decision_identity=?1",
+                params![attempt.decision_identity],
+            )
+            .expect("inject TEST_CODE attempt/fence corruption");
+    }
+    assert!(attempt_fixture
+        .coordinator
+        .inspect_foundation_terminal(&attempt.decision_identity)
+        .is_err());
+}
+
+#[test]
+fn w12_terminal_read_model_rejects_accepted_receipt_for_wrong_required_channel() {
+    let fixture = Fixture::new("W12_ACCEPTED_CHANNEL_MISMATCH");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("ACCEPTED_CHANNEL_MISMATCH");
+    prepare_reserved(&fixture, &candidate, &append);
+    let mut wrong_receipt = receipt(now());
+    wrong_receipt.channel = "TEST_CODE_WRONG_CHANNEL".to_owned();
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(wrong_receipt));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, now())
+        .expect("record mismatched accepted receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
+}
+
+#[test]
+fn w12_terminal_read_model_rejects_manual_receipt_for_wrong_required_channel() {
+    let fixture = Fixture::new("W12_MANUAL_CHANNEL_MISMATCH");
+    let append = MemoryAppendPort::default();
+    let candidate = w12_foundation_envelope("MANUAL_CHANNEL_MISMATCH");
+    prepare_reserved(&fixture, &candidate, &append);
+    let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![uncertain_sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &uncertain_sinks, now())
+        .expect("record uncertainty before mismatched manual receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::UncertainManualReview,
+        &candidate.decision_identity,
+    );
+    let mut wrong_receipt = receipt(now());
+    wrong_receipt.channel = "TEST_CODE_WRONG_CHANNEL".to_owned();
+    fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: candidate.decision_identity.clone(),
+                disposition: ManualDisposition::Accepted {
+                    receipt: Some(wrong_receipt),
+                },
+                operator_identity: "TEST_CODE_W12_OPERATOR".to_owned(),
+                reason: "TEST_CODE_W12_CONFIRMED_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_W12_MANUAL_ACCEPTANCE_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &append,
+        )
+        .expect("record mismatched manual receipt");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &candidate.decision_identity,
+    );
+
+    assert!(fixture
+        .coordinator
+        .inspect_foundation_terminal(&candidate.decision_identity)
+        .is_err());
 }

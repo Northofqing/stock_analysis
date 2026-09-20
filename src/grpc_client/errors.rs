@@ -7,6 +7,12 @@
 use prost::Message; // ErrorDetail::decode (tonic 0.14 details() 返回 &[u8])
 use sha2::{Digest, Sha256};
 
+pub use crate::grpc_client::provider_attempts::{
+    ProviderAttempt, ProviderAttemptText, ProviderAttemptValue, ProviderAttempts,
+};
+use crate::grpc_client::provider_attempts::ExternalProviderCatalog;
+use crate::grpc_contract::methods::{ContractProfile, ExternalMethod, LocalMethod, MethodIdentity};
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum GrpcError {
     #[error("请求参数错误 (不重试)")]
@@ -48,13 +54,29 @@ impl GrpcError {
             | GrpcError::Unknown { details } => details,
         }
     }
+
+    pub(crate) fn safe_diagnostic(&self) -> Option<&str> {
+        self.details()
+            .diagnostic_message
+            .as_deref()
+            .map(DiagnosticMessage::as_str)
+    }
+
+    pub(crate) fn from_status(status: tonic::Status, context: StatusErrorContext<'_>) -> Self {
+        let diagnostic_message = safe_status_message(status.message());
+        grpc_error_from_parts(
+            status.code(),
+            decode_status_error_detail(&status, context),
+            diagnostic_message,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ErrorDetail {
     pub code: String,
     pub request_id: Option<String>,
-    pub operation: Option<i32>,
+    pub method: Option<MethodIdentity>,
     pub provider: Option<String>,
     pub reason_code: Option<String>,
     pub retryable: Option<bool>,
@@ -62,6 +84,7 @@ pub struct ErrorDetail {
     pub evidence_code: Option<SafeEvidenceIdentifier>,
     pub evidence_field: Option<SafeEvidenceIdentifier>,
     pub record_index: Option<u32>,
+    pub provider_attempts: ProviderAttempts,
     /// Bounded, secret-screened server diagnostic for operator evidence only.
     /// Program flow must continue to branch exclusively on typed fields above.
     pub diagnostic_message: Option<Box<DiagnosticMessage>>,
@@ -98,6 +121,92 @@ impl DiagnosticMessage {
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const REQUEST_ID_HASH_DOMAIN: &[u8] = b"stock_analysis.grpc_error.request_id.v1";
 const ERROR_DETAIL_TRAILER: &str = "magic-error-detail-bin";
+
+#[derive(Clone, Copy)]
+enum StatusErrorExpectation<'a> {
+    Unchecked,
+    Data {
+        method: MethodIdentity,
+        request_id: &'a str,
+        provider_catalog: Option<&'a ExternalProviderCatalog>,
+    },
+    Control {
+        request_id: &'a str,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StatusErrorContext<'a> {
+    profile: ContractProfile,
+    expectation: StatusErrorExpectation<'a>,
+}
+
+impl<'a> StatusErrorContext<'a> {
+    pub(crate) const fn unchecked_local() -> Self {
+        Self {
+            profile: ContractProfile::LocalBridgeV1,
+            expectation: StatusErrorExpectation::Unchecked,
+        }
+    }
+
+    pub(crate) const fn data(method: MethodIdentity, request_id: &'a str) -> Self {
+        Self {
+            profile: method.profile(),
+            expectation: StatusErrorExpectation::Data {
+                method,
+                request_id,
+                provider_catalog: None,
+            },
+        }
+    }
+
+    pub(crate) const fn external_data(
+        method: ExternalMethod,
+        request_id: &'a str,
+        provider_catalog: &'a ExternalProviderCatalog,
+    ) -> Self {
+        Self {
+            profile: ContractProfile::ExternalV1,
+            expectation: StatusErrorExpectation::Data {
+                method: MethodIdentity::External(method),
+                request_id,
+                provider_catalog: Some(provider_catalog),
+            },
+        }
+    }
+
+    pub(crate) const fn control(profile: ContractProfile, request_id: &'a str) -> Self {
+        Self {
+            profile,
+            expectation: StatusErrorExpectation::Control { request_id },
+        }
+    }
+
+    fn accepts(self, wire: &DecodedWireErrorDetail) -> bool {
+        match self.expectation {
+            StatusErrorExpectation::Unchecked => true,
+            StatusErrorExpectation::Data {
+                method, request_id, ..
+            } => {
+                !request_id.is_empty()
+                    && wire.request_id == request_id
+                    && wire.method == Some(method)
+            }
+            StatusErrorExpectation::Control { request_id } => {
+                !request_id.is_empty() && wire.request_id == request_id && wire.raw_operation == 0
+            }
+        }
+    }
+
+    fn external_provider_catalog(self) -> Option<&'a ExternalProviderCatalog> {
+        match self.expectation {
+            StatusErrorExpectation::Data {
+                provider_catalog, ..
+            } if self.profile == ContractProfile::ExternalV1 => provider_catalog,
+            _ => None,
+        }
+    }
+}
 
 fn request_id_correlation(value: &str) -> Option<String> {
     if value.is_empty() {
@@ -237,6 +346,19 @@ impl KnownReasonCode {
     }
 }
 
+pub(crate) fn known_wire_reason_code(value: &str) -> Option<&'static str> {
+    KnownReasonCode::from_wire(value).map(KnownReasonCode::as_str)
+}
+
+pub(crate) fn is_canonical_safe_diagnostic(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            safe_status_message(value).is_some_and(|canonical| canonical.as_str() == value)
+        }
+    }
+}
+
 const MAX_EVIDENCE_IDENTIFIER_CHARS: usize = 160;
 
 fn safe_evidence_identifier(value: &str) -> Option<SafeEvidenceIdentifier> {
@@ -261,6 +383,19 @@ fn safe_wire_admission(
         .filter(|admission| *admission != AdmissionState::Unspecified)
 }
 
+fn safe_external_wire_admission(
+    value: i32,
+) -> Option<crate::grpc_client::pb::magic::market::v1::AdmissionState> {
+    use crate::grpc_client::external_pb::magic::market::v1::AdmissionState as ExternalAdmission;
+    use crate::grpc_client::pb::magic::market::v1::AdmissionState as LocalAdmission;
+
+    match ExternalAdmission::try_from(value).ok()? {
+        ExternalAdmission::Unspecified => None,
+        ExternalAdmission::Admitted => Some(LocalAdmission::Admitted),
+        ExternalAdmission::Unadmitted => Some(LocalAdmission::Unadmitted),
+    }
+}
+
 fn safe_wire_reason_code(value: &str) -> Option<String> {
     if value.is_empty() {
         None
@@ -274,13 +409,16 @@ fn safe_wire_reason_code(value: &str) -> Option<String> {
     }
 }
 
-fn safe_wire_operation(value: i32) -> Option<i32> {
-    use crate::grpc_client::pb::magic::market::v1::Operation;
-
-    Operation::try_from(value)
+fn safe_local_wire_method(value: i32) -> Option<MethodIdentity> {
+    LocalMethod::try_from_raw(value)
         .ok()
-        .filter(|operation| *operation != Operation::Unspecified)
-        .map(|operation| operation as i32)
+        .map(MethodIdentity::Local)
+}
+
+fn safe_external_wire_method(value: i32) -> Option<MethodIdentity> {
+    ExternalMethod::try_from_raw(value)
+        .ok()
+        .map(MethodIdentity::External)
 }
 
 fn safe_status_message(message: &str) -> Option<Box<DiagnosticMessage>> {
@@ -315,26 +453,25 @@ fn safe_status_message(message: &str) -> Option<Box<DiagnosticMessage>> {
     Some(Box::new(DiagnosticMessage::new(safe)))
 }
 
-fn decode_wire_error_detail(
-    status: &tonic::Status,
-) -> Option<crate::grpc_client::pb::magic::market::v1::ErrorDetail> {
-    type WireErrorDetail = crate::grpc_client::pb::magic::market::v1::ErrorDetail;
+struct DecodedWireErrorDetail {
+    request_id: String,
+    raw_operation: i32,
+    method: Option<MethodIdentity>,
+    provider: String,
+    reason_code: String,
+    retryable: bool,
+    admission: Option<crate::grpc_client::pb::magic::market::v1::AdmissionState>,
+    evidence_code: String,
+    evidence_field: String,
+    record_index: u32,
+    has_record_index: bool,
+    provider_attempts: ProviderAttempts,
+}
 
-    let standard = if status.details().is_empty() {
-        Ok(None)
-    } else {
-        WireErrorDetail::decode(status.details())
-            .map(Some)
-            .map_err(|_| ())
-    };
-    let trailer = match status.metadata().get_bin(ERROR_DETAIL_TRAILER) {
-        None => Ok(None),
-        Some(value) => value
-            .to_bytes()
-            .map_err(|_| ())
-            .and_then(|bytes| WireErrorDetail::decode(bytes).map(Some).map_err(|_| ())),
-    };
-
+fn reconcile_raw_error_detail(
+    standard: Result<Option<Vec<u8>>, ()>,
+    trailer: Result<Option<Vec<u8>>, ()>,
+) -> Option<Vec<u8>> {
     match (standard.ok()?, trailer.ok()?) {
         (Some(standard), Some(trailer)) if standard == trailer => Some(standard),
         (Some(_), Some(_)) => None,
@@ -343,68 +480,210 @@ fn decode_wire_error_detail(
     }
 }
 
+fn decode_status_error_detail(
+    status: &tonic::Status,
+    context: StatusErrorContext<'_>,
+) -> Option<DecodedWireErrorDetail> {
+    let standard = if status.details().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(status.details().to_vec()))
+    };
+    let trailer = match status.metadata().get_bin(ERROR_DETAIL_TRAILER) {
+        None => Ok(None),
+        Some(value) => value
+            .to_bytes()
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|_| ()),
+    };
+    let bytes = reconcile_raw_error_detail(standard, trailer)?;
+    decode_error_detail_bytes(&bytes, context)
+}
+
+fn decode_error_detail_bytes(
+    bytes: &[u8],
+    context: StatusErrorContext<'_>,
+) -> Option<DecodedWireErrorDetail> {
+    let wire = match context.profile {
+        ContractProfile::LocalBridgeV1 => {
+            let detail =
+                crate::grpc_client::pb::magic::market::v1::ErrorDetail::decode(bytes).ok()?;
+            DecodedWireErrorDetail {
+                request_id: detail.request_id,
+                raw_operation: detail.operation,
+                method: safe_local_wire_method(detail.operation),
+                provider: detail.provider,
+                reason_code: detail.reason_code,
+                retryable: detail.retryable,
+                admission: safe_wire_admission(detail.admission),
+                evidence_code: detail.evidence_code,
+                evidence_field: detail.evidence_field,
+                record_index: detail.record_index,
+                has_record_index: detail.has_record_index,
+                provider_attempts: ProviderAttempts::default(),
+            }
+        }
+        ContractProfile::ExternalV1 => {
+            let detail =
+                crate::grpc_client::external_pb::magic::market::v1::ErrorDetail::decode(bytes)
+                    .ok()?;
+            let provider_attempts = ProviderAttempts::from_external_wire(
+                detail.provider_attempts,
+                context.external_provider_catalog(),
+            );
+            DecodedWireErrorDetail {
+                request_id: detail.request_id,
+                raw_operation: detail.operation,
+                method: safe_external_wire_method(detail.operation),
+                provider: detail.provider,
+                reason_code: detail.reason_code,
+                retryable: detail.retryable,
+                admission: safe_external_wire_admission(detail.admission),
+                evidence_code: detail.evidence_code,
+                evidence_field: detail.evidence_field,
+                record_index: detail.record_index,
+                has_record_index: detail.has_record_index,
+                provider_attempts,
+            }
+        }
+    };
+    context.accepts(&wire).then_some(wire)
+}
+
+fn grpc_error_from_parts(
+    code: tonic::Code,
+    wire: Option<DecodedWireErrorDetail>,
+    diagnostic_message: Option<Box<DiagnosticMessage>>,
+) -> GrpcError {
+    let detail = if let Some(d) = wire {
+        ErrorDetail {
+            code: code.to_string(),
+            request_id: request_id_correlation(&d.request_id),
+            method: d.method,
+            provider: safe_wire_provider(&d.provider),
+            reason_code: safe_wire_reason_code(&d.reason_code),
+            retryable: Some(d.retryable),
+            admission: d.admission,
+            evidence_code: safe_evidence_identifier(&d.evidence_code),
+            evidence_field: safe_evidence_identifier(&d.evidence_field),
+            record_index: d.has_record_index.then_some(d.record_index),
+            provider_attempts: d.provider_attempts,
+            diagnostic_message,
+        }
+    } else {
+        ErrorDetail {
+            code: code.to_string(),
+            diagnostic_message,
+            ..Default::default()
+        }
+    };
+    match code {
+        tonic::Code::InvalidArgument => GrpcError::InvalidArgument {
+            details: Box::new(detail),
+        },
+        tonic::Code::Unauthenticated => GrpcError::Unauthenticated {
+            details: Box::new(detail),
+        },
+        tonic::Code::PermissionDenied => GrpcError::PermissionDenied {
+            details: Box::new(detail),
+        },
+        tonic::Code::Unimplemented => GrpcError::Unimplemented {
+            details: Box::new(detail),
+        },
+        tonic::Code::ResourceExhausted => GrpcError::ResourceExhausted {
+            details: Box::new(detail),
+        },
+        tonic::Code::DeadlineExceeded => GrpcError::DeadlineExceeded {
+            details: Box::new(detail),
+        },
+        tonic::Code::Unavailable => GrpcError::Unavailable {
+            details: Box::new(detail),
+        },
+        tonic::Code::FailedPrecondition => GrpcError::FailedPrecondition {
+            details: Box::new(detail),
+        },
+        tonic::Code::Internal => GrpcError::Internal {
+            details: Box::new(detail),
+        },
+        _ => GrpcError::Unknown {
+            details: Box::new(detail),
+        },
+    }
+}
+
+pub(crate) enum PersistedErrorDetailTrailer<'a> {
+    Absent,
+    Bytes(&'a [u8]),
+    Malformed,
+}
+
+pub(crate) enum PersistedErrorDetailTrailerOwned {
+    Absent,
+    Bytes(Vec<u8>),
+    Malformed,
+}
+
+impl PersistedErrorDetailTrailerOwned {
+    pub(crate) fn as_ref(&self) -> PersistedErrorDetailTrailer<'_> {
+        match self {
+            Self::Absent => PersistedErrorDetailTrailer::Absent,
+            Self::Bytes(bytes) => PersistedErrorDetailTrailer::Bytes(bytes),
+            Self::Malformed => PersistedErrorDetailTrailer::Malformed,
+        }
+    }
+}
+
+pub(crate) fn restore_persisted_status_error(
+    code: i32,
+    standard: &[u8],
+    trailer: PersistedErrorDetailTrailer<'_>,
+    diagnostic: Option<&str>,
+    context: StatusErrorContext<'_>,
+) -> Option<GrpcError> {
+    if !is_canonical_safe_diagnostic(diagnostic) {
+        return None;
+    }
+    let code = match code {
+        1 => tonic::Code::Cancelled,
+        2 => tonic::Code::Unknown,
+        3 => tonic::Code::InvalidArgument,
+        4 => tonic::Code::DeadlineExceeded,
+        5 => tonic::Code::NotFound,
+        6 => tonic::Code::AlreadyExists,
+        7 => tonic::Code::PermissionDenied,
+        8 => tonic::Code::ResourceExhausted,
+        9 => tonic::Code::FailedPrecondition,
+        10 => tonic::Code::Aborted,
+        11 => tonic::Code::OutOfRange,
+        12 => tonic::Code::Unimplemented,
+        13 => tonic::Code::Internal,
+        14 => tonic::Code::Unavailable,
+        15 => tonic::Code::DataLoss,
+        16 => tonic::Code::Unauthenticated,
+        _ => return None,
+    };
+    let standard = if standard.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(standard.to_vec()))
+    };
+    let trailer = match trailer {
+        PersistedErrorDetailTrailer::Absent => Ok(None),
+        PersistedErrorDetailTrailer::Bytes(bytes) => Ok(Some(bytes.to_vec())),
+        PersistedErrorDetailTrailer::Malformed => Err(()),
+    };
+    let wire = reconcile_raw_error_detail(standard, trailer)
+        .and_then(|bytes| decode_error_detail_bytes(&bytes, context));
+    let diagnostic_message = diagnostic.map(|value| Box::new(DiagnosticMessage::new(value)));
+    Some(grpc_error_from_parts(code, wire, diagnostic_message))
+}
+
 impl From<tonic::Status> for GrpcError {
     fn from(status: tonic::Status) -> Self {
-        let diagnostic_message = safe_status_message(status.message());
-        // 尝试解码 ErrorDetail (合同 §10: request ID/operation/provider/reason code/retryable)。
-        // tonic 0.14 重构: details() 返回原始 &[u8] (不再是 Box<dyn Any>),
-        // 用 prost::Message::decode 直接解码; 解码失败则忽略, 用 code 分支即可。
-        // 空 details → 纯默认 (prost 会把空 bytes 解码为全默认值, 语义上等于没有 ErrorDetail)。
-        let detail = if let Some(d) = decode_wire_error_detail(&status) {
-            ErrorDetail {
-                code: status.code().to_string(),
-                request_id: request_id_correlation(&d.request_id),
-                operation: safe_wire_operation(d.operation),
-                provider: safe_wire_provider(&d.provider),
-                reason_code: safe_wire_reason_code(&d.reason_code),
-                retryable: Some(d.retryable),
-                admission: safe_wire_admission(d.admission),
-                evidence_code: safe_evidence_identifier(&d.evidence_code),
-                evidence_field: safe_evidence_identifier(&d.evidence_field),
-                record_index: d.has_record_index.then_some(d.record_index),
-                diagnostic_message: diagnostic_message.clone(),
-            }
-        } else {
-            ErrorDetail {
-                code: status.code().to_string(),
-                diagnostic_message: diagnostic_message.clone(),
-                ..Default::default()
-            }
-        };
-
-        // D2: 每个变体都携带 detail — 即便非 Fetch 错误码也保留 request_id 供日志/审计。
-        match status.code() {
-            tonic::Code::InvalidArgument => GrpcError::InvalidArgument {
-                details: Box::new(detail),
-            },
-            tonic::Code::Unauthenticated => GrpcError::Unauthenticated {
-                details: Box::new(detail),
-            },
-            tonic::Code::PermissionDenied => GrpcError::PermissionDenied {
-                details: Box::new(detail),
-            },
-            tonic::Code::Unimplemented => GrpcError::Unimplemented {
-                details: Box::new(detail),
-            },
-            tonic::Code::ResourceExhausted => GrpcError::ResourceExhausted {
-                details: Box::new(detail),
-            },
-            tonic::Code::DeadlineExceeded => GrpcError::DeadlineExceeded {
-                details: Box::new(detail),
-            },
-            tonic::Code::Unavailable => GrpcError::Unavailable {
-                details: Box::new(detail),
-            },
-            tonic::Code::FailedPrecondition => GrpcError::FailedPrecondition {
-                details: Box::new(detail),
-            },
-            tonic::Code::Internal => GrpcError::Internal {
-                details: Box::new(detail),
-            },
-            _ => GrpcError::Unknown {
-                details: Box::new(detail),
-            },
-        }
+        // Backwards-compatible LocalBridgeV1 parser for callers that have no
+        // request context. Real online and recovery consumers use from_status
+        // with an explicit profile and identity binding.
+        Self::from_status(status, StatusErrorContext::unchecked_local())
     }
 }
 
@@ -683,7 +962,6 @@ mod tests {
             evidence_field: "private/request/payload".to_owned(),
             record_index: 42,
             has_record_index: false,
-            provider_attempts: Vec::new(),
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -697,7 +975,7 @@ mod tests {
             .expect("hashed request identity");
         assert!(request_id.starts_with("sha256:"));
         assert_eq!(request_id.len(), "sha256:".len() + 64);
-        assert_eq!(detail.operation, None);
+        assert_eq!(detail.method, None);
         assert_eq!(detail.provider, None);
         assert_eq!(detail.reason_code.as_deref(), Some("internal"));
         assert_eq!(detail.retryable, Some(true));
@@ -727,8 +1005,14 @@ mod tests {
             Some("TEST_CODE_CLASSIFIED_REQUEST")
         );
         assert_eq!(
-            detail.operation,
-            Some(crate::grpc_client::pb::magic::market::v1::Operation::ProviderTopNRankings as i32)
+            detail.method,
+            Some(MethodIdentity::Local(
+                LocalMethod::try_from_raw(
+                    crate::grpc_client::pb::magic::market::v1::Operation::ProviderTopNRankings
+                        as i32,
+                )
+                .expect("known Local method"),
+            ))
         );
         assert_eq!(detail.provider.as_deref(), Some("Tdx"));
         assert_eq!(detail.reason_code.as_deref(), Some("invalid_evidence"));
@@ -750,7 +1034,6 @@ mod tests {
             evidence_field: "records[2].identity".to_owned(),
             record_index: 2,
             has_record_index: true,
-            provider_attempts: Vec::new(),
         };
         let error = GrpcError::from(tonic::Status::with_details(
             Code::Internal,
@@ -799,7 +1082,6 @@ mod tests {
             evidence_field: "records[0].published_at".to_owned(),
             record_index: 0,
             has_record_index: true,
-            provider_attempts: Vec::new(),
         };
         let mut status = tonic::Status::new(Code::FailedPrecondition, "rejected");
         status.metadata_mut().insert_bin(
@@ -820,6 +1102,1146 @@ mod tests {
             Some("records[0].published_at")
         );
         assert_eq!(detail.record_index, Some(0));
+    }
+
+    #[test]
+    fn grpc_dual_contract_error_detail_carriers_reject_new_field_conflict() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            AdmissionState, ErrorDetail as ExternalErrorDetail, Operation,
+            ProviderAttemptDetail,
+        };
+        use tonic::metadata::MetadataValue;
+
+        let standard = ExternalErrorDetail {
+            request_id: "TEST_CODE_DUAL_CARRIER_REQUEST".to_owned(),
+            operation: Operation::GlobalNews as i32,
+            provider: "Cailianpress".to_owned(),
+            reason_code: "provider_unavailable".to_owned(),
+            retryable: true,
+            admission: AdmissionState::Unadmitted as i32,
+            evidence_code: "provider_attempt_failed".to_owned(),
+            evidence_field: "provider_attempts[0]".to_owned(),
+            record_index: 0,
+            has_record_index: false,
+            provider_attempts: vec![ProviderAttemptDetail {
+                ordinal: 1,
+                provider: "Cailianpress".to_owned(),
+                outcome: "unavailable".to_owned(),
+                reason_code: "provider_unavailable".to_owned(),
+                retryable: true,
+                terminal: false,
+            }],
+        };
+        let trailer = ExternalErrorDetail {
+            provider_attempts: vec![ProviderAttemptDetail {
+                outcome: "rejected".to_owned(),
+                ..standard.provider_attempts[0].clone()
+            }],
+            ..standard.clone()
+        };
+        let mut status = tonic::Status::with_details(
+            Code::Unavailable,
+            "provider unavailable",
+            standard.encode_to_vec().into(),
+        );
+        status.metadata_mut().insert_bin(
+            "magic-error-detail-bin",
+            MetadataValue::from_bytes(&trailer.encode_to_vec()),
+        );
+
+        let error = GrpcError::from(status);
+
+        assert!(matches!(&error, GrpcError::Unavailable { .. }));
+        assert_eq!(
+            (
+                error.details().provider.as_deref(),
+                error.details().reason_code.as_deref(),
+                error.details().retryable,
+            ),
+            (None, None, None),
+            "conflicting carriers must not authorize provider classification or retry evidence",
+        );
+    }
+
+    fn local_detail(
+        request_id: &str,
+        operation: crate::grpc_client::pb::magic::market::v1::Operation,
+    ) -> crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+        crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+            request_id: request_id.to_owned(),
+            operation: operation as i32,
+            provider: "Tdx".to_owned(),
+            reason_code: "provider_unavailable".to_owned(),
+            retryable: true,
+            ..Default::default()
+        }
+    }
+
+    fn external_detail(
+        request_id: &str,
+        operation: crate::grpc_client::external_pb::magic::market::v1::Operation,
+        provider_attempts: Vec<
+            crate::grpc_client::external_pb::magic::market::v1::ProviderAttemptDetail,
+        >,
+    ) -> crate::grpc_client::external_pb::magic::market::v1::ErrorDetail {
+        crate::grpc_client::external_pb::magic::market::v1::ErrorDetail {
+            request_id: request_id.to_owned(),
+            operation: operation as i32,
+            provider: "Cailianpress".to_owned(),
+            reason_code: "provider_unavailable".to_owned(),
+            retryable: true,
+            provider_attempts,
+            ..Default::default()
+        }
+    }
+
+    fn external_global_news_method() -> MethodIdentity {
+        MethodIdentity::from_client_operation(
+            ContractProfile::ExternalV1,
+            crate::grpc_client::pb::magic::market::v1::Operation::GlobalNews,
+        )
+        .expect("delivered External GlobalNews method")
+    }
+
+    fn validated_attempt_catalog(providers: &[&str]) -> ExternalProviderCatalog {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            AdmissionState, CapabilitiesResponse, Capability, Operation,
+        };
+
+        let response = CapabilitiesResponse {
+            request_id: "TEST_CODE_ATTEMPT_CATALOG".to_owned(),
+            capabilities: providers
+                .iter()
+                .map(|provider| Capability {
+                    operation: Operation::GlobalNews as i32,
+                    repository_admission: AdmissionState::Admitted as i32,
+                    runtime_available: true,
+                    provider: (*provider).to_owned(),
+                    exact_scope: "TEST_CODE_ATTEMPT_CATALOG_SCOPE".to_owned(),
+                    blocker: String::new(),
+                    diagnostic_available: true,
+                })
+                .collect(),
+        };
+        crate::grpc_client::client::external_control_attempt::validated_external_provider_catalog(
+            "TEST_CODE_ATTEMPT_CATALOG",
+            &response,
+        )
+        .expect("request-ID validated provider catalog")
+    }
+
+    #[test]
+    fn grpc_dual_contract_status_parser_keeps_profile_bound_method_identity() {
+        let local_cases = [
+            (61, "OPERATION_CHAIN_BATCH"),
+            (62, "OPERATION_BENCHMARK_BARS"),
+        ];
+        for (raw, expected_name) in local_cases {
+            let wire = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+                request_id: "TEST_CODE_LOCAL_RAW_METHOD".to_owned(),
+                operation: raw,
+                provider: "Tdx".to_owned(),
+                ..Default::default()
+            };
+            let method = MethodIdentity::Local(
+                LocalMethod::try_from_raw(raw).expect("known Local raw method"),
+            );
+            let error = GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Unavailable,
+                    "",
+                    wire.encode_to_vec().into(),
+                ),
+                StatusErrorContext::data(method, "TEST_CODE_LOCAL_RAW_METHOD"),
+            );
+
+            assert_eq!(error.details().method, Some(method));
+            assert_eq!(
+                error.details().method.map(MethodIdentity::as_str_name),
+                Some(expected_name)
+            );
+        }
+
+        let external_cases = [
+            (61, "OPERATION_CURRENT_AUCTION_OBSERVATIONS"),
+            (62, "OPERATION_ECONOMIC_RELEASE_OBSERVATIONS"),
+            (63, "OPERATION_ECONOMIC_RELEASE_SCHEDULE"),
+        ];
+        for (raw, expected_name) in external_cases {
+            let wire = crate::grpc_client::external_pb::magic::market::v1::ErrorDetail {
+                request_id: "TEST_CODE_EXTERNAL_RAW_METHOD".to_owned(),
+                operation: raw,
+                provider: "Cailianpress".to_owned(),
+                ..Default::default()
+            };
+            let method = MethodIdentity::External(
+                ExternalMethod::try_from_raw(raw).expect("known External raw method"),
+            );
+            let error = GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Unavailable,
+                    "",
+                    wire.encode_to_vec().into(),
+                ),
+                StatusErrorContext::data(method, "TEST_CODE_EXTERNAL_RAW_METHOD"),
+            );
+
+            assert_eq!(error.details().method, Some(method));
+            assert_eq!(
+                error.details().method.map(MethodIdentity::as_str_name),
+                Some(expected_name)
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_error_detail_carriers_enforce_raw_integrity() {
+        use tonic::metadata::MetadataValue;
+
+        let wire = local_detail(
+            "TEST_CODE_CARRIER_REQUEST",
+            crate::grpc_client::pb::magic::market::v1::Operation::GlobalNews,
+        );
+        let bytes = wire.encode_to_vec();
+
+        let standard_only = GrpcError::from(tonic::Status::with_details(
+            Code::Unavailable,
+            "",
+            bytes.clone().into(),
+        ));
+        assert_eq!(standard_only.details().provider.as_deref(), Some("Tdx"));
+
+        let mut trailer_only = tonic::Status::new(Code::Unavailable, "");
+        trailer_only.metadata_mut().insert_bin(
+            ERROR_DETAIL_TRAILER,
+            MetadataValue::from_bytes(&bytes),
+        );
+        assert_eq!(
+            GrpcError::from(trailer_only).details().provider.as_deref(),
+            Some("Tdx")
+        );
+
+        let mut equal = tonic::Status::with_details(
+            Code::Unavailable,
+            "",
+            bytes.clone().into(),
+        );
+        equal.metadata_mut().insert_bin(
+            ERROR_DETAIL_TRAILER,
+            MetadataValue::from_bytes(&bytes),
+        );
+        assert_eq!(
+            GrpcError::from(equal).details().provider.as_deref(),
+            Some("Tdx")
+        );
+
+        let mut conflicting = tonic::Status::with_details(
+            Code::Unavailable,
+            "",
+            bytes.clone().into(),
+        );
+        let mut conflicting_wire = wire.clone();
+        conflicting_wire.retryable = false;
+        conflicting.metadata_mut().insert_bin(
+            ERROR_DETAIL_TRAILER,
+            MetadataValue::from_bytes(&conflicting_wire.encode_to_vec()),
+        );
+        assert_eq!(
+            GrpcError::from(conflicting).details().provider,
+            None,
+            "different raw carriers reject the complete detail"
+        );
+
+        let mut malformed = tonic::Status::with_details(Code::Unavailable, "", bytes.into());
+        let mut headers = tonic::codegen::http::HeaderMap::new();
+        headers.insert(
+            ERROR_DETAIL_TRAILER,
+            tonic::codegen::http::HeaderValue::from_static("%%%"),
+        );
+        *malformed.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+        let malformed = GrpcError::from(malformed);
+        assert!(matches!(&malformed, GrpcError::Unavailable { .. }));
+        assert_eq!(malformed.details().provider, None);
+
+        let malformed_standard = GrpcError::from(tonic::Status::with_details(
+            Code::Unavailable,
+            "",
+            vec![0xff].into(),
+        ));
+        assert!(matches!(
+            &malformed_standard,
+            GrpcError::Unavailable { .. }
+        ));
+        assert_eq!(malformed_standard.details().provider, None);
+    }
+
+    #[test]
+    fn grpc_dual_contract_data_context_rejects_missing_or_mismatched_identity() {
+        use crate::grpc_client::pb::magic::market::v1::Operation;
+
+        let method = MethodIdentity::from_client_operation(
+            ContractProfile::LocalBridgeV1,
+            Operation::GlobalNews,
+        )
+        .expect("Local GlobalNews method");
+        let exact = local_detail("TEST_CODE_EXPECTED_REQUEST", Operation::GlobalNews);
+        let exact_error = GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Internal,
+                "",
+                exact.encode_to_vec().into(),
+            ),
+            StatusErrorContext::data(method, "TEST_CODE_EXPECTED_REQUEST"),
+        );
+        assert_eq!(exact_error.details().provider.as_deref(), Some("Tdx"));
+
+        let mut unknown_method = exact.clone();
+        unknown_method.operation = 63;
+        let cases = vec![
+            local_detail("", Operation::GlobalNews),
+            local_detail("TEST_CODE_WRONG_REQUEST", Operation::GlobalNews),
+            local_detail("TEST_CODE_EXPECTED_REQUEST", Operation::Unspecified),
+            local_detail("TEST_CODE_EXPECTED_REQUEST", Operation::InstrumentNews),
+            unknown_method,
+        ];
+        for wire in cases {
+            let error = GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Internal,
+                    "",
+                    wire.encode_to_vec().into(),
+                ),
+                StatusErrorContext::data(method, "TEST_CODE_EXPECTED_REQUEST"),
+            );
+            assert!(matches!(&error, GrpcError::Internal { .. }));
+            assert_eq!(
+                (
+                    error.details().method,
+                    error.details().provider.as_deref(),
+                    error.details().retryable,
+                ),
+                (None, None, None)
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_control_context_requires_exact_id_and_zero_operation() {
+        use crate::grpc_client::external_pb::magic::market::v1::Operation;
+
+        let exact = external_detail("TEST_CODE_CONTROL_REQUEST", Operation::Unspecified, vec![]);
+        let exact_error = GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "",
+                exact.encode_to_vec().into(),
+            ),
+            StatusErrorContext::control(
+                ContractProfile::ExternalV1,
+                "TEST_CODE_CONTROL_REQUEST",
+            ),
+        );
+        assert_eq!(exact_error.details().method, None);
+        assert_eq!(
+            exact_error.details().provider.as_deref(),
+            Some("Cailianpress")
+        );
+
+        let cases = [
+            external_detail("", Operation::Unspecified, vec![]),
+            external_detail("TEST_CODE_WRONG_CONTROL", Operation::Unspecified, vec![]),
+            external_detail("TEST_CODE_CONTROL_REQUEST", Operation::GlobalNews, vec![]),
+        ];
+        for wire in cases {
+            let error = GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Unavailable,
+                    "",
+                    wire.encode_to_vec().into(),
+                ),
+                StatusErrorContext::control(
+                    ContractProfile::ExternalV1,
+                    "TEST_CODE_CONTROL_REQUEST",
+                ),
+            );
+            assert!(matches!(&error, GrpcError::Unavailable { .. }));
+            assert_eq!(error.details().provider, None);
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_preserve_bounds_fields_and_order() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            Operation, ProviderAttemptDetail,
+        };
+
+        let catalog = validated_attempt_catalog(&["Cailianpress"]);
+        let MethodIdentity::External(method) = external_global_news_method() else {
+            panic!("External GlobalNews method identity");
+        };
+        let decode = |attempts: Vec<ProviderAttemptDetail>| {
+            GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Unavailable,
+                    "",
+                    external_detail("TEST_CODE_ATTEMPTS", Operation::GlobalNews, attempts)
+                        .encode_to_vec()
+                        .into(),
+                ),
+                StatusErrorContext::external_data(method, "TEST_CODE_ATTEMPTS", &catalog),
+            )
+        };
+        let attempt = |ordinal| {
+            let (outcome, reason_code, retryable, terminal) = match ordinal % 3 {
+                1 => ("selected", "selected", false, false),
+                2 => ("rejected", "query_rejected", false, false),
+                _ => ("failed", "unavailable", true, ordinal % 2 == 0),
+            };
+            ProviderAttemptDetail {
+                ordinal,
+                provider: "Cailianpress".to_owned(),
+                outcome: outcome.to_owned(),
+                reason_code: reason_code.to_owned(),
+                retryable,
+                terminal,
+            }
+        };
+
+        assert_eq!(
+            decode(vec![]).details().provider_attempts,
+            ProviderAttempts::Rejected { observed_count: 0 }
+        );
+
+        let one_error = decode(vec![attempt(1)]);
+        assert!(matches!(&one_error, GrpcError::Unavailable { .. }));
+        assert_eq!(
+            (
+                one_error.details().provider.as_deref(),
+                one_error.details().reason_code.as_deref(),
+                one_error.details().retryable,
+            ),
+            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+        );
+        let one = one_error
+            .details()
+            .provider_attempts
+            .accepted()
+            .expect("one attempt accepted");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].ordinal, 1);
+        assert_eq!(one[0].provider.as_str(), "Cailianpress");
+        assert_eq!(one[0].outcome.as_str(), "selected");
+        assert_eq!(one[0].reason_code.as_str(), "selected");
+        assert!(!one[0].retryable);
+        assert!(!one[0].terminal);
+        assert!(one[0].provider.is_supported());
+        assert!(one[0].outcome.is_supported());
+        assert!(one[0].reason_code.is_supported());
+
+        let sixteen_error = decode((1..=16).map(attempt).collect());
+        let sixteen = sixteen_error
+            .details()
+            .provider_attempts
+            .accepted()
+            .expect("sixteen attempts accepted");
+        assert_eq!(sixteen.len(), 16);
+        let expected_sixteen = [
+            (1, "Cailianpress", "selected", "selected", false, false),
+            (2, "Cailianpress", "rejected", "query_rejected", false, false),
+            (3, "Cailianpress", "failed", "unavailable", true, false),
+            (4, "Cailianpress", "selected", "selected", false, false),
+            (5, "Cailianpress", "rejected", "query_rejected", false, false),
+            (6, "Cailianpress", "failed", "unavailable", true, true),
+            (7, "Cailianpress", "selected", "selected", false, false),
+            (8, "Cailianpress", "rejected", "query_rejected", false, false),
+            (9, "Cailianpress", "failed", "unavailable", true, false),
+            (10, "Cailianpress", "selected", "selected", false, false),
+            (11, "Cailianpress", "rejected", "query_rejected", false, false),
+            (12, "Cailianpress", "failed", "unavailable", true, true),
+            (13, "Cailianpress", "selected", "selected", false, false),
+            (14, "Cailianpress", "rejected", "query_rejected", false, false),
+            (15, "Cailianpress", "failed", "unavailable", true, false),
+            (16, "Cailianpress", "selected", "selected", false, false),
+        ];
+        for (attempt, expected) in sixteen.iter().zip(expected_sixteen) {
+            assert_eq!(
+                (
+                    attempt.ordinal,
+                    attempt.provider.as_str(),
+                    attempt.outcome.as_str(),
+                    attempt.reason_code.as_str(),
+                    attempt.retryable,
+                    attempt.terminal,
+                ),
+                expected,
+            );
+            assert!(attempt.provider.is_supported());
+            assert!(attempt.outcome.is_supported());
+            assert!(attempt.reason_code.is_supported());
+        }
+
+        let seventeen = decode((1..=17).map(attempt).collect());
+        assert_eq!(
+            seventeen.details().provider_attempts,
+            ProviderAttempts::Rejected { observed_count: 17 }
+        );
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempt_unknown_vocabulary_is_preserved_and_redacted() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            Operation, ProviderAttemptDetail,
+        };
+
+        let catalog = validated_attempt_catalog(&["TEST_ONLY_UNKNOWN_PROVIDER"]);
+        let MethodIdentity::External(method) = external_global_news_method() else {
+            panic!("External GlobalNews method identity");
+        };
+        let error = GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "",
+                external_detail(
+                    "TEST_CODE_UNKNOWN_ATTEMPT_REQUEST",
+                    Operation::GlobalNews,
+                    vec![ProviderAttemptDetail {
+                        ordinal: 1,
+                        provider: "TEST_ONLY_UNKNOWN_PROVIDER".to_owned(),
+                        outcome: "TEST_ONLY_UNKNOWN_OUTCOME".to_owned(),
+                        reason_code: "TEST_ONLY_UNKNOWN_REASON".to_owned(),
+                        retryable: false,
+                        terminal: false,
+                    }],
+                )
+                .encode_to_vec()
+                .into(),
+            ),
+            StatusErrorContext::external_data(
+                method,
+                "TEST_CODE_UNKNOWN_ATTEMPT_REQUEST",
+                &catalog,
+            ),
+        );
+        assert_eq!(
+            error.details().provider_attempts,
+            ProviderAttempts::Rejected { observed_count: 1 }
+        );
+        assert!(matches!(&error, GrpcError::Unavailable { .. }));
+        assert_eq!(error.details().provider.as_deref(), Some("Cailianpress"));
+        assert_eq!(
+            error.details().reason_code.as_deref(),
+            Some("provider_unavailable")
+        );
+        assert_eq!(error.details().retryable, Some(true));
+        assert!(!format!("{error:?}").contains("TEST_ONLY_UNKNOWN"));
+    }
+
+    fn decode_closed_contract_attempts(
+        request_id: &str,
+        provider_attempts: Vec<
+            crate::grpc_client::external_pb::magic::market::v1::ProviderAttemptDetail,
+        >,
+    ) -> GrpcError {
+        use crate::grpc_client::external_pb::magic::market::v1::Operation;
+
+        GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "",
+                external_detail(request_id, Operation::GlobalNews, provider_attempts)
+                    .encode_to_vec()
+                    .into(),
+            ),
+            StatusErrorContext::data(external_global_news_method(), request_id),
+        )
+    }
+
+    fn decode_validated_closed_contract_attempts(
+        providers: &[&str],
+        request_id: &str,
+        provider_attempts: Vec<
+            crate::grpc_client::external_pb::magic::market::v1::ProviderAttemptDetail,
+        >,
+    ) -> GrpcError {
+        use crate::grpc_client::external_pb::magic::market::v1::Operation;
+
+        let catalog = validated_attempt_catalog(providers);
+        let MethodIdentity::External(method) = external_global_news_method() else {
+            panic!("External GlobalNews method identity");
+        };
+        GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "",
+                external_detail(request_id, Operation::GlobalNews, provider_attempts)
+                    .encode_to_vec()
+                    .into(),
+            ),
+            StatusErrorContext::external_data(method, request_id, &catalog),
+        )
+    }
+
+    fn closed_contract_attempt(
+        ordinal: u32,
+        provider: &str,
+        outcome: &str,
+        reason_code: &str,
+        retryable: bool,
+        terminal: bool,
+    ) -> crate::grpc_client::external_pb::magic::market::v1::ProviderAttemptDetail {
+        crate::grpc_client::external_pb::magic::market::v1::ProviderAttemptDetail {
+            ordinal,
+            provider: provider.to_owned(),
+            outcome: outcome.to_owned(),
+            reason_code: reason_code.to_owned(),
+            retryable,
+            terminal,
+        }
+    }
+
+    fn assert_attempt_trace_unsupported_without_top_level_change(
+        error: &GrpcError,
+        case: &str,
+    ) {
+        assert!(matches!(error, GrpcError::Unavailable { .. }), "{case}");
+        assert_eq!(
+            (
+                error.details().provider.as_deref(),
+                error.details().reason_code.as_deref(),
+                error.details().retryable,
+            ),
+            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+            "{case}: attempts validity must not rewrite the top-level detail",
+        );
+        assert_eq!(
+            crate::grpc_client::retry::retry_decision(error),
+            crate::grpc_client::retry::RetryDecision::RetryBackoff,
+            "{case}: attempts validity must not enter the top-level retry decision",
+        );
+        assert!(
+            error.details().provider_attempts.accepted().is_none(),
+            "{case}: the entire attempts interpretation must be unsupported",
+        );
+    }
+
+    fn assert_single_supported_attempt_without_top_level_change(
+        error: &GrpcError,
+        expected: (u32, &str, &str, &str, bool, bool),
+        case: &str,
+    ) {
+        assert!(matches!(error, GrpcError::Unavailable { .. }), "{case}");
+        assert_eq!(
+            (
+                error.details().provider.as_deref(),
+                error.details().reason_code.as_deref(),
+                error.details().retryable,
+            ),
+            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+            "{case}: attempts interpretation must not rewrite the top-level detail",
+        );
+        assert_eq!(
+            crate::grpc_client::retry::retry_decision(error),
+            crate::grpc_client::retry::RetryDecision::RetryBackoff,
+            "{case}: attempts interpretation must not enter the top-level retry decision",
+        );
+        let attempts = error
+            .details()
+            .provider_attempts
+            .accepted()
+            .unwrap_or_else(|| panic!("{case}: public contract row must be supported"));
+        assert_eq!(attempts.len(), 1, "{case}");
+        let attempt = &attempts[0];
+        assert_eq!(
+            (
+                attempt.ordinal,
+                attempt.provider.as_str(),
+                attempt.outcome.as_str(),
+                attempt.reason_code.as_str(),
+                attempt.retryable,
+                attempt.terminal,
+            ),
+            expected,
+            "{case}",
+        );
+        assert!(attempt.provider.is_supported(), "{case}");
+        assert!(attempt.outcome.is_supported(), "{case}");
+        assert!(attempt.reason_code.is_supported(), "{case}");
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_reject_empty_and_noncontiguous_ordinals() {
+        let attempt = |ordinal| {
+            closed_contract_attempt(
+                ordinal,
+                "Cailianpress",
+                "failed",
+                "unavailable",
+                true,
+                false,
+            )
+        };
+        let cases = [
+            ("empty", vec![]),
+            ("zero", vec![attempt(0)]),
+            ("starts-at-two", vec![attempt(2)]),
+            ("gap", vec![attempt(1), attempt(3)]),
+            ("duplicate", vec![attempt(1), attempt(1)]),
+            ("wire-order-is-not-ordinal-order", vec![attempt(2), attempt(1)]),
+        ];
+
+        for (case, attempts) in cases {
+            let error = decode_closed_contract_attempts("TEST_CODE_ATTEMPT_STRUCTURE", attempts);
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_reject_illegal_outcome_reason_boolean_matrix() {
+        let cases = [
+            ("selected-reason", "selected", "transport", false, false),
+            ("selected-retryable", "selected", "selected", true, false),
+            ("selected-terminal", "selected", "selected", false, true),
+            ("rejected-retryable", "rejected", "invalid_request", true, false),
+            ("rejected-terminal", "rejected", "evidence", false, true),
+            ("failed-selected-reason", "failed", "selected", false, false),
+            ("failed-retry-required", "failed", "unavailable", false, true),
+            ("failed-no-retry-required", "failed", "invalid_request", true, false),
+        ];
+
+        for (case, outcome, reason, retryable, terminal) in cases {
+            let error = decode_closed_contract_attempts(
+                "TEST_CODE_ATTEMPT_MATRIX",
+                vec![closed_contract_attempt(
+                    1,
+                    "Cailianpress",
+                    outcome,
+                    reason,
+                    retryable,
+                    terminal,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_without_capability_or_unknown_field_are_uninterpretable(
+    ) {
+        let cases = [
+            ("no-same-endpoint-capability-evidence", "Cailianpress", "failed", "unavailable"),
+            ("unknown-provider", "TEST_ONLY_UNKNOWN_PROVIDER", "failed", "unavailable"),
+            ("unknown-outcome", "Cailianpress", "TEST_ONLY_UNKNOWN_OUTCOME", "unavailable"),
+            ("unknown-reason", "Cailianpress", "failed", "TEST_ONLY_UNKNOWN_REASON"),
+        ];
+
+        for (case, provider, outcome, reason) in cases {
+            let error = decode_closed_contract_attempts(
+                "TEST_CODE_ATTEMPT_AUTHORITY",
+                vec![closed_contract_attempt(1, provider, outcome, reason, true, false)],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+            assert!(
+                !format!("{error:?}").contains("TEST_ONLY_UNKNOWN"),
+                "{case}: bounded raw fields must remain redacted from Debug",
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_accept_complete_closed_reason_boolean_matrix() {
+        const PUBLISHED: &str = "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER";
+        let selected = decode_validated_closed_contract_attempts(
+            &[PUBLISHED],
+            "TEST_CODE_ATTEMPT_SELECTED_MATRIX",
+            vec![closed_contract_attempt(
+                1,
+                PUBLISHED,
+                "selected",
+                "selected",
+                false,
+                false,
+            )],
+        );
+        assert_single_supported_attempt_without_top_level_change(
+            &selected,
+            (1, PUBLISHED, "selected", "selected", false, false),
+            "selected/selected/false/false",
+        );
+
+        let rejected_reasons = [
+            "authentication_rejected",
+            "query_rejected",
+            "response_invalid",
+            "invalid_request",
+            "unsupported",
+            "unauthenticated",
+            "permission_denied",
+            "provider_route_exhausted",
+            "provider_route_stopped",
+            "source_precondition",
+            "invalid_evidence",
+            "internal",
+            "transport",
+            "timeout",
+            "rate_limited",
+            "no_data",
+            "protocol",
+            "quality",
+            "evidence",
+            "provider",
+        ];
+        for reason in rejected_reasons {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_REJECTED_MATRIX",
+                vec![closed_contract_attempt(
+                    1,
+                    PUBLISHED,
+                    "rejected",
+                    reason,
+                    false,
+                    false,
+                )],
+            );
+            assert_single_supported_attempt_without_top_level_change(
+                &error,
+                (1, PUBLISHED, "rejected", reason, false, false),
+                reason,
+            );
+        }
+
+        let retryable_failed_reasons = [
+            "transport",
+            "timeout",
+            "rate_limited",
+            "unavailable",
+            "provider_busy",
+            "worker_unavailable",
+        ];
+        for reason in retryable_failed_reasons {
+            for terminal in [false, true] {
+                let error = decode_validated_closed_contract_attempts(
+                    &[PUBLISHED],
+                    "TEST_CODE_ATTEMPT_FAILED_RETRYABLE_MATRIX",
+                    vec![closed_contract_attempt(
+                        1, PUBLISHED, "failed", reason, true, terminal,
+                    )],
+                );
+                assert_single_supported_attempt_without_top_level_change(
+                    &error,
+                    (1, PUBLISHED, "failed", reason, true, terminal),
+                    reason,
+                );
+            }
+        }
+
+        let terminal_failed_reasons = [
+            "invalid_request",
+            "unsupported",
+            "no_data",
+            "protocol",
+            "quality",
+            "evidence",
+            "provider",
+        ];
+        for reason in terminal_failed_reasons {
+            for terminal in [false, true] {
+                let error = decode_validated_closed_contract_attempts(
+                    &[PUBLISHED],
+                    "TEST_CODE_ATTEMPT_FAILED_TERMINAL_MATRIX",
+                    vec![closed_contract_attempt(
+                        1, PUBLISHED, "failed", reason, false, terminal,
+                    )],
+                );
+                assert_single_supported_attempt_without_top_level_change(
+                    &error,
+                    (1, PUBLISHED, "failed", reason, false, terminal),
+                    reason,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_reject_complete_cross_and_boolean_matrix() {
+        const PUBLISHED: &str = "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER";
+        let structure_cases = [
+            ("ordinal-zero", vec![closed_contract_attempt(0, PUBLISHED, "selected", "selected", false, false)]),
+            ("ordinal-start-two", vec![closed_contract_attempt(2, PUBLISHED, "selected", "selected", false, false)]),
+            (
+                "ordinal-gap",
+                vec![
+                    closed_contract_attempt(1, PUBLISHED, "selected", "selected", false, false),
+                    closed_contract_attempt(3, PUBLISHED, "selected", "selected", false, false),
+                ],
+            ),
+            (
+                "ordinal-duplicate",
+                vec![
+                    closed_contract_attempt(1, PUBLISHED, "selected", "selected", false, false),
+                    closed_contract_attempt(1, PUBLISHED, "selected", "selected", false, false),
+                ],
+            ),
+            (
+                "ordinal-reverse-wire-order",
+                vec![
+                    closed_contract_attempt(2, PUBLISHED, "selected", "selected", false, false),
+                    closed_contract_attempt(1, PUBLISHED, "selected", "selected", false, false),
+                ],
+            ),
+        ];
+        for (case, attempts) in structure_cases {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_VALIDATED_STRUCTURE",
+                attempts,
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+        }
+
+        let selected_invalid = [
+            ("selected-wrong-reason", "transport", false, false),
+            ("selected-retryable", "selected", true, false),
+            ("selected-terminal", "selected", false, true),
+            ("selected-both-bools", "selected", true, true),
+        ];
+        for (case, reason, retryable, terminal) in selected_invalid {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_SELECTED_NEGATIVE",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, "selected", reason, retryable, terminal,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+        }
+
+        let rejected_reasons = [
+            "authentication_rejected",
+            "query_rejected",
+            "response_invalid",
+            "invalid_request",
+            "unsupported",
+            "unauthenticated",
+            "permission_denied",
+            "provider_route_exhausted",
+            "provider_route_stopped",
+            "source_precondition",
+            "invalid_evidence",
+            "internal",
+            "transport",
+            "timeout",
+            "rate_limited",
+            "no_data",
+            "protocol",
+            "quality",
+            "evidence",
+            "provider",
+        ];
+        for reason in rejected_reasons {
+            for (retryable, terminal) in [(true, false), (false, true), (true, true)] {
+                let error = decode_validated_closed_contract_attempts(
+                    &[PUBLISHED],
+                    "TEST_CODE_ATTEMPT_REJECTED_NEGATIVE",
+                    vec![closed_contract_attempt(
+                        1,
+                        PUBLISHED,
+                        "rejected",
+                        reason,
+                        retryable,
+                        terminal,
+                    )],
+                );
+                assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
+            }
+        }
+        for reason in ["selected", "unavailable", "provider_busy", "worker_unavailable"] {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_REJECTED_CROSS",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, "rejected", reason, false, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
+        }
+
+        for reason in [
+            "transport",
+            "timeout",
+            "rate_limited",
+            "unavailable",
+            "provider_busy",
+            "worker_unavailable",
+        ] {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_FAILED_RETRY_NEGATIVE",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, "failed", reason, false, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
+        }
+        for reason in [
+            "invalid_request",
+            "unsupported",
+            "no_data",
+            "protocol",
+            "quality",
+            "evidence",
+            "provider",
+        ] {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_FAILED_TERMINAL_NEGATIVE",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, "failed", reason, true, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
+        }
+        for reason in [
+            "selected",
+            "authentication_rejected",
+            "query_rejected",
+            "response_invalid",
+            "unauthenticated",
+            "permission_denied",
+            "provider_route_exhausted",
+            "provider_route_stopped",
+            "source_precondition",
+            "invalid_evidence",
+            "internal",
+        ] {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_FAILED_CROSS",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, "failed", reason, false, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
+        }
+
+        let unknown_cases = [
+            ("unknown-outcome", "TEST_ONLY_UNKNOWN_OUTCOME", "selected"),
+            ("unknown-reason", "selected", "TEST_ONLY_UNKNOWN_REASON"),
+        ];
+        for (case, outcome, reason) in unknown_cases {
+            let error = decode_validated_closed_contract_attempts(
+                &[PUBLISHED],
+                "TEST_CODE_ATTEMPT_UNKNOWN_NEGATIVE",
+                vec![closed_contract_attempt(
+                    1, PUBLISHED, outcome, reason, false, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+            assert!(!format!("{error:?}").contains("TEST_ONLY_UNKNOWN"), "{case}");
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_attempts_bind_exact_published_provider_identity() {
+        let provider_64 = "p".repeat(64);
+        let provider_65 = "p".repeat(65);
+        for provider in [provider_64.as_str(), "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER"] {
+            let error = decode_validated_closed_contract_attempts(
+                &[provider],
+                "TEST_CODE_ATTEMPT_PROVIDER_POSITIVE",
+                vec![closed_contract_attempt(
+                    1, provider, "selected", "selected", false, false,
+                )],
+            );
+            assert_single_supported_attempt_without_top_level_change(
+                &error,
+                (1, provider, "selected", "selected", false, false),
+                provider,
+            );
+        }
+
+        let provider_cases = [
+            ("empty", "", ""),
+            ("sixty-five", provider_65.as_str(), provider_65.as_str()),
+            ("control", "Eastmoney\n", "Eastmoney\n"),
+            ("case-mismatch", "Eastmoney", "eastmoney"),
+            ("unpublished-local-known", "Eastmoney", "Cailianpress"),
+        ];
+        for (case, published, attempted) in provider_cases {
+            let error = decode_validated_closed_contract_attempts(
+                &[published],
+                "TEST_CODE_ATTEMPT_PROVIDER_NEGATIVE",
+                vec![closed_contract_attempt(
+                    1, attempted, "selected", "selected", false, false,
+                )],
+            );
+            assert_attempt_trace_unsupported_without_top_level_change(&error, case);
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_online_and_restored_status_decoders_match_by_profile() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            Operation as ExternalOperation, ProviderAttemptDetail,
+        };
+        use crate::grpc_client::pb::magic::market::v1::Operation as LocalOperation;
+
+        let local_bytes = local_detail("TEST_CODE_LOCAL_PARITY", LocalOperation::GlobalNews)
+            .encode_to_vec();
+        let local_method = MethodIdentity::from_client_operation(
+            ContractProfile::LocalBridgeV1,
+            LocalOperation::GlobalNews,
+        )
+        .expect("Local method");
+        let local_online = GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "provider unavailable",
+                local_bytes.clone().into(),
+            ),
+            StatusErrorContext::data(local_method, "TEST_CODE_LOCAL_PARITY"),
+        );
+        let local_restored = restore_persisted_status_error(
+            Code::Unavailable as i32,
+            &local_bytes,
+            PersistedErrorDetailTrailer::Absent,
+            Some("[redacted-unclassified-status]"),
+            StatusErrorContext::data(local_method, "TEST_CODE_LOCAL_PARITY"),
+        )
+        .expect("restored Local status");
+        assert_eq!(local_online, local_restored);
+
+        let external_bytes = external_detail(
+            "TEST_CODE_EXTERNAL_PARITY",
+            ExternalOperation::GlobalNews,
+            vec![ProviderAttemptDetail {
+                ordinal: 1,
+                provider: "Jin10".to_owned(),
+                outcome: "TEST_CODE_EXTERNAL_OUTCOME".to_owned(),
+                reason_code: "provider_rate_limited".to_owned(),
+                retryable: true,
+                terminal: false,
+            }],
+        )
+        .encode_to_vec();
+        let external_method = external_global_news_method();
+        let external_online = GrpcError::from_status(
+            tonic::Status::with_details(
+                Code::Unavailable,
+                "provider unavailable",
+                external_bytes.clone().into(),
+            ),
+            StatusErrorContext::data(external_method, "TEST_CODE_EXTERNAL_PARITY"),
+        );
+        let external_restored = restore_persisted_status_error(
+            Code::Unavailable as i32,
+            &external_bytes,
+            PersistedErrorDetailTrailer::Absent,
+            Some("[redacted-unclassified-status]"),
+            StatusErrorContext::data(external_method, "TEST_CODE_EXTERNAL_PARITY"),
+        )
+        .expect("restored External status");
+        assert_eq!(external_online, external_restored);
     }
 
     #[test]

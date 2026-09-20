@@ -362,7 +362,7 @@ impl OutcomeSubjectLockGuard {
     fn try_acquire_production(
         logical_subject_key: &str,
     ) -> Result<OutcomeSubjectLockAttempt, OutcomeV2Error> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(OUTCOME_CLAIM_LOCK_RELATIVE_ROOT);
+        let root = crate::production_root::production_root().join(OUTCOME_CLAIM_LOCK_RELATIVE_ROOT);
         Self::try_acquire_at(&root, logical_subject_key)
     }
 

@@ -198,13 +198,11 @@ pub(super) struct GovernanceSmokeDispatch<'context> {
 }
 
 // 2026-08-12: R-03/A-10 升级 counted (BR-192)，2026-08-18: P-01 升级
-// counted (BR-241) — TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05
-// 同规则移出 governance smoke (6 → 3)。
-const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 3] = [
-    ("D-01-news-to-idea", PushKind::NewsToIdea),
-    ("I-02-news-catalyst", PushKind::NewsCatalyst),
-    ("T-11-auction-volume", PushKind::AuctionVolume),
-];
+// counted (BR-241)，2026-09-20: I-02/D-01/T-11 相继升级 counted —
+// TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05 同规则移出
+// governance smoke (6 → 3 → 2 → 1 → 0)。全部 counted 后 smoke 清单
+// 清空, smoke 机制退化为零员空校验。
+const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 0] = [];
 
 pub(super) const fn governance_smoke_identity_count() -> usize {
     GOVERNANCE_SMOKE_IDENTITIES.len()
@@ -353,7 +351,7 @@ type PresentationTuple = (&'static str, PushKind, &'static str, &'static str);
 // This inventory is the test manifest authority.  The production registry
 // below intentionally duplicates the canonical tuples instead of deriving
 // them, allowing either side to drift and the bijection test to catch it.
-const ACTIVE_PRESENTATIONS: [PresentationTuple; 56] = [
+const ACTIVE_PRESENTATIONS: [PresentationTuple; 57] = [
     (
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -692,6 +690,13 @@ const ACTIVE_PRESENTATIONS: [PresentationTuple; 56] = [
         "g5b_attribution_dispatcher",
         "render_deep_attribution",
     ),
+    (
+        // 快照过期提醒 (2026-09-20, MU-snapshot-stale) — 全 7 触点新增
+        "T-20-snapshot-stale",
+        PushKind::SnapshotStale,
+        "snapshot_stale_dispatcher",
+        "render_snapshot_stale",
+    ),
 ];
 
 const NEWS_PRESENTATIONS: [PresentationTuple; 2] = [
@@ -723,7 +728,8 @@ const FIXED_DISABLED_KINDS: [PushKind; 11] = [
     PushKind::IpoCatalyst,
 ];
 
-const ALL_PUSH_KINDS: [PushKind; 63] = [
+const ALL_PUSH_KINDS: [PushKind; 64] = [
+    PushKind::SnapshotStale,
     PushKind::HoldingEvent,
     PushKind::DailyReport,
     PushKind::Announcement,
@@ -978,10 +984,12 @@ fn validate_manifest(
     families: Vec<TemplateFamily>,
     news: &NewsFlashProcessCapabilitySnapshot,
 ) -> Result<ValidatedManifest, String> {
-    if families.len() != 72 {
+    if families.len() != 73 {
         // 交付物 A (2026-08-20) 注册 AttributionDaily 家族后 71 → 72;
         // BR-135 (2026-08-22) retires the external reminder presentation:
-        // 72 = ACTIVE 56 + DISABLED 13 + RETIRED 3.
+        // 72 = ACTIVE 56 + DISABLED 13 + RETIRED 3;
+        // 2026-09-20 SnapshotStale (MU-snapshot-stale): 73 = ACTIVE 57 +
+        // DISABLED 13 + RETIRED 3.
         return Err(format!("BR-196 family total drift: {}", families.len()));
     }
     let mut family_keys = HashSet::new();
@@ -1039,31 +1047,31 @@ fn validate_manifest(
     let expected = if news.selection_v2_enabled && news.registered_feed_count > 0 {
         (
             LifecycleCounts {
-                active: 58,
+                active: 59,
                 disabled: 11,
                 retired: 3,
-                total: 72,
+                total: 73,
             },
             LifecycleCounts {
-                active: 54,
+                active: 55,
                 disabled: 9,
                 retired: 0,
-                total: 63,
+                total: 64,
             },
         )
     } else {
         (
             LifecycleCounts {
-                active: 56,
+                active: 57,
                 disabled: 13,
                 retired: 3,
-                total: 72,
+                total: 73,
             },
             LifecycleCounts {
-                active: 52,
+                active: 53,
                 disabled: 11,
                 retired: 0,
-                total: 63,
+                total: 64,
             },
         )
     };
@@ -1132,10 +1140,11 @@ fn validate_descriptor_bijection(
     families: &[TemplateFamily],
     descriptors: &[ProductionPresentationDescriptor],
 ) -> Result<(), String> {
-    if descriptors.len() != 58 {
+    if descriptors.len() != 59 {
         // 交付物 A (2026-08-20) 注册 AttributionDaily descriptor 后需同步此门 → --test 启动即拒。
-        // 58 = G5b 59 - retired BR-135 external reminder presentation.
-        return Err("BR-196 production descriptor count must be 58".to_string());
+        // 59 = G5b 60 - retired BR-135 external reminder presentation
+        // + 2026-09-20 SnapshotStale (MU-snapshot-stale) 60 - 1 = 59。
+        return Err("BR-196 production descriptor count must be 59".to_string());
     }
     let descriptor_set = descriptors.iter().copied().collect::<HashSet<_>>();
     if descriptor_set.len() != descriptors.len() {
@@ -1200,17 +1209,17 @@ fn project_push_kind_lifecycle(families: &[TemplateFamily]) -> Result<LifecycleC
         }
     }
     let all = ALL_PUSH_KINDS.into_iter().collect::<HashSet<_>>();
-    if all.len() != 63 || projected.len() != 63 || projected.keys().any(|kind| !all.contains(kind))
+    if all.len() != 64 || projected.len() != 64 || projected.keys().any(|kind| !all.contains(kind))
     {
         // 交付物 A (2026-08-20) 新增 AttributionDaily PushKind 后 ALL_PUSH_KINDS 61 → 62;
         // G5b (2026-08-22) +1 → 63
-        return Err("BR-196 PushKind inventory is not an exact 63-kind cover".to_string());
+        return Err("BR-196 PushKind inventory is not an exact 64-kind cover".to_string());
     }
     let mut result = LifecycleCounts {
         active: 0,
         disabled: 0,
         retired: 0,
-        total: 63,
+        total: 64,
     };
     for counts in projected.values() {
         if counts.active > 0 {
@@ -1254,22 +1263,23 @@ mod tests {
         // 交付物 A (2026-08-20) 注册 A-12-attribution-daily 家族 (Active) +
         // AttributionDaily kind 后家族 71 → 72, kind 61 → 62。
         // BR-135 (2026-08-22) 退休 reminder 外发家族 → 72 / 63。
+        // 2026-09-20: SnapshotStale (MU-snapshot-stale) → 73 / 64。
         assert_eq!(
             default.family_counts,
             LifecycleCounts {
-                active: 56,
+                active: 57,
                 disabled: 13,
                 retired: 3,
-                total: 72
+                total: 73
             }
         );
         assert_eq!(
             default.push_kind_counts,
             LifecycleCounts {
-                active: 52,
+                active: 53,
                 disabled: 11,
                 retired: 0,
-                total: 63
+                total: 64
             }
         );
 
@@ -1277,19 +1287,19 @@ mod tests {
         assert_eq!(
             active.family_counts,
             LifecycleCounts {
-                active: 58,
+                active: 59,
                 disabled: 11,
                 retired: 3,
-                total: 72
+                total: 73
             }
         );
         assert_eq!(
             active.push_kind_counts,
             LifecycleCounts {
-                active: 54,
+                active: 55,
                 disabled: 9,
                 retired: 0,
-                total: 63
+                total: 64
             }
         );
         assert_eq!(
@@ -1349,7 +1359,7 @@ mod tests {
         let manifest = build_manifest(&snapshot(false, 0));
         assert_eq!(
             crate::presentation_registry::descriptors().len(),
-            58,
+            59,
             "descriptor count must match PRODUCTION_PRESENTATION_DESCRIPTORS array"
         );
         validate_descriptor_bijection(&manifest, crate::presentation_registry::descriptors())
@@ -1428,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn br196_governance_smoke_requires_exact_three_pushed_tuples() {
+    fn br196_governance_smoke_requires_exact_identity_count_pushed_tuples() {
         let valid = GOVERNANCE_SMOKE_IDENTITIES
             .into_iter()
             .map(|(family_key, push_kind)| GovernanceSmokeDisposition {
@@ -1437,15 +1447,14 @@ mod tests {
                 outcome: crate::notify::PushOutcome::Pushed,
             })
             .collect::<Vec<_>>();
+        // 2026-09-20: T-11 移出后清单清零 (0 员) — 空集精确校验成立;
+        // 任何非零 disposition 都是 identity mismatch。
         validate_governance_smoke(&valid).unwrap();
-
-        let mut denied = valid.clone();
-        denied[0].outcome = crate::notify::PushOutcome::Denied("TEST_CODE".to_string());
-        assert!(validate_governance_smoke(&denied).is_err());
-        let mut duplicate = valid.clone();
-        duplicate[0].family_key = duplicate[1].family_key;
-        duplicate[0].push_kind = duplicate[1].push_kind;
-        assert!(validate_governance_smoke(&duplicate).is_err());
-        assert!(validate_governance_smoke(&valid[..2]).is_err());
+        let stray = vec![GovernanceSmokeDisposition {
+            family_key: "TEST_CODE_STRAY",
+            push_kind: PushKind::AuctionVolume,
+            outcome: crate::notify::PushOutcome::Pushed,
+        }];
+        assert!(validate_governance_smoke(&stray).is_err());
     }
 }

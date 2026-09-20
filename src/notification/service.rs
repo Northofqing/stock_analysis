@@ -11,6 +11,8 @@ use log::{error, info, warn};
 use reqwest::Client;
 
 use super::config::{NotificationChannel, NotificationConfig};
+use super::send_report::{NotificationAttempt, NotificationSendReport};
+use crate::monitor::push_job::WeakOutcomeKind;
 
 /// 股票分析结果（与 `pipeline::AnalysisResult` 共用同一类型，避免重复定义）。
 pub use crate::pipeline::AnalysisResult;
@@ -20,6 +22,29 @@ pub struct NotificationService {
     pub(super) config: NotificationConfig,
     pub(super) client: Client,
     pub available_channels: Vec<NotificationChannel>,
+}
+
+fn observe_attempt(
+    attempts: &mut Vec<NotificationAttempt>,
+    channel: NotificationChannel,
+    result: Result<bool>,
+) {
+    let outcome = match result {
+        Ok(true) => WeakOutcomeKind::Accepted,
+        Ok(false) => {
+            error!("[{}] 渠道方法返回 false，投递状态未知", channel.name());
+            WeakOutcomeKind::Unknown
+        }
+        Err(error) => {
+            error!(
+                "[{}] 渠道方法返回错误，投递状态未知: {}",
+                channel.name(),
+                error
+            );
+            WeakOutcomeKind::Unknown
+        }
+    };
+    attempts.push(NotificationAttempt::new(channel, attempts.len(), outcome));
 }
 
 impl NotificationService {
@@ -124,9 +149,14 @@ impl NotificationService {
 impl NotificationService {
     /// 统一发送接口
     pub async fn send(&self, content: &str) -> Result<bool> {
+        Ok(self.send_report(content).await.has_success())
+    }
+
+    /// Send through every configured target and retain invocation-local weak outcomes.
+    pub async fn send_report(&self, content: &str) -> NotificationSendReport {
         if !self.is_available() {
             warn!("通知服务不可用，跳过推送");
-            return Ok(false);
+            return NotificationSendReport::default();
         }
 
         info!(
@@ -135,122 +165,54 @@ impl NotificationService {
             self.get_channel_names()
         );
 
-        let mut success_count = 0;
-        let mut fail_count = 0;
+        let mut attempts = Vec::new();
 
         for channel in &self.available_channels {
             match channel {
-                NotificationChannel::Wechat => match self.send_to_wechat(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[企业微信] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[企业微信] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Feishu => match self.send_to_feishu(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[飞书] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[飞书] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Email => match self.send_to_email(content) {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[邮件] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[邮件] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::ServerChan => match self.send_to_server_chan(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[Server酱] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[Server酱] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
+                NotificationChannel::Wechat => {
+                    observe_attempt(&mut attempts, *channel, self.send_to_wechat(content).await)
+                }
+                NotificationChannel::Feishu => {
+                    observe_attempt(&mut attempts, *channel, self.send_to_feishu(content).await)
+                }
+                NotificationChannel::Email => {
+                    observe_attempt(&mut attempts, *channel, self.send_to_email(content))
+                }
+                NotificationChannel::ServerChan => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_server_chan(content).await,
+                ),
                 // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
-                NotificationChannel::DingTalk => match self.send_to_dingtalk(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[钉钉] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[钉钉] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Telegram => match self.send_to_telegram(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[Telegram] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[Telegram] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Slack => match self.send_to_slack(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[Slack] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[Slack] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Discord => match self.send_to_discord(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[Discord] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[Discord] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
-                NotificationChannel::Pushover => match self.send_to_pushover(content).await {
-                    Ok(true) => success_count += 1,
-                    Ok(false) => {
-                        error!("[Pushover] 发送失败");
-                        fail_count += 1;
-                    }
-                    Err(e) => {
-                        error!("[Pushover] 发送出错: {}", e);
-                        fail_count += 1;
-                    }
-                },
+                NotificationChannel::DingTalk => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_dingtalk(content).await,
+                ),
+                NotificationChannel::Telegram => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_telegram(content).await,
+                ),
+                NotificationChannel::Slack => {
+                    observe_attempt(&mut attempts, *channel, self.send_to_slack(content).await)
+                }
+                NotificationChannel::Discord => {
+                    observe_attempt(&mut attempts, *channel, self.send_to_discord(content).await)
+                }
+                NotificationChannel::Pushover => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_pushover(content).await,
+                ),
                 NotificationChannel::Custom => {
                     // 修复 P0-0: Custom 多个 webhook URL 都发送
                     for url in &self.config.custom_webhook_urls {
-                        match self.send_to_custom_url(url, content).await {
-                            Ok(true) => success_count += 1,
-                            Ok(false) => fail_count += 1,
-                            Err(error) => {
-                                log::warn!("[Custom] {} 出错: {}", url, error);
-                                fail_count += 1;
-                            }
-                        }
+                        observe_attempt(
+                            &mut attempts,
+                            *channel,
+                            self.send_to_custom_url(url, content).await,
+                        );
                     }
                     if self.config.custom_webhook_urls.is_empty() {
                         log::warn!("[Custom] 未配置 webhook_urls, 跳过");
@@ -259,11 +221,18 @@ impl NotificationService {
             }
         }
 
+        let report = NotificationSendReport::from_attempts(attempts);
+        let accepted_count = report
+            .attempts()
+            .iter()
+            .filter(|attempt| attempt.outcome() == WeakOutcomeKind::Accepted)
+            .count();
+        let unknown_count = report.attempts().len() - accepted_count;
         info!(
-            "通知发送完成：成功 {} 个，失败 {} 个",
-            success_count, fail_count
+            "通知发送完成：弱成功 {} 个，状态未知 {} 个",
+            accepted_count, unknown_count
         );
-        Ok(success_count > 0)
+        report
     }
 
     /// 发送带图片的通知

@@ -9,31 +9,6 @@ pub enum SafetySide {
     Sell,
 }
 
-/// 当前策略以100股为步长；科创板新买入至少200股（上交所规则6.7）。
-/// TEST_CODE_ 仅保留测试标的的板块语义，环境隔离仍由 validate 执行。
-pub fn minimum_buy_quantity(code: &str) -> u32 {
-    let symbol = code.strip_prefix("TEST_CODE_").unwrap_or(code);
-    if symbol.starts_with("688") || symbol.starts_with("689") {
-        200
-    } else {
-        100
-    }
-}
-
-pub fn validate_quantity(code: &str, side: SafetySide, quantity: u64) -> Result<(), String> {
-    if quantity == 0 || !quantity.is_multiple_of(100) {
-        return Err(format!(
-            "BR-084 quantity must be positive and divisible by 100: {quantity}"
-        ));
-    }
-    if side == SafetySide::Buy && quantity < u64::from(minimum_buy_quantity(code)) {
-        return Err(format!(
-            "BR-084 科创板买入至少200股: {code} quantity={quantity}"
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub struct OrderSafetyInput<'a> {
     pub code: &'a str,
@@ -55,7 +30,12 @@ pub fn validate(input: &OrderSafetyInput<'_>) -> Result<(), String> {
             input.code, input.order_price
         ));
     }
-    validate_quantity(input.code, input.side, input.quantity)?;
+    if input.quantity == 0 || !input.quantity.is_multiple_of(100) {
+        return Err(format!(
+            "BR-084 quantity must be positive and divisible by 100: {}",
+            input.quantity
+        ));
+    }
 
     let lower = input
         .limit_down_price
@@ -121,18 +101,6 @@ mod tests {
             limit_up_price: Some(11.0),
             secondary_confirmed: false,
         }
-    }
-
-    #[test]
-    fn star_market_buy_requires_two_hundred_shares() {
-        let mut input = valid();
-        input.code = "TEST_CODE_688981";
-        assert!(validate(&input).is_err(), "科创板不得买入100股");
-        input.quantity = 200;
-        assert!(validate(&input).is_ok());
-        input.side = SafetySide::Sell;
-        input.quantity = 100;
-        assert!(validate(&input).is_ok(), "保留历史100股余仓的退出通路");
     }
 
     #[test]

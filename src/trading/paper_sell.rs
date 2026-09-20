@@ -13,7 +13,8 @@
 //! 抽离的纯函数），与旧模拟仓 track_position 共用，避免规则漂移。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use diesel::prelude::*;
@@ -32,7 +33,7 @@ use crate::trading::paper_lot_ledger::{
     parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill, PaperPositionInventory,
 };
 use crate::trading::paper_trade::{
-    portfolio_state_snapshot, simulate_with_audit_evidence, Direction, PaperAuditEvidence,
+    portfolio_state_snapshot_with_cancel, simulate_with_audit_evidence_controlled, Direction, PaperAuditEvidence,
     PaperRiskContext, PaperSignal, PaperTradeStatus,
 };
 use crate::trend_analyzer::StockTrendAnalyzer;
@@ -62,8 +63,6 @@ pub struct PaperSellResult {
     /// 净收益率（未扣往返交易成本，展示用）
     pub return_rate_pct: f64,
     pub reason: String,
-    pub quote_observed_at: chrono::DateTime<chrono::Utc>,
-    pub executed_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ============================================================================
@@ -103,83 +102,36 @@ fn store_indicators(code: &str, indicators: Indicators) {
     }
 }
 
-/// ATR14：最近14日真实波幅的简单均值，单位为元（最新K线在前）。
+/// ATR14：最近 14 个交易日 high−low 的均值（K 线降序，最新在前）。
 fn atr14(data: &[KlineData]) -> Option<f64> {
-    let bars = data
-        .iter()
-        .take(15)
-        .map(|bar| (bar.high, bar.low, bar.close))
-        .collect::<Vec<_>>();
-    crate::monitor::risk::average_true_range(&bars, 14)
+    let window = data.iter().take(14).collect::<Vec<_>>();
+    if window.len() < 14 {
+        return None;
+    }
+    let sum: f64 = window.iter().map(|bar| bar.high - bar.low).sum();
+    Some(sum / 14.0)
 }
 
 /// 拉取并缓存日K指标（MA5/20/60、ATR14、布林+MACD）。
 /// 失败出声（warn 在调用方），本 tick 跳过该只（fail-closed）。
-fn fetch_indicators(code: &str) -> Result<Indicators, String> {
+fn fetch_indicators(code: &str, io: &impl PaperSellReadIo) -> Result<Indicators, String> {
     if let Some(cached) = cached_indicators(code) {
         return Ok(cached);
     }
-    let admitted = HistoricalBarsGateway::new()
-        .daily_bars(code, 90)
-        .map_err(|error| format!("{code} 日K获取失败: {error}"))?;
-    let records = admitted.records();
+    let records = io.daily_bars(code)?;
     if records.is_empty() {
         return Err(format!("{code} 日K为空"));
     }
-    let trend = StockTrendAnalyzer::new().analyze_with_kline(records, code);
+    let trend = StockTrendAnalyzer::new().analyze_with_kline(&records, code);
     let indicators = Indicators {
         ma5: (trend.ma5 > 0.0).then_some(trend.ma5),
         ma20: (trend.ma20 > 0.0).then_some(trend.ma20),
         ma60: (trend.ma60 > 0.0).then_some(trend.ma60),
-        atr: atr14(records),
-        boll_macd: detect_boll_macd_signal(records),
+        atr: atr14(&records),
+        boll_macd: detect_boll_macd_signal(&records),
     };
     store_indicators(code, indicators.clone());
     Ok(indicators)
-}
-
-/// 买入前使用与卖出相同的日K条件；持有期规则不会在入场时触发。
-pub struct PaperEntryConditions(Indicators);
-
-impl PaperEntryConditions {
-    pub fn check(
-        &self,
-        code: &str,
-        name: &str,
-        price: f64,
-        today: chrono::NaiveDate,
-    ) -> Result<(), String> {
-        let indicators = &self.0;
-        if !price.is_finite()
-            || price <= 0.0
-            || [indicators.ma20, indicators.ma60, indicators.atr]
-                .iter()
-                .any(|value| value.is_none_or(|v| !v.is_finite() || v <= 0.0))
-        {
-            return Err("入场缺少有效价格/MA20/MA60/ATR证据".into());
-        }
-        let eval = SellEvaluation {
-            code,
-            name,
-            buy_price: price,
-            buy_date: today,
-            current_price: price,
-            ma5: indicators.ma5,
-            ma20: indicators.ma20,
-            ma60: indicators.ma60,
-            atr: indicators.atr,
-            boll_macd: Some(&indicators.boll_macd),
-            today,
-        };
-        if let Some(reason) = evaluate_sell_rules(&eval) {
-            return Err(format!("当前价格已触发退出条件，拒绝新买入: {reason}"));
-        }
-        Ok(())
-    }
-}
-
-pub fn entry_conditions(code: &str) -> Result<PaperEntryConditions, String> {
-    fetch_indicators(code).map(PaperEntryConditions)
 }
 
 // ============================================================================
@@ -395,40 +347,192 @@ fn in_trading_session() -> bool {
 // 卖出扫描
 // ============================================================================
 
+#[derive(Clone, Copy, Debug)]
+pub enum PaperScanPhase {
+    Intraday,
+    PostClose,
+}
+
+#[derive(Debug)]
+pub struct PaperScanFailure {
+    pub sold: Vec<PaperSellResult>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for PaperScanFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} (completed_sales={})", self.detail, self.sold.len())
+    }
+}
+
+struct PaperScanJob {
+    worker: tokio::task::JoinHandle<Result<Vec<PaperSellResult>, String>>,
+    sold: Arc<Mutex<Vec<PaperSellResult>>>,
+}
+
+/// Owns blocking paper work independently of the async caller awaiting it.
+/// The monitor supervisor must call `close_and_drain` before closing writers
+/// or releasing the instance lease, including when the caller future is dropped.
+#[derive(Default)]
+pub struct PaperScanSession {
+    closing: Arc<AtomicBool>,
+    active: tokio::sync::Mutex<Option<PaperScanJob>>,
+}
+
+impl PaperScanSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn scan(
+        &self,
+        phase: PaperScanPhase,
+        risk_context: PaperRiskContext,
+    ) -> Result<Vec<PaperSellResult>, PaperScanFailure> {
+        if matches!(phase, PaperScanPhase::Intraday) && !in_trading_session() {
+            return Ok(Vec::new());
+        }
+        self.scan_with_io(
+            risk_context,
+            chrono::Local::now().date_naive(),
+            Arc::new(ProductionPaperSellReadIo),
+        )
+        .await
+    }
+
+    async fn scan_with_io(
+        &self,
+        risk_context: PaperRiskContext,
+        today: chrono::NaiveDate,
+        io: Arc<impl PaperSellReadIo + Send + Sync + 'static>,
+    ) -> Result<Vec<PaperSellResult>, PaperScanFailure> {
+        let mut active = self.active.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(PaperScanFailure { sold: Vec::new(), detail: "paper scan session is closing".to_owned() });
+        }
+        if active.is_some() {
+            return Err(PaperScanFailure { sold: Vec::new(), detail: "previous paper scan still requires supervisor drain".to_owned() });
+        }
+        let closing = Arc::clone(&self.closing);
+        let sold = Arc::new(Mutex::new(Vec::new()));
+        let worker_sold = Arc::clone(&sold);
+        *active = Some(PaperScanJob {
+            sold,
+            worker: tokio::task::spawn_blocking(move || {
+                scan_and_sell_inner_with_io(risk_context, today, io.as_ref(), &closing, &worker_sold)
+            }),
+        });
+        // Await a borrowed handle: dropping this future releases the mutex,
+        // leaving the worker owned by the session for the supervisor to join.
+        Self::join_active(&mut active).await
+    }
+
+    /// Close admission immediately; this never waits for the active-slot lock.
+    pub fn cancel(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    pub async fn close_and_drain(&self) -> Result<Vec<PaperSellResult>, PaperScanFailure> {
+        self.cancel();
+        let mut active = self.active.lock().await;
+        Self::join_active(&mut active).await
+    }
+
+    async fn join_active(active: &mut Option<PaperScanJob>) -> Result<Vec<PaperSellResult>, PaperScanFailure> {
+        let Some(job) = active.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let result = (&mut job.worker).await;
+        let job = active.take().expect("joined paper scan");
+        let completed = job.sold.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        match result {
+            Ok(Ok(sold)) => Ok(sold),
+            other => Err(PaperScanFailure {
+                sold: completed,
+                detail: match other {
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("paper scan blocking worker join failed: {error}"),
+                    Ok(Ok(_)) => unreachable!("success handled above"),
+                },
+            }),
+        }
+    }
+}
+
 /// 盘中卖出扫描（30s tick）：带交易时段守卫。
 pub fn scan_and_sell(risk_context: PaperRiskContext) -> Result<Vec<PaperSellResult>, String> {
-    scan_and_sell_streaming(risk_context, false, |_| {})
+    if !in_trading_session() {
+        return Ok(Vec::new());
+    }
+    scan_and_sell_inner(risk_context)
 }
 
 /// 收盘后卖出扫描（15:30 evening_review）：无交易时段守卫。
 pub fn scan_and_sell_post_close(
     risk_context: PaperRiskContext,
 ) -> Result<Vec<PaperSellResult>, String> {
-    scan_and_sell_streaming(risk_context, true, |_| {})
+    scan_and_sell_inner(risk_context)
 }
 
-/// 每笔成交立即交给通知消费者，不等待其余持仓的行情/日K请求。
-/// callback 只处理已经落库的 Filled；失败仍保留订单审计，不改变只推成交约定。
-pub fn scan_and_sell_streaming(
-    risk_context: PaperRiskContext,
-    post_close: bool,
-    mut on_fill: impl FnMut(PaperSellResult),
-) -> Result<Vec<PaperSellResult>, String> {
-    if !post_close && !in_trading_session() {
-        return Ok(Vec::new());
-    }
+fn scan_and_sell_inner(risk_context: PaperRiskContext) -> Result<Vec<PaperSellResult>, String> {
     let today = chrono::Local::now().date_naive();
-    let positions = aggregate_open_positions_at(today)?;
+    scan_and_sell_inner_with_io(risk_context, today, &ProductionPaperSellReadIo, &AtomicBool::new(false), &Mutex::new(Vec::new()))
+}
+
+/// External reads used by the real scan; rule evaluation stays below this seam.
+trait PaperSellReadIo {
+    fn positions(&self, today: chrono::NaiveDate) -> Result<Vec<PaperPosition>, String>;
+    fn execution_quote(&self, code: &str) -> Result<crate::broker::ExecutionQuote, String>;
+    fn daily_bars(&self, code: &str) -> Result<Vec<KlineData>, String> {
+        HistoricalBarsGateway::new().daily_bars(code, 90)
+            .map(|admitted| admitted.records().to_vec())
+            .map_err(|error| format!("{code} 日K获取失败: {error}"))
+    }
+    fn already_sold(&self, code: &str, today: &str) -> Result<bool, String> {
+        already_sold_today(code, today)
+    }
+    fn portfolio_state(&self, code: &str, price: f64, cancelled: &AtomicBool) -> Result<(f64, f64, f64), String> {
+        portfolio_state_snapshot_with_cancel(code, price, cancelled)
+    }
+    fn trade_store(&self) -> Option<&dyn crate::trading::paper_trade::PaperTradeStore> { None }
+}
+
+struct ProductionPaperSellReadIo;
+
+impl PaperSellReadIo for ProductionPaperSellReadIo {
+    fn positions(&self, today: chrono::NaiveDate) -> Result<Vec<PaperPosition>, String> {
+        aggregate_open_positions_at(today)
+    }
+
+    fn execution_quote(&self, code: &str) -> Result<crate::broker::ExecutionQuote, String> {
+        crate::broker::execution_quote(code)
+    }
+}
+
+fn scan_and_sell_inner_with_io(
+    risk_context: PaperRiskContext,
+    today: chrono::NaiveDate,
+    io: &impl PaperSellReadIo,
+    cancelled: &AtomicBool,
+    completed: &Mutex<Vec<PaperSellResult>>,
+) -> Result<Vec<PaperSellResult>, String> {
+    if cancelled.load(Ordering::SeqCst) { return Ok(Vec::new()); }
+    let positions = io.positions(today)?;
     if positions.is_empty() {
         return Ok(Vec::new());
     }
     let mut sold = Vec::new();
     for pos in &positions {
-        match evaluate_and_sell(pos, risk_context, today) {
+        if cancelled.load(Ordering::SeqCst) { break; }
+        match evaluate_and_sell(pos, risk_context, today, io, cancelled) {
             Ok(Some(result)) => {
-                on_fill(result.clone());
+                completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(result.clone());
                 sold.push(result);
-            }
+            },
             Ok(None) => {}
             Err(error) => warn!("[paper_sell] {} 评估失败: {error}", pos.code),
         }
@@ -441,6 +545,8 @@ fn evaluate_and_sell(
     pos: &PaperPosition,
     risk_context: PaperRiskContext,
     today: chrono::NaiveDate,
+    io: &impl PaperSellReadIo,
+    cancelled: &AtomicBool,
 ) -> Result<Option<PaperSellResult>, String> {
     // 1. 适配器不变量：候选必须来自早于评估日的可卖批次。
     if pos.first_buy_date >= today {
@@ -450,18 +556,20 @@ fn evaluate_and_sell(
         ));
     }
 
-    // 日K请求可能较慢，先准备指标，再读取执行报价。
-    let indicators = fetch_indicators(&pos.code).map_err(|error| {
-        warn!("[paper_sell] {error}，本 tick 跳过");
-        error
-    })?;
-
     // 2. 实时价（BR-218 5s 门；超龄 fail-closed，下 tick 重试）
-    let quote = crate::broker::execution_quote(&pos.code).map_err(|error| {
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
+    let quote = io.execution_quote(&pos.code).map_err(|error| {
         warn!(
             "[paper_sell] {} 实时价不可用，本 tick 跳过: {error}",
             pos.code
         );
+        error
+    })?;
+
+    // 3. 日K指标（15min 缓存）
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
+    let indicators = fetch_indicators(&pos.code, io).map_err(|error| {
+        warn!("[paper_sell] {error}，本 tick 跳过");
         error
     })?;
 
@@ -484,15 +592,17 @@ fn evaluate_and_sell(
     };
 
     // 5. 当日一票一卖幂等
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
     let today_str = today.format("%Y-%m-%d").to_string();
-    if already_sold_today(&pos.code, &today_str)? {
+    if io.already_sold(&pos.code, &today_str)? {
         info!("[paper_sell] {} 当日已卖出，跳过", pos.code);
         return Ok(None);
     }
 
     // 6. 虚拟卖出（跌停/滑点判定 + INSERT paper_trades + order_audit）
     let gross_pct = (quote.price / pos.avg_buy_price - 1.0) * 100.0;
-    let (cash, total, pos_pct) = portfolio_state_snapshot(&pos.code, quote.price)?;
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
+    let (cash, total, pos_pct) = io.portfolio_state(&pos.code, quote.price, cancelled)?;
     let signal = PaperSignal {
         plan_id: format!("paper-sell-{}-{}", pos.code, today_str),
         code: pos.code.clone(),
@@ -513,8 +623,9 @@ fn evaluate_and_sell(
         risk_context,
     };
     let audit_evidence = PaperAuditEvidence::new(pos.inventory_audit_evidence.clone())?;
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
     let outcome =
-        simulate_with_audit_evidence(&signal, quote.price, cash, total, pos_pct, &audit_evidence)?;
+        simulate_with_audit_evidence_controlled(&signal, quote.price, cash, total, pos_pct, &audit_evidence, io.trade_store(), cancelled)?;
     if outcome.result.status != PaperTradeStatus::Filled {
         warn!(
             "[paper_sell] {} 卖出未成交: {:?}",
@@ -533,14 +644,16 @@ fn evaluate_and_sell(
         price: quote.price,
         return_rate_pct: gross_pct,
         reason,
-        quote_observed_at: quote.observed_at,
-        executed_at: chrono::Utc::now(),
     }))
 }
 
 // ============================================================================
 // 单元测试
 // ============================================================================
+
+#[cfg(test)]
+#[path = "paper_sell_runtime_tests.rs"]
+mod runtime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -899,27 +1012,8 @@ mod tests {
     }
 
     #[test]
-    fn entry_refuses_a_price_already_below_structural_exit() {
-        let indicators = Indicators {
-            ma5: Some(52.0),
-            ma20: Some(56.21),
-            ma60: Some(57.0),
-            atr: Some(2.0),
-            boll_macd: crate::strategy::detect_boll_macd_signal(&[]),
-        };
-        let conditions = PaperEntryConditions(indicators);
-        let error = conditions
-            .check("TEST_CODE_300346", "测试", 51.80, date(2026, 9, 8))
-            .unwrap_err();
-        assert!(error.contains("退出条件"));
-        assert!(conditions
-            .check("TEST_CODE_300346", "测试", 58.0, date(2026, 9, 8))
-            .is_ok());
-    }
-
-    #[test]
     fn atr14_computes_window_mean() {
-        let bars: Vec<KlineData> = (0..15)
+        let bars: Vec<KlineData> = (0..14)
             .map(|_| KlineData {
                 date: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
                 open: 10.0,
@@ -953,7 +1047,7 @@ mod tests {
                 adjust: crate::data_provider::AdjustType::None,
             })
             .collect();
-        // 15根K线提供14个真实波幅，均为2元。
+        // 每根 high-low = 2.0，14 根均值 = 2.0
         assert_eq!(atr14(&bars), Some(2.0));
         let short: Vec<KlineData> = bars[..5].to_vec();
         assert_eq!(atr14(&short), None);

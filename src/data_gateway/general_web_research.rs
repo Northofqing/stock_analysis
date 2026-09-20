@@ -148,7 +148,7 @@ pub struct GeneralWebResearchError {
 }
 
 impl GeneralWebResearchError {
-    fn new(
+    pub(crate) fn new(
         provider: GeneralWebResearchProvider,
         reason_code: &'static str,
         retryable: bool,
@@ -179,6 +179,55 @@ impl GeneralWebResearchError {
     pub const fn stage(&self) -> GeneralWebResearchStage {
         self.stage
     }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Shared request admission for the legacy Gateway and native Macro attempts.
+pub(crate) fn validate_request(
+    provider: GeneralWebResearchProvider,
+    query: &str,
+    limit: usize,
+) -> Result<&str, GeneralWebResearchError> {
+    let query = query.trim();
+    if query.is_empty() || !(1..=MAX_RESULTS).contains(&limit) {
+        return Err(GeneralWebResearchError::new(
+            provider,
+            "invalid_request",
+            false,
+            GeneralWebResearchStage::Request,
+            format!("query must be non-empty and limit must be within 1..={MAX_RESULTS}"),
+        ));
+    }
+    Ok(query)
+}
+
+pub(crate) fn transport_error(
+    provider: GeneralWebResearchProvider,
+    error: super::GatewayError,
+) -> GeneralWebResearchError {
+    GeneralWebResearchError::new(
+        provider,
+        error.reason_code(),
+        error.retryable(),
+        GeneralWebResearchStage::Transport,
+        error.to_string(),
+    )
+}
+
+pub(crate) fn bridge_error(
+    provider: GeneralWebResearchProvider,
+    error: super::GatewayError,
+) -> GeneralWebResearchError {
+    GeneralWebResearchError::new(
+        provider,
+        "grpc_bridge",
+        true,
+        GeneralWebResearchStage::Transport,
+        format!("SemanticSearch 桥初始化失败: {error}"),
+    )
 }
 
 impl fmt::Display for GeneralWebResearchError {
@@ -236,16 +285,7 @@ impl GeneralWebResearchGateway {
         query: &str,
         limit: usize,
     ) -> Result<GeneralWebResearchBatch, GeneralWebResearchError> {
-        let query = query.trim();
-        if query.is_empty() || !(1..=MAX_RESULTS).contains(&limit) {
-            return Err(GeneralWebResearchError::new(
-                self.provider,
-                "invalid_request",
-                false,
-                GeneralWebResearchStage::Request,
-                format!("query must be non-empty and limit must be within 1..={MAX_RESULTS}"),
-            ));
-        }
+        let query = validate_request(self.provider, query, limit)?;
         match super::grpc_source::bridge_for("SemanticSearch") {
             Ok(bridge) => {
                 return match bridge
@@ -253,23 +293,11 @@ impl GeneralWebResearchGateway {
                     .await
                 {
                     Ok(batch) => Ok(batch),
-                    Err(e) => Err(GeneralWebResearchError::new(
-                        self.provider,
-                        e.reason_code(),
-                        e.retryable(),
-                        GeneralWebResearchStage::Transport,
-                        e.to_string(),
-                    )),
+                    Err(error) => Err(transport_error(self.provider, error)),
                 };
             }
             Err(error) => {
-                return Err(GeneralWebResearchError::new(
-                    self.provider,
-                    "grpc_bridge",
-                    true,
-                    GeneralWebResearchStage::Transport,
-                    format!("SemanticSearch 桥初始化失败: {error}"),
-                ));
+                return Err(bridge_error(self.provider, error));
             }
         }
     }

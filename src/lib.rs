@@ -43,6 +43,7 @@ pub mod opportunity;
 pub mod performance; // v16.4 #4: PerformanceSnapshot 独立表
 pub mod pipeline;
 pub mod portfolio;
+pub mod production_root;
 pub mod review;
 // v16.4 Commit 1: StrategyRegistry 动态注册 (替代 v16.3 8 enum 硬编码)
 pub mod registry;
@@ -55,6 +56,7 @@ pub mod signal;
 // v14.2 push 7 层 — 对齐 docs/v14.x/v14.x-master-development.md 的 Phase 2/3 W 周编号
 // (b011 P2-2: 此前注释用的 W2.2/W3.2/W4.1 与 master plan W11-W17 不通用, 已对齐)
 pub mod event; // v17.1-r2: event envelope contract + PushDeliveryEvent
+pub mod push_foundation;
 pub mod push_l1; // Phase 2 W11: v14.2 L1 SignalEvent + event_id 派生
 pub mod push_l2; // Phase 3 W13: v14.2 L2 TemplateMetadata + DataMode (L3 Render 暂缺, 渲染走 push_templates::render_xxx)
 pub mod push_l4; // Phase 2 W12 + b011 P0-2: L4 Dispatcher (dedup 闭环已实装)

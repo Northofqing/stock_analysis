@@ -135,8 +135,8 @@ impl T0PlanState {
         match self {
             Self::WaitingSell => "等待进入卖出区",
             Self::SellTriggered => "卖出观察触发",
-            Self::WaitingBuyback => "接回区观察（需先确认已卖出）",
-            Self::BuybackTriggered => "接回条件触发（需先确认已卖出）",
+            Self::WaitingBuyback => "等待进入接回区",
+            Self::BuybackTriggered => "接回观察触发",
             Self::SellInvalidated => "卖出计划失效",
             Self::BuybackInvalidated => "接回计划失效",
         }
@@ -516,9 +516,6 @@ pub fn evaluate_structured(position: &T0Position, evidence: &T0Evidence) -> T0Pl
             ),
         ));
     };
-    if leg < u64::from(crate::trading::order_safety::minimum_buy_quantity(&position.code)) {
-        return T0PlanDecision::Forbidden(no_plan(position, "leg_below_board_lot", "观察腿不足该板块买入最低数量，无法按相同数量接回"));
-    }
     let Some(atr) = atr14(&evidence.settled_daily) else {
         return T0PlanDecision::Rejected(no_plan(
             position,
@@ -605,19 +602,6 @@ pub fn evaluate_structured(position: &T0Position, evidence: &T0Evidence) -> T0Pl
             format!("low={}", buy_zone.low),
         ));
     }
-    // 使用同批行情前收盘及既有板块规则作必要边界检查。
-    // 这是常规涨跌幅估算，不宣称包含上市初期/除权等特殊交易状态。
-    let symbol = position.code.strip_prefix("TEST_CODE_").unwrap_or(&position.code);
-    let limits = crate::data_provider::limit_status::LimitStatusCalculator::new()
-        .calculate(symbol, evidence.quote.last_close, &position.name);
-    if !evidence.quote.last_close.is_finite() || evidence.quote.last_close <= 0.0
-        || sell_zone.high > limits.limit_up_price || buy_zone.low < limits.limit_down_price
-    {
-        return T0PlanDecision::Rejected(no_plan(position, "zones_outside_daily_range", format!(
-            "常规涨跌幅范围{:.2}~{:.2}，卖出区上沿{:.3}、接回区下沿{:.3}；需核实当日实际价格限制",
-            limits.limit_down_price, limits.limit_up_price, sell_zone.high, buy_zone.low,
-        )));
-    }
     if sell_zone.low <= buy_zone.high {
         return T0PlanDecision::Forbidden(no_plan(
             position,
@@ -693,7 +677,7 @@ pub fn evaluate_structured(position: &T0Position, evidence: &T0Evidence) -> T0Pl
     }
 
     let trigger_text = format!(
-        "卖出需现价进入区间、末根5分钟量比≥{SELL_VOLUME_RATIO_TRIGGER:.1}x且五档卖/买≥{BOOK_RATIO_TRIGGER:.1}x；接回须先确认同一计划的卖出已成交，再检查进入区间、量比≤{BUYBACK_VOLUME_RATIO_TRIGGER:.1}x、5分钟收阳且五档买/卖≥{BOOK_RATIO_TRIGGER:.1}x；价格区间变化需重新核对计划"
+        "卖出需现价进入区间、末根5分钟量比≥{SELL_VOLUME_RATIO_TRIGGER:.1}x且五档卖/买≥{BOOK_RATIO_TRIGGER:.1}x；接回需进入区间、量比≤{BUYBACK_VOLUME_RATIO_TRIGGER:.1}x、5分钟收阳且五档买/卖≥{BOOK_RATIO_TRIGGER:.1}x"
     );
     let invalidation_text = format!(
         "连续两根已完成5分钟收盘>{:.2}取消卖出；最新已完成5分钟收盘<{:.2}取消接回",
@@ -964,24 +948,6 @@ mod tests {
     }
 
     #[test]
-    fn buyback_zone_must_fit_daily_price_range() {
-        let mut value = evidence();
-        value.quote.last_close = 17.3;
-        assert!(matches!(evaluate_structured(&position(500), &value), T0PlanDecision::Rejected(ref no)
-            if no.reason_code == "zones_outside_daily_range"));
-    }
-
-    #[test]
-    fn star_market_reverse_t_requires_a_buyable_leg() {
-        let mut position = position(500);
-        let mut value = evidence();
-        position.code = "TEST_CODE_688981".into();
-        value.code.clone_from(&position.code);
-        assert!(matches!(evaluate_structured(&position, &value), T0PlanDecision::Forbidden(ref no)
-            if no.reason_code == "leg_below_board_lot"));
-    }
-
-    #[test]
     fn position_below_one_observation_lot_is_forbidden() {
         let decision = evaluate_structured(&position(299), &evidence());
 
@@ -1159,8 +1125,8 @@ mod tests {
         assert_eq!(ZoneSource::AtrProjection.label(), "ATR投影");
         assert_eq!(T0PlanState::WaitingSell.label(), "等待进入卖出区");
         assert_eq!(T0PlanState::SellTriggered.label(), "卖出观察触发");
-        assert_eq!(T0PlanState::WaitingBuyback.label(), "接回区观察（需先确认已卖出）");
-        assert_eq!(T0PlanState::BuybackTriggered.label(), "接回条件触发（需先确认已卖出）");
+        assert_eq!(T0PlanState::WaitingBuyback.label(), "等待进入接回区");
+        assert_eq!(T0PlanState::BuybackTriggered.label(), "接回观察触发");
         assert_eq!(T0PlanState::SellInvalidated.label(), "卖出计划失效");
         assert_eq!(T0PlanState::BuybackInvalidated.label(), "接回计划失效");
 

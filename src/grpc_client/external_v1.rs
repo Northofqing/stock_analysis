@@ -5,9 +5,10 @@
 //! shape are explicitly delivered and fixture-proven. Local Rust domain types
 //! are never used to guess an upstream payload.
 
-use crate::grpc_client::pb::magic::market::v1::{
-    CanonicalPayload, Operation, QueryRequest, RequestContext,
+use crate::grpc_client::external_pb::magic::market::v1::{
+    CanonicalPayload, QueryRequest, RequestContext,
 };
+use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::market_domain::{AssetClass, InstrumentId};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::{Map, Value};

@@ -9,6 +9,8 @@
 > **痛点证据：** `/private/tmp/stock_analysis_monitor.log`（19,843 行 / 7h49m）
 
 > **2026-09-02 覆盖审计：** v19.x 不是整体完成状态。部分运行能力已被当前代码以不同形态吸收，BannerSnapshot、统一 ErrorCode、log rotation、health CLI 等仍未按设计落地；Push Template Catalog 和 v19.3 的 57/59-kind 清单已由 [项目架构蓝图 §24--§25](../Project_Architecture_Blueprint.md#24-推送系统专项架构与演进路线) 的 65-kind 审计上位替代。
+>
+> **来源注记（2026-09-05）：** v19.0 正文保留的 `AGENTS.md`、`docs/ENGINEERING_RULES_V2.md` 与 `CLAUDE.md` 规则指针已经退役，仅作历史设计语境，不是当前规则入口。另有四份纳管来源位于 `docs/v18.x/`，但文件分别自声明 v20.x（v18.2–v18.4）与 v20.0（v18.5）；这是目录位置与自声明版本的标签冲突，不改写原来源。
 
 ## 推荐入口
 

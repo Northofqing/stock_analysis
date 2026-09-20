@@ -106,10 +106,6 @@ pub enum PushKind {
     PaperTrade,
     /// 虚拟盘卖出 (BR-234, ℹ️ 5min批, 默认降级) [MVP-1]
     PaperSell,
-    /// 虚拟盘买入执行 (2026-09-03, ℹ️ 5min批, 默认降级, 仅 Filled 卡)
-    PaperBuy,
-    /// 系统死信哨兵 (P0 2026-09-03: watchdog_deadline 逾期触发, 幂等 1次/轨道/日)
-    Watchdog,
     /// 持仓快照过期提醒 (任务#3, ℹ️ 每日1次, 默认降级) [MVP-1]
     SnapshotStale,
     /// 虚拟盘绩效归因日推 (交付物 A, 每日 1 次, 默认出声) [2026-08-20]
@@ -366,8 +362,6 @@ impl PushKind {
                 | PushKind::ForbiddenOps
                 | PushKind::PaperTrade
                 | PushKind::PaperSell
-                | PushKind::PaperBuy
-                | PushKind::Watchdog
                 | PushKind::SnapshotStale
                 | PushKind::CloseCall
                 | PushKind::ReviewMarket
@@ -406,8 +400,6 @@ impl PushKind {
             PushKind::PaperTrade => Some(300),
             // 5 min / 票 (BR-234 虚拟盘卖出)
             PushKind::PaperSell => Some(300),
-            // 5 min / 票 (2026-09-03 虚拟盘买入执行卡, 同 PaperSell)
-            PushKind::PaperBuy => Some(300),
             // 每日快照提醒 (调用方已按日去重)
             PushKind::SnapshotStale => Some(300),
             // 1次/日
@@ -482,7 +474,6 @@ impl PushKind {
             | ForbiddenOps
             | PaperTrade
             | PaperSell
-            | PaperBuy
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -528,8 +519,6 @@ impl PushKind {
             PushKind::ForbiddenOps => "禁止操作",
             PushKind::PaperTrade => "虚拟盘",
             PushKind::PaperSell => "虚拟盘卖出",
-            PushKind::PaperBuy => "虚拟盘买入",
-            PushKind::Watchdog => "系统哨兵",
             PushKind::SnapshotStale => "快照过期提醒",
             PushKind::CloseCall => "尾盘决策",
             PushKind::ReviewMarket => "盘面走向",
@@ -866,28 +855,6 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::PerTicket,
             label: "虚拟盘卖出",
             stable_template_id: "papersell_v1",
-        },
-    ),
-    // ============== 2026-09-03: 虚拟盘买入执行卡 ==============
-    (
-        PushKind::PaperBuy,
-        DispatchRow {
-            level: PushLevel::Info,
-            cooldown_secs: Some(300),
-            cooldown_scope: CooldownScope::PerTicket,
-            label: "虚拟盘买入",
-            stable_template_id: "paperbuy_v1",
-        },
-    ),
-    // ============== P0 (2026-09-03): 系统死信哨兵 ==============
-    (
-        PushKind::Watchdog,
-        DispatchRow {
-            level: PushLevel::Info,
-            cooldown_secs: None,
-            cooldown_scope: CooldownScope::Global,
-            label: "系统哨兵",
-            stable_template_id: "watchdog_v1",
         },
     ),
     // ============== 任务#3: 持仓快照过期提醒 ==============
@@ -1637,7 +1604,10 @@ impl PinnedPushLogWriter {
                 namespace: namespace.label(),
             });
         }
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = stock_analysis::production_root::root_for_mode(matches!(
+            namespace,
+            crate::durable_delivery_runtime::RuntimeNamespace::Test { .. }
+        ));
         let (namespace_label, relative_root) = match namespace {
             crate::durable_delivery_runtime::RuntimeNamespace::Production => (
                 "production".to_owned(),
@@ -3133,7 +3103,6 @@ fn requires_ticket_code(kind: PushKind) -> bool {
             | ForbiddenOps
             | PaperTrade
             | PaperSell
-            | PaperBuy
             | NewsToIdea
             | PostFixedPriceOrder
             | PostFixedPriceFill
@@ -6783,14 +6752,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 完整性 (BR-234 + 任务#3 + R-12 + R-13 + PaperBuy + Watchdog) ==============
+    // ============== v17.x: DISPATCH_TABLE 19 rows 完整性 (BR-234 + 任务#3 + R-12 + R-13) ==============
 
     #[test]
-    fn dispatch_table_size() {
+    fn dispatch_table_size_is_twenty() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            23,
-            "v17.x DISPATCH_TABLE 应 23 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A + 1 G5b + 1 PaperBuy + 1 Watchdog)"
+            21,
+            "v17.x DISPATCH_TABLE 应 21 rows (3 v17.6 + 6 v17.7 + 6 v17.8 + 1 BR-234 + 1 #3 + 1 R-12 + 1 R-13 + 1 交付物A + 1 G5b)"
         );
     }
 
@@ -6805,8 +6774,7 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 + 任务#3 1 +
-        // R-12 1 + R-13 1 + 交付物A 1 + G5b 1 + PaperBuy 1 + Watchdog 1 = 22
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 + BR-234 1 + 任务#3 1 + R-12 1 = 18
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -6824,14 +6792,12 @@ mod tests {
             PushKind::BlockTradeIntradayConfirm,
             PushKind::BlockTradePriceRange,
             PushKind::PaperSell,
-            PushKind::PaperBuy,
-            PushKind::Watchdog,
             PushKind::SnapshotStale,
             PushKind::ReviewBacktest,
             PushKind::WatchlistTracking,
             PushKind::G5bAttribution,
         ];
-        assert_eq!(expected.len(), 22);
+        assert_eq!(expected.len(), 20);
         for k in expected {
             assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }
@@ -6907,7 +6873,11 @@ mod tests {
     async fn push_governor_deprecated_no_push() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let r = push_governor_v3("test kept auction", PushKind::AuctionVolume, None).await;
+        // 2026-09-20: AuctionVolume 升级 counted (MU-auction-volume) → 泛化
+        // governor 对其恒拒 counted_binding_required; 本测试验证的是
+        // deprecated governor 对**未 counted** kind 的保留行为 — 代表 kind
+        // 轮换为 PolicyHit (uncounted, C-scheme 放行先例)。
+        let r = push_governor_v3("test kept policy", PushKind::PolicyHit, None).await;
         assert_eq!(r, PushOutcome::Pushed);
     }
 
@@ -7049,7 +7019,9 @@ mod tests {
     async fn push_verbose_true_overrides_deprecated() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let r = push_governor_v3("test verbose auction", PushKind::AuctionVolume, None).await;
+        // 2026-09-20: AuctionVolume 升级 counted — 代表 kind 轮换 PolicyHit
+        // (同 push_governor_deprecated_no_push 论据)。
+        let r = push_governor_v3("test verbose policy", PushKind::PolicyHit, None).await;
         assert_eq!(r, PushOutcome::Pushed);
     }
 
@@ -7706,8 +7678,13 @@ mod tests {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
         let now = chrono::Local::now();
+        // 2026-09-20 (MU-announcement counted): Announcement 已 counted,
+        // v14_gate_source_fact 对 counted kind 恒拒 counted_binding_required
+        // — 此测试验证的是 v14 源事实门本身的 L4 去重/审计回滚语义, 按
+        // seam 轮换纪律改用未 counted 的 PolicyHit 作代表 kind (I-01/I-02
+        // 轮先例)。
         let evidence = crate::v14_adapter::SourceFactEvidence::new(
-            PushKind::Announcement,
+            PushKind::PolicyHit,
             "TEST_CODE_POST_AUDIT_RETRY_ID".to_string(),
             Some("TEST_CODE_POST_AUDIT_RETRY".to_string()),
             "后置审计失败后允许重试".to_string(),
@@ -7724,14 +7701,14 @@ mod tests {
             other => panic!("first attempt must reserve: {other:?}"),
         };
 
-        settle_dedup_after_delivery(&first, PushKind::Announcement, None, None, true, false)
+        settle_dedup_after_delivery(&first, PushKind::PolicyHit, None, None, true, false)
             .expect("failed post-delivery audit must roll back L4 identity");
 
         let retry = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
             crate::v14_adapter::V14Gate::Approved(event) => *event,
             other => panic!("audit failure must leave the source fact retryable: {other:?}"),
         };
-        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::Announcement, None, None)
+        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::PolicyHit, None, None)
             .expect("test cleanup rollback");
     }
 

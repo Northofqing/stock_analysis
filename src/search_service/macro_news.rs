@@ -1,6 +1,47 @@
+use crate::data_gateway::general_web_research::{GeneralWebResearchBatch, GeneralWebResearchError};
+use crate::data_gateway::grpc_source::macro_queries;
 use crate::data_gateway::{
     EconomicReleaseFact, GatewayBatch, GatewayError, GlobalNewsProvider, GlobalNewsRecord,
 };
+use crate::grpc_client::client::macro_attempt::MacroQueryIdentity;
+use crate::grpc_client::client::ContractProfile;
+use crate::grpc_client::envelope::QueryResult;
+use crate::grpc_client::errors::GrpcError;
+
+pub(super) mod legacy;
+pub(crate) mod runner;
+
+/// Native facts retained by both Macro Adapters before any rendering.
+#[derive(Clone, Debug)]
+pub(crate) enum NativeOutcome {
+    News(Result<GatewayBatch<GlobalNewsRecord>, GatewayError>),
+    Economic(Result<GatewayBatch<EconomicReleaseFact>, GatewayError>),
+    Web(Result<GeneralWebResearchBatch, GeneralWebResearchError>),
+}
+
+impl NativeOutcome {
+    pub(crate) fn project(
+        identity: &MacroQueryIdentity,
+        profile: ContractProfile,
+        processed: &Result<QueryResult, GrpcError>,
+    ) -> Self {
+        match identity {
+            MacroQueryIdentity::GlobalNews { provider, limit } => Self::News(
+                macro_queries::news_outcome(*provider, *limit, profile, processed),
+            ),
+            MacroQueryIdentity::EconomicCalendar => {
+                Self::Economic(macro_queries::economic_outcome(processed))
+            }
+            MacroQueryIdentity::SemanticSearch {
+                provider,
+                query,
+                limit,
+            } => Self::Web(macro_queries::web_outcome(
+                *provider, query, *limit, processed,
+            )),
+        }
+    }
+}
 
 const MAX_NEWS_PER_SOURCE: usize = 8;
 const MIN_RELEASE_IMPORTANCE: u32 = 2;

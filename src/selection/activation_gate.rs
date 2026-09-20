@@ -40,7 +40,7 @@ pub enum SelectionV2ActivationVerdict {
 /// Evaluate the production selection-v2 activation against the checked-in
 /// repository release materials.
 pub fn evaluate_production_selection_v2_activation() -> SelectionV2ActivationVerdict {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate::production_root::production_root();
     let now = Utc::now();
 
     if !root.join(ACTIVATION_FILE_RELATIVE_PATH).is_file() {

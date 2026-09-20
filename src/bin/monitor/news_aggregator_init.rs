@@ -1015,27 +1015,37 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                 }
             }
             FlashDecision::Aggregated { window, text } => {
-                let presentation_token = match crate::presentation_registry::acquire_token(
-                    "N-02-news-flash-aggregated",
-                    crate::notify::PushKind::NewsFlashAggregated,
-                    "news_flash_aggregate_dispatcher",
-                    "assemble_news_flash_aggregated",
-                ) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        log::error!("[NewsFlashGate][BR-196] aggregate token rejected: {error}");
-                        crate::push_templates::log_dispatcher_attempt(
-                            "N-02",
-                            false,
-                            1,
-                            &format!("presentation_token_rejected:{error}"),
-                        );
-                        continue;
-                    }
-                };
+                // 2026-09-20: N-02 升级 counted (MU-news-flash-aggregate)。
+                // 本路 (NewsFlashGate 直接推) 转 counted; reservation 结算
+                // 流 (push_flash_reservations) 保留自营持久化不经协调器
+                // (第三引擎模式, v14_gate_prepared 对 counted kind 直返
+                // Approved 不 fail-close)。Rolling 3600s 镜像 L4;
+                // retry_authorized=false (时刻锚定 + 下一窗口重渲染)。
                 let outcome =
-                    crate::notify::push_presented_v3(presentation_token, &text, Some(&window))
-                        .await;
+                    match crate::push_templates::build_news_flash_aggregated_counted_binding(
+                        chrono::Local::now().date_naive(),
+                        &window,
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &text,
+                    )
+                    .and_then(|binding| {
+                        crate::presentation_registry::acquire_token(
+                            "N-02-news-flash-aggregated",
+                            crate::notify::PushKind::NewsFlashAggregated,
+                            "news_flash_aggregate_dispatcher",
+                            "assemble_news_flash_aggregated",
+                        )
+                        .map(|token| (token, binding))
+                    }) {
+                        Ok((token, binding)) => {
+                            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                                .await
+                        }
+                        Err(reason) => {
+                            log::error!("[NewsFlashGate][BR-196] counted 准备失败: {reason}");
+                            crate::notify::PushOutcome::Denied(reason)
+                        }
+                    };
                 if outcome.is_pushed() {
                     n_agg += 1;
                     crate::push_templates::log_dispatcher_attempt("N-02", true, 1, "");
@@ -1178,7 +1188,7 @@ pub async fn candidate_ingest_from_news(titles: &[String]) -> (usize, usize) {
     // 2026-08-08 实测: 20 条标题 → 输出超 8192 tokens 仍可能截断; 10 条
     // 覆盖单轮 tick 的头部新闻, 输出稳定收敛。
     let batch: Vec<String> = titles.iter().take(10).cloned().collect();
-    let hits = match stock_analysis::llm::extract_tickers(provider, batch.clone()).await {
+    let hits = match stock_analysis::llm::extract_tickers(provider, batch).await {
         Ok(hits) => hits,
         Err(error) => {
             log::warn!("[候选入池][BR-183] LLM 提取失败, 本轮不入池: {error}");
@@ -1199,22 +1209,13 @@ pub async fn candidate_ingest_from_news(titles: &[String]) -> (usize, usize) {
         }
         match stock_analysis::broker::execution_quote(&hit.code) {
             Ok(quote) => {
-                let direct_title = stock_analysis::llm::ticker_extractor::directly_mentioned_title(&batch, &hit, &quote.name);
-                let base_metrics = news_catalyst_metric_json(
-                    &hit.chain,
-                    direct_title.unwrap_or(&hit.reason),
-                    hit.importance,
-                    quote.change_percent,
+                let theme = json_escape(&hit.chain);
+                let headline = json_escape(&hit.reason);
+                let metric_json = format!(
+                    "{{\"push_subkind\":\"NewsCatalyst\",\"theme\":\"{theme}\",\
+                     \"headline\":\"{headline}\",\"llm_importance\":{}}}",
+                    hit.importance
                 );
-                let mut metrics: serde_json::Value = serde_json::from_str(&base_metrics)
-                    .expect("news_catalyst_metric_json produces JSON");
-                metrics["news_direct_mention"] = serde_json::json!(direct_title.is_some());
-                metrics["source_title"] = serde_json::json!(direct_title);
-                metrics["verified_name"] = serde_json::json!(&quote.name);
-                let metric_json = metrics.to_string();
-                if direct_title.is_none() {
-                    log::info!("[候选入池] {}({}) 仅观察：原文未直接提及或名称不匹配", hit.name, hit.code);
-                }
                 let outcome = stock_analysis::signal::push_recorder::record(
                     &stock_analysis::signal::push_recorder::PushRecordMeta {
                         code: hit.code.clone(),
@@ -1290,16 +1291,14 @@ struct PooledCountRow {
     count: i64,
 }
 
-/// 候选原文按 JSON 编码，保留完整标题；行情缺失不填零。
-fn news_catalyst_metric_json(theme: &str, headline: &str, importance: u8, chg: f64) -> String {
-    let mut value = serde_json::json!({
-        "push_subkind": "NewsCatalyst", "theme": theme,
-        "headline": headline, "llm_importance": importance,
-    });
-    if chg.is_finite() {
-        value["price_chg_pct"] = serde_json::json!(chg);
-    }
-    value.to_string()
+/// JSON 字符串转义 (候选 metric_json 内联字段用)
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 // ============================================================================
@@ -1310,29 +1309,6 @@ fn news_catalyst_metric_json(theme: &str, headline: &str, importance: u8, chg: f
 mod tests {
     use super::*;
     use stock_analysis::signal::market_event::{Direction, EventType};
-
-    #[test]
-    fn news_catalyst_metric_json_embeds_finite_chg() {
-        let s = news_catalyst_metric_json("油气服务", "含\"引号\"标题", 4, -2.5);
-        let v: serde_json::Value = serde_json::from_str(&s).expect("合法 JSON");
-        assert_eq!(v["push_subkind"], "NewsCatalyst");
-        assert_eq!(v["headline"], "含\"引号\"标题"); // json_escape 语义保持
-        assert_eq!(v["price_chg_pct"].as_f64(), Some(-2.5)); // 原样精度, 不取整
-        assert_eq!(v["llm_importance"], 4);
-    }
-
-    #[test]
-    fn news_catalyst_metric_json_omits_non_finite_chg() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let v: serde_json::Value =
-                serde_json::from_str(&news_catalyst_metric_json("t", "h", 1, bad))
-                    .expect("合法 JSON");
-            assert!(v.get("price_chg_pct").is_none(), "非有限 chg 必须省略字段");
-            // 省略后其余字段完整
-            assert_eq!(v["push_subkind"], "NewsCatalyst");
-            assert_eq!(v["llm_importance"], 1);
-        }
-    }
 
     fn ev(id_seed: &str, strength: u8, certainty: u8) -> MarketEvent {
         let mut e = MarketEvent::new(
@@ -1853,11 +1829,11 @@ mod tests {
         assert_eq!((recorded, skipped), (0, 0));
     }
 
+    /// Track A: JSON 转义不产生畸形 metric_json
     #[test]
-    fn news_metric_json_preserves_control_characters_and_complete_title() {
-        let title = "公告\n包含\t制表符和\"引号\"".repeat(20);
-        let value: serde_json::Value = serde_json::from_str(&news_catalyst_metric_json("行业", &title, 8, 0.0)).unwrap();
-        assert_eq!(value["headline"], title);
+    fn json_escape_handles_quotes_and_backslashes() {
+        let escaped = json_escape("PCB \"涨价\" \\ 事件");
+        assert_eq!(escaped, "PCB \\\"涨价\\\" \\\\ 事件");
     }
 
     /// 红线 2.2: 窗口无事件不臆造推送

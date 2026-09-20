@@ -134,6 +134,9 @@ fn review_outcome_detail(outcome: &ReviewTaskOutcome) -> String {
             failure: ReviewTaskFailure::ExistingSourceFailure { reason, .. },
         } => reason.clone(),
         ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::GatewaySource(failure),
+        } => failure.reason.clone(),
+        ReviewTaskOutcome::Failed {
             failure: ReviewTaskFailure::AccountDependency(failure),
         } => format!(
             "stage={:?} reason_code={:?} source_provider={} source_time={} observed_at={}",
@@ -222,6 +225,13 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
         ReviewTaskOutcome::Failed {
             failure: ReviewTaskFailure::ExistingSourceFailure { reason, .. },
         } => classify_failure(reason).to_string(),
+        ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::GatewaySource(failure),
+        } => format!(
+            "gateway_{}_{}",
+            sanitize_reason_code(&failure.capability),
+            sanitize_reason_code(&failure.reason_code)
+        ),
         ReviewTaskOutcome::Failed {
             failure: ReviewTaskFailure::AccountDependency(_),
         } => "account_metrics_incomplete".to_string(),
@@ -671,6 +681,7 @@ pub enum ReviewTransitionFailure {
         retryable: bool,
         reason: String,
     },
+    GatewaySource(ReviewGatewayFailure),
     AccountDependency {
         stage: ReviewAccountDependencyStage,
         reason_code: ReviewAccountFailureReasonCode,
@@ -811,9 +822,42 @@ pub struct ReviewAccountDependencyFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGatewayFailure {
+    pub capability: String,
+    pub provider: Option<String>,
+    pub audit_outcome: String,
+    pub reason_code: String,
+    pub retryable: bool,
+    pub reason: String,
+}
+
+impl ReviewGatewayFailure {
+    fn from_gateway_error(error: &stock_analysis::data_gateway::GatewayError) -> Self {
+        Self {
+            capability: error.capability().to_string(),
+            provider: error.provider().map(|provider| format!("{provider:?}")),
+            audit_outcome: error.audit_outcome().to_string(),
+            reason_code: error.reason_code().to_string(),
+            retryable: error.retryable(),
+            reason: error.to_string(),
+        }
+    }
+
+    fn source(&self) -> String {
+        format!(
+            "gateway_{}_provider_{}",
+            sanitize_reason_code(&self.capability),
+            sanitize_reason_code(self.provider.as_deref().unwrap_or("unspecified"))
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "failure_class", rename_all = "snake_case")]
 pub enum ReviewTaskFailure {
     ExistingSourceFailure { retryable: bool, reason: String },
+    GatewaySource(ReviewGatewayFailure),
     AccountDependency(ReviewAccountDependencyFailure),
 }
 
@@ -821,6 +865,7 @@ impl ReviewTaskFailure {
     fn retryable(&self) -> bool {
         match self {
             Self::ExistingSourceFailure { retryable, .. } => *retryable,
+            Self::GatewaySource(failure) => failure.retryable,
             Self::AccountDependency(failure) => failure.retryable,
         }
     }
@@ -883,6 +928,14 @@ impl ReviewTaskOutcome {
                 retryable,
                 reason: reason.into(),
             },
+        }
+    }
+
+    pub fn gateway_failed(error: &stock_analysis::data_gateway::GatewayError) -> Self {
+        Self::Failed {
+            failure: ReviewTaskFailure::GatewaySource(ReviewGatewayFailure::from_gateway_error(
+                error,
+            )),
         }
     }
 
@@ -1267,6 +1320,18 @@ impl ReviewScheduleState {
                         evidence_identity_hash: evidence_identity_hash.clone(),
                     }),
                 ),
+                ReviewTaskOutcome::Failed {
+                    failure: ReviewTaskFailure::GatewaySource(failure),
+                } => (
+                    format!(
+                        "gateway_{}_{}",
+                        sanitize_reason_code(&failure.capability),
+                        sanitize_reason_code(&failure.reason_code)
+                    ),
+                    failure.source(),
+                    None,
+                    Some(ReviewTransitionFailure::GatewaySource(failure.clone())),
+                ),
                 _ => {
                     let reason_category = review_reason_category(*task, outcome);
                     let reason_detail = match outcome {
@@ -1283,6 +1348,9 @@ impl ReviewScheduleState {
                         ReviewTaskOutcome::Failed {
                             failure: ReviewTaskFailure::AccountDependency(_),
                         } => unreachable!("account dependency handled above"),
+                        ReviewTaskOutcome::Failed {
+                            failure: ReviewTaskFailure::GatewaySource(_),
+                        } => unreachable!("gateway source failure handled above"),
                     };
                     let fingerprint = audit_identity_hash("review-reason", reason_detail);
                     let failure = match outcome {
@@ -2304,6 +2372,111 @@ mod tests {
             assert_eq!(category, expected);
             assert!(!category.contains("603031"));
         }
+    }
+
+    #[test]
+    fn br140_gateway_failure_transition_roundtrip_preserves_typed_fields() {
+        let error = stock_analysis::data_gateway::GatewayError::unavailable(
+            "futures_delivery",
+            Some(stock_analysis::market_domain::ProviderId::Cffex),
+            false,
+            "TEST_CODE permanent contract rejection",
+        );
+        let mut state = ReviewScheduleState::for_date(day());
+        let transition = state
+            .apply(
+                &ReviewBatchOutcome::new(vec![(
+                    ReviewTask::R08,
+                    ReviewTaskOutcome::gateway_failed(&error),
+                )]),
+                at_datetime(19, 0),
+            )
+            .remove(0);
+
+        assert_eq!(
+            transition.reason_code,
+            "gateway_futures_delivery_no_verified_batch"
+        );
+        assert_eq!(transition.source, "gateway_futures_delivery_provider_Cffex");
+        let wire = serde_json::to_vec(&transition).unwrap();
+        let roundtrip: ReviewTaskTransition = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(roundtrip, transition);
+        assert!(matches!(
+            roundtrip.failure,
+            Some(ReviewTransitionFailure::GatewaySource(ReviewGatewayFailure {
+                capability,
+                provider: Some(provider),
+                audit_outcome,
+                reason_code,
+                retryable: false,
+                reason,
+            })) if capability == "futures_delivery"
+                && provider == "Cffex"
+                && audit_outcome == "unavailable"
+                && reason_code == "no_verified_batch"
+                && reason.contains("permanent contract rejection")
+        ));
+    }
+
+    #[test]
+    fn br140_gateway_failure_reason_code_does_not_hash_diagnostic_text() {
+        let transition_for = |reason: &str| {
+            let error = stock_analysis::data_gateway::GatewayError::unavailable(
+                "futures_delivery",
+                None,
+                false,
+                reason,
+            );
+            ReviewScheduleState::for_date(day())
+                .apply(
+                    &ReviewBatchOutcome::new(vec![(
+                        ReviewTask::R08,
+                        ReviewTaskOutcome::gateway_failed(&error),
+                    )]),
+                    at_datetime(19, 0),
+                )
+                .remove(0)
+        };
+
+        let first = transition_for("http request rejected by permanent contract");
+        let second = transition_for("TEST_CODE wholly different diagnostic");
+        assert_eq!(
+            first.reason_code,
+            "gateway_futures_delivery_no_verified_batch"
+        );
+        assert_eq!(first.reason_code, second.reason_code);
+    }
+
+    #[test]
+    fn br140_existing_source_failure_json_remains_readable() {
+        let wire = serde_json::json!({
+            "observed_at": "2026-07-21T19:00:00",
+            "task": "R-08",
+            "source": "event_calendar_public_component_batches",
+            "source_time": null,
+            "rule_ids": ["BR-110", "BR-140", "BR-192", "BR-199", "BR-200"],
+            "status": "failed",
+            "success": false,
+            "snapshot_size": 0,
+            "retryable": false,
+            "next_attempt": null,
+            "reason_code": "event_calendar_review_failed_TEST_CODE",
+            "identity_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "failure": {
+                "failure_class": "existing_source_failure",
+                "retryable": false,
+                "reason": "TEST_CODE legacy failure"
+            }
+        });
+
+        let parsed: ReviewTaskTransition = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            parsed.failure,
+            Some(ReviewTransitionFailure::ExistingSourceFailure {
+                retryable: false,
+                reason,
+            }) if reason == "TEST_CODE legacy failure"
+        ));
     }
 
     #[test]

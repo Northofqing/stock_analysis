@@ -1,0 +1,5530 @@
+{
+  "schema_version": 1,
+  "status": "PROVISIONAL",
+  "catalog_sha256": "0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3",
+  "assumptions": {
+    "engineering_day_hours": 8,
+    "engineer_count": 1,
+    "lineage": "reconstructed_2026-09-06",
+    "historical_foundation_range_hours": [
+      98,
+      142
+    ],
+    "historical_usage": "comparison_only_not_fit_or_recovered",
+    "review_and_repair": "included_in_three_point_estimates",
+    "unit_hash_encoding": "SHA256(raw catalog Unit canonical UTF-8 JSON; recursively sorted object keys; array order preserved; no whitespace/newline; no domain wrapper)",
+    "phase_epics": [
+      "盘前",
+      "集合竞价",
+      "盘中",
+      "盘后"
+    ],
+    "recent_evidence": "docs/push-system/comprehensive-reanalysis-2026-09-05.md#F01-F12; design/replay/pre-fix priority only; never promotion rank",
+    "nonbaseline": [
+      "PaperBuy",
+      "Watchdog"
+    ]
+  },
+  "contingency": {
+    "percent": 20,
+    "applications": 1,
+    "basis": "sum_stored_line_pert_hours",
+    "excludes": [
+      "external_wait",
+      "promotion_sessions",
+      "observation_sessions"
+    ],
+    "rationale": "跨owner接线与故障证据整合的不确定性；单行评审修复已在O/M/P内，缓冲不回写明细。"
+  },
+  "engineering_totals": {
+    "foundation_pert_hours": 281.34,
+    "migration_pert_hours": 547.65,
+    "baseline_hours": 828.99,
+    "baseline_engineering_days": 103.62,
+    "contingency_hours": 165.8,
+    "buffered_hours": 994.79,
+    "buffered_engineering_days": 124.35
+  },
+  "trading_totals": {
+    "physical_owner_units": 42,
+    "promotion_sessions": 42,
+    "observation_sessions": 76,
+    "serialized_rollout_sessions": 118,
+    "promotion_business_day_lower_bound": 42,
+    "session_policy": "one_unit_per_business_date; observation_serialized_after_each_promotion",
+    "unranked_requires_new_approval": true
+  },
+  "calendar_scenarios": {
+    "planning_start": "hypothetical_monday_not_a_committed_date",
+    "workdays_per_week": 5,
+    "external_wait_business_days_serial_sum": 63,
+    "buffered_engineering_business_days": 125,
+    "serialized_business_days": 306,
+    "weekdays_only_calendar_days": 428,
+    "additional_exchange_holidays": "add_authoritative_calendar_closures",
+    "approval_and_sample_delay_days": null,
+    "upper_bound_calendar_days": null,
+    "scope": "conditional_all_scoped_owner_changes_after_all_engineering; serial external waits; no overlap assumed; unranked and within-wave order require separate operator approval; STARVED/OPT-IN activation excluded; retention waiting >=90 days and stricter policies not included; cleanup eligibility only"
+  },
+  "critical_path": {
+    "engineering": {
+      "resource_policy": "one_engineer_serial",
+      "serial_order": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W13",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21",
+        "MU-cli-single",
+        "MU-cli-summary",
+        "MU-chain-preopen",
+        "MU-chain-post-close",
+        "MU-cli-chain",
+        "MU-news-ai",
+        "MU-paper-sell",
+        "MU-g5b-attribution",
+        "MU-review-r07",
+        "MU-review-r11",
+        "MU-review-r08",
+        "MU-announcement",
+        "MU-p01",
+        "MU-d01",
+        "MU-news-catalyst",
+        "MU-news-flash-aggregate",
+        "MU-earnings-beat",
+        "MU-earnings-miss",
+        "MU-analyst",
+        "MU-auction-volume",
+        "MU-auction-candidates",
+        "MU-virtual-watch",
+        "MU-paper-trade",
+        "MU-limit-boards",
+        "MU-holding-plan",
+        "MU-t0",
+        "MU-close-call",
+        "MU-industry-intraday",
+        "MU-intraday-market",
+        "MU-sector-top",
+        "MU-sector-anomaly",
+        "MU-data-mode",
+        "MU-account-mode",
+        "MU-frozen-side",
+        "MU-order-alert",
+        "MU-snapshot-stale",
+        "MU-attribution-daily",
+        "MU-fixed-order",
+        "MU-fixed-fill",
+        "MU-st-price",
+        "MU-paper-review-noon",
+        "MU-review-r04",
+        "MU-review-r09",
+        "MU-review-r13",
+        "MU-review-a10",
+        "MU-review-r03-auto",
+        "MU-review-r03-manual",
+        "MU-paper-review-daily",
+        "MU-block-confirm",
+        "MU-ipo-catalyst",
+        "MU-cli-replay-force",
+        "MU-review-r03-stored-recovery"
+      ],
+      "serialized_hours": 828.99,
+      "dependency_longest_path": [
+        "W01",
+        "W02",
+        "W03",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W14",
+        "W15",
+        "W18",
+        "W20",
+        "W21",
+        "MU-paper-sell"
+      ],
+      "dependency_path_hours": 208.01,
+      "first_batch_unit_ids": [
+        "MU-chain-post-close",
+        "MU-chain-preopen",
+        "MU-cli-single",
+        "MU-cli-summary"
+      ],
+      "first_batch_hours": 318.66
+    },
+    "trading_rollout": {
+      "wave_groups": [
+        {
+          "rank": 1,
+          "unit_ids": [
+            "MU-cli-single",
+            "MU-cli-summary"
+          ]
+        },
+        {
+          "rank": 2,
+          "unit_ids": [
+            "MU-chain-preopen"
+          ]
+        },
+        {
+          "rank": 3,
+          "unit_ids": [
+            "MU-chain-post-close"
+          ]
+        },
+        {
+          "rank": 4,
+          "unit_ids": [
+            "MU-attribution-daily"
+          ]
+        },
+        {
+          "rank": 5,
+          "unit_ids": [
+            "MU-g5b-attribution"
+          ]
+        },
+        {
+          "rank": 6,
+          "unit_ids": [
+            "MU-intraday-market"
+          ]
+        },
+        {
+          "rank": 7,
+          "unit_ids": [
+            "MU-auction-candidates"
+          ]
+        },
+        {
+          "rank": 8,
+          "unit_ids": [
+            "MU-limit-boards"
+          ]
+        },
+        {
+          "rank": 9,
+          "unit_ids": [
+            "MU-review-a10",
+            "MU-review-r04",
+            "MU-review-r07",
+            "MU-review-r08",
+            "MU-review-r09",
+            "MU-review-r11",
+            "MU-review-r13"
+          ]
+        },
+        {
+          "rank": 10,
+          "unit_ids": [
+            "MU-paper-review-daily",
+            "MU-paper-review-noon"
+          ]
+        }
+      ],
+      "within_wave_order": "operator_approval_required",
+      "unranked_unit_ids": [
+        "MU-account-mode",
+        "MU-analyst",
+        "MU-announcement",
+        "MU-auction-volume",
+        "MU-block-confirm",
+        "MU-cli-chain",
+        "MU-cli-replay-force",
+        "MU-close-call",
+        "MU-d01",
+        "MU-data-mode",
+        "MU-earnings-beat",
+        "MU-earnings-miss",
+        "MU-fixed-fill",
+        "MU-fixed-order",
+        "MU-frozen-side",
+        "MU-holding-plan",
+        "MU-industry-intraday",
+        "MU-ipo-catalyst",
+        "MU-news-ai",
+        "MU-news-catalyst",
+        "MU-news-flash-aggregate",
+        "MU-order-alert",
+        "MU-p01",
+        "MU-paper-sell",
+        "MU-paper-trade",
+        "MU-review-r03-auto",
+        "MU-review-r03-manual",
+        "MU-review-r03-stored-recovery",
+        "MU-sector-anomaly",
+        "MU-sector-top",
+        "MU-snapshot-stale",
+        "MU-st-price",
+        "MU-t0",
+        "MU-virtual-watch"
+      ],
+      "first_batch_unit_ids": [
+        "MU-chain-post-close",
+        "MU-chain-preopen",
+        "MU-cli-single",
+        "MU-cli-summary"
+      ],
+      "first_batch_sessions": 10
+    }
+  },
+  "foundation_work_packages": [
+    {
+      "id": "W01",
+      "name": "身份、业务日、occurrence 与 source-contract 基础合同",
+      "scope": "身份、业务日、occurrence 与 source-contract 基础合同的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 20,
+      "pert_hours": 12.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W01-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "同日期不同source-contract不能合并；重启及generation变化不改变 occurrence。"
+          }
+        ]
+      },
+      "rationale": "身份碰撞与跨业务日回放"
+    },
+    {
+      "id": "W02",
+      "name": "应用 DeliveryResult 与现有 durable 类型适配",
+      "scope": "应用 DeliveryResult 与现有 durable 类型适配的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 16,
+      "pert_hours": 10.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W02-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "BestEffort/Partial/NoChannel不得构造强终态，十四种durable状态逐一投影。"
+          }
+        ]
+      },
+      "rationale": "弱结果误升格"
+    },
+    {
+      "id": "W03",
+      "name": "CompletionPolicy、ReasonCode 与 RetryPolicy",
+      "scope": "CompletionPolicy、ReasonCode 与 RetryPolicy的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01",
+        "W02"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 22,
+      "pert_hours": 13.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W03-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "NoData/Disabled/Uncertain分别判定调度、通知游标与人工处置；退避保留typed reason。"
+          }
+        ]
+      },
+      "rationale": "错误游标和盲重试"
+    },
+    {
+      "id": "W04",
+      "name": "RunContext 与 PreparedFacts 单次取数",
+      "scope": "RunContext 与 PreparedFacts 单次取数的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01",
+        "W03"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 18,
+      "pert_hours": 11.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W04-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "old/new共享同一PreparedFacts与捕获模型输出，第二次外部采集有拒绝计数。"
+          }
+        ]
+      },
+      "rationale": "重复provider与模型计算"
+    },
+    {
+      "id": "W05",
+      "name": "SemanticProjection、PreparedPush 与 exact bytes 绑定",
+      "scope": "SemanticProjection、PreparedPush 与 exact bytes 绑定的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W02",
+        "W04"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 19,
+      "pert_hours": 12.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W05-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "同facts重建语义hash相同；首次渲染字节封存，重放不重新渲染。"
+          }
+        ]
+      },
+      "rationale": "语义与字节漂移"
+    },
+    {
+      "id": "W06",
+      "name": "catalog/Unit/completion-owner 运行时注册表",
+      "scope": "catalog/Unit/completion-owner 运行时注册表的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01",
+        "W03"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 13,
+      "pert_hours": 8.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W06-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "65 kind/102 producer/52 Unit双向闭合，枚举外入口保留独立注册。"
+          }
+        ]
+      },
+      "rationale": "共享owner被拆分"
+    },
+    {
+      "id": "W07",
+      "name": "business intent schema 与迁移",
+      "scope": "business intent schema 与迁移的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01",
+        "W03",
+        "W06"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 9,
+      "most_likely_hours": 15,
+      "pessimistic_hours": 24,
+      "pert_hours": 15.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W07-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "DDL重复应用不改原字节，拒绝版本冲突且保留原库与非终态事实。"
+          }
+        ]
+      },
+      "rationale": "持久身份与兼容性"
+    },
+    {
+      "id": "W08",
+      "name": "append-only transition/outbox",
+      "scope": "append-only transition/outbox的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W07"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 14,
+      "pessimistic_hours": 23,
+      "pert_hours": 14.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W08-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "每个intent版本连续且前驱hash相连，commit和outbox之间逐边界崩溃可恢复。"
+          }
+        ]
+      },
+      "rationale": "事件丢失与伪原子事务"
+    },
+    {
+      "id": "W09",
+      "name": "VerifiedTerminalRef 构造与重验证",
+      "scope": "VerifiedTerminalRef 构造与重验证的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W02",
+        "W05",
+        "W08"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 21,
+      "pert_hours": 13.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W09-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "构造和finalize时重验authority/decision/bytes/subject全部绑定，弱audit永不冒充receipt。"
+          }
+        ]
+      },
+      "rationale": "错绑定外部receipt"
+    },
+    {
+      "id": "W10",
+      "name": "通用 finalizer 与业务 CAS",
+      "scope": "通用 finalizer 与业务 CAS的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W03",
+        "W08",
+        "W09"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 10,
+      "most_likely_hours": 16,
+      "pessimistic_hours": 26,
+      "pert_hours": 16.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W10-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "CAS冲突进入ResolutionRequired；Accepted不可撤销，重复finalize只推进一次。"
+          }
+        ]
+      },
+      "rationale": "外部已接受后业务冲突"
+    },
+    {
+      "id": "W11",
+      "name": "reconciler、lease/fence 与启动恢复",
+      "scope": "reconciler、lease/fence 与启动恢复的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W08",
+        "W09",
+        "W10"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 10,
+      "most_likely_hours": 17,
+      "pessimistic_hours": 28,
+      "pert_hours": 17.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W11-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "恢复所有原业务日既存intent；过期lease重取fence，Uncertain不得盲重发。"
+          }
+        ]
+      },
+      "rationale": "启动跨日恢复和旧owner重发"
+    },
+    {
+      "id": "W12",
+      "name": "transport authority port 与通用 adapter",
+      "scope": "transport authority port 与通用 adapter的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W02",
+        "W05",
+        "W09"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 20,
+      "pert_hours": 12.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W12-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "逐required channel记录typed结果；Partial拒绝游标，强receipt保留exact bytes。"
+          }
+        ]
+      },
+      "rationale": "渠道结果不完整"
+    },
+    {
+      "id": "W13",
+      "name": "P01/N02 专用 conformance adapter",
+      "scope": "P01/N02 专用 conformance adapter的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W03",
+        "W09",
+        "W12"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 9,
+      "most_likely_hours": 14,
+      "pessimistic_hours": 25,
+      "pert_hours": 15,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W13-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "P01同日claim不分render-mode；N02 accepted-window独立于N01 critical quota。"
+          }
+        ]
+      },
+      "rationale": "专用authority与通用claim混淆"
+    },
+    {
+      "id": "W14",
+      "name": "PhaseScheduler 与 occurrence catch-up",
+      "scope": "PhaseScheduler 与 occurrence catch-up的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W01",
+        "W03",
+        "W06",
+        "W11"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 22,
+      "pert_hours": 13.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W14-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "窗口半开区间和原业务日catch-up可回放；closed occurrence不可重开。"
+          }
+        ]
+      },
+      "rationale": "错过窗口与非交易日触发"
+    },
+    {
+      "id": "W15",
+      "name": "readiness/operational snapshot 与 deploy probe",
+      "scope": "readiness/operational snapshot 与 deploy probe的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W06",
+        "W11",
+        "W14"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 17,
+      "pert_hours": 10.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W15-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "Core/Producer/Occurrence依赖缺失分别判级，恢复事件绑定前后snapshot及依赖版本。"
+          }
+        ]
+      },
+      "rationale": "日志冒充就绪"
+    },
+    {
+      "id": "W16",
+      "name": "activation manifest、generation CAS 与 owner fence",
+      "scope": "activation manifest、generation CAS 与 owner fence的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W06",
+        "W08",
+        "W11",
+        "W12"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 10,
+      "most_likely_hours": 16,
+      "pessimistic_hours": 27,
+      "pert_hours": 16.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W16-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "同事务验证全Unit当日journal和generation；legacy/new四类actor共同fence。"
+          }
+        ]
+      },
+      "rationale": "双owner与配额竞态"
+    },
+    {
+      "id": "W17",
+      "name": "shadow harness 与 typed diff",
+      "scope": "shadow harness 与 typed diff的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W04",
+        "W05",
+        "W12",
+        "W16"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 19,
+      "pert_hours": 11.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W17-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "exact typed diff只排除attempt/latency/diagnostic time；八副作用端口证明零调用。"
+          }
+        ]
+      },
+      "rationale": "隐式副作用与过宽排除"
+    },
+    {
+      "id": "W18",
+      "name": "operator inspect/reconcile/resolve/promote/rollback",
+      "scope": "operator inspect/reconcile/resolve/promote/rollback的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W10",
+        "W11",
+        "W15",
+        "W16"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 9,
+      "most_likely_hours": 15,
+      "pessimistic_hours": 25,
+      "pert_hours": 15.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W18-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "dry-run/refusal不写DB/journal；SingleControl允许认证一人，外部DualControl不得降级。"
+          }
+        ]
+      },
+      "rationale": "未经授权的人工处置"
+    },
+    {
+      "id": "W19",
+      "name": "指标、SLA、保留期与安全审计",
+      "scope": "指标、SLA、保留期与安全审计的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W08",
+        "W10",
+        "W15"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W19-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "Accepted两周期目标/五分钟上限；未决永不自动删，监管审计严格大于五年。"
+          }
+        ]
+      },
+      "rationale": "长期未决与错误清理"
+    },
+    {
+      "id": "W20",
+      "name": "fault/replay/dedup/rollback 回归 harness",
+      "scope": "fault/replay/dedup/rollback 回归 harness的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W11",
+        "W13",
+        "W14",
+        "W17",
+        "W18",
+        "W19"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 10,
+      "most_likely_hours": 17,
+      "pessimistic_hours": 29,
+      "pert_hours": 17.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W20-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "测试namespace覆盖七步崩溃、拒绝/不确定、rollback；PaperBuy/Watchdog仅nonbaseline回放。"
+          }
+        ]
+      },
+      "rationale": "故障覆盖与非基线误用"
+    },
+    {
+      "id": "W21",
+      "name": "发布编排、N/N-1 兼容和逐 Unit/tail-cleanup 门禁工具",
+      "scope": "发布编排、N/N-1 兼容和逐 Unit/tail-cleanup 门禁工具的实现、评审与修复；不含逐Unit cutover。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "Q:62",
+        "Q:102"
+      ],
+      "dependencies": [
+        "W16",
+        "W18",
+        "W19",
+        "W20"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 17,
+      "pert_hours": 10.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "工程工作按8小时工作日；外部批准不计入工时。"
+      ],
+      "acceptance_gates": {
+        "shared": [],
+        "specific": [
+          {
+            "id": "W21-contract",
+            "producer_ids": [],
+            "requirements": [],
+            "statement": "只交付编排/门禁工具；逐Unit cutover和tail cleanup人工工时在Unit行，90天及更严留存另等。"
+          }
+        ]
+      },
+      "rationale": "发布工具越权和清理越界"
+    }
+  ],
+  "migration_units": [
+    {
+      "id": "MU-announcement",
+      "name": "公告路由",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-announcement",
+        "producer:news-announcement",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 5,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 16,
+      "pert_hours": 9.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "公告到达窗口，跨日source-id重现",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-announcement-owner",
+            "producer_ids": [
+              "news-announcement"
+            ],
+            "requirements": [],
+            "statement": "source/external_id与observed_date需稳定绑定，claim释放后崩溃回放不得重复公告，L4不能替代receipt。"
+          }
+        ]
+      },
+      "rationale": "两层非原子claim与L4拆开故障覆盖",
+      "completion_owner": "news_dedup.key=annroute:{observed_date}:{source}:{external_id}；独立 L4(announcement,source_fact_event_id,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "news-announcement"
+      ],
+      "catalog_unit_sha256": "9902e0d2725c97f50d26250447c361fbaf278b45f113157bd3560ce70f515fc2",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-p01",
+      "name": "盘前新闻P01",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-p01",
+        "producer:p01-scheduled",
+        "producer:p01-compensation",
+        "producer:startup-resume-preopen-news-hot",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W13",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 21,
+      "pert_hours": 12.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "交易日盘前及补偿窗口",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-p01-owner",
+            "producer_ids": [
+              "p01-compensation",
+              "p01-scheduled",
+              "startup-resume-preopen-news-hot"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "scheduler与compensation同business-date claim；render mode变化不增claim；原P01 envelope重验accepted绑定。"
+          },
+          {
+            "id": "MU-p01-startup",
+            "producer_ids": [
+              "startup-resume-preopen-news-hot"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "盘前新闻P01：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "专用authority和补偿/恢复三入口共同封口",
+      "completion_owner": "business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}",
+      "phase_epics": [
+        "盘前"
+      ],
+      "producer_ids": [
+        "p01-compensation",
+        "p01-scheduled",
+        "startup-resume-preopen-news-hot"
+      ],
+      "catalog_unit_sha256": "973018c0000cf29fec4af83d629c9026672d440d810d0144ccb55cef69e351bf",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-d01",
+      "name": "公告选股D01",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-d01",
+        "producer:d01-announcement",
+        "producer:d01-manual",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 15,
+      "pert_hours": 8.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "公告触发与显式manual窗口",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-d01-owner",
+            "producer_ids": [
+              "d01-announcement",
+              "d01-manual"
+            ],
+            "requirements": [],
+            "statement": "公告与manual同code:name memo，空code的PerTicket确无L4冷却，banner拒绝不得推进memo。"
+          }
+        ]
+      },
+      "rationale": "不能把不存在的L4 owner实现为新增去重权限",
+      "completion_owner": "D01_LAST_PUSH[code:name]；COOLDOWN_TABLE(NewsToIdea,空 code)；L4 无冷却（PerTicket 缺 code）",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "d01-announcement",
+        "d01-manual"
+      ],
+      "catalog_unit_sha256": "dc3b9e522c6ce52bb5ee0d96de577837929aed44d33d03a36329be53219aa1ff",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-news-catalyst",
+      "name": "新闻催化I02",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-news-catalyst",
+        "producer:catalyst-announcement",
+        "producer:catalyst-manual",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 12,
+      "pert_hours": 7.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "公告eligible session与manual",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-news-catalyst-owner",
+            "producer_ids": [
+              "catalyst-announcement",
+              "catalyst-manual"
+            ],
+            "requirements": [],
+            "statement": "I02空code模板/L4冷却独立于D01 memo；manual失败不消耗新公告完成资格。"
+          }
+        ]
+      },
+      "rationale": "共享下游冷却的两入口需要独立触发回放",
+      "completion_owner": "L4(news_catalyst,空 code,空 sub_kind)；模板 COOLDOWN_TABLE(NewsCatalyst,空 code)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "catalyst-announcement",
+        "catalyst-manual"
+      ],
+      "catalog_unit_sha256": "949b777a3f783077f464d31c059d54094a08ab80aaea656d5029bce203411081",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-news-ai",
+      "name": "NewsAI业务通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-news-ai",
+        "producer:news-ai-same-tick",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 9,
+      "most_likely_hours": 15,
+      "pessimistic_hours": 26,
+      "pert_hours": 15.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "同tick及跨batch eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-news-ai-owner",
+            "producer_ids": [
+              "news-ai-same-tick"
+            ],
+            "requirements": [],
+            "statement": "F03跨batch相同事实不新增通知；目标/受众/业务日及有效修订分别验证；保留assessment/delivery/prediction链。"
+          }
+        ]
+      },
+      "rationale": "近期样本优先预修复；batch是lineage，不能为降消息数抹掉修订",
+      "completion_owner": "news_ai_delivery_event(delivery_identity_sha256=assessment_id,reservation,state)；assessment=provider+batch_id+item_id+target_code+analysis_version hash",
+      "phase_epics": [
+        "盘中",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "news-ai-same-tick"
+      ],
+      "catalog_unit_sha256": "896064314d797194f4135082a98cc4a92ba4a3dbc75fdbd5431727a04eafbb86",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-news-flash-aggregate",
+      "name": "N02新闻聚合窗口",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-news-flash-aggregate",
+        "producer:news-flash-aggregate",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W13",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 23,
+      "pert_hours": 13.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "每个聚合窗口完整session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-news-flash-aggregate-owner",
+            "producer_ids": [
+              "news-flash-aggregate"
+            ],
+            "requirements": [],
+            "statement": "F01/F10 receipt accepted_at与source analytics time分开；window reservation/attempt匹配，N01 critical quota不得借此激活。"
+          }
+        ]
+      },
+      "rationale": "专用accepted-window authority需窗口失败/恢复证明",
+      "completion_owner": "NewsFlash authority accepted-window(business_date,window) / window_state[index]；reservation_identity_sha256+attempt_ordinal",
+      "phase_epics": [
+        "盘中",
+        "盘后"
+      ],
+      "producer_ids": [
+        "news-flash-aggregate"
+      ],
+      "catalog_unit_sha256": "f18feb9c210232349e986b911e1ea363c94777b1defc1ed395fbdb8e7c76d072",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-earnings-beat",
+      "name": "业绩超预期OPT-IN",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-earnings-beat",
+        "producer:earnings-beat",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 3,
+      "most_likely_hours": 6,
+      "pessimistic_hours": 10,
+      "pert_hours": 6.17,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "未启用时仅测试隔离conformance，启用另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-earnings-beat-owner",
+            "producer_ids": [
+              "earnings-beat"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "Beat保持OPT-IN未激活；缺分类配置/来源依赖可见，零消息不是通过；正向event.kind不得完成Miss。"
+          }
+        ]
+      },
+      "rationale": "provider后配置门不授权自动开启功能",
+      "completion_owner": "L4(earnings_beat,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "earnings-beat"
+      ],
+      "catalog_unit_sha256": "ffb0284b313b642e0ffc8e2ac20e47480d10b16d201efb7c7f54508883431834",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-earnings-miss",
+      "name": "业绩低预期OPT-IN",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-earnings-miss",
+        "producer:earnings-miss",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 3,
+      "most_likely_hours": 5,
+      "pessimistic_hours": 9,
+      "pert_hours": 5.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "负向报告样本回放，启用另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-earnings-miss-owner",
+            "producer_ids": [
+              "earnings-miss"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "Miss保持OPT-IN未激活；缺配置/来源依赖可见，零消息不是通过；负向分类独立Beat并保留report_date。"
+          }
+        ]
+      },
+      "rationale": "共享earnings轮询不构成共享通知owner",
+      "completion_owner": "L4(earnings_miss,source_fact_event_id(earnings:{code}:{report_date}),空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "earnings-miss"
+      ],
+      "catalog_unit_sha256": "6261c1595dbc226fd1371026ad1a13e0610d79ed672d13104417b79420aa9066",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-analyst",
+      "name": "分析师上调",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-analyst",
+        "producer:analyst-upgrade",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 13,
+      "pert_hours": 7.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "研报自然到达或批准灰盒",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-analyst-owner",
+            "producer_ids": [
+              "analyst-upgrade"
+            ],
+            "requirements": [],
+            "statement": "code+broker+report_id稳定事件identity；AnalystStateStore观察推进不等于L4通知Accepted。"
+          }
+        ]
+      },
+      "rationale": "经纪商维度与报告修订的过度去重风险",
+      "completion_owner": "L4(analyst_upgrade,source_fact_event_id(analyst:{code}:{broker}:{report_id}),空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "analyst-upgrade"
+      ],
+      "catalog_unit_sha256": "b8d35b3cdb814a0aec8195e0ff8879cb57279a30a808bb94204dd07dde52653d",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-auction-volume",
+      "name": "竞价放量",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-auction-volume",
+        "producer:auction-volume",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "集合竞价完整eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-auction-volume-owner",
+            "producer_ids": [
+              "auction-volume"
+            ],
+            "requirements": [],
+            "statement": "外层new_items与dispatcher snapshot.items须同批绑定；逐票有限正价格/量比，失败不得insert通知set。"
+          }
+        ]
+      },
+      "rationale": "两次读取股票集合可能不一致，先修PreparedFacts",
+      "completion_owner": "monitor_loop.auction_vol_notified[session,code]；独立 L4(auction_volume,空 code,空 sub_kind)",
+      "phase_epics": [
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "auction-volume"
+      ],
+      "catalog_unit_sha256": "4744895bba638a1295b300003568ec2576d9838283da63e267945a238c7ef19d",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-auction-candidates",
+      "name": "竞价候选主卡与失效",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-auction-candidates",
+        "producer:auction-repush",
+        "producer:candidate-board",
+        "producer:candidate-invalidated",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 14,
+      "pessimistic_hours": 24,
+      "pert_hours": 14.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "集合竞价主卡及后续失效session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-auction-candidates-owner",
+            "producer_ids": [
+              "auction-repush",
+              "candidate-board",
+              "candidate-invalidated"
+            ],
+            "requirements": [],
+            "statement": "A02/主卡/失效共双bool和末尾code快照推进链；部分失败不提前持久快照，三kind独立receipt可追踪。"
+          }
+        ]
+      },
+      "rationale": "Q44 rank7按真实共享推进链迁移，不能按三kind拆owner",
+      "completion_owner": "monitor_loop.post_close_candidates_notified[session]；candidate_board_snapshot[{date}].jsonl 最末 code 集（双层非原子推进链）",
+      "phase_epics": [
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "auction-repush",
+        "candidate-board",
+        "candidate-invalidated"
+      ],
+      "catalog_unit_sha256": "5725bd51f9b8178e8988353b39e2e1d09ea862a10403498df569e58192467c5c",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 7,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-virtual-watch",
+      "name": "虚拟观察STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-virtual-watch",
+        "producer:virtual-watch-pilot",
+        "producer:virtual-watch-confirm",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 12,
+      "pert_hours": 7.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "隔离pilot/confirm样本，来源恢复另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-virtual-watch-owner",
+            "producer_ids": [
+              "virtual-watch-confirm",
+              "virtual-watch-pilot"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED未激活；空post_close/vector依赖缺失可见，零消息不是通过；confirm补价不得改变pilot资格来伪造成功。"
+          }
+        ]
+      },
+      "rationale": "业务vector和snapshot并非通知完成状态",
+      "completion_owner": "L4(virtual_watch,空 code,空 sub_kind)；共享 monitor_loop.virtual_observation vector / virtual_snapshot_persisted[session]",
+      "phase_epics": [
+        "盘中",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "virtual-watch-confirm",
+        "virtual-watch-pilot"
+      ],
+      "catalog_unit_sha256": "99a6deef2592d3119027d1e59e6ab5471886be070d997504bb00a13a00e5cb68",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-paper-trade",
+      "name": "模拟交易终态通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-paper-trade",
+        "producer:paper-trade-terminal",
+        "producer:startup-resume-paper-trade",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 8,
+      "most_likely_hours": 14,
+      "pessimistic_hours": 25,
+      "pert_hours": 14.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "交易终态出现后至少两eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-paper-trade-owner",
+            "producer_ids": [
+              "paper-trade-terminal",
+              "startup-resume-paper-trade"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "PaperTradeTerminalBindingV1 terminal_transition_id与通知decision绑定；回放只恢复通知不再成交，不与PaperSell code/day/Filled合并。"
+          },
+          {
+            "id": "MU-paper-trade-startup",
+            "producer_ids": [
+              "startup-resume-paper-trade"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "模拟交易终态通知：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "业务副作用需成交事实与通知崩溃分别追踪",
+      "completion_owner": "counted decision(PaperTrade,Ticket,terminal_transition_id,source fingerprint,subject,policy,rendered hash)",
+      "phase_epics": [
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "paper-trade-terminal",
+        "startup-resume-paper-trade"
+      ],
+      "catalog_unit_sha256": "db43f13207c8ff2d4655384ffa4731aec8885dc1d048ef5beb309de016a35051",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-limit-boards",
+      "name": "连板三展示形态",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-limit-boards",
+        "producer:limit-boards-first",
+        "producer:limit-boards-second",
+        "producer:limit-boards-third-plus",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 5,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 17,
+      "pert_hours": 9.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "盘中连板变化完整session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-limit-boards-owner",
+            "producer_ids": [
+              "limit-boards-first",
+              "limit-boards-second",
+              "limit-boards-third-plus"
+            ],
+            "requirements": [],
+            "statement": "first/second/third-plus共享code set；发送前insert的故障不得永久吞票；token不制造子类dedup identity。"
+          }
+        ]
+      },
+      "rationale": "rank8需要反证共享空code冷却吞掉其他票",
+      "completion_owner": "monitor_loop.board_notified[session,code]；L4(limit_boards,空 code,空 sub_kind)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "limit-boards-first",
+        "limit-boards-second",
+        "limit-boards-third-plus"
+      ],
+      "catalog_unit_sha256": "1b14ee102bfe471333ceef536e63de838cda2ed5bcbdbf21974a3558398e1848",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 8,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-holding-plan",
+      "name": "持仓计划",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-holding-plan",
+        "producer:holding-plan-periodic",
+        "producer:holding-plan-manual",
+        "producer:startup-resume-holding-plan",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 20,
+      "pert_hours": 11.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "持仓发生及定时扫描session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-holding-plan-owner",
+            "producer_ids": [
+              "holding-plan-manual",
+              "holding-plan-periodic",
+              "startup-resume-holding-plan"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "定时/manual同holding-plan:date:code只有source/rendered hash一致才同decision；修订计划不可被日级展示名压掉。"
+          },
+          {
+            "id": "MU-holding-plan-startup",
+            "producer_ids": [
+              "startup-resume-holding-plan"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "持仓计划：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "多入口与immutable binding组合需要修订样本",
+      "completion_owner": "counted decision(HoldingPlan,Ticket,holding-plan:{date}:{code},source fingerprint,subject,policy,rendered hash)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "holding-plan-manual",
+        "holding-plan-periodic",
+        "startup-resume-holding-plan"
+      ],
+      "catalog_unit_sha256": "e7b8832319b67e4aa899f882895f3a92205c8427c6cd5c1fcf9f1ae50156b3c9",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-t0",
+      "name": "T0建议",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-t0",
+        "producer:t0-advice",
+        "producer:startup-resume-t0-advice",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 8,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 22,
+      "pert_hours": 13,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "T0 eligible时段至少两session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-t0-owner",
+            "producer_ids": [
+              "startup-resume-t0-advice",
+              "t0-advice"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "T0PlanDecisionBindingV1 canonical decision与HoldingPlan独立；last_t0_scan不是完成游标；建议恢复不可重下单。"
+          },
+          {
+            "id": "MU-t0-startup",
+            "producer_ids": [
+              "startup-resume-t0-advice"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "T0建议：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "交易建议identity专用，错误重放有业务风险",
+      "completion_owner": "counted decision(T0Advice,Ticket,T0PlanDecisionBindingV1.decision_id(),source fingerprint,subject,policy,rendered hash)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "startup-resume-t0-advice",
+        "t0-advice"
+      ],
+      "catalog_unit_sha256": "a3281d95ce7fb9e63b5fd57b94122e6498622e5eb6b166db1b6e790c0c9629d1",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-close-call",
+      "name": "尾盘操作提醒",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-close-call",
+        "producer:close-call",
+        "producer:startup-resume-close-call",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "尾盘窗口与次日startup回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-close-call-owner",
+            "producer_ids": [
+              "close-call",
+              "startup-resume-close-call"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "close-call:date:code绑定原decision；close_call_pushed不替代receipt；窗口过期后只恢复既存发送事实。"
+          },
+          {
+            "id": "MU-close-call-startup",
+            "producer_ids": [
+              "startup-resume-close-call"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "尾盘操作提醒：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "外层bool和durable计数不能互相覆盖",
+      "completion_owner": "counted decision(CloseCall,Ticket,close-call:{date}:{code},source fingerprint,subject,policy,rendered hash)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "close-call",
+        "startup-resume-close-call"
+      ],
+      "catalog_unit_sha256": "8acc5a1f5cdedf6fe69ad401a5e2b43e4c7ffcc4bbc3c040999328643d467299",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-industry-intraday",
+      "name": "盘中产业链I03",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-industry-intraday",
+        "producer:industry-chain-periodic",
+        "producer:industry-chain-manual",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 14,
+      "pert_hours": 8.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "盘中周期与manual自然occurrence",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-industry-intraday-owner",
+            "producer_ids": [
+              "industry-chain-manual",
+              "industry-chain-periodic"
+            ],
+            "requirements": [],
+            "statement": "periodic/manual共享I03空code冷却；last_industry_chain_intraday仅调度，不能共享R03或enum外chain的完成。"
+          }
+        ]
+      },
+      "rationale": "同业务分析名称涉及三个不同owner家族",
+      "completion_owner": "L4(industry_chain_intraday,空 code,空 sub_kind)；COOLDOWN_TABLE(IndustryChainIntraday,空 code)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "industry-chain-manual",
+        "industry-chain-periodic"
+      ],
+      "catalog_unit_sha256": "bddd8edca0d370ff23b34d00d4c4c8464e6198517da01e7fd94362e179822dfb",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-intraday-market",
+      "name": "盘中市场与15:05快照",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-intraday-market",
+        "producer:market-view-periodic",
+        "producer:market-snapshot-warning",
+        "producer:market-preopen-probe",
+        "producer:market-manual-i01",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 23,
+      "pert_hours": 13.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "15:05窗口及另外三入口独立回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-intraday-market-owner",
+            "producer_ids": [
+              "market-manual-i01",
+              "market-preopen-probe",
+              "market-snapshot-warning",
+              "market-view-periodic"
+            ],
+            "requirements": [],
+            "statement": "15:05 SNAP_REMIND_LAST与market view/preopen probe/manual外门分别保留；共享空code冷却不应让一次bool替四入口封日。"
+          }
+        ]
+      },
+      "rationale": "rank6按catalog整体owner而非只切一条producer",
+      "completion_owner": "L4(intraday_market,空 code,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "market-manual-i01",
+        "market-preopen-probe",
+        "market-snapshot-warning",
+        "market-view-periodic"
+      ],
+      "catalog_unit_sha256": "c5b00d9ee00a79dc9764b6d2190c5bb58d91e79c1ac250c7c548ea14f958cdd5",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 6,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-sector-top",
+      "name": "强势板块",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-sector-top",
+        "producer:sector-top",
+        "producer:startup-resume-sector-top",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 16,
+      "pert_hours": 9.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "每日一次自然板块occurrence",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-sector-top-owner",
+            "producer_ids": [
+              "sector-top",
+              "startup-resume-sector-top"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "SectorTop日claim只对自身kind完成；last_sector_top和coordinator budget分别验证，不能吞SectorAnomaly。"
+          },
+          {
+            "id": "MU-sector-top-startup",
+            "producer_ids": [
+              "startup-resume-sector-top"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "强势板块：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "共享coordinator不足以共享claim",
+      "completion_owner": "business_date_once_claims(business_date,SectorTop,None,GLOBAL) → immutable decision / occurrence=sector-top:{date}",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "sector-top",
+        "startup-resume-sector-top"
+      ],
+      "catalog_unit_sha256": "464dd154ba3a3ed4cbdc8b387a7c40aba56c03f741db19fd11fbdeab5e4b11f8",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-sector-anomaly",
+      "name": "板块异动",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-sector-anomaly",
+        "producer:sector-anomaly",
+        "producer:startup-resume-sector-anomaly",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 17,
+      "pert_hours": 10.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "异动eligible session与日边界",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-sector-anomaly-owner",
+            "producer_ids": [
+              "sector-anomaly",
+              "startup-resume-sector-anomaly"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "SectorAnomaly异动source绑定自身日claim；外last_sector_anomaly失败保留重试，恢复不借SectorTop receipt。"
+          },
+          {
+            "id": "MU-sector-anomaly-startup",
+            "producer_ids": [
+              "startup-resume-sector-anomaly"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "板块异动：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "板块内容修订和独立预算分支需对照",
+      "completion_owner": "business_date_once_claims(business_date,SectorAnomaly,None,GLOBAL) → immutable decision / occurrence=sector-anomaly:{date}",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "sector-anomaly",
+        "startup-resume-sector-anomaly"
+      ],
+      "catalog_unit_sha256": "fbc8da70ee1cf01acc5fd4ebfa38cce98cca09107ba689150ad8075405b5808c",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-data-mode",
+      "name": "数据模式通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-data-mode",
+        "producer:data-mode",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 7,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 20,
+      "pert_hours": 12.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "模式稳定窗口及不安全heartbeat两session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-data-mode-owner",
+            "producer_ids": [
+              "data-mode"
+            ],
+            "requirements": [],
+            "statement": "LATEST/PENDING_STABLE/UNSAFE_REMINDER三个状态分开；heartbeat更新绝不伪造external_confirmed_at，fingerprint变化保留新资格。"
+          }
+        ]
+      },
+      "rationale": "健康事件误确认会隐藏来源故障",
+      "completion_owner": "LATEST_DATA_MODE；DATA_MODE_PENDING_STABLE(mode,since)；DATA_MODE_UNSAFE_REMINDER(fingerprint,external_confirmed_at,heartbeat_at)",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "data-mode"
+      ],
+      "catalog_unit_sha256": "10df8726c0af15198e568396b906a806bd230647ff1b148997185fe3e6c24736",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-account-mode",
+      "name": "账户模式主通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-account-mode",
+        "producer:account-mode-main",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 7,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 19,
+      "pert_hours": 11.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "账户模式变化后两eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-account-mode-owner",
+            "producer_ids": [
+              "account-mode-main"
+            ],
+            "requirements": [],
+            "statement": "同模式未确认复用log_id；account_mode_log.pushed须在typed receipt与最终banner刷新条件都满足后CAS。"
+          }
+        ]
+      },
+      "rationale": "主通知外部结果和hook/banner共同完成条件",
+      "completion_owner": "account_mode_log[log_id].pushed（同模式未确认复用 log_id）",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "account-mode-main"
+      ],
+      "catalog_unit_sha256": "2d4260eaa1cfd73f061f0b62140852edb65c3db40d4ad7d5115c69dc86e871ad",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-frozen-side",
+      "name": "Frozen副通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-frozen-side",
+        "producer:account-frozen-side",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 5,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 15,
+      "pert_hours": 9.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "Frozen事件两eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-frozen-side-owner",
+            "producer_ids": [
+              "account-frozen-side"
+            ],
+            "requirements": [],
+            "statement": "新account_mode_log只触发Frozen副推；主pushed不得完成FROZEN code独立L4通知，失败保留副推intent。"
+          }
+        ]
+      },
+      "rationale": "共享kind不能把主副通知合为一个receipt",
+      "completion_owner": "L4(market_action_alert,FROZEN,空 sub_kind)；触发资格来自 account_mode_log 新建事实，无副推持久确认列",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "account-frozen-side"
+      ],
+      "catalog_unit_sha256": "ab086af9985264e2d6444c483ed3d8777e37632768b74209f0ed313017e01ba9",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-order-alert",
+      "name": "订单变化通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-order-alert",
+        "producer:order-update-alert",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 24,
+      "pert_hours": 14,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "真实订单变化样本或授权灰盒，两session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-order-alert-owner",
+            "producer_ids": [
+              "order-update-alert"
+            ],
+            "requirements": [],
+            "statement": "EventBus seen(code,action,shares)先变更不应吞通知；订单revision绑定通知intent，重放不能提交或修改订单。"
+          }
+        ]
+      },
+      "rationale": "高风险业务状态先推进链需七步故障追踪",
+      "completion_owner": "MarketActionState.seen[code]=(action,shares)；L4(market_action_alert,code,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后"
+      ],
+      "producer_ids": [
+        "order-update-alert"
+      ],
+      "catalog_unit_sha256": "9b25b932fcc9df9b07cec62cdeca57917a508f7829fc1f321f9aa9cb6d0ba5ab",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-paper-sell",
+      "name": "模拟卖出通知",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-paper-sell",
+        "producer:paper-sell-intraday",
+        "producer:paper-sell-post-close",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 10,
+      "most_likely_hours": 16,
+      "pessimistic_hours": 28,
+      "pert_hours": 17,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "盘中/盘后卖出两eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-paper-sell-owner",
+            "producer_ids": [
+              "paper-sell-intraday",
+              "paper-sell-post-close"
+            ],
+            "requirements": [],
+            "statement": "F04的254条逐fill→intent追踪；部分通知失败恢复不得重跑模拟成交；分段latency不能用文件时间替Accepted时间。"
+          }
+        ]
+      },
+      "rationale": "近期优先回放但不改变Q44，Filled业务去重独立通知",
+      "completion_owner": "paper_trades(code,direction=sell,status=Filled,date(ts))；L4(paper_sell,code,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘后"
+      ],
+      "producer_ids": [
+        "paper-sell-intraday",
+        "paper-sell-post-close"
+      ],
+      "catalog_unit_sha256": "7b04f33d2d4f56b2bfefbc99f64dc8ed0919b146c81ba98a03b769afad7c3c52",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-snapshot-stale",
+      "name": "账户快照过期提醒",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-snapshot-stale",
+        "producer:snapshot-stale-startup",
+        "producer:snapshot-stale-timer",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 14,
+      "pert_hours": 8.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "启动与定时提醒跨交易日",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-snapshot-stale-owner",
+            "producer_ids": [
+              "snapshot-stale-startup",
+              "snapshot-stale-timer"
+            ],
+            "requirements": [],
+            "statement": "startup/timer共享SnapshotReminderGate today/in_flight/last_confirmed；拒绝释放预约，和持仓六小时警告分开。"
+          }
+        ]
+      },
+      "rationale": "同static函数预约恢复需要避免假confirmed",
+      "completion_owner": "check_snapshot_staleness_and_notify::LAST:SnapshotReminderGate(today,last_confirmed,in_flight)",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "snapshot-stale-startup",
+        "snapshot-stale-timer"
+      ],
+      "catalog_unit_sha256": "329470d64fb3428ea29b85fb601e1c33f0418e4fa236ac67df73155f7125f6fd",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-attribution-daily",
+      "name": "每日归因",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-attribution-daily",
+        "producer:attribution-daily",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "每日归因窗口及失败回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-attribution-daily-owner",
+            "producer_ids": [
+              "attribution-daily"
+            ],
+            "requirements": [],
+            "statement": "F05保存归因结果后sink失败只重用结果，不再调用LLM；ATTRIBUTION_LAST_RUN不得提前封日且不存在L4冷却owner。"
+          }
+        ]
+      },
+      "rationale": "rank4用独立通知cursor替分析成功bool",
+      "completion_owner": "monitor_loop::ATTRIBUTION_LAST_RUN[calendar_date]",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "attribution-daily"
+      ],
+      "catalog_unit_sha256": "83a1e47f85614639c578dc2958c0a15a32c2fc28f70aa6bfd2e6033801f6a955",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 4,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-g5b-attribution",
+      "name": "G5b归因",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-g5b-attribution",
+        "producer:g5b-attribution",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 21,
+      "pert_hours": 12.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "G5b日窗口与namespace隔离样本",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-g5b-attribution-owner",
+            "producer_ids": [
+              "g5b-attribution"
+            ],
+            "requirements": [],
+            "statement": "F02 test namespace在production provider/LLM/sink前拒绝；F05复用保存结果，G5B_LAST_RUN不因保存而封口。"
+          }
+        ]
+      },
+      "rationale": "rank5既需namespace拒绝又需无L4路径恢复",
+      "completion_owner": "monitor_loop::G5B_LAST_RUN[calendar_date]",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "g5b-attribution"
+      ],
+      "catalog_unit_sha256": "5fcd04a289eb3489191fd28eb110e59d9e113741e5152cd5fe88d1289530a26c",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 5,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-fixed-order",
+      "name": "盘后定价订单STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-fixed-order",
+        "producer:post-fixed-order",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 13,
+      "pert_hours": 7.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "仅隔离T14事件样本，源注册另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-fixed-order-owner",
+            "producer_ids": [
+              "post-fixed-order"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED未激活；TradeEventSource OnceLock未注册依赖可见，零消息不是通过；T14 900s timer不创造消费ack或订单。"
+          }
+        ]
+      },
+      "rationale": "无生产注册必须保留阻断事实",
+      "completion_owner": "monitor_loop.last_post_fixed_order[session]；L4(post_fixed_price_order,code,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘后"
+      ],
+      "producer_ids": [
+        "post-fixed-order"
+      ],
+      "catalog_unit_sha256": "97cb996100829fa02d754960a89842f5522a8bffac5fb623ba272870e7fcc127",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-fixed-fill",
+      "name": "盘后定价成交STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-fixed-fill",
+        "producer:post-fixed-fill",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 14,
+      "pert_hours": 8.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "仅隔离T15成交样本，源注册另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-fixed-fill-owner",
+            "producer_ids": [
+              "post-fixed-fill"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED未激活；T15来源依赖缺失可见，零消息不是通过；300s timer按fill事件独立校验，不借T14完成。"
+          }
+        ]
+      },
+      "rationale": "同缺源但成交事件identity/资格区别于订单",
+      "completion_owner": "monitor_loop.last_post_fixed_fill[session]；L4(post_fixed_price_fill,code,空 sub_kind)",
+      "phase_epics": [
+        "盘中",
+        "盘后"
+      ],
+      "producer_ids": [
+        "post-fixed-fill"
+      ],
+      "catalog_unit_sha256": "45d933a62d3868e45ec76db230ba27ae69fd299cb74c1f776d6070b75debea26",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-st-price",
+      "name": "ST价格限制批次",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-st-price",
+        "producer:st-price-limit-batch",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 17,
+      "pert_hours": 9.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "ST限制变化自然批次或授权灰盒",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-st-price-owner",
+            "producer_ids": [
+              "st-price-limit-batch"
+            ],
+            "requirements": [],
+            "statement": "零条Ok不能封st_price_pushed；部分逐票Accepted不回滚也不遮蔽失败票，code冷却与批次关闭分开。"
+          }
+        ]
+      },
+      "rationale": "外批次bool吞掉空数据和部分失败",
+      "completion_owner": "monitor_loop.st_price_pushed[session]；L4(st_price_limit_changed,code,空 sub_kind)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "st-price-limit-batch"
+      ],
+      "catalog_unit_sha256": "3e10a668bbfb29dbc716336e8e3d775a01c63e605f4c4f66a29ff8086b91d471",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-paper-review-noon",
+      "name": "午间PaperReview STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-paper-review-noon",
+        "producer:paper-review-noon",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 4,
+      "most_likely_hours": 6,
+      "pessimistic_hours": 11,
+      "pert_hours": 6.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "午间隔离conformance，来源恢复另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-paper-review-noon-owner",
+            "producer_ids": [
+              "paper-review-noon"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED未激活；today结构与来源缺依赖可见，零消息不是通过；NOON_SNAP_LAST不得因受阻bool封日，保留noon-code。"
+          }
+        ]
+      },
+      "rationale": "rank10 noon外门和daily实际code并非同owner",
+      "completion_owner": "monitor_loop::NOON_SNAP_LAST[calendar_date]；潜在模板/L4(PaperReview,noon-code,空 sub_kind)",
+      "phase_epics": [
+        "盘中"
+      ],
+      "producer_ids": [
+        "paper-review-noon"
+      ],
+      "catalog_unit_sha256": "945b17aa515e0191c6604ae0055064e1a91c48ee5b598123e3f8e01f7457441b",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": 10,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-review-r04",
+      "name": "R04龙虎榜复盘",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r04",
+        "producer:review-r04-auto",
+        "producer:review-r04-manual",
+        "producer:review-r04-backfill",
+        "producer:startup-resume-review-lhb",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 17,
+      "pert_hours": 10.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "盘后自然R04及历史业务日回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r04-owner",
+            "producer_ids": [
+              "review-r04-auto",
+              "review-r04-backfill",
+              "review-r04-manual",
+              "startup-resume-review-lhb"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R04 auto/manual/backfill同原日期ReviewLhb claim；先hydrate再due/attempt，终态Rejected不能标作Delivered。"
+          },
+          {
+            "id": "MU-review-r04-startup",
+            "producer_ids": [
+              "startup-resume-review-lhb"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R04龙虎榜复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "ReviewTask结果语义与同claim多入口结合",
+      "completion_owner": "business_date_once_claims(business_date,ReviewLhb,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R04)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r04-auto",
+        "review-r04-backfill",
+        "review-r04-manual",
+        "startup-resume-review-lhb"
+      ],
+      "catalog_unit_sha256": "cd5bf3bdd9de820950789aeb4610e33411811276f0007ee1f67d655086cc3efb",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r07",
+      "name": "R07明日观察",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r07",
+        "producer:review-r07-auto",
+        "producer:review-r07-manual",
+        "producer:review-r07-backfill",
+        "producer:startup-resume-tomorrow-watch",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 19,
+      "pert_hours": 11.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "盘后R07与历史补推样本",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r07-owner",
+            "producer_ids": [
+              "review-r07-auto",
+              "review-r07-backfill",
+              "review-r07-manual",
+              "startup-resume-tomorrow-watch"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "F01 08-31补08-28 TomorrowWatch保留08-28业务日与原decision；manual临时audit不得覆盖自动task state。"
+          },
+          {
+            "id": "MU-review-r07-startup",
+            "producer_ids": [
+              "startup-resume-tomorrow-watch"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R07明日观察：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "近期历史回放优先，发送日不能替原业务日",
+      "completion_owner": "business_date_once_claims(business_date,TomorrowWatch,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R07)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r07-auto",
+        "review-r07-backfill",
+        "review-r07-manual",
+        "startup-resume-tomorrow-watch"
+      ],
+      "catalog_unit_sha256": "3c6ba5e204dab31c199095c3ef33d3a49621729b36aee8414cf402910db24743",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r08",
+      "name": "R08事件日历",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r08",
+        "producer:review-r08-auto",
+        "producer:review-r08-manual",
+        "producer:review-r08-backfill",
+        "producer:startup-resume-event-calendar",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 8,
+      "most_likely_hours": 13,
+      "pessimistic_hours": 22,
+      "pert_hours": 13.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "事件来源能力恢复及盘后eligible窗口",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r08-owner",
+            "producer_ids": [
+              "review-r08-auto",
+              "review-r08-backfill",
+              "review-r08-manual",
+              "startup-resume-event-calendar"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "F08保留nonretryable证据直至能力恢复；CFFEX需求不删除，Rolling occurrence按原R08业务日恢复，不能靠字符串判断可重试。"
+          },
+          {
+            "id": "MU-review-r08-startup",
+            "producer_ids": [
+              "startup-resume-event-calendar"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R08事件日历：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "固定source-contract故障与单次等待分开",
+      "completion_owner": "durable review occurrence(business_date,EventCalendar,None,GLOBAL,review_task_identity(date,R08)) → Rolling immutable decision",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r08-auto",
+        "review-r08-backfill",
+        "review-r08-manual",
+        "startup-resume-event-calendar"
+      ],
+      "catalog_unit_sha256": "3175fb884c35aaf43d8dd46950a53c30cf60891463416d5ffd20840f9be04f47",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r09",
+      "name": "R09供应商TopN",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r09",
+        "producer:review-r09-auto",
+        "producer:review-r09-manual",
+        "producer:review-r09-backfill",
+        "producer:startup-resume-review-provider-top-n",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 16,
+      "pert_hours": 9.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "供应商数据到齐后的盘后occurrence",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r09-owner",
+            "producer_ids": [
+              "review-r09-auto",
+              "review-r09-backfill",
+              "review-r09-manual",
+              "startup-resume-review-provider-top-n"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "ReviewProviderTopN auto/manual/backfill共日claim；ExpectedWait/DeferredUntil按时间门复核，永久Failed终态不增通知Accepted。"
+          },
+          {
+            "id": "MU-review-r09-startup",
+            "producer_ids": [
+              "startup-resume-review-provider-top-n"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R09供应商TopN：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "来源迟到与业务结果终态的分支组合",
+      "completion_owner": "business_date_once_claims(business_date,ReviewProviderTopN,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R09)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r09-auto",
+        "review-r09-backfill",
+        "review-r09-manual",
+        "startup-resume-review-provider-top-n"
+      ],
+      "catalog_unit_sha256": "56e156d454d6b399d0e01bc9f92ba26fad986ed92f279cebec8c8719fafc5c53",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r11",
+      "name": "R11持仓复盘",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r11",
+        "producer:review-r11-auto",
+        "producer:review-r11-manual",
+        "producer:review-r11-backfill",
+        "producer:startup-resume-position-review",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 12,
+      "pessimistic_hours": 20,
+      "pert_hours": 12.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "盘后R11及两历史日期回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r11-owner",
+            "producer_ids": [
+              "review-r11-auto",
+              "review-r11-backfill",
+              "review-r11-manual",
+              "startup-resume-position-review"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "F01 08-31补08-26/08-28 PositionReview逐原日期绑定；新的持仓revision不改旧envelope，发送日期不冒充business_date。"
+          },
+          {
+            "id": "MU-review-r11-startup",
+            "producer_ids": [
+              "startup-resume-position-review"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R11持仓复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "多业务日样本要求逐intent而非单发送日统计",
+      "completion_owner": "business_date_once_claims(business_date,PositionReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R11)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r11-auto",
+        "review-r11-backfill",
+        "review-r11-manual",
+        "startup-resume-position-review"
+      ],
+      "catalog_unit_sha256": "bbe650096450cb78c65a46efd74eb14918ca8e5c74b38172869e7896afbf5c37",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r13",
+      "name": "R13观察池跟踪",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r13",
+        "producer:review-r13-auto",
+        "producer:review-r13-manual",
+        "producer:review-r13-backfill",
+        "producer:startup-resume-watchlist-tracking",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "观察池有效输入的盘后窗口",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r13-owner",
+            "producer_ids": [
+              "review-r13-auto",
+              "review-r13-backfill",
+              "review-r13-manual",
+              "startup-resume-watchlist-tracking"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "WatchlistTracking原日期claim共享auto/manual/backfill；append audit后才commit task state，重试不再次推进watchlist outcome。"
+          },
+          {
+            "id": "MU-review-r13-startup",
+            "producer_ids": [
+              "startup-resume-watchlist-tracking"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R13观察池跟踪：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "业务outcome与通知游标双写需CAS故障覆盖",
+      "completion_owner": "business_date_once_claims(business_date,WatchlistTracking,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,R13)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r13-auto",
+        "review-r13-backfill",
+        "review-r13-manual",
+        "startup-resume-watchlist-tracking"
+      ],
+      "catalog_unit_sha256": "11589731da7bc5bf6282b46a42b22e8038ba7fd7326831363a722bfb2d3d039f",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-a10",
+      "name": "A10催化复盘",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-a10",
+        "producer:review-a10-auto",
+        "producer:review-a10-manual",
+        "producer:review-a10-backfill",
+        "producer:review-a10-push",
+        "producer:startup-resume-catalyst-review",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 7,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 18,
+      "pert_hours": 11.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "催化复盘eligible窗口及四入口回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-a10-owner",
+            "producer_ids": [
+              "review-a10-auto",
+              "review-a10-backfill",
+              "review-a10-manual",
+              "review-a10-push",
+              "startup-resume-catalyst-review"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "A10 auto/manual/backfill/--push四入口只在同immutable decision下hydrate；催化事件修订独立，新invocation audit不授权再次送达。"
+          },
+          {
+            "id": "MU-review-a10-startup",
+            "producer_ids": [
+              "startup-resume-catalyst-review"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "A10催化复盘：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "多一个显式push入口增加去重和审计分支",
+      "completion_owner": "business_date_once_claims(business_date,CatalystReview,None,GLOBAL) → immutable decision / occurrence=review_task_identity(date,A10)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-a10-auto",
+        "review-a10-backfill",
+        "review-a10-manual",
+        "review-a10-push",
+        "startup-resume-catalyst-review"
+      ],
+      "catalog_unit_sha256": "7b81df249f49b286dfb59444b26e429b5d8b73cc6c24db34eefc74036ec93c33",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 9,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r03-auto",
+      "name": "R03自动任务STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r03-auto",
+        "producer:review-r03-auto",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 4,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 14,
+      "pert_hours": 8.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "隔离账户合同缺口，来源恢复另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r03-auto-owner",
+            "producer_ids": [
+              "review-r03-auto"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED新claim未激活；LegacyAccountGate缺verified broker batch及同批trade-sync watermark可见，零消息不是通过；自动tasks[R03]只由核验旧decision hydrate。"
+          }
+        ]
+      },
+      "rationale": "F07固定缺口应ProducerUnready，不归咎用户快照或轮询",
+      "completion_owner": "post_session_review_scheduler::ReviewScheduleState(date).tasks[R03]",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r03-auto"
+      ],
+      "catalog_unit_sha256": "657e3873f935b219cd9ced22b179055c9ded8da2dab9de5d4e9ccf5e2c8d9cf3",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-review-r03-manual",
+      "name": "R03手动任务STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r03-manual",
+        "producer:review-r03-manual",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 12,
+      "pert_hours": 7.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 3,
+      "calendar_constraints": [
+        "仅manual拒绝/历史hydrate回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r03-manual-owner",
+            "producer_ids": [
+              "review-r03-manual"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED新claim未激活；账户批次/水位缺依赖可见，零消息不是通过；每invocation临时audit不能冒充auto task owner或创建新claim。"
+          }
+        ]
+      },
+      "rationale": "F07手动临时状态独立于auto，不合并潜在durable owner",
+      "completion_owner": "run_review_only::temporary audit_state(invocation,date).tasks[R03]",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "review-r03-manual"
+      ],
+      "catalog_unit_sha256": "917f69da6d89a475f93e583667cfe9a545cfb6b535ea53e07405a9f61ee868a7",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-paper-review-daily",
+      "name": "每日PaperReview STARVED",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-paper-review-daily",
+        "producer:paper-review-daily-auto",
+        "producer:paper-review-daily-manual",
+        "producer:paper-review-daily-push",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 5,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 16,
+      "pert_hours": 9.5,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "历史T+1隔离样本，生产激活另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-paper-review-daily-owner",
+            "producer_ids": [
+              "paper-review-daily-auto",
+              "paper-review-daily-manual",
+              "paper-review-daily-push"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass"
+            ],
+            "statement": "保持STARVED新链未激活；A01自产链缺依赖可见，零消息不是通过；合法exact已完成T+1历史记录可conformance，排除自动backfill并保留实际code。"
+          }
+        ]
+      },
+      "rationale": "rank10不能把daily/manual/--push误写成现成counted decision",
+      "completion_owner": "COOLDOWN_TABLE(PaperReview,code)；L4(paper_review,code,空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "paper-review-daily-auto",
+        "paper-review-daily-manual",
+        "paper-review-daily-push"
+      ],
+      "catalog_unit_sha256": "6a1bf7c5ecc9814cfa1412be8dfbb545854ddd0e30fe74ee4a4e057f33ee5034",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": 10,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    },
+    {
+      "id": "MU-block-confirm",
+      "name": "大宗交易逐条确认",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-block-confirm",
+        "producer:block-confirm-side-route",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 18,
+      "pert_hours": 10.67,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "交易记录自然出现及跨日回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-block-confirm-owner",
+            "producer_ids": [
+              "block-confirm-side-route"
+            ],
+            "requirements": [],
+            "statement": "逐真实交易记录/历史business_date identity，300s模板/L4只冷却；同票两记录分别receipt，不虚构ReviewTask或批次日门。"
+          }
+        ]
+      },
+      "rationale": "从两层冷却补真实逐条identity有设计风险",
+      "completion_owner": "COOLDOWN_TABLE(BlockTradeIntradayConfirm,code)；L4(block_trade_intraday_confirm,code,空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "block-confirm-side-route"
+      ],
+      "catalog_unit_sha256": "047156d8d035761b9ea2e45611c99e04d860de2135019e21dda300ce8585ab36",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-ipo-catalyst",
+      "name": "IPO催化事件",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-ipo-catalyst",
+        "producer:ipo-catalyst-side-route",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 5,
+      "most_likely_hours": 9,
+      "pessimistic_hours": 15,
+      "pert_hours": 9.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "公告/stage自然变化或灰盒",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-ipo-catalyst-owner",
+            "producer_ids": [
+              "ipo-catalyst-side-route"
+            ],
+            "requirements": [],
+            "statement": "date+announcement+stage形成occurrence；R08日期公告cache仅输入复用，空code两层冷却不得合并不同IPO阶段。"
+          }
+        ]
+      },
+      "rationale": "无日LAST/claim，需要独立通知cursor",
+      "completion_owner": "COOLDOWN_TABLE(IpoCatalyst,空 code)；L4(ipo_catalyst,空 code,空 sub_kind)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "ipo-catalyst-side-route"
+      ],
+      "catalog_unit_sha256": "8ce28f1c4086219cf88ee9d92a69486f51532a4cb151ee4ad17149a178f46759",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-cli-replay-force",
+      "name": "显式历史强制重放",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-cli-replay-force",
+        "producer:cli-replay-force",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "critical",
+      "optimistic_hours": 9,
+      "most_likely_hours": 14,
+      "pessimistic_hours": 25,
+      "pert_hours": 15,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "操作员批准重放窗口，两eligible session",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-cli-replay-force-owner",
+            "producer_ids": [
+              "cli-replay-force"
+            ],
+            "requirements": [
+              "real_send_audit",
+              "original_and_replay_identity",
+              "dry_run_zero_send",
+              "force_explicit_authorization"
+            ],
+            "statement": "真实发送审计绑定原消息hash与新replay identity及required-channel receipt；dry-run零发送，force显式授权才能新attempt，跨进程崩溃不能借本地hash链证明Accepted。"
+          }
+        ]
+      },
+      "rationale": "独立replay owner不是普通startup或原业务claim；本批仅测试合同不执行发送",
+      "completion_owner": "MonitorReplayPublisher replay envelope.id → replay_audit/YYYY.jsonl attempt/result hash chain；ReplayRunner invocation summary",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "cli-replay-force"
+      ],
+      "catalog_unit_sha256": "9c967d9fd51e6d06b4da5155faee51070c189d643ebe2a0fde33cc8dd32f71ca",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-cli-single",
+      "name": "CLI单股报告",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-cli-single",
+        "producer:cli-single-default",
+        "producer:cli-single-schedule",
+        "producer:cli-single-lhb",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 4,
+      "most_likely_hours": 7,
+      "pessimistic_hours": 12,
+      "pert_hours": 7.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "CLI调用与schedule/LHB各一次隔离回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-cli-single-owner",
+            "producer_ids": [
+              "cli-single-default",
+              "cli-single-lhb",
+              "cli-single-schedule"
+            ],
+            "requirements": [],
+            "statement": "default/schedule/LHB每invocation+code通知结果为typed BestEffort；Option AnalysisResult或业务DB成功不推断强receipt，空结果不造通知。"
+          }
+        ]
+      },
+      "rationale": "rank1最小typed结果切口，跨调用无原持久cursor",
+      "completion_owner": "AnalysisPipeline::process_stock_inner(invocation,code) 的 Option<AnalysisResult>；无持久通知 completion cursor",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "cli-single-default",
+        "cli-single-lhb",
+        "cli-single-schedule"
+      ],
+      "catalog_unit_sha256": "207eb4da6553f038d1fb9d3fabebdb1cf33198fa389c80997cf4251be952f7e4",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 1,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-cli-summary",
+      "name": "CLI汇总报告",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-cli-summary",
+        "producer:cli-summary-default",
+        "producer:cli-summary-schedule",
+        "producer:cli-summary-lhb",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 5,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 13,
+      "pert_hours": 8.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "三个CLI入口非空结果集回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-cli-summary-owner",
+            "producer_ids": [
+              "cli-summary-default",
+              "cli-summary-lhb",
+              "cli-summary-schedule"
+            ],
+            "requirements": [],
+            "statement": "nonempty results汇总保存独立通知结果；文件同分钟重名不当作completion，single成功不能完成summary。"
+          }
+        ]
+      },
+      "rationale": "rank1汇总形态与单股通知分开验证",
+      "completion_owner": "AnalysisPipeline::run(invocation) 的 results / send_summary_notification_to 返回值；无持久通知 completion cursor",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "cli-summary-default",
+        "cli-summary-lhb",
+        "cli-summary-schedule"
+      ],
+      "catalog_unit_sha256": "f30beea312d5bcd4c154c65cb5968b17c431ef39ecf1a0c74c1d04e369e1abde",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 1,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-cli-chain",
+      "name": "CLI产业链报告",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-cli-chain",
+        "producer:cli-chain",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "medium",
+      "optimistic_hours": 4,
+      "most_likely_hours": 8,
+      "pessimistic_hours": 14,
+      "pert_hours": 8.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 0,
+      "calendar_constraints": [
+        "显式CLI invocation回放",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-cli-chain-owner",
+            "producer_ids": [
+              "cli-chain"
+            ],
+            "requirements": [],
+            "statement": "Result<()>只代表函数完成，typed BestEffort逐渠道呈现；latest completed business date绑定payload，不借timer日期门授权。"
+          }
+        ]
+      },
+      "rationale": "CLI产业链报告的历史批准范围有歧义：蓝图明确default CLI单股/汇总，未明确纳入独立run_chain_analysis_mode owner。保持rank=null，纳入波次需要另行产品裁决；工程范围仍保留，且不合并R03/I03或两个timer。",
+      "completion_owner": "run_chain_analysis_mode(invocation) 的 Result<()>；无独立持久通知 cursor",
+      "phase_epics": [
+        "盘中",
+        "盘前",
+        "盘后",
+        "集合竞价"
+      ],
+      "producer_ids": [
+        "cli-chain"
+      ],
+      "catalog_unit_sha256": "f99e1b311f12062db0002c69d68074a5e4532493a98d71143ffeb5d42e9edccf",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 1,
+      "observation_sessions": 1
+    },
+    {
+      "id": "MU-chain-preopen",
+      "name": "09:05产业链定时",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-chain-preopen",
+        "producer:chain-preopen-timer",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 16,
+      "pert_hours": 10.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "交易日09:05至09:15自然occurrence",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-chain-preopen-owner",
+            "producer_ids": [
+              "chain-preopen-timer"
+            ],
+            "requirements": [],
+            "statement": "09:05≤t<09:15交易日guard；calendar封口日与latest completed业务日分开，跨自然日同业务结果不盲重发，CHAIN_PREOPEN_LAST按通知结果推进。"
+          }
+        ]
+      },
+      "rationale": "rank2 timer现无交易日guard，日期混淆需窗口回放",
+      "completion_owner": "monitor_loop::CHAIN_PREOPEN_LAST[calendar_date]",
+      "phase_epics": [
+        "盘前"
+      ],
+      "producer_ids": [
+        "chain-preopen-timer"
+      ],
+      "catalog_unit_sha256": "0c1944dbae3ad3fa21f7f4851cebbe7dbcde5d59dae46cf8047395271ea8b9a9",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 2,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-chain-post-close",
+      "name": "15:30产业链定时",
+      "scope": "逐Unit接线、六门禁证据、cutover准备/核验及tail-cleanup资格核验；不含自然等待。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-chain-post-close",
+        "producer:chain-post-close-timer",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W04",
+        "W05",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W14",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 11,
+      "pessimistic_hours": 18,
+      "pert_hours": 11.33,
+      "engineer_count": 1,
+      "external_wait_business_days": 1,
+      "calendar_constraints": [
+        "交易日15:30至15:35自然occurrence",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-chain-post-close-owner",
+            "producer_ids": [
+              "chain-post-close-timer"
+            ],
+            "requirements": [],
+            "statement": "15:30≤t<15:35独立occurrence；CHAIN_POST_LAST不借preopen/CLI结果；同分钟报告文件覆盖不证明新通知成功。"
+          }
+        ]
+      },
+      "rationale": "rank3五分钟窗口与分析耗时竞争，完成cursor独立",
+      "completion_owner": "monitor_loop::CHAIN_POST_LAST[calendar_date]",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "chain-post-close-timer"
+      ],
+      "catalog_unit_sha256": "5596c2836c2023c75a26490bc5b5e1f3970e61b0b5eff025a22ac8f4fb9ff6f9",
+      "changes_physical_owner": true,
+      "approved_promotion_rank": 3,
+      "promotion_sessions": 1,
+      "observation_sessions": 2
+    },
+    {
+      "id": "MU-review-r03-stored-recovery",
+      "name": "R03既存事实恢复",
+      "scope": "隔离conformance与保持未激活；不切换physical owner，不补生产依赖。",
+      "lineage": "reconstructed_2026-09-06",
+      "evidence_or_catalog_refs": [
+        "unit:MU-review-r03-stored-recovery",
+        "producer:startup-resume-industry-chain",
+        "Q:84",
+        "Q:100"
+      ],
+      "dependencies": [
+        "W01",
+        "W02",
+        "W03",
+        "W06",
+        "W07",
+        "W08",
+        "W09",
+        "W10",
+        "W11",
+        "W12",
+        "W13",
+        "W14",
+        "W15",
+        "W16",
+        "W17",
+        "W18",
+        "W19",
+        "W20",
+        "W21"
+      ],
+      "risk_class": "high",
+      "optimistic_hours": 6,
+      "most_likely_hours": 10,
+      "pessimistic_hours": 19,
+      "pert_hours": 10.83,
+      "engineer_count": 1,
+      "external_wait_business_days": 2,
+      "calendar_constraints": [
+        "启动all-date旧信封隔离恢复，来源激活另批",
+        "人工批准与样本不足可无限延期；非交易日不消耗交易session。"
+      ],
+      "acceptance_gates": {
+        "shared": [
+          "unit",
+          "failure",
+          "crash",
+          "shadow",
+          "dedup",
+          "rollback"
+        ],
+        "specific": [
+          {
+            "id": "MU-review-r03-stored-recovery-owner",
+            "producer_ids": [
+              "startup-resume-industry-chain"
+            ],
+            "requirements": [
+              "remain_inactive",
+              "missing_dependencies_visible",
+              "zero_messages_not_pass",
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "保持STARVED新claim未激活；账户依赖缺失可见，零消息不是通过；只恢复原业务日existing IndustryChain decision，Rejected/Uncertain hydrate不能当已送达。"
+          },
+          {
+            "id": "MU-review-r03-stored-recovery-startup",
+            "producer_ids": [
+              "startup-resume-industry-chain"
+            ],
+            "requirements": [
+              "recover_existing_facts",
+              "no_new_occurrence",
+              "no_duplicate_send",
+              "uncertain_no_blind_resend"
+            ],
+            "statement": "R03既存事实恢复：普通startup恢复旧事实及原immutable bytes/decision，不制造新occurrence或重复发送；Uncertain保留人工处置，恢复职责不授予新生产资格。"
+          }
+        ]
+      },
+      "rationale": "独立既存durable owner不能与auto/manual临时任务状态合并",
+      "completion_owner": "business_date_once_claims(business_date,IndustryChain,None,GLOBAL) → existing immutable decision / occurrence=review_task_identity(date,R03)",
+      "phase_epics": [
+        "盘后"
+      ],
+      "producer_ids": [
+        "startup-resume-industry-chain"
+      ],
+      "catalog_unit_sha256": "f9850a92694dc1fcc215d432ea91aeed223685b6930572591d8a506b82f5b5d9",
+      "changes_physical_owner": false,
+      "approved_promotion_rank": null,
+      "promotion_sessions": 0,
+      "observation_sessions": 0
+    }
+  ]
+}

@@ -181,7 +181,7 @@ impl From<crate::selection::schema_v2::SchemaV2Error> for ConfigActivationPrepar
 pub(crate) fn prepare_checked_in_config_activation(
     context: ConfigActivationPreparationContext,
 ) -> Result<PreparedConfigActivation, ConfigActivationPreparationError> {
-    prepare_config_activation_from_root(Path::new(env!("CARGO_MANIFEST_DIR")), context)
+    prepare_config_activation_from_root(crate::production_root::production_root(), context)
 }
 
 /// BR-183/193 release-gate materials: stages 1-4 of the full activation
@@ -416,36 +416,11 @@ fn prepare_config_activation_from_root(
     })
 }
 
-/// BR-183 dual-gate (2026-09-03): the config-domain revision. Scoped to
-/// `config/**` release materials only — a source-only change (new PushKind,
-/// wiring, …) no longer invalidates the activation. Source-tree drift is
-/// reported by [`spawn_executable_drift_banner`] instead (WARN-only).
 pub(crate) fn compute_executable_revision(
     repository_root: impl AsRef<Path>,
 ) -> Result<ExecutableRevisionSnapshot, ConfigActivationPreparationError> {
     let root = validate_repository_root(repository_root.as_ref())?;
-    let relative_paths = enumerate_config_inputs(&root)?;
-    revision_for_inputs(&root, relative_paths)
-}
-
-/// Full release-tree revision (src/**, config/**, root Cargo.toml /
-/// Cargo.lock / build.rs): the banner-only executable domain. Used by the
-/// prepare tool to record `expected_executable_revision` in the activation
-/// file and by [`spawn_executable_drift_banner`] at runtime. Never gates.
-pub fn compute_full_tree_executable_revision(
-    repository_root: impl AsRef<Path>,
-) -> Result<ExecutableRevisionSnapshot, ConfigActivationPreparationError> {
-    let root = validate_repository_root(repository_root.as_ref())?;
-    let relative_paths = enumerate_full_tree_inputs(&root)?;
-    revision_for_inputs(&root, relative_paths)
-}
-
-/// Hash the enumerated inputs into an [`ExecutableRevisionSnapshot`] (double
-/// read pass guards against mutation mid-preparation).
-fn revision_for_inputs(
-    root: &Path,
-    relative_paths: Vec<PathBuf>,
-) -> Result<ExecutableRevisionSnapshot, ConfigActivationPreparationError> {
+    let relative_paths = enumerate_executable_inputs(&root)?;
     let mut files = Vec::with_capacity(relative_paths.len());
     let mut first_read_hashes = BTreeMap::new();
     for relative_path in &relative_paths {
@@ -878,11 +853,6 @@ fn prepare_registered_feed_snapshot() -> Result<(String, String), ConfigActivati
 struct ActivationFileWire {
     schema_version: String,
     expected_config_hash: String,
-    /// BR-183 dual-gate (2026-09-03): full release-tree revision recorded by
-    /// the prepare tool for the WARN-only drift banner. Optional so pre-9/3
-    /// activation files keep parsing; absent → no banner is spawned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expected_executable_revision: Option<String>,
     effective_from: String,
     reviewed_by: String,
     reviewed_at: String,
@@ -899,9 +869,6 @@ fn parse_activation_file(
         ));
     }
     require_hash(&wire.expected_config_hash, "expected_config_hash")?;
-    if let Some(executable_revision) = &wire.expected_executable_revision {
-        require_hash(executable_revision, "expected_executable_revision")?;
-    }
     require_text(&wire.reviewed_by, "reviewed_by")?;
     let reviewer = wire.reviewed_by.to_ascii_lowercase();
     if matches!(reviewer.as_str(), "unreviewed" | "pending" | "todo") {
@@ -913,68 +880,6 @@ fn parse_activation_file(
     parse_canonical_timestamp(&wire.effective_from, "effective_from")?;
     parse_canonical_timestamp(&wire.reviewed_at, "reviewed_at")?;
     Ok(wire)
-}
-
-/// BR-183 dual-gate drift banner (2026-09-03): after the config-domain gate
-/// has been evaluated, optionally compare the activation file's recorded full
-/// release-tree revision with the live tree and log the outcome. Only fires
-/// when the activation file carries `expected_executable_revision` (post-9/3
-/// activations); WARN on drift, info on match. Never disables the capability
-/// and never blocks startup — a full-tree hash takes minutes, so the compare
-/// runs on a detached thread.
-pub fn spawn_executable_drift_banner() {
-    let root = match std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .map_err(|error| {
-            ConfigActivationPreparationError::new(
-                "repository_root_canonicalization_failed",
-                error.to_string(),
-            )
-        }) {
-        Ok(root) => root,
-        Err(_) => return,
-    };
-    let Some(expected) = read_recorded_executable_revision(&root) else {
-        return;
-    };
-    std::thread::spawn(move || {
-        let recorded = expected.as_str();
-        match compute_full_tree_executable_revision(&root) {
-            Ok(snapshot) if snapshot.hash == recorded => {
-                log::info!(
-                    "[selection-v2][BR-183] executable revision match ({})",
-                    &recorded[..12]
-                );
-            }
-            Ok(snapshot) => {
-                log::warn!(
-                    "[selection-v2][BR-183] executable drift: current={} recorded={}; \
-                     config 域门不受影响, 如需校准请重发 activation",
-                    &snapshot.hash[..12],
-                    &recorded[..12]
-                );
-            }
-            Err(error) => {
-                log::warn!(
-                    "[selection-v2][BR-183] executable revision unavailable code={} detail={}",
-                    error.code,
-                    error.detail
-                );
-            }
-        }
-    });
-}
-
-/// Read only the banner-relevant field from the activation file. Absent or
-/// unparseable → None (banner stays silent; the config gate is untouched).
-fn read_recorded_executable_revision(root: &Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct LiteWire {
-        #[serde(rename = "expected_executable_revision")]
-        expected_executable_revision: Option<String>,
-    }
-    let bytes = fs::read(root.join(ACTIVATION_FILE_RELATIVE_PATH)).ok()?;
-    serde_json::from_slice::<LiteWire>(&bytes).ok()?.expected_executable_revision
 }
 
 fn validate_context(
@@ -1058,26 +963,7 @@ fn validate_repository_root(root: &Path) -> Result<PathBuf, ConfigActivationPrep
     })
 }
 
-/// Config-domain release materials (BR-183 gate domain): everything under
-/// `config/**`. Chain rules, board bindings/proposal, trading-calendar
-/// manifests and the selection activation input itself all live here;
-/// operator edits to these MUST invalidate the activation.
-fn enumerate_config_inputs(
-    root: &Path,
-) -> Result<Vec<PathBuf>, ConfigActivationPreparationError> {
-    let config = root.join("config");
-    require_real_directory(&config, "config")?;
-    let mut paths = Vec::new();
-    collect_regular_files(root, &config, &mut paths)?;
-    finalize_input_paths(paths)
-}
-
-/// Full release tree (src/**, config/**, root Cargo.toml / Cargo.lock /
-/// build.rs): the banner-only executable domain (BR-183 dual-gate,
-/// 2026-09-03). Drift here never disables the capability — the prepare tool
-/// records it as `expected_executable_revision` and startup compares it with
-/// a WARN-only banner.
-fn enumerate_full_tree_inputs(
+fn enumerate_executable_inputs(
     root: &Path,
 ) -> Result<Vec<PathBuf>, ConfigActivationPreparationError> {
     let src = root.join("src");
@@ -1123,14 +1009,6 @@ fn enumerate_full_tree_inputs(
             "root Cargo.toml is required",
         ));
     }
-    finalize_input_paths(paths)
-}
-
-/// Shared tail: exclude the activation file itself, sort by slash path,
-/// enforce uniqueness and relative-path shape.
-fn finalize_input_paths(
-    mut paths: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>, ConfigActivationPreparationError> {
     paths.retain(|path| path != Path::new(ACTIVATION_FILE_RELATIVE_PATH));
     paths.sort_by(|left, right| {
         path_to_slash_string(left)
@@ -1501,7 +1379,6 @@ mod tests {
             let wire = ActivationFileWire {
                 schema_version: ACTIVATION_FILE_SCHEMA_VERSION.to_owned(),
                 expected_config_hash: expected_hash.to_owned(),
-                expected_executable_revision: None,
                 effective_from: "2026-07-28T09:00:00.000000000Z".to_owned(),
                 reviewed_by: reviewed_by.to_owned(),
                 reviewed_at: "2026-07-28T07:00:00.000000000Z".to_owned(),
@@ -1577,12 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn source_byte_changes_only_full_tree_revision_not_config_gate() {
-        // BR-183 dual-gate (2026-09-03): a source-only change moves the
-        // banner-domain (full-tree) executable revision but must NOT move the
-        // config-domain gate hash — otherwise every src edit would require an
-        // activation regen and the drift would silently disable the capability
-        // instead of being reported by the WARN banner.
+    fn one_source_byte_changes_executable_and_config_revision() {
         let fixture = TestFixture::new();
         fixture.install_verified_config();
         let first = prepare_snapshot(
@@ -1591,9 +1463,6 @@ mod tests {
             &ConfigActivationGateContract::checked_in(),
         )
         .expect("first snapshot");
-        // Baseline the full-tree (banner) revision BEFORE the source edit.
-        let full_first = compute_full_tree_executable_revision(&fixture.root)
-            .expect("first full-tree revision");
         fs::write(
             fixture.root.join("src/lib.rs"),
             b"pub const TEST_CODE: u8 = 2;\n",
@@ -1606,48 +1475,11 @@ mod tests {
         )
         .expect("second snapshot");
 
-        // Full-tree (banner) revision must still see the src change.
-        let full_second = compute_full_tree_executable_revision(&fixture.root)
-            .expect("second full-tree revision");
-        assert_ne!(full_first.hash, full_second.hash);
-
-        // Config-domain (gate) hash is intentionally src-blind now.
-        assert_eq!(first.config_hash, second.config_hash);
-        // ... and the gate-domain executable revision with it (it feeds config_hash).
-        assert_eq!(
+        assert_ne!(
             first.executable_revision.hash,
             second.executable_revision.hash
         );
-    }
-
-    #[test]
-    fn config_byte_change_still_moves_both_config_gate_and_full_tree_revision() {
-        // Config/** sits in both domains: an operator config edit must keep
-        // invalidating the activation (gate) and also moves the banner hash.
-        let fixture = TestFixture::new();
-        fixture.install_verified_config();
-        let first = prepare_snapshot(
-            &fixture.root,
-            fixture.context().activated_at,
-            &ConfigActivationGateContract::checked_in(),
-        )
-        .expect("first snapshot");
-        let full_first = compute_full_tree_executable_revision(&fixture.root)
-            .expect("first full-tree revision");
-        let chain_path = fixture.root.join(CHAIN_CONFIG_RELATIVE_PATH);
-        let mut chain_bytes = fs::read(&chain_path).expect("read chain config");
-        chain_bytes.extend_from_slice(b"\n# TEST_CODE comment\n");
-        fs::write(&chain_path, chain_bytes).expect("mutate chain config");
-        let second = prepare_snapshot(
-            &fixture.root,
-            fixture.context().activated_at,
-            &ConfigActivationGateContract::checked_in(),
-        )
-        .expect("second snapshot");
         assert_ne!(first.config_hash, second.config_hash);
-        let full_second = compute_full_tree_executable_revision(&fixture.root)
-            .expect("second full-tree revision");
-        assert_ne!(full_first.hash, full_second.hash);
     }
 
     #[test]

@@ -1190,8 +1190,6 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::ForbiddenOps => (HoldingHealth, "forbidden_ops", Severity::Emergency),
         PushKind::PaperTrade => (HoldingHealth, "paper_trade", Severity::Normal),
         PushKind::PaperSell => (HoldingHealth, "paper_sell", Severity::Normal),
-        PushKind::PaperBuy => (HoldingHealth, "paper_buy", Severity::Normal),
-        PushKind::Watchdog => (HoldingHealth, "watchdog", Severity::High),
         PushKind::SnapshotStale => (HoldingHealth, "snapshot_stale", Severity::Normal),
         PushKind::CloseCall => (HoldingHealth, "close_call", Severity::High),
         PushKind::ReviewMarket => (HoldingHealth, "review_market", Severity::Normal),
@@ -1626,28 +1624,27 @@ mod tests {
             v14_gate(PushKind::PreopenNewsHot, None),
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
+        // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
+        // 已升级 counted → 换 NewsCatalyst → 换 EtfClosingCallAuction; 后续
+        // 接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::IntradayMarket, None),
+            v14_gate(PushKind::EtfClosingCallAuction, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
 
-        let context = crate::br196_test_delivery::GovernanceSmokeContext::for_review_date(
-            Local::now().date_naive(),
-        )
-        .expect("construct scoped BR-196 governance context");
-        let dispatch = context
-            .dispatch("T-11-auction-volume", PushKind::AuctionVolume, None)
-            .expect("mint exact governance dispatch");
-        assert!(matches!(
-            v14_gate_br196_smoke(&dispatch),
-            V14Gate::Approved(_)
-        ));
+        // 2026-09-20: T-11 移出后 GOVERNANCE_SMOKE_IDENTITIES 清零 (6→3→2→1→0)
+        // — smoke mint 路径 vacated, 原 v14_gate_br196_smoke 放行断言不再可
+        // 构造; 本测试核心 (scoped clock 不放松普通/计数门) 由以下 Denied
+        // 断言承载。
         assert!(matches!(
             v14_gate(PushKind::PreopenNewsHot, None),
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
+        // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
+        // 已升级 counted → 换 NewsCatalyst → 换 EtfClosingCallAuction; 后续
+        // 接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::IntradayMarket, None),
+            v14_gate(PushKind::EtfClosingCallAuction, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
     }
@@ -2056,6 +2053,10 @@ mod tests {
     /// 2026-08-06 用户决策 (C 方案): 未接券商 → data_mode_min 全局放宽到 Down,
     /// data_quality 门禁不再拦任何推送 (DataMode banner 仍出声)。
     /// 原 BR-137 契约 (Unsafe 拒 generic news) 被该决策取代。
+    /// 2026-09-20: 代表 kind 从 NewsCatalyst 轮换为 NewsToIdea (NewsCatalyst 已
+    /// 升级 counted), 再轮换为 PolicyHit (NewsToIdea 升级 counted, MU-d01) —
+    /// uncounted 池继续缩小, C 方案契约 (Unsafe 下 generic news 放行) 与
+    /// 代表 kind 无关, 任何未 counted kind 均可承载。
     fn br137_generic_mixed_news_approved_at_data_mode_unsafe_after_c_decision() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
@@ -2068,7 +2069,7 @@ mod tests {
 
         assert!(
             matches!(
-                v14_gate(PushKind::NewsCatalyst, Some("TEST_CODE_MIXED_NEWS")),
+                v14_gate(PushKind::PolicyHit, Some("TEST_CODE_MIXED_NEWS")),
                 V14Gate::Approved(_)
             ),
             "C 方案后 Unsafe 下 generic news 应放行 (data_quality 门禁已移除)"

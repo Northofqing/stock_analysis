@@ -346,7 +346,7 @@ impl SelectionAuditWriter {
     /// path, environment override, or process-CWD input.
     pub fn production() -> Result<Self, SelectionAuditError> {
         let namespace_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(PRODUCTION_AUDIT_ROOT_RELATIVE_PATH);
+            crate::production_root::production_root().join(PRODUCTION_AUDIT_ROOT_RELATIVE_PATH);
         Self::for_namespace(namespace_root)
     }
 

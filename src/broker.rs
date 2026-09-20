@@ -42,10 +42,7 @@ pub enum BrokerSource {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionQuote {
-    pub name: String,
     pub price: f64,
-    /// 实时涨跌幅 % — 与 price 同一行情快照 (D-01 判分低吸公式 / 买入卡技术句共用)
-    pub change_percent: f64,
     pub limit_down_price: f64,
     pub limit_up_price: f64,
     pub observed_at: chrono::DateTime<chrono::Utc>,
@@ -90,9 +87,7 @@ impl QuoteProvider for PublicQuoteProvider {
             ));
         }
         Ok(ExecutionQuote {
-            name: quote.name.clone(),
             price,
-            change_percent: quote.change_percent,
             limit_down_price,
             limit_up_price,
             observed_at: quote.source_at,
@@ -109,9 +104,7 @@ struct FreshTestQuoteProvider;
 impl QuoteProvider for FreshTestQuoteProvider {
     fn get_execution_quote(&self, _code: &str) -> Result<ExecutionQuote, String> {
         Ok(ExecutionQuote {
-            name: "测试".into(),
             price: 10.0,
-            change_percent: 0.0,
             limit_down_price: 9.0,
             limit_up_price: 11.0,
             observed_at: chrono::Utc::now(),

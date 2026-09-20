@@ -47,23 +47,6 @@ const USER_TEMPLATE: &str = "从以下 {n} 条新闻标题提取受益个股.\n\
 \n\
 输出 JSON (无 markdown, 无解释):";
 
-/// 仅提供原文直接提及的证据。模型给出的名称必须与行情源名称一致。
-/// 产业链受益推断可保留观察，但不能靠模型自己的 reason 自证业务关联。
-pub fn directly_mentioned_title<'a>(
-    titles: &'a [String],
-    hit: &TickerHit,
-    source_name: &str,
-) -> Option<&'a str> {
-    let source_name = source_name.trim();
-    if source_name.chars().count() < 2 || hit.name.trim() != source_name {
-        return None;
-    }
-    titles
-        .iter()
-        .find(|title| title.contains(source_name) || title.contains(&hit.code))
-        .map(String::as_str)
-}
-
 /// 调 LLM 提取 ticker. 失败 → 返回空 Vec (业务降级).
 ///
 /// 设计: 单次调用处理所有 titles, 避免 N 次调用.
@@ -130,25 +113,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
-
-    #[test]
-    fn chain_inference_cannot_supply_its_own_direct_news_evidence() {
-        let hit = TickerHit {
-            code: "002301".into(),
-            name: "齐心集团".into(),
-            importance: 8,
-            reason: "尿素涨价，公司为农化龙头".into(),
-            chain: "农化".into(),
-        };
-        assert!(directly_mentioned_title(&["尿素价格上涨".into()], &hit, "齐心集团").is_none());
-        assert!(directly_mentioned_title(
-            &["齐心集团发布办公物资集采业务公告".into()],
-            &hit,
-            "齐心集团"
-        )
-        .is_some());
-        assert!(directly_mentioned_title(&["齐心集团发布公告".into()], &hit, "其他公司").is_none());
-    }
 
     /// Mock provider — 业务侧可注入假 LLM 测路径, 不打网络
     struct MockProvider {

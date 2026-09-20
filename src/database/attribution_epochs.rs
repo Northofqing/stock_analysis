@@ -3818,18 +3818,8 @@ impl<'a> AttributionEpochStore<'a> {
                     "BR-255 invalid or duplicate epoch daily signal family",
                 ));
             }
-            // BR-255 canonical 化: 内存 f64 直出文本与 validate 端 from_str→to_string
-            // 重算存在 1-ulp 差异 (如 118.99999999999977 vs ...776) → 存储前先做一次
-            // parse→to_string 往返, 保证存的是 validate 重算的 canonical 文本 (2026-09-04
-            // 实测: 9/4 有 realized pnl 后 persist 恒失败 invalid at row N)。
-            let rendered = serde_json::to_string(&family.payload).map_err(|error| {
+            let payload_json = serde_json::to_string(&family.payload).map_err(|error| {
                 failed_integrity(format!("BR-255 serialize daily payload: {error}"))
-            })?;
-            let parsed: serde_json::Value = serde_json::from_str(&rendered).map_err(|error| {
-                failed_integrity(format!("BR-255 canonicalize daily payload: {error}"))
-            })?;
-            let payload_json = serde_json::to_string(&parsed).map_err(|error| {
-                failed_integrity(format!("BR-255 canonical daily payload: {error}"))
             })?;
             let payload_hash =
                 hash_json(b"BR255_ATTRIBUTION_EPOCH_DAILY_PAYLOAD_V1\0", &payload_json)

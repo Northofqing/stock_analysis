@@ -65,25 +65,959 @@ fn closing_valuation_note() -> Option<String> {
     CLOSING_VALUATION_NOTE.get()?.lock().ok()?.clone()
 }
 
+pub(super) fn format_user_confirmed_account_note(
+    summary: &stock_analysis::database::user_account_summary::UserAccountSummary,
+) -> String {
+    let Ok(effective_at) = chrono::DateTime::parse_from_rfc3339(&summary.effective_at) else {
+        return "用户确认账户摘要不可用：快照时间格式无效".to_string();
+    };
+    let effective_date = effective_at.date_naive();
+    format!(
+        "用户确认账户快照（截至 {}，source={}）：快照仓位{:.1}%，{} 当日盈亏 {:+.2}（截至快照，非实时账户）",
+        summary.effective_at,
+        summary.source,
+        summary.position_ratio_pct,
+        effective_date,
+        summary.daily_pnl
+    )
+}
+
+pub(super) fn format_bound_closing_valuation_note(
+    account: Option<&stock_analysis::database::user_account_summary::UserAccountSummary>,
+    compared_position: Result<
+        Option<&stock_analysis::database::user_position_snapshot::UserPositionSnapshot>,
+        &str,
+    >,
+    rechecked_position: Result<
+        Option<&stock_analysis::database::user_position_snapshot::UserPositionSnapshot>,
+        &str,
+    >,
+    valuation: Result<
+        Option<&stock_analysis::database::closing_valuation::ClosingValuationView>,
+        &str,
+    >,
+    target_price_date: chrono::NaiveDate,
+) -> String {
+    let account_note = account.map_or_else(
+        || "用户确认账户摘要缺失".to_string(),
+        format_user_confirmed_account_note,
+    );
+
+    let position = match compared_position {
+        Err(_) => {
+            return format!(
+                "{account_note}；持仓快照读取失败，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(None) => return format!("{account_note}；持仓快照缺失，收盘估值不可用"),
+        Ok(Some(position)) => position,
+    };
+    let position_context = format!(
+        "用于本次核验的持仓快照（截至 {}，source={}）",
+        position.effective_at.to_rfc3339(),
+        position.source
+    );
+    if position.confirm_empty || position.items.is_empty() {
+        return format!("{account_note}；{position_context}；持仓快照为空，收盘估值不可用");
+    }
+    let rechecked_position = match rechecked_position {
+        Err(_) => {
+            return format!(
+                "{account_note}；{position_context}；持仓快照无法复核，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(None) => {
+            return format!(
+                "{account_note}；{position_context}；持仓在校验期间变化，收盘估值不可用，等待按当前持仓重算"
+            )
+        }
+        Ok(Some(rechecked_position)) => rechecked_position,
+    };
+    if position.snapshot_row_id != rechecked_position.snapshot_row_id
+        || position.snapshot_id != rechecked_position.snapshot_id
+        || position.evidence_sha256 != rechecked_position.evidence_sha256
+    {
+        return format!(
+            "{account_note}；{position_context}；持仓在校验期间变化，收盘估值不可用，等待按当前持仓重算"
+        );
+    }
+
+    let valuation = match valuation {
+        Err(_) => {
+            return format!("{account_note}；{position_context}；收盘估值不可用（读取失败）")
+        }
+        Ok(None) => {
+            return format!(
+                "{account_note}；{position_context}；收盘估值不可用（目标日无记录）"
+            )
+        }
+        Ok(Some(valuation)) => valuation,
+    };
+    let (total_market_value, total_unrealized_pnl) =
+        match validated_valuation_totals(position, valuation, target_price_date) {
+            Ok(totals) => totals,
+            Err(BoundValuationError::WrongPriceDate) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值价格日 {} 与目标日 {target_price_date} 不符，等待按当前持仓重算",
+                    valuation.valuation.price_date
+                )
+            }
+            Err(BoundValuationError::IncompleteCoverage) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值覆盖不完整，等待按当前持仓重算"
+                )
+            }
+            Err(BoundValuationError::HoldingsMismatch) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值与当前持仓不匹配，等待按当前持仓重算"
+                )
+            }
+            Err(BoundValuationError::InvalidAmounts) => {
+                return format!(
+                    "{account_note}；{position_context}；收盘估值金额不完整或无效，等待按当前持仓重算"
+                )
+            }
+        };
+
+    format!(
+        "{}；持仓快照（截至 {}，source={}）；收盘估值价格日 {}，目标日覆盖 {}/{}，provider={}，系统估值市值 {:.2}，系统按显示成本计算的未实现盈亏 {:+.2}",
+        account_note,
+        position.effective_at.to_rfc3339(),
+        position.source,
+        valuation.valuation.price_date,
+        valuation.valuation.covered,
+        valuation.valuation.total,
+        valuation.valuation.provider,
+        total_market_value,
+        total_unrealized_pnl,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundValuationError {
+    WrongPriceDate,
+    IncompleteCoverage,
+    HoldingsMismatch,
+    InvalidAmounts,
+}
+
+fn validated_valuation_totals(
+    position: &stock_analysis::database::user_position_snapshot::UserPositionSnapshot,
+    valuation: &stock_analysis::database::closing_valuation::ClosingValuationView,
+    target_price_date: chrono::NaiveDate,
+) -> Result<(f64, f64), BoundValuationError> {
+    let valuation = &valuation.valuation;
+    if valuation.price_date != target_price_date {
+        return Err(BoundValuationError::WrongPriceDate);
+    }
+    if valuation.total == 0
+        || valuation.covered != valuation.total
+        || valuation.total != valuation.items.len()
+    {
+        return Err(BoundValuationError::IncompleteCoverage);
+    }
+    if valuation.total != position.items.len() {
+        return Err(BoundValuationError::HoldingsMismatch);
+    }
+
+    let mut positions = std::collections::HashMap::with_capacity(position.items.len());
+    for item in &position.items {
+        if item.code.trim().is_empty()
+            || item.quantity == 0
+            || !item.cost_price.is_finite()
+            || item.cost_price <= 0.0
+            || positions.insert(item.code.as_str(), item).is_some()
+        {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+    }
+    let mut valuation_codes = std::collections::HashSet::with_capacity(valuation.items.len());
+    for item in &valuation.items {
+        if item.code.trim().is_empty()
+            || item.quantity == 0
+            || !item.cost_price.is_finite()
+            || item.cost_price <= 0.0
+            || !valuation_codes.insert(item.code.as_str())
+        {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+        let Some(position_item) = positions.get(item.code.as_str()) else {
+            return Err(BoundValuationError::HoldingsMismatch);
+        };
+        if item.quantity != position_item.quantity || item.cost_price != position_item.cost_price {
+            return Err(BoundValuationError::HoldingsMismatch);
+        }
+        let (Some(close), Some(market_value), Some(unrealized_pnl)) =
+            (item.close, item.market_value, item.unrealized_pnl)
+        else {
+            return Err(BoundValuationError::InvalidAmounts);
+        };
+        if !close.is_finite()
+            || close <= 0.0
+            || !market_value.is_finite()
+            || market_value <= 0.0
+            || !unrealized_pnl.is_finite()
+        {
+            return Err(BoundValuationError::InvalidAmounts);
+        }
+    }
+
+    let (Some(total_market_value), Some(total_unrealized_pnl)) =
+        (valuation.total_market_value, valuation.total_unrealized_pnl)
+    else {
+        return Err(BoundValuationError::InvalidAmounts);
+    };
+    if !total_market_value.is_finite()
+        || total_market_value <= 0.0
+        || !total_unrealized_pnl.is_finite()
+    {
+        return Err(BoundValuationError::InvalidAmounts);
+    }
+    Ok((total_market_value, total_unrealized_pnl))
+}
+
 fn user_confirmed_account_note() -> Option<String> {
     stock_analysis::database::DatabaseManager::try_get()?;
     let summary = stock_analysis::database::user_account_summary::latest()
         .ok()
         .flatten()?;
-    Some(format!(
-        "用户确认持仓可用；仓位{:.1}%，日盈亏{:+.2}",
-        summary.position_ratio_pct, summary.daily_pnl
-    ))
+    Some(format_user_confirmed_account_note(&summary))
 }
 
-fn account_status_note() -> String {
-    if let Some(note) = closing_valuation_note() {
+#[cfg(test)]
+mod tests_account_valuation_binding {
+    use super::format_bound_closing_valuation_note;
+    use chrono::{DateTime, NaiveDate};
+    use stock_analysis::database::closing_valuation::ClosingValuationView;
+    use stock_analysis::database::user_account_summary::UserAccountSummary;
+    use stock_analysis::database::user_position_snapshot::UserPositionSnapshot;
+    use stock_analysis::portfolio::closing_valuation::{
+        ClosingValuationItem, ClosingValuationView as PortfolioValuationView,
+    };
+    use stock_analysis::portfolio::user_position_snapshot::UserPositionItemInput;
+
+    #[test]
+    fn changed_quantity_hides_old_valuation_amounts() {
+        let position = UserPositionSnapshot {
+            snapshot_row_id: 1,
+            snapshot_id: "TEST_CODE_SNAPSHOT_V1".to_string(),
+            effective_at: DateTime::parse_from_rfc3339("2026-09-15T15:08:09+08:00")
+                .expect("position effective_at"),
+            confirmed_at: DateTime::parse_from_rfc3339("2026-09-15T15:09:00+08:00")
+                .expect("position confirmed_at"),
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "a".repeat(64),
+            items: vec![
+                UserPositionItemInput {
+                    code: "TEST_CODE_000001".to_string(),
+                    name: "TEST_NAME_000001".to_string(),
+                    quantity: 100,
+                    cost_price: 10.000_000_1,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000002".to_string(),
+                    name: "TEST_NAME_000002".to_string(),
+                    quantity: 200,
+                    cost_price: 12.34,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000003".to_string(),
+                    name: "TEST_NAME_000003".to_string(),
+                    quantity: 300,
+                    cost_price: 38.125,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000004".to_string(),
+                    name: "TEST_NAME_000004".to_string(),
+                    quantity: 40,
+                    cost_price: 210.75,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000005".to_string(),
+                    name: "TEST_NAME_000005".to_string(),
+                    quantity: 500,
+                    cost_price: 9.876_543_2,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000006".to_string(),
+                    name: "TEST_NAME_000006".to_string(),
+                    quantity: 6,
+                    cost_price: 1_500.125,
+                },
+            ],
+        };
+        let account = UserAccountSummary {
+            effective_at: "2026-09-14T18:50:00+08:00".to_string(),
+            total_assets: 10_000.0,
+            securities_market_value: 6_000.0,
+            available_cash: 4_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: -12.50,
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+        };
+        let target = NaiveDate::from_ymd_opt(2026, 9, 15).expect("target price date");
+        let valuation = ClosingValuationView {
+            persisted_run_row_id: 1,
+            run_id: "TEST_CODE_VALUATION_V1".to_string(),
+            valuation: PortfolioValuationView {
+                price_date: target,
+                provider: "TEST_CODE_VALIDATED_CLOSE".to_string(),
+                covered: 6,
+                total: 6,
+                items: vec![
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000001".to_string(),
+                        name: "TEST_NAME_000001".to_string(),
+                        quantity: 100,
+                        cost_price: 10.000_000_1,
+                        close: Some(11.0),
+                        market_value: Some(1_100.0),
+                        unrealized_pnl: Some(99.999_99),
+                        unrealized_return_pct: Some(9.999_999),
+                        daily_price_pnl: Some(10.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000002".to_string(),
+                        name: "TEST_NAME_000002".to_string(),
+                        quantity: 200,
+                        cost_price: 12.34,
+                        close: Some(13.0),
+                        market_value: Some(2_600.0),
+                        unrealized_pnl: Some(132.0),
+                        unrealized_return_pct: Some(5.348_46),
+                        daily_price_pnl: Some(20.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000003".to_string(),
+                        name: "TEST_NAME_000003".to_string(),
+                        quantity: 300,
+                        cost_price: 38.125,
+                        close: Some(39.0),
+                        market_value: Some(11_700.0),
+                        unrealized_pnl: Some(262.5),
+                        unrealized_return_pct: Some(2.295_082),
+                        daily_price_pnl: Some(30.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000004".to_string(),
+                        name: "TEST_NAME_000004".to_string(),
+                        quantity: 41,
+                        cost_price: 210.75,
+                        close: Some(220.0),
+                        market_value: Some(9_020.0),
+                        unrealized_pnl: Some(379.25),
+                        unrealized_return_pct: Some(4.389_087),
+                        daily_price_pnl: Some(41.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000005".to_string(),
+                        name: "TEST_NAME_000005".to_string(),
+                        quantity: 500,
+                        cost_price: 9.876_543_2,
+                        close: Some(10.0),
+                        market_value: Some(5_000.0),
+                        unrealized_pnl: Some(61.728_4),
+                        unrealized_return_pct: Some(1.25),
+                        daily_price_pnl: Some(50.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000006".to_string(),
+                        name: "TEST_NAME_000006".to_string(),
+                        quantity: 6,
+                        cost_price: 1_500.125,
+                        close: Some(1_520.0),
+                        market_value: Some(9_120.0),
+                        unrealized_pnl: Some(119.25),
+                        unrealized_return_pct: Some(1.324_889),
+                        daily_price_pnl: Some(60.0),
+                    },
+                ],
+                total_market_value: Some(654_321.98),
+                total_unrealized_pnl: Some(123_456.78),
+            },
+        };
+
+        let note = format_bound_closing_valuation_note(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+            target,
+        );
+
+        assert!(note.contains("与当前持仓不匹配"), "{note}");
+        assert!(note.contains("等待按当前持仓重算"), "{note}");
+        assert!(!note.contains("654321.98"), "{note}");
+        assert!(!note.contains("123456.78"), "{note}");
+    }
+
+    fn valid_account() -> UserAccountSummary {
+        UserAccountSummary {
+            effective_at: "2026-09-14T18:50:00+08:00".to_string(),
+            total_assets: 10_000.0,
+            securities_market_value: 6_000.0,
+            available_cash: 4_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: -12.50,
+            source: "TEST_CODE_ACCOUNT".to_string(),
+        }
+    }
+
+    fn valid_position() -> UserPositionSnapshot {
+        UserPositionSnapshot {
+            snapshot_row_id: 11,
+            snapshot_id: "TEST_CODE_VALID_POSITION".to_string(),
+            effective_at: DateTime::parse_from_rfc3339("2026-09-15T15:08:09+08:00")
+                .expect("position effective_at"),
+            confirmed_at: DateTime::parse_from_rfc3339("2026-09-15T15:09:00+08:00")
+                .expect("position confirmed_at"),
+            source: "TEST_CODE_POSITION".to_string(),
+            confirm_empty: false,
+            evidence_sha256: "b".repeat(64),
+            items: vec![
+                UserPositionItemInput {
+                    code: "TEST_CODE_000011".to_string(),
+                    name: "TEST_NAME_000011".to_string(),
+                    quantity: 100,
+                    cost_price: 10.0,
+                },
+                UserPositionItemInput {
+                    code: "TEST_CODE_000012".to_string(),
+                    name: "TEST_NAME_000012".to_string(),
+                    quantity: 200,
+                    cost_price: 20.0,
+                },
+            ],
+        }
+    }
+
+    fn valid_valuation() -> ClosingValuationView {
+        ClosingValuationView {
+            persisted_run_row_id: 12,
+            run_id: "TEST_CODE_VALID_VALUATION".to_string(),
+            valuation: PortfolioValuationView {
+                price_date: NaiveDate::from_ymd_opt(2026, 9, 15).expect("price date"),
+                provider: "TEST_CODE_VALIDATED_CLOSE".to_string(),
+                covered: 2,
+                total: 2,
+                items: vec![
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000011".to_string(),
+                        name: "TEST_NAME_000011".to_string(),
+                        quantity: 100,
+                        cost_price: 10.0,
+                        close: Some(11.0),
+                        market_value: Some(1_100.0),
+                        unrealized_pnl: Some(100.0),
+                        unrealized_return_pct: Some(10.0),
+                        daily_price_pnl: Some(10.0),
+                    },
+                    ClosingValuationItem {
+                        code: "TEST_CODE_000012".to_string(),
+                        name: "TEST_NAME_000012".to_string(),
+                        quantity: 200,
+                        cost_price: 20.0,
+                        close: Some(19.0),
+                        market_value: Some(3_800.0),
+                        unrealized_pnl: Some(-200.0),
+                        unrealized_return_pct: Some(-5.0),
+                        daily_price_pnl: Some(-20.0),
+                    },
+                ],
+                total_market_value: Some(4_900.0),
+                total_unrealized_pnl: Some(-100.0),
+            },
+        }
+    }
+
+    fn render(
+        account: Option<&UserAccountSummary>,
+        position: Result<Option<&UserPositionSnapshot>, &str>,
+        rechecked: Result<Option<&UserPositionSnapshot>, &str>,
+        valuation: Result<Option<&ClosingValuationView>, &str>,
+    ) -> String {
+        format_bound_closing_valuation_note(
+            account,
+            position,
+            rechecked,
+            valuation,
+            NaiveDate::from_ymd_opt(2026, 9, 15).expect("target price date"),
+        )
+    }
+
+    fn assert_totals_hidden(note: &str) {
+        assert!(!note.contains("4900.00"), "{note}");
+        assert!(!note.contains("-100.00"), "{note}");
+    }
+
+    #[test]
+    fn costs_must_match_exactly_and_be_finite_positive() {
+        for (case, position_cost, valuation_cost) in [
+            ("sub_mill", 10.0, 10.000_000_1),
+            ("nan", f64::NAN, f64::NAN),
+            ("infinity", f64::INFINITY, f64::INFINITY),
+            ("zero", 0.0, 0.0),
+            ("negative", -1.0, -1.0),
+        ] {
+            let account = valid_account();
+            let mut position = valid_position();
+            position.items[0].cost_price = position_cost;
+            let rechecked = position.clone();
+            let mut valuation = valid_valuation();
+            valuation.valuation.items[0].cost_price = valuation_cost;
+
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&rechecked)),
+                Ok(Some(&valuation)),
+            );
+
+            assert!(note.contains("与当前持仓不匹配"), "case={case}: {note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn structure_coverage_and_price_date_rejections_hide_totals() {
+        let mut cases = Vec::new();
+
+        let mut missing = valid_valuation();
+        missing.valuation.items.pop();
+        missing.valuation.covered = 1;
+        missing.valuation.total = 1;
+        cases.push((
+            "missing_code",
+            valid_position(),
+            missing,
+            "与当前持仓不匹配",
+        ));
+
+        let mut extra = valid_valuation();
+        let mut extra_item = extra.valuation.items[0].clone();
+        extra_item.code = "TEST_CODE_000013".to_string();
+        extra.valuation.items.push(extra_item);
+        extra.valuation.covered = 3;
+        extra.valuation.total = 3;
+        cases.push((
+            "extra_code",
+            valid_position(),
+            extra,
+            "与当前持仓不匹配",
+        ));
+
+        let mut duplicate = valid_valuation();
+        duplicate.valuation.items[1].code = "TEST_CODE_000011".to_string();
+        cases.push((
+            "duplicate_valuation_code",
+            valid_position(),
+            duplicate,
+            "与当前持仓不匹配",
+        ));
+
+        let mut duplicate_position = valid_position();
+        duplicate_position.items[1].code = "TEST_CODE_000011".to_string();
+        cases.push((
+            "duplicate_position_code",
+            duplicate_position,
+            valid_valuation(),
+            "与当前持仓不匹配",
+        ));
+
+        let mut empty_code = valid_valuation();
+        empty_code.valuation.items[0].code.clear();
+        cases.push((
+            "empty_code",
+            valid_position(),
+            empty_code,
+            "与当前持仓不匹配",
+        ));
+
+        let mut whitespace_code = valid_valuation();
+        whitespace_code.valuation.items[0].code = "   ".to_string();
+        cases.push((
+            "whitespace_code",
+            valid_position(),
+            whitespace_code,
+            "与当前持仓不匹配",
+        ));
+
+        let mut zero_quantity = valid_valuation();
+        zero_quantity.valuation.items[0].quantity = 0;
+        cases.push((
+            "zero_quantity",
+            valid_position(),
+            zero_quantity,
+            "与当前持仓不匹配",
+        ));
+
+        let mut uncovered = valid_valuation();
+        uncovered.valuation.covered = 1;
+        cases.push((
+            "coverage",
+            valid_position(),
+            uncovered,
+            "覆盖不完整",
+        ));
+
+        let mut length_mismatch = valid_valuation();
+        length_mismatch.valuation.items.pop();
+        cases.push((
+            "valuation_length",
+            valid_position(),
+            length_mismatch,
+            "覆盖不完整",
+        ));
+
+        for day in [(2026, 9, 12), (2026, 9, 16)] {
+            let mut wrong_day = valid_valuation();
+            wrong_day.valuation.price_date =
+                NaiveDate::from_ymd_opt(day.0, day.1, day.2).expect("wrong price date");
+            cases.push((
+                "wrong_price_date",
+                valid_position(),
+                wrong_day,
+                "与目标日 2026-09-15 不符",
+            ));
+        }
+
+        for (case, position, valuation, expected_reason) in cases {
+            let account = valid_account();
+            let rechecked = position.clone();
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&rechecked)),
+                Ok(Some(&valuation)),
+            );
+            assert!(
+                note.contains(expected_reason),
+                "case={case}, expected={expected_reason}: {note}"
+            );
+            assert!(note.contains("等待按当前持仓重算"), "case={case}: {note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn quantity_and_price_date_rejections_keep_both_snapshot_dates() {
+        let account = valid_account();
+        let position = valid_position();
+
+        let mut quantity_changed = valid_valuation();
+        quantity_changed.valuation.items[0].quantity = 101;
+        let mut wrong_price_date = valid_valuation();
+        wrong_price_date.valuation.price_date =
+            NaiveDate::from_ymd_opt(2026, 9, 12).expect("wrong price date");
+
+        for valuation in [quantity_changed, wrong_price_date] {
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&position)),
+                Ok(Some(&valuation)),
+            );
+
+            assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+            assert!(note.contains("source=TEST_CODE_ACCOUNT"), "{note}");
+            assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+            assert!(note.contains("source=TEST_CODE_POSITION"), "{note}");
+            assert!(note.contains("用于本次核验的持仓快照"), "{note}");
+            assert!(note.contains("等待按当前持仓重算"), "{note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn missing_changed_or_unreadable_facts_hide_totals() {
+        let account = valid_account();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let notes = [
+            (
+                render(
+                    Some(&account),
+                    Err("TEST_CODE_POSITION_READ"),
+                    Ok(Some(&position)),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照读取失败",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(None),
+                    Ok(None),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照缺失",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Err("TEST_CODE_RECHECK_READ"),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓快照无法复核",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(None),
+                    Ok(Some(&valuation)),
+                ),
+                "持仓在校验期间变化",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(Some(&position)),
+                    Ok(None),
+                ),
+                "收盘估值不可用（目标日无记录）",
+            ),
+            (
+                render(
+                    Some(&account),
+                    Ok(Some(&position)),
+                    Ok(Some(&position)),
+                    Err("TEST_CODE_INVALID_STORED_DATE"),
+                ),
+                "收盘估值不可用（读取失败）",
+            ),
+        ];
+        for (note, expected_reason) in notes {
+            assert!(note.contains(expected_reason), "{note}");
+            assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+            assert!(!note.contains("TEST_CODE_POSITION_READ"), "{note}");
+            assert!(!note.contains("TEST_CODE_RECHECK_READ"), "{note}");
+            assert!(!note.contains("TEST_CODE_INVALID_STORED_DATE"), "{note}");
+            assert_totals_hidden(&note);
+        }
+
+        let mut empty = valid_position();
+        empty.confirm_empty = true;
+        empty.items.clear();
+        let empty_note = render(
+            Some(&account),
+            Ok(Some(&empty)),
+            Ok(Some(&empty)),
+            Ok(Some(&valuation)),
+        );
+        assert!(empty_note.contains("持仓快照为空"), "{empty_note}");
+        assert_totals_hidden(&empty_note);
+
+        for identity_field in ["row_id", "snapshot_id", "evidence"] {
+            let mut changed = position.clone();
+            match identity_field {
+                "row_id" => changed.snapshot_row_id += 1,
+                "snapshot_id" => changed.snapshot_id.push_str("_CHANGED"),
+                "evidence" => changed.evidence_sha256 = "c".repeat(64),
+                _ => unreachable!(),
+            }
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&changed)),
+                Ok(Some(&valuation)),
+            );
+            assert!(note.contains("持仓在校验期间变化"), "{note}");
+            assert!(note.contains("等待按当前持仓重算"), "{note}");
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn missing_or_non_finite_valuation_amounts_are_rejected() {
+        let mut cases = Vec::new();
+
+        let mut close_missing = valid_valuation();
+        close_missing.valuation.items[0].close = None;
+        cases.push(("close_missing", close_missing));
+        let mut close_non_finite = valid_valuation();
+        close_non_finite.valuation.items[0].close = Some(f64::NAN);
+        cases.push(("close_non_finite", close_non_finite));
+        let mut close_non_positive = valid_valuation();
+        close_non_positive.valuation.items[0].close = Some(0.0);
+        cases.push(("close_non_positive", close_non_positive));
+
+        let mut market_missing = valid_valuation();
+        market_missing.valuation.items[0].market_value = None;
+        cases.push(("market_missing", market_missing));
+        let mut market_non_finite = valid_valuation();
+        market_non_finite.valuation.items[0].market_value = Some(f64::INFINITY);
+        cases.push(("market_non_finite", market_non_finite));
+        let mut market_non_positive = valid_valuation();
+        market_non_positive.valuation.items[0].market_value = Some(0.0);
+        cases.push(("market_non_positive", market_non_positive));
+
+        let mut pnl_missing = valid_valuation();
+        pnl_missing.valuation.items[0].unrealized_pnl = None;
+        cases.push(("pnl_missing", pnl_missing));
+        let mut pnl_non_finite = valid_valuation();
+        pnl_non_finite.valuation.items[0].unrealized_pnl = Some(f64::NAN);
+        cases.push(("pnl_non_finite", pnl_non_finite));
+
+        let mut total_market_missing = valid_valuation();
+        total_market_missing.valuation.total_market_value = None;
+        cases.push(("total_market_missing", total_market_missing));
+        let mut total_market_non_finite = valid_valuation();
+        total_market_non_finite.valuation.total_market_value = Some(f64::INFINITY);
+        cases.push(("total_market_non_finite", total_market_non_finite));
+        let mut total_market_non_positive = valid_valuation();
+        total_market_non_positive.valuation.total_market_value = Some(0.0);
+        cases.push(("total_market_non_positive", total_market_non_positive));
+
+        let mut total_pnl_missing = valid_valuation();
+        total_pnl_missing.valuation.total_unrealized_pnl = None;
+        cases.push(("total_pnl_missing", total_pnl_missing));
+        let mut total_pnl_non_finite = valid_valuation();
+        total_pnl_non_finite.valuation.total_unrealized_pnl = Some(f64::NAN);
+        cases.push(("total_pnl_non_finite", total_pnl_non_finite));
+
+        for (case, valuation) in cases {
+            let account = valid_account();
+            let position = valid_position();
+            let note = render(
+                Some(&account),
+                Ok(Some(&position)),
+                Ok(Some(&position)),
+                Ok(Some(&valuation)),
+            );
+            assert!(
+                note.contains("金额不完整或无效"),
+                "case={case}: {note}"
+            );
+            assert_totals_hidden(&note);
+        }
+    }
+
+    #[test]
+    fn valid_valuation_keeps_independent_dates_and_system_cost_basis() {
+        let account = valid_account();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let note = render(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+
+        assert!(note.contains("2026-09-14T18:50:00+08:00"), "{note}");
+        assert!(note.contains("source=TEST_CODE_ACCOUNT"), "{note}");
+        assert!(note.contains("2026-09-14 当日盈亏 -12.50"), "{note}");
+        assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+        assert!(note.contains("source=TEST_CODE_POSITION"), "{note}");
+        assert!(note.contains("收盘估值价格日 2026-09-15"), "{note}");
+        assert!(note.contains("目标日覆盖 2/2"), "{note}");
+        assert!(note.contains("provider=TEST_CODE_VALIDATED_CLOSE"), "{note}");
+        assert!(note.contains("系统估值市值 4900.00"), "{note}");
+        assert!(
+            note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{note}"
+        );
+        assert!(!note.contains("昨日"), "{note}");
+        assert!(!note.contains("券商截图原值"), "{note}");
+    }
+
+    #[test]
+    fn invalid_account_date_does_not_hide_valid_position_valuation() {
+        let mut account = valid_account();
+        account.effective_at = "2026-09-14Tnot-rfc3339".to_string();
+        let position = valid_position();
+        let valuation = valid_valuation();
+
+        let note = render(
+            Some(&account),
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+
+        assert!(
+            note.contains("用户确认账户摘要不可用：快照时间格式无效"),
+            "{note}"
+        );
+        assert!(!note.contains("快照仓位60.0%"), "{note}");
+        assert!(!note.contains("当日盈亏 -12.50"), "{note}");
+        assert!(note.contains("2026-09-15T15:08:09+08:00"), "{note}");
+        assert!(
+            note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{note}"
+        );
+
+        let missing_account_note = render(
+            None,
+            Ok(Some(&position)),
+            Ok(Some(&position)),
+            Ok(Some(&valuation)),
+        );
+        assert!(
+            missing_account_note.contains("用户确认账户摘要缺失"),
+            "{missing_account_note}"
+        );
+        assert!(
+            missing_account_note.contains("2026-09-15T15:08:09+08:00"),
+            "{missing_account_note}"
+        );
+        assert!(
+            missing_account_note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
+            "{missing_account_note}"
+        );
+    }
+}
+
+trait BannerExternalNoteSource {
+    fn closing_valuation_note(&self) -> Option<String>;
+    fn user_confirmed_account_note(&self) -> Option<String>;
+}
+
+struct LiveBannerExternalNoteSource;
+
+impl BannerExternalNoteSource for LiveBannerExternalNoteSource {
+    fn closing_valuation_note(&self) -> Option<String> {
+        closing_valuation_note()
+    }
+
+    fn user_confirmed_account_note(&self) -> Option<String> {
+        user_confirmed_account_note()
+    }
+}
+
+fn account_status_note_from_values(
+    closing_valuation: Option<&str>,
+    user_confirmed_account: Option<&str>,
+) -> String {
+    if let Some(note) = closing_valuation {
         return format!("实时账户未接入；{note}");
     }
-    if let Some(note) = user_confirmed_account_note() {
+    if let Some(note) = user_confirmed_account {
         return format!("实时账户未接入；{note}；收盘估值不可用");
     }
     "实时账户未接入；用户确认账户摘要不可用".to_string()
+}
+
+fn account_status_note() -> String {
+    account_status_note_with_source(&LiveBannerExternalNoteSource)
+}
+
+fn account_status_note_with_source(source: &impl BannerExternalNoteSource) -> String {
+    let closing_valuation = source.closing_valuation_note();
+    let user_confirmed_account = closing_valuation
+        .is_none()
+        .then(|| source.user_confirmed_account_note())
+        .flatten();
+    account_status_note_from_values(
+        closing_valuation.as_deref(),
+        user_confirmed_account.as_deref(),
+    )
 }
 
 use stock_analysis::trading::paper_trade::{self, Direction, PaperSignal};
@@ -161,6 +1095,26 @@ impl fmt::Display for DataMode {
     }
 }
 
+#[derive(Clone)]
+struct CapturedBanner {
+    rendered: String,
+}
+
+impl CapturedBanner {
+    fn render(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Debug for CapturedBanner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedBanner")
+            .field("rendered_bytes", &self.rendered.len())
+            .finish()
+    }
+}
+
 /// v12 §14.0 全局横幅入参
 ///
 /// `total_pos` 仓位成数 (0~10). `today_pnl` 日盈亏百分比 (已带正负号).
@@ -197,14 +1151,32 @@ impl BannerCtx {
     /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
     /// 第 2 行 (可选): `[⚠️ {data_missing_note}]` — 仅 Degraded/Unsafe 时出现
     pub fn render(&self) -> String {
+        self.capture().render().to_string()
+    }
+
+    fn capture(&self) -> CapturedBanner {
+        self.capture_with_external_notes(&LiveBannerExternalNoteSource)
+    }
+
+    fn capture_with_external_notes(
+        &self,
+        source: &impl BannerExternalNoteSource,
+    ) -> CapturedBanner {
+        let closing_valuation = (!self.account_metrics_complete)
+            .then(|| source.closing_valuation_note())
+            .flatten();
+        let user_confirmed_account = (!self.account_metrics_complete
+            && closing_valuation.is_none())
+        .then(|| source.user_confirmed_account_note())
+        .flatten();
         let position = if !self.account_metrics_complete && self.total_pos.is_some() {
-            "仓位已确认".to_string()
+            "仓位批次不完整".to_string()
         } else {
             self.total_pos
                 .map_or_else(|| "仓位缺失".to_string(), |value| format!("仓位{value}成"))
         };
         let pnl = if !self.account_metrics_complete && self.today_pnl.is_some() {
-            "日盈亏已确认".to_string()
+            "日盈亏批次不完整".to_string()
         } else {
             self.today_pnl.map_or_else(
                 || "日盈亏缺失".to_string(),
@@ -219,17 +1191,24 @@ impl BannerCtx {
             pnl,
             self.data_mode.label(),
         );
-        let account_note = (!self.account_metrics_complete).then_some(account_status_note());
-        let rendered = match (self.data_missing_note.as_deref(), account_note) {
-            (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
-                format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
-            }
-            (_, Some(note)) => format!("{}\n[ℹ️ {}]", line1, note),
-            _ => line1,
-        };
-        closing_valuation_note().map_or(rendered.clone(), |note| {
-            format!("{}\n[ℹ️ {}]", rendered, note)
-        })
+        let account_note = (!self.account_metrics_complete).then(|| {
+            account_status_note_from_values(
+                closing_valuation.as_deref(),
+                user_confirmed_account.as_deref(),
+            )
+        });
+        let mut rendered = line1;
+        if let Some(note) = self
+            .data_missing_note
+            .as_deref()
+            .filter(|note| !note.is_empty() && self.data_mode != DataMode::Full)
+        {
+            rendered.push_str(&format!("\n[⚠️ {note}: 本条不含承接判断]"));
+        }
+        if let Some(note) = account_note {
+            rendered.push_str(&format!("\n[ℹ️ {note}]"));
+        }
+        CapturedBanner { rendered }
     }
 }
 
@@ -354,6 +1333,48 @@ fn append_data_mode_eta_footer(out: &mut String, eta: Option<&str>) {
     }
 }
 
+struct DataModeTextParams<'a> {
+    hhmm: &'a str,
+    old: Option<DataMode>,
+    new: DataMode,
+    missing_items: &'a str,
+    restrictions: &'a [String],
+    eta: Option<&'a str>,
+}
+
+fn render_data_mode_body(
+    params: &DataModeTextParams<'_>,
+    account_status: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
+        params.hhmm,
+        params.old.map(DataMode::label).unwrap_or("未建立"),
+        params.new.label(),
+        params.missing_items,
+    );
+    append_data_mode_restrictions(&mut out, params.restrictions);
+    if let Some(account_status) = account_status {
+        out.push_str(&format!("\n账户状态: {}", account_status));
+    }
+    append_data_mode_eta_footer(&mut out, params.eta);
+    out
+}
+
+fn render_data_mode_message(
+    banner: Option<&BannerCtx>,
+    params: &DataModeTextParams<'_>,
+    source: &impl BannerExternalNoteSource,
+) -> String {
+    if let Some(banner) = banner {
+        let mut text = format!("{}\n", banner.capture_with_external_notes(source).render());
+        text.push_str(&render_data_mode_body(params, None));
+        return text;
+    }
+    let account_status = account_status_note_with_source(source);
+    render_data_mode_body(params, Some(&account_status))
+}
+
 pub fn render_data_mode(
     hhmm: &str,
     old: Option<DataMode>,
@@ -362,17 +1383,18 @@ pub fn render_data_mode(
     restrictions: &[String],
     eta: Option<&str>,
 ) -> String {
-    let mut out = format!(
-        "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
-        hhmm,
-        old.map(DataMode::label).unwrap_or("未建立"),
-        new.label(),
-        missing_items,
-    );
-    append_data_mode_restrictions(&mut out, restrictions);
-    out.push_str(&format!("\n账户状态: {}", account_status_note()));
-    append_data_mode_eta_footer(&mut out, eta);
-    out
+    let account_status = account_status_note();
+    render_data_mode_body(
+        &DataModeTextParams {
+            hhmm,
+            old,
+            new,
+            missing_items,
+            restrictions,
+            eta,
+        },
+        Some(&account_status),
+    )
 }
 
 /// 持仓建议动作倾向
@@ -402,26 +1424,12 @@ impl Intent {
     }
 }
 
-/// 价格和成本只能描述盈亏；亏损本身不构成加仓证据。
-pub fn holding_snapshot_assessment(price: f64, cost: f64) -> (Intent, String) {
-    if !price.is_finite() || !cost.is_finite() || price <= 0.0 || cost <= 0.0 {
-        return (Intent::Hold, "价格或成本无效，暂不能形成操作建议".into());
-    }
-    let pnl = (price / cost - 1.0) * 100.0;
-    let label = if pnl < 0.0 { "浮亏" } else { "浮盈" };
-    if price <= cost * 0.92 {
-        (Intent::Reduce, format!("{label} {:.1}%，已低于成本8%参考风险线；需结合趋势复核减仓条件，不因亏损自动加仓", pnl.abs()))
-    } else {
-        (Intent::Hold, format!("{label} {:.1}%；当前仅有价格和成本，缺少支持加仓或止盈的趋势证据", pnl.abs()))
-    }
-}
-
 /// T-03 持仓操作建议
 /// v12 §14.1 T-03 HoldingPlan 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) -> String {
     let hhmm = params.hhmm;
     let mut out = format!(
-        "{}\n🎯 持仓建议 {}({})（{}）\n动作倾向: {} | 现价{} 成本{} 可用{}",
+        "{}\n🎯 持仓建议 {}({})（{}）\n动作倾向: {} | 现价{} 成本{} 可用{}股",
         banner.render(),
         params.name,
         params.code,
@@ -429,7 +1437,7 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
         params.intent.label(),
         fmt_price(params.price),
         fmt_price(params.cost),
-        params.avail.map(|quantity| format!("{quantity}股")).unwrap_or_else(|| "未核实".into()),
+        params.avail,
     );
     if let Some((lo, hi)) = params.reduce_zone {
         out.push_str(&format!(
@@ -440,9 +1448,9 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
     }
     out.push_str(&format!(
         "\n支撑{} | 压力{} | 硬止损{}",
-        params.support.map(fmt_price).unwrap_or_else(|| "暂无".into()),
-        params.pressure.map(fmt_price).unwrap_or_else(|| "暂无".into()),
-        params.stop.map(fmt_price).unwrap_or_else(|| "暂无".into()),
+        fmt_price(params.support),
+        fmt_price(params.pressure),
+        fmt_price(params.stop),
     ));
     if !params.invalidations.is_empty() {
         out.push_str("\n无效条件:");
@@ -465,11 +1473,11 @@ pub struct HoldingPlanParams<'a> {
     pub intent: Intent,
     pub price: f64,
     pub cost: f64,
-    pub avail: Option<u32>,
+    pub avail: u32,
     pub reduce_zone: Option<(f64, f64)>,
-    pub support: Option<f64>,
-    pub pressure: Option<f64>,
-    pub stop: Option<f64>,
+    pub support: f64,
+    pub pressure: f64,
+    pub stop: f64,
     pub invalidations: &'a [String],
     pub reasons: &'a [String],
 }
@@ -549,7 +1557,6 @@ pub fn render_t0_advice(banner: &BannerCtx, p: T0AdviceParams<'_>) -> String {
          触发: {}\n\
          失效: {}\n\
          说明: 总持仓{}股；观察腿由用户确认持仓计算，不代表券商已验证可卖数量；执行前必须另取≤30秒券商可用持仓并校验T+1。\n\
-         未读取卖出成交回执，接回状态仅表示价格条件；区间按常规涨跌幅估算校验，执行前核实当日实际限制。\n\
          仅观察建议，不自动下单。",
         banner.render(),
         plan.name,
@@ -974,6 +1981,17 @@ pub struct PaperTradeParams<'a> {
 /// v12 §14.1 T-11 AuctionVolume 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_auction_volume(
     banner: &BannerCtx,
+    hhmm: &str,
+    items: &[AuctionItem<'_>],
+    sentiment: &str,
+    watch_status: &str,
+) -> String {
+    let captured_banner = banner.capture();
+    render_auction_volume_from_captured(&captured_banner, hhmm, items, sentiment, watch_status)
+}
+
+fn render_auction_volume_from_captured(
+    banner: &CapturedBanner,
     hhmm: &str,
     items: &[AuctionItem<'_>],
     sentiment: &str,
@@ -2808,77 +3826,24 @@ fn fetch_realtime_quote_batch_strict(
 /// 实时行情 5s 红线 (BR-218) 盘中不变; 收市后 (21:00 晚间装配) 最后成交
 /// 时间必然超龄, 但价格=当日收盘价, 走 settled-close 准入
 /// (source_at 日期==trading_date 且该时段已收盘; 盘中误调 fail-closed)。
-///
-/// 2026-09-02 修复 (R-07 只剩做T持仓根因): settled_close_quotes 在 remote
-/// transport 下是 fail-closed stub (恒 Err) → 9/1+9/2 龙虎榜/涨停链候选
-/// 全部因「缺少同日收盘价」被 BR-222 排除。settled-close 通道本身已死,
-/// 收盘价改走 HistoricalBarsGateway (tdx-smart 日线, 与 15:05 归因修复
-/// 同源): bar.date == trading_date 才是同日收盘价, BR-222 红线 2.2 不变。
-/// 任一 code 缺目标日 bar → 整批 Err (与旧 project_settled_close_records
-/// 批不全即错的 fail-closed 语义一致) → 调用方回退 closes 视图。
-async fn fetch_same_day_closes(
-    codes: &[String],
+fn fetch_settled_close_batch_strict(
+    codes: &[&str],
     trading_date: chrono::NaiveDate,
-) -> Result<std::collections::HashMap<String, f64>, String> {
+) -> Result<
+    std::collections::HashMap<String, stock_analysis::data_gateway::RealtimeMarketQuote>,
+    String,
+> {
     if codes.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let gateway = stock_analysis::data_gateway::HistoricalBarsGateway::new();
-    let mut closes = std::collections::HashMap::with_capacity(codes.len());
-    for code in codes {
-        let admitted = gateway
-            .required_daily_bars_async(code, 5)
-            .await
-            .map_err(|error| format!("历史日线不可用 (R-07 {trading_date} 收盘快照): {error}"))?;
-        let bar = admitted
-            .records()
-            .iter()
-            .find(|bar| bar.date == trading_date)
-            .ok_or_else(|| {
-                let dates: Vec<String> = admitted
-                    .records()
-                    .iter()
-                    .map(|bar| bar.date.to_string())
-                    .collect();
-                format!(
-                    "{code}: 目标日 {trading_date} 无日线记录 (可用: {})",
-                    dates.join(",")
-                )
-            })?;
-        closes.insert(code.clone(), bar.close);
+    let requested: Vec<String> = codes.iter().map(|code| (*code).to_string()).collect();
+    let batch = stock_analysis::data_gateway::MarketDataGateway::new()
+        .settled_close_quotes(&requested, trading_date)
+        .map_err(|error| format!("盘后收盘快照 Gateway 不可用: {error}"))?;
+    if batch.is_verified_empty() {
+        return Err("盘后收盘快照 Gateway 返回不允许的 verified-empty".to_string());
     }
-    Ok(closes)
-}
-
-/// R-07 名称补齐 (display-only): BR-225 证券身份统一 Gateway
-/// (news_ai BR-250 卡片标的名同源, 24/7 静态目录, 无收盘/新鲜度门)。
-/// 目录不可用或缺 code → 该 code 缺席 → 调用方回退 closes 视图 → code,
-/// 名称缺失不阻断候选 (与 BR-250 降级仅代码同一容错哲学)。
-async fn fetch_security_names(
-    codes: &[String],
-) -> std::collections::HashMap<String, String> {
-    if codes.is_empty() {
-        return std::collections::HashMap::new();
-    }
-    use stock_analysis::data_gateway::{GatewayBatch, MarketCapabilitiesGateway};
-    let batch = match MarketCapabilitiesGateway::new()
-        .security_identities(codes)
-        .await
-    {
-        Ok(batch) => batch,
-        Err(error) => {
-            log::warn!("[R-07][BR-233] 证券身份目录不可用, 名称回退 closes/code: {error}");
-            return std::collections::HashMap::new();
-        }
-    };
-    let records = match batch {
-        GatewayBatch::Available { records, .. } => records,
-        GatewayBatch::VerifiedEmpty(_) => return std::collections::HashMap::new(),
-    };
-    records
-        .into_iter()
-        .map(|identity| (identity.code.clone(), identity.name.clone()))
-        .collect()
+    project_settled_close_records(&requested, batch.records())
 }
 
 /// BR-164/BR-233: preserve the exact requested identity set when projecting an
@@ -5103,6 +6068,823 @@ async fn dispatch_post_fixed_price_fill_outcome(
     clippy::too_many_arguments,
     reason = "stable ST rule-change protocol boundary mirrors the documented template fields"
 )]
+/// T-16 ST 涨跌幅变更提醒 counted binding: occurrence = st-price:{业务日}:{code}。
+/// canonical 只含业务事实 (name/hhmm 为展示字段, 不进 identity/hash — BR-250 纪律)。
+pub fn build_st_price_counted_binding(
+    business_date: chrono::NaiveDate,
+    params: &StPriceLimitChangedParams<'_>,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "st-price-limit-changed-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": params.code,
+        "st_type": format!("{:?}", params.st_type),
+        "old_limit": params.old_limit,
+        "new_limit": params.new_limit,
+        "holding_qty": params.holding_qty,
+        "cost": params.cost,
+        "now_price": params.now_price,
+        "new_stop_loss": params.new_stop_loss,
+        "new_take_profit": params.new_take_profit,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (BJ/ETF 安全, 不用 starts_with('6') 启发式 — 配方 §4)。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        params.code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("T-16 证券身份解析失败 code={}: {error}", params.code))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("st-price:{business_date}:{}", params.code),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("T-16 counted binding 构造失败 code={}: {error}", params.code))
+}
+
+/// A-12 归因日推 counted binding: occurrence = attribution-daily:{业务日},
+/// Global BusinessDateOnce (每日必达, 豁免日预算 — 2026-09-20 分流规则)。
+/// canonical = 业务日 + 渲染文本 sha256 (同事实同字节, decision 回放稳定)。
+/// G5b 深链归因 counted binding: 每事件一推 (≤3/日), occurrence =
+/// g5b-attribution:{业务日}:{code}:{事件事实 hash} — identity 与真实事件粒度对齐
+/// (v14 event_id 每事件稳定, 且为未来 Rolling 每事件冷却迁移预留)。
+/// canonical = row 事实 + 渲染 sha256; Global scope (告警 code 不强制解析证券身份),
+/// WindowMode::None 无冷却 (镜像 HoldingEvent 先例)。
+pub fn build_g5b_counted_binding(
+    business_date: chrono::NaiveDate,
+    record: &stock_analysis::monitor::alert_log::AlertRecord,
+    summary: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let event_facts = format!(
+        "{}|{}|{}|{}",
+        record.triggered_at, record.code, record.category, record.message
+    );
+    let event_hash = hex::encode(Sha256::digest(event_facts.as_bytes()));
+    let rendered_sha256 = hex::encode(Sha256::digest(summary.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "g5b-attribution-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": record.code,
+        "triggered_at": record.triggered_at,
+        "category": record.category,
+        "level": record.level,
+        "message": record.message,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("g5b-attribution:{business_date}:{}:{event_hash}", record.code),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("G5b counted binding 构造失败: {error}"))
+}
+
+pub fn build_attribution_daily_counted_binding(
+    business_date: chrono::NaiveDate,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "attribution-daily-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("attribution-daily:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("A-12 counted binding 构造失败: {error}"))
+}
+
+/// I-01 盘中轮动 counted binding 的 occurrence 生产者区分。同 kind 四个语义:
+/// 每日一次健康提醒 (BR-226 快照/盘前预检)、5 分钟周期信息卡 (R-02 盘面走向)
+/// 与手工工具轮动总览, 各自独立 occurrence, 互不挤占身份; 冷却仍共享
+/// per-kind 900s 全局头 (镜像旧 L4)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntradayProducer {
+    /// BR-226 持仓快照新鲜度提醒 (15:05, 每日一次)
+    SnapshotReminder,
+    /// 开盘前行情源预检失败 (9:10-9:20, 每日一次, 仅失败时出声)
+    PreopenProbe,
+    /// R-02 盘中盘面走向 (每 5 分钟硬推, 每时间槽独立 occurrence)
+    MarketView { hhmm: String },
+    /// I-01 板块轮动总览 (仅 --push 手工工具经 dispatch_intraday_market_daily;
+    /// 生产盘中轮动已由 R-02 盘面走向替代, 每时间槽独立 occurrence)
+    SectorRotation { hhmm: String },
+}
+
+impl IntradayProducer {
+    fn identity_suffix(&self) -> String {
+        match self {
+            Self::SnapshotReminder => "snapshot-reminder".to_owned(),
+            Self::PreopenProbe => "preopen-probe".to_owned(),
+            Self::MarketView { hhmm } => format!("market-view:{hhmm}"),
+            Self::SectorRotation { hhmm } => format!("sector-rotation:{hhmm}"),
+        }
+    }
+
+    /// 旧语义保真: 各生产者自有进程内补偿 (BR-226 次日再检 / 预检窗口即弃 /
+    /// R-02 5 分钟循环新渲染重试 / 轮动总览手工重跑), durable 补发只会推送
+    /// 过时时间戳内容 (R-02 全天失败时重启 flood 风险) — 故 sink 失败不授权
+    /// 重试, 只留审计。
+    fn retry_authorized(&self) -> bool {
+        match self {
+            Self::SnapshotReminder
+            | Self::PreopenProbe
+            | Self::MarketView { .. }
+            | Self::SectorRotation { .. } => false,
+        }
+    }
+}
+
+/// I-01 counted binding: canonical = 业务日 + 生产者 + 渲染文本 sha256
+/// (A-12/G5b 模式, 同事实同字节 decision 回放稳定); Global scope (盘面为
+/// 市场级事实, 无票维度); policy 行 Rolling 900s 镜像旧 L4 全局冷却。
+pub fn build_intraday_counted_binding(
+    business_date: chrono::NaiveDate,
+    producer: IntradayProducer,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "intraday-market-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "producer": producer.identity_suffix(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("intraday:{business_date}:{}", producer.identity_suffix()),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        producer.retry_authorized(),
+    )
+    .map_err(|error| format!("I-01 counted binding 构造失败: {error}"))
+}
+
+/// I-02 新闻催化 counted binding: 事件驱动 (Important 公告非空时调一次),
+/// 每时间槽独立 occurrence news-catalyst:{业务日}:{hhmm}; canonical =
+/// 业务日 + 渲染 sha256 (LLM 非确定 → 分析后构造, G5b 先例); Global scope;
+/// retry_authorized=false (旧语义一次性调用失败即弃, 无进程内重试; 内容含
+/// 时刻锚定, 补发即过时 — I-01 同理由)。
+pub fn build_news_catalyst_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-catalyst-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-catalyst:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("I-02 counted binding 构造失败: {error}"))
+}
+
+/// BR-033 大宗盘中确认 counted binding: canonical = 业务日 + 票 + 成交事实
+/// (qty/price/board/settle — T-16 模式, hhmm/name 展示字段不进 identity,
+/// BR-250 纪律; block_type/real_time_confirm 为 guard 常量不进); occurrence
+/// block-trade-confirm:{业务日}:{code} 每票每日一次; PerTicket scope (旧 L4
+/// 逐票两层 300s 冷却, 批量多票互不阻塞); retry_authorized=true (盘后 review
+/// 侧推可被 backfill 重跑, 内容 = 历史成交事实, 补发仍有效 — A-12/G5b 先例)。
+pub fn build_block_trade_confirm_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    qty: u32,
+    price: f64,
+    board: Board,
+    next_session_settle: SettleType,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "block-trade-confirm-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "qty": qty,
+        "price": price,
+        "board": format!("{board:?}"),
+        "next_session_settle": format!("{next_session_settle:?}"),
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (BJ/别名码 fail-closed — 配方 §4)。BR-033 票池
+    // 300/301/688 均为 A 股, require_a_share 恒成立; 解析失败拒绝推送。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("BR-033 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("block-trade-confirm:{business_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("BR-033 counted binding 构造失败 code={code}: {error}"))
+}
+
+/// A-11 IPO 阶段催化 counted binding: 每日一次全市场 digest (空 code Global
+/// 形态); canonical = 业务日 + 渲染 sha256 (hits 结构复杂, I-01/I-02 模式;
+/// 渲染确定性 + 历史公告批次稳定 → 同事实回放稳定); occurrence
+/// ipo-catalyst:{业务日}; retry_authorized=true (backfill 重跑 side route
+/// 是既有补偿路径, 内容 = 该业务日历史 digest 补发仍有效)。
+pub fn build_ipo_catalyst_counted_binding(
+    business_date: chrono::NaiveDate,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "ipo-catalyst-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("ipo-catalyst:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("A-11 counted binding 构造失败: {error}"))
+}
+
+/// MU-snapshot-stale 渲染 (2026-09-20): 快照过期提醒文本 (原 main.rs inline,
+/// 单一事实源收敛)。
+pub fn render_snapshot_stale(days_behind: i64, effective_at: &str, total_assets: f64) -> String {
+    format!(
+        "[快照提醒] 持仓快照已 {days_behind} 个交易日未更新：最新 {effective_at}（总资产 {total_assets:.2}）。期间收益为自动估算（持仓×实时行情）；若真实持仓有变动，请上传最新截图。"
+    )
+}
+
+/// MU-snapshot-stale counted binding (2026-09-20): canonical = 业务日 + 业务
+/// 事实 (days_behind/effective_at/total_assets); occurrence
+/// snapshot-stale:{业务日} 每日一次 (镜像进程内 SnapshotReminderGate);
+/// Global scope; retry_authorized=false (days_behind 相对今日时刻锚定, 补发
+/// 会低估过期天数; 进程内 gate 失败保留重试资格 + 次日启动重算补偿 —
+/// I-01 论据)。
+pub fn build_snapshot_stale_counted_binding(
+    business_date: chrono::NaiveDate,
+    days_behind: i64,
+    effective_at: &str,
+    total_assets: f64,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "snapshot-stale-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "days_behind": days_behind,
+        "effective_at": effective_at,
+        "total_assets": total_assets,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("snapshot-stale:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("快照提醒 counted binding 构造失败: {error}"))
+}
+
+/// MU-limit-boards counted binding (2026-09-20): 每 shape 每时间槽 occurrence
+/// limit-boards:{业务日}:{shape}:{hhmm} (I-01 MarketView 模式); canonical =
+/// 业务日 + shape + 渲染 sha256; Global scope (3 shape 共享 kind-全局头,
+/// 保真旧 L4 默认 1800s 互相阻塞语义); retry_authorized=false (盘中状态
+/// 快照时刻锚定 + 周期循环重渲染补偿 — I-01 论据)。
+pub fn build_limit_boards_counted_binding(
+    business_date: chrono::NaiveDate,
+    shape: LimitBoardsShape,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "limit-boards-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "shape": format!("{shape:?}"),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("limit-boards:{business_date}:{shape:?}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("涨停板 counted binding 构造失败: {error}"))
+}
+
+/// MU-data-mode counted binding (2026-09-20): occurrence
+/// data-mode:{业务日}:{old:?}:{new:?} — 变迁对即身份 (BR-116 committed-mode
+/// 去重语义, 同日多次变迁互不杀身份); canonical = 业务日 + 变迁对 + 渲染
+/// sha256; Global scope; retry_authorized=true (系统健康告警必达 + 内容为
+/// 状态变迁事实, 补发仍有效 — A-12 先例)。
+pub fn build_data_mode_counted_binding(
+    business_date: chrono::NaiveDate,
+    prev_mode: Option<stock_analysis::monitor::data_mode::DataMode>,
+    new_mode: stock_analysis::monitor::data_mode::DataMode,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let old_str = prev_mode
+        .map(|mode| format!("{mode:?}"))
+        .unwrap_or_else(|| "None".to_owned());
+    let new_str = format!("{new_mode:?}");
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "data-mode-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "old": old_str,
+        "new": new_str,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("data-mode:{business_date}:{old_str}:{new_str}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("数据模式 counted binding 构造失败: {error}"))
+}
+
+/// MU-auction-candidates: A-02 竞价重推 counted binding (2026-09-20):
+/// occurrence auction-repush:{业务日}:{hhmm} (每时间槽, I-01 模式);
+/// canonical = 业务日 + 渲染 sha256; Global scope; retry_authorized=false
+/// (盘中竞价快照时刻锚定 + 下一轮 repush 重渲染补偿 — I-01 论据)。
+pub fn build_auction_repush_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "auction-repush-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("auction-repush:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("A-02 counted binding 构造失败: {error}"))
+}
+
+/// MU-auction-candidates: T-08 候选失效 counted binding (2026-09-20):
+/// occurrence candidate-invalidated:{业务日}:{code} (每票每日失效事件);
+/// canonical = 业务日 + 票 + prev/reason + 渲染 sha256; PerTicket scope
+/// (旧逐票 30 min 冷却); retry_authorized=true (内容 = 失效事件事实,
+/// 补发仍有效; 旧系统失效推送无进程内补偿 — durable 是唯一恢复路径)。
+pub fn build_candidate_invalidated_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    prev: &str,
+    reason: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "candidate-invalidated-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "prev": prev,
+        "reason": reason,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 解析失败 fail-closed 拒绝推送。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("T-08 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("candidate-invalidated:{business_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("T-08 counted binding 构造失败 code={code}: {error}"))
+}
+
+/// MU-announcement: S-01 公告源事实 counted binding (2026-09-20):
+/// occurrence announcement:{业务日}:{source}:{event_id} (event_id 为
+/// provider-scoped — 加 source 段防跨源同日碰撞; 旧语义 v14 memo 仅
+/// event_id 去重, 此更强非回归); canonical = 业务日 + event 事实 +
+/// 渲染 sha256; Global scope
+/// (公告可无票, 市场级); retry_authorized=true (公告 = 历史事实, 补发仍
+/// 有效; 旧系统新闻轮询 dedup 后事件不再来 — durable 是唯一恢复路径,
+/// T-08 同论据)。业务日锚定 observed_at (观察时刻, 回放稳定)。
+pub fn build_announcement_counted_binding(
+    business_date: chrono::NaiveDate,
+    event_id: &str,
+    code: Option<&str>,
+    title: &str,
+    source: &str,
+    strength: u8,
+    certainty: u8,
+    stale: bool,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "announcement-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "event_id": event_id,
+        "code": code,
+        "title": title,
+        "source": source,
+        "strength": strength,
+        "certainty": certainty,
+        "stale": stale,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("announcement:{business_date}:{source}:{event_id}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("S-01 counted binding 构造失败: {error}"))
+}
+
+/// MU-analyst: S-05 分析师上调 counted binding (2026-09-20): occurrence
+/// analyst-upgrade:{业务日}:{source}:{event_id} (event_id 为 provider-
+/// scoped, 加 source 段防跨源碰撞 — S-01 同形); canonical = 业务日 +
+/// event 事实 + 渲染 sha256; Global scope; retry_authorized=true (历史
+/// 事实 + 旧轮询 dedup 后不重发, durable 唯一恢复路径 — S-01 同论据)。
+pub fn build_analyst_upgrade_counted_binding(
+    business_date: chrono::NaiveDate,
+    event_id: &str,
+    code: Option<&str>,
+    title: &str,
+    source: &str,
+    strength: u8,
+    certainty: u8,
+    stale: bool,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "analyst-upgrade-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "event_id": event_id,
+        "code": code,
+        "title": title,
+        "source": source,
+        "strength": strength,
+        "certainty": certainty,
+        "stale": stale,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("analyst-upgrade:{business_date}:{source}:{event_id}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("S-05 counted binding 构造失败: {error}"))
+}
+
+/// MU-d01: D-01 新闻到灵感 counted binding (2026-09-20): occurrence
+/// news-to-idea:{业务日}:{code}:{hhmm} (每票每槽); canonical = 业务日 +
+/// 票 + 渲染 sha256 (LLM 非确定 → 分析后构造, G5b/I-02 模式); PerTicket
+/// scope (镜像 L4 20 min/票); retry_authorized=false (LLM 内容 + hhmm
+/// 时刻锚定 + 进程内 D01 memo 1h/票补偿 + 手工工具重跑 — I-01/I-02
+/// 论据)。
+pub fn build_news_to_idea_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-to-idea-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 手工工具任意码解析失败 fail-closed。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("D-01 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-to-idea:{business_date}:{code}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("D-01 counted binding 构造失败 code={code}: {error}"))
+}
+
+/// MU-auction-volume: P-02 竞价热点量能 counted binding (2026-09-20):
+/// occurrence auction-volume:{业务日}:{hhmm} (每槽一卡, I-01 模式);
+/// canonical = 业务日 + 渲染 sha256; Global scope (旧 L4 空 code
+/// kind-全局 600s); retry_authorized=false (盘中竞价快照时刻锚定 +
+/// 30s 轮询重渲染补偿 — I-01 论据)。
+pub fn build_auction_volume_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "auction-volume-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("auction-volume:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("P-02 counted binding 构造失败: {error}"))
+}
+
+/// MU-industry-chain-intraday: I-03 盘中涨停扩散 counted binding
+/// (2026-09-20): occurrence industry-chain-intraday:{业务日}:{code}:{hhmm}
+/// (每票每槽); canonical = 业务日 + 票 + 渲染 sha256 (LLM 非确定,
+/// G5b/I-02 模式); PerTicket scope (镜像 L4 30 min/票);
+/// retry_authorized=false (LLM 时刻锚定 + 周期重渲染补偿 — I-01 论据)。
+pub fn build_industry_chain_intraday_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "industry-chain-intraday-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 手工工具任意码解析失败 fail-closed。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("I-03 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("industry-chain-intraday:{business_date}:{code}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("I-03 counted binding 构造失败 code={code}: {error}"))
+}
+
+/// MU-news-flash-aggregate: N-02 新闻聚合 counted binding (2026-09-20):
+/// occurrence news-flash-agg:{业务日}:{window}:{hhmm} (每窗口每槽, I-01
+/// 模式); canonical = 业务日 + window + 渲染 sha256; Global scope;
+/// retry_authorized=false (盘中聚合时刻锚定, 下一窗口重渲染补偿 — I-01
+/// 论据)。注: reservation 结算流 (push_flash_reservations) 保留自营
+/// 持久化, 不经 counted 协调器 (第三引擎模式, D-01 news-ai 同型)。
+pub fn build_news_flash_aggregated_counted_binding(
+    business_date: chrono::NaiveDate,
+    window: &str,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-flash-aggregated-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "window": window,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-flash-agg:{business_date}:{window}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("N-02 counted binding 构造失败: {error}"))
+}
+
+/// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
+/// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
+/// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
+/// family+renderer 派生); counted 门取 CountedSourceOnly (requires_banner=
+/// false, BR-241 公共源形态)。
+pub async fn push_limit_boards_counted(
+    business_date: chrono::NaiveDate,
+    shape: LimitBoardsShape,
+    hhmm: &str,
+    lines: &[String],
+) -> crate::notify::PushOutcome {
+    let (family, assembler) = match shape {
+        LimitBoardsShape::First => ("L-01-limit-boards-first", "assemble_limit_boards_first"),
+        LimitBoardsShape::Second => (
+            "L-02-limit-boards-second",
+            "assemble_limit_boards_second",
+        ),
+        LimitBoardsShape::ThirdPlus => (
+            "L-03-limit-boards-third-plus",
+            "assemble_limit_boards_third_plus",
+        ),
+    };
+    let text = match render_limit_boards_shape(shape, hhmm, lines) {
+        Ok(text) => text,
+        Err(error) => {
+            log::error!("[涨停板] 展示失败: {error}");
+            return crate::notify::PushOutcome::Denied(error);
+        }
+    };
+    match build_limit_boards_counted_binding(business_date, shape, hhmm, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                family,
+                crate::notify::PushKind::LimitBoards,
+                "monitor_limit_board_producer",
+                assembler,
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[涨停板][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -5115,8 +6897,7 @@ pub async fn dispatch_st_price_limit_changed(
     now_price: f64,
     new_stop_loss: Option<f64>,
     new_take_profit: Option<f64>,
-    banner: &BannerCtx,
-) -> bool {
+) -> crate::notify::PushOutcome {
     let params = StPriceLimitChangedParams {
         hhmm,
         name,
@@ -5130,29 +6911,43 @@ pub async fn dispatch_st_price_limit_changed(
         new_stop_loss,
         new_take_profit,
     };
-    let text = render_st_price_limit_changed(params);
-    let result = dispatch_registered_outcome!(
+    let attempt_note = format!(
+        "st_type={:?} {}→{}%",
+        st_type,
+        old_limit * 100.0,
+        new_limit * 100.0
+    );
+    let business_date = chrono::Local::now().date_naive();
+    let binding = match build_st_price_counted_binding(business_date, &params) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            log::error!("[T-16][BR-192] {reason}");
+            log_dispatcher_attempt("T-16", false, 1, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let presentation_token = match crate::presentation_registry::acquire_token(
         "T-16-st-price-limit-changed",
         crate::notify::PushKind::StPriceLimitChanged,
         "st_price_limit_dispatcher",
         "render_st_price_limit_changed",
-        code,
-        Some(banner),
-        text
-    )
-    .is_pushed();
-    log_dispatcher_attempt(
-        "T-16",
-        result,
-        1,
-        &format!(
-            "st_type={:?} {}→{}%",
-            st_type,
-            old_limit * 100.0,
-            new_limit * 100.0
-        ),
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!("[T-16][BR-196] st-price presentation token rejected: {reason}");
+            log_dispatcher_attempt("T-16", false, 1, &reason);
+            return crate::notify::PushOutcome::Denied(reason);
+        }
+    };
+    let text = render_st_price_limit_changed(params);
+    let outcome =
+        crate::notify::push_counted_with_binding(presentation_token, &text, None, binding).await;
+    let handled = matches!(
+        outcome,
+        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
     );
-    result
+    log_dispatcher_attempt("T-16", handled, 1, &attempt_note);
+    outcome
 }
 
 /// v47: T-17 ETF 收盘集合竞价 dispatcher
@@ -5195,6 +6990,7 @@ pub async fn dispatch_etf_closing_call_auction(
 /// BR-033: 创业板/科创板协议大宗盘中实时确认。
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_block_trade_intraday_confirm(
+    business_date: chrono::NaiveDate,
     hhmm: &str,
     name: &str,
     code: &str,
@@ -5227,18 +7023,40 @@ pub async fn dispatch_block_trade_intraday_confirm(
         real_time_confirm,
         next_session_settle,
     });
-    let result = dispatch_registered_outcome!(
-        "BR-033-block-trade-confirm",
-        crate::notify::PushKind::BlockTradeIntradayConfirm,
-        "block_trade_dispatcher",
-        "render_block_trade_intraday_confirm",
+    // 2026-09-20: BR-033 升级 counted (MU-block-confirm)。盘后 review side
+    // route (BR-223) 每票每日一次; counted 门 (v14_gate_counted_binding) 取
+    // CountedSourceOnly (requires_banner=false, BR-241 公共源形态 — 不虚构
+    // banner 依赖), 与 T-16/A-12 同形态。BusinessDateOnce 幂等 + 豁免日预算。
+    match build_block_trade_confirm_counted_binding(
+        business_date,
         code,
-        None,
-        text
+        qty,
+        price,
+        board,
+        next_session_settle,
     )
-    .is_pushed();
-    log_dispatcher_attempt("T-18", result, 1, &format!("board={board:?}"));
-    result
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "BR-033-block-trade-confirm",
+            crate::notify::PushKind::BlockTradeIntradayConfirm,
+            "block_trade_dispatcher",
+            "render_block_trade_intraday_confirm",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            let result = crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed();
+            log_dispatcher_attempt("T-18", result, 1, &format!("board={board:?}"));
+            result
+        }
+        Err(reason) => {
+            log::error!("[BR-033][BR-196] counted 准备失败: {reason}");
+            log_dispatcher_attempt("T-18", false, 1, &format!("board={board:?}"));
+            false
+        }
+    }
 }
 
 /// BR-034: 北交所大宗区间以当日竞价实时均价为口径。
@@ -5938,49 +7756,155 @@ pub struct AuctionVolumeSnapshot {
     pub watch_status: String,                        // 观察状态描述
 }
 
-/// v37: 加载 P-02 快照 - 复用 limit_up_stocks
-pub fn load_auction_volume_snapshot_real(
-    hhmm: &str,
-    trading_date: chrono::NaiveDate,
-) -> Result<AuctionVolumeSnapshot, String> {
-    use stock_analysis::market_analyzer::MarketAnalyzer;
-    let analyzer = match MarketAnalyzer::new(None) {
-        Ok(a) => a,
-        Err(error) => return Err(format!("竞价量能 analyzer 初始化失败: {error}")),
-    };
-    let limit_stocks = match analyzer.get_limit_up_stocks(trading_date) {
-        Ok(s) => s,
-        Err(error) => return Err(format!("竞价量能涨停列表获取失败: {error}")),
-    };
-    if limit_stocks.is_empty() {
-        return Err("竞价量能涨停列表为空".to_string());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuctionVolumeRejectionCounts {
+    source_rows: usize,
+    valid_rows: usize,
+    notified_valid_rows: usize,
+    missing_volume_ratio_rows: usize,
+    invalid_volume_ratio_rows: usize,
+    invalid_price_rows: usize,
+    invalid_change_pct_rows: usize,
+}
+
+impl AuctionVolumeRejectionCounts {
+    pub fn source_rows(&self) -> usize {
+        self.source_rows
     }
-    // 按量比降序, 取前 10
-    let mut sorted = limit_stocks.clone();
-    sorted.sort_by(|a, b| {
-        b.volume_ratio
-            .partial_cmp(&a.volume_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let items: Vec<(String, String, f64, f64, f64)> = sorted
-        .iter()
+
+    pub fn valid_rows(&self) -> usize {
+        self.valid_rows
+    }
+
+    pub fn notified_valid_rows(&self) -> usize {
+        self.notified_valid_rows
+    }
+
+    pub fn missing_volume_ratio_rows(&self) -> usize {
+        self.missing_volume_ratio_rows
+    }
+
+    pub fn invalid_volume_ratio_rows(&self) -> usize {
+        self.invalid_volume_ratio_rows
+    }
+
+    pub fn invalid_price_rows(&self) -> usize {
+        self.invalid_price_rows
+    }
+
+    pub fn invalid_change_pct_rows(&self) -> usize {
+        self.invalid_change_pct_rows
+    }
+
+    pub fn all_source_rows_valid_and_notified(&self) -> bool {
+        self.source_rows > 0
+            && self.valid_rows == self.source_rows
+            && self.notified_valid_rows == self.source_rows
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuctionVolumeSelectionError {
+    SourceRowsEmpty,
+    NoEligibleUnnotifiedRows(AuctionVolumeRejectionCounts),
+}
+
+impl fmt::Display for AuctionVolumeSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceRowsEmpty => formatter.write_str("竞价量能涨停列表为空"),
+            Self::NoEligibleUnnotifiedRows(counts) => write!(
+                formatter,
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: \
+                 source_rows={} valid_rows={} notified_valid_rows={} \
+                 missing_volume_ratio_rows={} invalid_volume_ratio_rows={} \
+                 invalid_price_rows={} invalid_change_pct_rows={}",
+                counts.source_rows,
+                counts.valid_rows,
+                counts.notified_valid_rows,
+                counts.missing_volume_ratio_rows,
+                counts.invalid_volume_ratio_rows,
+                counts.invalid_price_rows,
+                counts.invalid_change_pct_rows,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuctionVolumeSelectionError {}
+
+/// 从一次涨停池采集构造 P-02 快照。
+///
+/// `notified` 必须是本次 tick 开始时的通知集合；返回的 `items` 是后续渲染、
+/// 入池与通知游标推进共同使用的不可变选中批次。
+pub fn prepare_auction_volume_snapshot(
+    hhmm: &str,
+    limit_stocks: &[stock_analysis::market_data::TopStock],
+    notified: &std::collections::HashSet<String>,
+) -> Result<AuctionVolumeSnapshot, AuctionVolumeSelectionError> {
+    if limit_stocks.is_empty() {
+        return Err(AuctionVolumeSelectionError::SourceRowsEmpty);
+    }
+
+    // 排除无效及已通知票后再排序、取 Top10；稳定排序保留相同量比的输入次序。
+    let mut counts = AuctionVolumeRejectionCounts {
+        source_rows: limit_stocks.len(),
+        valid_rows: 0,
+        notified_valid_rows: 0,
+        missing_volume_ratio_rows: 0,
+        invalid_volume_ratio_rows: 0,
+        invalid_price_rows: 0,
+        invalid_change_pct_rows: 0,
+    };
+    let mut eligible = Vec::new();
+    for stock in limit_stocks {
+        let ratio = match stock.volume_ratio {
+            Some(ratio) if ratio.is_finite() && ratio > 0.0 => Some(ratio),
+            Some(_) => {
+                counts.invalid_volume_ratio_rows += 1;
+                None
+            }
+            None => {
+                counts.missing_volume_ratio_rows += 1;
+                None
+            }
+        };
+        let price_is_valid = stock.price.is_finite() && stock.price > 0.0;
+        if !price_is_valid {
+            counts.invalid_price_rows += 1;
+        }
+        let change_pct_is_valid = stock.change_pct.is_finite();
+        if !change_pct_is_valid {
+            counts.invalid_change_pct_rows += 1;
+        }
+
+        if let Some(ratio) = ratio.filter(|_| price_is_valid && change_pct_is_valid) {
+            counts.valid_rows += 1;
+            if notified.contains(&stock.code) {
+                counts.notified_valid_rows += 1;
+            } else {
+                eligible.push((stock, ratio));
+            }
+        }
+    }
+    eligible.sort_by(|(_, a_ratio), (_, b_ratio)| b_ratio.total_cmp(a_ratio));
+    let items: Vec<(String, String, f64, f64, f64)> = eligible
+        .into_iter()
         .take(10)
-        .filter_map(|s| {
-            let Some(volume_ratio) = s.volume_ratio else {
-                log::warn!("[P-02] {}({}) 量比缺失，跳过竞价量能快照", s.name, s.code);
-                return None;
-            };
-            Some((
-                s.name.clone(),
-                s.code.clone(),
-                s.change_pct,
+        .map(|(stock, volume_ratio)| {
+            (
+                stock.name.clone(),
+                stock.code.clone(),
+                stock.change_pct,
                 volume_ratio,
-                s.price,
-            ))
+                stock.price,
+            )
         })
         .collect();
     if items.is_empty() {
-        return Err("竞价热点无具备真实量比的有效行".to_string());
+        return Err(AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(
+            counts,
+        ));
     }
 
     // sentiment: 平均量比 >= 3 强承接, >= 1 一般, < 1 弱承接
@@ -6001,87 +7925,256 @@ pub fn load_auction_volume_snapshot_real(
     })
 }
 
-/// v37: P-02 dispatcher
-pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let hhmm_owned = hhmm.to_string();
-    let trading_date = chrono::Local::now().date_naive();
-    let snapshot = match crate::blocking_market_data::run_blocking_market_data(
-        "P-02 auction volume snapshot",
-        move || load_auction_volume_snapshot_real(&hhmm_owned, trading_date),
-    )
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            log_dispatcher_attempt("P-02", false, 0, &error);
-            log::warn!("[P-02] 竞价量能快照不可用: {}", error);
-            return false;
-        }
+#[derive(Debug)]
+pub struct AuctionVolumeTickData {
+    pub limit_stocks: Vec<stock_analysis::market_data::TopStock>,
+    pub snapshot: Result<AuctionVolumeSnapshot, AuctionVolumeSelectionError>,
+    source_observation: Option<stock_analysis::market_analyzer::LimitUpObservation>,
+}
+
+impl AuctionVolumeTickData {
+    /// The real loader retains the exact audited acquisition used for both
+    /// projections. Pure algorithm seams deliberately return `None`.
+    pub fn source_observation(
+        &self,
+    ) -> Option<&stock_analysis::market_analyzer::LimitUpObservation> {
+        self.source_observation.as_ref()
+    }
+}
+
+fn load_auction_volume_tick_with<Loader>(
+    hhmm: &str,
+    trading_date: chrono::NaiveDate,
+    notified: &std::collections::HashSet<String>,
+    mut loader: Loader,
+) -> Result<AuctionVolumeTickData, String>
+where
+    Loader: FnMut(chrono::NaiveDate) -> Result<Vec<stock_analysis::market_data::TopStock>, String>,
+{
+    let limit_stocks = loader(trading_date)?;
+    let snapshot = prepare_auction_volume_snapshot(hhmm, &limit_stocks, notified);
+    Ok(AuctionVolumeTickData {
+        limit_stocks,
+        snapshot,
+        source_observation: None,
+    })
+}
+
+/// v37: 一次加载 Auction 分支共享的涨停池，并从同一 Vec 准备 P-02 快照。
+pub fn load_auction_volume_tick_real(
+    hhmm: &str,
+    trading_date: chrono::NaiveDate,
+    notified: &std::collections::HashSet<String>,
+) -> Result<AuctionVolumeTickData, String> {
+    use stock_analysis::market_analyzer::MarketAnalyzer;
+    let analyzer = match MarketAnalyzer::new(None) {
+        Ok(a) => a,
+        Err(error) => return Err(format!("竞价量能 analyzer 初始化失败: {error}")),
     };
-    // 构造 AuctionItem refs
+    let source_observation = analyzer
+        .get_limit_up_observation(trading_date)
+        .map_err(|error| format!("竞价量能涨停列表获取失败: {error}"))?;
+    let limit_stocks = source_observation.stocks().to_vec();
+    let snapshot = prepare_auction_volume_snapshot(hhmm, &limit_stocks, notified);
+    Ok(AuctionVolumeTickData {
+        limit_stocks,
+        snapshot,
+        source_observation: Some(source_observation),
+    })
+}
+
+struct PreparedAuctionVolumeDispatch {
+    message: String,
+    records: Vec<stock_analysis::signal::push_recorder::PushRecordMeta>,
+    notified_codes: std::collections::HashSet<String>,
+}
+
+impl PreparedAuctionVolumeDispatch {
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn records(&self) -> &[stock_analysis::signal::push_recorder::PushRecordMeta] {
+        &self.records
+    }
+
+    fn notified_codes(&self) -> &std::collections::HashSet<String> {
+        &self.notified_codes
+    }
+}
+
+impl fmt::Debug for PreparedAuctionVolumeDispatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedAuctionVolumeDispatch")
+            .field("message_bytes", &self.message.len())
+            .field("record_count", &self.records.len())
+            .field("notified_code_count", &self.notified_codes.len())
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedAuctionVolumeDispatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+            && self.notified_codes == other.notified_codes
+            && self.records.len() == other.records.len()
+            && self
+                .records
+                .iter()
+                .zip(&other.records)
+                .all(|(left, right)| {
+                    left.code == right.code
+                        && left.name == right.name
+                        && left.push_kind == right.push_kind
+                        && left.push_price.to_bits() == right.push_price.to_bits()
+                        && left.metric_json == right.metric_json
+                        && left.source == right.source
+                })
+    }
+}
+
+fn prepare_auction_volume_dispatch(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: &CapturedBanner,
+) -> PreparedAuctionVolumeDispatch {
     let auction_items: Vec<AuctionItem<'_>> = snapshot
         .items
         .iter()
-        .map(|(n, c, g, v, _p)| AuctionItem {
-            name: n,
-            code: c,
-            gap_pct: *g,
-            vol_ratio: *v,
-            tag: "", // 简化: 不填 tag
+        .map(|(name, code, gap_pct, volume_ratio, _price)| AuctionItem {
+            name,
+            code,
+            gap_pct: *gap_pct,
+            vol_ratio: *volume_ratio,
+            tag: "",
         })
         .collect();
-    let text = render_auction_volume(
+    let message = render_auction_volume_from_captured(
         banner,
         &snapshot.hhmm,
         &auction_items,
         &snapshot.sentiment,
         &snapshot.watch_status,
     );
-    let result = dispatch_registered_outcome!(
-        "T-11-auction-volume",
-        crate::notify::PushKind::AuctionVolume,
-        "auction_volume_dispatcher",
-        "render_auction_volume",
-        "",
-        Some(banner),
-        text
-    )
-    .is_pushed();
-    log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
-    // review fix Issue #6: P-02 推送成功后入 pushed_stocks 票池 (R3)
-    // 红线 2.2: price <= 0 (缺数据) 的票不入池, 不造价格
-    if result {
-        for (n, c, g, v, p) in &snapshot.items {
-            if *p <= 0.0 {
-                log::warn!("[P-02] {}({}) 无真实价格, 跳过入池 (红线 2.2)", n, c);
-                continue;
-            }
+    let records = snapshot
+        .items
+        .iter()
+        .map(|(name, code, gap_pct, volume_ratio, price)| {
             let metric_json = truncate_metric_json(
                 serde_json::json!({
-                    "vol_ratio": v,
-                    "price_chg_pct": g,
+                    "vol_ratio": volume_ratio,
+                    "price_chg_pct": gap_pct,
                     "push_subkind": "AuctionVolume",
                 })
                 .to_string(),
             );
-            if let Err(error) = stock_analysis::signal::push_recorder::record(
-                &stock_analysis::signal::push_recorder::PushRecordMeta {
-                    code: c.clone(),
-                    name: n.clone(),
-                    push_kind: "P-02".to_string(),
-                    push_price: *p,
-                    metric_json,
-                    source: "preopen".to_string(),
-                },
-            ) {
-                let reason = format!("P-02 pushed_stocks audit failed for {c}: {error}");
-                log::error!("{reason}");
-                log_dispatcher_attempt("P-02", false, snapshot.items.len(), &reason);
-                return false;
+            stock_analysis::signal::push_recorder::PushRecordMeta {
+                code: code.clone(),
+                name: name.clone(),
+                push_kind: "P-02".to_string(),
+                push_price: *price,
+                metric_json,
+                source: "preopen".to_string(),
             }
+        })
+        .collect();
+    let notified_codes = snapshot
+        .items
+        .iter()
+        .map(|(_, code, _, _, _)| code.clone())
+        .collect();
+
+    PreparedAuctionVolumeDispatch {
+        message,
+        records,
+        notified_codes,
+    }
+}
+
+async fn dispatch_auction_volume_snapshot_with<Sink, SinkFuture, Recorder>(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: Option<&BannerCtx>,
+    notified: &mut std::collections::HashSet<String>,
+    sink: Sink,
+    mut recorder: Recorder,
+) -> bool
+where
+    Sink: FnOnce(String) -> SinkFuture,
+    SinkFuture: std::future::Future<Output = bool>,
+    Recorder: FnMut(&stock_analysis::signal::push_recorder::PushRecordMeta) -> Result<(), String>,
+{
+    let Some(banner) = banner else {
+        log_dispatcher_attempt("P-02", false, snapshot.items.len(), "banner unavailable");
+        log::warn!("[竞价][P-02] banner unavailable; retain retry eligibility");
+        return false;
+    };
+
+    let captured_banner = banner.capture();
+    let prepared = prepare_auction_volume_dispatch(snapshot, &captured_banner);
+    let result = sink(prepared.message().to_string()).await;
+    log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
+    if !result {
+        return false;
+    }
+
+    for record in prepared.records() {
+        if let Err(error) = recorder(record) {
+            let reason = format!(
+                "P-02 pushed_stocks audit failed for {}: {error}",
+                record.code
+            );
+            log::error!("{reason}");
+            log_dispatcher_attempt("P-02", false, snapshot.items.len(), &reason);
+            return false;
         }
     }
-    result
+
+    notified.extend(prepared.notified_codes().iter().cloned());
+    true
+}
+
+/// v37: P-02 dispatcher。调用方提供一次真实采集所得的不可变选中批次。
+pub async fn dispatch_auction_volume_daily(
+    snapshot: &AuctionVolumeSnapshot,
+    banner: Option<&BannerCtx>,
+    notified: &mut std::collections::HashSet<String>,
+) -> bool {
+    dispatch_auction_volume_snapshot_with(
+        snapshot,
+        banner,
+        notified,
+        |text| async move {
+            // 2026-09-20: P-02 升级 counted (MU-auction-volume)。盘中信息
+            // 卡; Rolling 600s 镜像 L4; retry_authorized=false (盘中快照
+            // 时刻锚定 + 30s 轮询重渲染补偿)。
+            match build_auction_volume_counted_binding(
+                chrono::Local::now().date_naive(),
+                &snapshot.hhmm,
+                &text,
+            )
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-11-auction-volume",
+                    crate::notify::PushKind::AuctionVolume,
+                    "auction_volume_dispatcher",
+                    "render_auction_volume",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding)
+                        .await
+                        .is_pushed()
+                }
+                Err(reason) => {
+                    log::error!("[P-02][BR-196] counted 准备失败: {reason}");
+                    false
+                }
+            }
+        },
+        |meta| stock_analysis::signal::push_recorder::record(meta).map(|_| ()),
+    )
+    .await
 }
 
 // A-10 名单快照装载已迁至 lib (src/review/catalyst_review.rs) — backfill 工具与
@@ -7329,17 +9422,36 @@ pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
         return false;
     }
     let text = render_auction_repush(hhmm, &top5);
-    let result = dispatch_registered_outcome!(
-        "A-02-auction-repush",
-        crate::notify::PushKind::AuctionRepush,
-        "auction_repush_dispatcher",
-        "render_auction_repush",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("A-02", result.is_pushed(), top5.len(), "");
-    result.is_pushed()
+    // 2026-09-20: A-02 升级 counted (MU-auction-candidates)。盘中信息卡;
+    // Rolling 600s 镜像显式 L4; retry_authorized=false (盘中竞价快照时刻
+    // 锚定 + 下一轮 repush 重渲染补偿)。业务日取 Local::now (I-01
+    // SectorRotation 同形态)。
+    let result = match build_auction_repush_counted_binding(
+        chrono::Local::now().date_naive(),
+        hhmm,
+        &text,
+    )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "A-02-auction-repush",
+            crate::notify::PushKind::AuctionRepush,
+            "auction_repush_dispatcher",
+            "render_auction_repush",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[A-02][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    };
+    log_dispatcher_attempt("A-02", result, top5.len(), "");
+    result
 }
 
 /// BR-223: A-11 IPO 阶段催化模板渲染 (静态供应链表)。
@@ -7685,19 +9797,36 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
     }
 
     let text = render_ipo_catalyst_dynamic(date, &hits);
-    let result = dispatch_registered_outcome!(
-        "A-11-ipo-catalyst",
-        crate::notify::PushKind::IpoCatalyst,
-        "ipo_catalyst_dispatcher",
-        // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
-        // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
-        "render_ipo_catalyst",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("A-11", result.is_pushed(), hits.len(), "");
-    result.is_pushed()
+    // 2026-09-20: A-11 升级 counted (MU-ipo-catalyst)。19:00 盘后 review side
+    // route (BR-223) 每日一次全市场 digest; counted 门 (v14_gate_counted_binding)
+    // 取 CountedSourceOnly (requires_banner=false, BR-241 公共源形态 — 不虚构
+    // banner 依赖), 与 T-16/A-12/BR-033 同形态。BusinessDateOnce 幂等 + 豁免
+    // 日预算。
+    let result = match build_ipo_catalyst_counted_binding(date_naive, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                "A-11-ipo-catalyst",
+                crate::notify::PushKind::IpoCatalyst,
+                "ipo_catalyst_dispatcher",
+                // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
+                // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
+                "render_ipo_catalyst",
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[A-11][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    };
+    log_dispatcher_attempt("A-11", result, hits.len(), "");
+    result
 }
 
 /// 动态 IPO 催化渲染: 最近 IPO 公告 → 公司 + 阶段 + 供应链关联 + 产业链影响。
@@ -7775,6 +9904,7 @@ pub async fn dispatch_block_trade_review(
             let board = if is_star { Board::Star } else { Board::Gem };
             let qty = review.volume as u32;
             if dispatch_block_trade_intraday_confirm(
+                trading_date,
                 &hhmm,
                 &name,
                 code,
@@ -7876,6 +10006,10 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
     // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
     if let Some(previous) = candidate_snapshot_previous(date) {
         let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
+        // T-08 counted (2026-09-20): binding 锚定候选台业务日 (date 参数
+        // 解析, 失败回退 Local::now 保底 — 与 hhmm 同源)。
+        let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::Local::now().date_naive());
         for code in previous.difference(&codes_now) {
             let name = batch
                 .entries
@@ -7883,7 +10017,8 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
                 .find(|entry| &entry.code == code)
                 .map(|entry| entry.name.clone())
                 .unwrap_or_else(|| code.clone());
-            let _ = push_candidate_invalidated(code, &hhmm, &name, "候选", "从候选台消失").await;
+            let _ = push_candidate_invalidated(business_date, code, &hhmm, &name, "候选", "从候选台消失")
+                .await;
         }
     }
     // BR-232: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
@@ -8224,43 +10359,32 @@ async fn dispatch_tomorrow_watch_after_preflight(
                     .partial_cmp(&a.ranking_net_amount_yuan)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间必然超龄,
-            // 5s 红线不可用)。2026-09-02 修复: settled-close 通道 remote stub
-            // 已死, 收盘价改走 tdx 日线 (bar.date==trading_date), 名称走
-            // BR-225 证券身份目录 (display-only)。
+            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
+            // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
             // 失败/缺失 → closes 视图兜底；仍缺失则排除 (fail-closed, 红线 2.2)。
             let strong_codes: Vec<String> = strong
                 .iter()
                 .take(5)
                 .map(|record| record.code.clone())
                 .collect();
-            let (strong_closes, strong_names) = tokio::join!(
-                fetch_same_day_closes(&strong_codes, trading_date),
-                fetch_security_names(&strong_codes),
-            );
+            let strong_quotes = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = strong_codes.iter().map(|code| code.as_str()).collect();
+                fetch_settled_close_batch_strict(&refs, trading_date)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
             for record in strong.iter().take(5) {
-                let resolved = match strong_closes {
-                    Ok(ref closes_map) => closes_map.get(&record.code).map(|close| {
-                        let name = strong_names
+                let resolved = strong_quotes
+                    .as_ref()
+                    .ok()
+                    .and_then(|quotes| quotes.get(&record.code))
+                    .map(|quote| (quote.name.clone(), quote.price))
+                    .or_else(|| {
+                        closes
                             .get(&record.code)
-                            .cloned()
-                            .or_else(|| closes.get(&record.code).map(|(name, _)| name.clone()))
-                            .unwrap_or_else(|| record.code.clone());
-                        (name, *close)
-                    }),
-                    Err(ref error) => {
-                        log::warn!(
-                            "[R-07][BR-233] 龙虎榜收盘价拉取失败, 回退收盘估值视图: {error}"
-                        );
-                        None
-                    }
-                }
-                .or_else(|| {
-                    closes
-                        .get(&record.code)
-                        .map(|(name, close)| (name.clone(), *close))
-                })
-                .filter(|(_, price)| price.is_finite() && *price > 0.0);
+                            .map(|(name, close)| (name.clone(), *close))
+                    })
+                    .filter(|(_, price)| price.is_finite() && *price > 0.0);
                 let Some((name, base)) = resolved else {
                     log::warn!(
                         "[R-07][BR-222] 龙虎榜 {} 缺少 {} 同日有限正收盘价, 排除该条目",
@@ -8315,45 +10439,38 @@ async fn dispatch_tomorrow_watch_after_preflight(
             };
             let chains = stock_analysis::market_analyzer::limit_chain_review::aggregate(&input);
             // BR-233: 盘后收盘快照补名补价; leader_name 优先, 缺失才查行情。
-            // 2026-09-02 修复同龙虎榜: 收盘价走 tdx 日线, 名称走身份目录。
             let leader_codes: Vec<String> = chains
                 .iter()
                 .take(3)
                 .filter(|chain| chain.leader_name.is_empty())
                 .map(|chain| chain.leader_code.clone())
                 .collect();
-            let (leader_closes, leader_names) = tokio::join!(
-                fetch_same_day_closes(&leader_codes, trading_date),
-                fetch_security_names(&leader_codes),
-            );
-            let leader_close_view = leader_closes.as_ref().ok();
+            let leader_quotes = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = leader_codes.iter().map(|code| code.as_str()).collect();
+                fetch_settled_close_batch_strict(&refs, trading_date)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("R-07 涨停链收盘快照 join 失败: {error}")));
             for chain in chains.iter().take(3) {
-                // name 优先级 leader_name → 身份目录 → 收盘估值视图 → code
+                // name 优先级 leader_name → 实时行情 → 收盘估值视图 → code
                 let name = if !chain.leader_name.is_empty() {
                     chain.leader_name.clone()
-                } else if leader_close_view.is_some() {
-                    leader_names
-                        .get(&chain.leader_code)
-                        .cloned()
+                } else {
+                    leader_quotes
+                        .as_ref()
+                        .ok()
+                        .and_then(|quotes| quotes.get(&chain.leader_code))
+                        .map(|quote| quote.name.clone())
                         .or_else(|| closes.get(&chain.leader_code).map(|(name, _)| name.clone()))
                         .unwrap_or_else(|| chain.leader_code.clone())
-                } else {
-                    closes
-                        .get(&chain.leader_code)
-                        .map(|(name, _)| name.clone())
-                        .unwrap_or_else(|| chain.leader_code.clone())
                 };
-                let base = match leader_closes {
-                    Ok(ref closes_map) => closes_map.get(&chain.leader_code).copied(),
-                    Err(ref error) => {
-                        log::warn!(
-                            "[R-07][BR-233] 涨停链收盘价拉取失败, 回退收盘估值视图: {error}"
-                        );
-                        None
-                    }
-                }
-                .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
-                .filter(|price| price.is_finite() && *price > 0.0);
+                let base = leader_quotes
+                    .as_ref()
+                    .ok()
+                    .and_then(|quotes| quotes.get(&chain.leader_code))
+                    .map(|quote| quote.price)
+                    .or_else(|| closes.get(&chain.leader_code).map(|(_, close)| *close))
+                    .filter(|price| price.is_finite() && *price > 0.0);
                 let Some(base) = base else {
                     log::warn!(
                         "[R-07][BR-222] 涨停链龙头 {} 缺少 {} 同日有限正收盘价, 排除该条目",
@@ -11164,6 +13281,12 @@ where
     }
     let (announcements, futures_delivery_batch, overnight_indices_batch, overnight_fx_batch) =
         loader(review_date, reminder_date).await;
+    if let Err(error) = &futures_delivery_batch {
+        let reason = format!("r08_cffex_component_unavailable: {error}");
+        log::error!("[R-08][BR-140] {reason}");
+        log_dispatcher_attempt("R-08", false, 0, &reason);
+        return ReviewTaskOutcome::gateway_failed(error);
+    }
     let announcements = announcements.map_err(|error| format!("CNInfo 全市场公告不可用: {error}"));
     let futures_delivery = futures_delivery_batch
         .as_ref()
@@ -11436,7 +13559,7 @@ mod tests_br140_r08_partial_components {
                     Err(stock_analysis::data_gateway::GatewayError::unavailable(
                         "event_calendar",
                         Some(stock_analysis::market_domain::ProviderId::Cffex),
-                        false,
+                        true,
                         format!(
                             "provider_unsupported: unsupported by {review_date} {reminder_date}"
                         ),
@@ -11449,22 +13572,87 @@ mod tests_br140_r08_partial_components {
         .await;
 
         assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-        match outcome {
+        match &outcome {
             crate::review_batch::ReviewTaskOutcome::Failed { failure } => {
-                if let crate::review_batch::ReviewTaskFailure::ExistingSourceFailure {
-                    retryable,
-                    reason,
-                } = failure
-                {
-                    assert!(retryable);
-                    assert!(reason.contains("r08_cffex_component_unavailable"));
-                    assert!(reason.contains("provider_unsupported"));
+                if let crate::review_batch::ReviewTaskFailure::GatewaySource(failure) = failure {
+                    assert!(failure.retryable);
+                    assert_eq!(failure.provider.as_deref(), Some("Cffex"));
+                    assert_eq!(failure.audit_outcome, "unavailable");
+                    assert_eq!(failure.reason_code, "no_verified_batch");
+                    assert!(failure.reason.contains("provider_unsupported"));
                 } else {
-                    panic!("R-08 expected existing source failure on unsupported CFFEX");
+                    panic!("R-08 expected typed gateway failure on unsupported CFFEX");
                 }
             }
             _ => panic!("R-08 unsupported CFFEX should remain retryable"),
         }
+
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let mut state = crate::review_batch::ReviewScheduleState::for_date(business_date);
+        let transitions = state.apply(
+            &crate::review_batch::ReviewBatchOutcome::new(vec![(
+                crate::review_batch::ReviewTask::R08,
+                outcome,
+            )]),
+            business_date.and_hms_opt(19, 0, 0).unwrap(),
+        );
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].retryable);
+        assert_eq!(
+            transitions[0].next_attempt.as_deref(),
+            Some("2026-07-21T19:01:00")
+        );
+        assert!(!state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_milli_opt(19, 0, 59, 999).unwrap(),
+        ));
+        assert!(state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_opt(19, 1, 0).unwrap(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn br199_r08_permanent_cffex_failure_is_terminal_without_transport_reclassification() {
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let outcome = dispatch_r08_event_calendar_outcome_with_loader(
+            "2026-07-21",
+            |_| async { Ok(None) },
+            move |review_date, _reminder_date| async move {
+                (
+                    Ok(announcement_batch(review_date)),
+                    Err(stock_analysis::data_gateway::GatewayError::unavailable(
+                        "futures_delivery",
+                        None,
+                        false,
+                        "http request rejected by permanent contract",
+                    )),
+                    Ok(indices_batch()),
+                    Ok(fx_batch()),
+                )
+            },
+        )
+        .await;
+
+        let mut state = crate::review_batch::ReviewScheduleState::for_date(business_date);
+        let transitions = state.apply(
+            &crate::review_batch::ReviewBatchOutcome::new(vec![(
+                crate::review_batch::ReviewTask::R08,
+                outcome,
+            )]),
+            business_date.and_hms_opt(19, 0, 0).unwrap(),
+        );
+
+        assert!(!state.is_due(
+            crate::review_batch::ReviewTask::R08,
+            business_date.and_hms_opt(23, 0, 0).unwrap(),
+        ));
+        assert_eq!(transitions.len(), 1);
+        assert!(!transitions[0].retryable);
+        assert!(!transitions[0].success);
+        assert!(!transitions[0]
+            .reason_code
+            .starts_with("source_transport_failed"));
     }
 
     #[test]
@@ -14135,20 +16323,40 @@ pub async fn push_intraday_market(
 }
 
 async fn push_intraday_market_outcome(
-    code: &str,
+    _code: &str,
     banner: &BannerCtx,
     params: IntradayMarketParams<'_>,
 ) -> crate::notify::PushOutcome {
     let text = render_intraday_market(banner, params);
-    dispatch_registered_outcome!(
-        "I-01-intraday-market",
-        crate::notify::PushKind::IntradayMarket,
-        "intraday_market_dispatcher",
-        "render_intraday_market",
-        code,
-        Some(banner),
-        text
+    // 2026-09-20: I-01 轮动总览升级 counted (MU-intraday-market)。生产盘中
+    // 轮动已由 R-02 盘面走向替代, 此 dispatcher 仅 --push 手工工具经
+    // dispatch_intraday_market_daily 调用; counted 门 (v14_gate_counted_binding,
+    // CountedCombinedAccount) 内部取 banner 并评估 mode/dm, 与 T-16 同形态。
+    // 每时间槽独立 occurrence; retry_authorized=false (手工重跑即补偿)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_intraday_counted_binding(
+        today,
+        IntradayProducer::SectorRotation { hhmm },
+        &text,
     )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "I-01-intraday-market",
+            crate::notify::PushKind::IntradayMarket,
+            "intraday_market_dispatcher",
+            "render_intraday_market",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-01][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.2 I-02 新闻催化映射 (⚡交易建议类, 带 banner)
@@ -14157,17 +16365,40 @@ pub async fn push_news_catalyst(
     banner: &BannerCtx,
     params: NewsCatalystParams<'_>,
 ) -> bool {
+    push_news_catalyst_outcome(code, banner, params)
+        .await
+        .is_pushed()
+}
+
+async fn push_news_catalyst_outcome(
+    _code: &str,
+    banner: &BannerCtx,
+    params: NewsCatalystParams<'_>,
+) -> crate::notify::PushOutcome {
     let text = render_news_catalyst(banner, params);
-    dispatch_registered_outcome!(
-        "I-02-news-catalyst",
-        crate::notify::PushKind::NewsCatalyst,
-        "news_catalyst_dispatcher",
-        "render_news_catalyst",
-        code,
-        Some(banner),
-        text
-    )
-    .is_pushed()
+    // 2026-09-20: I-02 新闻催化升级 counted (MU-news-catalyst)。事件驱动
+    // 一次性调用 (无进程内重试); counted 门 (v14_gate_counted_binding,
+    // CountedCombinedAccount) 内部取 banner 并评估 mode/dm, 与 I-01/T-16 同
+    // 形态。每时间槽独立 occurrence; retry_authorized=false (失败即弃保真)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_news_catalyst_counted_binding(today, &hhmm, &text).and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "I-02-news-catalyst",
+            crate::notify::PushKind::NewsCatalyst,
+            "news_catalyst_dispatcher",
+            "render_news_catalyst",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-02][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.2 I-09 量价反向发现 (⚡重要, 无 banner)
@@ -14255,15 +16486,32 @@ async fn push_industry_chain_intraday_outcome(
     params: IndustryChainIntradayParams<'_>,
 ) -> crate::notify::PushOutcome {
     let text = render_industry_chain_intraday(banner, params);
-    dispatch_registered_outcome!(
-        "I-03-industry-chain-intraday",
-        crate::notify::PushKind::IndustryChainIntraday,
-        "industry_chain_intraday_dispatcher",
-        "render_industry_chain_intraday",
-        code,
-        Some(banner),
-        text
-    )
+    // 2026-09-20: I-03 升级 counted (MU-industry-chain-intraday)。生产
+    // periodic 与 --push 手工工具共用此 funnel, 转一处全覆盖。counted
+    // 门取 CountedCombinedAccount (requires_banner=true, 门内部取 banner);
+    // PerTicket Rolling 1800s 镜像 L4; retry_authorized=false (LLM 时刻
+    // 锚定 + 周期重渲染补偿)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_industry_chain_intraday_counted_binding(today, code, &hhmm, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                "I-03-industry-chain-intraday",
+                crate::notify::PushKind::IndustryChainIntraday,
+                "industry_chain_intraday_dispatcher",
+                "render_industry_chain_intraday",
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-03][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.4 D-01 新闻驱动个股 (⚡交易建议类, 带 banner)
@@ -14273,16 +16521,32 @@ pub async fn push_news_to_idea(
     params: NewsToIdeaParams<'_>,
 ) -> bool {
     let text = render_news_to_idea(banner, params);
-    dispatch_registered_outcome!(
-        "D-01-news-to-idea",
-        crate::notify::PushKind::NewsToIdea,
-        "news_to_idea_dispatcher",
-        "render_news_to_idea",
-        code,
-        Some(banner),
-        text
-    )
-    .is_pushed()
+    // 2026-09-20: D-01 升级 counted (MU-d01)。生产 (news loop daily) 与
+    // --push 手工工具共用此 funnel, 转一处全覆盖 (I-02 同形态)。counted
+    // 门取 CountedCombinedAccount (requires_banner=true, 门内部取 banner);
+    // PerTicket Rolling 1200s 镜像 L4; retry_authorized=false (LLM 时刻
+    // 锚定 + D01 memo 补偿)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_news_to_idea_counted_binding(today, code, &hhmm, &text).and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "D-01-news-to-idea",
+            crate::notify::PushKind::NewsToIdea,
+            "news_to_idea_dispatcher",
+            "render_news_to_idea",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[D-01][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    }
 }
 
 /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️盘后参考, 复用 T-11 竞价复算)
@@ -14353,6 +16617,7 @@ pub async fn push_candidate_triggered(
 
 /// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).
 pub async fn push_candidate_invalidated(
+    business_date: chrono::NaiveDate,
     code: &str,
     hhmm: &str,
     name: &str,
@@ -14360,16 +16625,29 @@ pub async fn push_candidate_invalidated(
     reason: &str,
 ) -> bool {
     let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
-    dispatch_registered_outcome!(
-        "T-08-candidate-invalidated",
-        crate::notify::PushKind::CandidateInvalidated,
-        "candidate_dispatcher",
-        "render_candidate_invalidated",
-        code,
-        None,
-        text
-    )
-    .is_pushed()
+    // 2026-09-20: T-08 升级 counted (MU-auction-candidates)。盘中信息卡;
+    // PerTicket Rolling 1800s 镜像旧逐票冷却; retry_authorized=true
+    // (失效事件事实 + 旧系统无进程内补偿 — durable 是唯一恢复路径)。
+    match build_candidate_invalidated_counted_binding(business_date, code, prev, reason, &text)
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "T-08-candidate-invalidated",
+                crate::notify::PushKind::CandidateInvalidated,
+                "candidate_dispatcher",
+                "render_candidate_invalidated",
+            )
+            .map(|token| (token, binding))
+        }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[T-08][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    }
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.
@@ -14520,34 +16798,54 @@ pub async fn push_data_mode_change(
         LibDM::Unsafe => DataMode::Unsafe,
     };
 
-    let mut text = if let Some(b) = banner {
-        format!("{}\n", b.render())
-    } else {
-        String::new()
-    };
-    let mode_text = match dispatch_reason {
-        DataModeDispatchReason::Transition => render_data_mode(
-            &hhmm,
-            prev_tmpl,
-            new_tmpl,
-            &missing_str,
-            &restrictions,
-            health.eta.as_deref(),
+    let text = match dispatch_reason {
+        DataModeDispatchReason::Transition => render_data_mode_message(
+            banner,
+            &DataModeTextParams {
+                hhmm: &hhmm,
+                old: prev_tmpl,
+                new: new_tmpl,
+                missing_items: &missing_str,
+                restrictions: &restrictions,
+                eta: health.eta.as_deref(),
+            },
+            &LiveBannerExternalNoteSource,
         ),
     };
-    text.push_str(&mode_text);
 
     // 2. dispatch (code="" 全局键; BR-116 uses the committed mode as exact dedup state)
     let outcome = match dispatch_reason {
-        DataModeDispatchReason::Transition => dispatch_registered_outcome!(
-            "T-02-data-mode",
-            crate::notify::PushKind::DataMode,
-            "data_mode_hook",
-            "render_data_mode",
-            "",
-            banner,
-            text
-        ),
+        DataModeDispatchReason::Transition => {
+            // 2026-09-20: T-02 升级 counted (MU-data-mode)。数据健康告警 =
+            // 健康提醒类豁免日预算; counted 门取 CountedCombinedAccount
+            // (requires_banner=true, 门内部取 banner — T-16 同形态)。
+            // policy = WindowMode::None 无冷却 (G5b 先例, BR-116: 已确认
+            // 状态对本身精确去重, 不设跨状态粗粒度冷却);
+            // retry_authorized=true (状态变迁事实, 补发仍有效)。
+            match build_data_mode_counted_binding(
+                chrono::Local::now().date_naive(),
+                prev_mode,
+                new_mode,
+                &text,
+            )
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-02-data-mode",
+                    crate::notify::PushKind::DataMode,
+                    "data_mode_hook",
+                    "render_data_mode",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding).await
+                }
+                Err(reason) => {
+                    log::error!("[DataMode][BR-196] counted 准备失败: {reason}");
+                    crate::notify::PushOutcome::Denied(reason)
+                }
+            }
+        }
     };
 
     if !matches!(outcome, crate::notify::PushOutcome::Pushed) {
@@ -15502,7 +17800,7 @@ pub fn build_test_template_catalog(
     use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 56;
+    const EXPECTED_CATALOG_TOTAL: usize = 57;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -15553,11 +17851,11 @@ pub fn build_test_template_catalog(
                 intent: Intent::Reduce,
                 price: 10.80,
                 cost: 9.50,
-                avail: Some(500),
+                avail: 500,
                 reduce_zone: Some((10.70, 10.95)),
-                support: Some(10.20),
-                pressure: Some(11.00),
-                stop: Some(9.90),
+                support: 10.20,
+                pressure: 11.00,
+                stop: 9.90,
                 invalidations: &invalidations,
                 reasons: &reasons,
             },
@@ -16389,6 +18687,11 @@ pub fn build_test_template_catalog(
         "G5b-attribution-deep",
         render_g5b_attribution("TEST_CODE 深链归因摘要…"),
     );
+    // 快照过期提醒 (2026-09-20): MU-snapshot-stale 全 7 触点新增
+    push(
+        "T-20-snapshot-stale",
+        render_snapshot_stale(5, "2026-09-11", 123456.78),
+    );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
         return Err(format!(
@@ -17089,12 +19392,272 @@ mod tests {
         }
     }
 
+    struct NoBannerExternalNotes;
+
+    impl BannerExternalNoteSource for NoBannerExternalNotes {
+        fn closing_valuation_note(&self) -> Option<String> {
+            None
+        }
+
+        fn user_confirmed_account_note(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn captured_banner_normal() -> CapturedBanner {
+        banner_normal().capture_with_external_notes(&NoBannerExternalNotes)
+    }
+
     // ---- §14.0 横幅 ----
 
     #[test]
     fn banner_normal_full_format() {
         let b = banner_normal();
         assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+    }
+
+    #[test]
+    fn banner_capture_unsafe_incomplete_preserves_dated_account_without_confirmation() {
+        struct HistoricalAccountNotes;
+
+        impl BannerExternalNoteSource for HistoricalAccountNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
+            }
+        }
+
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let captured = banner.capture_with_external_notes(&HistoricalAccountNotes);
+        let text = captured.render();
+
+        assert!(!text.contains("仓位已确认"), "false confirmation: {text}");
+        assert!(!text.contains("日盈亏已确认"), "false confirmation: {text}");
+        assert!(!text.contains("仓位7成"), "incomplete batch: {text}");
+        assert!(!text.contains("日盈亏-2.5%"), "incomplete batch: {text}");
+        assert!(text.contains("[⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]"), "{text}");
+        assert!(text.contains("2026-09-14T18:50:00+08:00"), "{text}");
+        assert!(text.contains("source=TEST_CODE_USER_CONFIRMED"), "{text}");
+        assert!(text.contains("2026-09-14 当日盈亏 -12.50"), "{text}");
+        assert_eq!(text.matches("用户确认账户快照").count(), 1, "{text}");
+        assert!(paper_risk_context_from_banner(&banner).is_err());
+    }
+
+    #[test]
+    fn banner_capture_complete_account_does_not_read_external_notes() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes<'a> {
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CODE_OLD_CLOSING".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some("TEST_CODE_OLD_ACCOUNT".to_string())
+            }
+        }
+
+        let closing_reads = Cell::new(0);
+        let user_summary_reads = Cell::new(0);
+        let captured = banner_normal().capture_with_external_notes(&CountingExternalNotes {
+            closing_reads: &closing_reads,
+            user_summary_reads: &user_summary_reads,
+        });
+
+        assert_eq!(
+            captured.render(),
+            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"
+        );
+        assert!(!captured.render().contains("TEST_CODE_OLD_CLOSING"));
+        assert!(!captured.render().contains("TEST_CODE_OLD_ACCOUNT"));
+        assert_eq!(closing_reads.get(), 0);
+        assert_eq!(user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn banner_capture_reads_closing_note_once_and_skips_user_summary() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes<'a> {
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CLOSING".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                None
+            }
+        }
+
+        let closing_reads = Cell::new(0);
+        let user_summary_reads = Cell::new(0);
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let captured = banner.capture_with_external_notes(&CountingExternalNotes {
+            closing_reads: &closing_reads,
+            user_summary_reads: &user_summary_reads,
+        });
+
+        assert_eq!(
+            captured.render(),
+            "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据Full]\n\
+             [ℹ️ 实时账户未接入；TEST_CLOSING]"
+        );
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn banner_capture_is_frozen_after_external_notes_change() {
+        use std::cell::{Cell, RefCell};
+
+        struct MutableExternalNotes<'a> {
+            closing: &'a RefCell<Option<String>>,
+            user_summary: &'a RefCell<Option<String>>,
+            closing_reads: &'a Cell<usize>,
+            user_summary_reads: &'a Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for MutableExternalNotes<'_> {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                self.closing.borrow().clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                self.user_summary.borrow().clone()
+            }
+        }
+
+        let closing = RefCell::new(None);
+        let user_summary = RefCell::new(Some("FIRST_ACCOUNT_NOTE".to_string()));
+        let closing_reads = Cell::new(0);
+        let user_summary_reads = Cell::new(0);
+        let source = MutableExternalNotes {
+            closing: &closing,
+            user_summary: &user_summary,
+            closing_reads: &closing_reads,
+            user_summary_reads: &user_summary_reads,
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let captured = banner.capture_with_external_notes(&source);
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Full]\n\
+                        [ℹ️ 实时账户未接入；FIRST_ACCOUNT_NOTE；收盘估值不可用]";
+
+        assert_eq!(captured.render(), expected);
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 1);
+
+        closing.replace(Some("SECOND_CLOSING_NOTE".to_string()));
+        user_summary.replace(Some("SECOND_ACCOUNT_NOTE".to_string()));
+        assert_eq!(captured.render(), expected);
+        assert_eq!(captured.render(), expected);
+        assert_eq!(closing_reads.get(), 1);
+        assert_eq!(user_summary_reads.get(), 1);
+
+        let debug = format!("{captured:?}");
+        assert!(!debug.contains("FIRST_ACCOUNT_NOTE"));
+        assert!(!debug.contains(expected));
+    }
+
+    #[test]
+    fn banner_capture_preserves_warnings_and_account_dates() {
+        struct FixedExternalNotes {
+            closing: Option<String>,
+            user_summary: Option<String>,
+        }
+
+        impl BannerExternalNoteSource for FixedExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing.clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary.clone()
+            }
+        }
+
+        let incomplete = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let without_closing = FixedExternalNotes {
+            closing: None,
+            user_summary: Some("TEST_ACCOUNT".to_string()),
+        };
+        assert_eq!(
+            incomplete
+                .capture_with_external_notes(&without_closing)
+                .render(),
+            "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据Full]\n\
+             [ℹ️ 实时账户未接入；TEST_ACCOUNT；收盘估值不可用]"
+        );
+
+        for data_mode in [DataMode::Degraded, DataMode::Unsafe] {
+            let banner = BannerCtx {
+                data_mode,
+                data_missing_note: Some("TEST_DATA_MISSING".to_string()),
+                ..incomplete.clone()
+            };
+            assert_eq!(
+                banner
+                    .capture_with_external_notes(&without_closing)
+                    .render(),
+                format!(
+                    "[🟡 ReduceOnly | 仓位缺失 | 日盈亏缺失 | 数据{}]\n\
+                     [⚠️ TEST_DATA_MISSING: 本条不含承接判断]\n\
+                     [ℹ️ 实时账户未接入；TEST_ACCOUNT；收盘估值不可用]",
+                    data_mode.label()
+                )
+            );
+        }
     }
 
     #[test]
@@ -17107,7 +19670,8 @@ mod tests {
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
-        let text = banner.render();
+        let captured = banner.capture_with_external_notes(&NoBannerExternalNotes);
+        let text = captured.render();
         assert!(text.contains("仓位缺失"));
         assert!(text.contains("日盈亏缺失"));
     }
@@ -17122,9 +19686,12 @@ mod tests {
             data_mode: DataMode::Unsafe,
             data_missing_note: None,
         };
-        let text = banner.render();
-        assert!(text.contains("仓位已确认"));
-        assert!(text.contains("日盈亏已确认"));
+        let captured = banner.capture_with_external_notes(&NoBannerExternalNotes);
+        let text = captured.render();
+        assert!(text.contains("仓位批次不完整"));
+        assert!(text.contains("日盈亏批次不完整"));
+        assert!(!text.contains("仓位已确认"));
+        assert!(!text.contains("日盈亏已确认"));
         assert!(!text.contains("仓位7成"));
         assert!(!text.contains("日盈亏+2.5%"));
     }
@@ -17239,6 +19806,279 @@ mod tests {
     // ---- T-02 数据模式 ----
 
     #[test]
+    fn t02_message_keeps_one_dated_account_snapshot() {
+        use std::cell::Cell;
+
+        struct CountingExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for CountingExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
+            }
+        }
+
+        let source = CountingExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "10:59",
+                old: Some(DataMode::Degraded),
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+            },
+            &source,
+        );
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+                        [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
+                        [ℹ️ 实时账户未接入；用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）；收盘估值不可用]\n\
+                        📡 数据状态变更（10:59）\n\
+                        Degraded → Unsafe\n\
+                        受影响: TEST_CODE_QUOTE_MISSING\n\
+                        输出限制:\n\
+                        · 禁出价格型建议\n\
+                        · 仅保留风险类推送\n\
+                        恢复预计: TEST_CODE_FRESHNESS_RECOVERY\n\
+                        辅助建议, 非下单指令";
+
+        assert_eq!(text.matches("用户确认账户快照").count(), 1, "{text}");
+        assert_eq!(text, expected);
+        assert!(!text.contains("账户状态:"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 1);
+    }
+
+    #[test]
+    fn t02_message_complete_account_does_not_read_historical_notes() {
+        use std::cell::Cell;
+
+        struct HistoricalExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for HistoricalExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                Some("TEST_CODE_OLD_CLOSING：收盘估值价格日 2026-09-14".to_string())
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                Some(
+                    "用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_OLD_ACCOUNT）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）"
+                        .to_string(),
+                )
+            }
+        }
+
+        let source = HistoricalExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: Some(5),
+            today_pnl: Some(0.3),
+            account_metrics_complete: true,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "11:00",
+                old: Some(DataMode::Unsafe),
+                new: DataMode::Full,
+                missing_items: "(无)",
+                restrictions: &[],
+                eta: None,
+            },
+            &source,
+        );
+
+        assert_eq!(
+            text,
+            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n\
+             📡 数据状态变更（11:00）\n\
+             Unsafe → Full\n\
+             受影响: (无)\n\
+             输出限制:\n\
+             辅助建议, 非下单指令"
+        );
+        assert!(!text.contains("TEST_CODE_OLD_CLOSING"), "{text}");
+        assert!(!text.contains("TEST_CODE_OLD_ACCOUNT"), "{text}");
+        assert!(!text.contains("账户状态:"), "{text}");
+        assert_eq!(source.closing_reads.get(), 0);
+        assert_eq!(source.user_summary_reads.get(), 0);
+    }
+
+    #[test]
+    fn t02_message_without_banner_keeps_explicit_unavailable_account_status() {
+        use std::cell::Cell;
+
+        struct EmptyExternalNotes {
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for EmptyExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                None
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                None
+            }
+        }
+
+        let source = EmptyExternalNotes {
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let text = render_data_mode_message(
+            None,
+            &DataModeTextParams {
+                hhmm: "11:01",
+                old: None,
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: None,
+            },
+            &source,
+        );
+
+        assert_eq!(
+            text,
+            "📡 数据状态变更（11:01）\n\
+             未建立 → Unsafe\n\
+             受影响: TEST_CODE_QUOTE_MISSING\n\
+             输出限制:\n\
+             · 禁出价格型建议\n\
+             · 仅保留风险类推送\n\
+             账户状态: 实时账户未接入；用户确认账户摘要不可用\n\
+             辅助建议, 非下单指令"
+        );
+        assert_eq!(text.matches("账户状态:").count(), 1);
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 1);
+    }
+
+    #[test]
+    fn t02_message_captures_closing_note_once_and_stays_frozen() {
+        use std::cell::{Cell, RefCell};
+
+        struct MutableExternalNotes {
+            closing: RefCell<Option<String>>,
+            user_summary: RefCell<Option<String>>,
+            closing_reads: Cell<usize>,
+            user_summary_reads: Cell<usize>,
+        }
+
+        impl BannerExternalNoteSource for MutableExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                self.closing_reads.set(self.closing_reads.get() + 1);
+                self.closing.borrow().clone()
+            }
+
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                self.user_summary_reads
+                    .set(self.user_summary_reads.get() + 1);
+                self.user_summary.borrow().clone()
+            }
+        }
+
+        let source = MutableExternalNotes {
+            closing: RefCell::new(Some(
+                "TEST_CODE_FIRST_CLOSING：收盘估值价格日 2026-09-15".to_string(),
+            )),
+            user_summary: RefCell::new(Some("TEST_CODE_FIRST_ACCOUNT".to_string())),
+            closing_reads: Cell::new(0),
+            user_summary_reads: Cell::new(0),
+        };
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(-2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "11:02",
+                old: Some(DataMode::Degraded),
+                new: DataMode::Unsafe,
+                missing_items: "TEST_CODE_QUOTE_MISSING",
+                restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
+                eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+            },
+            &source,
+        );
+        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+                        [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
+                        [ℹ️ 实时账户未接入；TEST_CODE_FIRST_CLOSING：收盘估值价格日 2026-09-15]\n\
+                        📡 数据状态变更（11:02）\n\
+                        Degraded → Unsafe\n\
+                        受影响: TEST_CODE_QUOTE_MISSING\n\
+                        输出限制:\n\
+                        · 禁出价格型建议\n\
+                        · 仅保留风险类推送\n\
+                        恢复预计: TEST_CODE_FRESHNESS_RECOVERY\n\
+                        辅助建议, 非下单指令";
+
+        assert_eq!(text, expected);
+        assert_eq!(text.matches("TEST_CODE_FIRST_CLOSING").count(), 1);
+        assert!(!text.contains("TEST_CODE_FIRST_ACCOUNT"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 0);
+
+        source
+            .closing
+            .replace(Some("TEST_CODE_SECOND_CLOSING".to_string()));
+        source
+            .user_summary
+            .replace(Some("TEST_CODE_SECOND_ACCOUNT".to_string()));
+
+        assert_eq!(text, expected);
+        assert!(!text.contains("TEST_CODE_SECOND_CLOSING"), "{text}");
+        assert!(!text.contains("TEST_CODE_SECOND_ACCOUNT"), "{text}");
+        assert_eq!(source.closing_reads.get(), 1);
+        assert_eq!(source.user_summary_reads.get(), 0);
+    }
+
+    #[test]
     fn t02_data_mode_full_to_degraded() {
         let s = render_data_mode(
             "09:35",
@@ -17270,22 +20110,6 @@ mod tests {
     // ---- T-03 持仓建议 ----
 
     #[test]
-    fn holding_snapshot_does_not_turn_losses_into_add_orders() {
-        assert_eq!(holding_snapshot_assessment(9.5, 10.0).0, Intent::Hold);
-        assert_eq!(holding_snapshot_assessment(12.92, 17.867).0, Intent::Reduce);
-        assert_eq!(holding_snapshot_assessment(11.0, 10.0).0, Intent::Hold);
-        let (intent, reason) = holding_snapshot_assessment(9.8, 10.0);
-        let text = render_holding_plan(&banner_normal(), HoldingPlanParams {
-            name: "测试", code: "TEST_CODE_000001", hhmm: "14:00", intent,
-            price: 9.8, cost: 10.0, avail: None, reduce_zone: None,
-            support: None, pressure: None, stop: None, invalidations: &[], reasons: &[reason],
-        });
-        assert!(text.contains("浮亏 2.0%"));
-        assert!(text.contains("支撑暂无 | 压力暂无 | 硬止损暂无"));
-        assert!(text.contains("可用未核实"));
-    }
-
-    #[test]
     fn t03_holding_plan_full() {
         let s = render_holding_plan(
             &banner_normal(),
@@ -17296,11 +20120,11 @@ mod tests {
                 intent: Intent::Reduce,
                 price: 12.30,
                 cost: 11.80,
-                avail: Some(3000),
+                avail: 3000,
                 reduce_zone: Some((12.45, 12.60)),
-                support: Some(11.95),
-                pressure: Some(12.70),
-                stop: Some(11.95),
+                support: 11.95,
+                pressure: 12.70,
+                stop: 11.95,
                 invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },
@@ -17328,11 +20152,11 @@ mod tests {
                 intent: Intent::Hold,
                 price: 10.0,
                 cost: 9.5,
-                avail: Some(1000),
+                avail: 1000,
                 reduce_zone: None,
-                support: Some(9.6),
-                pressure: Some(10.5),
-                stop: Some(9.4),
+                support: 9.6,
+                pressure: 10.5,
+                stop: 9.4,
                 invalidations: &[],
                 reasons: &["暂无催化".to_string()],
             },
@@ -17560,6 +20384,830 @@ mod tests {
 
     // ---- T-11 竞价异动 ----
 
+    fn p02_stock(
+        code: &str,
+        change_pct: f64,
+        price: f64,
+        volume_ratio: Option<f64>,
+    ) -> stock_analysis::market_data::TopStock {
+        stock_analysis::market_data::TopStock {
+            code: code.to_string(),
+            name: format!("股票{code}"),
+            change_pct,
+            price,
+            volume_ratio,
+            main_net_yi: None,
+        }
+    }
+
+    #[test]
+    fn p02_selection_distinguishes_empty_source_from_missing_volume_ratios() {
+        let notified = std::collections::HashSet::new();
+        let empty_error = prepare_auction_volume_snapshot("09:20:00", &[], &notified)
+            .expect_err("an empty source must be classified explicitly");
+        assert_eq!(empty_error, AuctionVolumeSelectionError::SourceRowsEmpty);
+        assert_eq!(empty_error.to_string(), "竞价量能涨停列表为空");
+
+        let stocks = vec![
+            p02_stock("MISSING_A", 1.0, 10.0, None),
+            p02_stock("MISSING_B", -1.0, 20.0, None),
+        ];
+        let missing_error = prepare_auction_volume_snapshot("09:20:00", &stocks, &notified)
+            .expect_err("non-empty rows without volume ratios must retain rejection counts");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = &missing_error else {
+            panic!("non-empty rejected rows must carry selection counts");
+        };
+        assert_eq!(counts.source_rows(), 2);
+        assert_eq!(counts.valid_rows(), 0);
+        assert_eq!(counts.notified_valid_rows(), 0);
+        assert_eq!(counts.missing_volume_ratio_rows(), 2);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert!(!counts.all_source_rows_valid_and_notified());
+        assert_eq!(
+            missing_error.to_string(),
+            concat!(
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: ",
+                "source_rows=2 valid_rows=0 notified_valid_rows=0 ",
+                "missing_volume_ratio_rows=2 invalid_volume_ratio_rows=0 ",
+                "invalid_price_rows=0 invalid_change_pct_rows=0"
+            )
+        );
+    }
+
+    #[test]
+    fn p02_selection_counts_duplicate_valid_notified_rows_and_preserves_inputs() {
+        let stocks = vec![
+            p02_stock("DUPLICATE", 1.0, 10.0, Some(2.0)),
+            p02_stock("DUPLICATE", 2.0, 20.0, Some(3.0)),
+            p02_stock("OTHER", -1.0, 30.0, Some(4.0)),
+        ];
+        let original_codes = stocks
+            .iter()
+            .map(|stock| stock.code.clone())
+            .collect::<Vec<_>>();
+        let notified =
+            std::collections::HashSet::from(["DUPLICATE".to_string(), "OTHER".to_string()]);
+        let original_notified = notified.clone();
+
+        let error = prepare_auction_volume_snapshot("09:20:30", &stocks, &notified)
+            .expect_err("every valid row is already notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = error else {
+            panic!("non-empty rejected rows must carry selection counts");
+        };
+
+        assert_eq!(counts.source_rows(), 3);
+        assert_eq!(counts.valid_rows(), 3);
+        assert_eq!(counts.notified_valid_rows(), 3);
+        assert_eq!(counts.missing_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert!(counts.all_source_rows_valid_and_notified());
+        assert_eq!(
+            stocks
+                .iter()
+                .map(|stock| stock.code.clone())
+                .collect::<Vec<_>>(),
+            original_codes
+        );
+        assert_eq!(notified, original_notified);
+    }
+
+    #[test]
+    fn p02_selection_all_notified_fact_excludes_mixed_invalid_rows() {
+        let notified = std::collections::HashSet::from([
+            "VALID".to_string(),
+            "MISSING".to_string(),
+            "BAD_PRICE".to_string(),
+        ]);
+        let mixed = vec![
+            p02_stock("VALID", 1.0, 10.0, Some(2.0)),
+            p02_stock("MISSING", 2.0, 20.0, None),
+        ];
+        let mixed_error = prepare_auction_volume_snapshot("09:21:00", &mixed, &notified)
+            .expect_err("the only valid row is notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(mixed_counts) = mixed_error
+        else {
+            panic!("mixed rejected rows must carry selection counts");
+        };
+        assert_eq!(mixed_counts.source_rows(), 2);
+        assert_eq!(mixed_counts.valid_rows(), 1);
+        assert_eq!(mixed_counts.notified_valid_rows(), 1);
+        assert_eq!(mixed_counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(mixed_counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(mixed_counts.invalid_price_rows(), 0);
+        assert_eq!(mixed_counts.invalid_change_pct_rows(), 0);
+        assert!(!mixed_counts.all_source_rows_valid_and_notified());
+
+        let every_code_notified = vec![
+            p02_stock("VALID", -1.0, 10.0, Some(2.0)),
+            p02_stock("BAD_PRICE", 1.0, 0.0, Some(3.0)),
+        ];
+        let every_code_error =
+            prepare_auction_volume_snapshot("09:21:00", &every_code_notified, &notified)
+                .expect_err("an invalid row is not a notified valid row");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(every_code_counts) =
+            every_code_error
+        else {
+            panic!("all-code rejected rows must carry selection counts");
+        };
+        assert_eq!(every_code_counts.source_rows(), 2);
+        assert_eq!(every_code_counts.valid_rows(), 1);
+        assert_eq!(every_code_counts.notified_valid_rows(), 1);
+        assert_eq!(every_code_counts.missing_volume_ratio_rows(), 0);
+        assert_eq!(every_code_counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(every_code_counts.invalid_price_rows(), 1);
+        assert_eq!(every_code_counts.invalid_change_pct_rows(), 0);
+        assert!(!every_code_counts.all_source_rows_valid_and_notified());
+    }
+
+    #[test]
+    fn p02_selection_counts_overlapping_numeric_defects_by_source_row() {
+        let stocks = vec![
+            p02_stock("MISSING_MULTI", f64::NAN, 0.0, None),
+            p02_stock("RATIO_NAN_MULTI", f64::INFINITY, f64::NAN, Some(f64::NAN)),
+            p02_stock("RATIO_POS_INF", 0.0, f64::INFINITY, Some(f64::INFINITY)),
+            p02_stock(
+                "RATIO_NEG_INF",
+                0.0,
+                f64::NEG_INFINITY,
+                Some(f64::NEG_INFINITY),
+            ),
+            p02_stock("RATIO_ZERO", -2.0, 0.0, Some(0.0)),
+            p02_stock("RATIO_NEG", -3.0, -1.0, Some(-1.0)),
+            p02_stock("PRICE_NAN", 0.0, f64::NAN, Some(1.0)),
+            p02_stock("PRICE_POS_INF", 0.0, f64::INFINITY, Some(1.0)),
+            p02_stock("PRICE_NEG_INF", 0.0, f64::NEG_INFINITY, Some(1.0)),
+            p02_stock("CHANGE_POS_INF", f64::INFINITY, 10.0, Some(1.0)),
+            p02_stock("CHANGE_NEG_INF", f64::NEG_INFINITY, 10.0, Some(1.0)),
+            p02_stock("VALID_NEG_CHANGE", -99.0, 10.0, Some(1.0)),
+        ];
+        let notified = std::collections::HashSet::from(["VALID_NEG_CHANGE".to_string()]);
+
+        let error = prepare_auction_volume_snapshot("09:21:30", &stocks, &notified)
+            .expect_err("the finite negative-change row is valid but notified");
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = error else {
+            panic!("numeric rejection must carry selection counts");
+        };
+
+        assert_eq!(counts.source_rows(), 12);
+        assert_eq!(counts.valid_rows(), 1);
+        assert_eq!(counts.notified_valid_rows(), 1);
+        assert_eq!(counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 5);
+        assert_eq!(counts.invalid_price_rows(), 9);
+        assert_eq!(counts.invalid_change_pct_rows(), 4);
+        assert!(!counts.all_source_rows_valid_and_notified());
+    }
+
+    #[test]
+    fn p02_selection_success_preserves_stable_top10_full_tuples_and_inputs() {
+        let mut stocks = vec![
+            p02_stock("ALREADY", 99.0, 99.0, Some(100.0)),
+            p02_stock("ALREADY", 98.0, 98.0, Some(99.0)),
+            p02_stock("MISSING", 1.0, 10.0, None),
+            p02_stock("DUP", 1.1, 11.1, Some(9.0)),
+            p02_stock("BAD_PRICE", 2.0, 0.0, Some(50.0)),
+            p02_stock("DUP", 1.2, 12.2, Some(9.0)),
+            p02_stock("EQUAL", 1.3, 13.3, Some(9.0)),
+        ];
+        for index in 0..9 {
+            stocks.push(p02_stock(
+                &format!("NEXT_{index}"),
+                index as f64,
+                20.0 + index as f64,
+                Some(8.0 - index as f64 * 0.5),
+            ));
+        }
+        let original_codes = stocks
+            .iter()
+            .map(|stock| stock.code.clone())
+            .collect::<Vec<_>>();
+        let notified = std::collections::HashSet::from(["ALREADY".to_string()]);
+        let original_notified = notified.clone();
+
+        let snapshot = prepare_auction_volume_snapshot("09:22:00", &stocks, &notified)
+            .expect("more than ten eligible rows should select a stable Top10");
+
+        assert_eq!(snapshot.hhmm, "09:22:00");
+        assert_eq!(
+            snapshot.items,
+            vec![
+                ("股票DUP".to_string(), "DUP".to_string(), 1.1, 9.0, 11.1),
+                ("股票DUP".to_string(), "DUP".to_string(), 1.2, 9.0, 12.2),
+                ("股票EQUAL".to_string(), "EQUAL".to_string(), 1.3, 9.0, 13.3),
+                (
+                    "股票NEXT_0".to_string(),
+                    "NEXT_0".to_string(),
+                    0.0,
+                    8.0,
+                    20.0,
+                ),
+                (
+                    "股票NEXT_1".to_string(),
+                    "NEXT_1".to_string(),
+                    1.0,
+                    7.5,
+                    21.0,
+                ),
+                (
+                    "股票NEXT_2".to_string(),
+                    "NEXT_2".to_string(),
+                    2.0,
+                    7.0,
+                    22.0,
+                ),
+                (
+                    "股票NEXT_3".to_string(),
+                    "NEXT_3".to_string(),
+                    3.0,
+                    6.5,
+                    23.0,
+                ),
+                (
+                    "股票NEXT_4".to_string(),
+                    "NEXT_4".to_string(),
+                    4.0,
+                    6.0,
+                    24.0,
+                ),
+                (
+                    "股票NEXT_5".to_string(),
+                    "NEXT_5".to_string(),
+                    5.0,
+                    5.5,
+                    25.0,
+                ),
+                (
+                    "股票NEXT_6".to_string(),
+                    "NEXT_6".to_string(),
+                    6.0,
+                    5.0,
+                    26.0,
+                ),
+            ]
+        );
+        assert_eq!(snapshot.sentiment, "强承接");
+        assert_eq!(snapshot.watch_status, "9:25 集合竞价结果, 关注开盘承接");
+        assert_eq!(
+            stocks
+                .iter()
+                .map(|stock| stock.code.clone())
+                .collect::<Vec<_>>(),
+            original_codes
+        );
+        assert_eq!(notified, original_notified);
+    }
+
+    #[test]
+    fn p02_selection_loader_retains_typed_failure_raw_batch_and_provider_contract() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let notified = std::collections::HashSet::from(["UNCHANGED".to_string()]);
+        let original_notified = notified.clone();
+        let raw = vec![p02_stock("RAW_MISSING", 1.0, 10.0, None)];
+        let tick = load_auction_volume_tick_with("09:22:30", date, &notified, |_| {
+            calls.set(calls.get() + 1);
+            Ok(raw.clone())
+        })
+        .expect("provider success returns a tick even when P-02 selection rejects it");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(tick.limit_stocks.len(), 1);
+        assert_eq!(tick.limit_stocks[0].code, "RAW_MISSING");
+        assert!(tick.source_observation().is_none());
+        let AuctionVolumeSelectionError::NoEligibleUnnotifiedRows(counts) = tick
+            .snapshot
+            .expect_err("typed selection failure crosses tick")
+        else {
+            panic!("non-empty tick rejection must retain counts");
+        };
+        assert_eq!(counts.source_rows(), 1);
+        assert_eq!(counts.valid_rows(), 0);
+        assert_eq!(counts.notified_valid_rows(), 0);
+        assert_eq!(counts.missing_volume_ratio_rows(), 1);
+        assert_eq!(counts.invalid_volume_ratio_rows(), 0);
+        assert_eq!(counts.invalid_price_rows(), 0);
+        assert_eq!(counts.invalid_change_pct_rows(), 0);
+        assert_eq!(notified, original_notified);
+
+        let provider_error = load_auction_volume_tick_with("09:22:30", date, &notified, |_| {
+            Err("provider unavailable".to_string())
+        })
+        .expect_err("provider errors remain the loader's outer String contract");
+        assert_eq!(provider_error, "provider unavailable");
+    }
+
+    #[test]
+    fn p02_selection_display_and_debug_are_stable_safe_and_observation_free() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let empty_tick = load_auction_volume_tick_with(
+            "09:23:00",
+            date,
+            &std::collections::HashSet::new(),
+            |_| Ok(Vec::new()),
+        )
+        .expect("an empty source is a selection result within a successful pure load");
+        assert!(empty_tick.limit_stocks.is_empty());
+        assert!(empty_tick.source_observation().is_none());
+        assert_eq!(
+            empty_tick.snapshot.expect_err("empty source is rejected"),
+            AuctionVolumeSelectionError::SourceRowsEmpty
+        );
+        assert_eq!(
+            format!("{:?}", AuctionVolumeSelectionError::SourceRowsEmpty),
+            "SourceRowsEmpty"
+        );
+
+        let mut sensitive = p02_stock("SENSITIVE_CODE_600000", 1.0, 10.0, None);
+        sensitive.name = "私密股票名称".to_string();
+        let error = prepare_auction_volume_snapshot(
+            "09:23:00",
+            &[sensitive],
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("missing volume ratio is rejected without leaking row data");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(
+            display,
+            concat!(
+                "竞价热点无有限正价格/量比且有限涨跌幅的有效行: ",
+                "source_rows=1 valid_rows=0 notified_valid_rows=0 ",
+                "missing_volume_ratio_rows=1 invalid_volume_ratio_rows=0 ",
+                "invalid_price_rows=0 invalid_change_pct_rows=0"
+            )
+        );
+        assert_eq!(
+            debug,
+            concat!(
+                "NoEligibleUnnotifiedRows(AuctionVolumeRejectionCounts { ",
+                "source_rows: 1, valid_rows: 0, notified_valid_rows: 0, ",
+                "missing_volume_ratio_rows: 1, invalid_volume_ratio_rows: 0, ",
+                "invalid_price_rows: 0, invalid_change_pct_rows: 0 })"
+            )
+        );
+        for secret in ["SENSITIVE_CODE_600000", "私密股票名称", "10"] {
+            assert!(!display.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn p02_preparation_rejects_non_finite_and_non_positive_market_values() {
+        let stocks = vec![
+            p02_stock("VALID", 1.5, 10.0, Some(2.0)),
+            p02_stock("RATIO_MISSING", 1.0, 10.0, None),
+            p02_stock("RATIO_NAN", 1.0, 10.0, Some(f64::NAN)),
+            p02_stock("RATIO_INF", 1.0, 10.0, Some(f64::INFINITY)),
+            p02_stock("RATIO_ZERO", 1.0, 10.0, Some(0.0)),
+            p02_stock("RATIO_NEG", 1.0, 10.0, Some(-1.0)),
+            p02_stock("PRICE_NAN", 1.0, f64::NAN, Some(3.0)),
+            p02_stock("PRICE_INF", 1.0, f64::INFINITY, Some(3.0)),
+            p02_stock("PRICE_ZERO", 1.0, 0.0, Some(3.0)),
+            p02_stock("PRICE_NEG", 1.0, -1.0, Some(3.0)),
+            p02_stock("CHANGE_NAN", f64::NAN, 10.0, Some(3.0)),
+            p02_stock("CHANGE_INF", f64::INFINITY, 10.0, Some(3.0)),
+        ];
+
+        let snapshot =
+            prepare_auction_volume_snapshot("09:20:30", &stocks, &std::collections::HashSet::new())
+                .expect("the valid row should produce a snapshot");
+        let selected_codes: Vec<&str> = snapshot
+            .items
+            .iter()
+            .map(|(_, code, _, _, _)| code.as_str())
+            .collect();
+
+        assert_eq!(selected_codes, vec!["VALID"]);
+    }
+
+    #[test]
+    fn auction_volume_p02_preparation_contains_exact_message_records_and_codes() {
+        let snapshot = prepare_auction_volume_snapshot(
+            "09:25:00",
+            &[
+                p02_stock("SECOND", 2.5, 20.25, Some(2.3)),
+                p02_stock("FIRST", 1.4, 10.5, Some(4.5)),
+            ],
+            &std::collections::HashSet::new(),
+        )
+        .expect("valid selected snapshot");
+        let prepared = prepare_auction_volume_dispatch(&snapshot, &captured_banner_normal());
+
+        assert_eq!(
+            prepared.message(),
+            concat!(
+                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "🌅 竞价热点量能 Top2（09:25:00）\n",
+                "  股票FIRST(FIRST) 高开+1.4% 量比4.5 []\n",
+                "  股票SECOND(SECOND) 高开+2.5% 量比2.3 []\n",
+                "情绪判读: 强承接, 观察池今日9:25 集合竞价结果, 关注开盘承接\n",
+                "辅助建议, 非下单指令",
+            )
+        );
+        assert_eq!(prepared.records().len(), 2);
+        let first = &prepared.records()[0];
+        assert_eq!(first.code, "FIRST");
+        assert_eq!(first.name, "股票FIRST");
+        assert_eq!(first.push_price, 10.5);
+        assert_eq!(
+            first.metric_json,
+            r#"{"price_chg_pct":1.4,"push_subkind":"AuctionVolume","vol_ratio":4.5}"#
+        );
+        assert_eq!(first.push_kind, "P-02");
+        assert_eq!(first.source, "preopen");
+
+        let second = &prepared.records()[1];
+        assert_eq!(second.code, "SECOND");
+        assert_eq!(second.name, "股票SECOND");
+        assert_eq!(second.push_price, 20.25);
+        assert_eq!(
+            second.metric_json,
+            r#"{"price_chg_pct":2.5,"push_subkind":"AuctionVolume","vol_ratio":2.3}"#
+        );
+        assert_eq!(second.push_kind, "P-02");
+        assert_eq!(second.source, "preopen");
+        assert_eq!(
+            prepared.notified_codes(),
+            &std::collections::HashSet::from(["FIRST".to_string(), "SECOND".to_string()])
+        );
+
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains("竞价热点量能"));
+        assert!(!debug.contains("FIRST"));
+        assert!(!debug.contains("price_chg_pct"));
+    }
+
+    #[test]
+    fn auction_volume_p02_preparation_comparison_detects_price_metric_and_code_changes() {
+        let prepare = |code: &str, price: f64, change_pct: f64, volume_ratio: f64| {
+            let snapshot = prepare_auction_volume_snapshot(
+                "09:25:00",
+                &[p02_stock(code, change_pct, price, Some(volume_ratio))],
+                &std::collections::HashSet::new(),
+            )
+            .expect("valid one-row snapshot");
+            prepare_auction_volume_dispatch(&snapshot, &captured_banner_normal())
+        };
+
+        let baseline = prepare("COMPARE", 10.0, 1.51, 4.01);
+        let price_changed = prepare("COMPARE", 20.0, 1.51, 4.01);
+        assert_eq!(baseline.message(), price_changed.message());
+        assert_ne!(baseline, price_changed);
+
+        let metric_changed = prepare("COMPARE", 10.0, 1.52, 4.02);
+        assert_eq!(baseline.message(), metric_changed.message());
+        assert_ne!(
+            baseline.records()[0].metric_json,
+            metric_changed.records()[0].metric_json
+        );
+        assert_ne!(baseline, metric_changed);
+
+        let mut code_changed = prepare("COMPARE", 10.0, 1.51, 4.01);
+        assert_eq!(baseline.message(), code_changed.message());
+        assert_eq!(baseline.records()[0].code, code_changed.records()[0].code);
+        assert_eq!(baseline.records()[0].name, code_changed.records()[0].name);
+        assert_eq!(
+            baseline.records()[0].push_price.to_bits(),
+            code_changed.records()[0].push_price.to_bits()
+        );
+        assert_eq!(
+            baseline.records()[0].metric_json,
+            code_changed.records()[0].metric_json
+        );
+        assert_eq!(
+            baseline.records()[0].push_kind,
+            code_changed.records()[0].push_kind
+        );
+        assert_eq!(
+            baseline.records()[0].source,
+            code_changed.records()[0].source
+        );
+        code_changed.notified_codes.clear();
+        code_changed.notified_codes.insert("OTHER".to_string());
+        assert_ne!(baseline.notified_codes(), code_changed.notified_codes());
+        assert_ne!(baseline, code_changed);
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_filters_notified_before_stable_top10() {
+        let mut stocks = vec![
+            p02_stock("NOTIFIED", 9.0, 99.0, Some(100.0)),
+            p02_stock("EQUAL_A", 1.1, 11.1, Some(9.0)),
+            p02_stock("EQUAL_B", 1.2, 12.2, Some(9.0)),
+        ];
+        for index in 0..8 {
+            stocks.push(p02_stock(
+                &format!("NEXT_{index}"),
+                index as f64,
+                20.0 + index as f64,
+                Some(8.0 - index as f64),
+            ));
+        }
+        stocks.push(p02_stock("LOW", 0.1, 9.9, Some(0.5)));
+        let notified = std::collections::HashSet::from(["NOTIFIED".to_string()]);
+
+        let snapshot = prepare_auction_volume_snapshot("09:21:00", &stocks, &notified)
+            .expect("ten eligible unnotified rows");
+        let selected_codes: Vec<_> = snapshot
+            .items
+            .iter()
+            .map(|(_, code, _, _, _)| code.as_str())
+            .collect();
+
+        assert_eq!(
+            selected_codes,
+            vec![
+                "EQUAL_A", "EQUAL_B", "NEXT_0", "NEXT_1", "NEXT_2", "NEXT_3", "NEXT_4", "NEXT_5",
+                "NEXT_6", "NEXT_7"
+            ]
+        );
+        assert_eq!(
+            snapshot.items[0],
+            (
+                "股票EQUAL_A".to_string(),
+                "EQUAL_A".to_string(),
+                1.1,
+                9.0,
+                11.1,
+            )
+        );
+
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let mut cursor = notified.clone();
+        let banner = BannerCtx::test_default();
+        let delivered = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut cursor,
+            |text| {
+                messages.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(delivered);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("竞价热点量能 Top10（09:21:00）"));
+        assert!(messages[0].contains("股票EQUAL_A(EQUAL_A) 高开+1.1% 量比9.0"));
+        assert!(messages[0].contains("股票EQUAL_B(EQUAL_B) 高开+1.2% 量比9.0"));
+        assert!(!messages[0].contains("NOTIFIED"));
+        assert!(!messages[0].contains("LOW"));
+        assert_eq!(
+            records
+                .iter()
+                .map(|meta| meta.code.as_str())
+                .collect::<Vec<_>>(),
+            selected_codes
+        );
+        assert_eq!(cursor.len(), 11);
+        assert!(cursor.contains("NOTIFIED"));
+        for code in selected_codes {
+            assert!(cursor.contains(code));
+        }
+    }
+
+    #[test]
+    fn auction_volume_p02_rejects_empty_and_all_invalid_batches() {
+        let notified = std::collections::HashSet::new();
+        assert!(prepare_auction_volume_snapshot("09:22:00", &[], &notified).is_err());
+        assert!(prepare_auction_volume_snapshot(
+            "09:22:00",
+            &[
+                p02_stock("MISSING", 1.0, 10.0, None),
+                p02_stock("BAD_PRICE", 1.0, 0.0, Some(2.0)),
+            ],
+            &notified,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn auction_volume_p02_source_failure_does_not_prepare_snapshot() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let notified = std::collections::HashSet::from(["ALREADY_NOTIFIED".to_string()]);
+        let result = load_auction_volume_tick_with("09:23:00", date, &notified, |_| {
+            calls.set(calls.get() + 1);
+            Err("provider unavailable".to_string())
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.unwrap_err(), "provider unavailable");
+        assert_eq!(
+            notified,
+            std::collections::HashSet::from(["ALREADY_NOTIFIED".to_string()])
+        );
+    }
+
+    #[test]
+    fn auction_volume_p02_preparation_preserves_shared_raw_stocks() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let raw = vec![
+            stock_analysis::market_data::TopStock {
+                main_net_yi: Some(1.25),
+                ..p02_stock("HOLDING_RAW", 4.0, 15.0, None)
+            },
+            stock_analysis::market_data::TopStock {
+                main_net_yi: Some(2.5),
+                ..p02_stock("P02_VALID", 2.0, 12.0, Some(5.0))
+            },
+        ];
+        let tick_data = load_auction_volume_tick_with(
+            "09:23:30",
+            date,
+            &std::collections::HashSet::new(),
+            |_| Ok(raw.clone()),
+        )
+        .expect("one source call should retain raw stocks");
+
+        assert!(tick_data.source_observation().is_none());
+        assert_eq!(
+            tick_data
+                .limit_stocks
+                .iter()
+                .map(|stock| stock.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["HOLDING_RAW", "P02_VALID"]
+        );
+        assert_eq!(tick_data.limit_stocks[0].main_net_yi, Some(1.25));
+        let snapshot = tick_data.snapshot.expect("one P-02-valid row");
+        assert_eq!(
+            snapshot
+                .items
+                .iter()
+                .map(|(_, code, _, _, _)| code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["P02_VALID"]
+        );
+
+        let all_notified =
+            std::collections::HashSet::from(["HOLDING_RAW".to_string(), "P02_VALID".to_string()]);
+        let tick_data =
+            load_auction_volume_tick_with("09:23:30", date, &all_notified, |_| Ok(raw.clone()))
+                .expect("P-02 emptiness must not discard shared raw stocks");
+        assert_eq!(tick_data.limit_stocks.len(), 2);
+        assert!(tick_data.snapshot.is_err());
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_uses_one_source_batch_for_message_records_and_cursor() {
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("fixed trading date");
+        let tick_data = load_auction_volume_tick_with(
+            "09:24:00",
+            date,
+            &std::collections::HashSet::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                let stock = if calls.get() == 1 {
+                    p02_stock("BATCH_FIRST", 2.5, 12.34, Some(6.0))
+                } else {
+                    p02_stock("BATCH_SECOND", 8.8, 88.88, Some(9.0))
+                };
+                Ok(vec![stock])
+            },
+        )
+        .expect("first source batch is valid");
+        assert_eq!(tick_data.limit_stocks[0].code, "BATCH_FIRST");
+        let snapshot = tick_data
+            .snapshot
+            .expect("first batch prepares P-02 snapshot");
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let mut notified = std::collections::HashSet::new();
+        let banner = BannerCtx::test_default();
+        let expected = prepare_auction_volume_dispatch(&snapshot, &banner.capture());
+
+        let delivered = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut notified,
+            |text| {
+                messages.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(delivered);
+        assert_eq!(calls.get(), 1, "dispatcher must not fetch a second batch");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], expected.message());
+        assert!(messages[0].contains("股票BATCH_FIRST(BATCH_FIRST) 高开+2.5% 量比6.0"));
+        assert!(!messages[0].contains("BATCH_SECOND"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].code, "BATCH_FIRST");
+        assert_eq!(records[0].name, "股票BATCH_FIRST");
+        assert_eq!(records[0].push_price, 12.34);
+        assert_eq!(records[0].metric_json, expected.records()[0].metric_json);
+        assert_eq!(records[0].push_kind, "P-02");
+        assert_eq!(records[0].source, "preopen");
+        assert_eq!(&notified, expected.notified_codes());
+        assert_eq!(
+            notified,
+            std::collections::HashSet::from(["BATCH_FIRST".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_volume_p02_failures_do_not_advance_cursor() {
+        let snapshot = prepare_auction_volume_snapshot(
+            "09:24:30",
+            &[
+                p02_stock("FIRST", 1.0, 10.0, Some(3.0)),
+                p02_stock("SECOND", 2.0, 20.0, Some(2.0)),
+            ],
+            &std::collections::HashSet::new(),
+        )
+        .expect("valid two-row snapshot");
+        let banner = BannerCtx::test_default();
+
+        let mut missing_banner_sink = Vec::new();
+        let mut missing_banner_records = Vec::new();
+        let mut missing_banner_cursor = std::collections::HashSet::new();
+        let missing_banner = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            None,
+            &mut missing_banner_cursor,
+            |text| {
+                missing_banner_sink.push(text);
+                std::future::ready(true)
+            },
+            |meta| {
+                missing_banner_records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!missing_banner);
+        assert!(missing_banner_sink.is_empty());
+        assert!(missing_banner_records.is_empty());
+        assert!(missing_banner_cursor.is_empty());
+
+        let mut failed_sink_output = Vec::new();
+        let mut failed_sink_records = Vec::new();
+        let mut failed_sink_cursor = std::collections::HashSet::new();
+        let sink_failed = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut failed_sink_cursor,
+            |text| {
+                failed_sink_output.push(text);
+                std::future::ready(false)
+            },
+            |meta| {
+                failed_sink_records.push(meta.clone());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!sink_failed);
+        assert_eq!(failed_sink_output.len(), 1);
+        assert!(failed_sink_records.is_empty());
+        assert!(failed_sink_cursor.is_empty());
+
+        let mut partial_records = Vec::new();
+        let mut recorder_failure_cursor = std::collections::HashSet::new();
+        let recorder_failed = dispatch_auction_volume_snapshot_with(
+            &snapshot,
+            Some(&banner),
+            &mut recorder_failure_cursor,
+            |_| std::future::ready(true),
+            |meta| {
+                partial_records.push(meta.clone());
+                if partial_records.len() == 2 {
+                    Err("second record rejected".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(!recorder_failed);
+        assert_eq!(
+            partial_records
+                .iter()
+                .map(|meta| meta.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["FIRST", "SECOND"]
+        );
+        assert!(recorder_failure_cursor.is_empty());
+    }
+
     #[test]
     fn t11_auction_volume() {
         let items = vec![
@@ -17584,6 +21232,35 @@ mod tests {
         assert!(s.contains("B(TEST_CODE_600000) 高开+2.1% 量比3.2 [观察池]"));
         assert!(s.contains("情绪判读: 强承接, 观察池今日可操作"));
         assert!(s.contains("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn t11_public_renderer_matches_frozen_banner_pure_renderer() {
+        let banner = banner_normal();
+        let captured = banner.capture();
+        let items = [AuctionItem {
+            name: "共享渲染",
+            code: "TEST_CODE_000001",
+            gap_pct: 3.4,
+            vol_ratio: 5.6,
+            tag: "TEST_TAG",
+        }];
+
+        let public = render_auction_volume(&banner, "09:25", &items, "强承接", "可操作");
+        let frozen =
+            render_auction_volume_from_captured(&captured, "09:25", &items, "强承接", "可操作");
+
+        assert_eq!(public, frozen);
+        assert_eq!(
+            frozen,
+            concat!(
+                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "🌅 竞价热点量能 Top1（09:25）\n",
+                "  共享渲染(TEST_CODE_000001) 高开+3.4% 量比5.6 [TEST_TAG]\n",
+                "情绪判读: 强承接, 观察池今日可操作\n",
+                "辅助建议, 非下单指令",
+            )
+        );
     }
 
     // ---- T-12 尾盘决策 ----
@@ -18785,6 +22462,836 @@ mod tests {
         assert_eq!(
             crate::notify::PushKind::StPriceLimitChanged.level(),
             crate::notify::PushLevel::Important
+        );
+    }
+
+    // ====== T-16 counted binding (MU-st-price 接线, 2026-09-19) ======
+    #[test]
+    fn t16_counted_binding_is_per_ticket_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let params = StPriceLimitChangedParams {
+            hhmm: "09:30",
+            name: "示例ST",
+            code: "600001",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 100,
+            cost: 8.0,
+            now_price: 7.5,
+            new_stop_loss: Some(6.8),
+            new_take_profit: Some(9.6),
+        };
+        let binding = build_st_price_counted_binding(date, &params).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600001"
+        );
+        // 同票同日同事实 → 同 occurrence (durable dedup 键稳定)
+        let again = build_st_price_counted_binding(date, &params).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 展示字段 (name/hhmm) 不进 identity (BR-250 纪律)
+        let renamed = StPriceLimitChangedParams {
+            name: "另一个名字",
+            hhmm: "10:00",
+            ..params
+        };
+        let rebinding = build_st_price_counted_binding(date, &renamed).expect("valid binding");
+        assert_eq!(
+            rebinding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600001"
+        );
+        // 不同业务日 → 不同 occurrence
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_st_price_counted_binding(next_day, &params).expect("valid binding");
+        assert_eq!(
+            next.schedule_occurrence_identity(),
+            "st-price:2026-09-21:600001"
+        );
+        // 不同票 → 不同 occurrence
+        let other = StPriceLimitChangedParams {
+            code: "600002",
+            ..params
+        };
+        let other_binding = build_st_price_counted_binding(date, &other).expect("valid binding");
+        assert_eq!(
+            other_binding.schedule_occurrence_identity(),
+            "st-price:2026-09-20:600002"
+        );
+    }
+
+    #[test]
+    fn g5b_counted_binding_is_per_event_per_day() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let record = stock_analysis::monitor::alert_log::AlertRecord {
+            origin: Default::default(),
+            triggered_at: "2026-09-20T15:02:00".to_string(),
+            code: "600001".to_string(),
+            name: "示例".to_string(),
+            level: "important".to_string(),
+            category: "资金".to_string(),
+            message: "主力净流入".to_string(),
+            price: None,
+            change_pct: None,
+            main_flow_yi: None,
+            news_title: None,
+            news_importance: None,
+            attribution_decision: None,
+            routed_external_id: None,
+            t1_locked: false,
+        };
+        let summary = "深链归因摘要";
+        let binding = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+        assert!(binding.retry_authorized());
+        assert!(
+            binding
+                .schedule_occurrence_identity()
+                .starts_with("g5b-attribution:2026-09-20:600001:")
+        );
+        // 同事件同日 → 同 occurrence; 同票不同事件 → 不同 occurrence (不互杀)
+        let again = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        let mut second = record.clone();
+        second.message = "另一条告警".to_string();
+        let other = build_g5b_counted_binding(date, &second, summary).expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next_binding = build_g5b_counted_binding(next, &record, summary).expect("valid binding");
+        assert!(
+            next_binding
+                .schedule_occurrence_identity()
+                .starts_with("g5b-attribution:2026-09-21:600001:")
+        );
+    }
+
+    #[test]
+    fn a12_counted_binding_is_global_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "归因摘要 (固定内容)";
+        let binding = build_attribution_daily_counted_binding(date, text).expect("valid binding");
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-20"
+        );
+        // 同业务日 → 同 occurrence (每日必达一次, 第二次同日推送被 policy 拒)
+        let again = build_attribution_daily_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 文本变化不改变 occurrence (当日一次不变式), 只改变 canonical
+        let other_text = "不同内容的摘要";
+        let other = build_attribution_daily_counted_binding(date, other_text).expect("valid binding");
+        assert_eq!(
+            other.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-20"
+        );
+        // 不同业务日 → 不同 occurrence
+        let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next_binding = build_attribution_daily_counted_binding(next, text).expect("valid binding");
+        assert_eq!(
+            next_binding.schedule_occurrence_identity(),
+            "attribution-daily:2026-09-21"
+        );
+    }
+
+    #[test]
+    fn t16_counted_binding_rejects_test_and_non_equity_codes() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let test_code = StPriceLimitChangedParams {
+            hhmm: "09:30",
+            name: "A",
+            code: "TEST_CODE_600000",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 100,
+            cost: 8.0,
+            now_price: 7.5,
+            new_stop_loss: None,
+            new_take_profit: None,
+        };
+        assert!(build_st_price_counted_binding(date, &test_code).is_err());
+        let malformed = StPriceLimitChangedParams { code: "12345", ..test_code };
+        assert!(build_st_price_counted_binding(date, &malformed).is_err());
+    }
+
+    #[test]
+    fn i01_counted_binding_identity_is_per_producer_and_per_time_slot() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "盘中盘面走向样本";
+
+        // R-02 周期卡: 每时间槽独立 occurrence (跨槽重试不互杀身份)
+        let slot_a = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            slot_a.schedule_occurrence_identity(),
+            "intraday:2026-09-20:market-view:10:15"
+        );
+        let slot_b = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:20".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            slot_b.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+
+        // 每日一次提醒: 同业务日同生产者 → 同 occurrence
+        let reminder = build_intraday_counted_binding(
+            date,
+            IntradayProducer::SnapshotReminder,
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            reminder.schedule_occurrence_identity(),
+            "intraday:2026-09-20:snapshot-reminder"
+        );
+        let probe = build_intraday_counted_binding(date, IntradayProducer::PreopenProbe, text)
+            .expect("valid binding");
+        assert_eq!(
+            probe.schedule_occurrence_identity(),
+            "intraday:2026-09-20:preopen-probe"
+        );
+        assert_ne!(
+            reminder.schedule_occurrence_identity(),
+            probe.schedule_occurrence_identity()
+        );
+
+        // 手工工具轮动总览: 同样每时间槽独立
+        let rotation = build_intraday_counted_binding(
+            date,
+            IntradayProducer::SectorRotation { hhmm: "10:30".to_owned() },
+            text,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            rotation.schedule_occurrence_identity(),
+            "intraday:2026-09-20:sector-rotation:10:30"
+        );
+        assert_ne!(
+            rotation.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+    }
+
+    #[test]
+    fn i01_counted_binding_is_global_scope_without_replay_authorization() {
+        // 旧语义保真: 三个生产者各有进程内补偿 (次日再检/窗口即弃/5 分钟循环),
+        // durable 补发只会推过时时间戳内容 → retry_authorized=false, 只留审计。
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_intraday_counted_binding(
+            date,
+            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            "盘中盘面走向样本",
+        )
+        .expect("valid binding");
+        assert_eq!(binding.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+    }
+
+    #[test]
+    fn i02_counted_binding_identity_is_per_time_slot_and_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "新闻催化映射样本";
+        let slot_a =
+            build_news_catalyst_counted_binding(date, "10:15", text).expect("valid binding");
+        assert_eq!(
+            slot_a.schedule_occurrence_identity(),
+            "news-catalyst:2026-09-20:10:15"
+        );
+        // 每时间槽独立 (事件驱动, 同日多次触发不互杀身份)
+        let slot_b =
+            build_news_catalyst_counted_binding(date, "10:25", text).expect("valid binding");
+        assert_ne!(
+            slot_b.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+        // 同槽同字节 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_news_catalyst_counted_binding(date, "10:15", text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+        // 旧语义一次性调用失败即弃 → retry_authorized=false, Global scope
+        assert_eq!(slot_a.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert!(!slot_a.retry_authorized());
+        assert_eq!(slot_a.business_date(), date);
+    }
+
+    #[test]
+    fn u06_counted_binding_identity_is_per_ticket_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_block_trade_confirm_counted_binding(
+            date,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "block-trade-confirm:2026-09-20:300001"
+        );
+        // 同票同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_block_trade_confirm_counted_binding(
+            date,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同批不同票 → 不同 occurrence (PerTicket, 批量互不阻塞)
+        let other = build_block_trade_confirm_counted_binding(
+            date,
+            "688001",
+            500,
+            45.60,
+            Board::Star,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_block_trade_confirm_counted_binding(
+            next_day,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // backfill 重跑补偿授权 → retry_authorized=true, Ticket scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
+    }
+
+    #[test]
+    fn u07_counted_binding_is_global_daily_digest_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "🛰️ IPO 产业链催化（2026-09-20 动态）";
+        let binding =
+            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "ipo-catalyst:2026-09-20"
+        );
+        // 同业务日同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence (修复旧跨日期共享空code冷却缺陷)
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next =
+            build_ipo_catalyst_counted_binding(next_day, text).expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // backfill 重跑补偿授权 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u08_counted_binding_is_daily_global_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_snapshot_stale_counted_binding(date, 5, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "snapshot-stale:2026-09-20"
+        );
+        // 同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_snapshot_stale_counted_binding(date, 5, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence (每日一次)
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_snapshot_stale_counted_binding(next_day, 6, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // days_behind 时刻锚定 + 进程内 gate 补偿 → retry_authorized=false
+        // (I-01 论据), Global scope
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u09_counted_binding_is_per_shape_per_time_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::First,
+            "09:35",
+            "🟢 首板涨停",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "limit-boards:2026-09-20:First:09:35"
+        );
+        // 同 shape 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::First,
+            "09:35",
+            "🟢 首板涨停",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 shape → 不同 occurrence (但共享 Global 头, 旧互相阻塞语义)
+        let other = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::Second,
+            "09:35",
+            "🟡 二板涨停",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中状态快照 + 周期重渲染补偿 → retry_authorized=false, Global
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u10_counted_binding_is_per_transition_with_replay() {
+        use stock_analysis::monitor::data_mode::DataMode as LibDM;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Full),
+            LibDM::Degraded,
+            "数据模式降级",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "data-mode:2026-09-20:Full:Degraded"
+        );
+        // 同变迁对同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Full),
+            LibDM::Degraded,
+            "数据模式降级",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同日反向变迁 (Degraded→Full) → 不同 occurrence (日级头不会吞掉)
+        let reverse = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Degraded),
+            LibDM::Full,
+            "数据模式恢复",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            reverse.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 健康告警必达 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u11_counted_binding_is_per_time_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding =
+            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "auction-repush:2026-09-20:09:25"
+        );
+        // 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中快照 + 下一轮重渲染补偿 → retry_authorized=false, Global
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u12_counted_binding_is_per_ticket_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_candidate_invalidated_counted_binding(
+            date,
+            "600001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "candidate-invalidated:2026-09-20:600001"
+        );
+        // 同票同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_candidate_invalidated_counted_binding(
+            date,
+            "600001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同批不同票 → 不同 occurrence (PerTicket, 批量互不阻塞)
+        let other = build_candidate_invalidated_counted_binding(
+            date,
+            "300001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 失效事件事实 + 唯一恢复路径 → retry_authorized=true, Ticket scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
+    }
+
+    #[test]
+    fn u14_counted_binding_is_per_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_announcement_counted_binding(
+            date,
+            "evt-001",
+            Some("600001"),
+            "公告标题",
+            "cninfo",
+            80,
+            90,
+            false,
+            "公告样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "announcement:2026-09-20:cninfo:evt-001"
+        );
+        // 同 event 同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_announcement_counted_binding(
+            date,
+            "evt-001",
+            Some("600001"),
+            "公告标题",
+            "cninfo",
+            80,
+            90,
+            false,
+            "公告样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 event → 不同 occurrence (批量公告同日全达, 无冷却互不阻塞)
+        let other = build_announcement_counted_binding(
+            date,
+            "evt-002",
+            None,
+            "宏观公告",
+            "cninfo",
+            70,
+            60,
+            false,
+            "公告样本二",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 历史事实 + 唯一恢复路径 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u16_counted_binding_is_per_ticket_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_news_to_idea_counted_binding(date, "600001", "10:15", "新闻到灵感样本")
+            .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "news-to-idea:2026-09-20:600001:10:15"
+        );
+        // 同票同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_news_to_idea_counted_binding(date, "600001", "10:15", "新闻到灵感样本")
+            .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // LLM 时刻锚定 + D01 memo 补偿 → retry_authorized=false, Ticket scope
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
+    }
+
+    #[test]
+    fn u17_counted_binding_is_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding =
+            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "auction-volume:2026-09-20:09:22"
+        );
+        // 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中快照 + 轮询重渲染补偿 → retry_authorized=false, Global
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u18_counted_binding_is_per_ticket_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_industry_chain_intraday_counted_binding(
+            date,
+            "600001",
+            "10:30",
+            "涨停扩散样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "industry-chain-intraday:2026-09-20:600001:10:30"
+        );
+        // 同票同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_industry_chain_intraday_counted_binding(
+            date,
+            "600001",
+            "10:30",
+            "涨停扩散样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // LLM 时刻锚定 + 周期重渲染补偿 → retry_authorized=false, Ticket
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
+    }
+
+    #[test]
+    fn u19_counted_binding_is_per_window_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_news_flash_aggregated_counted_binding(
+            date,
+            "morning",
+            "10:30",
+            "新闻聚合样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "news-flash-agg:2026-09-20:morning:10:30"
+        );
+        // 同窗口同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_news_flash_aggregated_counted_binding(
+            date,
+            "morning",
+            "10:30",
+            "新闻聚合样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中聚合时刻锚定 + 下一窗口重渲染补偿 → retry_authorized=false
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u15_counted_binding_is_per_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            Some("600001"),
+            "上调评级",
+            "em",
+            75,
+            85,
+            false,
+            "分析师上调样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "analyst-upgrade:2026-09-20:em:upg-001"
+        );
+        // 同 event 同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            Some("600001"),
+            "上调评级",
+            "em",
+            75,
+            85,
+            false,
+            "分析师上调样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 source 同 event_id → 不同 occurrence (跨源防碰撞)
+        let other = build_analyst_upgrade_counted_binding(
+            date,
+            "upg-001",
+            None,
+            "上调评级",
+            "cninfo",
+            75,
+            85,
+            false,
+            "分析师上调样本",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 历史事实 + 唯一恢复路径 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
     }
 
@@ -20501,11 +25008,11 @@ mod tests {
                 intent: Intent::Reduce,
                 price: 12.30,
                 cost: 11.80,
-                avail: Some(3000),
+                avail: 3000,
                 reduce_zone: Some((12.45, 12.60)),
-                support: Some(11.95),
-                pressure: Some(12.70),
-                stop: Some(11.95),
+                support: 11.95,
+                pressure: 12.70,
+                stop: 11.95,
                 invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },

@@ -29,6 +29,7 @@ mod integration;
 pub mod news_ai;
 pub mod news_monitor;
 pub mod prediction;
+pub mod push_job;
 pub mod rate_budget;
 pub mod risk;
 pub mod scanner;

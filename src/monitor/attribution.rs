@@ -196,9 +196,7 @@ pub fn attribute_event(event: &AlertEvent) -> Result<AttributionResult, Attribut
         } else {
             "无链命中".into()
         },
-        fund: event.detail.main_flow_yi.filter(|value| value.is_finite())
-            .map(|value| format!("主力净流入 {value:+.2}亿"))
-            .unwrap_or_else(|| "[数据缺失]".into()),
+        fund: "[数据缺失]".into(),
         technical: match (event.detail.change_pct, event.detail.volume_ratio) {
             (Some(change), Some(volume)) => format!("gap={change:.2}% vol={volume:.2}"),
             (Some(change), None) => format!("gap={change:.2}% vol=[数据缺失]"),
@@ -208,10 +206,7 @@ pub fn attribute_event(event: &AlertEvent) -> Result<AttributionResult, Attribut
         sentiment: format!("alert_level={:?}", event.level),
     };
 
-    let mut missing = Vec::new();
-    if event.detail.main_flow_yi.is_none_or(|value| !value.is_finite()) {
-        missing.push("fund_flow".to_string());
-    }
+    let mut missing = vec!["fund_flow".to_string()];
     if news_importance.is_none() {
         missing.push("news_importance".into());
     }

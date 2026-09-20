@@ -75,6 +75,26 @@ async fn run_time_schedule(args: &Args, schedule_time: &str, run_now: bool) -> R
             "无效的定时时间格式，应为 HH:MM 或 HH:MM,HH:MM"
         ));
     }
+    // 范围校验: 循环内的 and_hms_opt 对越界小时/分钟返回 None 并 panic (原缺陷),
+    // 且纯非法 weekday 会使 contains 等待循环永不终止 —— 在此处优雅拒绝。
+    if let Some(&(h, m)) = time_points
+        .iter()
+        .find(|&&(h, m)| h >= 24 || m >= 60)
+    {
+        return Err(anyhow::anyhow!(
+            "无效的定时时间 {h}:{m:02}，HH:MM 需满足 0<=H<24, 0<=M<60"
+        ));
+    }
+    if let Some(days) = weekdays {
+        // 仅当列表中没有任何合法值时才拒绝 —— 那是 while !contains 循环
+        // 永不终止的条件。混合列表 (如 1,8) 保留旧行为: 合法日参与匹配,
+        // 非法值被显示层过滤 (与 filter_map 的静默丢弃一致)。
+        if !days.iter().any(|d| (1..=7u32).contains(d)) {
+            return Err(anyhow::anyhow!(
+                "无效的星期过滤: 至少需要一个 1..=7 的值（周一..周日）"
+            ));
+        }
+    }
 
     let weekdays_str = if let Some(days) = weekdays {
         let day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];

@@ -21,8 +21,13 @@ pub mod config;
 pub mod email;
 pub mod feishu;
 pub mod report;
+pub mod send_report;
 pub mod service;
 pub mod wechat;
 
+#[cfg(test)]
+mod send_report_tests;
+
 pub use config::{NotificationChannel, NotificationConfig, SmtpConfig};
+pub use send_report::{NotificationAttempt, NotificationSendReport};
 pub use service::{send_daily_report, AnalysisResult, NotificationService};

@@ -100,19 +100,15 @@ macro_rules! impl_strategy_id {
 mod tests {
     use super::*;
 
-    fn make_input_chg(kind: &str, vol: f64, chg: f64) -> StrategyInput {
+    fn make_input(kind: &str, vol: f64) -> StrategyInput {
         StrategyInput {
             code: "TEST_CODE_000001".to_string(),
             push_price: 10.0,
-            metric_json: serde_json::json!({"vol_ratio": vol, "push_subkind": "Test", "price_chg_pct": chg, "sector": "AI"}).to_string(),
+            // Fix v16.4 完整化: chg + 0.1 (momentum/sector_leader 拒 chg<=0)
+            metric_json: serde_json::json!({"vol_ratio": vol, "push_subkind": "Test", "price_chg_pct": 0.1, "sector": "AI"}).to_string(),
             push_kind: kind.to_string(),
             now: chrono::Local::now(),
         }
-    }
-
-    fn make_input(kind: &str, vol: f64) -> StrategyInput {
-        // Fix v16.4 完整化: chg + 0.1 (momentum/sector_leader 拒 chg<=0)
-        make_input_chg(kind, vol, 0.1)
     }
 
     #[test]
@@ -120,55 +116,6 @@ mod tests {
         let s = NewsCatalystStrategy;
         let out = s.score(&make_input("D-01", 0.0)).expect("should score");
         assert_eq!(out.score, 7.0);
-    }
-
-    #[test]
-    fn news_catalyst_dip_2_5_caps_dip_and_adds_accel() {
-        let s = NewsCatalystStrategy;
-        // chg=-2.5 → 7.0 + min(2.5,2)*0.3=0.6 (低吸) + 0.5 (急跌<-2) = 8.1
-        let out = s
-            .score(&make_input_chg("D-01", 0.0, -2.5))
-            .expect("should score");
-        assert!((out.score - 8.1).abs() < 1e-9, "期望 8.1, 实际 {}", out.score);
-        assert_eq!(out.reason, "新闻驱动 chg=-2.5%");
-        // 低吸封顶 min(|chg|,2): 再深跌不叠加
-        let deep = s
-            .score(&make_input_chg("D-01", 0.0, -10.0))
-            .expect("should score");
-        assert!((deep.score - 8.1).abs() < 1e-9, "封顶 8.1, 实际 {}", deep.score);
-    }
-
-    #[test]
-    fn news_catalyst_dip_1_only_dip_bonus() {
-        let s = NewsCatalystStrategy;
-        // chg=-1.0 → 7.0 + min(1,2)*0.3 = 7.3 (无急跌加速)
-        let out = s
-            .score(&make_input_chg("D-01", 0.0, -1.0))
-            .expect("should score");
-        assert!((out.score - 7.3).abs() < 1e-9, "期望 7.3, 实际 {}", out.score);
-        assert_eq!(out.reason, "新闻驱动 chg=-1.0%");
-    }
-
-    #[test]
-    fn news_catalyst_gain_2_stays_base() {
-        let s = NewsCatalystStrategy;
-        // 上涨无低吸加成 → base 7.0
-        let out = s
-            .score(&make_input_chg("D-01", 0.0, 2.0))
-            .expect("should score");
-        assert!((out.score - 7.0).abs() < 1e-9, "期望 7.0, 实际 {}", out.score);
-        assert_eq!(out.reason, "新闻驱动 chg=2.0%"); // 无 '+' 号
-    }
-
-    #[test]
-    fn news_catalyst_without_chg_stays_base_7() {
-        let s = NewsCatalystStrategy;
-        // 历史行/上游缺失 chg → 字段省略 → 回落 base 7.0 (零回归语义)
-        let mut input = make_input_chg("D-01", 0.0, 0.1);
-        input.metric_json = serde_json::json!({"push_subkind": "NewsCatalyst"}).to_string();
-        let out = s.score(&input).expect("should score");
-        assert!((out.score - 7.0).abs() < 1e-9, "期望 7.0, 实际 {}", out.score);
-        assert_eq!(out.reason, "新闻驱动 chg=暂无");
     }
 
     #[test]

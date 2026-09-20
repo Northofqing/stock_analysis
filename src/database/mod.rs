@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, Metadata};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
@@ -744,6 +744,10 @@ struct DescriptorSqliteSource {
     readback_connection: Mutex<Option<SqliteConnection>>,
     pool_evidence: Mutex<Option<DescriptorPoolEvidence>>,
     connection_proofs: Mutex<HashMap<String, DescriptorConnectionProof>>,
+    /// Main descriptors of attested connections this source has released,
+    /// oldest first. The unix VFS parks them on the inode and reissues the
+    /// most recently parked one to the next open of the same inode.
+    released_main_descriptors: Mutex<Vec<RawFd>>,
     first_integrity_failure: Mutex<Option<String>>,
     registration_namespace: String,
     next_connection_id: AtomicU64,
@@ -811,6 +815,7 @@ impl SqliteConnectionManager {
                     readback_connection: Mutex::new(None),
                     pool_evidence: Mutex::new(None),
                     connection_proofs: Mutex::new(HashMap::new()),
+                    released_main_descriptors: Mutex::new(Vec::new()),
                     first_integrity_failure: Mutex::new(None),
                     registration_namespace: descriptor_registration_namespace()?,
                     next_connection_id: AtomicU64::new(0),
@@ -1919,96 +1924,131 @@ impl ManageConnection for SqliteConnectionManager {
                                 .unwrap_or(false)
                     });
                 validate_retained_namespace(source)?;
-                let before = ProcessDescriptorSnapshot::capture()
+                let reusable_main = reusable_released_main_descriptors(source)?;
+                let mut before = ProcessDescriptorSnapshot::capture()
                     .map_err(descriptor_attestation_manager_error)?;
                 let route = sqlite_open_route(source)?;
                 let manager = ConnectionManager::<SqliteConnection>::new(format!(
                     "file:{}?mode=rw",
                     route.to_string_lossy()
                 ));
-                let mut connection = manager.connect()?;
-                configure_sqlite_connection(&mut connection)?;
-                let actual = Self::verify_descriptor_connection(source, &mut connection, &route)?;
-                if actual != source.identity {
-                    return Err(descriptor_integrity_manager_error(
-                        "descriptor_identity_changed: SQLite main connection escaped owner inode",
-                    ));
-                }
-                let journal_mode = diesel::sql_query("PRAGMA journal_mode")
-                    .get_result::<JournalModeRow>(&mut connection)
-                    .map_err(|error| sqlite_configuration_error("read journal_mode", error))?
-                    .journal_mode;
-                validate_wal_journal_mode(&journal_mode)
+                // The unix VFS reissues main descriptors parked by closed
+                // connections of this inode. Descriptors this source released
+                // itself are attested directly; parked descriptors of unknown
+                // origin are exhausted by holding each unproved open until a
+                // fresh descriptor appears (same bound as BR-206).
+                let pinned_main = FileObjectIdentity::from_file(&source.database_anchor)
                     .map_err(descriptor_attestation_manager_error)?;
-                diesel::sql_query("BEGIN IMMEDIATE")
-                    .execute(&mut connection)
-                    .map_err(|error| sqlite_configuration_error("prime WAL begin", error))?;
-                diesel::sql_query("ROLLBACK")
-                    .execute(&mut connection)
-                    .map_err(|error| sqlite_configuration_error("prime WAL rollback", error))?;
-                let after = ProcessDescriptorSnapshot::capture()
-                    .map_err(descriptor_attestation_manager_error)?;
-                // Open pins only after the fd snapshot. Otherwise our own
-                // no-follow pins would enter the delta and make ownership
-                // ambiguous.
-                let observed_objects = capture_pinned_sqlite_object_set(source)?;
-                let existing_evidence = current_descriptor_pool_evidence(source)?;
-                let expected_objects = match existing_evidence.as_ref() {
-                    Some(existing) if existing.expected_objects.as_ref() != &observed_objects => {
+                let maximum_attempts = before.count_matching(pinned_main).saturating_add(1);
+                let mut unproved_connections = Vec::new();
+                let (mut connection, handles, expected_objects, existing_evidence, after) = loop {
+                    let attempt = unproved_connections.len() + 1;
+                    let mut connection = manager.connect()?;
+                    configure_sqlite_connection(&mut connection)?;
+                    let actual =
+                        Self::verify_descriptor_connection(source, &mut connection, &route)?;
+                    if actual != source.identity {
                         return Err(descriptor_integrity_manager_error(
-                            "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
+                            "descriptor_identity_changed: SQLite main connection escaped owner inode",
                         ));
                     }
-                    Some(existing) => Arc::clone(&existing.expected_objects),
-                    None => Arc::new(observed_objects),
+                    let journal_mode = diesel::sql_query("PRAGMA journal_mode")
+                        .get_result::<JournalModeRow>(&mut connection)
+                        .map_err(|error| sqlite_configuration_error("read journal_mode", error))?
+                        .journal_mode;
+                    validate_wal_journal_mode(&journal_mode)
+                        .map_err(descriptor_attestation_manager_error)?;
+                    diesel::sql_query("BEGIN IMMEDIATE")
+                        .execute(&mut connection)
+                        .map_err(|error| sqlite_configuration_error("prime WAL begin", error))?;
+                    diesel::sql_query("ROLLBACK")
+                        .execute(&mut connection)
+                        .map_err(|error| sqlite_configuration_error("prime WAL rollback", error))?;
+                    let after = ProcessDescriptorSnapshot::capture()
+                        .map_err(descriptor_attestation_manager_error)?;
+                    // Open pins only after the fd snapshot. Otherwise our own
+                    // no-follow pins would enter the delta and make ownership
+                    // ambiguous.
+                    let observed_objects = capture_pinned_sqlite_object_set(source)?;
+                    let existing_evidence = current_descriptor_pool_evidence(source)?;
+                    let expected_objects = match existing_evidence.as_ref() {
+                        Some(existing)
+                            if existing.expected_objects.as_ref() != &observed_objects =>
+                        {
+                            return Err(descriptor_integrity_manager_error(
+                                "descriptor_identity_changed: SQLite main/WAL/SHM objects changed between connections",
+                            ));
+                        }
+                        Some(existing) => Arc::clone(&existing.expected_objects),
+                        None => Arc::new(observed_objects),
+                    };
+                    let attested = AttestedSqliteHandles::from_delta_with_shared_shm(
+                        &before,
+                        &after,
+                        &expected_objects,
+                        existing_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.shared_shm_anchor.as_ref()),
+                        &reusable_main,
+                    );
+                    match attested {
+                        Ok(handles) => {
+                            break (
+                                connection,
+                                handles,
+                                expected_objects,
+                                existing_evidence,
+                                after,
+                            )
+                        }
+                        Err(DescriptorAttestationError::Unavailable { .. })
+                            if attempt < maximum_attempts
+                                && AttestedSqliteHandles::exact_main_candidates(
+                                    &before,
+                                    &after,
+                                    &expected_objects,
+                                ) == 0 =>
+                        {
+                            unproved_connections.push(connection);
+                            before = after;
+                        }
+                        Err(error) => return Err(descriptor_attestation_manager_error(error)),
+                    }
                 };
-                let handles = AttestedSqliteHandles::from_delta_with_shared_shm(
-                    &before,
-                    &after,
-                    &expected_objects,
-                    existing_evidence
-                        .as_ref()
-                        .map(|evidence| evidence.shared_shm_anchor.as_ref()),
-                )
-                .map_err(descriptor_attestation_manager_error)?;
+                // Closing unproved opens re-parks their descriptors; they are
+                // exhausted again by the same bounded loop on a later connect.
+                drop(unproved_connections);
                 handles
                     .validate(&expected_objects)
                     .map_err(descriptor_attestation_manager_error)?;
-                let shared_shm_anchor = match existing_evidence {
-                    Some(evidence) => evidence.shared_shm_anchor,
-                    None => Arc::new(open_shared_shm_anchor(source, &expected_objects)?),
-                };
-                let pool_evidence = commit_descriptor_pool_evidence(
+                consume_released_main_descriptor(
                     source,
-                    DescriptorPoolEvidence {
-                        expected_objects,
-                        shared_shm_anchor,
-                    },
+                    handles.main().descriptor(),
+                    expected_objects.identity(SqliteObjectRole::Main),
+                    &after,
                 )?;
-                validate_retained_namespace(source)?;
-                Self::verify_descriptor_connection(source, &mut connection, &route)?;
-                let token = format!(
-                    "descriptor-source-{}-connection-{:016x}",
-                    source.registration_namespace,
-                    source.next_connection_id.fetch_add(1, Ordering::Relaxed)
+                let attested_main = handles.main().descriptor();
+                let registered = register_attested_descriptor_connection(
+                    source,
+                    &mut connection,
+                    handles,
+                    expected_objects,
+                    existing_evidence,
+                    &route,
                 );
-                install_connection_attestation_token(&mut connection, &token)?;
-                source
-                    .connection_proofs
-                    .lock()
-                    .map_err(|_| {
-                        sqlite_manager_error("descriptor connection-proof lock is poisoned")
-                    })?
-                    .insert(
-                        token,
-                        DescriptorConnectionProof {
-                            handles,
-                            expected_objects: Arc::clone(&pool_evidence.expected_objects),
-                            shared_shm_anchor: Arc::clone(&pool_evidence.shared_shm_anchor),
-                        },
-                    );
-                validate_live_registered_descriptor_connection(source, &mut connection)?;
-                Ok(connection)
+                match registered {
+                    Ok(()) => Ok(connection),
+                    Err(error) => {
+                        // The connection closes here and SQLite parks its main
+                        // descriptor for reuse; record it so the next open can
+                        // still be attested.
+                        drop(connection);
+                        if let Ok(mut released) = source.released_main_descriptors.lock() {
+                            released.push(attested_main);
+                        }
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -2041,6 +2081,14 @@ struct SqliteConnectionConfiguration {
 
 #[derive(Debug)]
 struct SqliteConnectionCustomizer;
+
+/// Pool customizer for descriptor-attested sources. Its release hook runs on
+/// every r2d2 drop path and hands the closing connection's main descriptor
+/// back to the source before SQLite parks it for reuse.
+#[derive(Debug)]
+struct DescriptorSqliteConnectionCustomizer {
+    source: Arc<DescriptorSqliteSource>,
+}
 
 #[derive(Debug)]
 struct ReadonlySqliteConnectionCustomizer;
@@ -2249,6 +2297,160 @@ impl CustomizeConnection<SqliteConnection, ConnectionManagerError> for SqliteCon
 }
 
 impl CustomizeConnection<SqliteConnection, ConnectionManagerError>
+    for DescriptorSqliteConnectionCustomizer
+{
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
+        configure_sqlite_connection(conn)
+    }
+
+    fn on_release(&self, conn: SqliteConnection) {
+        release_descriptor_connection(&self.source, conn);
+    }
+}
+
+/// Closes an attested connection while its source's connect lock is held, so
+/// the descriptor SQLite parks on close is recorded before any later open
+/// snapshot can observe it.
+fn release_descriptor_connection(
+    source: &DescriptorSqliteSource,
+    mut connection: SqliteConnection,
+) {
+    let _guard = match source.connect_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            log::warn!("descriptor connect lock poisoned while releasing a pooled connection");
+            return;
+        }
+    };
+    match connection_attestation_token(&mut connection) {
+        Ok(token) => unregister_descriptor_connection_proof_locked(source, &token),
+        Err(error) => log::warn!(
+            "released descriptor-attested connection has no readable attestation token; its main descriptor stays claimed: {error}"
+        ),
+    }
+    drop(connection);
+}
+
+/// Commits pool evidence, installs the token and registers the proof for an
+/// already attested connection. On error the proof is not left registered;
+/// the caller owns closing the connection. Caller must hold
+/// `source.connect_lock`.
+fn register_attested_descriptor_connection(
+    source: &DescriptorSqliteSource,
+    connection: &mut SqliteConnection,
+    handles: AttestedSqliteHandles,
+    expected_objects: Arc<PinnedSqliteObjectSet>,
+    existing_evidence: Option<DescriptorPoolEvidence>,
+    route: &Path,
+) -> Result<(), ConnectionManagerError> {
+    let shared_shm_anchor = match existing_evidence {
+        Some(evidence) => evidence.shared_shm_anchor,
+        None => Arc::new(open_shared_shm_anchor(source, &expected_objects)?),
+    };
+    let pool_evidence = commit_descriptor_pool_evidence(
+        source,
+        DescriptorPoolEvidence {
+            expected_objects,
+            shared_shm_anchor,
+        },
+    )?;
+    validate_retained_namespace(source)?;
+    SqliteConnectionManager::verify_descriptor_connection(source, connection, route)?;
+    let token = format!(
+        "descriptor-source-{}-connection-{:016x}",
+        source.registration_namespace,
+        source.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    );
+    install_connection_attestation_token(connection, &token)?;
+    source
+        .connection_proofs
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?
+        .insert(
+            token.clone(),
+            DescriptorConnectionProof {
+                handles,
+                expected_objects: Arc::clone(&pool_evidence.expected_objects),
+                shared_shm_anchor: Arc::clone(&pool_evidence.shared_shm_anchor),
+            },
+        );
+    if let Err(error) = validate_live_registered_descriptor_connection(source, connection) {
+        if let Ok(mut proofs) = source.connection_proofs.lock() {
+            proofs.remove(&token);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Caller must hold `source.connect_lock`.
+fn unregister_descriptor_connection_proof_locked(source: &DescriptorSqliteSource, token: &str) {
+    let removed = match source.connection_proofs.lock() {
+        Ok(mut proofs) => proofs.remove(token),
+        Err(_) => {
+            log::warn!(
+                "descriptor connection-proof lock poisoned while unregistering a connection"
+            );
+            return;
+        }
+    };
+    if let Some(proof) = removed {
+        match source.released_main_descriptors.lock() {
+            Ok(mut released) => released.push(proof.handles.main().descriptor()),
+            Err(_) => log::warn!(
+                "descriptor released-main lock poisoned; reopen of descriptor {} cannot be attested",
+                proof.handles.main().descriptor()
+            ),
+        }
+    }
+}
+
+/// Released main descriptors that may be reissued to the next open, most
+/// recent first, excluding descriptors still owned by a registered proof or by
+/// this source's own pins. Caller must hold `source.connect_lock`.
+fn reusable_released_main_descriptors(
+    source: &DescriptorSqliteSource,
+) -> Result<Vec<RawFd>, ConnectionManagerError> {
+    let claimed = source
+        .connection_proofs
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor connection-proof lock is poisoned"))?
+        .values()
+        .map(|proof| proof.handles.main().descriptor())
+        .collect::<std::collections::HashSet<_>>();
+    let anchor = source.database_anchor.as_raw_fd();
+    let released = source
+        .released_main_descriptors
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor released-main lock is poisoned"))?;
+    Ok(released
+        .iter()
+        .rev()
+        .copied()
+        .filter(|descriptor| *descriptor != anchor && !claimed.contains(descriptor))
+        .collect())
+}
+
+/// Removes the descriptor SQLite just reissued from the released list and
+/// prunes entries that no longer name the pinned main object. Caller must
+/// hold `source.connect_lock`.
+fn consume_released_main_descriptor(
+    source: &DescriptorSqliteSource,
+    attested_main: RawFd,
+    expected_main: FileObjectIdentity,
+    after: &ProcessDescriptorSnapshot,
+) -> Result<(), ConnectionManagerError> {
+    let mut released = source
+        .released_main_descriptors
+        .lock()
+        .map_err(|_| sqlite_manager_error("descriptor released-main lock is poisoned"))?;
+    released.retain(|descriptor| {
+        *descriptor != attested_main && after.identity_of(*descriptor) == Some(expected_main)
+    });
+    Ok(())
+}
+
+impl CustomizeConnection<SqliteConnection, ConnectionManagerError>
     for ReadonlySqliteConnectionCustomizer
 {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
@@ -2313,27 +2515,46 @@ fn install_descriptor_readback_connection(
     let mut reader = manager
         .connect()
         .map_err(|error| descriptor_readback_initialization_error(source, error))?;
+    if let Err(error) = validate_descriptor_readback_connection(source, &mut reader) {
+        release_descriptor_connection(source, reader);
+        return Err(error);
+    }
+    let slot = source.readback_connection.lock();
+    match slot {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(reader);
+            Ok(())
+        }
+        Ok(slot) => {
+            drop(slot);
+            release_descriptor_connection(source, reader);
+            Err(latch_descriptor_integrity_failure(
+                source,
+                "descriptor source already owns a read-back connection".into(),
+            ))
+        }
+        Err(_) => {
+            release_descriptor_connection(source, reader);
+            Err(DatabaseAuthorityError::DescriptorIntegrityFailed {
+                detail: "read-back connection lock is poisoned".into(),
+            })
+        }
+    }
+}
+
+fn validate_descriptor_readback_connection(
+    source: &Arc<DescriptorSqliteSource>,
+    reader: &mut SqliteConnection,
+) -> Result<(), DatabaseAuthorityError> {
     diesel::sql_query("PRAGMA query_only=ON")
-        .execute(&mut reader)
+        .execute(reader)
         .map_err(
             |error| DatabaseAuthorityError::DescriptorAttestationUnavailable {
                 detail: format!("enable source-owned read-back query_only: {error}"),
             },
         )?;
-    require_query_only_readback(source, &mut reader)?;
-    registered_descriptor_connection_authority(source, &mut reader)?;
-    let mut slot = source.readback_connection.lock().map_err(|_| {
-        DatabaseAuthorityError::DescriptorIntegrityFailed {
-            detail: "read-back connection lock is poisoned".into(),
-        }
-    })?;
-    if slot.is_some() {
-        return Err(latch_descriptor_integrity_failure(
-            source,
-            "descriptor source already owns a read-back connection".into(),
-        ));
-    }
-    *slot = Some(reader);
+    require_query_only_readback(source, reader)?;
+    registered_descriptor_connection_authority(source, reader)?;
     Ok(())
 }
 
@@ -2369,10 +2590,15 @@ fn build_sqlite_pool_from_manager_with_checkout_validation(
     max_size: u32,
     test_on_check_out: bool,
 ) -> Result<DbPool, PoolError> {
+    let customizer: Box<dyn CustomizeConnection<SqliteConnection, ConnectionManagerError>> =
+        match manager.descriptor_source() {
+            Some(source) => Box::new(DescriptorSqliteConnectionCustomizer { source }),
+            None => Box::new(SqliteConnectionCustomizer),
+        };
     Pool::builder()
         .max_size(max_size)
         .test_on_check_out(test_on_check_out)
-        .connection_customizer(Box::new(SqliteConnectionCustomizer))
+        .connection_customizer(customizer)
         .build(manager)
 }
 
@@ -2398,6 +2624,9 @@ pub(crate) mod paper_inventory_failure_audit;
 pub mod position_chain;
 mod positions;
 // BR-215: projection reconciliation is a tool-facing entry point.
+pub(crate) use positions::{
+    read_open_position_rows, valid_sqlite_timestamp, OwnedPositionSourceRow,
+};
 pub use positions::{reconcile_stock_position_from_confirmed_snapshot, PositionReconciliation};
 mod sqlite_descriptor_attestation;
 // v12 PR1-1.5 (BR-021)
@@ -2415,8 +2644,6 @@ pub mod selection_v2_read_model;
 pub mod selection_v2_repository;
 pub mod user_account_summary;
 pub mod user_position_snapshot;
-// P0 死信哨兵 (2026-09-03)
-pub mod watchdog_deadline;
 
 /// BR-180 migration operator façade.
 ///
@@ -3359,8 +3586,6 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // BR-172: NewsAI assessments plus exact reservation/sink/delivery/
         // prediction-link events are independently immutable SHA-256 chains.
         news_ai::create_schema(&mut *conn)?;
-        // P0 (2026-09-03): 死信哨兵 deadline 注册表 (可更新 — 满足/触发都改行)。
-        watchdog_deadline::create_schema(&mut *conn)?;
 
         // ledger 表（v3 每日净值快照）
         diesel::sql_query(
@@ -4929,6 +5154,137 @@ mod tests {
 
         std::fs::remove_dir_all(&namespace).expect("remove replacement namespace");
         std::fs::remove_dir_all(&moved_namespace).expect("remove owner namespace");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn descriptor_manager_reattests_main_descriptor_reissued_after_pool_release() {
+        let namespace = std::env::temp_dir().join(unique_test_label("descriptor_pool_reissue"));
+        std::fs::create_dir(&namespace).expect("create owner namespace");
+        let database_path = namespace.join("stock_analysis.db");
+        let database_url = database_path.to_string_lossy().into_owned();
+        let mut bootstrap =
+            SqliteConnection::establish(&database_url).expect("create empty owner SQLite database");
+        diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap)
+            .expect("enable WAL before descriptor attestation");
+        drop(bootstrap);
+
+        let parent_file = File::open(&namespace).expect("pin owner database parent");
+        let owner_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("pin owner database descriptor");
+        let root_file = parent_file
+            .try_clone()
+            .expect("clone owner root descriptor");
+        let manager = SqliteConnectionManager::descriptor(
+            PinnedSqliteDatabase::from_test_descriptors(
+                root_file,
+                parent_file,
+                OsString::from("stock_analysis.db"),
+                PathBuf::from("stock_analysis.db"),
+                owner_file,
+            )
+            .expect("bind test owner descriptors"),
+        )
+        .expect("descriptor manager");
+        let source = manager
+            .descriptor_source()
+            .expect("descriptor manager retains proof registry");
+        let main_descriptor_of = |connection: &mut SqliteConnection| -> RawFd {
+            let token = connection_attestation_token(connection).expect("read token");
+            let proofs = source.connection_proofs.lock().expect("lock proofs");
+            proofs
+                .get(&token)
+                .expect("connection retains registered fd proof")
+                .handles
+                .main()
+                .descriptor()
+        };
+
+        // `first` stays open and keeps the WAL-mode SHARED lock on the inode,
+        // so closing `second` parks its main descriptor instead of closing it.
+        let mut first = manager.connect().expect("first attested connection");
+        let mut second = manager.connect().expect("second attested connection");
+        let first_main = main_descriptor_of(&mut first);
+        let second_main = main_descriptor_of(&mut second);
+        let second_token = connection_attestation_token(&mut second).expect("read second token");
+        assert_ne!(first_main, second_main);
+
+        let customizer = DescriptorSqliteConnectionCustomizer {
+            source: Arc::clone(&source),
+        };
+        customizer.on_release(second);
+        assert!(
+            !source
+                .connection_proofs
+                .lock()
+                .expect("lock proofs")
+                .contains_key(&second_token),
+            "released connection must leave the proof registry"
+        );
+        assert_eq!(
+            *source
+                .released_main_descriptors
+                .lock()
+                .expect("lock released"),
+            vec![second_main]
+        );
+
+        let mut third = manager
+            .connect()
+            .expect("reopen after pool release must attest the reissued main descriptor");
+        let third_main = main_descriptor_of(&mut third);
+        assert_eq!(
+            third_main, second_main,
+            "SQLite reissues the parked main descriptor to the next open"
+        );
+        assert!(source
+            .released_main_descriptors
+            .lock()
+            .expect("lock released")
+            .is_empty());
+        manager
+            .is_valid(&mut third)
+            .expect("reissued descriptor validates on checkout");
+        manager
+            .is_valid(&mut first)
+            .expect("untouched connection still validates");
+
+        // A descriptor parked by an opener this source never attested cannot
+        // be claimed; the bounded retry must exhaust it instead.
+        let route = sqlite_open_route(&source).expect("resolve open route");
+        let foreign =
+            SqliteConnection::establish(&format!("file:{}?mode=rw", route.to_string_lossy()))
+                .expect("open unattested connection to the pinned database");
+        drop(foreign);
+        assert!(source
+            .released_main_descriptors
+            .lock()
+            .expect("lock released")
+            .is_empty());
+        let mut fourth = manager
+            .connect()
+            .expect("reopen after a foreign release must exhaust the parked descriptor");
+        let fourth_main = main_descriptor_of(&mut fourth);
+        assert_ne!(fourth_main, first_main);
+        assert_ne!(fourth_main, third_main);
+        manager
+            .is_valid(&mut fourth)
+            .expect("fresh descriptor validates on checkout");
+        drop(fourth);
+
+        // A pooled release followed by a pool-driven reopen exercises the same path.
+        let pool = build_sqlite_pool_from_manager(manager.clone(), 4).expect("build pool");
+        let pooled = pool.get().expect("pooled attested connection");
+        drop(pooled);
+        drop(third);
+        drop(pool);
+        drop(first);
+        drop(manager);
+        std::fs::remove_dir_all(&namespace).expect("remove owner namespace");
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

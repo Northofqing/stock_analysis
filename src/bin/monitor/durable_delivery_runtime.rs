@@ -2285,6 +2285,42 @@ fn durable_kind_and_sub_kind_with_override(
         K::PreopenNewsHot => (D::PreopenNewsHot, DeliverySubKind::None),
         K::CloseCall => (D::CloseCall, DeliverySubKind::None),
         K::ForbiddenOps => (D::ForbiddenOps, DeliverySubKind::None),
+        // 2026-09-19: T-16 ST 涨跌幅变更提醒升级 counted (MU-st-price 接线)。
+        K::StPriceLimitChanged => (D::StPriceLimitChanged, DeliverySubKind::None),
+        // 2026-09-20: A-12 归因日推升级 counted (MU-attribution-daily 接线)。
+        K::AttributionDaily => (D::AttributionDaily, DeliverySubKind::None),
+        // 2026-09-20: G5b 深链归因升级 counted (MU-g5b-attribution 接线)。
+        K::G5bAttribution => (D::G5bAttribution, DeliverySubKind::None),
+        // 2026-09-20: I-01 盘中轮动升级 counted (MU-intraday-market 接线)。
+        K::IntradayMarket => (D::IntradayMarket, DeliverySubKind::None),
+        // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
+        K::NewsCatalyst => (D::NewsCatalyst, DeliverySubKind::None),
+        // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+        K::BlockTradeIntradayConfirm => (D::BlockTradeIntradayConfirm, DeliverySubKind::None),
+        // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+        K::IpoCatalyst => (D::IpoCatalyst, DeliverySubKind::None),
+        // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+        K::SnapshotStale => (D::SnapshotStale, DeliverySubKind::None),
+        // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+        K::LimitBoards => (D::LimitBoards, DeliverySubKind::None),
+        // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
+        K::DataMode => (D::DataMode, DeliverySubKind::None),
+        // 2026-09-20: 竞价重推升级 counted (MU-auction-candidates 接线)。
+        K::AuctionRepush => (D::AuctionRepush, DeliverySubKind::None),
+        // 2026-09-20: 候选失效升级 counted (MU-auction-candidates 接线)。
+        K::CandidateInvalidated => (D::CandidateInvalidated, DeliverySubKind::None),
+        // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
+        K::Announcement => (D::Announcement, DeliverySubKind::None),
+        // 2026-09-20: 分析师上调升级 counted (MU-analyst 接线)。
+        K::AnalystUpgrade => (D::AnalystUpgrade, DeliverySubKind::None),
+        // 2026-09-20: 新闻到灵感升级 counted (MU-d01 接线)。
+        K::NewsToIdea => (D::NewsToIdea, DeliverySubKind::None),
+        // 2026-09-20: 竞价热点量能升级 counted (MU-auction-volume 接线)。
+        K::AuctionVolume => (D::AuctionVolume, DeliverySubKind::None),
+        // 2026-09-20: 盘中涨停扩散升级 counted (MU-industry-chain-intraday 接线)。
+        K::IndustryChainIntraday => (D::IndustryChainIntraday, DeliverySubKind::None),
+        // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
+        K::NewsFlashAggregated => (D::NewsFlashAggregated, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3196,6 +3232,173 @@ mod tests {
             Some((DurablePushKind::PreopenNewsHot, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::PreopenNewsHot));
+    }
+
+    #[test]
+    fn t16_st_price_kind_maps_to_durable_st_price_limit_changed() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::StPriceLimitChanged),
+            Some((
+                DurablePushKind::StPriceLimitChanged,
+                DeliverySubKind::None
+            ))
+        );
+        assert!(is_counted_kind(PushKind::StPriceLimitChanged));
+    }
+    #[test]
+    fn g5b_attribution_kind_maps_to_durable_g5b() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::G5bAttribution),
+            Some((DurablePushKind::G5bAttribution, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::G5bAttribution));
+    }
+
+    #[test]
+    fn a12_attribution_daily_kind_maps_to_durable_attribution_daily() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AttributionDaily),
+            Some((DurablePushKind::AttributionDaily, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AttributionDaily));
+    }
+
+    #[test]
+    fn intraday_market_kind_maps_to_durable_intraday_market() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::IntradayMarket),
+            Some((DurablePushKind::IntradayMarket, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::IntradayMarket));
+    }
+
+    #[test]
+    fn news_catalyst_kind_maps_to_durable_news_catalyst() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsCatalyst),
+            Some((DurablePushKind::NewsCatalyst, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsCatalyst));
+    }
+
+    #[test]
+    fn block_trade_intraday_confirm_kind_maps_to_durable_block_trade_intraday_confirm() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::BlockTradeIntradayConfirm),
+            Some((
+                DurablePushKind::BlockTradeIntradayConfirm,
+                DeliverySubKind::None
+            ))
+        );
+        assert!(is_counted_kind(PushKind::BlockTradeIntradayConfirm));
+    }
+
+    #[test]
+    fn ipo_catalyst_kind_maps_to_durable_ipo_catalyst() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::IpoCatalyst),
+            Some((DurablePushKind::IpoCatalyst, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::IpoCatalyst));
+    }
+
+    #[test]
+    fn snapshot_stale_kind_maps_to_durable_snapshot_stale() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::SnapshotStale),
+            Some((DurablePushKind::SnapshotStale, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::SnapshotStale));
+    }
+
+    #[test]
+    fn limit_boards_kind_maps_to_durable_limit_boards() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::LimitBoards),
+            Some((DurablePushKind::LimitBoards, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::LimitBoards));
+    }
+
+    #[test]
+    fn data_mode_kind_maps_to_durable_data_mode() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::DataMode),
+            Some((DurablePushKind::DataMode, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::DataMode));
+    }
+
+    #[test]
+    fn auction_repush_kind_maps_to_durable_auction_repush() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AuctionRepush),
+            Some((DurablePushKind::AuctionRepush, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AuctionRepush));
+    }
+
+    #[test]
+    fn candidate_invalidated_kind_maps_to_durable_candidate_invalidated() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::CandidateInvalidated),
+            Some((DurablePushKind::CandidateInvalidated, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::CandidateInvalidated));
+    }
+
+    #[test]
+    fn announcement_kind_maps_to_durable_announcement() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::Announcement),
+            Some((DurablePushKind::Announcement, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::Announcement));
+    }
+
+    #[test]
+    fn analyst_upgrade_kind_maps_to_durable_analyst_upgrade() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AnalystUpgrade),
+            Some((DurablePushKind::AnalystUpgrade, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AnalystUpgrade));
+    }
+
+    #[test]
+    fn news_to_idea_kind_maps_to_durable_news_to_idea() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsToIdea),
+            Some((DurablePushKind::NewsToIdea, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsToIdea));
+    }
+
+    #[test]
+    fn auction_volume_kind_maps_to_durable_auction_volume() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AuctionVolume),
+            Some((DurablePushKind::AuctionVolume, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AuctionVolume));
+    }
+
+    #[test]
+    fn industry_chain_intraday_kind_maps_to_durable_industry_chain_intraday() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::IndustryChainIntraday),
+            Some((DurablePushKind::IndustryChainIntraday, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::IndustryChainIntraday));
+    }
+
+    #[test]
+    fn news_flash_aggregated_kind_maps_to_durable_news_flash_aggregated() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsFlashAggregated),
+            Some((DurablePushKind::NewsFlashAggregated, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsFlashAggregated));
     }
 
     #[tokio::test]

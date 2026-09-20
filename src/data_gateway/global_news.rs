@@ -67,7 +67,7 @@ impl GlobalNewsProvider {
         }
     }
 
-    const fn capability(self) -> &'static str {
+    pub(crate) const fn capability(self) -> &'static str {
         match self {
             Self::Eastmoney => "GlobalNews-Eastmoney",
             Self::Cailianpress => "GlobalNews-CLS",
@@ -166,27 +166,34 @@ impl GlobalNewsGateway {
         provider: GlobalNewsProvider,
         limit: u32,
     ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
-        let capability = provider.capability();
-        let provider_id = provider.provider_id();
-        let request_hash =
-            acquisition_request_hash(capability, format!("{}:{limit}", provider.source()));
         // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("GlobalNews") {
             Ok(bridge) => {
                 let result = bridge.global_news_async(provider, limit).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(provider_id);
-                return audit_gateway_result(capability, audit_provider, &request_hash, result);
+                return audit_macro_query(provider, limit, result);
             }
             Err(error) => {
-                return audit_gateway_result(capability, provider_id, &request_hash, Err(error));
+                return audit_macro_query(provider, limit, Err(error));
             }
         }
         // no-feature (monitor 零 magic 构建): library transport 编译期不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
     }
+}
+
+pub(crate) fn macro_request_hash(provider: GlobalNewsProvider, limit: u32) -> String {
+    acquisition_request_hash(provider.capability(), format!("{}:{limit}", provider.source()))
+}
+
+pub(crate) fn audit_macro_query(
+    provider: GlobalNewsProvider,
+    limit: u32,
+    result: Result<GatewayBatch<GlobalNewsRecord>, GatewayError>,
+) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+    let audit_provider = result.as_ref().map(|batch| batch.evidence().provider)
+        .unwrap_or(provider.provider_id());
+    audit_gateway_result(provider.capability(), audit_provider,
+        &macro_request_hash(provider, limit), result)
 }
 
 fn parse_provider_time(

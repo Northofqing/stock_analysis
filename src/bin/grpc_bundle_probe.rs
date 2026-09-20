@@ -9,32 +9,45 @@ use stock_analysis::data_gateway::GlobalNewsProvider;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
 use stock_analysis::grpc_client::envelope::QueryResult;
 use stock_analysis::grpc_client::errors::GrpcError;
-use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Capability, Operation};
+use stock_analysis::grpc_client::external_pb::magic::market::v1::{
+    AdmissionState as ExternalAdmissionState, Capability as ExternalCapability,
+    Operation as ExternalOperation,
+};
+use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
 
-const DIRECT_EXTERNAL_OPERATIONS: &[Operation] = &[
-    Operation::SecurityMetadata,
-    Operation::GlobalNews,
-    Operation::InstrumentNews,
+const DIRECT_EXTERNAL_OPERATIONS: &[ExternalOperation] = &[
+    ExternalOperation::SecurityMetadata,
+    ExternalOperation::GlobalNews,
+    ExternalOperation::InstrumentNews,
 ];
 
 const DIRECT_GLOBAL_NEWS_PROVIDERS: [&str; 4] = ["Eastmoney", "Cailianpress", "Jin10", "ThePaper"];
 
-const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[Operation])] = &[
-    ("SecurityMetadata", &[Operation::SecurityMetadata]),
-    ("GlobalNews", &[Operation::GlobalNews]),
+const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[ExternalOperation])] = &[
+    ("SecurityMetadata", &[ExternalOperation::SecurityMetadata]),
+    ("GlobalNews", &[ExternalOperation::GlobalNews]),
     (
         "Announcements",
-        &[Operation::MarketAnnouncements, Operation::Announcements],
+        &[
+            ExternalOperation::MarketAnnouncements,
+            ExternalOperation::Announcements,
+        ],
     ),
     (
         "BoardMemberships",
-        &[Operation::BoardMemberships, Operation::BoardConstituents],
+        &[
+            ExternalOperation::BoardMemberships,
+            ExternalOperation::BoardConstituents,
+        ],
     ),
     (
         "LimitPools",
-        &[Operation::LimitPools, Operation::UpperLimitPoolReview],
+        &[
+            ExternalOperation::LimitPools,
+            ExternalOperation::UpperLimitPoolReview,
+        ],
     ),
-    ("InstrumentNews", &[Operation::InstrumentNews]),
+    ("InstrumentNews", &[ExternalOperation::InstrumentNews]),
 ];
 
 #[derive(Parser)]
@@ -48,22 +61,25 @@ struct Args {
     code: String,
 }
 
-fn capability_ready(capabilities: &[Capability], operation: Operation) -> bool {
+fn capability_ready(capabilities: &[ExternalCapability], operation: ExternalOperation) -> bool {
     capabilities.iter().any(|capability| {
         capability.operation == operation as i32
-            && capability.repository_admission == AdmissionState::Admitted as i32
+            && capability.repository_admission == ExternalAdmissionState::Admitted as i32
             && capability.runtime_available
     })
 }
 
-fn capability_family_ready(capabilities: &[Capability], operations: &[Operation]) -> bool {
+fn capability_family_ready(
+    capabilities: &[ExternalCapability],
+    operations: &[ExternalOperation],
+) -> bool {
     operations
         .iter()
         .copied()
         .any(|operation| capability_ready(capabilities, operation))
 }
 
-fn external_contract_ready(operation: Operation) -> bool {
+fn external_contract_ready(operation: ExternalOperation) -> bool {
     DIRECT_EXTERNAL_OPERATIONS.contains(&operation)
 }
 
@@ -117,16 +133,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("bundle transport not ready: {error}"))?;
     let health = client
-        .get_health()
+        .get_external_health()
         .await
         .map_err(|error| anyhow::anyhow!("bundle health unavailable: {error}"))?;
     println!("health live={} ready={}", health.live, health.ready);
+    println!(
+        "health_fields observability_present={} build_identity_present={} authenticity=not_assessed",
+        health.observability.is_some(),
+        health.build_identity.is_some()
+    );
     if !health.live || !health.ready {
         anyhow::bail!("bundle health is not opening-ready");
     }
 
     let capabilities = client
-        .get_capabilities()
+        .get_external_capabilities()
         .await
         .map_err(|error| anyhow::anyhow!("bundle capabilities unavailable: {error}"))?;
     for &(family, operations) in STATIC_OPENING_CAPABILITY_FAMILIES {
@@ -420,7 +441,7 @@ fn validate_canary(
     }
     if result.selected_provider.trim().is_empty()
         || result.batch_id.trim().is_empty()
-        || result.source.trim().is_empty()
+        || result.source().trim().is_empty()
         || result.observed_at.trim().is_empty()
     {
         anyhow::bail!("canary evidence identity is incomplete");
@@ -462,11 +483,11 @@ mod tests {
     use super::*;
     use prost::Message;
     fn capability(
-        operation: Operation,
-        admission: AdmissionState,
+        operation: ExternalOperation,
+        admission: ExternalAdmissionState,
         runtime_available: bool,
-    ) -> Capability {
-        Capability {
+    ) -> ExternalCapability {
+        ExternalCapability {
             operation: operation as i32,
             repository_admission: admission as i32,
             runtime_available,
@@ -481,41 +502,65 @@ mod tests {
     fn opening_capability_requires_admitted_runtime_provider() {
         let rows = vec![
             capability(
-                Operation::SecurityMetadata,
-                AdmissionState::Unadmitted,
+                ExternalOperation::SecurityMetadata,
+                ExternalAdmissionState::Unadmitted,
                 true,
             ),
-            capability(Operation::SecurityMetadata, AdmissionState::Admitted, false),
-            capability(Operation::SecurityMetadata, AdmissionState::Admitted, true),
+            capability(
+                ExternalOperation::SecurityMetadata,
+                ExternalAdmissionState::Admitted,
+                false,
+            ),
+            capability(
+                ExternalOperation::SecurityMetadata,
+                ExternalAdmissionState::Admitted,
+                true,
+            ),
         ];
-        assert!(capability_ready(&rows, Operation::SecurityMetadata));
-        assert!(!capability_ready(&rows, Operation::InstrumentNews));
+        assert!(capability_ready(&rows, ExternalOperation::SecurityMetadata));
+        assert!(!capability_ready(&rows, ExternalOperation::InstrumentNews));
     }
 
     #[test]
     fn diagnostic_capability_cannot_satisfy_production_readiness() {
-        let mut diagnostic = capability(Operation::MoneyFlows, AdmissionState::Unadmitted, true);
+        let mut diagnostic = capability(
+            ExternalOperation::MoneyFlows,
+            ExternalAdmissionState::Unadmitted,
+            true,
+        );
         diagnostic.diagnostic_available = true;
-        assert!(!capability_ready(&[diagnostic], Operation::MoneyFlows));
+        assert!(!capability_ready(
+            &[diagnostic],
+            ExternalOperation::MoneyFlows
+        ));
     }
 
     #[test]
     fn opening_capability_family_accepts_one_admitted_runtime_alias() {
         for (selected, family) in [
             (
-                Operation::Announcements,
-                &[Operation::MarketAnnouncements, Operation::Announcements][..],
+                ExternalOperation::Announcements,
+                &[
+                    ExternalOperation::MarketAnnouncements,
+                    ExternalOperation::Announcements,
+                ][..],
             ),
             (
-                Operation::BoardMemberships,
-                &[Operation::BoardMemberships, Operation::BoardConstituents][..],
+                ExternalOperation::BoardMemberships,
+                &[
+                    ExternalOperation::BoardMemberships,
+                    ExternalOperation::BoardConstituents,
+                ][..],
             ),
             (
-                Operation::LimitPools,
-                &[Operation::LimitPools, Operation::UpperLimitPoolReview][..],
+                ExternalOperation::LimitPools,
+                &[
+                    ExternalOperation::LimitPools,
+                    ExternalOperation::UpperLimitPoolReview,
+                ][..],
             ),
         ] {
-            let rows = vec![capability(selected, AdmissionState::Admitted, true)];
+            let rows = vec![capability(selected, ExternalAdmissionState::Admitted, true)];
             assert!(capability_family_ready(&rows, family));
         }
     }
@@ -527,19 +572,23 @@ mod tests {
             .flat_map(|(_, operations)| operations.iter())
             .copied()
             .collect::<Vec<_>>();
-        assert!(!operations.contains(&Operation::RealtimeQuotes));
-        assert!(!operations.contains(&Operation::OrderBooks));
-        assert!(!operations.contains(&Operation::T0Evidence));
+        assert!(!operations.contains(&ExternalOperation::RealtimeQuotes));
+        assert!(!operations.contains(&ExternalOperation::OrderBooks));
+        assert!(!operations.contains(&ExternalOperation::T0Evidence));
     }
 
     #[test]
     fn direct_external_contract_allow_list_is_closed() {
-        assert!(external_contract_ready(Operation::SecurityMetadata));
-        assert!(external_contract_ready(Operation::GlobalNews));
-        assert!(external_contract_ready(Operation::InstrumentNews));
-        assert!(!external_contract_ready(Operation::RealtimeQuotes));
-        assert!(!external_contract_ready(Operation::BoardConstituents));
-        assert!(!external_contract_ready(Operation::UpperLimitPoolReview));
+        assert!(external_contract_ready(ExternalOperation::SecurityMetadata));
+        assert!(external_contract_ready(ExternalOperation::GlobalNews));
+        assert!(external_contract_ready(ExternalOperation::InstrumentNews));
+        assert!(!external_contract_ready(ExternalOperation::RealtimeQuotes));
+        assert!(!external_contract_ready(
+            ExternalOperation::BoardConstituents
+        ));
+        assert!(!external_contract_ready(
+            ExternalOperation::UpperLimitPoolReview
+        ));
     }
 
     #[test]
@@ -584,14 +633,17 @@ mod tests {
     #[test]
     fn instrument_news_probe_preserves_missing_source_time() {
         let result = QueryResult {
-            admission: AdmissionState::Admitted,
+            admission: stock_analysis::grpc_client::envelope::QueryAdmission::Admitted,
             selected_provider: "TEST_CODE_provider".to_string(),
             batch_id: "TEST_CODE_batch".to_string(),
             complete: true,
             observed_at: "2026-08-17T09:20:01+08:00".to_string(),
             source_at: String::new(),
             records: vec![],
-            source: "TEST_CODE_mtls_authority".to_string(),
+            provenance:
+                stock_analysis::grpc_client::envelope::AcquisitionProvenance::ExternalMtlsAuthority(
+                    "TEST_CODE_mtls_authority".to_string(),
+                ),
             diagnostic_blocker: String::new(),
         };
         let summary = validate_canary(&result, "magic.market.news_item", 2, false, false)

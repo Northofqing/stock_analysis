@@ -15,6 +15,7 @@
 
 use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
 use crate::monitor::alert_log::AlertRecord;
+use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -39,8 +40,7 @@ pub const G5B_SYSTEM_PROMPT_V1: &str = r#"你是 A 股异动深链归因分析�
   "risk_note": "风险提示, ≤40 字"
 }
 
-约束: 证据不足时 confidence=low 并明示; 不得编造新闻/公告/数据。
-absent 和缺失标记表示未知，不是零；缺少资金流时不得推断主力、散户或游资行为。"#;
+约束: 证据不足时 confidence=low 并明示; 不得编造新闻/公告/数据。"#;
 
 /// G5b 分析请求 (输入 = 当日告警记录 + 观测时刻)。
 #[derive(Debug, Clone)]
@@ -90,6 +90,7 @@ pub struct DeepAttributionAnalyzer {
 /// G5b 错误 (出声语义, 不静默折叠)。
 #[derive(Debug)]
 pub enum DeepAttributionError {
+    IneligibleRecord(String),
     ModelUnavailable(String),
     InvalidModelSchema(String),
     Io(String),
@@ -98,6 +99,7 @@ pub enum DeepAttributionError {
 impl std::fmt::Display for DeepAttributionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IneligibleRecord(m) => write!(f, "ineligible record: {m}"),
             Self::ModelUnavailable(m) => write!(f, "model unavailable: {m}"),
             Self::InvalidModelSchema(m) => write!(f, "invalid model schema: {m}"),
             Self::Io(m) => write!(f, "io: {m}"),
@@ -118,6 +120,12 @@ impl DeepAttributionAnalyzer {
         &self,
         request: &DeepAttributionRequest,
     ) -> Result<DeepAttributionOutcome, DeepAttributionError> {
+        if !request.record.is_production_eligible() {
+            return Err(DeepAttributionError::IneligibleRecord(format!(
+                "code={} origin={:?}",
+                request.record.code, request.record.origin
+            )));
+        }
         let user_prompt = deep_attribution_prompt(request);
         let started = std::time::Instant::now();
         let completed: ReceiptBearingJson = tokio::time::timeout(
@@ -133,33 +141,16 @@ impl DeepAttributionAnalyzer {
         })?
         .map_err(deep_model_call_error)?;
         let (_, raw_response, receipt) = completed.into_parts();
-        let mut result = parse_deep_attribution_output(&raw_response).map_err(|e| {
+        let result = parse_deep_attribution_output(&raw_response).map_err(|e| {
             DeepAttributionError::InvalidModelSchema(format!(
                 "G5b 深链归因输出无法按 v1 schema 解析: {e}"
             ))
         })?;
-        if known_main_flow(&request.record).is_none() {
-            result.capital_logic = "资金流数据缺失，无法判断净流入或参与资金类型".into();
-            result.confidence = "low".into();
-        }
         Ok(DeepAttributionOutcome {
             result,
             receipt,
             elapsed_ms: started.elapsed().as_millis() as u64,
         })
-    }
-}
-
-fn known_main_flow(record: &AlertRecord) -> Option<f64> {
-    let declared_missing = record
-        .attribution_decision
-        .as_deref()
-        .and_then(|text| text.split_once("缺失:"))
-        .is_some_and(|(_, fields)| fields.split(',').any(|field| field.trim() == "fund_flow"));
-    if declared_missing {
-        None
-    } else {
-        record.main_flow_yi.filter(|value| value.is_finite())
     }
 }
 
@@ -192,7 +183,8 @@ pub fn deep_attribution_prompt(request: &DeepAttributionRequest) -> String {
             .change_pct
             .map(|v| v.to_string())
             .unwrap_or_else(|| "absent".to_string()),
-        main_flow = known_main_flow(r)
+        main_flow = r
+            .main_flow_yi
             .map(|v| v.to_string())
             .unwrap_or_else(|| "absent".to_string()),
         news_title = r.news_title.as_deref().unwrap_or("absent"),
@@ -281,7 +273,20 @@ fn deep_model_call_error(error: LlmError) -> DeepAttributionError {
 /// 当日事件优先级筛选: Emergency > Important > Info, 最多 max 个。
 /// 同级别按告警时间先后 (sort_by_key 稳定), 不足 max 时全取。
 pub fn top_events_for_deep(records: Vec<AlertRecord>, max: usize) -> Vec<AlertRecord> {
-    let mut events = records;
+    let mut events: Vec<_> = records
+        .into_iter()
+        .filter(|record| {
+            let eligible = record.is_production_eligible();
+            if !eligible {
+                log::warn!(
+                    "[g5b] top_events_for_deep 跳过非生产告警: code={} origin={:?}",
+                    record.code,
+                    record.origin
+                );
+            }
+            eligible
+        })
+        .collect();
     let priority = |level: &str| match level {
         "紧急" => 0usize,
         "重要" => 1,
@@ -294,6 +299,17 @@ pub fn top_events_for_deep(records: Vec<AlertRecord>, max: usize) -> Vec<AlertRe
 
 /// 落库: data/g5b/{date}.jsonl (行追加, 失败显式返回)。
 pub fn append_deep_attribution_row(row: &DeepAttributionRow) -> Result<(), DeepAttributionError> {
+    if !row.record.is_production_eligible() {
+        return Err(DeepAttributionError::IneligibleRecord(format!(
+            "code={} origin={:?}",
+            row.record.code, row.record.origin
+        )));
+    }
+    if runtime_is_test_process() || current_env() == TradingEnv::Test {
+        return Err(DeepAttributionError::Io(
+            "test runtime cannot write the production G5b archive".to_string(),
+        ));
+    }
     let dir = PathBuf::from("data/g5b");
     fs::create_dir_all(&dir).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
     let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
@@ -373,6 +389,7 @@ mod tests {
 
     fn sample_record() -> AlertRecord {
         AlertRecord {
+            origin: crate::monitor::alert_log::AlertRecordOrigin::LegacyUnknown,
             triggered_at: "2026-08-22T14:00:00+08:00".to_string(),
             code: "600396".to_string(),
             name: "金山股份".to_string(),
@@ -418,20 +435,6 @@ mod tests {
                 "prompt 缺少字段: {needle}\n{prompt}"
             );
         }
-    }
-
-    #[test]
-    fn missing_fund_flow_marker_overrides_legacy_zero_placeholder() {
-        let mut request = sample_request();
-        request.record.main_flow_yi = Some(0.0);
-        request.record.attribution_decision =
-            Some("查无催化 | 置信度C | 缺失:fund_flow,news_title".into());
-        assert!(deep_attribution_prompt(&request).contains("主力净流入(亿): absent"));
-        request.record.attribution_decision = None;
-        assert!(
-            deep_attribution_prompt(&request).contains("主力净流入(亿): 0"),
-            "真实零值仍保留"
-        );
     }
 
     #[test]
@@ -516,6 +519,52 @@ mod tests {
     }
 
     #[test]
+    fn top_events_excludes_legacy_test_code() {
+        let mut record = sample_record();
+        record.code = "TEST_CODE_000001".into();
+        assert!(top_events_for_deep(vec![record], 3).is_empty());
+    }
+
+    #[test]
+    fn top_events_excludes_test_origin_with_normal_code_and_honors_zero_cap() {
+        let mut record = sample_record();
+        record.origin = crate::monitor::alert_log::AlertRecordOrigin::Test;
+        assert!(top_events_for_deep(vec![record], 3).is_empty());
+        assert!(top_events_for_deep(vec![sample_record()], 0).is_empty());
+    }
+
+    #[test]
+    fn append_rejects_ineligible_record_before_production_io() {
+        let mut record = sample_record();
+        record.code = "TEST_CODE_000001".into();
+        let mut row = DeepAttributionRow {
+            record,
+            result: DeepAttributionResult {
+                main_reason: "fixture".into(),
+                catalyst_chain: vec![],
+                capital_logic: "fixture".into(),
+                confidence: "low".into(),
+                risk_note: "fixture".into(),
+            },
+            analyzed_at: "2026-09-05T15:05:00Z".into(),
+            provider: "fixture".into(),
+            model: "fixture".into(),
+            upstream_request_id: None,
+            upstream_response_id: None,
+            elapsed_ms: 0,
+        };
+        assert!(matches!(
+            append_deep_attribution_row(&row),
+            Err(DeepAttributionError::IneligibleRecord(_))
+        ));
+        row.record = sample_record();
+        assert!(matches!(
+            append_deep_attribution_row(&row),
+            Err(DeepAttributionError::Io(_))
+        ));
+    }
+
+    #[test]
     fn render_includes_core_fields() {
         let row = DeepAttributionRow {
             record: sample_record(),
@@ -553,6 +602,40 @@ mod tests {
         fail_with_api: bool,
     }
 
+    struct PanicIfCalledProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PanicIfCalledProvider {
+        fn name(&self) -> &'static str {
+            "panic-if-called"
+        }
+        fn model(&self) -> &str {
+            "none"
+        }
+        async fn chat_json(&self, _system: &str, _user: &str) -> Result<Value, LlmError> {
+            panic!("ineligible record reached provider")
+        }
+        async fn chat_json_with_receipt(
+            &self,
+            _system: &str,
+            _user: &str,
+        ) -> Result<ReceiptBearingJson, LlmError> {
+            panic!("ineligible record reached provider")
+        }
+    }
+
+    #[tokio::test]
+    async fn assess_rejects_test_origin_before_provider_call() {
+        let mut request = sample_request();
+        request.record.origin = crate::monitor::alert_log::AlertRecordOrigin::Test;
+        let analyzer = DeepAttributionAnalyzer::new(Arc::new(PanicIfCalledProvider));
+        let error = analyzer
+            .assess(&request)
+            .await
+            .expect_err("测试来源必须拒绝");
+        assert!(matches!(error, DeepAttributionError::IneligibleRecord(_)));
+    }
+
     #[async_trait::async_trait]
     impl LlmProvider for MockDeepProvider {
         fn name(&self) -> &'static str {
@@ -587,29 +670,6 @@ mod tests {
                 Utc::now(),
             ))
         }
-    }
-
-    #[tokio::test]
-    async fn missing_flow_cannot_be_published_as_speculative_capital_logic() {
-        let provider = Arc::new(MockDeepProvider {
-            raw_response: r#"{"main_reason":"异动","catalyst_chain":[],"capital_logic":"主力净流入为零，可能为游资","confidence":"high","risk_note":"波动"}"#.into(),
-            fail_with_api: false,
-        });
-        let mut request = sample_request();
-        request.record.main_flow_yi = None;
-        let outcome = DeepAttributionAnalyzer::new(provider)
-            .assess(&request)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.result.capital_logic,
-            "资金流数据缺失，无法判断净流入或参与资金类型"
-        );
-        assert_eq!(outcome.result.confidence, "low");
-        assert_eq!(
-            outcome.receipt.upstream_response_id(),
-            Some("mock-response-id")
-        );
     }
 
     #[tokio::test]

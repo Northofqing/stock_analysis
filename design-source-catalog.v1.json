@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "status": "PROVISIONAL",
+  "provenance": "user_workspace_snapshot",
+  "approved_decisions": {
+    "path": "docs/push-system/grill-decisions-2026-09-02.md",
+    "sha256": "55354916a4b03401afa771e2f4e149bc1189222fc3c76d89aeb5ad79c086e794",
+    "question_count": 108
+  },
+  "sources": [
+    {
+      "id": "v18.1-strategic-gap-analysis",
+      "path": "docs/v18.x/v18.1-strategic-gap-analysis.md",
+      "sha256": "7f74b5abe4c20d6be099239878f27483a52d44cfa6ac126e1c750e916567c3f2",
+      "title": "v18.1 — 战略差距分析：机构就绪度与盈利能力",
+      "self_version": "v18.1",
+      "self_status": "Strategic Research",
+      "ruling": "保留为战略研究来源，不把方向性分析视为当前运行事实。",
+      "conflicts": [],
+      "superseded_by": []
+    },
+    {
+      "id": "v18.2-backtest-direction",
+      "path": "docs/v18.x/v18.2-backtest-direction.md",
+      "sha256": "946770a2bb66f1e9eeb90e87d4cd4f7b13434e1f377409ef891be84c5a5178f2",
+      "title": "v20.x — 回测体系建设方向",
+      "self_version": "v20.x",
+      "self_status": "Strategic Planning",
+      "ruling": "保留为回测方向来源；目录位置与自声明版本分别记录。",
+      "conflicts": ["位于 v18.x 且文件自声明 v20.x 的版本标签冲突。"],
+      "superseded_by": []
+    },
+    {
+      "id": "v18.3-backtest-implementation",
+      "path": "docs/v18.x/v18.3-backtest-implementation.md",
+      "sha256": "b63393561c17252524cbafabf322a5e4624b9e31b60a668af5b1334bc11283c2",
+      "title": "v20.x — 因子库 & 回测引擎 实现设计",
+      "self_version": "v20.x",
+      "self_status": "Implementation Design",
+      "ruling": "保留为实现设计来源，不据此声明实现已经存在。",
+      "conflicts": ["位于 v18.x 且文件自声明 v20.x 的版本标签冲突。"],
+      "superseded_by": []
+    },
+    {
+      "id": "v18.4-factor-zoo-design",
+      "path": "docs/v18.x/v18.4-factor-zoo-design.md",
+      "sha256": "7cf4040e11698c4f67aef54d2471d855d00cd9f31d178b7dfc1676c762977ce7",
+      "title": "v20.x — 生产级因子库 + 回测模式 完整设计",
+      "self_version": "v20.x",
+      "self_status": "Implementation Design",
+      "ruling": "保留为因子库与回测模式设计来源，不据此声明生产就绪。",
+      "conflicts": ["位于 v18.x 且文件自声明 v20.x 的版本标签冲突。"],
+      "superseded_by": []
+    },
+    {
+      "id": "v18.5-production-readiness-design",
+      "path": "docs/v18.x/v18.5-production-readiness-design.md",
+      "sha256": "7265e80311074f774ba2194c3728622bbf3e6b4f5f26499bdca8d76b7fff067f",
+      "title": "v20.0 — Production Readiness & Scale Design",
+      "self_version": "v20.0",
+      "self_status": "Draft",
+      "ruling": "保留为生产就绪与扩展设计输入；Draft 不作为现状证明。",
+      "conflicts": ["位于 v18.x 且文件自声明 v20.0 的版本标签冲突。"],
+      "superseded_by": []
+    },
+    {
+      "id": "push-template-catalog-97f28b9",
+      "path": "docs/v19.x/push-template-catalog.md",
+      "sha256": "c6e0fc8bce6d4fe668222837052425a07a6db6918c68b5fc8121efe1beced4d2",
+      "title": "Push Template Catalog",
+      "self_version": null,
+      "self_status": "历史代码索引 + 生产接线审计；当前事实已由蓝图 §24 上位替代",
+      "ruling": "文件未声明版本号，因此 self_version 为 null；仅作为 master@97f28b9 的 57-kind 历史快照，不作为当前 65-kind 目录。",
+      "conflicts": [],
+      "superseded_by": ["docs/Project_Architecture_Blueprint.md#24-推送系统专项架构与演进路线"]
+    },
+    {
+      "id": "v19.0-operational-clarity-design",
+      "path": "docs/v19.x/v19.0-operational-clarity-design.md",
+      "sha256": "da8f141e2c5aee942ea29539e80ff267dac339ca678c4fe7b764df133dc69284",
+      "title": "v19.0 — Operational Clarity 设计",
+      "self_version": "v19.0",
+      "self_status": "评审中",
+      "ruling": "保留为历史设计输入；文内退役规则指针不作为当前规则。",
+      "conflicts": ["文内 AGENTS.md、docs/ENGINEERING_RULES_V2.md 与 CLAUDE.md 规则指针已经退役。"],
+      "superseded_by": []
+    },
+    {
+      "id": "v19.1-review-enhancement",
+      "path": "docs/v19.x/v19.1-review-enhancement.md",
+      "sha256": "26ca82982ebdc8c6cab9251dc00f250b57a33e5e90821db25705c87be23ad2ef",
+      "title": "v19.1 — 复盘系统增强设计",
+      "self_version": "v19.1",
+      "self_status": "Design",
+      "ruling": "保留为复盘增强设计输入，不把设计描述视为运行时状态。",
+      "conflicts": [],
+      "superseded_by": []
+    },
+    {
+      "id": "v19.2-ai-analysis-improvement",
+      "path": "docs/v19.x/v19.2-ai-analysis-improvement.md",
+      "sha256": "ac7b2430ee5cf043314bd37aea622fbc16e42c27e4cea6bb9e50ef787b3b99ea",
+      "title": "v19.2 — AI 分析系统改进设计",
+      "self_version": "v19.2",
+      "self_status": "Design",
+      "ruling": "保留为 AI 分析改进设计输入，不把诊断数值视为当前测量。",
+      "conflicts": [],
+      "superseded_by": []
+    }
+  ]
+}

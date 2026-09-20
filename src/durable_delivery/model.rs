@@ -196,10 +196,43 @@ pub enum PushKind {
     WatchlistTracking,
     CatalystReview,
     PreopenNewsHot,
+    StPriceLimitChanged,
+    AttributionDaily,
+    G5bAttribution,
+    // 2026-09-20: I-01 盘中轮动升级 counted (MU-intraday-market 接线)。
+    IntradayMarket,
+    // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
+    NewsCatalyst,
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+    BlockTradeIntradayConfirm,
+    // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+    IpoCatalyst,
+    // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+    SnapshotStale,
+    // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+    LimitBoards,
+    // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
+    DataMode,
+    // 2026-09-20: 竞价重推升级 counted (MU-auction-candidates 接线)。
+    AuctionRepush,
+    // 2026-09-20: 候选失效升级 counted (MU-auction-candidates 接线)。
+    CandidateInvalidated,
+    // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
+    Announcement,
+    // 2026-09-20: 分析师上调升级 counted (MU-analyst 接线)。
+    AnalystUpgrade,
+    // 2026-09-20: 新闻到灵感升级 counted (MU-d01 接线)。
+    NewsToIdea,
+    // 2026-09-20: 竞价热点量能升级 counted (MU-auction-volume 接线)。
+    AuctionVolume,
+    // 2026-09-20: 盘中涨停扩散升级 counted (MU-industry-chain-intraday 接线)。
+    IndustryChainIntraday,
+    // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
+    NewsFlashAggregated,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 41] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -223,6 +256,24 @@ impl PushKind {
         Self::WatchlistTracking,
         Self::CatalystReview,
         Self::PreopenNewsHot,
+        Self::StPriceLimitChanged,
+        Self::AttributionDaily,
+        Self::G5bAttribution,
+        Self::IntradayMarket,
+        Self::NewsCatalyst,
+        Self::BlockTradeIntradayConfirm,
+        Self::IpoCatalyst,
+        Self::SnapshotStale,
+        Self::LimitBoards,
+        Self::DataMode,
+        Self::AuctionRepush,
+        Self::CandidateInvalidated,
+        Self::Announcement,
+        Self::AnalystUpgrade,
+        Self::NewsToIdea,
+        Self::AuctionVolume,
+        Self::IndustryChainIntraday,
+        Self::NewsFlashAggregated,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -250,6 +301,24 @@ impl PushKind {
             Self::WatchlistTracking => "WatchlistTracking",
             Self::CatalystReview => "CatalystReview",
             Self::PreopenNewsHot => "PreopenNewsHot",
+            Self::StPriceLimitChanged => "StPriceLimitChanged",
+            Self::AttributionDaily => "AttributionDaily",
+            Self::G5bAttribution => "G5bAttribution",
+            Self::IntradayMarket => "IntradayMarket",
+            Self::NewsCatalyst => "NewsCatalyst",
+            Self::BlockTradeIntradayConfirm => "BlockTradeIntradayConfirm",
+            Self::IpoCatalyst => "IpoCatalyst",
+            Self::SnapshotStale => "SnapshotStale",
+            Self::LimitBoards => "LimitBoards",
+            Self::DataMode => "DataMode",
+            Self::AuctionRepush => "AuctionRepush",
+            Self::CandidateInvalidated => "CandidateInvalidated",
+            Self::Announcement => "Announcement",
+            Self::AnalystUpgrade => "AnalystUpgrade",
+            Self::NewsToIdea => "NewsToIdea",
+            Self::AuctionVolume => "AuctionVolume",
+            Self::IndustryChainIntraday => "IndustryChainIntraday",
+            Self::NewsFlashAggregated => "NewsFlashAggregated",
         }
     }
 
@@ -278,6 +347,24 @@ impl PushKind {
             Self::WatchlistTracking => "watchlist_tracking_v1",
             Self::CatalystReview => "catalyst_review_v1",
             Self::PreopenNewsHot => "preopen_news_hot_v1",
+            Self::StPriceLimitChanged => "st_price_limit_changed_v1",
+            Self::AttributionDaily => "attribution_daily_v1",
+            Self::G5bAttribution => "g5b_attribution_v1",
+            Self::IntradayMarket => "intraday_market_v1",
+            Self::NewsCatalyst => "news_catalyst_v1",
+            Self::BlockTradeIntradayConfirm => "block_trade_intraday_confirm_v1",
+            Self::IpoCatalyst => "ipo_catalyst_v1",
+            Self::SnapshotStale => "snapshot_stale_v1",
+            Self::LimitBoards => "limit_boards_v1",
+            Self::DataMode => "data_mode_v1",
+            Self::AuctionRepush => "auction_repush_v1",
+            Self::CandidateInvalidated => "candidate_invalidated_v1",
+            Self::Announcement => "announcement_v1",
+            Self::AnalystUpgrade => "analyst_upgrade_v1",
+            Self::NewsToIdea => "news_to_idea_v1",
+            Self::AuctionVolume => "auction_volume_v1",
+            Self::IndustryChainIntraday => "industry_chain_intraday_v1",
+            Self::NewsFlashAggregated => "news_flash_aggregated_v1",
         }
     }
 
@@ -427,6 +514,98 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 拒绝。改 PerTicket 与 T-03 HoldingPlan 语义一致。
         (CloseCall, PerTicket, Some(86_400), Rolling),
         (ForbiddenOps, PerTicket, Some(3_600), Rolling),
+        // 2026-09-19 用户决策: T-16 ST 涨跌幅变更提醒升级 counted
+        // (MU-st-price 接线)。occurrence = st-price:{业务日}:{code} 每票每日一次,
+        // 镜像旧 L4 (st_price_limit_changed,code,"") 86400s 语义;
+        // 计入 30 条/日预算 (盘中信息卡, 非资金动作, 与 T0Advice 同待遇)。
+        (StPriceLimitChanged, PerTicket, Some(86_400), Rolling),
+        // 2026-09-20 用户决策 (分流规则): A-12 归因日推 = 每日必达 → 豁免日预算
+        // (与 BR-237 复盘类同语义)。occurrence = attribution-daily:{业务日},
+        // 15:05 一次, BusinessDateOnce 防跨日 Rolling 头误杀。
+        (AttributionDaily, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: G5b 深链归因升级 counted — 每事件一推 (≤3/日, LLM 非确定),
+        // 无冷却 (WindowMode::None, 镜像 HoldingEvent 先例); 盘后归因类豁免日预算
+        // (分流规则: 复盘/归因不被盘中信号饿死)。
+        (G5bAttribution, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: I-01 盘中轮动升级 counted — R-02 盘面走向每 5 分钟硬推,
+        // Rolling 900s 镜像旧 L4 (notify cooldown_secs 900, per-kind 全局头);
+        // 盘中信息卡计入 30 条/日预算 (分流规则)。同 kind 两个每日一次借用点
+        // (BR-226 快照提醒/盘前预检) 同样计预算 — per-kind 粒度无法拆分。
+        (IntradayMarket, Global, Some(900), Rolling),
+        // 2026-09-20: I-02 新闻催化映射升级 counted — 事件驱动 (Important 公告
+        // 非空时调一次), Rolling 600s 镜像旧 L4 (notify cooldown_secs 600);
+        // 盘中信息卡计入 30 条/日预算 (分流规则)。
+        (NewsCatalyst, Global, Some(600), Rolling),
+        // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+        // 名称含 Intraday 实际是 19:00 盘后 review side route (BR-223), 每票
+        // 每日一次历史成交记录。PerTicket 镜像旧 L4 逐票两层 300s 冷却 (批量
+        // 多票互不阻塞, Global 会第一票 claim 头阻塞同批其余票);
+        // BusinessDateOnce 与 ReviewMarket 同语义 (按业务日幂等, 名义时长
+        // 不作 rolling 过期解释); 盘后复盘类豁免日预算 (分流规则, BR-237
+        // 原理: 复盘不被盘中信号挤掉)。
+        (BlockTradeIntradayConfirm, PerTicket, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+        // 19:00 盘后 review side route (BR-223), 每日一次全市场 digest (旧
+        // 调用形态 code="" — 旧 L4 冷却键实为 kind-全局)。BusinessDateOnce
+        // 按业务日幂等 (ReviewMarket BR-214 先例) 并修复旧「跨日期共享
+        // kind-全局 1800s 冷却」缺陷; 盘后复盘类豁免日预算 (分流规则,
+        // BR-237 原理)。
+        (IpoCatalyst, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+        // 健康提醒类 — 分流规则: 每日必达/健康提醒豁免日预算 (不被盘中信号
+        // 挤掉); 每日一次 (进程内 SnapshotReminderGate 语义), Global
+        // BusinessDateOnce 按业务日幂等 (ReviewMarket BR-214 先例)。
+        (SnapshotStale, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+        // 盘中信息卡计入预算 (分流规则)。Rolling 1800s 镜像旧 L4 默认
+        // kind-全局冷却 (notify cooldown `_ => Some(1800)`, 3 个 shape 共享
+        // 头 — 保真旧互相阻塞语义)。
+        (LimitBoards, Global, Some(1_800), Rolling),
+        // 2026-09-20: T-02 数据模式变化卡升级 counted (MU-data-mode 接线)。
+        // 数据健康告警 = 健康提醒类 → 豁免日预算 (分流规则, 系统健康卡不被
+        // 盘中信号挤掉, BR-237 精神)。WindowMode::None 无冷却 (G5b 先例) —
+        // BR-116 语义: 已确认状态对本身负责精确去重, 不设跨状态粗粒度冷却
+        // (br116_rapid_distinct_data_mode_transitions_are_both_delivered
+        // 行为测试为权威: 快速不同变迁必须双双送达)。
+        (DataMode, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: A-02 竞价重推升级 counted (MU-auction-candidates
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 600s 镜像显式
+        // L4 (notify.rs:418 AuctionVolume|AuctionRepush 共用行)。
+        (AuctionRepush, Global, Some(600), Rolling),
+        // 2026-09-20: T-08 候选失效升级 counted (MU-auction-candidates
+        // 接线)。盘中信息卡计入预算 (分流规则); PerTicket Rolling 1800s
+        // 镜像旧逐票 30 min 冷却 (批量 diff 多票互不阻塞)。
+        (CandidateInvalidated, PerTicket, Some(1_800), Rolling),
+        // 2026-09-20: S-01 公告源事实升级 counted (MU-announcement 接线)。
+        // 盘中信息卡计入预算 (分流规则); WindowMode::None 无冷却 (G5b/
+        // DataMode 先例: event_id 精确去重是旧语义, 批量公告同日全达 —
+        // 8/30 周日 19 条实证)。
+        (Announcement, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: S-05 分析师上调升级 counted (MU-analyst 接线)。
+        // 盘中信息卡计入预算 (分流规则); Rolling 86400s 镜像显式 L4
+        // (notify.rs:448 "1次/日" — 旧 kind-全局日级 throttle 保真)。
+        (AnalystUpgrade, Global, Some(86_400), Rolling),
+        // 2026-09-20: D-01 新闻到灵感升级 counted (MU-d01 接线)。盘中
+        // 信息卡计入预算 (分流规则); PerTicket Rolling 1200s 镜像显式
+        // L4 (notify.rs:431 20 min/票; 进程内 D01 memo 1h/票成功才写仍
+        // 保留, 为独立补偿)。
+        (NewsToIdea, PerTicket, Some(1_200), Rolling),
+        // 2026-09-20: P-02 竞价热点量能升级 counted (MU-auction-volume
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 600s 镜像显式
+        // L4 (notify.rs:418 AuctionVolume|AuctionRepush 共用行, 旧键
+        // 空 code kind-全局)。
+        (AuctionVolume, Global, Some(600), Rolling),
+        // 2026-09-20: I-03 盘中涨停扩散升级 counted (MU-industry-chain-
+        // intraday 接线)。盘中信息卡计入预算 (分流规则); PerTicket
+        // Rolling 1800s 镜像显式 L4 (notify.rs:433 30 min/票, 旧键含
+        // code 逐票)。
+        (IndustryChainIntraday, PerTicket, Some(1_800), Rolling),
+        // 2026-09-20: N-02 新闻聚合升级 counted (MU-news-flash-aggregate
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 3600s 镜像显式
+        // L4 (notify.rs:452 1h/窗口)。旧冷却键 code=窗口标签 (每窗口独立)
+        // 映射为 kind-全局 3600s — 跨窗口互相阻塞 ≤1h 残余行为 (窗口间
+        // 实际间隔小时级, 实践中无影响)。
+        (NewsFlashAggregated, Global, Some(3_600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -480,6 +659,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::WatchlistTracking
                     | PushKind::CatalystReview
                     | PushKind::PreopenNewsHot
+                    | PushKind::AttributionDaily
+                    | PushKind::G5bAttribution
+                    | PushKind::BlockTradeIntradayConfirm
+                    | PushKind::IpoCatalyst
+                    | PushKind::SnapshotStale
+                    | PushKind::DataMode
             ),
             policy_version: POLICY_VERSION,
         },
@@ -570,6 +755,195 @@ impl TaskBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FoundationDeliveryBinding {
+    schema_version: i64,
+    namespace: String,
+    application_decision_id: String,
+    intent_id: String,
+    unit_id: String,
+    occurrence_id: String,
+    business_date: String,
+    subject: String,
+    delivery_subject_hash: String,
+    audience: String,
+    template_id: String,
+    template_version: String,
+    rendered_sha256: String,
+    source_evidence_fingerprint: String,
+    required_channel: String,
+}
+
+impl FoundationDeliveryBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        namespace: String,
+        application_decision_id: String,
+        intent_id: String,
+        unit_id: String,
+        occurrence_id: String,
+        business_date: String,
+        subject: String,
+        delivery_subject_hash: String,
+        audience: String,
+        template_id: String,
+        template_version: String,
+        rendered_sha256: String,
+        source_evidence_fingerprint: String,
+        required_channel: String,
+    ) -> Result<Self> {
+        let binding = Self {
+            schema_version: 1,
+            namespace,
+            application_decision_id,
+            intent_id,
+            unit_id,
+            occurrence_id,
+            business_date,
+            subject,
+            delivery_subject_hash,
+            audience,
+            template_id,
+            template_version,
+            rendered_sha256,
+            source_evidence_fingerprint,
+            required_channel,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding schema version is invalid".to_owned(),
+            ));
+        }
+        for (field, value) in [
+            ("namespace", self.namespace.as_str()),
+            ("unit_id", self.unit_id.as_str()),
+            ("subject", self.subject.as_str()),
+            ("audience", self.audience.as_str()),
+            ("template_id", self.template_id.as_str()),
+            ("template_version", self.template_version.as_str()),
+            ("required_channel", self.required_channel.as_str()),
+        ] {
+            if !valid_foundation_text(value) {
+                return Err(DurableDeliveryError::InvalidEnvelope(format!(
+                    "foundation delivery binding field {field} is invalid"
+                )));
+            }
+        }
+        validate_business_date(&self.business_date)?;
+        for (field, value) in [
+            (
+                "application_decision_id",
+                self.application_decision_id.as_str(),
+            ),
+            ("intent_id", self.intent_id.as_str()),
+            ("occurrence_id", self.occurrence_id.as_str()),
+            ("delivery_subject_hash", self.delivery_subject_hash.as_str()),
+            ("rendered_sha256", self.rendered_sha256.as_str()),
+            (
+                "source_evidence_fingerprint",
+                self.source_evidence_fingerprint.as_str(),
+            ),
+        ] {
+            if !is_lower_sha256_hex(value) {
+                return Err(DurableDeliveryError::InvalidEnvelope(format!(
+                    "foundation delivery binding field {field} is not lowercase SHA-256"
+                )));
+            }
+        }
+        if self.namespace != "Production"
+            && self
+                .namespace
+                .strip_prefix("Test:")
+                .is_none_or(|run_id| !valid_foundation_text(run_id))
+        {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding namespace is invalid".to_owned(),
+            ));
+        }
+        if self.subject != "Global"
+            && self
+                .subject
+                .strip_prefix("Entity:")
+                .is_none_or(|entity| !valid_foundation_text(entity))
+        {
+            return Err(DurableDeliveryError::InvalidEnvelope(
+                "foundation delivery binding subject is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn application_decision_id(&self) -> &str {
+        &self.application_decision_id
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+
+    pub(crate) fn unit_id(&self) -> &str {
+        &self.unit_id
+    }
+
+    pub(crate) fn occurrence_id(&self) -> &str {
+        &self.occurrence_id
+    }
+
+    pub(crate) fn business_date(&self) -> &str {
+        &self.business_date
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    pub(crate) fn required_channel(&self) -> &str {
+        &self.required_channel
+    }
+
+    pub(crate) fn rendered_sha256(&self) -> &str {
+        &self.rendered_sha256
+    }
+
+    pub(crate) fn template_id(&self) -> &str {
+        &self.template_id
+    }
+
+    pub(crate) fn template_version(&self) -> &str {
+        &self.template_version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_sha256(&self) -> Result<String> {
+        Ok(sha256_hex(&serde_json::to_vec(self)?))
+    }
+}
+
+fn valid_foundation_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.trim() == value && !value.contains('\0')
+}
+
+fn is_lower_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryEnvelope {
     pub envelope_version: i64,
     pub decision_identity: String,
@@ -591,6 +965,8 @@ pub struct DeliveryEnvelope {
     pub provider_as_of: Option<String>,
     pub original_batch_ids: Vec<String>,
     pub task_binding: Option<TaskBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foundation_binding: Option<FoundationDeliveryBinding>,
 }
 
 #[derive(Serialize)]
@@ -686,6 +1062,7 @@ impl DeliveryEnvelope {
             provider_as_of: None,
             original_batch_ids: Vec::new(),
             task_binding,
+            foundation_binding: None,
         })
     }
 
@@ -709,6 +1086,21 @@ impl DeliveryEnvelope {
 
     pub fn canonical_sha256(&self) -> Result<String> {
         Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    pub(crate) fn with_foundation_binding(
+        mut self,
+        binding: FoundationDeliveryBinding,
+    ) -> Result<Self> {
+        binding.validate()?;
+        self.decision_identity = binding.application_decision_id.clone();
+        self.foundation_binding = Some(binding);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn foundation_binding(&self) -> Option<&FoundationDeliveryBinding> {
+        self.foundation_binding.as_ref()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -761,20 +1153,35 @@ impl DeliveryEnvelope {
                 ));
             }
         }
-        let material = DecisionIdentityMaterial {
-            domain: "durable-delivery-decision-v1",
-            policy_version: self.policy_version,
-            business_date: &self.business_date,
-            push_kind: self.push_kind,
-            sub_kind: self.sub_kind,
-            cooldown_scope: self.cooldown_scope,
-            scope_key: &self.scope_key,
-            schedule_occurrence_identity: &self.schedule_occurrence_identity,
-            source_evidence_fingerprint: &self.source_evidence_fingerprint,
-            delivery_subject_hash: &self.delivery_subject_hash,
-            rendered_content_sha256: &self.rendered_content_sha256,
+        let expected = if let Some(binding) = &self.foundation_binding {
+            binding.validate()?;
+            if binding.business_date != self.business_date
+                || binding.occurrence_id != self.schedule_occurrence_identity
+                || binding.delivery_subject_hash != self.delivery_subject_hash
+                || binding.rendered_sha256 != self.rendered_content_sha256
+                || binding.source_evidence_fingerprint != self.source_evidence_fingerprint
+            {
+                return Err(DurableDeliveryError::InvalidEnvelope(
+                    "foundation delivery binding does not match envelope fields".to_owned(),
+                ));
+            }
+            binding.application_decision_id.clone()
+        } else {
+            let material = DecisionIdentityMaterial {
+                domain: "durable-delivery-decision-v1",
+                policy_version: self.policy_version,
+                business_date: &self.business_date,
+                push_kind: self.push_kind,
+                sub_kind: self.sub_kind,
+                cooldown_scope: self.cooldown_scope,
+                scope_key: &self.scope_key,
+                schedule_occurrence_identity: &self.schedule_occurrence_identity,
+                source_evidence_fingerprint: &self.source_evidence_fingerprint,
+                delivery_subject_hash: &self.delivery_subject_hash,
+                rendered_content_sha256: &self.rendered_content_sha256,
+            };
+            sha256_hex(&serde_json::to_vec(&material)?)
         };
-        let expected = sha256_hex(&serde_json::to_vec(&material)?);
         if expected != self.decision_identity {
             return Err(DurableDeliveryError::InvalidEnvelope(
                 "decision identity does not match canonical evidence".to_owned(),
@@ -862,6 +1269,119 @@ impl fmt::Display for DecisionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FoundationTerminalDisposition {
+    Accepted,
+    Rejected,
+    Uncertain,
+    ManualAccepted,
+    ManualNotDelivered,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct FoundationTerminalRecord {
+    pub(crate) binding: FoundationDeliveryBinding,
+    pub(crate) ref_id: String,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) disposition: FoundationTerminalDisposition,
+    pub(crate) evidence_bytes: Vec<u8>,
+    pub(crate) evidence_sha256: String,
+    pub(crate) durable_schema_version: i64,
+}
+
+impl FoundationTerminalRecord {
+    pub(crate) fn disposition(&self) -> FoundationTerminalDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn attempt_id(&self) -> Option<&str> {
+        self.attempt_id.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn required_channel(&self) -> &str {
+        self.binding.required_channel()
+    }
+
+    pub(crate) fn evidence_bytes(&self) -> &[u8] {
+        &self.evidence_bytes
+    }
+
+    pub(crate) fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    pub(crate) fn durable_schema_version(&self) -> i64 {
+        self.durable_schema_version
+    }
+}
+
+impl fmt::Debug for FoundationTerminalRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FoundationTerminalRecord")
+            .field("decision_id", &self.binding.application_decision_id)
+            .field("ref_id", &self.ref_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("disposition", &self.disposition)
+            .field("evidence_len", &self.evidence_bytes.len())
+            .field("evidence_sha256", &self.evidence_sha256)
+            .field("durable_schema_version", &self.durable_schema_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FoundationTerminalQuery {
+    Missing,
+    PendingSeal { state: DecisionState },
+    Terminal(Box<FoundationTerminalRecord>),
+}
+
+/// Exact read model for the legacy P01 BusinessDateOnce authority.
+///
+/// The reader deliberately exposes the frozen envelope rather than accepting
+/// an envelope from its caller.  W13 can therefore bind the existing P01
+/// decision to one application intent without acquiring send/retry authority.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct P01DedicatedTerminalRecord {
+    pub(crate) legacy_decision_identity: String,
+    pub(crate) envelope_canonical: Vec<u8>,
+    pub(crate) envelope_sha256: String,
+    pub(crate) ref_id: String,
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) disposition: FoundationTerminalDisposition,
+    pub(crate) accepted_channel: Option<String>,
+    pub(crate) evidence_bytes: Vec<u8>,
+    pub(crate) evidence_sha256: String,
+    pub(crate) durable_schema_version: i64,
+}
+
+impl fmt::Debug for P01DedicatedTerminalRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("P01DedicatedTerminalRecord")
+            .field("legacy_decision_identity", &self.legacy_decision_identity)
+            .field("envelope_len", &self.envelope_canonical.len())
+            .field("envelope_sha256", &self.envelope_sha256)
+            .field("ref_id", &self.ref_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("disposition", &self.disposition)
+            .field("accepted_channel", &self.accepted_channel)
+            .field("evidence_len", &self.evidence_bytes.len())
+            .field("evidence_sha256", &self.evidence_sha256)
+            .field("durable_schema_version", &self.durable_schema_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum P01DedicatedTerminalQuery {
+    Missing,
+    PendingSeal { state: DecisionState },
+    Terminal(Box<P01DedicatedTerminalRecord>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1005,6 +1525,84 @@ impl AcceptedSinkResultCanonical {
         validate_typed_canonical_reencode(
             canonical,
             "authoritative accepted sink result",
+            &payload,
+        )?;
+        Ok(payload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RejectedSinkResultCanonical {
+    pub(crate) kind: String,
+    pub(crate) rejection: TypedRejection,
+}
+
+impl RejectedSinkResultCanonical {
+    pub(crate) fn parse_exact(canonical: &[u8]) -> Result<Self> {
+        let value = parse_exact_canonical_value(canonical, "authoritative rejected sink result")?;
+        require_exact_object_fields(
+            &value,
+            "authoritative rejected sink result",
+            &["kind", "rejection"],
+        )?;
+        let rejection = value.get("rejection").ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "authoritative rejected sink result rejection is missing".to_owned(),
+            )
+        })?;
+        require_exact_object_fields(
+            rejection,
+            "authoritative rejected evidence",
+            &["reason_code", "evidence", "retry_authorized", "observed_at"],
+        )?;
+        let payload: Self = serde_json::from_value(value).map_err(|error| {
+            DurableDeliveryError::PolicyMismatch(format!(
+                "authoritative rejected sink result canonical payload is invalid: {error}"
+            ))
+        })?;
+        validate_typed_canonical_reencode(
+            canonical,
+            "authoritative rejected sink result",
+            &payload,
+        )?;
+        Ok(payload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UncertainSinkResultCanonical {
+    pub(crate) kind: String,
+    pub(crate) uncertainty: TypedUncertainty,
+}
+
+impl UncertainSinkResultCanonical {
+    pub(crate) fn parse_exact(canonical: &[u8]) -> Result<Self> {
+        let value = parse_exact_canonical_value(canonical, "authoritative uncertain sink result")?;
+        require_exact_object_fields(
+            &value,
+            "authoritative uncertain sink result",
+            &["kind", "uncertainty"],
+        )?;
+        let uncertainty = value.get("uncertainty").ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch(
+                "authoritative uncertain sink result uncertainty is missing".to_owned(),
+            )
+        })?;
+        require_exact_object_fields(
+            uncertainty,
+            "authoritative uncertainty evidence",
+            &["reason_code", "evidence", "observed_at"],
+        )?;
+        let payload: Self = serde_json::from_value(value).map_err(|error| {
+            DurableDeliveryError::PolicyMismatch(format!(
+                "authoritative uncertain sink result canonical payload is invalid: {error}"
+            ))
+        })?;
+        validate_typed_canonical_reencode(
+            canonical,
+            "authoritative uncertain sink result",
             &payload,
         )?;
         Ok(payload)

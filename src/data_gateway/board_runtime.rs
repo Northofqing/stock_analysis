@@ -99,6 +99,35 @@ pub struct BoardMembershipRecord {
     pub kind: BoardKind,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MembershipRequest {
+    code: String,
+    request_hash: String,
+}
+
+impl MembershipRequest {
+    pub(crate) fn try_new(code: &str) -> Result<Self, GatewayError> {
+        let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
+        let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        Ok(Self { code, request_hash })
+    }
+
+    pub(crate) fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub(crate) fn request_hash(&self) -> &str {
+        &self.request_hash
+    }
+
+    pub(crate) fn audit_provider<T>(result: &Result<GatewayBatch<T>, GatewayError>) -> ProviderId {
+        result
+            .as_ref()
+            .map(|batch| batch.evidence().provider)
+            .unwrap_or(ProviderId::Tdx)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoardFlowFact {
     pub code: String,
@@ -176,20 +205,16 @@ impl BoardDataGateway {
         &self,
         code: &str,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
-        let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
-        let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        let request = MembershipRequest::try_new(code)?;
         // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardConstituents") {
             Ok(bridge) => {
-                let result = bridge.board_constituents_async(&code).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
+                let result = bridge.board_constituents_async(request.code()).await;
+                let audit_provider = MembershipRequest::audit_provider(&result);
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
                     audit_provider,
-                    &request_hash,
+                    request.request_hash(),
                     result,
                 );
             }
@@ -197,7 +222,7 @@ impl BoardDataGateway {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
                     ProviderId::Tdx,
-                    &request_hash,
+                    request.request_hash(),
                     Err(error),
                 );
             }
@@ -215,21 +240,17 @@ impl BoardDataGateway {
         &self,
         code: &str,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
-        let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
-        let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        let request = MembershipRequest::try_new(code)?;
         // BR-238: 同步消费者复用与 async memberships 完全相同的 gRPC
         // acquisition + audit 分支；桥失败显式返回，绝不降级 library。
         match super::grpc_source::bridge_for("BoardConstituents") {
             Ok(bridge) => {
-                let result = bridge.board_constituents(&code);
-                let audit_provider = result
-                    .as_ref()
-                    .map(|batch| batch.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
+                let result = bridge.board_constituents(request.code());
+                let audit_provider = MembershipRequest::audit_provider(&result);
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
                     audit_provider,
-                    &request_hash,
+                    request.request_hash(),
                     result,
                 );
             }
@@ -237,7 +258,7 @@ impl BoardDataGateway {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
                     ProviderId::Tdx,
-                    &request_hash,
+                    request.request_hash(),
                     Err(error),
                 );
             }

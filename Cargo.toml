@@ -44,7 +44,7 @@ once_cell = "1.19"
 regex = "1.10"
 lazy_static = "1.4"
 diesel = { version = "2.3.5", features = ["sqlite", "r2d2", "chrono"] }
-rusqlite = { version = "0.31", features = ["chrono", "functions"] }
+rusqlite = { version = "0.31", features = ["chrono", "functions", "serialize"] }
 lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transport", "builder", "tokio1-native-tls"] }
 clap = { version = "4.5.54", features = ["derive"] }
 plotters = "0.3"
@@ -67,6 +67,7 @@ zeroize = "1"         # 密码 buffer 擦除
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 prost = "0.14"
+http-body = "1"
 tokio-stream = "0.1"
 
 [build-dependencies]
@@ -81,7 +82,10 @@ pam = "0.7"           # PAM 跨平台认证 (Linux/macOS, 用 0.7 因 0.8 与 ru
 # v20.2: race condition 彻底解决 (test_design_contradiction 跨 test binary 文件 race)
 # serial_test 0.10+ 用 process-wide mutex (std Mutex 跨 test binary 不可见)
 [dev-dependencies]
+prost-types = "=0.14.4"
 serial_test = "0.10"
+tempfile = "3.27.0"
+tokio = { version = "1.49.0", features = ["test-util"] }
 criterion = { version = "0.5", features = ["html_reports"] } # v16.8 #1: benchmark 套件
 reqwest_011 = { package = "reqwest", version = "0.11.27", default-features = false }
 

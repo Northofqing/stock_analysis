@@ -746,7 +746,69 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
         };
     }
     let rendered = render_message(&event);
-    let outcome = if matches!(
+    // 2026-09-20: v17_sources 管线 counted 接入 (MU-announcement 首例)。
+    // counted kind 在汇合点转 binding 路径; 未接线的 counted kind 走
+    // fail-closed 防御臂 (counted_source_kind_not_wired) — 后续 kind
+    // (AnalystUpgrade 等) 逐个在此扩展。
+    let outcome = if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        match kind {
+            PushKind::Announcement => {
+                match crate::push_templates::build_announcement_counted_binding(
+                    event.observed_at.date_naive(),
+                    &event.event_id,
+                    event.code.as_deref(),
+                    &event.title,
+                    &event.source,
+                    event.strength,
+                    event.certainty,
+                    event.stale,
+                    &rendered,
+                ) {
+                    Ok(binding) => {
+                        crate::notify::push_counted_with_binding(
+                            presentation_token,
+                            &rendered,
+                            None,
+                            binding,
+                        )
+                        .await
+                    }
+                    Err(reason) => {
+                        log::error!("[v17.7][BR-137] counted 准备失败: {reason}");
+                        PushOutcome::Denied(reason)
+                    }
+                }
+            }
+            PushKind::AnalystUpgrade => {
+                match crate::push_templates::build_analyst_upgrade_counted_binding(
+                    event.observed_at.date_naive(),
+                    &event.event_id,
+                    event.code.as_deref(),
+                    &event.title,
+                    &event.source,
+                    event.strength,
+                    event.certainty,
+                    event.stale,
+                    &rendered,
+                ) {
+                    Ok(binding) => {
+                        crate::notify::push_counted_with_binding(
+                            presentation_token,
+                            &rendered,
+                            None,
+                            binding,
+                        )
+                        .await
+                    }
+                    Err(reason) => {
+                        log::error!("[v17.7][BR-137] counted 准备失败: {reason}");
+                        PushOutcome::Denied(reason)
+                    }
+                }
+            }
+            _ => PushOutcome::Denied("counted_source_kind_not_wired".to_owned()),
+        }
+    } else if matches!(
         kind,
         PushKind::Announcement
             | PushKind::PolicyHit
@@ -1319,8 +1381,14 @@ mod tests {
         let first = route_announcements(std::slice::from_ref(&announcement), &eligible).await;
         let second = route_announcements(&[announcement], &eligible).await;
         assert_eq!(first.source.pushed, 1);
-        assert_eq!(second.source.pushed, 0);
-        assert_eq!(second.source.failed, 1);
+        // 2026-09-20 (MU-announcement counted): 旧 dedup (v14 事件 memo) 的
+        // 报告口径为第二次 pushed=0/failed=1; counted 后去重发生在 durable
+        // 决策层 — 同 occurrence 同事实字节 → decision 回放返回 Pushed
+        // (无物理重投, 无 sink 调用)。意图 (同一真实公告不投两次) 由
+        // decision identity 稳定性保证 (u14 binding 测试 + durable 层
+        // 决策身份测试)。此处断言报告口径: 第二次亦 Pushed (回放)。
+        assert_eq!(second.source.pushed, 1);
+        assert_eq!(second.source.failed, 0);
     }
 
     fn br138_important_announcement(

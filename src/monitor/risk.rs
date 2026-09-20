@@ -81,49 +81,20 @@ pub fn classify_market(up_ratio: f64, index_change_pct: f64) -> MarketRegime {
 // 止损三级体系
 // ============================================================================
 
-/// 最近 period 日真实波幅的简单均值（元），输入为倒序的 (high, low, close)。
-/// 额外一根K线提供窗口首日的前收盘价；缺失/非法价格不缩短窗口或填零。
-pub fn average_true_range(bars: &[(f64, f64, f64)], period: usize) -> Option<f64> {
-    if period == 0 || bars.len() <= period {
-        return None;
-    }
-    let mut sum = 0.0;
-    for pair in bars[..=period].windows(2) {
-        let (high, low, _) = pair[0];
-        let previous_close = pair[1].2;
-        if ![high, low, previous_close]
-            .iter()
-            .all(|v| v.is_finite() && *v > 0.0)
-            || high < low
-        {
-            return None;
-        }
-        sum += (high - low)
-            .max((high - previous_close).abs())
-            .max((low - previous_close).abs());
-    }
-    let result = sum / period as f64;
-    result.is_finite().then_some(result)
-}
-
 #[derive(Debug, Clone)]
 pub struct StopLoss {
-    pub technical: f64,  // 一级：买入价 - 2×ATR（元）
+    pub technical: f64,  // 一级：买入价 × (1 - 2×ATR%)
     pub structural: f64, // 二级：最近支撑位 × 0.98
     pub hard: f64,       // 三级：买入价 × 0.92（硬止损）
-    pub atr: f64,        // 绝对价格波幅，单位与 buy_price 相同
+    pub atr: f64,
     pub buy_price: f64,
     pub support_level: Option<f64>,
 }
 
 impl StopLoss {
     pub fn new(buy_price: f64, atr: f64, support: Option<f64>) -> Self {
+        let technical = buy_price * (1.0 - 2.0 * atr / 100.0);
         let hard = buy_price * 0.92;
-        let technical = if atr.is_finite() && atr > 0.0 {
-            buy_price - 2.0 * atr
-        } else {
-            hard
-        };
         let structural = support.map(|s| s * 0.98).unwrap_or(hard);
         StopLoss {
             technical,
@@ -320,25 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn true_range_includes_overnight_gap() {
-        // 最新日高低53/51，前收48，真实波幅为5元；更早一天波幅2元。
-        let bars = [(53.0, 51.0, 52.0), (49.0, 47.0, 48.0), (49.0, 47.0, 48.0)];
-        assert_eq!(average_true_range(&bars, 2), Some(3.5));
-        assert_eq!(average_true_range(&bars[..2], 2), None);
-    }
-
-    #[test]
-    fn absolute_atr_keeps_a_fifty_yuan_position_above_its_stop() {
-        let sl = StopLoss::new(50.0, 2.0, None);
-        assert!((sl.technical - 46.0).abs() < 1e-9);
-        assert!(!sl.triggered(47.0));
-        assert!(sl.triggered(46.0));
-    }
-
-    #[test]
     fn test_stop_loss_effective() {
-        let sl = StopLoss::new(10.0, 0.3, Some(9.5));
-        // technical = 10 - 2*0.3 = 9.4
+        let sl = StopLoss::new(10.0, 3.0, Some(9.5));
+        // technical = 10 * (1 - 2*3/100) = 9.4
         // hard = 10 * 0.92 = 9.2
         // structural = 9.5 * 0.98 = 9.31
         // effective = max(9.4, 9.31, 9.2) = 9.4

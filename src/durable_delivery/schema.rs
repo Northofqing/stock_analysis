@@ -941,6 +941,7 @@ fn migrate_schema_v3_to_v4(transaction: &Transaction<'_>) -> Result<()> {
 
 fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
     type MigratedAuditOutboxRow = (
+        i64,
         String,
         String,
         Option<String>,
@@ -985,9 +986,13 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
         "#,
     )?;
     let insert_rows: Vec<MigratedAuditOutboxRow> = {
+        // Keep the legacy ORDER BY as a deterministic read order, but carry
+        // rowid explicitly: recovery has historically treated physical append
+        // order as authority, so a schema rebuild must not renumber valid v4
+        // audit rows.
         let mut stmt = transaction.prepare(
             "SELECT
-               audit_identity, decision_identity, attempt_identity, audit_kind,
+               rowid, audit_identity, decision_identity, attempt_identity, audit_kind,
                predecessor_audit_identity, audit_canonical, audit_sha256,
                append_state, immutable_audit_ref, created_at
              FROM immutable_audit_outbox
@@ -1009,6 +1014,7 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1017,14 +1023,14 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
     {
         let mut stmt = transaction.prepare(
             "INSERT INTO immutable_audit_outbox_v5(
-               audit_identity, decision_identity, attempt_identity, audit_kind,
+               rowid, audit_identity, decision_identity, attempt_identity, audit_kind,
                predecessor_audit_identity, audit_canonical, audit_sha256,
                append_state, immutable_audit_ref, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         )?;
         for row in &insert_rows {
             stmt.execute(rusqlite::params![
-                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
             ])?;
         }
     }
@@ -1063,12 +1069,12 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
         );
 
         INSERT INTO immutable_audit_outbox_v5_with_fk(
-          audit_identity, decision_identity, attempt_identity, audit_kind,
+          rowid, audit_identity, decision_identity, attempt_identity, audit_kind,
           predecessor_audit_identity, audit_canonical, audit_sha256,
           append_state, immutable_audit_ref, created_at
         )
         SELECT
-          audit_identity, decision_identity, attempt_identity, audit_kind,
+          rowid, audit_identity, decision_identity, attempt_identity, audit_kind,
           predecessor_audit_identity, audit_canonical, audit_sha256,
           append_state, immutable_audit_ref, created_at
         FROM immutable_audit_outbox
@@ -1091,23 +1097,32 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
     if foreign_key_violation_count != 0 {
         let mut violations = String::new();
         let mut stmt = transaction
-            .prepare("SELECT \"table\",\"from\",\"to\",fkid FROM pragma_foreign_key_check")?;
+            .prepare("SELECT \"table\",rowid,parent,fkid FROM pragma_foreign_key_check")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
             ))
         })?;
         for row in rows {
-            let (table, from, to, fkid) = row?;
-            violations.push_str(&format!(" [table={table} from={from} to={to} fkid={fkid}]"));
+            let (table, rowid, parent, fkid) = row?;
+            violations.push_str(&format!(
+                " [table={table} rowid={rowid:?} parent={parent} fkid={fkid}]"
+            ));
         }
         return Err(DurableDeliveryError::InvalidConfiguration(format!(
             "schema-v4 to v5 migration produced {foreign_key_violation_count} foreign-key violation(s):{violations}"
         )));
     }
+    // Rebuilding the FK parent can leave SQLite's immediate-as-deferred
+    // counter non-zero after every real reference has been restored.  The
+    // exhaustive zero-violation guard above is mandatory before clearing that
+    // stale counter; foreign_keys stays ON, and deferral is restored for every
+    // statement that follows in this same migration transaction.
+    transaction.pragma_update(None, "defer_foreign_keys", "OFF")?;
+    transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
     Ok(())
 }
 
@@ -1424,9 +1439,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         let mapped = statement.query_map([], policy_from_row)?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if rows.len() != 26 {
+    if rows.len() != 44 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 26 rows, got {}",
+            "seeded policy catalog must have 44 rows, got {}",
             rows.len()
         )));
     }
@@ -1434,9 +1449,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         .iter()
         .map(|row| row.push_kind)
         .collect::<BTreeSet<_>>();
-    if distinct.len() != 23 {
+    if distinct.len() != 41 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 23 kinds, got {}",
+            "seeded policy catalog must have 41 kinds, got {}",
             distinct.len()
         )));
     }
