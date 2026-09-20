@@ -6294,6 +6294,58 @@ pub fn build_news_catalyst_counted_binding(
     .map_err(|error| format!("I-02 counted binding 构造失败: {error}"))
 }
 
+/// BR-033 大宗盘中确认 counted binding: canonical = 业务日 + 票 + 成交事实
+/// (qty/price/board/settle — T-16 模式, hhmm/name 展示字段不进 identity,
+/// BR-250 纪律; block_type/real_time_confirm 为 guard 常量不进); occurrence
+/// block-trade-confirm:{业务日}:{code} 每票每日一次; PerTicket scope (旧 L4
+/// 逐票两层 300s 冷却, 批量多票互不阻塞); retry_authorized=true (盘后 review
+/// 侧推可被 backfill 重跑, 内容 = 历史成交事实, 补发仍有效 — A-12/G5b 先例)。
+pub fn build_block_trade_confirm_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    qty: u32,
+    price: f64,
+    board: Board,
+    next_session_settle: SettleType,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "block-trade-confirm-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "qty": qty,
+        "price": price,
+        "board": format!("{board:?}"),
+        "next_session_settle": format!("{next_session_settle:?}"),
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (BJ/别名码 fail-closed — 配方 §4)。BR-033 票池
+    // 300/301/688 均为 A 股, require_a_share 恒成立; 解析失败拒绝推送。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("BR-033 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("block-trade-confirm:{business_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("BR-033 counted binding 构造失败 code={code}: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -6399,6 +6451,7 @@ pub async fn dispatch_etf_closing_call_auction(
 /// BR-033: 创业板/科创板协议大宗盘中实时确认。
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_block_trade_intraday_confirm(
+    business_date: chrono::NaiveDate,
     hhmm: &str,
     name: &str,
     code: &str,
@@ -6431,18 +6484,40 @@ pub async fn dispatch_block_trade_intraday_confirm(
         real_time_confirm,
         next_session_settle,
     });
-    let result = dispatch_registered_outcome!(
-        "BR-033-block-trade-confirm",
-        crate::notify::PushKind::BlockTradeIntradayConfirm,
-        "block_trade_dispatcher",
-        "render_block_trade_intraday_confirm",
+    // 2026-09-20: BR-033 升级 counted (MU-block-confirm)。盘后 review side
+    // route (BR-223) 每票每日一次; counted 门 (v14_gate_counted_binding) 取
+    // CountedSourceOnly (requires_banner=false, BR-241 公共源形态 — 不虚构
+    // banner 依赖), 与 T-16/A-12 同形态。BusinessDateOnce 幂等 + 豁免日预算。
+    match build_block_trade_confirm_counted_binding(
+        business_date,
         code,
-        None,
-        text
+        qty,
+        price,
+        board,
+        next_session_settle,
     )
-    .is_pushed();
-    log_dispatcher_attempt("T-18", result, 1, &format!("board={board:?}"));
-    result
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "BR-033-block-trade-confirm",
+            crate::notify::PushKind::BlockTradeIntradayConfirm,
+            "block_trade_dispatcher",
+            "render_block_trade_intraday_confirm",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            let result = crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed();
+            log_dispatcher_attempt("T-18", result, 1, &format!("board={board:?}"));
+            result
+        }
+        Err(reason) => {
+            log::error!("[BR-033][BR-196] counted 准备失败: {reason}");
+            log_dispatcher_attempt("T-18", false, 1, &format!("board={board:?}"));
+            false
+        }
+    }
 }
 
 /// BR-034: 北交所大宗区间以当日竞价实时均价为口径。
@@ -9237,6 +9312,7 @@ pub async fn dispatch_block_trade_review(
             let board = if is_star { Board::Star } else { Board::Gem };
             let qty = review.volume as u32;
             if dispatch_block_trade_intraday_confirm(
+                trading_date,
                 &hhmm,
                 &name,
                 code,
@@ -21996,6 +22072,74 @@ mod tests {
         assert_eq!(slot_a.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
         assert!(!slot_a.retry_authorized());
         assert_eq!(slot_a.business_date(), date);
+    }
+
+    #[test]
+    fn u06_counted_binding_identity_is_per_ticket_per_business_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_block_trade_confirm_counted_binding(
+            date,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "block-trade-confirm:2026-09-20:300001"
+        );
+        // 同票同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_block_trade_confirm_counted_binding(
+            date,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同批不同票 → 不同 occurrence (PerTicket, 批量互不阻塞)
+        let other = build_block_trade_confirm_counted_binding(
+            date,
+            "688001",
+            500,
+            45.60,
+            Board::Star,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_block_trade_confirm_counted_binding(
+            next_day,
+            "300001",
+            1000,
+            45.60,
+            Board::Gem,
+            SettleType::NextSession,
+        )
+        .expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // backfill 重跑补偿授权 → retry_authorized=true, Ticket scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======

@@ -203,10 +203,12 @@ pub enum PushKind {
     IntradayMarket,
     // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
     NewsCatalyst,
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+    BlockTradeIntradayConfirm,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -235,6 +237,7 @@ impl PushKind {
         Self::G5bAttribution,
         Self::IntradayMarket,
         Self::NewsCatalyst,
+        Self::BlockTradeIntradayConfirm,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -267,6 +270,7 @@ impl PushKind {
             Self::G5bAttribution => "G5bAttribution",
             Self::IntradayMarket => "IntradayMarket",
             Self::NewsCatalyst => "NewsCatalyst",
+            Self::BlockTradeIntradayConfirm => "BlockTradeIntradayConfirm",
         }
     }
 
@@ -300,6 +304,7 @@ impl PushKind {
             Self::G5bAttribution => "g5b_attribution_v1",
             Self::IntradayMarket => "intraday_market_v1",
             Self::NewsCatalyst => "news_catalyst_v1",
+            Self::BlockTradeIntradayConfirm => "block_trade_intraday_confirm_v1",
         }
     }
 
@@ -471,6 +476,14 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 非空时调一次), Rolling 600s 镜像旧 L4 (notify cooldown_secs 600);
         // 盘中信息卡计入 30 条/日预算 (分流规则)。
         (NewsCatalyst, Global, Some(600), Rolling),
+        // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+        // 名称含 Intraday 实际是 19:00 盘后 review side route (BR-223), 每票
+        // 每日一次历史成交记录。PerTicket 镜像旧 L4 逐票两层 300s 冷却 (批量
+        // 多票互不阻塞, Global 会第一票 claim 头阻塞同批其余票);
+        // BusinessDateOnce 与 ReviewMarket 同语义 (按业务日幂等, 名义时长
+        // 不作 rolling 过期解释); 盘后复盘类豁免日预算 (分流规则, BR-237
+        // 原理: 复盘不被盘中信号挤掉)。
+        (BlockTradeIntradayConfirm, PerTicket, Some(86_400), BusinessDateOnce),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -526,6 +539,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::PreopenNewsHot
                     | PushKind::AttributionDaily
                     | PushKind::G5bAttribution
+                    | PushKind::BlockTradeIntradayConfirm
             ),
             policy_version: POLICY_VERSION,
         },

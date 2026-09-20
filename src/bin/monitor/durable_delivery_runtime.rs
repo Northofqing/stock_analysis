@@ -2295,6 +2295,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::IntradayMarket => (D::IntradayMarket, DeliverySubKind::None),
         // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
         K::NewsCatalyst => (D::NewsCatalyst, DeliverySubKind::None),
+        // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
+        K::BlockTradeIntradayConfirm => (D::BlockTradeIntradayConfirm, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3253,6 +3255,18 @@ mod tests {
             Some((DurablePushKind::NewsCatalyst, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::NewsCatalyst));
+    }
+
+    #[test]
+    fn block_trade_intraday_confirm_kind_maps_to_durable_block_trade_intraday_confirm() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::BlockTradeIntradayConfirm),
+            Some((
+                DurablePushKind::BlockTradeIntradayConfirm,
+                DeliverySubKind::None
+            ))
+        );
+        assert!(is_counted_kind(PushKind::BlockTradeIntradayConfirm));
     }
 
     #[tokio::test]

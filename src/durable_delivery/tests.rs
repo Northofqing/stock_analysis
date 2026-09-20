@@ -5963,6 +5963,29 @@ fn news_catalyst_policy_is_global_rolling_600_and_budget_counted() {
 }
 
 #[test]
+fn block_trade_confirm_policy_is_per_ticket_business_date_once_and_budget_exempt() {
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted — 名称含 Intraday 实际是
+    // 19:00 盘后 review side route (BR-223), 每票每日一次历史成交记录;
+    // PerTicket 镜像旧 L4 逐票两层 300s 冷却 (批量多票互不阻塞);
+    // BusinessDateOnce 与 ReviewMarket 同语义 (按业务日幂等); 盘后复盘类
+    // 豁免日预算 (分流规则, BR-237 原理: 复盘不被盘中信号挤掉)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::BlockTradeIntradayConfirm)
+        .expect("BR-033 durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::BusinessDateOnce);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(86_400));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "block_trade_intraday_confirm_v1"
+    );
+}
+
+#[test]
 fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
     let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
     let append = MemoryAppendPort::default();
@@ -7174,7 +7197,7 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_twenty_eight_kinds_and_thirty_one_rows() {
+fn policy_catalog_has_twenty_nine_kinds_and_thirty_two_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
@@ -7185,16 +7208,17 @@ fn policy_catalog_has_twenty_eight_kinds_and_thirty_one_rows() {
     // 2026-09-20: G5b 深链归因升级 counted → 26 kind/29 row。
     // 2026-09-20: I-01 盘中轮动升级 counted → 27 kind/30 row。
     // 2026-09-20: I-02 新闻催化升级 counted → 28 kind/31 row。
+    // 2026-09-20: BR-033 大宗盘中确认升级 counted → 29 kind/32 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        31
+        32
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        28
+        29
     );
-    assert_eq!(compiled_policy_catalog().len(), 31);
+    assert_eq!(compiled_policy_catalog().len(), 32);
 }
 
 #[test]
