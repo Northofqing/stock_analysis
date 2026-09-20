@@ -6529,6 +6529,55 @@ pub fn build_auction_repush_counted_binding(
     .map_err(|error| format!("A-02 counted binding 构造失败: {error}"))
 }
 
+/// MU-auction-candidates: T-08 候选失效 counted binding (2026-09-20):
+/// occurrence candidate-invalidated:{业务日}:{code} (每票每日失效事件);
+/// canonical = 业务日 + 票 + prev/reason + 渲染 sha256; PerTicket scope
+/// (旧逐票 30 min 冷却); retry_authorized=true (内容 = 失效事件事实,
+/// 补发仍有效; 旧系统失效推送无进程内补偿 — durable 是唯一恢复路径)。
+pub fn build_candidate_invalidated_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    prev: &str,
+    reason: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "candidate-invalidated-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "prev": prev,
+        "reason": reason,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 解析失败 fail-closed 拒绝推送。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("T-08 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("candidate-invalidated:{business_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("T-08 counted binding 构造失败 code={code}: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -9683,6 +9732,10 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
     // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
     if let Some(previous) = candidate_snapshot_previous(date) {
         let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
+        // T-08 counted (2026-09-20): binding 锚定候选台业务日 (date 参数
+        // 解析, 失败回退 Local::now 保底 — 与 hhmm 同源)。
+        let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::Local::now().date_naive());
         for code in previous.difference(&codes_now) {
             let name = batch
                 .entries
@@ -9690,7 +9743,8 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
                 .find(|entry| &entry.code == code)
                 .map(|entry| entry.name.clone())
                 .unwrap_or_else(|| code.clone());
-            let _ = push_candidate_invalidated(code, &hhmm, &name, "候选", "从候选台消失").await;
+            let _ = push_candidate_invalidated(business_date, code, &hhmm, &name, "候选", "从候选台消失")
+                .await;
         }
     }
     // BR-232: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
@@ -16256,6 +16310,7 @@ pub async fn push_candidate_triggered(
 
 /// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).
 pub async fn push_candidate_invalidated(
+    business_date: chrono::NaiveDate,
     code: &str,
     hhmm: &str,
     name: &str,
@@ -16263,16 +16318,29 @@ pub async fn push_candidate_invalidated(
     reason: &str,
 ) -> bool {
     let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
-    dispatch_registered_outcome!(
-        "T-08-candidate-invalidated",
-        crate::notify::PushKind::CandidateInvalidated,
-        "candidate_dispatcher",
-        "render_candidate_invalidated",
-        code,
-        None,
-        text
-    )
-    .is_pushed()
+    // 2026-09-20: T-08 升级 counted (MU-auction-candidates)。盘中信息卡;
+    // PerTicket Rolling 1800s 镜像旧逐票冷却; retry_authorized=true
+    // (失效事件事实 + 旧系统无进程内补偿 — durable 是唯一恢复路径)。
+    match build_candidate_invalidated_counted_binding(business_date, code, prev, reason, &text)
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "T-08-candidate-invalidated",
+                crate::notify::PushKind::CandidateInvalidated,
+                "candidate_dispatcher",
+                "render_candidate_invalidated",
+            )
+            .map(|token| (token, binding))
+        }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[T-08][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    }
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.
@@ -22624,6 +22692,56 @@ mod tests {
             binding.scope(),
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
+    }
+
+    #[test]
+    fn u12_counted_binding_is_per_ticket_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_candidate_invalidated_counted_binding(
+            date,
+            "600001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "candidate-invalidated:2026-09-20:600001"
+        );
+        // 同票同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_candidate_invalidated_counted_binding(
+            date,
+            "600001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同批不同票 → 不同 occurrence (PerTicket, 批量互不阻塞)
+        let other = build_candidate_invalidated_counted_binding(
+            date,
+            "300001",
+            "候选",
+            "从候选台消失",
+            "候选失效样本",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 失效事件事实 + 唯一恢复路径 → retry_authorized=true, Ticket scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======
