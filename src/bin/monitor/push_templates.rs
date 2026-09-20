@@ -6497,6 +6497,38 @@ pub fn build_data_mode_counted_binding(
     .map_err(|error| format!("数据模式 counted binding 构造失败: {error}"))
 }
 
+/// MU-auction-candidates: A-02 竞价重推 counted binding (2026-09-20):
+/// occurrence auction-repush:{业务日}:{hhmm} (每时间槽, I-01 模式);
+/// canonical = 业务日 + 渲染 sha256; Global scope; retry_authorized=false
+/// (盘中竞价快照时刻锚定 + 下一轮 repush 重渲染补偿 — I-01 论据)。
+pub fn build_auction_repush_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "auction-repush-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("auction-repush:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("A-02 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -9067,17 +9099,36 @@ pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
         return false;
     }
     let text = render_auction_repush(hhmm, &top5);
-    let result = dispatch_registered_outcome!(
-        "A-02-auction-repush",
-        crate::notify::PushKind::AuctionRepush,
-        "auction_repush_dispatcher",
-        "render_auction_repush",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("A-02", result.is_pushed(), top5.len(), "");
-    result.is_pushed()
+    // 2026-09-20: A-02 升级 counted (MU-auction-candidates)。盘中信息卡;
+    // Rolling 600s 镜像显式 L4; retry_authorized=false (盘中竞价快照时刻
+    // 锚定 + 下一轮 repush 重渲染补偿)。业务日取 Local::now (I-01
+    // SectorRotation 同形态)。
+    let result = match build_auction_repush_counted_binding(
+        chrono::Local::now().date_naive(),
+        hhmm,
+        &text,
+    )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "A-02-auction-repush",
+            crate::notify::PushKind::AuctionRepush,
+            "auction_repush_dispatcher",
+            "render_auction_repush",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[A-02][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    };
+    log_dispatcher_attempt("A-02", result, top5.len(), "");
+    result
 }
 
 /// BR-223: A-11 IPO 阶段催化模板渲染 (静态供应链表)。
@@ -22543,6 +22594,31 @@ mod tests {
         );
         // 健康告警必达 → retry_authorized=true, Global scope
         assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u11_counted_binding_is_per_time_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding =
+            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "auction-repush:2026-09-20:09:25"
+        );
+        // 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中快照 + 下一轮重渲染补偿 → retry_authorized=false, Global
+        assert!(!binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
         assert_eq!(
             binding.scope(),

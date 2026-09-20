@@ -213,10 +213,12 @@ pub enum PushKind {
     LimitBoards,
     // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
     DataMode,
+    // 2026-09-20: 竞价重推升级 counted (MU-auction-candidates 接线)。
+    AuctionRepush,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -250,6 +252,7 @@ impl PushKind {
         Self::SnapshotStale,
         Self::LimitBoards,
         Self::DataMode,
+        Self::AuctionRepush,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -287,6 +290,7 @@ impl PushKind {
             Self::SnapshotStale => "SnapshotStale",
             Self::LimitBoards => "LimitBoards",
             Self::DataMode => "DataMode",
+            Self::AuctionRepush => "AuctionRepush",
         }
     }
 
@@ -325,6 +329,7 @@ impl PushKind {
             Self::SnapshotStale => "snapshot_stale_v1",
             Self::LimitBoards => "limit_boards_v1",
             Self::DataMode => "data_mode_v1",
+            Self::AuctionRepush => "auction_repush_v1",
         }
     }
 
@@ -528,6 +533,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // (br116_rapid_distinct_data_mode_transitions_are_both_delivered
         // 行为测试为权威: 快速不同变迁必须双双送达)。
         (DataMode, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: A-02 竞价重推升级 counted (MU-auction-candidates
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 600s 镜像显式
+        // L4 (notify.rs:418 AuctionVolume|AuctionRepush 共用行)。
+        (AuctionRepush, Global, Some(600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

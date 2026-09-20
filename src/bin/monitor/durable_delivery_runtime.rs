@@ -2305,6 +2305,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::LimitBoards => (D::LimitBoards, DeliverySubKind::None),
         // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
         K::DataMode => (D::DataMode, DeliverySubKind::None),
+        // 2026-09-20: 竞价重推升级 counted (MU-auction-candidates 接线)。
+        K::AuctionRepush => (D::AuctionRepush, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3311,6 +3313,15 @@ mod tests {
             Some((DurablePushKind::DataMode, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::DataMode));
+    }
+
+    #[test]
+    fn auction_repush_kind_maps_to_durable_auction_repush() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AuctionRepush),
+            Some((DurablePushKind::AuctionRepush, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AuctionRepush));
     }
 
     #[tokio::test]
