@@ -217,10 +217,12 @@ pub enum PushKind {
     AuctionRepush,
     // 2026-09-20: 候选失效升级 counted (MU-auction-candidates 接线)。
     CandidateInvalidated,
+    // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
+    Announcement,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -256,6 +258,7 @@ impl PushKind {
         Self::DataMode,
         Self::AuctionRepush,
         Self::CandidateInvalidated,
+        Self::Announcement,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -295,6 +298,7 @@ impl PushKind {
             Self::DataMode => "DataMode",
             Self::AuctionRepush => "AuctionRepush",
             Self::CandidateInvalidated => "CandidateInvalidated",
+            Self::Announcement => "Announcement",
         }
     }
 
@@ -335,6 +339,7 @@ impl PushKind {
             Self::DataMode => "data_mode_v1",
             Self::AuctionRepush => "auction_repush_v1",
             Self::CandidateInvalidated => "candidate_invalidated_v1",
+            Self::Announcement => "announcement_v1",
         }
     }
 
@@ -546,6 +551,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 接线)。盘中信息卡计入预算 (分流规则); PerTicket Rolling 1800s
         // 镜像旧逐票 30 min 冷却 (批量 diff 多票互不阻塞)。
         (CandidateInvalidated, PerTicket, Some(1_800), Rolling),
+        // 2026-09-20: S-01 公告源事实升级 counted (MU-announcement 接线)。
+        // 盘中信息卡计入预算 (分流规则); WindowMode::None 无冷却 (G5b/
+        // DataMode 先例: event_id 精确去重是旧语义, 批量公告同日全达 —
+        // 8/30 周日 19 条实证)。
+        (Announcement, Global, std::option::Option::None, WindowMode::None),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

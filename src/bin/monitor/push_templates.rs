@@ -6578,6 +6578,55 @@ pub fn build_candidate_invalidated_counted_binding(
     .map_err(|error| format!("T-08 counted binding 构造失败 code={code}: {error}"))
 }
 
+/// MU-announcement: S-01 公告源事实 counted binding (2026-09-20):
+/// occurrence announcement:{业务日}:{source}:{event_id} (event_id 为
+/// provider-scoped — 加 source 段防跨源同日碰撞; 旧语义 v14 memo 仅
+/// event_id 去重, 此更强非回归); canonical = 业务日 + event 事实 +
+/// 渲染 sha256; Global scope
+/// (公告可无票, 市场级); retry_authorized=true (公告 = 历史事实, 补发仍
+/// 有效; 旧系统新闻轮询 dedup 后事件不再来 — durable 是唯一恢复路径,
+/// T-08 同论据)。业务日锚定 observed_at (观察时刻, 回放稳定)。
+pub fn build_announcement_counted_binding(
+    business_date: chrono::NaiveDate,
+    event_id: &str,
+    code: Option<&str>,
+    title: &str,
+    source: &str,
+    strength: u8,
+    certainty: u8,
+    stale: bool,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "announcement-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "event_id": event_id,
+        "code": code,
+        "title": title,
+        "source": source,
+        "strength": strength,
+        "certainty": certainty,
+        "stale": stale,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("announcement:{business_date}:{source}:{event_id}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("S-01 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -22742,6 +22791,68 @@ mod tests {
             binding.scope(),
             crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
         ));
+    }
+
+    #[test]
+    fn u14_counted_binding_is_per_event_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_announcement_counted_binding(
+            date,
+            "evt-001",
+            Some("600001"),
+            "公告标题",
+            "cninfo",
+            80,
+            90,
+            false,
+            "公告样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "announcement:2026-09-20:cninfo:evt-001"
+        );
+        // 同 event 同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_announcement_counted_binding(
+            date,
+            "evt-001",
+            Some("600001"),
+            "公告标题",
+            "cninfo",
+            80,
+            90,
+            false,
+            "公告样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 event → 不同 occurrence (批量公告同日全达, 无冷却互不阻塞)
+        let other = build_announcement_counted_binding(
+            date,
+            "evt-002",
+            None,
+            "宏观公告",
+            "cninfo",
+            70,
+            60,
+            false,
+            "公告样本二",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 历史事实 + 唯一恢复路径 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======

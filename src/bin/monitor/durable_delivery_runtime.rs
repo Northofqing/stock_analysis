@@ -2309,6 +2309,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::AuctionRepush => (D::AuctionRepush, DeliverySubKind::None),
         // 2026-09-20: 候选失效升级 counted (MU-auction-candidates 接线)。
         K::CandidateInvalidated => (D::CandidateInvalidated, DeliverySubKind::None),
+        // 2026-09-20: 公告源事实升级 counted (MU-announcement 接线)。
+        K::Announcement => (D::Announcement, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3333,6 +3335,15 @@ mod tests {
             Some((DurablePushKind::CandidateInvalidated, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::CandidateInvalidated));
+    }
+
+    #[test]
+    fn announcement_kind_maps_to_durable_announcement() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::Announcement),
+            Some((DurablePushKind::Announcement, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::Announcement));
     }
 
     #[tokio::test]
