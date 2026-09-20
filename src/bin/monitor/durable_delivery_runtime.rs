@@ -2297,6 +2297,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::NewsCatalyst => (D::NewsCatalyst, DeliverySubKind::None),
         // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
         K::BlockTradeIntradayConfirm => (D::BlockTradeIntradayConfirm, DeliverySubKind::None),
+        // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+        K::IpoCatalyst => (D::IpoCatalyst, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3267,6 +3269,15 @@ mod tests {
             ))
         );
         assert!(is_counted_kind(PushKind::BlockTradeIntradayConfirm));
+    }
+
+    #[test]
+    fn ipo_catalyst_kind_maps_to_durable_ipo_catalyst() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::IpoCatalyst),
+            Some((DurablePushKind::IpoCatalyst, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::IpoCatalyst));
     }
 
     #[tokio::test]

@@ -205,10 +205,12 @@ pub enum PushKind {
     NewsCatalyst,
     // 2026-09-20: BR-033 大宗盘中确认升级 counted (MU-block-confirm 接线)。
     BlockTradeIntradayConfirm,
+    // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+    IpoCatalyst,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -238,6 +240,7 @@ impl PushKind {
         Self::IntradayMarket,
         Self::NewsCatalyst,
         Self::BlockTradeIntradayConfirm,
+        Self::IpoCatalyst,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -271,6 +274,7 @@ impl PushKind {
             Self::IntradayMarket => "IntradayMarket",
             Self::NewsCatalyst => "NewsCatalyst",
             Self::BlockTradeIntradayConfirm => "BlockTradeIntradayConfirm",
+            Self::IpoCatalyst => "IpoCatalyst",
         }
     }
 
@@ -305,6 +309,7 @@ impl PushKind {
             Self::IntradayMarket => "intraday_market_v1",
             Self::NewsCatalyst => "news_catalyst_v1",
             Self::BlockTradeIntradayConfirm => "block_trade_intraday_confirm_v1",
+            Self::IpoCatalyst => "ipo_catalyst_v1",
         }
     }
 
@@ -484,6 +489,13 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 不作 rolling 过期解释); 盘后复盘类豁免日预算 (分流规则, BR-237
         // 原理: 复盘不被盘中信号挤掉)。
         (BlockTradeIntradayConfirm, PerTicket, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
+        // 19:00 盘后 review side route (BR-223), 每日一次全市场 digest (旧
+        // 调用形态 code="" — 旧 L4 冷却键实为 kind-全局)。BusinessDateOnce
+        // 按业务日幂等 (ReviewMarket BR-214 先例) 并修复旧「跨日期共享
+        // kind-全局 1800s 冷却」缺陷; 盘后复盘类豁免日预算 (分流规则,
+        // BR-237 原理)。
+        (IpoCatalyst, Global, Some(86_400), BusinessDateOnce),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -540,6 +552,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::AttributionDaily
                     | PushKind::G5bAttribution
                     | PushKind::BlockTradeIntradayConfirm
+                    | PushKind::IpoCatalyst
             ),
             policy_version: POLICY_VERSION,
         },

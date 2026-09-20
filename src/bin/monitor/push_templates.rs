@@ -6346,6 +6346,38 @@ pub fn build_block_trade_confirm_counted_binding(
     .map_err(|error| format!("BR-033 counted binding 构造失败 code={code}: {error}"))
 }
 
+/// A-11 IPO 阶段催化 counted binding: 每日一次全市场 digest (空 code Global
+/// 形态); canonical = 业务日 + 渲染 sha256 (hits 结构复杂, I-01/I-02 模式;
+/// 渲染确定性 + 历史公告批次稳定 → 同事实回放稳定); occurrence
+/// ipo-catalyst:{业务日}; retry_authorized=true (backfill 重跑 side route
+/// 是既有补偿路径, 内容 = 该业务日历史 digest 补发仍有效)。
+pub fn build_ipo_catalyst_counted_binding(
+    business_date: chrono::NaiveDate,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "ipo-catalyst-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("ipo-catalyst:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("A-11 counted binding 构造失败: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -9222,19 +9254,36 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
     }
 
     let text = render_ipo_catalyst_dynamic(date, &hits);
-    let result = dispatch_registered_outcome!(
-        "A-11-ipo-catalyst",
-        crate::notify::PushKind::IpoCatalyst,
-        "ipo_catalyst_dispatcher",
-        // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
-        // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
-        "render_ipo_catalyst",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("A-11", result.is_pushed(), hits.len(), "");
-    result.is_pushed()
+    // 2026-09-20: A-11 升级 counted (MU-ipo-catalyst)。19:00 盘后 review side
+    // route (BR-223) 每日一次全市场 digest; counted 门 (v14_gate_counted_binding)
+    // 取 CountedSourceOnly (requires_banner=false, BR-241 公共源形态 — 不虚构
+    // banner 依赖), 与 T-16/A-12/BR-033 同形态。BusinessDateOnce 幂等 + 豁免
+    // 日预算。
+    let result = match build_ipo_catalyst_counted_binding(date_naive, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                "A-11-ipo-catalyst",
+                crate::notify::PushKind::IpoCatalyst,
+                "ipo_catalyst_dispatcher",
+                // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
+                // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
+                "render_ipo_catalyst",
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[A-11][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    };
+    log_dispatcher_attempt("A-11", result, hits.len(), "");
+    result
 }
 
 /// 动态 IPO 催化渲染: 最近 IPO 公告 → 公司 + 阶段 + 供应链关联 + 产业链影响。
@@ -22140,6 +22189,40 @@ mod tests {
             binding.scope(),
             crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
         ));
+    }
+
+    #[test]
+    fn u07_counted_binding_is_global_daily_digest_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "🛰️ IPO 产业链催化（2026-09-20 动态）";
+        let binding =
+            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "ipo-catalyst:2026-09-20"
+        );
+        // 同业务日同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence (修复旧跨日期共享空code冷却缺陷)
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next =
+            build_ipo_catalyst_counted_binding(next_day, text).expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // backfill 重跑补偿授权 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======
