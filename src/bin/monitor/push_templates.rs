@@ -6422,6 +6422,91 @@ pub fn build_snapshot_stale_counted_binding(
     .map_err(|error| format!("快照提醒 counted binding 构造失败: {error}"))
 }
 
+/// MU-limit-boards counted binding (2026-09-20): 每 shape 每时间槽 occurrence
+/// limit-boards:{业务日}:{shape}:{hhmm} (I-01 MarketView 模式); canonical =
+/// 业务日 + shape + 渲染 sha256; Global scope (3 shape 共享 kind-全局头,
+/// 保真旧 L4 默认 1800s 互相阻塞语义); retry_authorized=false (盘中状态
+/// 快照时刻锚定 + 周期循环重渲染补偿 — I-01 论据)。
+pub fn build_limit_boards_counted_binding(
+    business_date: chrono::NaiveDate,
+    shape: LimitBoardsShape,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "limit-boards-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "shape": format!("{shape:?}"),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("limit-boards:{business_date}:{shape:?}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("涨停板 counted binding 构造失败: {error}"))
+}
+
+/// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
+/// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
+/// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
+/// family+renderer 派生); counted 门取 CountedSourceOnly (requires_banner=
+/// false, BR-241 公共源形态)。
+pub async fn push_limit_boards_counted(
+    business_date: chrono::NaiveDate,
+    shape: LimitBoardsShape,
+    hhmm: &str,
+    lines: &[String],
+) -> crate::notify::PushOutcome {
+    let (family, assembler) = match shape {
+        LimitBoardsShape::First => ("L-01-limit-boards-first", "assemble_limit_boards_first"),
+        LimitBoardsShape::Second => (
+            "L-02-limit-boards-second",
+            "assemble_limit_boards_second",
+        ),
+        LimitBoardsShape::ThirdPlus => (
+            "L-03-limit-boards-third-plus",
+            "assemble_limit_boards_third_plus",
+        ),
+    };
+    let text = match render_limit_boards_shape(shape, hhmm, lines) {
+        Ok(text) => text,
+        Err(error) => {
+            log::error!("[涨停板] 展示失败: {error}");
+            return crate::notify::PushOutcome::Denied(error);
+        }
+    };
+    match build_limit_boards_counted_binding(business_date, shape, hhmm, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                family,
+                crate::notify::PushKind::LimitBoards,
+                "monitor_limit_board_producer",
+                assembler,
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[涨停板][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -22300,6 +22385,53 @@ mod tests {
         );
         // days_behind 时刻锚定 + 进程内 gate 补偿 → retry_authorized=false
         // (I-01 论据), Global scope
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u09_counted_binding_is_per_shape_per_time_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::First,
+            "09:35",
+            "🟢 首板涨停",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "limit-boards:2026-09-20:First:09:35"
+        );
+        // 同 shape 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::First,
+            "09:35",
+            "🟢 首板涨停",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同 shape → 不同 occurrence (但共享 Global 头, 旧互相阻塞语义)
+        let other = build_limit_boards_counted_binding(
+            date,
+            LimitBoardsShape::Second,
+            "09:35",
+            "🟡 二板涨停",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中状态快照 + 周期重渲染补偿 → retry_authorized=false, Global
         assert!(!binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
         assert_eq!(

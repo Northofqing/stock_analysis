@@ -2301,6 +2301,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::IpoCatalyst => (D::IpoCatalyst, DeliverySubKind::None),
         // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
         K::SnapshotStale => (D::SnapshotStale, DeliverySubKind::None),
+        // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+        K::LimitBoards => (D::LimitBoards, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3289,6 +3291,15 @@ mod tests {
             Some((DurablePushKind::SnapshotStale, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::SnapshotStale));
+    }
+
+    #[test]
+    fn limit_boards_kind_maps_to_durable_limit_boards() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::LimitBoards),
+            Some((DurablePushKind::LimitBoards, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::LimitBoards));
     }
 
     #[tokio::test]

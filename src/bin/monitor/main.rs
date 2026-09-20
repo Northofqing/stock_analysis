@@ -10439,82 +10439,39 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
 
                             let ts = chrono::Local::now().format("%H:%M").to_string();
+                            // MU-limit-boards counted (2026-09-20): binding 锚定
+                            // 本地业务日 (盘中 tick 与 ts 同源; 与 I-01 盘中
+                            // 轮动同形态)。
+                            let business_date = chrono::Local::now().date_naive();
 
                             if !first_lines.is_empty() {
-                                match push_templates::render_limit_boards_shape(
+                                push_templates::push_limit_boards_counted(
+                                    business_date,
                                     push_templates::LimitBoardsShape::First,
                                     &ts,
                                     &first_lines,
-                                ) {
-                                    Ok(text) => {
-                                        match presentation_registry::acquire_token(
-                                            "L-01-limit-boards-first",
-                                            notify::PushKind::LimitBoards,
-                                            "monitor_limit_board_producer",
-                                            "assemble_limit_boards_first",
-                                        ) {
-                                            Ok(token) => {
-                                                notify::push_presented_v3(token, &text, None).await;
-                                            }
-                                            Err(error) => log::error!(
-                                                "[涨停板][BR-196] 首板 token 失败: {error}"
-                                            ),
-                                        }
-                                    }
-                                    Err(error) => log::error!("[涨停板] 首板展示失败: {error}"),
-                                }
+                                )
+                                .await;
                             }
 
                             if !second_lines.is_empty() {
-                                match push_templates::render_limit_boards_shape(
+                                push_templates::push_limit_boards_counted(
+                                    business_date,
                                     push_templates::LimitBoardsShape::Second,
                                     &ts,
                                     &second_lines,
-                                ) {
-                                    Ok(text) => {
-                                        match presentation_registry::acquire_token(
-                                            "L-02-limit-boards-second",
-                                            notify::PushKind::LimitBoards,
-                                            "monitor_limit_board_producer",
-                                            "assemble_limit_boards_second",
-                                        ) {
-                                            Ok(token) => {
-                                                notify::push_presented_v3(token, &text, None).await;
-                                            }
-                                            Err(error) => log::error!(
-                                                "[涨停板][BR-196] 二板 token 失败: {error}"
-                                            ),
-                                        }
-                                    }
-                                    Err(error) => log::error!("[涨停板] 二板展示失败: {error}"),
-                                }
+                                )
+                                .await;
                             }
 
                             if !third_lines.is_empty() {
-                                match push_templates::render_limit_boards_shape(
+                                push_templates::push_limit_boards_counted(
+                                    business_date,
                                     push_templates::LimitBoardsShape::ThirdPlus,
                                     &ts,
                                     &third_lines,
-                                ) {
-                                    Ok(text) => {
-                                        match presentation_registry::acquire_token(
-                                            "L-03-limit-boards-third-plus",
-                                            notify::PushKind::LimitBoards,
-                                            "monitor_limit_board_producer",
-                                            "assemble_limit_boards_third_plus",
-                                        ) {
-                                            Ok(token) => {
-                                                notify::push_presented_v3(token, &text, None).await;
-                                            }
-                                            Err(error) => log::error!(
-                                                "[涨停板][BR-196] 三板+ token 失败: {error}"
-                                            ),
-                                        }
-                                    }
-                                    Err(error) => {
-                                        log::error!("[涨停板] 三板+展示失败: {error}")
-                                    }
-                                }
+                                )
+                                .await;
                             }
                         }
 

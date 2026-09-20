@@ -209,10 +209,12 @@ pub enum PushKind {
     IpoCatalyst,
     // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
     SnapshotStale,
+    // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+    LimitBoards,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -244,6 +246,7 @@ impl PushKind {
         Self::BlockTradeIntradayConfirm,
         Self::IpoCatalyst,
         Self::SnapshotStale,
+        Self::LimitBoards,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -279,6 +282,7 @@ impl PushKind {
             Self::BlockTradeIntradayConfirm => "BlockTradeIntradayConfirm",
             Self::IpoCatalyst => "IpoCatalyst",
             Self::SnapshotStale => "SnapshotStale",
+            Self::LimitBoards => "LimitBoards",
         }
     }
 
@@ -315,6 +319,7 @@ impl PushKind {
             Self::BlockTradeIntradayConfirm => "block_trade_intraday_confirm_v1",
             Self::IpoCatalyst => "ipo_catalyst_v1",
             Self::SnapshotStale => "snapshot_stale_v1",
+            Self::LimitBoards => "limit_boards_v1",
         }
     }
 
@@ -506,6 +511,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 挤掉); 每日一次 (进程内 SnapshotReminderGate 语义), Global
         // BusinessDateOnce 按业务日幂等 (ReviewMarket BR-214 先例)。
         (SnapshotStale, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
+        // 盘中信息卡计入预算 (分流规则)。Rolling 1800s 镜像旧 L4 默认
+        // kind-全局冷却 (notify cooldown `_ => Some(1800)`, 3 个 shape 共享
+        // 头 — 保真旧互相阻塞语义)。
+        (LimitBoards, Global, Some(1_800), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
