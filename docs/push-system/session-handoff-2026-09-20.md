@@ -31,12 +31,13 @@
 
 ## 3. 进度与下一步
 
-**2026-09-20 续 (用户指令: 剩下全部接完, 分流规则已裁决): 已完成 4/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0) + I-01 盘中轮动 (cc828b7)。下一 Unit: registered-template 类 (BlockConfirm/IpoCatalyst/NewsCatalyst 等, 逐一核实源健康; NewsCatalyst 已因 v14 seam 轮换成为熟面孔)。**
+**2026-09-20 续 (用户指令: 剩下全部接完, 分流规则已裁决): 已完成 5/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0) + I-01 盘中轮动 (cc828b7) + I-02 新闻催化 (0277cc9)。下一 Unit: registered-template 类继续 (BlockConfirm/IpoCatalyst 等, 逐一核实源健康 + 查 GOVERNANCE_SMOKE_IDENTITIES)。**
 
 - 决策规则 (用户 2026-09-20 裁决): 每日必达类豁免预算 (BR-237 语义); 4 个结构性源缺陷 Unit (OrderAlert/FrozenSide/VirtualWatch/PaperSell) 跳过待修源、单独成批。
-- 下一批接线顺序: registered-template 类 (BlockConfirm/IpoCatalyst/NewsCatalyst 等, 逐一核实源健康) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
-- **I-01 经验 (已提交 cc828b7)**: ① 同 kind 混合语义 (每日提醒×2 + 周期信息卡×1 + 手工工具×1) — policy 行 per-kind 粒度无法拆分预算豁免, 以主导语义 (盘中信息卡) 计预算, 残余行为入 commit message; ② retry_authorized=false 与前三轮 true 的偏离: 内容含时刻锚定+进程内补偿已存在时, durable 补发只推过时卡 (R-02 flood 风险), 旧注释「失败不重试」保真优先; ③ generic governor fail-closed 会波及手工工具路径 (manual_push → dispatch_registered_outcome) — 前提核实必须穷举 kind 的所有 dispatch 家族, 不只是 main.rs 调用点; ④ v14_adapter 测试 quiet_hour 断言用 uncounted kind, 每轮接线需轮换; ⑤ catalog 计数测试有第 3 处独立 len() 断言 (A-12 教训的完整形态); ⑥ 复审代理机器休眠会停滞 (本轮 2h+), 催促/恢复机制: SendMessage 恢复后要求跳过验证直接裁定。
-- 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-i01-intraday-market-wiring/i01-wiring-evidence.log`。
+- 下一批接线顺序: registered-template 类 (BlockConfirm/IpoCatalyst 等) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
+- **I-02 经验 (已提交 0277cc9)**: ① **配方第七触点: GOVERNANCE_SMOKE_IDENTITIES (br196_test_delivery.rs) + main.rs smoke 块** — counted kind 若在 smoke 清单里, generic smoke dispatch 被 counted_binding_required 拒 → dry-run EXIT 2。前四轮 kind 恰都不在 smoke 块才没暴露。修复 = 移出清单 (P-01/R-03 先例: capability_unavailable 出声, 保留渲染跳过 dispatch) + cardinality 测试同步。② 生产与手工工具共用 dispatcher 时转一处全覆盖 (dispatch_news_catalyst_daily)。③ 同 I-01: 事件驱动一次性调用 → retry_authorized=false 保真。
+- **I-01 经验 (已提交 cc828b7)**: ① 同 kind 混合语义 — policy 行按主导语义分流, 残余行为入 commit message; ② retry_authorized=false 偏离论据 (内容时刻锚定+进程内补偿已存在); ③ 前提核实穷举全部 dispatch 家族 (manual_push 手工工具会被 fail-closed 波及); ④ v14_adapter quiet_hour/br137 测试断言 kind 每轮轮换; ⑤ catalog 计数测试有 3 处断言; ⑥ 复审代理机器休眠停滞 → SendMessage 恢复+限时裁定指令。
+- 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-i02-news-catalyst-wiring/i02-wiring-evidence.log`。
 - **经验补充 (A-12 轮)**: ① schema.rs seed 计数改消息串必须同步改比较常量 (否则 panic "must have N rows, got N" 自相矛盾); ② include_str!("main.rs") 源码扫描守卫存在 (attribution_epoch_runtime.rs), 改调用点必须同步守卫 seam; ③ LAST_RUN 类无条件设置语义要保真, 推送失败补偿靠 durable 决策而非进程内重试; ④ 复审核实: Uncertain 需人工裁定 (启动对账只补 Reserved/Rejected-retry), commit message 别写错。
 - gRPC 数据问题记录约定 (用户指令): 记入 `grpc_handoffs/` 目录。
 2. 配方 §6 的**单一事实源收敛**（触点 6 计数常量从 descriptors() 派生）— 接第 2 个 Unit 前做能省一半维护成本。
