@@ -198,11 +198,11 @@ pub(super) struct GovernanceSmokeDispatch<'context> {
 }
 
 // 2026-08-12: R-03/A-10 升级 counted (BR-192)，2026-08-18: P-01 升级
-// counted (BR-241) — TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05
-// 同规则移出 governance smoke (6 → 3)。
-const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 3] = [
+// counted (BR-241)，2026-09-20: I-02 升级 counted (MU-news-catalyst) —
+// TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05 同规则移出
+// governance smoke (6 → 3 → 2)。
+const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 2] = [
     ("D-01-news-to-idea", PushKind::NewsToIdea),
-    ("I-02-news-catalyst", PushKind::NewsCatalyst),
     ("T-11-auction-volume", PushKind::AuctionVolume),
 ];
 
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn br196_governance_smoke_requires_exact_three_pushed_tuples() {
+    fn br196_governance_smoke_requires_exact_identity_count_pushed_tuples() {
         let valid = GOVERNANCE_SMOKE_IDENTITIES
             .into_iter()
             .map(|(family_key, push_kind)| GovernanceSmokeDisposition {
@@ -1446,6 +1446,6 @@ mod tests {
         duplicate[0].family_key = duplicate[1].family_key;
         duplicate[0].push_kind = duplicate[1].push_kind;
         assert!(validate_governance_smoke(&duplicate).is_err());
-        assert!(validate_governance_smoke(&valid[..2]).is_err());
+        assert!(validate_governance_smoke(&valid[..1]).is_err());
     }
 }

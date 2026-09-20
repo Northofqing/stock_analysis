@@ -7120,21 +7120,25 @@ async fn push_e2e_news_modules(
 
     log::info!("[v70] I-02 推 ({} 字)", i02.chars().count());
 
-    let i02_outcome = notify::push_br196_governance_smoke_v3(
-        &i02,
-        smoke_context.dispatch("I-02-news-catalyst", notify::PushKind::NewsCatalyst, None)?,
-    )
-    .await;
+    // 2026-09-20: I-02 升级 counted durable delivery (MU-news-catalyst)。TEST_CODE
+    // fixture 不能替代不可变 binding 或权威 typed receipt (P-01/R-03 同规则),
+    // 保留渲染 smoke, 治理路径跳过出声。
+    log::warn!(
+        "[v70][BR-196][BR-192] capability_unavailable=news_catalyst_counted_binding_unavailable; \
+         skipped before governance smoke dispatch"
+    );
+    push_templates::log_dispatcher_attempt(
+        "I-02",
+        false,
+        0,
+        "news_catalyst_counted_binding_unavailable",
+    );
+
     Ok(vec![
         br196_test_delivery::GovernanceSmokeDisposition {
             family_key: "D-01-news-to-idea",
             push_kind: notify::PushKind::NewsToIdea,
             outcome: d01_outcome,
-        },
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "I-02-news-catalyst",
-            push_kind: notify::PushKind::NewsCatalyst,
-            outcome: i02_outcome,
         },
     ])
 }

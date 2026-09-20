@@ -201,10 +201,12 @@ pub enum PushKind {
     G5bAttribution,
     // 2026-09-20: I-01 盘中轮动升级 counted (MU-intraday-market 接线)。
     IntradayMarket,
+    // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
+    NewsCatalyst,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -232,6 +234,7 @@ impl PushKind {
         Self::AttributionDaily,
         Self::G5bAttribution,
         Self::IntradayMarket,
+        Self::NewsCatalyst,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -263,6 +266,7 @@ impl PushKind {
             Self::AttributionDaily => "AttributionDaily",
             Self::G5bAttribution => "G5bAttribution",
             Self::IntradayMarket => "IntradayMarket",
+            Self::NewsCatalyst => "NewsCatalyst",
         }
     }
 
@@ -295,6 +299,7 @@ impl PushKind {
             Self::AttributionDaily => "attribution_daily_v1",
             Self::G5bAttribution => "g5b_attribution_v1",
             Self::IntradayMarket => "intraday_market_v1",
+            Self::NewsCatalyst => "news_catalyst_v1",
         }
     }
 
@@ -462,6 +467,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 盘中信息卡计入 30 条/日预算 (分流规则)。同 kind 两个每日一次借用点
         // (BR-226 快照提醒/盘前预检) 同样计预算 — per-kind 粒度无法拆分。
         (IntradayMarket, Global, Some(900), Rolling),
+        // 2026-09-20: I-02 新闻催化映射升级 counted — 事件驱动 (Important 公告
+        // 非空时调一次), Rolling 600s 镜像旧 L4 (notify cooldown_secs 600);
+        // 盘中信息卡计入 30 条/日预算 (分流规则)。
+        (NewsCatalyst, Global, Some(600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

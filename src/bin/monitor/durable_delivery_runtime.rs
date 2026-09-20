@@ -2293,6 +2293,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::G5bAttribution => (D::G5bAttribution, DeliverySubKind::None),
         // 2026-09-20: I-01 盘中轮动升级 counted (MU-intraday-market 接线)。
         K::IntradayMarket => (D::IntradayMarket, DeliverySubKind::None),
+        // 2026-09-20: I-02 新闻催化映射升级 counted (MU-news-catalyst 接线)。
+        K::NewsCatalyst => (D::NewsCatalyst, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3242,6 +3244,15 @@ mod tests {
             Some((DurablePushKind::IntradayMarket, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::IntradayMarket));
+    }
+
+    #[test]
+    fn news_catalyst_kind_maps_to_durable_news_catalyst() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsCatalyst),
+            Some((DurablePushKind::NewsCatalyst, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsCatalyst));
     }
 
     #[tokio::test]

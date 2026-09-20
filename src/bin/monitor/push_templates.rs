@@ -6261,6 +6261,39 @@ pub fn build_intraday_counted_binding(
     .map_err(|error| format!("I-01 counted binding 构造失败: {error}"))
 }
 
+/// I-02 新闻催化 counted binding: 事件驱动 (Important 公告非空时调一次),
+/// 每时间槽独立 occurrence news-catalyst:{业务日}:{hhmm}; canonical =
+/// 业务日 + 渲染 sha256 (LLM 非确定 → 分析后构造, G5b 先例); Global scope;
+/// retry_authorized=false (旧语义一次性调用失败即弃, 无进程内重试; 内容含
+/// 时刻锚定, 补发即过时 — I-01 同理由)。
+pub fn build_news_catalyst_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-catalyst-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-catalyst:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("I-02 counted binding 构造失败: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -15659,17 +15692,40 @@ pub async fn push_news_catalyst(
     banner: &BannerCtx,
     params: NewsCatalystParams<'_>,
 ) -> bool {
+    push_news_catalyst_outcome(code, banner, params)
+        .await
+        .is_pushed()
+}
+
+async fn push_news_catalyst_outcome(
+    _code: &str,
+    banner: &BannerCtx,
+    params: NewsCatalystParams<'_>,
+) -> crate::notify::PushOutcome {
     let text = render_news_catalyst(banner, params);
-    dispatch_registered_outcome!(
-        "I-02-news-catalyst",
-        crate::notify::PushKind::NewsCatalyst,
-        "news_catalyst_dispatcher",
-        "render_news_catalyst",
-        code,
-        Some(banner),
-        text
-    )
-    .is_pushed()
+    // 2026-09-20: I-02 新闻催化升级 counted (MU-news-catalyst)。事件驱动
+    // 一次性调用 (无进程内重试); counted 门 (v14_gate_counted_binding,
+    // CountedCombinedAccount) 内部取 banner 并评估 mode/dm, 与 I-01/T-16 同
+    // 形态。每时间槽独立 occurrence; retry_authorized=false (失败即弃保真)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_news_catalyst_counted_binding(today, &hhmm, &text).and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "I-02-news-catalyst",
+            crate::notify::PushKind::NewsCatalyst,
+            "news_catalyst_dispatcher",
+            "render_news_catalyst",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-02][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.2 I-09 量价反向发现 (⚡重要, 无 banner)
@@ -21910,6 +21966,36 @@ mod tests {
         assert_eq!(binding.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
         assert!(!binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
+    }
+
+    #[test]
+    fn i02_counted_binding_identity_is_per_time_slot_and_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let text = "新闻催化映射样本";
+        let slot_a =
+            build_news_catalyst_counted_binding(date, "10:15", text).expect("valid binding");
+        assert_eq!(
+            slot_a.schedule_occurrence_identity(),
+            "news-catalyst:2026-09-20:10:15"
+        );
+        // 每时间槽独立 (事件驱动, 同日多次触发不互杀身份)
+        let slot_b =
+            build_news_catalyst_counted_binding(date, "10:25", text).expect("valid binding");
+        assert_ne!(
+            slot_b.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+        // 同槽同字节 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_news_catalyst_counted_binding(date, "10:15", text).expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            slot_a.schedule_occurrence_identity()
+        );
+        // 旧语义一次性调用失败即弃 → retry_authorized=false, Global scope
+        assert_eq!(slot_a.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert!(!slot_a.retry_authorized());
+        assert_eq!(slot_a.business_date(), date);
     }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======

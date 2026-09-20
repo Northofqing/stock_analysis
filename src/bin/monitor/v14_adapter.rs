@@ -1625,9 +1625,10 @@ mod tests {
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
         // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
-        // 已升级 counted → 换 NewsCatalyst; 后续接线轮次继续轮换)。
+        // 已升级 counted → 换 NewsCatalyst → 换 EtfClosingCallAuction; 后续
+        // 接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::NewsCatalyst, None),
+            v14_gate(PushKind::EtfClosingCallAuction, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
 
@@ -1647,9 +1648,10 @@ mod tests {
             V14Gate::Denied(reason) if reason == "counted_binding_required"
         ));
         // quiet_hour 断言用仍为 uncounted 的 kind (2026-09-20: IntradayMarket
-        // 已升级 counted → 换 NewsCatalyst; 后续接线轮次继续轮换)。
+        // 已升级 counted → 换 NewsCatalyst → 换 EtfClosingCallAuction; 后续
+        // 接线轮次继续轮换)。
         assert!(matches!(
-            v14_gate(PushKind::NewsCatalyst, None),
+            v14_gate(PushKind::EtfClosingCallAuction, None),
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
     }
@@ -2058,6 +2060,8 @@ mod tests {
     /// 2026-08-06 用户决策 (C 方案): 未接券商 → data_mode_min 全局放宽到 Down,
     /// data_quality 门禁不再拦任何推送 (DataMode banner 仍出声)。
     /// 原 BR-137 契约 (Unsafe 拒 generic news) 被该决策取代。
+    /// 2026-09-20: 代表 kind 从 NewsCatalyst 轮换为 NewsToIdea (NewsCatalyst 已
+    /// 升级 counted, generic v14_gate 对其返回 counted_binding_required)。
     fn br137_generic_mixed_news_approved_at_data_mode_unsafe_after_c_decision() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
@@ -2070,7 +2074,7 @@ mod tests {
 
         assert!(
             matches!(
-                v14_gate(PushKind::NewsCatalyst, Some("TEST_CODE_MIXED_NEWS")),
+                v14_gate(PushKind::NewsToIdea, Some("TEST_CODE_MIXED_NEWS")),
                 V14Gate::Approved(_)
             ),
             "C 方案后 Unsafe 下 generic news 应放行 (data_quality 门禁已移除)"
