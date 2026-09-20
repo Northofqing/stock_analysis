@@ -2327,6 +2327,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::MarketActionAlert => (D::MarketActionAlert, DeliverySubKind::None),
         // 2026-09-20: 账户模式卡升级 counted (MU-account-mode 接线)。
         K::AccountMode => (D::AccountMode, DeliverySubKind::None),
+        // 2026-09-20: 候选台升级 counted (MU-auction-candidates 接线)。
+        K::CandidateBoard => (D::CandidateBoard, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3432,6 +3434,15 @@ mod tests {
             Some((DurablePushKind::AccountMode, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::AccountMode));
+    }
+
+    #[test]
+    fn candidate_board_kind_maps_to_durable_candidate_board() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::CandidateBoard),
+            Some((DurablePushKind::CandidateBoard, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::CandidateBoard));
     }
 
     #[tokio::test]

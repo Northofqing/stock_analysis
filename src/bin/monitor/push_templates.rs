@@ -7016,6 +7016,38 @@ pub fn build_account_mode_counted_binding(
     .map_err(|error| format!("T-01 counted binding 构造失败: {error}"))
 }
 
+/// MU-auction-candidates: P-05 候选台 counted binding (2026-09-20):
+/// occurrence candidate-board:{业务日}:{hhmm} (每槽整卡, I-01 模式);
+/// canonical = 业务日 + 渲染 sha256; Global scope (旧 L4 默认 kind-全局);
+/// retry_authorized=false (盘中快照时刻锚定 + 下一轮重渲染补偿)。
+pub fn build_candidate_board_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "candidate-board-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("candidate-board:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("P-05 counted binding 构造失败: {error}"))
+}
+
 /// MU-paper-sell counted dispatch (2026-09-20): 盘中/盘后两调用点共用。
 /// counted 门取 CountedCombinedAccount (requires_banner=true, 门内部取
 /// LATEST_BANNER — T-16 先例)。
@@ -10276,17 +10308,34 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
     }
     candidate_snapshot_persist(date, &codes_now);
     let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
-    let result = dispatch_registered_outcome!(
-        "P-05-candidate-board",
-        crate::notify::PushKind::CandidateBoard,
-        "candidate_board_dispatcher",
-        "format_candidate_board",
-        "",
-        None,
-        text
-    );
-    log_dispatcher_attempt("P-05", result.is_pushed(), batch.entries.len(), "");
-    result.is_pushed()
+    // 2026-09-20: P-05 升级 counted (MU-auction-candidates)。盘中信息卡;
+    // Rolling 1800s 镜像 L4 默认; retry_authorized=false (盘中快照锚定 +
+    // 下一轮重渲染补偿)。
+    let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Local::now().date_naive());
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let result = match build_candidate_board_counted_binding(business_date, &hhmm, &text)
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "P-05-candidate-board",
+                crate::notify::PushKind::CandidateBoard,
+                "candidate_board_dispatcher",
+                "format_candidate_board",
+            )
+            .map(|token| (token, binding))
+        }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                .await
+                .is_pushed()
+        }
+        Err(reason) => {
+            log::error!("[P-05][BR-196] counted 准备失败: {reason}");
+            false
+        }
+    };
+    log_dispatcher_attempt("P-05", result, batch.entries.len(), "");
+    result
 }
 
 /// BR-222: R-07 counted 投递材料 (BR-140/BR-192 counted ceremony)。

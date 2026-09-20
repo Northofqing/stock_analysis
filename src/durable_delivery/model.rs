@@ -235,10 +235,12 @@ pub enum PushKind {
     MarketActionAlert,
     // 2026-09-20: 账户模式卡升级 counted (MU-account-mode 接线)。
     AccountMode,
+    // 2026-09-20: 候选台升级 counted (MU-auction-candidates 接线)。
+    CandidateBoard,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 45] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -283,6 +285,7 @@ impl PushKind {
         Self::PaperSell,
         Self::MarketActionAlert,
         Self::AccountMode,
+        Self::CandidateBoard,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -331,6 +334,7 @@ impl PushKind {
             Self::PaperSell => "PaperSell",
             Self::MarketActionAlert => "MarketActionAlert",
             Self::AccountMode => "AccountMode",
+            Self::CandidateBoard => "CandidateBoard",
         }
     }
 
@@ -380,6 +384,7 @@ impl PushKind {
             Self::PaperSell => "paper_sell_v1",
             Self::MarketActionAlert => "market_action_alert_v1",
             Self::AccountMode => "account_mode_v1",
+            Self::CandidateBoard => "candidate_board_v1",
         }
     }
 
@@ -635,6 +640,10 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // WindowMode::None 无冷却 (旧 dispatcher 注释明示 "AccountMode
         // 无冷却", 变迁对精确去重 — DataMode 同款)。
         (AccountMode, Global, std::option::Option::None, WindowMode::None),
+        // 2026-09-20: P-05 候选台升级 counted (MU-auction-candidates
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 1800s 镜像旧
+        // L4 默认 (无显式行, kind-全局 30 min)。
+        (CandidateBoard, Global, Some(1_800), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
