@@ -198,11 +198,11 @@ pub(super) struct GovernanceSmokeDispatch<'context> {
 }
 
 // 2026-08-12: R-03/A-10 升级 counted (BR-192)，2026-08-18: P-01 升级
-// counted (BR-241)，2026-09-20: I-02 升级 counted (MU-news-catalyst) —
-// TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05 同规则移出
-// governance smoke (6 → 3 → 2)。
-const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 2] = [
-    ("D-01-news-to-idea", PushKind::NewsToIdea),
+// counted (BR-241)，2026-09-20: I-02 升级 counted (MU-news-catalyst)，
+// 2026-09-20: D-01 升级 counted (MU-d01) — TEST_CODE fixtures 不能替代
+// 不可变 binding，与 R-04/R-05 同规则移出 governance smoke
+// (6 → 3 → 2 → 1)。
+const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 1] = [
     ("T-11-auction-volume", PushKind::AuctionVolume),
 ];
 
@@ -1454,10 +1454,8 @@ mod tests {
         let mut denied = valid.clone();
         denied[0].outcome = crate::notify::PushOutcome::Denied("TEST_CODE".to_string());
         assert!(validate_governance_smoke(&denied).is_err());
-        let mut duplicate = valid.clone();
-        duplicate[0].family_key = duplicate[1].family_key;
-        duplicate[0].push_kind = duplicate[1].push_kind;
-        assert!(validate_governance_smoke(&duplicate).is_err());
-        assert!(validate_governance_smoke(&valid[..1]).is_err());
+        // 2026-09-20: D-01 移出后清单仅 1 员 — duplicate 用例不适用,
+        // cardinality-mismatch 用例改用空集 (0 ≠ 1)。
+        assert!(validate_governance_smoke(&valid[..0]).is_err());
     }
 }

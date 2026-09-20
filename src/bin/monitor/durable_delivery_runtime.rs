@@ -2313,6 +2313,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::Announcement => (D::Announcement, DeliverySubKind::None),
         // 2026-09-20: 分析师上调升级 counted (MU-analyst 接线)。
         K::AnalystUpgrade => (D::AnalystUpgrade, DeliverySubKind::None),
+        // 2026-09-20: 新闻到灵感升级 counted (MU-d01 接线)。
+        K::NewsToIdea => (D::NewsToIdea, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3355,6 +3357,15 @@ mod tests {
             Some((DurablePushKind::AnalystUpgrade, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::AnalystUpgrade));
+    }
+
+    #[test]
+    fn news_to_idea_kind_maps_to_durable_news_to_idea() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsToIdea),
+            Some((DurablePushKind::NewsToIdea, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsToIdea));
     }
 
     #[tokio::test]

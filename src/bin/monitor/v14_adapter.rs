@@ -2061,7 +2061,9 @@ mod tests {
     /// data_quality 门禁不再拦任何推送 (DataMode banner 仍出声)。
     /// 原 BR-137 契约 (Unsafe 拒 generic news) 被该决策取代。
     /// 2026-09-20: 代表 kind 从 NewsCatalyst 轮换为 NewsToIdea (NewsCatalyst 已
-    /// 升级 counted, generic v14_gate 对其返回 counted_binding_required)。
+    /// 升级 counted), 再轮换为 PolicyHit (NewsToIdea 升级 counted, MU-d01) —
+    /// uncounted 池继续缩小, C 方案契约 (Unsafe 下 generic news 放行) 与
+    /// 代表 kind 无关, 任何未 counted kind 均可承载。
     fn br137_generic_mixed_news_approved_at_data_mode_unsafe_after_c_decision() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
@@ -2074,7 +2076,7 @@ mod tests {
 
         assert!(
             matches!(
-                v14_gate(PushKind::NewsToIdea, Some("TEST_CODE_MIXED_NEWS")),
+                v14_gate(PushKind::PolicyHit, Some("TEST_CODE_MIXED_NEWS")),
                 V14Gate::Approved(_)
             ),
             "C 方案后 Unsafe 下 generic news 应放行 (data_quality 门禁已移除)"

@@ -7113,15 +7113,19 @@ async fn push_e2e_news_modules(
 
     log::info!("[v70] D-01 推 ({} 字)", d01.chars().count());
 
-    let d01_outcome = notify::push_br196_governance_smoke_v3(
-        &d01,
-        smoke_context.dispatch(
-            "D-01-news-to-idea",
-            notify::PushKind::NewsToIdea,
-            Some("TEST_CODE_NEWS_1"),
-        )?,
-    )
-    .await;
+    // 2026-09-20: D-01 升级 counted durable delivery (MU-d01)。TEST_CODE
+    // fixture 不能替代不可变 binding 或权威 typed receipt (P-01/R-03/I-02
+    // 同规则), 保留渲染 smoke, 治理路径跳过出声。
+    log::warn!(
+        "[v70][BR-196][BR-192] capability_unavailable=news_to_idea_counted_binding_unavailable; \
+         skipped before governance smoke dispatch"
+    );
+    push_templates::log_dispatcher_attempt(
+        "D-01",
+        false,
+        0,
+        "news_to_idea_counted_binding_unavailable",
+    );
 
     // I-02 新闻催化映射 (isolated fixture)
 
@@ -7167,13 +7171,9 @@ async fn push_e2e_news_modules(
         "news_catalyst_counted_binding_unavailable",
     );
 
-    Ok(vec![
-        br196_test_delivery::GovernanceSmokeDisposition {
-            family_key: "D-01-news-to-idea",
-            push_kind: notify::PushKind::NewsToIdea,
-            outcome: d01_outcome,
-        },
-    ])
+    // 2026-09-20: D-01 移出 governance smoke (2 → 1, T-11 独存于
+    // push_e2e_auction 块) — 本块不再产出 disposition。
+    Ok(vec![])
 }
 
 /// v70: 推所有盘中 14.x 模板 (isolated test fixtures)
