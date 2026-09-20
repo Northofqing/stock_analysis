@@ -31,7 +31,7 @@
 
 ## 3. 进度与下一步
 
-**2026-09-20 续 (用户指令: 剩下全部接完 → 改自主连续模式「直接干完, 不要一直输入继续」): 已完成 11/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0) + I-01 盘中轮动 (cc828b7) + I-02 新闻催化 (0277cc9) + BR-033 大宗盘中确认 (00128fd) + A-11 IPO 阶段催化 (f5226e9) + SnapshotStale 快照过期提醒 (9a05561) + LimitBoards 涨停板板数榜 (2941664) + DataMode 数据模式卡 (7e2a806) + A-02 竞价重推 (e90201e)。剩余完整清单: .superpowers/sdd/2026-09-20-remaining-unit-inventory.md (A 类 9 个接线单元 / B 类缺陷源批次锁定跳过 / C 类已覆盖或 INACTIVE)。**
+**2026-09-20 续 (用户指令: 剩下全部接完 → 改自主连续模式「直接干完, 不要一直输入继续」): 已完成 12/52 — T-16 (47cf502) + A-12 (a892b85) + G5b (8f68fc0) + I-01 盘中轮动 (cc828b7) + I-02 新闻催化 (0277cc9) + BR-033 大宗盘中确认 (00128fd) + A-11 IPO 阶段催化 (f5226e9) + SnapshotStale 快照过期提醒 (9a05561) + LimitBoards 涨停板板数榜 (2941664) + DataMode 数据模式卡 (7e2a806) + A-02 竞价重推 (e90201e) + T-08 候选失效 (7fba9f3)。剩余完整清单: .superpowers/sdd/2026-09-20-remaining-unit-inventory.md (A 类 9 个接线单元 / B 类缺陷源批次锁定跳过 / C 类已覆盖或 INACTIVE)。**
 
 - 决策规则 (用户 2026-09-20 裁决): 每日必达类豁免预算 (BR-237 语义); 4 个结构性源缺陷 Unit (OrderAlert/FrozenSide/VirtualWatch/PaperSell) 跳过待修源、单独成批。
 - 下一批接线顺序: registered-template 类 (BlockConfirm/IpoCatalyst 等) → SnapshotStale (不在 BR-196 清单, 需全 7 触点含计数常量陷阱) → 最后缺陷源成批。
@@ -42,7 +42,7 @@
 - **BR-033 经验 (已提交 00128fd, registered-template 类首个)**: ① 名称含 Intraday 实际是 19:00 盘后 review side route — 分流按**实际语义** (盘后复盘 → 豁免预算) 而非 kind 名; ② 批量多票循环必须 **PerTicket** scope (Global 会首票 claim 头阻塞同批其余票); ③ business_date 穿线传 **trading_date** (锚定交易业务日) 而非 Local::now(); ④ 复核实锤 requires_banner=false 的 kind 计数门走 **CountedSourceOnly** (BR-241 公共源形态), 注释别写 CountedCombinedAccount; ⑤ canonical 枚举用 Debug 表示 — 枚举改名会变 identity (低风险); ⑥ 复审提醒: policy 行变更 → config_hash 变化, 未来上线重启前必须重发 BR-183 activation; ⑦ retry_authorized=true 依据 = backfill 重跑 side route 是既有补偿路径 (main.rs:6115 → dispatch_post_session_review)。
 - **I-02 经验 (已提交 0277cc9)**: ① **配方第七触点: GOVERNANCE_SMOKE_IDENTITIES (br196_test_delivery.rs) + main.rs smoke 块** — counted kind 若在 smoke 清单里, generic smoke dispatch 被 counted_binding_required 拒 → dry-run EXIT 2。前四轮 kind 恰都不在 smoke 块才没暴露。修复 = 移出清单 (P-01/R-03 先例: capability_unavailable 出声, 保留渲染跳过 dispatch) + cardinality 测试同步。② 生产与手工工具共用 dispatcher 时转一处全覆盖 (dispatch_news_catalyst_daily)。③ 同 I-01: 事件驱动一次性调用 → retry_authorized=false 保真。
 - **I-01 经验 (已提交 cc828b7)**: ① 同 kind 混合语义 — policy 行按主导语义分流, 残余行为入 commit message; ② retry_authorized=false 偏离论据 (内容时刻锚定+进程内补偿已存在); ③ 前提核实穷举全部 dispatch 家族 (manual_push 手工工具会被 fail-closed 波及); ④ v14_adapter quiet_hour/br137 测试断言 kind 每轮轮换; ⑤ catalog 计数测试有 3 处断言; ⑥ 复审代理机器休眠停滞 → SendMessage 恢复+限时裁定指令。
-- 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-u11-auction-repush-wiring/u11-wiring-evidence.log`。
+- 每 Unit 流程: 前提核实 → RED → 实现 → 回归 → 独立复审 → 提交。证据日志: `.superpowers/sdd/2026-09-20-u12-candidate-invalidated-wiring/u12-wiring-evidence.log`。
 - **经验补充 (A-12 轮)**: ① schema.rs seed 计数改消息串必须同步改比较常量 (否则 panic "must have N rows, got N" 自相矛盾); ② include_str!("main.rs") 源码扫描守卫存在 (attribution_epoch_runtime.rs), 改调用点必须同步守卫 seam; ③ LAST_RUN 类无条件设置语义要保真, 推送失败补偿靠 durable 决策而非进程内重试; ④ 复审核实: Uncertain 需人工裁定 (启动对账只补 Reserved/Rejected-retry), commit message 别写错。
 - gRPC 数据问题记录约定 (用户指令): 记入 `grpc_handoffs/` 目录。
 2. 配方 §6 的**单一事实源收敛**（触点 6 计数常量从 descriptors() 派生）— 接第 2 个 Unit 前做能省一半维护成本。
