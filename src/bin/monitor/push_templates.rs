@@ -6753,6 +6753,52 @@ pub fn build_auction_volume_counted_binding(
     .map_err(|error| format!("P-02 counted binding 构造失败: {error}"))
 }
 
+/// MU-industry-chain-intraday: I-03 盘中涨停扩散 counted binding
+/// (2026-09-20): occurrence industry-chain-intraday:{业务日}:{code}:{hhmm}
+/// (每票每槽); canonical = 业务日 + 票 + 渲染 sha256 (LLM 非确定,
+/// G5b/I-02 模式); PerTicket scope (镜像 L4 30 min/票);
+/// retry_authorized=false (LLM 时刻锚定 + 周期重渲染补偿 — I-01 论据)。
+pub fn build_industry_chain_intraday_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "industry-chain-intraday-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 手工工具任意码解析失败 fail-closed。
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("I-03 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("industry-chain-intraday:{business_date}:{code}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("I-03 counted binding 构造失败 code={code}: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -16404,15 +16450,32 @@ async fn push_industry_chain_intraday_outcome(
     params: IndustryChainIntradayParams<'_>,
 ) -> crate::notify::PushOutcome {
     let text = render_industry_chain_intraday(banner, params);
-    dispatch_registered_outcome!(
-        "I-03-industry-chain-intraday",
-        crate::notify::PushKind::IndustryChainIntraday,
-        "industry_chain_intraday_dispatcher",
-        "render_industry_chain_intraday",
-        code,
-        Some(banner),
-        text
-    )
+    // 2026-09-20: I-03 升级 counted (MU-industry-chain-intraday)。生产
+    // periodic 与 --push 手工工具共用此 funnel, 转一处全覆盖。counted
+    // 门取 CountedCombinedAccount (requires_banner=true, 门内部取 banner);
+    // PerTicket Rolling 1800s 镜像 L4; retry_authorized=false (LLM 时刻
+    // 锚定 + 周期重渲染补偿)。
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let today = chrono::Local::now().date_naive();
+    match build_industry_chain_intraday_counted_binding(today, code, &hhmm, &text).and_then(
+        |binding| {
+            crate::presentation_registry::acquire_token(
+                "I-03-industry-chain-intraday",
+                crate::notify::PushKind::IndustryChainIntraday,
+                "industry_chain_intraday_dispatcher",
+                "render_industry_chain_intraday",
+            )
+            .map(|token| (token, binding))
+        },
+    ) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[I-03][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// v13 §14.4 D-01 新闻驱动个股 (⚡交易建议类, 带 banner)
@@ -23062,6 +23125,41 @@ mod tests {
             binding.scope(),
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
+    }
+
+    #[test]
+    fn u18_counted_binding_is_per_ticket_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_industry_chain_intraday_counted_binding(
+            date,
+            "600001",
+            "10:30",
+            "涨停扩散样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "industry-chain-intraday:2026-09-20:600001:10:30"
+        );
+        // 同票同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_industry_chain_intraday_counted_binding(
+            date,
+            "600001",
+            "10:30",
+            "涨停扩散样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // LLM 时刻锚定 + 周期重渲染补偿 → retry_authorized=false, Ticket
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
     }
 
     #[test]
