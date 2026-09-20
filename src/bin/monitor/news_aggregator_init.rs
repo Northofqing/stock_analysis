@@ -504,9 +504,15 @@ impl NewsFlashGate {
                 Some("future_publication")
             } else if e.occurred_at.date_naive() != now.date_naive() {
                 Some("publication_date_not_current")
-            } else if provenance
-                .is_some_and(|item| item.fetched_at > now || item.fetched_at < e.occurred_at)
-            {
+            } else if provenance.is_some_and(|item| {
+                // 2026-09-20 (grpc_handoffs 上游回复修订版 2): 跨主机盖章的
+                // 时刻不应与本机 now 做零容差比较 — VM 上游时钟超前 ~0.7s
+                // (NTP 未同步) 导致每个 tick 最晚返回的 provider 整批被拒。
+                // 给 5s 显式容差: 仍然挡住真正的未来时刻, 消除 NTP 残差/
+                // VM 挂起恢复/日志写入抖动类误杀。上游侧 w32tm 校时已执行。
+                item.fetched_at > now + chrono::Duration::seconds(5)
+                    || item.fetched_at < e.occurred_at
+            }) {
                 Some("invalid_observation_time")
             } else {
                 None
