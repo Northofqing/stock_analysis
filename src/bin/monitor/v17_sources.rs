@@ -806,6 +806,33 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
                     }
                 }
             }
+            PushKind::MarketActionAlert => {
+                match crate::push_templates::build_market_action_alert_counted_binding(
+                    event.observed_at.date_naive(),
+                    &event.event_id,
+                    event.code.as_deref(),
+                    &event.title,
+                    &event.source,
+                    event.strength,
+                    event.certainty,
+                    event.stale,
+                    &rendered,
+                ) {
+                    Ok(binding) => {
+                        crate::notify::push_counted_with_binding(
+                            presentation_token,
+                            &rendered,
+                            None,
+                            binding,
+                        )
+                        .await
+                    }
+                    Err(reason) => {
+                        log::error!("[v17.7][BR-137] counted 准备失败: {reason}");
+                        PushOutcome::Denied(reason)
+                    }
+                }
+            }
             _ => PushOutcome::Denied("counted_source_kind_not_wired".to_owned()),
         }
     } else if matches!(
@@ -1761,9 +1788,11 @@ mod tests {
             .expect("test banner")
             .data_mode = crate::push_templates::DataMode::Unsafe;
 
-        let event =
-            normalize_market_action(&order_update("TEST_CODE_MARKET_ACTION_DOWN", "sell", 100))
-                .expect("normalized market action");
+        // 2026-09-20: MarketActionAlert 升级 counted (MU-market-action-alert)
+        // — binding 身份解析需真实 A 股码 (T-16 测试先例), TEST_CODE_ 码
+        // 由 production resolver 拒绝。
+        let event = normalize_market_action(&order_update("600001", "sell", 100))
+            .expect("normalized market action");
         assert_eq!(
             push_normalized_event(event).await.outcome,
             PushOutcome::Pushed

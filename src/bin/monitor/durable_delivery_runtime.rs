@@ -2321,6 +2321,12 @@ fn durable_kind_and_sub_kind_with_override(
         K::IndustryChainIntraday => (D::IndustryChainIntraday, DeliverySubKind::None),
         // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
         K::NewsFlashAggregated => (D::NewsFlashAggregated, DeliverySubKind::None),
+        // 2026-09-20: 虚拟盘卖出升级 counted (MU-paper-sell 接线)。
+        K::PaperSell => (D::PaperSell, DeliverySubKind::None),
+        // 2026-09-20: 实盘异常告警升级 counted (MU-market-action-alert 接线)。
+        K::MarketActionAlert => (D::MarketActionAlert, DeliverySubKind::None),
+        // 2026-09-20: 账户模式卡升级 counted (MU-account-mode 接线)。
+        K::AccountMode => (D::AccountMode, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3399,6 +3405,33 @@ mod tests {
             Some((DurablePushKind::NewsFlashAggregated, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::NewsFlashAggregated));
+    }
+
+    #[test]
+    fn paper_sell_kind_maps_to_durable_paper_sell() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::PaperSell),
+            Some((DurablePushKind::PaperSell, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::PaperSell));
+    }
+
+    #[test]
+    fn market_action_alert_kind_maps_to_durable_market_action_alert() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::MarketActionAlert),
+            Some((DurablePushKind::MarketActionAlert, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::MarketActionAlert));
+    }
+
+    #[test]
+    fn account_mode_kind_maps_to_durable_account_mode() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AccountMode),
+            Some((DurablePushKind::AccountMode, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AccountMode));
     }
 
     #[tokio::test]

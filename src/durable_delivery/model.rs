@@ -229,10 +229,16 @@ pub enum PushKind {
     IndustryChainIntraday,
     // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
     NewsFlashAggregated,
+    // 2026-09-20: 虚拟盘卖出升级 counted (MU-paper-sell 接线)。
+    PaperSell,
+    // 2026-09-20: 实盘异常告警升级 counted (MU-market-action-alert 接线)。
+    MarketActionAlert,
+    // 2026-09-20: 账户模式卡升级 counted (MU-account-mode 接线)。
+    AccountMode,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 44] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -274,6 +280,9 @@ impl PushKind {
         Self::AuctionVolume,
         Self::IndustryChainIntraday,
         Self::NewsFlashAggregated,
+        Self::PaperSell,
+        Self::MarketActionAlert,
+        Self::AccountMode,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -319,6 +328,9 @@ impl PushKind {
             Self::AuctionVolume => "AuctionVolume",
             Self::IndustryChainIntraday => "IndustryChainIntraday",
             Self::NewsFlashAggregated => "NewsFlashAggregated",
+            Self::PaperSell => "PaperSell",
+            Self::MarketActionAlert => "MarketActionAlert",
+            Self::AccountMode => "AccountMode",
         }
     }
 
@@ -365,6 +377,9 @@ impl PushKind {
             Self::AuctionVolume => "auction_volume_v1",
             Self::IndustryChainIntraday => "industry_chain_intraday_v1",
             Self::NewsFlashAggregated => "news_flash_aggregated_v1",
+            Self::PaperSell => "paper_sell_v1",
+            Self::MarketActionAlert => "market_action_alert_v1",
+            Self::AccountMode => "account_mode_v1",
         }
     }
 
@@ -606,6 +621,20 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 映射为 kind-全局 3600s — 跨窗口互相阻塞 ≤1h 残余行为 (窗口间
         // 实际间隔小时级, 实践中无影响)。
         (NewsFlashAggregated, Global, Some(3_600), Rolling),
+        // 2026-09-20: 虚拟盘卖出升级 counted (MU-paper-sell 接线)。卖出
+        // 成交卡 = 资金动作类计入预算 (PaperTrade 先例, 不在豁免名单);
+        // PerTicket Rolling 300s 镜像显式 L4 (notify.rs:402 5 min/票)。
+        (PaperSell, PerTicket, Some(300), Rolling),
+        // 2026-09-20: S-06 实盘异常告警升级 counted (MU-market-action-
+        // alert 接线)。账户安全告警 = 健康提醒类 → 豁免日预算 (账户异常
+        // 不被盘中信号挤掉, DataMode 先例); PerTicket Rolling 60s 镜像
+        // 显式 L4 (notify.rs:449 1 min/票, 实盘异常需立即)。
+        (MarketActionAlert, PerTicket, Some(60), Rolling),
+        // 2026-09-20: T-01 账户模式卡升级 counted (MU-account-mode 接线)。
+        // 账户状态告警 = 健康提醒类 → 豁免日预算 (DataMode 先例);
+        // WindowMode::None 无冷却 (旧 dispatcher 注释明示 "AccountMode
+        // 无冷却", 变迁对精确去重 — DataMode 同款)。
+        (AccountMode, Global, std::option::Option::None, WindowMode::None),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -665,6 +694,8 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::IpoCatalyst
                     | PushKind::SnapshotStale
                     | PushKind::DataMode
+                    | PushKind::MarketActionAlert
+                    | PushKind::AccountMode
             ),
             policy_version: POLICY_VERSION,
         },

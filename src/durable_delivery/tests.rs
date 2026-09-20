@@ -6208,6 +6208,60 @@ fn news_flash_aggregated_policy_is_global_rolling_3600_and_budget_counted() {
 }
 
 #[test]
+fn paper_sell_policy_is_per_ticket_rolling_300_and_budget_counted() {
+    // 2026-09-20: 虚拟盘卖出升级 counted — 资金动作类计入预算
+    // (PaperTrade 先例); PerTicket Rolling 300s 镜像显式 L4
+    // (notify.rs:402 5 min/票)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::PaperSell)
+        .expect("paper-sell durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(300));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "paper_sell_v1");
+}
+
+#[test]
+fn market_action_alert_policy_is_per_ticket_rolling_60_and_budget_exempt() {
+    // 2026-09-20: S-06 实盘异常告警升级 counted — 账户安全告警 =
+    // 健康提醒类豁免日预算 (DataMode 先例); PerTicket Rolling 60s 镜像
+    // 显式 L4 (notify.rs:449 1 min/票)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::MarketActionAlert)
+        .expect("market-action-alert durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(60));
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "market_action_alert_v1");
+}
+
+#[test]
+fn account_mode_policy_is_global_no_cooldown_and_budget_exempt() {
+    // 2026-09-20: T-01 账户模式卡升级 counted — 账户状态告警 =
+    // 健康提醒类豁免日预算 (DataMode 先例); WindowMode::None 无冷却
+    // (旧 dispatcher 注释明示, 变迁对精确去重)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::AccountMode)
+        .expect("account-mode durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "account_mode_v1");
+}
+
+#[test]
 fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
     let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
     let append = MemoryAppendPort::default();
@@ -7419,7 +7473,7 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_forty_one_kinds_and_forty_four_rows() {
+fn policy_catalog_has_forty_four_kinds_and_forty_seven_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
@@ -7443,16 +7497,19 @@ fn policy_catalog_has_forty_one_kinds_and_forty_four_rows() {
     // 2026-09-20: 竞价热点量能升级 counted → 39 kind/42 row。
     // 2026-09-20: 盘中涨停扩散升级 counted → 40 kind/43 row。
     // 2026-09-20: 新闻聚合升级 counted → 41 kind/44 row。
+    // 2026-09-20: 虚拟盘卖出升级 counted → 42 kind/45 row。
+    // 2026-09-20: 实盘异常告警升级 counted → 43 kind/46 row。
+    // 2026-09-20: 账户模式卡升级 counted → 44 kind/47 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        44
+        47
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        41
+        44
     );
-    assert_eq!(compiled_policy_catalog().len(), 44);
+    assert_eq!(compiled_policy_catalog().len(), 47);
 }
 
 #[test]

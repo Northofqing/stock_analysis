@@ -3046,16 +3046,33 @@ pub async fn push_account_mode_change(
         &hhmm, prev_tmpl, new_tmpl, &reasons, forbidden, recovery,
     ));
 
-    // 3. dispatch (code="" 全局键, AccountMode 无冷却)
-    let outcome = dispatch_registered_outcome!(
-        "T-01-account-mode",
-        crate::notify::PushKind::AccountMode,
-        "account_mode_hook",
-        "render_account_mode",
-        "", // code 空 = 全局键
-        banner,
-        text
-    );
+    // 3. dispatch (2026-09-20: T-01 升级 counted, MU-account-mode)。
+    // WindowMode::None 无冷却 (旧语义); 变迁对精确去重; 健康提醒类
+    // 豁免预算; retry_authorized=true (状态变迁事实)。
+    let outcome =
+        match build_account_mode_counted_binding(
+            chrono::Local::now().date_naive(),
+            Some(prev_mode),
+            new_mode,
+            &text,
+        )
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "T-01-account-mode",
+                crate::notify::PushKind::AccountMode,
+                "account_mode_hook",
+                "render_account_mode",
+            )
+            .map(|token| (token, binding))
+        }) {
+            Ok((token, binding)) => {
+                crate::notify::push_counted_with_binding(token, &text, None, binding).await
+            }
+            Err(reason) => {
+                log::error!("[T-01][BR-196] counted 准备失败: {reason}");
+                crate::notify::PushOutcome::Denied(reason)
+            }
+        };
 
     // 3a. Frozen transition: also emit one MarketActionAlert (NOT for initial eval, NOT for unchanged)
     if is_new_transition && !is_initial_evaluation && new_mode == LibAM::Frozen {
@@ -6833,6 +6850,211 @@ pub fn build_news_flash_aggregated_counted_binding(
         false,
     )
     .map_err(|error| format!("N-02 counted binding 构造失败: {error}"))
+}
+
+/// MU-paper-sell 渲染 (2026-09-20): 虚拟盘卖出成交卡文本 (原 main.rs inline,
+/// 单一事实源收敛)。
+pub fn render_paper_sell(name: &str, code: &str, quantity: i64, price: f64, return_rate_pct: f64, reason: &str) -> String {
+    format!(
+        "[虚拟盘卖出] {name}({code}) 卖出{quantity}股 @{price:.2} | 收益率{return_rate_pct:+.2}% | 原因:{reason}"
+    )
+}
+
+/// MU-paper-sell counted binding (2026-09-20): occurrence
+/// paper-sell:{业务日}:{code} (源层 already_sold_today 每票每日一次同形);
+/// canonical = 业务日 + 成交事实 + 渲染 sha256; PerTicket scope (镜像 L4
+/// 5 min/票); retry_authorized=true (成交事实 + 旧系统失败即丢 —
+/// log_completed_paper_sales 记账后不再重扫, durable 唯一恢复路径,
+/// T-08 论据)。
+pub fn build_paper_sell_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    quantity: i64,
+    price: f64,
+    return_rate_pct: f64,
+    reason: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "paper-sell-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "quantity": quantity,
+        "price": price,
+        "return_rate_pct": return_rate_pct,
+        "reason": reason,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+        code, None,
+    )
+    .and_then(|identity| {
+        identity.require_a_share()?;
+        Ok(identity)
+    })
+    .map_err(|error| format!("虚拟盘卖出 证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("paper-sell:{business_date}:{code}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("虚拟盘卖出 counted binding 构造失败 code={code}: {error}"))
+}
+
+/// MU-market-action-alert: S-06 实盘异常告警 counted binding (2026-09-20):
+/// occurrence market-action:{业务日}:{source}:{event_id} (S-01 同形, 跨源
+/// 防碰撞); canonical = 业务日 + event 事实 + 渲染 sha256; PerTicket
+/// scope (镜像 L4 1 min/票); retry_authorized=true (事件事实 + 事件总线
+/// dedup 后不重发, durable 唯一恢复路径 — S-01 论据)。
+pub fn build_market_action_alert_counted_binding(
+    business_date: chrono::NaiveDate,
+    event_id: &str,
+    code: Option<&str>,
+    title: &str,
+    source: &str,
+    strength: u8,
+    certainty: u8,
+    stale: bool,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "market-action-alert-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "event_id": event_id,
+        "code": code,
+        "title": title,
+        "source": source,
+        "strength": strength,
+        "certainty": certainty,
+        "stale": stale,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    let identity = code
+        .map(|code| {
+            stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
+                code, None,
+            )
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+        })
+        .transpose()
+        .map_err(|error| format!("S-06 证券身份解析失败: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("market-action:{business_date}:{source}:{event_id}"),
+        canonical_bytes,
+        match identity {
+            Some(identity) => crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+                instrument: identity.instrument().clone(),
+            },
+            None => crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("S-06 counted binding 构造失败: {error}"))
+}
+
+/// MU-account-mode: T-01 账户模式卡 counted binding (2026-09-20):
+/// occurrence account-mode:{业务日}:{old:?}:{new:?} (变迁对精确去重 —
+/// DataMode 同款); canonical = 业务日 + 变迁对 + 渲染 sha256; Global
+/// scope; retry_authorized=true (状态变迁事实补发仍有效 — DataMode
+/// 同论据)。
+pub fn build_account_mode_counted_binding(
+    business_date: chrono::NaiveDate,
+    prev_mode: Option<stock_analysis::risk::action_gate::AccountMode>,
+    new_mode: stock_analysis::risk::action_gate::AccountMode,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let old_str = prev_mode
+        .map(|mode| format!("{mode:?}"))
+        .unwrap_or_else(|| "None".to_owned());
+    let new_str = format!("{new_mode:?}");
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "account-mode-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "old": old_str,
+        "new": new_str,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("account-mode:{business_date}:{old_str}:{new_str}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("T-01 counted binding 构造失败: {error}"))
+}
+
+/// MU-paper-sell counted dispatch (2026-09-20): 盘中/盘后两调用点共用。
+/// counted 门取 CountedCombinedAccount (requires_banner=true, 门内部取
+/// LATEST_BANNER — T-16 先例)。
+pub async fn dispatch_paper_sell_counted(
+    business_date: chrono::NaiveDate,
+    name: &str,
+    code: &str,
+    quantity: i64,
+    price: f64,
+    return_rate_pct: f64,
+    reason: &str,
+) -> crate::notify::PushOutcome {
+    let text = render_paper_sell(name, code, quantity, price, return_rate_pct, reason);
+    match build_paper_sell_counted_binding(
+        business_date,
+        code,
+        quantity,
+        price,
+        return_rate_pct,
+        reason,
+        &text,
+    )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "T-21-paper-sell",
+            crate::notify::PushKind::PaperSell,
+            "paper_sell_dispatcher",
+            "render_paper_sell",
+        )
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[paper_sell][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    }
 }
 
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
@@ -17800,7 +18022,7 @@ pub fn build_test_template_catalog(
     use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 57;
+    const EXPECTED_CATALOG_TOTAL: usize = 58;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -18691,6 +18913,11 @@ pub fn build_test_template_catalog(
     push(
         "T-20-snapshot-stale",
         render_snapshot_stale(5, "2026-09-11", 123456.78),
+    );
+    // 虚拟盘卖出 (2026-09-20): MU-paper-sell 全 7 触点新增
+    push(
+        "T-21-paper-sell",
+        render_paper_sell("TEST_CODE 测试股", "TEST_CODE_600001", 100, 10.50, 8.20, "TEST_CODE 触发原因"),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
@@ -23234,6 +23461,47 @@ mod tests {
     }
 
     #[test]
+    fn u20_counted_binding_is_per_ticket_per_day_with_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_paper_sell_counted_binding(
+            date,
+            "600001",
+            100,
+            10.50,
+            8.20,
+            "铁律触发",
+            "虚拟盘卖出样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "paper-sell:2026-09-20:600001"
+        );
+        // 同票同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_paper_sell_counted_binding(
+            date,
+            "600001",
+            100,
+            10.50,
+            8.20,
+            "铁律触发",
+            "虚拟盘卖出样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 成交事实 + 唯一恢复路径 → retry_authorized=true, Ticket scope
+        assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
+    }
+
+    #[test]
     fn u15_counted_binding_is_per_event_with_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
         let binding = build_analyst_upgrade_counted_binding(
@@ -24924,9 +25192,12 @@ mod tests {
     #[test]
     fn emergency_bypass_cooldown_table() {
         use super::super::notify::{PushKind, PushLevel};
+        // 2026-09-20: MarketActionAlert 升级 counted (MU-market-action-alert)
+        // — 冷却由 DurableDeliveryCoordinator 独占, 进程内 COOLDOWN_TABLE
+        // 对 counted kind 恒 bypass (旧 Emergency 即时语义由 PerTicket
+        // Rolling 60s 决策层承载); Emergency 等级断言保留。
         let kind = PushKind::MarketActionAlert;
-        assert!(!crate::durable_delivery_runtime::is_counted_kind(kind));
-        record_uncounted_cooldown(kind, "TEST_CODE_000001");
+        assert!(crate::durable_delivery_runtime::is_counted_kind(kind));
         assert!(!is_in_cooldown(kind, "TEST_CODE_000001"));
         assert_eq!(kind.level(), PushLevel::Emergency);
     }

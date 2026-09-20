@@ -6655,14 +6655,14 @@ impl TemplateTestSummary {
         // (55,9,0,64)。
         let activated_news = self.family_disabled_total == 11;
         let expected_family = if activated_news {
-            (59, 11, 3, 73)
+            (60, 11, 3, 74)
         } else {
-            (57, 13, 3, 73)
+            (58, 13, 3, 74)
         };
         let expected_kind = if activated_news {
-            (55, 9, 0, 64)
+            (56, 9, 0, 65)
         } else {
-            (53, 11, 0, 64)
+            (54, 11, 0, 65)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -6939,15 +6939,15 @@ mod tests_br196_monitor_test_acceptance {
             news_capability_sha256: "b".repeat(64),
             // BR-135 (2026-08-22) 退休外部 reminder 家族，PushKind 闭集不变。
             // 2026-09-20: SnapshotStale (MU-snapshot-stale) 全 7 触点 +1。
-            family_active_total: 57,
+            family_active_total: 58,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 73,
-            push_kind_active_total: 53,
+            family_total: 74,
+            push_kind_active_total: 54,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
-            push_kind_total: 64,
-            rendered_family_total: 57,
+            push_kind_total: 65,
+            rendered_family_total: 58,
             governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
             governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
@@ -6959,7 +6959,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 57,
+            explicit_dry_run_family_total: 58,
             failed: 0,
         }
     }
@@ -7004,7 +7004,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 57);
+        assert_eq!(catalog.len(), 58);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -8844,16 +8844,14 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         Ok(sold) if !sold.is_empty() => {
                             for result in &sold {
                                 if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
-                                let text =
-                                    format!(
-                                    "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
-                                    result.name, result.code, result.quantity, result.price,
-                                    result.return_rate_pct, result.reason
-                                );
-                                let outcome = push_governor_v3(
-                                    &text,
-                                    PushKind::PaperSell,
-                                    Some(&result.code),
+                                let outcome = push_templates::dispatch_paper_sell_counted(
+                                    chrono::Local::now().date_naive(),
+                                    &result.name,
+                                    &result.code,
+                                    result.quantity,
+                                    result.price,
+                                    result.return_rate_pct,
+                                    &result.reason,
                                 )
                                 .await;
                                 if !outcome.is_pushed() {
@@ -8935,15 +8933,14 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 Ok(sold) if !sold.is_empty() => {
                                     for result in &sold {
                                         if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
-                                        let text = format!(
-                                        "[虚拟盘卖出] {}({}) 卖出{}股 @{:.2} | 收益率{:+.2}% | 原因:{}",
-                                        result.name, result.code, result.quantity, result.price,
-                                        result.return_rate_pct, result.reason
-                                    );
-                                        let outcome = push_governor_v3(
-                                            &text,
-                                            PushKind::PaperSell,
-                                            Some(&result.code),
+                                        let outcome = push_templates::dispatch_paper_sell_counted(
+                                            chrono::Local::now().date_naive(),
+                                            &result.name,
+                                            &result.code,
+                                            result.quantity,
+                                            result.price,
+                                            result.return_rate_pct,
+                                            &result.reason,
                                         )
                                         .await;
                                         if !outcome.is_pushed() {
