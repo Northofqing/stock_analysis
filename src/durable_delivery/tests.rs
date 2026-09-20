@@ -6042,6 +6042,26 @@ fn limit_boards_policy_is_global_rolling_1800_and_budget_counted() {
 }
 
 #[test]
+fn data_mode_policy_is_global_no_cooldown_and_budget_exempt() {
+    // 2026-09-20: T-02 数据模式变化卡升级 counted — 数据健康告警 =
+    // 健康提醒类 → 豁免日预算 (系统健康卡不被盘中信号挤掉, BR-237 精神);
+    // WindowMode::None 无冷却 (G5b 先例) — BR-116 语义: 已确认状态对本身
+    // 负责精确去重, 不设跨状态粗粒度冷却 (快速不同变迁必须双双送达,
+    // br116 行为测试为权威)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::DataMode)
+        .expect("data-mode durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::None);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, std::option::Option::None);
+    assert!(!row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "data_mode_v1");
+}
+
+#[test]
 fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
     let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
     let append = MemoryAppendPort::default();
@@ -7253,7 +7273,7 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_thirty_two_kinds_and_thirty_five_rows() {
+fn policy_catalog_has_thirty_three_kinds_and_thirty_six_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
@@ -7268,16 +7288,17 @@ fn policy_catalog_has_thirty_two_kinds_and_thirty_five_rows() {
     // 2026-09-20: A-11 IPO 阶段催化升级 counted → 30 kind/33 row。
     // 2026-09-20: 快照过期提醒升级 counted → 31 kind/34 row。
     // 2026-09-20: 涨停板板数榜升级 counted → 32 kind/35 row。
+    // 2026-09-20: 数据模式变化卡升级 counted → 33 kind/36 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        35
+        36
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        32
+        33
     );
-    assert_eq!(compiled_policy_catalog().len(), 35);
+    assert_eq!(compiled_policy_catalog().len(), 36);
 }
 
 #[test]

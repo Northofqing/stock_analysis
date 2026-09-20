@@ -211,10 +211,12 @@ pub enum PushKind {
     SnapshotStale,
     // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
     LimitBoards,
+    // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
+    DataMode,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -247,6 +249,7 @@ impl PushKind {
         Self::IpoCatalyst,
         Self::SnapshotStale,
         Self::LimitBoards,
+        Self::DataMode,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -283,6 +286,7 @@ impl PushKind {
             Self::IpoCatalyst => "IpoCatalyst",
             Self::SnapshotStale => "SnapshotStale",
             Self::LimitBoards => "LimitBoards",
+            Self::DataMode => "DataMode",
         }
     }
 
@@ -320,6 +324,7 @@ impl PushKind {
             Self::IpoCatalyst => "ipo_catalyst_v1",
             Self::SnapshotStale => "snapshot_stale_v1",
             Self::LimitBoards => "limit_boards_v1",
+            Self::DataMode => "data_mode_v1",
         }
     }
 
@@ -516,6 +521,13 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // kind-全局冷却 (notify cooldown `_ => Some(1800)`, 3 个 shape 共享
         // 头 — 保真旧互相阻塞语义)。
         (LimitBoards, Global, Some(1_800), Rolling),
+        // 2026-09-20: T-02 数据模式变化卡升级 counted (MU-data-mode 接线)。
+        // 数据健康告警 = 健康提醒类 → 豁免日预算 (分流规则, 系统健康卡不被
+        // 盘中信号挤掉, BR-237 精神)。WindowMode::None 无冷却 (G5b 先例) —
+        // BR-116 语义: 已确认状态对本身负责精确去重, 不设跨状态粗粒度冷却
+        // (br116_rapid_distinct_data_mode_transitions_are_both_delivered
+        // 行为测试为权威: 快速不同变迁必须双双送达)。
+        (DataMode, Global, std::option::Option::None, WindowMode::None),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -574,6 +586,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::BlockTradeIntradayConfirm
                     | PushKind::IpoCatalyst
                     | PushKind::SnapshotStale
+                    | PushKind::DataMode
             ),
             policy_version: POLICY_VERSION,
         },

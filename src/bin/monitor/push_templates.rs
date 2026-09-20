@@ -6457,6 +6457,46 @@ pub fn build_limit_boards_counted_binding(
     .map_err(|error| format!("涨停板 counted binding 构造失败: {error}"))
 }
 
+/// MU-data-mode counted binding (2026-09-20): occurrence
+/// data-mode:{业务日}:{old:?}:{new:?} — 变迁对即身份 (BR-116 committed-mode
+/// 去重语义, 同日多次变迁互不杀身份); canonical = 业务日 + 变迁对 + 渲染
+/// sha256; Global scope; retry_authorized=true (系统健康告警必达 + 内容为
+/// 状态变迁事实, 补发仍有效 — A-12 先例)。
+pub fn build_data_mode_counted_binding(
+    business_date: chrono::NaiveDate,
+    prev_mode: Option<stock_analysis::monitor::data_mode::DataMode>,
+    new_mode: stock_analysis::monitor::data_mode::DataMode,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let old_str = prev_mode
+        .map(|mode| format!("{mode:?}"))
+        .unwrap_or_else(|| "None".to_owned());
+    let new_str = format!("{new_mode:?}");
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "data-mode-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "old": old_str,
+        "new": new_str,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("data-mode:{business_date}:{old_str}:{new_str}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        true,
+    )
+    .map_err(|error| format!("数据模式 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -16349,15 +16389,37 @@ pub async fn push_data_mode_change(
 
     // 2. dispatch (code="" 全局键; BR-116 uses the committed mode as exact dedup state)
     let outcome = match dispatch_reason {
-        DataModeDispatchReason::Transition => dispatch_registered_outcome!(
-            "T-02-data-mode",
-            crate::notify::PushKind::DataMode,
-            "data_mode_hook",
-            "render_data_mode",
-            "",
-            banner,
-            text
-        ),
+        DataModeDispatchReason::Transition => {
+            // 2026-09-20: T-02 升级 counted (MU-data-mode)。数据健康告警 =
+            // 健康提醒类豁免日预算; counted 门取 CountedCombinedAccount
+            // (requires_banner=true, 门内部取 banner — T-16 同形态)。
+            // policy = WindowMode::None 无冷却 (G5b 先例, BR-116: 已确认
+            // 状态对本身精确去重, 不设跨状态粗粒度冷却);
+            // retry_authorized=true (状态变迁事实, 补发仍有效)。
+            match build_data_mode_counted_binding(
+                chrono::Local::now().date_naive(),
+                prev_mode,
+                new_mode,
+                &text,
+            )
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-02-data-mode",
+                    crate::notify::PushKind::DataMode,
+                    "data_mode_hook",
+                    "render_data_mode",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding).await
+                }
+                Err(reason) => {
+                    log::error!("[DataMode][BR-196] counted 准备失败: {reason}");
+                    crate::notify::PushOutcome::Denied(reason)
+                }
+            }
+        }
     };
 
     if !matches!(outcome, crate::notify::PushOutcome::Pushed) {
@@ -22433,6 +22495,54 @@ mod tests {
         );
         // 盘中状态快照 + 周期重渲染补偿 → retry_authorized=false, Global
         assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u10_counted_binding_is_per_transition_with_replay() {
+        use stock_analysis::monitor::data_mode::DataMode as LibDM;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Full),
+            LibDM::Degraded,
+            "数据模式降级",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "data-mode:2026-09-20:Full:Degraded"
+        );
+        // 同变迁对同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Full),
+            LibDM::Degraded,
+            "数据模式降级",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 同日反向变迁 (Degraded→Full) → 不同 occurrence (日级头不会吞掉)
+        let reverse = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Degraded),
+            LibDM::Full,
+            "数据模式恢复",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            reverse.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 健康告警必达 → retry_authorized=true, Global scope
+        assert!(binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
         assert_eq!(
             binding.scope(),

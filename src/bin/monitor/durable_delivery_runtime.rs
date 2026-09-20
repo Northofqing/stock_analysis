@@ -2303,6 +2303,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::SnapshotStale => (D::SnapshotStale, DeliverySubKind::None),
         // 2026-09-20: 涨停板板数榜升级 counted (MU-limit-boards 接线)。
         K::LimitBoards => (D::LimitBoards, DeliverySubKind::None),
+        // 2026-09-20: 数据模式变化卡升级 counted (MU-data-mode 接线)。
+        K::DataMode => (D::DataMode, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3300,6 +3302,15 @@ mod tests {
             Some((DurablePushKind::LimitBoards, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::LimitBoards));
+    }
+
+    #[test]
+    fn data_mode_kind_maps_to_durable_data_mode() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::DataMode),
+            Some((DurablePushKind::DataMode, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::DataMode));
     }
 
     #[tokio::test]
