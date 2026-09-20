@@ -227,10 +227,12 @@ pub enum PushKind {
     AuctionVolume,
     // 2026-09-20: 盘中涨停扩散升级 counted (MU-industry-chain-intraday 接线)。
     IndustryChainIntraday,
+    // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
+    NewsFlashAggregated,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -271,6 +273,7 @@ impl PushKind {
         Self::NewsToIdea,
         Self::AuctionVolume,
         Self::IndustryChainIntraday,
+        Self::NewsFlashAggregated,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -315,6 +318,7 @@ impl PushKind {
             Self::NewsToIdea => "NewsToIdea",
             Self::AuctionVolume => "AuctionVolume",
             Self::IndustryChainIntraday => "IndustryChainIntraday",
+            Self::NewsFlashAggregated => "NewsFlashAggregated",
         }
     }
 
@@ -360,6 +364,7 @@ impl PushKind {
             Self::NewsToIdea => "news_to_idea_v1",
             Self::AuctionVolume => "auction_volume_v1",
             Self::IndustryChainIntraday => "industry_chain_intraday_v1",
+            Self::NewsFlashAggregated => "news_flash_aggregated_v1",
         }
     }
 
@@ -595,6 +600,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // Rolling 1800s 镜像显式 L4 (notify.rs:433 30 min/票, 旧键含
         // code 逐票)。
         (IndustryChainIntraday, PerTicket, Some(1_800), Rolling),
+        // 2026-09-20: N-02 新闻聚合升级 counted (MU-news-flash-aggregate
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 3600s 镜像显式
+        // L4 (notify.rs:452 1h/窗口)。旧冷却键 code=窗口标签 (每窗口独立)
+        // 映射为 kind-全局 3600s — 跨窗口互相阻塞 ≤1h 残余行为 (窗口间
+        // 实际间隔小时级, 实践中无影响)。
+        (NewsFlashAggregated, Global, Some(3_600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous

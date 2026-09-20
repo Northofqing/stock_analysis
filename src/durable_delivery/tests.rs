@@ -6191,6 +6191,23 @@ fn industry_chain_intraday_policy_is_per_ticket_rolling_1800_and_budget_counted(
 }
 
 #[test]
+fn news_flash_aggregated_policy_is_global_rolling_3600_and_budget_counted() {
+    // 2026-09-20: N-02 新闻聚合升级 counted — 盘中信息卡计入预算
+    // (分流规则); Rolling 3600s 镜像显式 L4 (notify.rs:452 1h/窗口)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::NewsFlashAggregated)
+        .expect("news-flash-aggregated durable policy");
+
+    assert_eq!(row.cooldown_scope, CooldownScope::Global);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.base_cooldown_secs, Some(3_600));
+    assert!(row.counts_against_daily_budget);
+    assert_eq!(row.push_kind.stable_template_id(), "news_flash_aggregated_v1");
+}
+
+#[test]
 fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
     let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
     let append = MemoryAppendPort::default();
@@ -7402,7 +7419,7 @@ fn reconcile_terminal(
 }
 
 #[test]
-fn policy_catalog_has_forty_kinds_and_forty_three_rows() {
+fn policy_catalog_has_forty_one_kinds_and_forty_four_rows() {
     // 2026-08-07: I-09 SectorTop / I-09A SectorAnomaly 升级 counted,
     // policy catalog 15 kind/18 row → 17 kind/20 row。
     // 2026-08-12: R-03/R-11/R-12/R-13/A-10 复盘 dispatcher 升级 counted
@@ -7425,16 +7442,17 @@ fn policy_catalog_has_forty_kinds_and_forty_three_rows() {
     // 2026-09-20: 新闻到灵感升级 counted → 38 kind/41 row。
     // 2026-09-20: 竞价热点量能升级 counted → 39 kind/42 row。
     // 2026-09-20: 盘中涨停扩散升级 counted → 40 kind/43 row。
+    // 2026-09-20: 新闻聚合升级 counted → 41 kind/44 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        43
+        44
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        40
+        41
     );
-    assert_eq!(compiled_policy_catalog().len(), 43);
+    assert_eq!(compiled_policy_catalog().len(), 44);
 }
 
 #[test]

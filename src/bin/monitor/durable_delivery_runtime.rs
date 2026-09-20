@@ -2319,6 +2319,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::AuctionVolume => (D::AuctionVolume, DeliverySubKind::None),
         // 2026-09-20: 盘中涨停扩散升级 counted (MU-industry-chain-intraday 接线)。
         K::IndustryChainIntraday => (D::IndustryChainIntraday, DeliverySubKind::None),
+        // 2026-09-20: 新闻聚合升级 counted (MU-news-flash-aggregate 接线)。
+        K::NewsFlashAggregated => (D::NewsFlashAggregated, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3388,6 +3390,15 @@ mod tests {
             Some((DurablePushKind::IndustryChainIntraday, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::IndustryChainIntraday));
+    }
+
+    #[test]
+    fn news_flash_aggregated_kind_maps_to_durable_news_flash_aggregated() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsFlashAggregated),
+            Some((DurablePushKind::NewsFlashAggregated, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsFlashAggregated));
     }
 
     #[tokio::test]

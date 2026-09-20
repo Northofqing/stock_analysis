@@ -6799,6 +6799,42 @@ pub fn build_industry_chain_intraday_counted_binding(
     .map_err(|error| format!("I-03 counted binding 构造失败 code={code}: {error}"))
 }
 
+/// MU-news-flash-aggregate: N-02 新闻聚合 counted binding (2026-09-20):
+/// occurrence news-flash-agg:{业务日}:{window}:{hhmm} (每窗口每槽, I-01
+/// 模式); canonical = 业务日 + window + 渲染 sha256; Global scope;
+/// retry_authorized=false (盘中聚合时刻锚定, 下一窗口重渲染补偿 — I-01
+/// 论据)。注: reservation 结算流 (push_flash_reservations) 保留自营
+/// 持久化, 不经 counted 协调器 (第三引擎模式, D-01 news-ai 同型)。
+pub fn build_news_flash_aggregated_counted_binding(
+    business_date: chrono::NaiveDate,
+    window: &str,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-flash-aggregated-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "window": window,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-flash-agg:{business_date}:{window}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("N-02 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -23160,6 +23196,41 @@ mod tests {
             binding.scope(),
             crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
         ));
+    }
+
+    #[test]
+    fn u19_counted_binding_is_per_window_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_news_flash_aggregated_counted_binding(
+            date,
+            "morning",
+            "10:30",
+            "新闻聚合样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "news-flash-agg:2026-09-20:morning:10:30"
+        );
+        // 同窗口同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_news_flash_aggregated_counted_binding(
+            date,
+            "morning",
+            "10:30",
+            "新闻聚合样本",
+        )
+        .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中聚合时刻锚定 + 下一窗口重渲染补偿 → retry_authorized=false
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
     }
 
     #[test]

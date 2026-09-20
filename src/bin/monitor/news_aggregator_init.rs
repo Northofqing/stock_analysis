@@ -1015,27 +1015,37 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                 }
             }
             FlashDecision::Aggregated { window, text } => {
-                let presentation_token = match crate::presentation_registry::acquire_token(
-                    "N-02-news-flash-aggregated",
-                    crate::notify::PushKind::NewsFlashAggregated,
-                    "news_flash_aggregate_dispatcher",
-                    "assemble_news_flash_aggregated",
-                ) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        log::error!("[NewsFlashGate][BR-196] aggregate token rejected: {error}");
-                        crate::push_templates::log_dispatcher_attempt(
-                            "N-02",
-                            false,
-                            1,
-                            &format!("presentation_token_rejected:{error}"),
-                        );
-                        continue;
-                    }
-                };
+                // 2026-09-20: N-02 升级 counted (MU-news-flash-aggregate)。
+                // 本路 (NewsFlashGate 直接推) 转 counted; reservation 结算
+                // 流 (push_flash_reservations) 保留自营持久化不经协调器
+                // (第三引擎模式, v14_gate_prepared 对 counted kind 直返
+                // Approved 不 fail-close)。Rolling 3600s 镜像 L4;
+                // retry_authorized=false (时刻锚定 + 下一窗口重渲染)。
                 let outcome =
-                    crate::notify::push_presented_v3(presentation_token, &text, Some(&window))
-                        .await;
+                    match crate::push_templates::build_news_flash_aggregated_counted_binding(
+                        chrono::Local::now().date_naive(),
+                        &window,
+                        &chrono::Local::now().format("%H:%M").to_string(),
+                        &text,
+                    )
+                    .and_then(|binding| {
+                        crate::presentation_registry::acquire_token(
+                            "N-02-news-flash-aggregated",
+                            crate::notify::PushKind::NewsFlashAggregated,
+                            "news_flash_aggregate_dispatcher",
+                            "assemble_news_flash_aggregated",
+                        )
+                        .map(|token| (token, binding))
+                    }) {
+                        Ok((token, binding)) => {
+                            crate::notify::push_counted_with_binding(token, &text, None, binding)
+                                .await
+                        }
+                        Err(reason) => {
+                            log::error!("[NewsFlashGate][BR-196] counted 准备失败: {reason}");
+                            crate::notify::PushOutcome::Denied(reason)
+                        }
+                    };
                 if outcome.is_pushed() {
                     n_agg += 1;
                     crate::push_templates::log_dispatcher_attempt("N-02", true, 1, "");
