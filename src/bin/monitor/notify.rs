@@ -6873,7 +6873,11 @@ mod tests {
     async fn push_governor_deprecated_no_push() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let r = push_governor_v3("test kept auction", PushKind::AuctionVolume, None).await;
+        // 2026-09-20: AuctionVolume 升级 counted (MU-auction-volume) → 泛化
+        // governor 对其恒拒 counted_binding_required; 本测试验证的是
+        // deprecated governor 对**未 counted** kind 的保留行为 — 代表 kind
+        // 轮换为 PolicyHit (uncounted, C-scheme 放行先例)。
+        let r = push_governor_v3("test kept policy", PushKind::PolicyHit, None).await;
         assert_eq!(r, PushOutcome::Pushed);
     }
 
@@ -7015,7 +7019,9 @@ mod tests {
     async fn push_verbose_true_overrides_deprecated() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        let r = push_governor_v3("test verbose auction", PushKind::AuctionVolume, None).await;
+        // 2026-09-20: AuctionVolume 升级 counted — 代表 kind 轮换 PolicyHit
+        // (同 push_governor_deprecated_no_push 论据)。
+        let r = push_governor_v3("test verbose policy", PushKind::PolicyHit, None).await;
         assert_eq!(r, PushOutcome::Pushed);
     }
 

@@ -1632,17 +1632,10 @@ mod tests {
             V14Gate::Denied(reason) if reason == "quiet_hour"
         ));
 
-        let context = crate::br196_test_delivery::GovernanceSmokeContext::for_review_date(
-            Local::now().date_naive(),
-        )
-        .expect("construct scoped BR-196 governance context");
-        let dispatch = context
-            .dispatch("T-11-auction-volume", PushKind::AuctionVolume, None)
-            .expect("mint exact governance dispatch");
-        assert!(matches!(
-            v14_gate_br196_smoke(&dispatch),
-            V14Gate::Approved(_)
-        ));
+        // 2026-09-20: T-11 移出后 GOVERNANCE_SMOKE_IDENTITIES 清零 (6→3→2→1→0)
+        // — smoke mint 路径 vacated, 原 v14_gate_br196_smoke 放行断言不再可
+        // 构造; 本测试核心 (scoped clock 不放松普通/计数门) 由以下 Denied
+        // 断言承载。
         assert!(matches!(
             v14_gate(PushKind::PreopenNewsHot, None),
             V14Gate::Denied(reason) if reason == "counted_binding_required"

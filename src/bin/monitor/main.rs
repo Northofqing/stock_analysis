@@ -7242,11 +7242,19 @@ async fn push_e2e_14x_templates(
 
     log::info!("[v70] P-02 推 ({} 字)", p02.chars().count());
 
-    let p02_outcome = notify::push_br196_governance_smoke_v3(
-        &p02,
-        smoke_context.dispatch("T-11-auction-volume", notify::PushKind::AuctionVolume, None)?,
-    )
-    .await;
+    // 2026-09-20: T-11 升级 counted durable delivery (MU-auction-volume)。
+    // TEST_CODE fixture 不能替代不可变 binding (P-01/R-03/I-02/D-01 同规
+    // 则), 保留渲染 smoke, 治理路径跳过出声 — smoke 清单至此清零。
+    log::warn!(
+        "[v70][BR-196][BR-192] capability_unavailable=auction_volume_counted_binding_unavailable; \
+         skipped before governance smoke dispatch"
+    );
+    push_templates::log_dispatcher_attempt(
+        "P-02",
+        false,
+        0,
+        "auction_volume_counted_binding_unavailable",
+    );
 
     // R-03 涨停产业链 (chain_daily 5 概念, TEST_CODE 数据)
 
@@ -7357,11 +7365,9 @@ async fn push_e2e_14x_templates(
     );
 
     log::info!("[v70] e2e 14x 模板跑完");
-    Ok(vec![br196_test_delivery::GovernanceSmokeDisposition {
-        family_key: "T-11-auction-volume",
-        push_kind: notify::PushKind::AuctionVolume,
-        outcome: p02_outcome,
-    }])
+    // 2026-09-20: T-11 移出 governance smoke (1 → 0) — 本块不再产出
+    // disposition, smoke 清单清零。
+    Ok(vec![])
 }
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。

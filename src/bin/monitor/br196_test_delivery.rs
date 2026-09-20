@@ -198,13 +198,11 @@ pub(super) struct GovernanceSmokeDispatch<'context> {
 }
 
 // 2026-08-12: R-03/A-10 升级 counted (BR-192)，2026-08-18: P-01 升级
-// counted (BR-241)，2026-09-20: I-02 升级 counted (MU-news-catalyst)，
-// 2026-09-20: D-01 升级 counted (MU-d01) — TEST_CODE fixtures 不能替代
-// 不可变 binding，与 R-04/R-05 同规则移出 governance smoke
-// (6 → 3 → 2 → 1)。
-const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 1] = [
-    ("T-11-auction-volume", PushKind::AuctionVolume),
-];
+// counted (BR-241)，2026-09-20: I-02/D-01/T-11 相继升级 counted —
+// TEST_CODE fixtures 不能替代不可变 binding，与 R-04/R-05 同规则移出
+// governance smoke (6 → 3 → 2 → 1 → 0)。全部 counted 后 smoke 清单
+// 清空, smoke 机制退化为零员空校验。
+const GOVERNANCE_SMOKE_IDENTITIES: [(&str, PushKind); 0] = [];
 
 pub(super) const fn governance_smoke_identity_count() -> usize {
     GOVERNANCE_SMOKE_IDENTITIES.len()
@@ -1449,13 +1447,14 @@ mod tests {
                 outcome: crate::notify::PushOutcome::Pushed,
             })
             .collect::<Vec<_>>();
+        // 2026-09-20: T-11 移出后清单清零 (0 员) — 空集精确校验成立;
+        // 任何非零 disposition 都是 identity mismatch。
         validate_governance_smoke(&valid).unwrap();
-
-        let mut denied = valid.clone();
-        denied[0].outcome = crate::notify::PushOutcome::Denied("TEST_CODE".to_string());
-        assert!(validate_governance_smoke(&denied).is_err());
-        // 2026-09-20: D-01 移出后清单仅 1 员 — duplicate 用例不适用,
-        // cardinality-mismatch 用例改用空集 (0 ≠ 1)。
-        assert!(validate_governance_smoke(&valid[..0]).is_err());
+        let stray = vec![GovernanceSmokeDisposition {
+            family_key: "TEST_CODE_STRAY",
+            push_kind: PushKind::AuctionVolume,
+            outcome: crate::notify::PushOutcome::Pushed,
+        }];
+        assert!(validate_governance_smoke(&stray).is_err());
     }
 }

@@ -6720,6 +6720,39 @@ pub fn build_news_to_idea_counted_binding(
     .map_err(|error| format!("D-01 counted binding 构造失败 code={code}: {error}"))
 }
 
+/// MU-auction-volume: P-02 竞价热点量能 counted binding (2026-09-20):
+/// occurrence auction-volume:{业务日}:{hhmm} (每槽一卡, I-01 模式);
+/// canonical = 业务日 + 渲染 sha256; Global scope (旧 L4 空 code
+/// kind-全局 600s); retry_authorized=false (盘中竞价快照时刻锚定 +
+/// 30s 轮询重渲染补偿 — I-01 论据)。
+pub fn build_auction_volume_counted_binding(
+    business_date: chrono::NaiveDate,
+    hhmm: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "auction-volume-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("auction-volume:{business_date}:{hhmm}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("P-02 counted binding 构造失败: {error}"))
+}
+
 /// MU-limit-boards counted dispatch (2026-09-20): 3 个 shape (首板/二板/
 /// 三板+) 合一的 counted 入口 — 原 main.rs 3 处 inline push_presented_v3
 /// 转换。shape→(family, assembler) 映射保持注册名不变 (BR-196 token 按
@@ -8029,16 +8062,33 @@ pub async fn dispatch_auction_volume_daily(
         banner,
         notified,
         |text| async move {
-            dispatch_registered_outcome!(
-                "T-11-auction-volume",
-                crate::notify::PushKind::AuctionVolume,
-                "auction_volume_dispatcher",
-                "render_auction_volume",
-                "",
-                banner,
-                text
+            // 2026-09-20: P-02 升级 counted (MU-auction-volume)。盘中信息
+            // 卡; Rolling 600s 镜像 L4; retry_authorized=false (盘中快照
+            // 时刻锚定 + 30s 轮询重渲染补偿)。
+            match build_auction_volume_counted_binding(
+                chrono::Local::now().date_naive(),
+                &snapshot.hhmm,
+                &text,
             )
-            .is_pushed()
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-11-auction-volume",
+                    crate::notify::PushKind::AuctionVolume,
+                    "auction_volume_dispatcher",
+                    "render_auction_volume",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding)
+                        .await
+                        .is_pushed()
+                }
+                Err(reason) => {
+                    log::error!("[P-02][BR-196] counted 准备失败: {reason}");
+                    false
+                }
+            }
         },
         |meta| stock_analysis::signal::push_recorder::record(meta).map(|_| ()),
     )
@@ -22987,6 +23037,31 @@ mod tests {
             binding.scope(),
             crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
         ));
+    }
+
+    #[test]
+    fn u17_counted_binding_is_per_slot_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding =
+            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "auction-volume:2026-09-20:09:22"
+        );
+        // 同槽同事实 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 盘中快照 + 轮询重渲染补偿 → retry_authorized=false, Global
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
     }
 
     #[test]

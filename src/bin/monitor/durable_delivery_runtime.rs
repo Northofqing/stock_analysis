@@ -2315,6 +2315,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::AnalystUpgrade => (D::AnalystUpgrade, DeliverySubKind::None),
         // 2026-09-20: 新闻到灵感升级 counted (MU-d01 接线)。
         K::NewsToIdea => (D::NewsToIdea, DeliverySubKind::None),
+        // 2026-09-20: 竞价热点量能升级 counted (MU-auction-volume 接线)。
+        K::AuctionVolume => (D::AuctionVolume, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3366,6 +3368,15 @@ mod tests {
             Some((DurablePushKind::NewsToIdea, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::NewsToIdea));
+    }
+
+    #[test]
+    fn auction_volume_kind_maps_to_durable_auction_volume() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::AuctionVolume),
+            Some((DurablePushKind::AuctionVolume, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::AuctionVolume));
     }
 
     #[tokio::test]

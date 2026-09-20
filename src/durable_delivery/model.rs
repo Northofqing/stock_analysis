@@ -223,10 +223,12 @@ pub enum PushKind {
     AnalystUpgrade,
     // 2026-09-20: 新闻到灵感升级 counted (MU-d01 接线)。
     NewsToIdea,
+    // 2026-09-20: 竞价热点量能升级 counted (MU-auction-volume 接线)。
+    AuctionVolume,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -265,6 +267,7 @@ impl PushKind {
         Self::Announcement,
         Self::AnalystUpgrade,
         Self::NewsToIdea,
+        Self::AuctionVolume,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -307,6 +310,7 @@ impl PushKind {
             Self::Announcement => "Announcement",
             Self::AnalystUpgrade => "AnalystUpgrade",
             Self::NewsToIdea => "NewsToIdea",
+            Self::AuctionVolume => "AuctionVolume",
         }
     }
 
@@ -350,6 +354,7 @@ impl PushKind {
             Self::Announcement => "announcement_v1",
             Self::AnalystUpgrade => "analyst_upgrade_v1",
             Self::NewsToIdea => "news_to_idea_v1",
+            Self::AuctionVolume => "auction_volume_v1",
         }
     }
 
@@ -575,6 +580,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // L4 (notify.rs:431 20 min/票; 进程内 D01 memo 1h/票成功才写仍
         // 保留, 为独立补偿)。
         (NewsToIdea, PerTicket, Some(1_200), Rolling),
+        // 2026-09-20: P-02 竞价热点量能升级 counted (MU-auction-volume
+        // 接线)。盘中信息卡计入预算 (分流规则); Rolling 600s 镜像显式
+        // L4 (notify.rs:418 AuctionVolume|AuctionRepush 共用行, 旧键
+        // 空 code kind-全局)。
+        (AuctionVolume, Global, Some(600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
