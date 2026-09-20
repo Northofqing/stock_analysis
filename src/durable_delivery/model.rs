@@ -207,10 +207,12 @@ pub enum PushKind {
     BlockTradeIntradayConfirm,
     // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
     IpoCatalyst,
+    // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+    SnapshotStale,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -241,6 +243,7 @@ impl PushKind {
         Self::NewsCatalyst,
         Self::BlockTradeIntradayConfirm,
         Self::IpoCatalyst,
+        Self::SnapshotStale,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -275,6 +278,7 @@ impl PushKind {
             Self::NewsCatalyst => "NewsCatalyst",
             Self::BlockTradeIntradayConfirm => "BlockTradeIntradayConfirm",
             Self::IpoCatalyst => "IpoCatalyst",
+            Self::SnapshotStale => "SnapshotStale",
         }
     }
 
@@ -310,6 +314,7 @@ impl PushKind {
             Self::NewsCatalyst => "news_catalyst_v1",
             Self::BlockTradeIntradayConfirm => "block_trade_intraday_confirm_v1",
             Self::IpoCatalyst => "ipo_catalyst_v1",
+            Self::SnapshotStale => "snapshot_stale_v1",
         }
     }
 
@@ -496,6 +501,11 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // kind-全局 1800s 冷却」缺陷; 盘后复盘类豁免日预算 (分流规则,
         // BR-237 原理)。
         (IpoCatalyst, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+        // 健康提醒类 — 分流规则: 每日必达/健康提醒豁免日预算 (不被盘中信号
+        // 挤掉); 每日一次 (进程内 SnapshotReminderGate 语义), Global
+        // BusinessDateOnce 按业务日幂等 (ReviewMarket BR-214 先例)。
+        (SnapshotStale, Global, Some(86_400), BusinessDateOnce),
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -553,6 +563,7 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::G5bAttribution
                     | PushKind::BlockTradeIntradayConfirm
                     | PushKind::IpoCatalyst
+                    | PushKind::SnapshotStale
             ),
             policy_version: POLICY_VERSION,
         },

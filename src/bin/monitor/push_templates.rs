@@ -6378,6 +6378,50 @@ pub fn build_ipo_catalyst_counted_binding(
     .map_err(|error| format!("A-11 counted binding 构造失败: {error}"))
 }
 
+/// MU-snapshot-stale 渲染 (2026-09-20): 快照过期提醒文本 (原 main.rs inline,
+/// 单一事实源收敛)。
+pub fn render_snapshot_stale(days_behind: i64, effective_at: &str, total_assets: f64) -> String {
+    format!(
+        "[快照提醒] 持仓快照已 {days_behind} 个交易日未更新：最新 {effective_at}（总资产 {total_assets:.2}）。期间收益为自动估算（持仓×实时行情）；若真实持仓有变动，请上传最新截图。"
+    )
+}
+
+/// MU-snapshot-stale counted binding (2026-09-20): canonical = 业务日 + 业务
+/// 事实 (days_behind/effective_at/total_assets); occurrence
+/// snapshot-stale:{业务日} 每日一次 (镜像进程内 SnapshotReminderGate);
+/// Global scope; retry_authorized=false (days_behind 相对今日时刻锚定, 补发
+/// 会低估过期天数; 进程内 gate 失败保留重试资格 + 次日启动重算补偿 —
+/// I-01 论据)。
+pub fn build_snapshot_stale_counted_binding(
+    business_date: chrono::NaiveDate,
+    days_behind: i64,
+    effective_at: &str,
+    total_assets: f64,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::json!({
+        "schema": "snapshot-stale-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "days_behind": days_behind,
+        "effective_at": effective_at,
+        "total_assets": total_assets,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("snapshot-stale:{business_date}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("快照提醒 counted binding 构造失败: {error}"))
+}
+
 pub async fn dispatch_st_price_limit_changed(
     hhmm: &str,
     name: &str,
@@ -17183,7 +17227,7 @@ pub fn build_test_template_catalog(
     use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 56;
+    const EXPECTED_CATALOG_TOTAL: usize = 57;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -18069,6 +18113,11 @@ pub fn build_test_template_catalog(
     push(
         "G5b-attribution-deep",
         render_g5b_attribution("TEST_CODE 深链归因摘要…"),
+    );
+    // 快照过期提醒 (2026-09-20): MU-snapshot-stale 全 7 触点新增
+    push(
+        "T-20-snapshot-stale",
+        render_snapshot_stale(5, "2026-09-11", 123456.78),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
@@ -22218,6 +22267,40 @@ mod tests {
         );
         // backfill 重跑补偿授权 → retry_authorized=true, Global scope
         assert!(binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
+    }
+
+    #[test]
+    fn u08_counted_binding_is_daily_global_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let binding = build_snapshot_stale_counted_binding(date, 5, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "snapshot-stale:2026-09-20"
+        );
+        // 同日同事实 → 同 occurrence (decision 回放稳定)
+        let again = build_snapshot_stale_counted_binding(date, 5, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // 不同业务日 → 不同 occurrence (每日一次)
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
+        let next = build_snapshot_stale_counted_binding(next_day, 6, "2026-09-11", 123456.78)
+            .expect("valid binding");
+        assert_ne!(
+            next.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        // days_behind 时刻锚定 + 进程内 gate 补偿 → retry_authorized=false
+        // (I-01 论据), Global scope
+        assert!(!binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
         assert_eq!(
             binding.scope(),

@@ -1887,12 +1887,41 @@ async fn check_snapshot_staleness_and_notify() {
     if !should_attempt {
         return;
     }
-    let text = format!(
-        "[快照提醒] 持仓快照已 {days_behind} 个交易日未更新：最新 {}（总资产 {:.2}）。期间收益为自动估算（持仓×实时行情）；若真实持仓有变动，请上传最新截图。",
-        summary.effective_at, summary.total_assets
+    let text = crate::push_templates::render_snapshot_stale(
+        days_behind,
+        &summary.effective_at,
+        summary.total_assets,
     );
     log::warn!("[快照提醒] {}", text);
-    let outcome = push_governor_v3(&text, PushKind::SnapshotStale, None).await;
+    // 2026-09-20: 快照提醒升级 counted (MU-snapshot-stale)。健康提醒类每日
+    // 一次 (进程内 SnapshotReminderGate 语义保留); counted 门取
+    // CountedCombinedAccount (requires_banner=true, 门内部取 banner — T-16
+    // 同形态)。BusinessDateOnce 幂等 + 豁免日预算; retry_authorized=false
+    // (days_behind 时刻锚定 + 进程内 gate 失败保留重试资格补偿)。
+    let outcome =
+        match crate::push_templates::build_snapshot_stale_counted_binding(
+            today,
+            days_behind,
+            &summary.effective_at,
+            summary.total_assets,
+        )
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "T-20-snapshot-stale",
+                PushKind::SnapshotStale,
+                "snapshot_stale_dispatcher",
+                "render_snapshot_stale",
+            )
+            .map(|token| (token, binding))
+        }) {
+            Ok((token, binding)) => {
+                crate::notify::push_counted_with_binding(token, &text, None, binding).await
+            }
+            Err(reason) => {
+                log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
+                crate::notify::PushOutcome::Denied(reason)
+            }
+        };
     let confirmed = periodic_delivery_confirmed(&outcome);
     {
         let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
@@ -6621,16 +6650,19 @@ impl TemplateTestSummary {
         // BR-135 (2026-08-22) 退休外部 reminder 家族: 未激活
         // (56,13,3,72)/(52,11,0,63), 激活 news 后 (58,11,3,72)/(54,9,0,63)
         // (2026-08-22 实测运行时 manifest 与 br196 单元 default 快照一致)。
+        // 2026-09-20: SnapshotStale (MU-snapshot-stale) 全 7 触点 →
+        // 未激活 (57,13,3,73)/(53,11,0,64), 激活 news (59,11,3,73)/
+        // (55,9,0,64)。
         let activated_news = self.family_disabled_total == 11;
         let expected_family = if activated_news {
-            (58, 11, 3, 72)
+            (59, 11, 3, 73)
         } else {
-            (56, 13, 3, 72)
+            (57, 13, 3, 73)
         };
         let expected_kind = if activated_news {
-            (54, 9, 0, 63)
+            (55, 9, 0, 64)
         } else {
-            (52, 11, 0, 63)
+            (53, 11, 0, 64)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -6906,15 +6938,16 @@ mod tests_br196_monitor_test_acceptance {
             news_capability_generation: 1,
             news_capability_sha256: "b".repeat(64),
             // BR-135 (2026-08-22) 退休外部 reminder 家族，PushKind 闭集不变。
-            family_active_total: 56,
+            // 2026-09-20: SnapshotStale (MU-snapshot-stale) 全 7 触点 +1。
+            family_active_total: 57,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 72,
-            push_kind_active_total: 52,
+            family_total: 73,
+            push_kind_active_total: 53,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
-            push_kind_total: 63,
-            rendered_family_total: 56,
+            push_kind_total: 64,
+            rendered_family_total: 57,
             governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
             governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
@@ -6926,7 +6959,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 56,
+            explicit_dry_run_family_total: 57,
             failed: 0,
         }
     }
@@ -6971,7 +7004,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 56);
+        assert_eq!(catalog.len(), 57);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)

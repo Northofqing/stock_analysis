@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 59] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -396,9 +396,15 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 58
         "news_flash_aggregate_dispatcher",
         "assemble_news_flash_aggregated",
     ),
+    descriptor(
+        "T-20-snapshot-stale",
+        PushKind::SnapshotStale,
+        "snapshot_stale_dispatcher",
+        "render_snapshot_stale",
+    ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 58] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 59] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 

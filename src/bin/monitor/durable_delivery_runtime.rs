@@ -2299,6 +2299,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::BlockTradeIntradayConfirm => (D::BlockTradeIntradayConfirm, DeliverySubKind::None),
         // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
         K::IpoCatalyst => (D::IpoCatalyst, DeliverySubKind::None),
+        // 2026-09-20: 快照过期提醒升级 counted (MU-snapshot-stale 接线)。
+        K::SnapshotStale => (D::SnapshotStale, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3278,6 +3280,15 @@ mod tests {
             Some((DurablePushKind::IpoCatalyst, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::IpoCatalyst));
+    }
+
+    #[test]
+    fn snapshot_stale_kind_maps_to_durable_snapshot_stale() {
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::SnapshotStale),
+            Some((DurablePushKind::SnapshotStale, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::SnapshotStale));
     }
 
     #[tokio::test]
