@@ -4,6 +4,7 @@ pub mod attribution;
 pub mod attribution_epoch;
 pub mod attribution_replay;
 pub mod economic_position;
+pub mod fee_evidence;
 pub mod report;
 pub mod snapshot;
 

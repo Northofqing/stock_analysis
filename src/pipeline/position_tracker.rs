@@ -33,14 +33,6 @@ use diesel::prelude::*;
 
 use super::AnalysisResult;
 
-/// 交易成本（与回测默认一致）：佣金万三、印花税千一(仅卖出)、滑点千一。
-const COMMISSION_RATE: f64 = 0.0003;
-const STAMP_TAX_RATE: f64 = 0.001;
-const SLIPPAGE_RATE: f64 = 0.001;
-/// 往返交易成本百分比（买:佣金+滑点；卖:佣金+印花税+滑点），用于把毛收益折算为净收益。
-const ROUND_TRIP_COST_PCT: f64 =
-    (COMMISSION_RATE + SLIPPAGE_RATE + COMMISSION_RATE + STAMP_TAX_RATE + SLIPPAGE_RATE) * 100.0;
-
 // ============================================================================
 // RiskContext — 注入 position_tracker 的风控参数
 // ============================================================================
@@ -93,9 +85,12 @@ fn position_shares(price: f64, available_cash: f64) -> Result<i32, String> {
     Ok(lots * 100)
 }
 
-/// 毛收益率 → 净收益率（扣往返交易成本）。
-fn net_return_rate(gross_pct: f64) -> f64 {
-    gross_pct - ROUND_TRIP_COST_PCT
+/// 毛收益率 → 净收益率（扣逐笔往返成本）。
+///
+/// 评估 #2: 一刀切 0.36% 常量退役, 改用 fee_evidence 同一份逐笔成本
+/// (佣金万三最低5元双边 + 印花税千一卖出侧) — 与模拟盘卡片/回测口径合一.
+fn net_return_rate(buy_price: f64, sell_price: f64, quantity: u64) -> f64 {
+    stock_analysis::performance::fee_evidence::net_return_pct(buy_price, sell_price, quantity)
 }
 
 fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
@@ -179,6 +174,8 @@ pub struct SellEvaluation<'a> {
     pub buy_price: f64,
     pub buy_date: chrono::NaiveDate,
     pub current_price: f64,
+    /// 评估 #2: 逐笔成本口径需要持仓数量 (佣金最低5元按成交额计).
+    pub quantity: u64,
     pub ma5: Option<f64>,
     pub ma20: Option<f64>,
     pub ma60: Option<f64>,
@@ -194,8 +191,7 @@ pub struct SellEvaluation<'a> {
 ///
 /// T+1 锁仓（buy_date == today）不在此函数内判定，由调用方检查。
 pub fn evaluate_sell_rules(e: &SellEvaluation<'_>) -> Option<String> {
-    let gross_pct = (e.current_price / e.buy_price - 1.0) * 100.0;
-    let return_rate = net_return_rate(gross_pct);
+    let return_rate = net_return_rate(e.buy_price, e.current_price, e.quantity);
     let hold_days = (e.today - e.buy_date).num_days();
 
     // P0-2: ATR 动态止损替代硬编码 8%
@@ -309,7 +305,7 @@ pub(super) fn track_position_with_assignment(
             let buy_date = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d")
                 .map_err(|error| format!("BR-124 {code} persisted buy date is invalid: {error}"))?;
             let today = chrono::Local::now().date_naive();
-            let return_rate = net_return_rate((current_price / pos.buy_price - 1.0) * 100.0);
+            let return_rate = net_return_rate(pos.buy_price, current_price, pos.quantity as u64);
             result.position_buy_price = Some(pos.buy_price);
             result.position_buy_date = Some(pos.buy_date.clone());
             result.position_return = Some(return_rate);
@@ -324,6 +320,7 @@ pub(super) fn track_position_with_assignment(
                 buy_price: pos.buy_price,
                 buy_date,
                 current_price,
+                quantity: pos.quantity as u64,
                 ma5: result.ma5,
                 ma20: result.ma20,
                 ma60: result.ma60,
@@ -1268,5 +1265,30 @@ mod tests {
         assert!(dynamic
             .position_quantity
             .is_some_and(|shares| shares >= 100));
+    }
+
+    #[test]
+    fn small_position_cost_floor_pulls_stop_loss_earlier() {
+        // 评估 #2: 100 股 ¥10 仓位 (¥1,000), 毛亏 7.0% → 净亏 7.0+1.1=8.1% ≥ 8%
+        // → 固定 8% 止损触发. 旧口径 0.36% 一刀切: 净亏 7.36% < 8% → 不止损.
+        use super::{evaluate_sell_rules, SellEvaluation};
+        let eval = SellEvaluation {
+            code: "TEST_CODE_600000",
+            name: "测试",
+            buy_price: 10.0,
+            buy_date: NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            current_price: 9.3,
+            quantity: 100,
+            ma5: None,
+            ma20: None,
+            ma60: None,
+            atr: None,
+            boll_macd: None,
+            today: NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
+        };
+        assert!(
+            evaluate_sell_rules(&eval).is_some(),
+            "小仓位逐笔成本应让止损更早触发"
+        );
     }
 }

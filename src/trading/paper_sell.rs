@@ -580,6 +580,7 @@ fn evaluate_and_sell(
         buy_price: pos.avg_buy_price,
         buy_date: pos.first_buy_date,
         current_price: quote.price,
+        quantity: pos.quantity as u64,
         ma5: indicators.ma5,
         ma20: indicators.ma20,
         ma60: indicators.ma60,
@@ -601,6 +602,13 @@ fn evaluate_and_sell(
 
     // 6. 虚拟卖出（跌停/滑点判定 + INSERT paper_trades + order_audit）
     let gross_pct = (quote.price / pos.avg_buy_price - 1.0) * 100.0;
+    // 评估 #1: 卡片收益率由毛转净 (lot.rs 逐笔成本: 佣金最低5 + 印花税卖出侧).
+    let net_pct =
+        stock_analysis::performance::fee_evidence::net_return_pct(
+            pos.avg_buy_price,
+            quote.price,
+            pos.quantity as u64,
+        );
     if cancelled.load(Ordering::SeqCst) { return Ok(None); }
     let (cash, total, pos_pct) = io.portfolio_state(&pos.code, quote.price, cancelled)?;
     let signal = PaperSignal {
@@ -634,15 +642,17 @@ fn evaluate_and_sell(
         return Ok(None);
     }
     info!(
-        "[paper_sell] {} 虚拟卖出 {}股 @{:.2}，收益率 {:+.2}%（原因: {}）",
-        pos.name, pos.quantity, quote.price, gross_pct, reason
+        "[paper_sell] {} 虚拟卖出 {}股 @{:.2}，收益率 {:+.2}%（毛 {:+.2}%）（原因: {}）",
+        pos.name, pos.quantity, quote.price, net_pct, gross_pct, reason
     );
     Ok(Some(PaperSellResult {
         code: pos.code.clone(),
         name: pos.name.clone(),
         quantity: pos.quantity,
         price: quote.price,
-        return_rate_pct: gross_pct,
+        // 评估 #1: 卡片取净值 (return_rate_pct 进入 decision_identity 哈希,
+        // 口径变更后同票同日生成新投递决策行 — 评估 §8.1 已核验无冲突).
+        return_rate_pct: net_pct,
         reason,
     }))
 }

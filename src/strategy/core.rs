@@ -529,7 +529,8 @@ impl BacktestEngine {
         let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
         let actual_price = price * (1.0 + slippage_rate); // 买入滑点
         let amount = actual_price * shares;
-        let commission = amount * self.config.commission_rate;
+        // 评估 #2: 佣金加最低 5 元保底 (lot.rs 口径), 与 try_buy_realistic 一致.
+        let commission = crate::strategy::lot::min_commission(amount);
         let total_cost = amount + commission;
 
         if total_cost > self.state.cash {
@@ -730,7 +731,8 @@ impl BacktestEngine {
         }
         let actual_price = price * (1.0 - slippage_rate); // 卖出滑点
         let amount = actual_price * shares;
-        let commission = amount * self.config.commission_rate;
+        // 评估 #2: 佣金加最低 5 元保底 (lot.rs 口径), 与 try_sell_realistic 一致.
+        let commission = crate::strategy::lot::min_commission(amount);
         let stamp_tax = amount * self.config.stamp_tax_rate;
         let proceeds = amount - commission - stamp_tax;
 

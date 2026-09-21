@@ -2443,21 +2443,56 @@ fn compute_account_mode_metrics_blocking(
     let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
     // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
-    // (FIFO 引擎) 的 gross_pnl 推导; 账本重建失败 → Err (不允许放行交易门).
+    // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
+    // 账本重建失败 → Err (不允许放行交易门).
+    let as_of = chrono::Local::now().date_naive();
+    let cost_ledger = {
+        use stock_analysis::performance::economic_position::query_economic_fills_through;
+        use stock_analysis::performance::fee_evidence::{lot_rate_fill_cost_ledger, FillSide};
+        let rows = query_economic_fills_through(as_of)
+            .map_err(|error| format!("BR-103 paper ledger fills: {error}"))?;
+        let mut fills: Vec<(i64, FillSide, f64)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // 缺成交价的 Filled 行 → 明确 fail-closed, 不用静默跳过掩盖账本缺口.
+            let price = row.fill_price.ok_or_else(|| {
+                format!("BR-103 paper ledger fill id={} has no fill_price", row.id)
+            })?;
+            let side = match row.direction.as_str() {
+                "buy" => FillSide::Buy,
+                "sell" => FillSide::Sell,
+                other => {
+                    return Err(format!(
+                        "BR-103 paper ledger fill id={} direction invalid: {other}",
+                        row.id
+                    ));
+                }
+            };
+            fills.push((row.id, side, price * row.quantity as f64));
+        }
+        lot_rate_fill_cost_ledger(&fills)
+            .map_err(|error| format!("BR-103 paper ledger cost evidence: {error}"))?
+    };
     let report =
         stock_analysis::performance::economic_position::compute_economic_position_report(
-            chrono::Local::now().date_naive(),
-            None,
+            as_of,
+            Some(&cost_ledger),
         )
         .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
     let realized: Vec<(chrono::NaiveDateTime, String, f64)> = report
         .closed_positions
         .iter()
         .map(|position| {
+            let pnl = match &position.net {
+                stock_analysis::performance::economic_position::NetMetrics::Available {
+                    net_pnl,
+                    ..
+                } => *net_pnl,
+                _ => position.gross_pnl,
+            };
             (
                 position.closed_at,
                 format!("economic-cycle-{}", position.cycle_open_fill_id),
-                position.gross_pnl,
+                pnl,
             )
         })
         .collect();

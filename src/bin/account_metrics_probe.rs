@@ -52,13 +52,41 @@ fn main() -> ExitCode {
         let today_pnl_pct = summary.daily_pnl / summary.total_assets * 100.0;
         let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
-        let report = stock_analysis::performance::economic_position::compute_economic_position_report(
-            chrono::Local::now().date_naive(),
-            None,
-        )
-        .map_err(|error| format!("paper ledger anchor: {error}"))?;
+        let report = {
+            // 与生产 compute_account_mode_metrics_blocking 同路径: 费率口径
+            // 逐笔成本 ledger 喂引擎 (评估 #1), 净口径计数.
+            use stock_analysis::performance::economic_position::query_economic_fills_through;
+            use stock_analysis::performance::fee_evidence::{lot_rate_fill_cost_ledger, FillSide};
+            let as_of = chrono::Local::now().date_naive();
+            let rows = query_economic_fills_through(as_of)
+                .map_err(|error| format!("paper ledger fills: {error}"))?;
+            let mut fills: Vec<(i64, FillSide, f64)> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let price = row
+                    .fill_price
+                    .ok_or_else(|| format!("paper ledger fill id={} has no fill_price", row.id))?;
+                let side = match row.direction.as_str() {
+                    "buy" => FillSide::Buy,
+                    "sell" => FillSide::Sell,
+                    other => {
+                        return Err(format!(
+                            "paper ledger fill id={} direction invalid: {other}",
+                            row.id
+                        ));
+                    }
+                };
+                fills.push((row.id, side, price * row.quantity as f64));
+            }
+            let ledger = lot_rate_fill_cost_ledger(&fills)
+                .map_err(|error| format!("paper ledger cost evidence: {error}"))?;
+            stock_analysis::performance::economic_position::compute_economic_position_report(
+                as_of,
+                Some(&ledger),
+            )
+            .map_err(|error| format!("paper ledger anchor: {error}"))?
+        };
         println!(
-            "ledger: closed_positions={} open_positions={}",
+            "ledger: closed_positions={} open_positions={} (费率逐笔成本净口径)",
             report.closed_positions.len(),
             report.open_positions.len()
         );
@@ -66,10 +94,15 @@ fn main() -> ExitCode {
             .closed_positions
             .iter()
             .map(|position| {
+                use stock_analysis::performance::economic_position::NetMetrics;
+                let pnl = match &position.net {
+                    NetMetrics::Available { net_pnl, .. } => *net_pnl,
+                    _ => position.gross_pnl,
+                };
                 (
                     position.closed_at,
                     format!("economic-cycle-{}", position.cycle_open_fill_id),
-                    position.gross_pnl,
+                    pnl,
                 )
             })
             .collect();
