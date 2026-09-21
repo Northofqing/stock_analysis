@@ -779,6 +779,13 @@ fn v14_gate_prepared(request: V14PreparedGate<'_>) -> V14Gate {
             context_source,
             GovernanceContextSource::CountedCombinedAccount
                 | GovernanceContextSource::CountedSourceOnly
+                // 2026-09-21 (系统评估 §4.1, 修复 #2): NewsAI 与 news_flash
+                // reservation 专用路径各自的结算/审计流拥有投递权威, 经
+                // prepared gate 放行 counted kind (L4 dedup 对 counted 本就
+                // 跳过); 泛化路径仍由 deliver_and_record 的 counted 边界
+                // (notify.rs:2325) 拒绝, 防线不撤。
+                | GovernanceContextSource::NewsAiCombinedAccount
+                | GovernanceContextSource::SourceFact
         )
     {
         return V14Gate::Denied("counted_binding_required".to_owned());
