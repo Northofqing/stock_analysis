@@ -1018,6 +1018,14 @@ fn reason_code_static(s: &str) -> &'static str {
     const KNOWN: &[&str] = &[
         "no_current_reports",
         "no_verified_batch",
+        // 2026-09-21 (grpc_handoffs 上游回复修订版 4): 上游 unary 路由层
+        // 的 4 个 reason_code 显式纳表 — 此前未知 wire 值被 intern 成
+        // "internal", 丢失「无 provider 应答」vs「应答但不合格」的区分,
+        // 竞价窗口诊断无从下手。retryable 已由 detail 保真。
+        "provider_route_exhausted",
+        "provider_route_stopped",
+        "provider_response_invalid",
+        "source_precondition_failed",
         "invalid_request",
         "invalid_evidence",
         "unavailable",
