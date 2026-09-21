@@ -100,3 +100,33 @@ pub fn calc_kdj(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_time_high_pushes_kdj_to_overbought() {
+        let closes: Vec<f64> = (1..=30).map(|i| 10.0 + i as f64 * 0.8).collect();
+        let highs = closes.clone();
+        let lows: Vec<f64> = closes.iter().map(|c| c - 0.2).collect();
+        let out = calc_kdj(&highs, &lows, &closes, 9, 3, 3);
+        let last = out.last().expect("nonempty");
+        // 连续新高收盘贴近最高价 → RSV≈100 → K/D/J 全部超买区 (>80)
+        assert!(last.k > 80.0);
+        assert!(last.d > 80.0);
+        assert!(last.j > 80.0);
+    }
+
+    #[test]
+    fn all_time_low_pushes_kdj_to_oversold() {
+        let closes: Vec<f64> = (1..=30).map(|i| 30.0 - i as f64 * 0.7).collect();
+        let lows = closes.clone();
+        let highs: Vec<f64> = closes.iter().map(|c| c + 0.2).collect();
+        let out = calc_kdj(&highs, &lows, &closes, 9, 3, 3);
+        let last = out.last().expect("nonempty");
+        assert!(last.k < 20.0);
+        assert!(last.d < 20.0);
+        assert!(last.j < 20.0);
+    }
+}

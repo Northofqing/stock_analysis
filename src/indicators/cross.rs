@@ -50,3 +50,29 @@ pub fn detect_cross(fast: &[f64], slow: &[f64], lookback: usize) -> CrossType {
     }
     CrossType::None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_crossing_above_slow_is_golden() {
+        let fast = vec![1.0, 1.2, 1.6, 2.2];
+        let slow = vec![1.0, 1.1, 1.4, 1.8];
+        assert_eq!(detect_cross(&fast, &slow, 4), CrossType::GoldenCross);
+    }
+
+    #[test]
+    fn fast_crossing_below_slow_is_death() {
+        let fast = vec![3.0, 2.6, 2.0, 1.4];
+        let slow = vec![3.0, 2.8, 2.4, 2.0];
+        assert_eq!(detect_cross(&fast, &slow, 4), CrossType::DeathCross);
+    }
+
+    #[test]
+    fn parallel_series_have_no_cross() {
+        let fast = vec![2.0, 2.5, 3.0, 3.5];
+        let slow = vec![1.0, 1.5, 2.0, 2.5];
+        assert_eq!(detect_cross(&fast, &slow, 4), CrossType::None);
+    }
+}

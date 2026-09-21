@@ -42,3 +42,27 @@ pub fn calc_macd(closes: &[f64], fast: usize, slow: usize, signal: usize) -> Vec
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rising_series_gives_positive_dif_and_histogram() {
+        let closes: Vec<f64> = (1..=40).map(|i| 10.0 + i as f64 * 0.5).collect();
+        let out = calc_macd(&closes, 12, 26, 9);
+        assert_eq!(out.len(), closes.len());
+        let last = out.last().expect("nonempty");
+        // 持续上涨 → 快线在慢线上方, 柱为正
+        assert!(last.dif > last.dea);
+        assert!(last.histogram > 0.0);
+    }
+
+    #[test]
+    fn falling_series_gives_negative_histogram() {
+        let closes: Vec<f64> = (1..=40).map(|i| 30.0 - i as f64 * 0.3).collect();
+        let out = calc_macd(&closes, 12, 26, 9);
+        let last = out.last().expect("nonempty");
+        assert!(last.histogram < 0.0);
+    }
+}

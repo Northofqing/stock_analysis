@@ -108,3 +108,23 @@ pub fn detect_divergence(
         description: format!("{}未发现背离", indicator_name),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_new_high_with_flat_indicator_is_bearish_top() {
+        let prices = vec![10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5];
+        // 价格创新高而指标回落 (>3%): 顶背离条件 curr_ind < prev_ind*0.97
+        let indicator = vec![5.5, 5.5, 5.5, 5.5, 5.5, 5.2, 4.9, 4.6, 4.3, 4.0];
+        let result = detect_divergence(&prices, &indicator, 10, "TEST");
+        assert_eq!(result.divergence, DivergenceType::BearishTop);
+    }
+
+    #[test]
+    fn short_series_returns_no_divergence() {
+        let result = detect_divergence(&[1.0, 2.0], &[1.0, 2.0], 10, "TEST");
+        assert_eq!(result.divergence, DivergenceType::None);
+    }
+}
