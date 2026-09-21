@@ -11013,6 +11013,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             .collect();
                                         let mut confirmed = true;
                                         let mut delivered_codes: Vec<String> = Vec::new();
+                                        let mut attempted_codes: Vec<String> = Vec::new();
                                         for prepared in pending {
                                             let token =
                                                 match crate::presentation_registry::acquire_token(
@@ -11058,10 +11059,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                 );
                                                 delivered_codes.push(prepared.code.clone());
                                             }
+                                            attempted_codes.push(prepared.code.clone());
                                         }
-                                        // 记录当日已推 (成功才记录, 失败保留重试资格; DB 级跨重启)
-                                        for code in delivered_codes {
-                                            holding_plan_daily_record(today, &code);
+                                        // 2026-09-21 修复: 记录当日已**尝试** (成功/拒绝均记) —
+                                        // 终态决策 (RejectedDurable, 审计拒绝) 重试只会回放
+                                        // 同一终态, 此前"仅成功记录"造成每 tick 重试 → 每日
+                                        // 256 次 ERROR 风暴 + durable 行膨胀。旧语义 (当日
+                                        // 一票一推) 由尝试级记录恢复; 瞬时 sink 失败由
+                                        // durable 层 retry_authorized 补偿, 次日周期自然重试。
+                                        for code in &attempted_codes {
+                                            holding_plan_daily_record(today, code);
                                         }
                                         if confirmed {
                                             last_holding_plan = std::time::Instant::now();
