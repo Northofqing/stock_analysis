@@ -1383,6 +1383,33 @@ fn is_source_fact_signal(kind: PushKind, event: &SignalEvent) -> bool {
     ) && matches!(event.payload, SignalPayload::NewsCatalyst(_))
 }
 
+/// 交易动作类 kind (2026-09-21 评估 #11): 行情实时依赖 + 触发交易动作.
+/// - Frozen 拦截: 熔断期停止交易建议推送
+/// - data_mode_min = Degraded: 行情不可信 (Unsafe/Down) 时 fail-closed
+/// 其余 kind (复盘/新闻/公告/归因/竞价/运维/状态卡) 保持出声 (C 方案 +
+/// 分流规则「每日必达」), Frozen 不拦、data_mode_min 维持 Down.
+fn is_live_trading_kind(kind: PushKind) -> bool {
+    matches!(
+        kind,
+        PushKind::HoldingPlan
+            | PushKind::T0Advice
+            | PushKind::CandidateTriggered
+            | PushKind::CloseCall
+            | PushKind::PaperTrade
+            | PushKind::PaperSell
+            | PushKind::SectorTop
+            | PushKind::SectorAnomaly
+            | PushKind::IntradayMarket
+            | PushKind::LimitBoards
+            | PushKind::IndustryChainIntraday
+            | PushKind::BlockTradeIntradayConfirm
+            | PushKind::CandidateBoard
+            | PushKind::AuctionRepush
+            | PushKind::AuctionVolume
+            | PushKind::CandidateInvalidated
+    )
+}
+
 /// 默认 profile (按 PushKind 给推荐 category + §14.3 冷却)
 fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
     use stock_analysis::push_l2::TemplateCategory::*;
@@ -1399,18 +1426,20 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         category,
         // 🚨紧急类 (风控/持仓事件) 不受静默期抑制, 其余尊重 02:00-06:00 静默
         quiet_hours_respect: !kind.level().is_emergency(),
-        // v17.1 治本: frozen_mode_respect 改为 false (L5 governance 不再 Deny Frozen)
-        // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
-        // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
-        frozen_mode_respect: false,
-        // 2026-08-06 用户决策 (C 方案): 未接入券商, 全部推送为参考级 —
-        // 全局 data_mode_min 从 Degraded 放宽到 Down (L5 data_quality 门禁
-        // 不再拦任何推送)。实证: 收盘后 Quote 停止 → DataMode=Unsafe 是
-        // 每日 15:00-次日 9:15 常态, 快照预警/行情预检等运维提醒被误伤
-        // (Denied("data_quality"))。交易建议类 (做T/候选/持有) 行情不可信
-        // 时仍会推送, 但 DataMode banner (T-02) 保持出声, 数据模式状态
-        // 始终可见 — "出声"原则保留, 仅移除推送拦截。
-        data_mode_min: DataMode::Down,
+        // 2026-09-21 评估 #11 恢复: 交易动作类 kind 在 Frozen 下被 L5 拦截;
+        // 状态卡/复盘/新闻/运维类保持出声 (v17.1 全量放行撤销, 拦截面收敛
+        // 到真正触发交易动作的 kind).
+        frozen_mode_respect: is_live_trading_kind(kind),
+        // 2026-08-06 用户决策 (C 方案): 未接入券商, 参考级推送 data_mode_min
+        // 放宽到 Down —— 但 2026-09-21 评估 #11 指出 Down 为最大枚举值,
+        // data_quality 门禁算术不可达. 折中: 交易动作类收紧到 Degraded
+        // (行情不可信时不推建议, fail-closed), 其余保留 Down (收盘后
+        // DataMode=Unsafe/Down 是每日常态, 复盘/运维提醒不被误伤).
+        data_mode_min: if is_live_trading_kind(kind) {
+            DataMode::Degraded
+        } else {
+            DataMode::Down
+        },
         // b011: 不再硬编码 60, 与 §14.3 治理表一致 (0 = 无冷却)
         cooldown_secs: kind.cooldown_secs().map(u64::from).unwrap_or(0),
         max_per_user_per_day: matches!(kind, PushKind::CandidateBoard).then_some(5),
@@ -1955,6 +1984,62 @@ mod tests {
             default_profile_for_kind(PushKind::AccountMode).data_mode_min,
             DataMode::Down
         );
+    }
+
+    #[test]
+    fn live_trading_kinds_fail_closed_on_degraded_data_mode() {
+        // 2026-09-21 评估 #11: 交易动作类 kind data_mode_min = Degraded
+        // (data_quality 门禁重新可达), 复盘/状态类保持 Down.
+        for kind in [
+            PushKind::T0Advice,
+            PushKind::HoldingPlan,
+            PushKind::PaperSell,
+            PushKind::CandidateBoard,
+        ] {
+            assert_eq!(
+                default_profile_for_kind(kind).data_mode_min,
+                DataMode::Degraded,
+                "{kind:?} 应要求 Degraded"
+            );
+        }
+        for kind in [
+            PushKind::ReviewMarket,
+            PushKind::AttributionDaily,
+            PushKind::NewsFlashAggregated,
+            PushKind::AccountMode,
+            PushKind::DataMode,
+        ] {
+            assert_eq!(
+                default_profile_for_kind(kind).data_mode_min,
+                DataMode::Down,
+                "{kind:?} 应保持 Down (C 方案 + 每日必达)"
+            );
+        }
+    }
+
+    #[test]
+    fn only_live_trading_kinds_respect_frozen_deny() {
+        // 2026-09-21 评估 #11 恢复: Frozen 拦截收敛到交易动作类 kind;
+        // 状态卡/复盘/新闻保持出声.
+        for kind in [PushKind::T0Advice, PushKind::HoldingPlan, PushKind::PaperSell] {
+            assert!(
+                default_profile_for_kind(kind).frozen_mode_respect,
+                "{kind:?} 应在 Frozen 下被拦截"
+            );
+        }
+        for kind in [
+            PushKind::AccountMode,
+            PushKind::DataMode,
+            PushKind::ReviewMarket,
+            PushKind::NewsFlashCritical,
+            PushKind::SnapshotStale,
+            PushKind::HoldingEvent,
+        ] {
+            assert!(
+                !default_profile_for_kind(kind).frozen_mode_respect,
+                "{kind:?} 在 Frozen 下应保持出声"
+            );
+        }
     }
 
     #[test]

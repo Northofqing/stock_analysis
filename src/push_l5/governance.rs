@@ -70,7 +70,7 @@ fn throttled_frozen_warn() {
         ) {
             Ok(_) => {
                 log::warn!(
-                    "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告 (节流 60s/次)"
+                    "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → Deny(frozen) 拦截 (节流 60s/次)"
                 );
                 return;
             }
@@ -164,14 +164,15 @@ impl GovernanceEngine {
             return GovernanceDecision::Deny("quiet_hour".to_string());
         }
 
-        // Step 2: 冻结模式
-        // v17.1 治本: Frozen 状态不再 Deny, 模板从 ctx.is_frozen 读后渲染 ⚠️ 警告
-        // 仓位风险控制应在 broker 下单层, 通知层应保持出声 (4 铁律)
-        // 字段保留用于日志/审计.
-        // F8 fix: 节流到 60s 一次, 避免 frozen_mode_respect=true 启用时每条 push 都 warn.
+        // Step 2: 冻结模式 (2026-09-21 评估 #11 恢复 Deny)
+        // v17.1 曾改为 fall-through 放行, 理由是「仓位风险控制在 broker 下单层」
+        // —— 按零券商决策该层永不存在, 通知层是唯一面向用户的闸门.
+        // 拦截面由 profile.frozen_mode_respect 控制: 交易动作类 kind 拦截,
+        // 状态/复盘/新闻等保持出声 (见 v14_adapter is_live_trading_kind).
+        // F8 fix: 节流到 60s 一次, 避免每条被拦 push 都打 warn.
         if profile.frozen_mode_respect && ctx.is_frozen {
             throttled_frozen_warn();
-            // 故意 fall through, 不 return Deny
+            return GovernanceDecision::Deny("frozen".to_string());
         }
 
         // Step 3: 数据质量 (b-008 §4.1: data_source_down 主动告警可豁免)
@@ -311,10 +312,9 @@ mod tests {
 
     #[test]
     fn deny_in_frozen_mode_when_respect_enabled() {
-        // v17.1 治本: Frozen 状态不再 Deny, 而是由模板在 banner 渲染 ⚠️ 警告
-        // 旧行为: assert_eq!(...Deny("frozen"...))  - 违反 4 铁律"默认值出声"
-        // 新行为: Approve (放行), ctx.is_frozen 保留给模板做警告
-        // 仓位风险控制应在 broker 下单层, 不在通知层 (v17.1 决策)
+        // 2026-09-21 评估 #11 恢复: Frozen + frozen_mode_respect=true → Deny.
+        // (v17.1 曾 fall-through 放行, 理由是 broker 下单层管仓位 —— 该层
+        // 按零券商决策永不存在, 通知层是唯一闸门.)
         let engine = GovernanceEngine::new();
         let profile = make_profile(true, true, DataMode::Full, false);
         let event = make_event(SignalSource::LimitUp);
@@ -322,9 +322,25 @@ mod tests {
             is_frozen: true,
             ..Default::default()
         };
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("frozen".to_string())
+        );
+    }
+
+    #[test]
+    fn approve_in_frozen_mode_when_respect_disabled() {
+        // frozen_mode_respect=false 的 kind (状态卡/复盘/新闻等) 在 Frozen 下放行.
+        let engine = GovernanceEngine::new();
+        let profile = make_profile(true, false, DataMode::Full, false);
+        let event = make_event(SignalSource::LimitUp);
+        let ctx = GovernanceContext {
+            is_frozen: true,
+            ..Default::default()
+        };
         assert!(
             engine.check(&profile, &event, &ctx).is_approve(),
-            "v17.1: Frozen 状态必须放行 (banner 警告), 不能 Deny"
+            "frozen_mode_respect=false 的 kind 在 Frozen 下应放行 (保持出声)"
         );
     }
 

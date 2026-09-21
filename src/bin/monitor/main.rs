@@ -2404,52 +2404,76 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// 同步版 metrics 装配 (供 spawn_blocking 调用).
 
-/// 数据源: real_account_snapshot + 同批券商成交同步水位.
+/// 数据源 (2026-09-21 评估 #12 重定义): user_account_summary (用户截图确认
 
-/// 失败 / 缺失 → 返回 data_complete=false 的 metrics (保守策略).
+/// 导入, 实际工作流) + paper_trades 模拟账本水位.
+
+/// 完备性锚从「券商 trade-sync watermark」(按零券商决策永不会到来) 改为
+
+/// 纸面账本: economic engine 重建成功即账本一致; summary 缺 / 未来 / >4 天
+
+/// → 保守 Err (旧事实不得用于重开交易门).
 
 fn compute_account_mode_metrics_blocking(
 ) -> Result<stock_analysis::risk::account_mode::PortfolioMetrics, String> {
     let observed_at = chrono::Local::now().fixed_offset();
-    let snapshot = stock_analysis::database::account_snapshot::latest_account_snapshot()
-        .map_err(|error| format!("BR-103 latest real account snapshot: {error}"))?
-        .ok_or_else(|| "BR-103 real account snapshot is missing".to_string())?;
-    snapshot.validate_fresh_for_action(observed_at)?;
-
-    if snapshot.daily_pnl_status != "available" {
+    let summary = stock_analysis::database::user_account_summary::latest()
+        .map_err(|error| format!("BR-103 latest user account summary: {error}"))?
+        .ok_or_else(|| "BR-103 user account summary is missing".to_string())?;
+    // 新鲜度: 拒绝未来; > 96h 视为 stale — 覆盖周五导入 → 周一 08:30 盘前
+    // 重置窗口 (BR-021). 更旧的事实不应用于账户模式判定 (fail-closed).
+    let effective_at = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
+        .map_err(|error| format!("BR-103 summary effective_at unparseable: {error}"))?;
+    let age = observed_at.signed_duration_since(effective_at);
+    if age < chrono::Duration::zero() {
         return Err(format!(
-            "BR-103 daily PnL is unavailable: status={}",
-            snapshot.daily_pnl_status
+            "BR-103 account summary is from the future: age={age}"
         ));
     }
-    let daily_pnl = snapshot
-        .daily_pnl
-        .ok_or_else(|| "BR-103 daily PnL is missing".to_string())?;
-    let position_ratio_pct = snapshot
-        .position_ratio_pct
-        .ok_or_else(|| "BR-103 position ratio is missing".to_string())?;
-    if snapshot.total_assets <= 0.0 {
+    if age > chrono::Duration::hours(96) {
+        return Err(format!("BR-103 account summary is stale: age={age}"));
+    }
+    if summary.total_assets <= 0.0 {
         return Err("BR-103 total assets must be positive for account mode".to_string());
     }
-    let today_pnl_pct = daily_pnl / snapshot.total_assets * 100.0;
+    let today_pnl_pct = summary.daily_pnl / summary.total_assets * 100.0;
     if !today_pnl_pct.is_finite() {
         return Err("BR-103 daily PnL ratio is non-finite".to_string());
     }
-    let _total_pos_cheng = (position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
+    let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
-    // A fresh account snapshot does not prove that the local trade ledger was
-    // synchronized in the same batch. Until the broker exposes that watermark,
-    // consecutive-stop-loss data must stay incomplete rather than being inferred
-    // from an arbitrarily old local `trades` table.
-    Err(
-        "BR-103 complete account metrics unavailable: real broker trade-sync watermark is not connected"
-            .to_string(),
-    )
+    // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
+    // (FIFO 引擎) 的 gross_pnl 推导; 账本重建失败 → Err (不允许放行交易门).
+    let report =
+        stock_analysis::performance::economic_position::compute_economic_position_report(
+            chrono::Local::now().date_naive(),
+            None,
+        )
+        .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
+    let realized: Vec<(chrono::NaiveDateTime, String, f64)> = report
+        .closed_positions
+        .iter()
+        .map(|position| {
+            (
+                position.closed_at,
+                format!("economic-cycle-{}", position.cycle_open_fill_id),
+                position.gross_pnl,
+            )
+        })
+        .collect();
+    let consecutive_stop_loss_n = count_consecutive_realized_losses(&realized)?;
+
+    Ok(stock_analysis::risk::account_mode::PortfolioMetrics::complete(
+        today_pnl_pct,
+        consecutive_stop_loss_n,
+        total_pos_cheng,
+    ))
 }
 
 /// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
 
-#[cfg(test)]
+/// (2026-09-21 评估 #12: 从 cfg(test) 提升为生产函数, 供纸面账本锚使用.)
+
 fn count_consecutive_realized_losses(
     realized: &[(chrono::NaiveDateTime, String, f64)],
 ) -> Result<u32, String> {
