@@ -1,1 +1,1 @@
-{"schema_version":"selection-config-activation-v1","expected_config_hash":"28d1f63e14d5663250971bd06c8f9d5d3df192973970c2b8c4e182281d28d0c4","effective_from":"2026-09-21T03:43:46.000000000Z","reviewed_by":"claude-deploy-20260921-t03-storm-fix","reviewed_at":"2026-09-21T03:32:57.371632000Z"}
+{"schema_version":"selection-config-activation-v1","expected_config_hash":"2b7f4b56a5b24b14e0de13a9ab37b57291d0588797534df7dee91ca2112143cb","effective_from":"2026-09-21T09:59:40.000000000Z","reviewed_by":"claude-deploy-20260921-resync","reviewed_at":"2026-09-21T09:50:08.801404000Z"}
