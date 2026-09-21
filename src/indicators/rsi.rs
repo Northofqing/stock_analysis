@@ -62,8 +62,12 @@ pub(super) fn rsi_single(closes: &[f64], period: usize) -> Vec<f64> {
             avg_loss += change.abs();
         }
     }
-    avg_gain /= period as f64;
-    avg_loss /= period as f64;
+    // 2026-09-21 (系统评估 §6.3): 短序列时循环仅跑 first_window 次却除以
+    // period → RSI 被系统性低估。以实际窗口长度做简单平均 (Wilder 平滑
+    // 只应在首窗之后; 首窗为简单平均)。
+    let divisor = first_window.max(1) as f64;
+    avg_gain /= divisor;
+    avg_loss /= divisor;
 
     if avg_gain + avg_loss > 1e-10 {
         result[first_window] = avg_gain / (avg_gain + avg_loss) * 100.0;
@@ -84,4 +88,26 @@ pub(super) fn rsi_single(closes: &[f64], period: usize) -> Vec<f64> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_sequence_first_window_uses_actual_window_length() {
+        // 序列长度 3 < period 6: first_window=2, 首窗应为简单平均而非除 period
+        let closes = vec![10.0, 11.0, 12.0];
+        let out = rsi_single(&closes, 6);
+        // 全涨序列: avg_gain=2, avg_loss=0 → RSI=100 (不再被 period 低估)
+        assert_eq!(out[2], 100.0);
+    }
+
+    #[test]
+    fn full_window_still_wilder_shaped() {
+        let closes = vec![10.0, 11.0, 10.5, 11.5, 11.0, 11.8, 12.2];
+        let out = rsi_single(&closes, 6);
+        // 首窗 = period=6, 全涨为主 → RSI 接近 100 但不等于 (存在回调)
+        assert!(out[6] > 50.0);
+    }
 }

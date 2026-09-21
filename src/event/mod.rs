@@ -2816,3 +2816,35 @@ mod delivery_observation_tests {
         publish_delivery_on(&local, "announcement_v1", None, "Pushed", "dry_run", 1, 1);
     }
 }
+
+/// 2026-09-21 (系统评估 §4.3): NewsFlashGate 拒绝计数与原因落审计。
+/// 写入 event_bus 审计域的轻量记录; 失败仅 warn (审计路径不可影响
+/// fail-closed 主链)。幂等: 同 event_id 同 reason 重复写无妨 (追加式)。
+pub fn record_gate_rejection(gate: &str, reason: &str, event_id: &str) -> Result<(), String> {
+    let record = serde_json::json!({
+        "schema": "gate-rejection-v1",
+        "gate": gate,
+        "reason": reason,
+        "event_id": event_id,
+        "observed_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let line = serde_json::to_string(&record)
+        .map_err(|error| format!("gate rejection serialize: {error}"))?;
+    // 追加到 data/event_bus/gate_rejections.jsonl (生产) 或测试隔离目录。
+    let path = if crate::risk::env_guard::runtime_is_test_process() {
+        std::path::PathBuf::from("data/test/event_bus_gate_rejections.jsonl")
+    } else {
+        std::path::PathBuf::from("data/event_bus_gate_rejections.jsonl")
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("gate rejection audit open: {error}"))?;
+    writeln!(file, "{line}").map_err(|error| format!("gate rejection audit write: {error}"))?;
+    Ok(())
+}

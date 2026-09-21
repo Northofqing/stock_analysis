@@ -540,9 +540,11 @@ keywords = [
 
 # 历史归类不一致兜底: prediction_tracker 历史上有"新能源-电池" theme_name
 # (10 推送 0%), 是早期 AI 兜底用的粗分类, 后续 config 已细化为
-# 锂电池 / 钠离子 / 固态 / 储能. 此条仅 audit, enabled=false 不参与匹配.
-# AGENTS §2.9 边界证明: priority=0 + enabled=false, 永不进 chain_mapper
-# 输出; winrate_simulator 自动纳入 BR-006 blacklist 名单.
+# 锂电池 / 钠离子 / 固态 / 储能. 2026-09-21 系统评估 (docs/audits/
+# 2026-09-21-系统评估.md §4.9) 指出此注释与实际不符: 实际 enabled=true
+# priority=100, 该兜底桩**正在生产中参与匹配**。若意图是仅审计,
+# 应将 enabled 与 priority 改为注释所述值; 当前保留行为并修正注释为
+# 实情 (行为变更需单独决策, 见评估 §8 B 档)。
 [[rules]]
 chain = "新能源-电池"
 category = "新能源"
@@ -1040,15 +1042,15 @@ keywords = [
 ]
 
 [[rules]]
-chain = "铜薄"
-category = "铜薄"
+chain = "铜箔"
+category = "铜箔"
 priority = 100
-logic = "PCB 上游高端铜薄 (RTF / HVLP3) 国产替代 + AI 服务器高频需求"
-board_keyword = "铜薄"
+logic = "PCB 上游高端铜箔 (RTF / HVLP3) 国产替代 + AI 服务器高频需求"
+board_keyword = "铜箔"
 enabled = true
 keywords = [
-    "铜薄", "电解铜薄", "RTF铜薄", "HVLP3", "RTF", "HVLP", "高频铜薄",
-    "锂电铜薄", "PCB铜薄", "高频高速铜薄",
+    "铜箔", "电解铜箔", "RTF铜箔", "HVLP3", "RTF", "HVLP", "高频铜箔",
+    "锂电铜箔", "PCB铜箔", "高频高速铜箔",
     "铜冠铜箔", "诺德股份", "中一科技", "九江德福",
 ]
 

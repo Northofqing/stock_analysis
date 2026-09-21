@@ -518,6 +518,15 @@ impl NewsFlashGate {
                 None
             };
             if let Some(reason) = validation_error {
+                // 2026-09-21 (系统评估 §4.3): gate 层丢弃此前仅 log::warn!
+                // + continue, 无审计记录 (~11,300 条/月静默丢弃)。现在把
+                // 拒绝计数与原因写审计: event_bus 的 gate-rejection 审计
+                // 域, 失败可见性不改变 fail-closed 语义。
+                let _ = stock_analysis::event::record_gate_rejection(
+                    "news_flash_gate",
+                    reason,
+                    &e.event_id,
+                );
                 log::warn!(
                     "[NewsFlashGate][BR-137] source event rejected before critical and aggregate governance: {reason}"
                 );

@@ -1076,10 +1076,36 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
             "acquisition_audit_unavailable",
             error.retryable(),
         ),
+        // 2026-09-21 (系统评估 §4.2 + grpc_handoffs 上游回复修订版 4):
+        // 上游路由层 reason_code 显式映射 — 此前 catch-all 把「四路源
+        // 同时不可用」洗成不可重试的 "provider_error_mapping_missing"
+        // (9 月 4234/4262 次失败均为此)。retryable 由 error.retryable()
+        // 保真, 不再一律 false。
+        "provider_route_exhausted" => (
+            "provider_route_exhausted",
+            "provider_route_exhausted",
+            error.retryable(),
+        ),
+        "provider_route_stopped" => (
+            "provider_route_stopped",
+            "provider_route_stopped",
+            error.retryable(),
+        ),
+        "provider_response_invalid" => (
+            "provider_response_invalid",
+            "provider_response_invalid",
+            error.retryable(),
+        ),
+        "source_precondition_failed" => (
+            "source_precondition_failed",
+            "source_precondition_failed",
+            error.retryable(),
+        ),
+        "internal" => ("internal", "internal", error.retryable()),
         _ => (
             "provider_error_mapping_missing",
             "provider_error_mapping_missing",
-            false,
+            error.retryable(),
         ),
     }
 }
