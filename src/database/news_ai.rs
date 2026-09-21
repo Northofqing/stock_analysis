@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS news_ai_assessment (
 );
 CREATE INDEX IF NOT EXISTS idx_news_ai_assessment_source
     ON news_ai_assessment (
-        source_provider, source_item_id, target_code, analysis_version
+        source_provider, source_batch_id, source_item_id, target_code, analysis_version
     );
 
 CREATE TABLE IF NOT EXISTS news_ai_assessment_chain (
@@ -713,12 +713,9 @@ fn assessment_content_hash(
 
 fn core_assessment_id(source: &CanonicalSourceIdentity) -> String {
     let mut hasher = Sha256::new();
-    // 2026-09-21 (系统评估 §4.7, 修复 #3): 身份移除 source_batch_id —
-    // 每 120s 轮询产生新 batch_id 曾使同一条新闻每个 tick 被重新评估、
-    // 重新推送。同一 (provider, item, target, version) 现在跨批次去重;
-    // source_batch_id 仍落库 (审计列) 但不参与身份。
     for value in [
         source.source_provider.as_str(),
+        source.source_batch_id.as_str(),
         source.source_item_id.as_str(),
         source.target_code.as_str(),
         source.analysis_version.as_str(),
