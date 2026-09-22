@@ -141,9 +141,13 @@ fn main() {
                         continue;
                     }
                     None => {
-                        panic!(
-                            "统一行情网关日线不可用 (上游 gRPC 失败): {primary_error}; adaptive 回退同样失败: {code}"
+                        // 2026-09-22: 部分恢复期主路径逐码 flaky (部分 Baidu
+                        // 成功, 部分 no_verified_batch) — 双路失败按码跳过并
+                        // 出声, 不因单码失败废弃整批 (归因卡宁缺勿整缺).
+                        eprintln!(
+                            "[backfill] {code} 双路失败跳过: {primary_error}"
                         );
+                        continue;
                     }
                 }
             }
