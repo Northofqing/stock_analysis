@@ -57,3 +57,16 @@ decision 行), 成功后 counted Delivered 收口。NewsToIdea kind 的 policy �
   伴随 NewsAI 卡推送
 - durable DB delivery_decisions 当日 NewsToIdea 行 > 0
 - 预算满时 NewsAI 正确 RejectedDurable (不物理外发)
+
+## 2026-09-22 反查补充核实 (LimitBoards / Announcement 排除)
+
+- **LimitBoards (MU-limit-boards)**: counted dispatch 已接线
+  (main.rs:10512 push_limit_boards_counted ×3 shape), 今日零产出根因 =
+  竞价确认段 (9:20-9:25) 上游 LimitPools gRPC internal 全窗口失败
+  (竞价案), 非接线缺口。上游恢复日自然产出。
+- **S-01 公告 (MU-announcement)**: counted 接线在 source_fact 路径;
+  今日 pushed=0 根因 = 前置漏斗全滤 (100 条: 86 分类排除 + 13 受众
+  过滤 + 1 生命周期 + 87 已见重复去重), 无条目到达 push 段。属数据
+  依赖行为, 非接线缺口; 若后续「公告永远 0 推送」持续多日需查漏斗
+  分类是否过严 (单独排期)。
+- **T-03 重试**: 已修 (5f68f2f, 每码 3 次/日上限)。
