@@ -95,6 +95,19 @@ pub(super) fn record_to_market_event(
     event_hasher.update(record.item_id.as_bytes());
     let event_id = hex::encode(event_hasher.finalize());
     let stale = occurred_at.date_naive() != fetched_at.date_naive();
+    // 2026-09-22 判别日志 (上游回复要求, 9/20 排查指引 2 未落地项):
+    // fetched_at = record.observed_at (上游客证时刻), 非本机抓取时刻;
+    // batch source_at = 批次最新记录 published_at (合同), 与 stale 判定无关.
+    // 逐条打印被拒记录的三值, 供上游判别「旧条目混入新批次」还是「时间口径错位」.
+    if stale {
+        log::warn!(
+            "[NewsFlashStale][BR-166] provider={} item_id={} published_at={} observed_at={}",
+            provider.feed_name(),
+            record.item_id,
+            record.published_at.format("%Y-%m-%dT%H:%M:%S%.f%:z"),
+            record.observed_at.format("%Y-%m-%dT%H:%M:%S%.f%:z")
+        );
+    }
 
     Ok(MarketEvent {
         event_id,
