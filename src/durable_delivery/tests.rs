@@ -5663,10 +5663,11 @@ fn br214_daily_review_kinds_are_business_date_once() {
         );
     }
     assert_eq!(
-        POLICY_VERSION, 5,
+        POLICY_VERSION, 6,
         "BR-245: TomorrowWatch Global BusinessDateOnce budget-exempt policy changed \
          policy semantics, POLICY_VERSION must be bumped because it is decision_identity hash \
-         material (bumped 4 -> 5 on 2026-08-18)"
+         material (bumped 4 -> 5 on 2026-08-18; 5 -> 6 on 2026-09-22: PaperSell/PaperTrade \
+         budget exemption)"
     );
 }
 
@@ -5963,6 +5964,27 @@ fn news_catalyst_policy_is_global_rolling_600_and_budget_counted() {
 }
 
 #[test]
+fn paper_execution_kinds_are_budget_exempt_after_20260922_decision() {
+    // 2026-09-22 用户决策 (预算修正): PaperSell/PaperTrade = 交易执行确认,
+    // 豁免 30 槽日预算 (2026-09-22 事故: 止损潮 24 张 PaperSell 烧满全预算
+    // → T-03 持仓监控/盘中卡被 DailyBudgetFull 饿死). 8/13 复盘豁免同原理:
+    // 执行确认不被信息卡挤掉. 冷却语义不变 (PerTicket Rolling 300s).
+    for kind in [PushKind::PaperSell, PushKind::PaperTrade] {
+        let row = compiled_policy_catalog()
+            .into_iter()
+            .find(|row| row.push_kind == kind)
+            .expect("paper execution durable policy");
+        assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+        assert_eq!(row.window_mode, WindowMode::Rolling);
+        assert_eq!(row.base_cooldown_secs, Some(300));
+        assert!(
+            !row.counts_against_daily_budget,
+            "{kind:?} 应豁免日预算 (2026-09-22 决策)"
+        );
+    }
+}
+
+#[test]
 fn block_trade_confirm_policy_is_per_ticket_business_date_once_and_budget_exempt() {
     // 2026-09-20: BR-033 大宗盘中确认升级 counted — 名称含 Intraday 实际是
     // 19:00 盘后 review side route (BR-223), 每票每日一次历史成交记录;
@@ -6208,10 +6230,10 @@ fn news_flash_aggregated_policy_is_global_rolling_3600_and_budget_counted() {
 }
 
 #[test]
-fn paper_sell_policy_is_per_ticket_rolling_300_and_budget_counted() {
-    // 2026-09-20: 虚拟盘卖出升级 counted — 资金动作类计入预算
-    // (PaperTrade 先例); PerTicket Rolling 300s 镜像显式 L4
-    // (notify.rs:402 5 min/票)。
+fn paper_sell_policy_is_per_ticket_rolling_300_and_budget_exempt() {
+    // 2026-09-20: 虚拟盘卖出升级 counted — PerTicket Rolling 300s 镜像显式
+    // L4 (notify.rs:402 5 min/票)。2026-09-22 用户决策: 交易执行确认豁免
+    // 日预算 (止损潮烧满 30 槽 → T-03/盘中卡被饿死事故)。
     let row = compiled_policy_catalog()
         .into_iter()
         .find(|row| row.push_kind == PushKind::PaperSell)
@@ -6221,7 +6243,7 @@ fn paper_sell_policy_is_per_ticket_rolling_300_and_budget_counted() {
     assert_eq!(row.window_mode, WindowMode::Rolling);
     assert_eq!(row.sub_kind, DeliverySubKind::None);
     assert_eq!(row.base_cooldown_secs, Some(300));
-    assert!(row.counts_against_daily_budget);
+    assert!(!row.counts_against_daily_budget);
     assert_eq!(row.push_kind.stable_template_id(), "paper_sell_v1");
 }
 
@@ -7731,7 +7753,7 @@ fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows(
             "BusinessDateOnce".to_owned(),
             86_400,
             0,
-            5
+            6 // 2026-09-22: POLICY_VERSION 5→6 (PaperSell/PaperTrade 预算豁免)
         )
     );
     assert_eq!(

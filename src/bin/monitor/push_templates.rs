@@ -12201,12 +12201,25 @@ pub async fn dispatch_post_session_review(
     let observed_at = chrono::Local::now().fixed_offset();
     // BR-139/BR-194: account_required 任务在真实账户指标缺失时统一停在
     // typed AccountMetricsIncomplete 边界；不得调用 provider、renderer 或 sink。
+    // 2026-09-22 (评估 #12 后续): 完备性锚改为 banner.account_metrics_complete
+    // (用户确认快照 + 纸面账本, 与 AccountMode-hook 同源). 指标完整时 R-03
+    // 恢复真实 dispatch (legacy gate 不再结构不可达); 不完整时维持
+    // fail-closed typed 边界. R-02/R-05/R-06 (UnclassifiedConservative)
+    // 语义不变, 继续保守停在边界内.
+    let account_metrics_ok = crate::current_banner()
+        .map(|banner| banner.account_metrics_complete)
+        .unwrap_or(false);
     let mut account_required_outcomes = Vec::new();
     for task in &phases.account_required {
-        account_required_outcomes.push((
-            *task,
-            ReviewTaskOutcome::account_metrics_incomplete(observed_at),
-        ));
+        if account_metrics_ok && *task == ReviewTask::R03 {
+            let outcome = dispatch_r03_industry_chain_outcome(&date).await;
+            account_required_outcomes.push((*task, outcome));
+        } else {
+            account_required_outcomes.push((
+                *task,
+                ReviewTaskOutcome::account_metrics_incomplete(observed_at),
+            ));
+        }
     }
     if !account_required_outcomes.is_empty() {
         log::warn!(
@@ -14434,7 +14447,9 @@ mod tests_br140_r08_partial_components {
         assert!(followup_phase_start < account_phase_start);
         let account_phase = &dispatcher[account_phase_start..];
         assert!(account_phase.contains("ReviewTaskOutcome::account_metrics_incomplete"));
-        assert!(!account_phase.contains("dispatch_r03_industry_chain_outcome"));
+        // 2026-09-22 (评估 #12 后续): 指标完整时 account phase 恢复 R-03 真实
+        // dispatch (banner.account_metrics_complete 锚), fail-closed 边界保留.
+        assert!(account_phase.contains("dispatch_r03_industry_chain_outcome"));
     }
 
     #[test]
@@ -14464,8 +14479,13 @@ mod tests_br140_r08_partial_components {
         assert!(a01 < account);
         // BR-139/BR-194: R-03 is a LegacyAccountGate task. When account
         // metrics are incomplete the dispatcher must produce only the typed
-        // outcome; invoking R-03 would create provider/render/sink effects.
-        assert!(!dispatcher.contains("dispatch_r03_industry_chain_outcome"));
+        // outcome; 2026-09-22 (评估 #12 后续) metrics 完整时 (banner.account_metrics_complete)
+        // R-03 恢复真实 dispatch, 且只允许出现在 account phase 内 (在 account
+        // 锚之后, 不进入 BR-139 封闭的 source-only 初始相).
+        let r03_dispatch = dispatcher
+            .find("dispatch_r03_industry_chain_outcome")
+            .expect("R-03 dispatch call");
+        assert!(r03_dispatch > account);
         assert!(dispatcher[account..].contains("ReviewTaskOutcome::account_metrics_incomplete"));
     }
 

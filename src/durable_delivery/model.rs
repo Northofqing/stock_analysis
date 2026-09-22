@@ -20,7 +20,7 @@ pub const ENVELOPE_VERSION: i64 = 1;
 // BusinessDateOnce review delivery per business date and is budget-exempt;
 // the preceding business day's Accepted wall time cannot create a rolling
 // 86,400-second denial on the next business date.
-pub const POLICY_VERSION: i64 = 5;
+pub const POLICY_VERSION: i64 = 6;
 pub const DAILY_BUDGET_LIMIT: i64 = 30;
 pub(crate) const MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN: &str = "manual-delivery-accepted-audit-v1";
 
@@ -626,9 +626,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 映射为 kind-全局 3600s — 跨窗口互相阻塞 ≤1h 残余行为 (窗口间
         // 实际间隔小时级, 实践中无影响)。
         (NewsFlashAggregated, Global, Some(3_600), Rolling),
-        // 2026-09-20: 虚拟盘卖出升级 counted (MU-paper-sell 接线)。卖出
-        // 成交卡 = 资金动作类计入预算 (PaperTrade 先例, 不在豁免名单);
-        // PerTicket Rolling 300s 镜像显式 L4 (notify.rs:402 5 min/票)。
+        // 2026-09-20: 虚拟盘卖出升级 counted (MU-paper-sell 接线)。PerTicket
+        // Rolling 300s 镜像显式 L4 (notify.rs:402 5 min/票)。
+        // 2026-09-22 用户决策 (预算修正): 卖出成交卡 = 交易执行确认, 改为
+        // 豁免 30 槽日预算 (2026-09-22 事故: 止损潮 24 张 PaperSell 烧满
+        // 全预算 → T-03/盘中卡全被 DailyBudgetFull 饿死; 8/13 复盘豁免
+        // 同原理 — 执行确认不被信息卡挤掉)。
         (PaperSell, PerTicket, Some(300), Rolling),
         // 2026-09-20: S-06 实盘异常告警升级 counted (MU-market-action-
         // alert 接线)。账户安全告警 = 健康提醒类 → 豁免日预算 (账户异常
@@ -644,6 +647,8 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 接线)。盘中信息卡计入预算 (分流规则); Rolling 1800s 镜像旧
         // L4 默认 (无显式行, kind-全局 30 min)。
         (CandidateBoard, Global, Some(1_800), Rolling),
+        // 2026-09-22 用户决策 (预算修正): 买入成交卡 = 交易执行确认, 与
+        // PaperSell 同豁免 30 槽日预算 (执行确认不被信息卡挤掉).
         (PaperTrade, PerTicket, Some(300), Rolling),
         // BR-214: daily review deliveries are idempotent per business date, not per
         // rolling 24h window. Rolling anchors `blocked_until` at the previous
@@ -684,6 +689,9 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
             // BR-237 (2026-08-13): 复盘类 (BusinessDateOnce 每日必达) 豁免日预算,
             // 盘中信号类 (T0Advice/HoldingPlan/SectorTop 等) 继续竞争 30 槽。
             // 复盘推送永不被盘中信号挤掉 (8/13 饿死事故根因)。用户批准豁免方案。
+            // 2026-09-22 追加 (用户批准): PaperSell/PaperTrade 交易执行确认
+            // 同样豁免 (止损潮烧满预算 → 持仓监控/盘中卡被 DailyBudgetFull
+            // 饿死事故)。
             counts_against_daily_budget: !matches!(
                 push_kind,
                 PushKind::ReviewMarket
@@ -705,6 +713,8 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::DataMode
                     | PushKind::MarketActionAlert
                     | PushKind::AccountMode
+                    | PushKind::PaperSell
+                    | PushKind::PaperTrade
             ),
             policy_version: POLICY_VERSION,
         },
