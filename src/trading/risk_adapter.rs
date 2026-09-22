@@ -166,17 +166,18 @@ pub fn pre_trade_check(
     }
 
     // 4. DataMode
+    // 2026-09-22 用户决策: 买入不受账户模式限制; 数据降级不静默 —
+    // Degraded (行情可用, 仅辅助源缺失) 放行买入并在卡片/审计标注,
+    // Unsafe (行情本身不可信) 仍拒所有交易 (fail-closed 不变).
     match signal.risk_context.data_mode {
         DataMode::Full => {}
-        DataMode::Degraded if signal.direction == Direction::Buy => {
+        DataMode::Degraded => {
             log::warn!(
-                "[risk_adapter] 拒 {}({}): data_mode=Degraded 禁开仓",
+                "[risk_adapter] {} data_mode=Degraded 放行 (数据降级标注; direction={:?})",
                 signal.name,
-                signal.code
+                signal.direction
             );
-            return Err("data_mode=Degraded 禁开仓".to_string());
         }
-        DataMode::Degraded => {} // 允许减仓
         DataMode::Unsafe => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): data_mode=Unsafe 拒所有交易",
@@ -351,11 +352,11 @@ mod tests {
     // ---- 4. DataMode ----
 
     #[test]
-    fn rejects_buy_when_degraded() {
+    fn allows_buy_when_degraded_after_20260922_decision() {
+        // 2026-09-22 用户决策: Degraded (辅助源缺失) 放行买入, 卡片标注数据降级.
         let s = signal(AccountMode::Normal, DataMode::Degraded, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("Degraded"));
+        assert!(r.is_ok());
     }
 
     #[test]

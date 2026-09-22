@@ -1919,6 +1919,10 @@ pub fn render_paper_trade(p: PaperTradeParams<'_>) -> String {
         p.code,
         p.status.label(),
     );
+    // 2026-09-22 用户决策: 数据降级不静默 — 卡片显式标注数据问题.
+    if p.status == PaperTradeStatus::Filled && p.data_mode != DataMode::Full {
+        out.push_str(&format!("\n⚠️ 数据降级({})", p.data_mode.label()));
+    }
     if p.status == PaperTradeStatus::Filled {
         // W1.12 / B-010 P0-1: fill_price 缺失必须显式, 不允许 0.0 fallback
         let fill_price_str = match p.fill_price {
