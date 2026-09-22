@@ -152,24 +152,80 @@ pub fn fetch_attribution_close_prices(
         std::collections::HashMap::with_capacity(codes.len());
     for code in &codes {
         // 回拉窗口 5 天 (目标日=今天, 保证今日 bar 在返回区间内)。
-        let admitted = gateway
-            .required_daily_bars(code, 5)
-            .map_err(|error| format!("统一行情网关日线不可用 (上游 gRPC 失败): {error}"))?;
-        let bar = admitted
-            .records()
-            .iter()
-            .find(|k| k.date == today)
-            .ok_or_else(|| {
-                let dates: Vec<String> = admitted
+        // 主路径: gRPC HistoricalBars (fail-closed)。2026-09-22 实测该通道
+        // 全天 no_verified_batch → 归因日推整批丢失; 追加服务端 adaptive 链
+        // (OutcomeDailyBars op: TDX→腾讯→Sina→Baidu 回退, selection-v2 同源)
+        // 兜底, 与 9/3 R-07 tdx 日线回退同精神。
+        match gateway.required_daily_bars(code, 5) {
+            Ok(admitted) => {
+                let bar = admitted
                     .records()
                     .iter()
-                    .map(|k| k.date.to_string())
-                    .collect();
-                format!("{code}: 目标日 {today} 无日线记录 (可用: {})", dates.join(","))
-            })?;
-        prices.insert(code.clone(), bar.close);
+                    .find(|k| k.date == today)
+                    .ok_or_else(|| {
+                        let dates: Vec<String> = admitted
+                            .records()
+                            .iter()
+                            .map(|k| k.date.to_string())
+                            .collect();
+                        format!("{code}: 目标日 {today} 无日线记录 (可用: {})", dates.join(","))
+                    })?;
+                prices.insert(code.clone(), bar.close);
+            }
+            Err(primary_error) => match fetch_close_via_outcome_adaptive(code, today) {
+                Some(close) => {
+                    log::warn!(
+                        "[attribution] {code} HistoricalBars 主路径失败, adaptive 回退成功 close={close}: {primary_error}"
+                    );
+                    prices.insert(code.clone(), close);
+                }
+                None => {
+                    return Err(format!(
+                        "统一行情网关日线不可用 (上游 gRPC 失败): {primary_error}; adaptive 回退同样失败: {code}"
+                    ));
+                }
+            },
+        }
     }
     Ok(prices)
+}
+
+/// 2026-09-22 回退: 服务端 adaptive 日线链 (OutcomeDailyBars op)。
+///
+/// gRPC HistoricalBars 通道 fail-closed 无本地回退, 上游全窗口失败时
+/// 归因日推整批丢失 (9/22 实测)。OutcomeDailyBars op 由服务端执行
+/// TDX→腾讯→Sina→Baidu 的 adaptive transport, 同样走 gRPC 但服务端
+/// 侧有提供方回退 (今晨 Baidu accepted=5 实证可用)。
+fn fetch_close_via_outcome_adaptive(code: &str, today: chrono::NaiveDate) -> Option<f64> {
+    use stock_analysis::data_gateway::grpc_source::bridge_for;
+    use stock_analysis::market_domain::instrument::{AssetClass, Exchange, InstrumentId};
+    let bridge = bridge_for("OutcomeDailyBars").ok()?;
+    let (exchange, market) = match code.chars().next() {
+        Some('6') => (Exchange::Shanghai, "SH"),
+        Some('0') | Some('3') => (Exchange::Shenzhen, "SZ"),
+        Some('4') | Some('8') => (Exchange::Beijing, "BJ"),
+        _ => return None,
+    };
+    let instrument = InstrumentId::new(exchange, code.to_string(), AssetClass::Equity).ok()?;
+    let window_start = today - chrono::Duration::days(5);
+    let fetched = bridge
+        .outcome_daily_bars_adaptive(
+            instrument,
+            market.to_string(),
+            code.to_string(),
+            5,
+            5,
+            window_start,
+        )
+        .ok()?;
+    fetched
+        .batch
+        .records()
+        .iter()
+        .find(|bar| {
+            chrono::NaiveDate::parse_from_str(bar.bar_start(), "%Y-%m-%d").ok() == Some(today)
+        })
+        .map(|bar| bar.close().get())
 }
 
 /// BR-164 持仓实时行情：只消费统一 Magic provider Gateway。

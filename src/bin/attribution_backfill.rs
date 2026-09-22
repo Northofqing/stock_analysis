@@ -122,14 +122,32 @@ fn main() {
 
     // 统一网关 HistoricalDailyBars (fail-closed, 自带审计证据)。收盘后实时行情
     // 因 BR-217/218 五秒新鲜度门必挂, 故用日线收盘价 (与 R-13 复盘同源)。
+    // 2026-09-22 追加: 主路径失败时走服务端 adaptive 链 (OutcomeDailyBars op)
+    // 回退 (与 monitor market_data.rs 同语义)。
     let bars_gateway = HistoricalBarsGateway;
     let mut prices: HashMap<String, f64> = HashMap::new();
     for code in &codes {
         // 回拉窗口: 目标日距今 + 5 天缓冲 (保证目标日 bar 在返回区间内)。
         let days = (Local::now().date_naive() - date).num_days().max(0) as usize + 5;
-        let admitted = bars_gateway
-            .required_daily_bars(code, days)
-            .expect("统一行情网关日线不可用 (上游 gRPC 失败)");
+        let admitted = match bars_gateway.required_daily_bars(code, days) {
+            Ok(admitted) => admitted,
+            Err(primary_error) => {
+                match fetch_close_via_outcome_adaptive(code, date) {
+                    Some(close) => {
+                        eprintln!(
+                            "[backfill] {code} HistoricalBars 主路径失败, adaptive 回退成功 close={close}: {primary_error}"
+                        );
+                        prices.insert(code.clone(), close);
+                        continue;
+                    }
+                    None => {
+                        panic!(
+                            "统一行情网关日线不可用 (上游 gRPC 失败): {primary_error}; adaptive 回退同样失败: {code}"
+                        );
+                    }
+                }
+            }
+        };
         let bar = admitted
             .records()
             .iter()
@@ -211,4 +229,38 @@ fn fallback_positions() -> Vec<String> {
         .into_iter()
         .map(|position| position.code)
         .collect()
+}
+
+/// 2026-09-22 回退: 服务端 adaptive 日线链 (OutcomeDailyBars op), 与
+/// monitor market_data.rs 同语义 (TDX→腾讯→Sina→Baidu 服务端回退).
+fn fetch_close_via_outcome_adaptive(code: &str, target: chrono::NaiveDate) -> Option<f64> {
+    use stock_analysis::data_gateway::grpc_source::bridge_for;
+    use stock_analysis::market_domain::instrument::{AssetClass, Exchange, InstrumentId};
+    let bridge = bridge_for("OutcomeDailyBars").ok()?;
+    let (exchange, market) = match code.chars().next() {
+        Some('6') => (Exchange::Shanghai, "SH"),
+        Some('0') | Some('3') => (Exchange::Shenzhen, "SZ"),
+        Some('4') | Some('8') => (Exchange::Beijing, "BJ"),
+        _ => return None,
+    };
+    let instrument = InstrumentId::new(exchange, code.to_string(), AssetClass::Equity).ok()?;
+    let window_start = target - chrono::Duration::days(5);
+    let fetched = bridge
+        .outcome_daily_bars_adaptive(
+            instrument,
+            market.to_string(),
+            code.to_string(),
+            5,
+            5,
+            window_start,
+        )
+        .ok()?;
+    fetched
+        .batch
+        .records()
+        .iter()
+        .find(|bar| {
+            chrono::NaiveDate::parse_from_str(bar.bar_start(), "%Y-%m-%d").ok() == Some(target)
+        })
+        .map(|bar| bar.close().get())
 }
