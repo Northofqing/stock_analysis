@@ -37,6 +37,28 @@
 | 一致预期 | `Consensus`, `TargetPrices` | 报告数、机构数、预测分布和时间窗口 | 盈利预测与估值 |
 | 网页研究 | `SemanticSearch` | provider 精确匹配、每条 evidence 与批次一致、仅 ResearchOnly | R-11 研究上下文 |
 
+> ⚠️ **本表的「主要消费者」列不能反推复盘任务的单源 operation。**
+> 2026-09-22 上游据本表推断 `R-08 = MarketAnnouncements` 并据此定位故障，
+> 结果是错的 —— R-08 是**多源组合**任务，四个组件各自独立失败：
+>
+> | 组件 | provider | operation |
+> | --- | --- | --- |
+> | `R-08-announcements` | Cninfo | `MarketAnnouncements` |
+> | `R-08-cffex-delivery` | Cffex | `FuturesDelivery` |
+> | `R-08-global-indices` | Sina | — |
+> | `R-08-global-fx` | Sina | — |
+>
+> 定位 R-08 故障必须按组件读 `[R-08-<component>][BR-159]` 日志行。
+> 2026-09-22 19:00 批次 R-08 整任务 failed 的组件是 **`R-08-cffex-delivery`**
+> （`FuturesDelivery` 返回 internal，本仓 gate 归类 `invalid_evidence`）。
+
+> ⚠️ **已退役 operation：`EconomicCalendar`**。金十免费日历源 2025-12-01 退役，
+> 上游未准入，调用返回 `UNIMPLEMENTED` / `capability_unadmitted`。
+> 本仓仍有**构造**它的代码（`src/push_foundation/intent_store/chain_post_close_macro_*`），
+> 但该链**无生产调用者**（`src/bin/` 零引用），当前是休眠代码 —— 不是活跃故障。
+> 活跃的宏观上下文路径走 `GlobalNews`（`src/search_service/macro_news/legacy.rs:37`
+> 的 `bridge_for("GlobalNews")`）。**若将来启用 post-close macro 链，须先处理该 operation。**
+
 ## 板块、资金与盘后数据
 
 | 能力 | gRPC operation / 本地边界 | 本仓准入重点 |

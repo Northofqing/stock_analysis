@@ -86,3 +86,22 @@ decision 行), 成功后 counted Delivered 收口。NewsToIdea kind 的 policy �
   pub(crate) 同 crate 可用; 9/3 R-07 tdx 日线回退同精神), 或至少
   加 Baidu HistoricalDailyBars 兜底 (今晨 Baidu accepted=5 可用实证);
   另外 A-12 加交易日门 (非交易日不推模板块)
+
+### ⚠️ 2026-09-22 晚 上游回函推翻本节两处前提 — 修复方向须重做论证
+
+见 `grpc_handoffs/2026-09-22-review-upstream-failures-upstream-reply.md` §6（上游两遍实测）：
+
+1. **「Baidu accepted=5 可用实证」作废。** 上游以 6 个码 × 7 条路由连跑两遍，
+   Baidu 对**全部**码一律返回 `Unimplemented`（scope decline：交易日历 / 相邻交易日 /
+   公司行为连续性证据未证明），**不存在逐码状态**，两遍逐字一致。
+   ⇒ **「加 Baidu 兜底」这条处方的前提不成立，不得据此实现。**
+2. **「逐码 flaky」表述作废。** 每条路由的失败都是**确定性**的合同/准入事实：
+   Baidu=scope、HithinkFinance/EmQuant=请求形状（需显式日期）、**Tdx=解码失败**
+   （`FailedPrecondition [E2103] response length mismatch`，100% 可复现，上游已认领）。
+   ⇒ 不得按"flaky 重试"思路设计修复。
+3. **形状不匹配**：上游那张确定性矩阵用的是 `interval=Day, limit=5, 无 start/end`；
+   本仓该链路用的是**带显式 `window_start`/`window_end` 的形状**
+   （`src/data_gateway/historical_bars.rs:50`），**不在矩阵覆盖范围内**。
+   ⇒ 需请上游按带日期范围的形状重测后，再定修复方向。
+
+**结论：本节修复方向暂缓，等上游按正确形状复测后再论证。**
