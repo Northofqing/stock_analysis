@@ -270,11 +270,11 @@ mod tests {
     // ---- 1. AccountMode 拦截 ----
 
     #[test]
-    fn rejects_buy_when_reduceonly() {
+    fn allows_buy_when_reduceonly_after_20260922_decision() {
+        // 2026-09-22 用户决策: 账户模式完全解除, ReduceOnly 不再 gate 动作.
         let s = signal(AccountMode::ReduceOnly, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("ReduceOnly"));
+        assert!(r.is_ok());
     }
 
     #[test]
@@ -285,18 +285,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_buy_when_frozen() {
+    fn allows_buy_when_frozen_after_20260922_decision() {
+        // 2026-09-22 用户决策: 账户模式完全解除, Frozen 不再 gate 动作.
         let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
+        assert!(r.is_ok());
     }
 
     #[test]
-    fn rejects_sell_when_frozen() {
+    fn allows_sell_when_frozen_after_20260922_decision() {
+        // 2026-09-22 用户决策: 账户模式完全解除, Frozen 不再 gate 动作.
         let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Sell);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("Frozen"));
+        assert!(r.is_ok());
     }
 
     // ---- 2. 单票仓位硬线 ----
@@ -383,11 +384,12 @@ mod tests {
     // ---- 5. 优先级: account_mode 优先于其他 ----
 
     #[test]
-    fn account_mode_check_runs_first() {
+    fn account_mode_check_is_noop_after_20260922_decision() {
+        // 2026-09-22 用户决策: 账户模式完全解除 — authorize 恒 Allow,
+        // Frozen 不再拦截, 后续独立闸门 (仓位/现金/DataMode) 仍生效.
         let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("Frozen"));
+        assert!(r.is_ok());
     }
 
     // ---- 6. 非法账户状态必须 fail closed ----

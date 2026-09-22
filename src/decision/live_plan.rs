@@ -211,24 +211,23 @@ mod tests {
     // ---- 校验 1: ActionGate 失败 → Advice ----
 
     #[test]
-    fn frozen_mode_blocks_executable() {
+    fn frozen_mode_no_longer_blocks_executable() {
+        // 2026-09-22 用户决策: 账户模式完全解除, Frozen 不再 gate 动作.
         let mut inp = input_normal();
         inp.account_mode = AccountMode::Frozen;
         inp.action = ActionKind::OpenNew;
         let r = evaluate(&inp);
-        assert!(!r.is_executable());
-        if let LivePlanResult::Advice(a) = r {
-            assert!(a.downgrade_reason.unwrap().contains("Gate"));
-        }
+        assert!(r.is_executable());
     }
 
     #[test]
-    fn reduce_only_blocks_open_new() {
+    fn reduce_only_no_longer_blocks_open_new() {
+        // 2026-09-22 用户决策: 账户模式完全解除.
         let mut inp = input_normal();
         inp.account_mode = AccountMode::ReduceOnly;
         inp.action = ActionKind::OpenNew;
         let r = evaluate(&inp);
-        assert!(!r.is_executable());
+        assert!(r.is_executable());
     }
 
     #[test]
@@ -290,6 +289,7 @@ mod tests {
 
     #[test]
     fn multiple_failures_concatenate() {
+        // 2026-09-22 决策后: Gate 不再产生失败, 剩余校验 (Unsafe + 无股可卖) 仍串联.
         let mut inp = input_normal();
         inp.account_mode = AccountMode::Frozen;
         inp.data_mode = DataMode::Unsafe;
@@ -299,7 +299,7 @@ mod tests {
         assert!(!r.is_executable());
         if let LivePlanResult::Advice(a) = r {
             let reason = a.downgrade_reason.unwrap();
-            assert!(reason.contains("Gate"));
+            assert!(!reason.contains("Gate"), "2026-09-22 决策: Gate 不再 deny, reason={reason}");
             assert!(reason.contains("Unsafe"));
             assert!(reason.contains("无股可卖"));
         }

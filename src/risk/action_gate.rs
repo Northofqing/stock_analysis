@@ -108,7 +108,13 @@ impl GateResult {
     }
 }
 
-/// BR-022 权限矩阵: 6 动作 × 3 模式 = 18 格
+/// 2026-09-22 用户决策: **完全解除**账户模式对交易动作的 gate。
+///
+/// 背景: 模拟盘实验被实盘语义的熔断器自锁 (连续止损 4 笔 → ReduceOnly →
+/// 禁买入 → 无新卖出 → 计数永不清零 → 永续 ReduceOnly)。账户模式保留为
+/// 纯状态展示 (banner / T-01 卡 / L5 Frozen 推送拦截不受影响)。
+///
+/// 原 BR-022 权限矩阵 (保留供未来接真实券商时恢复):
 ///
 /// | Action       | Normal | ReduceOnly                | Frozen |
 /// |--------------|--------|---------------------------|--------|
@@ -118,34 +124,8 @@ impl GateResult {
 /// | Clear        | Allow  | Allow                     | Deny   |
 /// | T0Positive   | Allow  | Deny(只允许减仓)          | Deny   |
 /// | T0Reverse    | Allow  | Allow                     | Deny   |
-pub fn authorize(action: ActionKind, mode: AccountMode) -> GateResult {
-    use AccountMode::*;
-    use ActionKind::*;
-
-    match (action, mode) {
-        // ============ Normal: 全 Allow ============
-        (OpenNew, Normal)
-        | (Add, Normal)
-        | (Reduce, Normal)
-        | (Clear, Normal)
-        | (Hold, Normal)
-        | (T0Positive, Normal)
-        | (T0Reverse, Normal) => GateResult::Allow,
-
-        // ============ ReduceOnly ============
-        (OpenNew, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 禁止开新仓"),
-        (Add, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 禁止加仓"),
-        (T0Positive, ReduceOnly) => {
-            GateResult::Deny("账户降级 ReduceOnly, 只允许减仓, 不允许做T加仓")
-        }
-        (Reduce, ReduceOnly) => GateResult::Allow,
-        (Clear, ReduceOnly) => GateResult::Allow,
-        (Hold, ReduceOnly) => GateResult::Allow, // 持有观望永远允许
-        (T0Reverse, ReduceOnly) => GateResult::Allow, // 反T接回底仓允许 (v12.2 §2.3 显式)
-
-        // ============ Frozen: 全 Deny (含反T) ============
-        (_, Frozen) => GateResult::Deny("账户熔断 Frozen, 禁止任何新动作"),
-    }
+pub fn authorize(_action: ActionKind, _mode: AccountMode) -> GateResult {
+    GateResult::Allow
 }
 
 /// 便捷: 批量检查一个 mode 下所有 7 个 action (PR4-4.2 加 Hold)
@@ -163,164 +143,32 @@ pub fn authorize_all(mode: AccountMode) -> [(ActionKind, GateResult); 7] {
 mod tests {
     use super::*;
 
-    /// 18 格权限矩阵表驱动单测 — 必须与 v12 §2.3 矩阵逐格一致
+    /// 18 格权限矩阵表驱动单测 — 2026-09-22 用户决策后全格 Allow (完全解除),
+    /// 矩阵保留以锁定「模式不再 gate 动作」的语义 (恢复原矩阵见 authorize 注释).
     #[test]
-    fn matrix_all_18_cells() {
-        // 期望矩阵: Normal 全 Allow, ReduceOnly 大部分 Deny (除减仓类), Frozen 全 Deny
-        struct Expectation {
-            action: ActionKind,
-            mode: AccountMode,
-            allow: bool,
-            reason_contains: Option<&'static str>,
-        }
-        let matrix = [
-            // Normal (6 格全 Allow)
-            Expectation {
-                action: ActionKind::OpenNew,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::Add,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::Reduce,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::Clear,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::T0Positive,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::T0Reverse,
-                mode: AccountMode::Normal,
-                allow: true,
-                reason_contains: None,
-            },
-            // ReduceOnly (3 Deny + 3 Allow)
-            Expectation {
-                action: ActionKind::OpenNew,
-                mode: AccountMode::ReduceOnly,
-                allow: false,
-                reason_contains: Some("开新仓"),
-            },
-            Expectation {
-                action: ActionKind::Add,
-                mode: AccountMode::ReduceOnly,
-                allow: false,
-                reason_contains: Some("加仓"),
-            },
-            Expectation {
-                action: ActionKind::Reduce,
-                mode: AccountMode::ReduceOnly,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::Clear,
-                mode: AccountMode::ReduceOnly,
-                allow: true,
-                reason_contains: None,
-            },
-            Expectation {
-                action: ActionKind::T0Positive,
-                mode: AccountMode::ReduceOnly,
-                allow: false,
-                reason_contains: Some("只允许减仓"),
-            },
-            Expectation {
-                action: ActionKind::T0Reverse,
-                mode: AccountMode::ReduceOnly,
-                allow: true,
-                reason_contains: None,
-            },
-            // Frozen (6 格全 Deny)
-            Expectation {
-                action: ActionKind::OpenNew,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-            Expectation {
-                action: ActionKind::Add,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-            Expectation {
-                action: ActionKind::Reduce,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-            Expectation {
-                action: ActionKind::Clear,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-            Expectation {
-                action: ActionKind::T0Positive,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-            Expectation {
-                action: ActionKind::T0Reverse,
-                mode: AccountMode::Frozen,
-                allow: false,
-                reason_contains: Some("熔断"),
-            },
-        ];
-        assert_eq!(matrix.len(), 18, "18 格矩阵");
-        for e in &matrix {
-            let r = authorize(e.action, e.mode);
-            assert_eq!(
-                r.is_allow(),
-                e.allow,
-                "矩阵不一致: {:?} × {:?} 期望 {} 实得 {}",
-                e.action,
-                e.mode,
-                if e.allow { "Allow" } else { "Deny" },
-                if r.is_allow() { "Allow" } else { "Deny" }
-            );
-            if let Some(expected) = e.reason_contains {
-                let reason = r.blocked_reason().expect("Deny 必有 reason");
+    fn matrix_all_18_cells_allow_after_20260922_decision() {
+        for action in ActionKind::ALL {
+            for mode in AccountMode::ALL {
+                let r = authorize(action, mode);
                 assert!(
-                    reason.contains(expected),
-                    "{:?} × {:?} reason 不含 '{}', 实得 '{}'",
-                    e.action,
-                    e.mode,
-                    expected,
-                    reason
+                    r.is_allow(),
+                    "2026-09-22 决策: {:?} × {:?} 应 Allow (账户模式不再 gate 动作)",
+                    action,
+                    mode
                 );
             }
         }
     }
 
-    /// 专项: Frozen 下反T被 Deny (v12.2 §2.3 显式要求)
+    /// 专项: 2026-09-22 后 Frozen 不再 Deny 反T (原 v12.2 §2.3 要求已随
+    /// 完全解除决策废止; 原语义见 authorize 注释矩阵).
     #[test]
-    fn frozen_blocks_reverse_t() {
+    fn frozen_no_longer_blocks_reverse_t() {
         let r = authorize(ActionKind::T0Reverse, AccountMode::Frozen);
         assert!(
-            !r.is_allow(),
-            "Frozen 下反T必须 Deny (与 Normal/ReduceOnly 反T 行为区分)"
+            r.is_allow(),
+            "2026-09-22 决策: Frozen 下反T 也应 Allow (模式不再 gate 动作)"
         );
-        assert!(r.blocked_reason().unwrap().contains("熔断"));
     }
 
     /// 专项: ReduceOnly 反T放行 (v12.2 §2.3 显式要求)
@@ -330,15 +178,14 @@ mod tests {
         assert!(r.is_allow(), "ReduceOnly 下反T必须 Allow (接回底仓)");
     }
 
-    /// 专项: ReduceOnly 正T被 Deny (避免做T加仓扩大敞口)
+    /// 专项: 2026-09-22 后 ReduceOnly 不再 Deny 正T (完全解除决策).
     #[test]
-    fn reduce_only_blocks_positive_t() {
+    fn reduce_only_no_longer_blocks_positive_t() {
         let r = authorize(ActionKind::T0Positive, AccountMode::ReduceOnly);
         assert!(
-            !r.is_allow(),
-            "ReduceOnly 下正T必须 Deny (做T加仓违反降级精神)"
+            r.is_allow(),
+            "2026-09-22 决策: ReduceOnly 下正T 也应 Allow (模式不再 gate 动作)"
         );
-        assert!(r.blocked_reason().unwrap().contains("只允许减仓"));
     }
 
     /// GateResult API 行为
@@ -362,9 +209,14 @@ mod tests {
             assert!(r.is_allow(), "Normal 下 {:?} 应 Allow", a);
         }
 
+        // 2026-09-22 决策: 任意模式下全 Allow (完全解除).
         let result_frozen = authorize_all(AccountMode::Frozen);
         for (a, r) in result_frozen.iter() {
-            assert!(!r.is_allow(), "Frozen 下 {:?} 应 Deny", a);
+            assert!(
+                r.is_allow(),
+                "2026-09-22 决策: Frozen 下 {:?} 也应 Allow",
+                a
+            );
         }
     }
 
