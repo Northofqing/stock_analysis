@@ -70,3 +70,19 @@ decision 行), 成功后 counted Delivered 收口。NewsToIdea kind 的 policy �
   依赖行为, 非接线缺口; 若后续「公告永远 0 推送」持续多日需查漏斗
   分类是否过严 (单独排期)。
 - **T-03 重试**: 已修 (5f68f2f, 每码 3 次/日上限)。
+
+## 追加: 归因日推上游耦合 (用户 9/21 发现「只有模版没有数据」)
+
+- 现象 9/21: A-12 归因日推卡内容稀薄 (今日合计 666, 仅 1 个信号族行) —
+  周日 epoch 几乎无成交 + 上游价格链失败双重叠加
+- 现象 9/22: A-12 零推送 — `attribution_market_prices_unavailable`:
+  market_data.rs:157 用 `HistoricalBarsGateway::required_daily_bars`
+  = **gRPC bridge 专用, fail-closed 无回退** (historical_bars.rs:220-242
+  "绝不静默回退"), 今日上游 HistoricalBars no_verified_batch 全天挂
+- 对照: G5b 深链归因正常 (今日 3/3 Delivered, LLM 实数据) — 它不依赖
+  该价格网关
+- 修复方向: market_data.rs 的价格获取改走自适应多提供方链
+  (`OutcomeDailyBarsGateway.acquire`, TDX→腾讯→Sina→Baidu 回退,
+  pub(crate) 同 crate 可用; 9/3 R-07 tdx 日线回退同精神), 或至少
+  加 Baidu HistoricalDailyBars 兜底 (今晨 Baidu accepted=5 可用实证);
+  另外 A-12 加交易日门 (非交易日不推模板块)
