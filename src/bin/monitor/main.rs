@@ -11071,8 +11071,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             .filter(|m| !already_pushed.contains(&m.code))
                                             .collect();
                                         let mut confirmed = true;
-                                        let mut delivered_codes: Vec<String> = Vec::new();
-                                        let mut attempted_codes: Vec<String> = Vec::new();
+                                        // 2026-09-22: 进程级重试计数 (跨批次持久, 每码
+                                        // 每日最多 3 次失败尝试后记日推门放弃) — 修复
+                                        // 2026-09-21 尝试级记录的「一次拒绝=当日丢失」,
+                                        // 同时用上限防止每 tick 重试风暴复发.
+                                        static T03_RETRY_CAPS: std::sync::OnceLock<
+                                            std::sync::Mutex<std::collections::HashMap<String, u8>>,
+                                        > = std::sync::OnceLock::new();
                                         for prepared in pending {
                                             let token =
                                                 match crate::presentation_registry::acquire_token(
@@ -11110,24 +11115,34 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                     outcome
                                                 );
                                                 confirmed = false;
+                                                // 失败计数: <3 次 → 不记日推门, 下批重试;
+                                                // >=3 次 → 记录放弃 (防风暴).
+                                                let mut caps = T03_RETRY_CAPS
+                                                    .get_or_init(|| {
+                                                        std::sync::Mutex::new(
+                                                            std::collections::HashMap::new(),
+                                                        )
+                                                    })
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                let cap = caps.entry(prepared.code.clone()).or_insert(0);
+                                                *cap += 1;
+                                                if *cap >= 3 {
+                                                    log::warn!(
+                                                        "[T-03] code={} 连续 {} 次投递失败, 当日放弃重试",
+                                                        prepared.code,
+                                                        *cap
+                                                    );
+                                                    holding_plan_daily_record(today, &prepared.code);
+                                                }
                                             } else {
                                                 log::info!(
                                                     "[T-03] delivered code={} outcome={:?}",
                                                     prepared.code,
                                                     outcome
                                                 );
-                                                delivered_codes.push(prepared.code.clone());
+                                                holding_plan_daily_record(today, &prepared.code);
                                             }
-                                            attempted_codes.push(prepared.code.clone());
-                                        }
-                                        // 2026-09-21 修复: 记录当日已**尝试** (成功/拒绝均记) —
-                                        // 终态决策 (RejectedDurable, 审计拒绝) 重试只会回放
-                                        // 同一终态, 此前"仅成功记录"造成每 tick 重试 → 每日
-                                        // 256 次 ERROR 风暴 + durable 行膨胀。旧语义 (当日
-                                        // 一票一推) 由尝试级记录恢复; 瞬时 sink 失败由
-                                        // durable 层 retry_authorized 补偿, 次日周期自然重试。
-                                        for code in &attempted_codes {
-                                            holding_plan_daily_record(today, code);
                                         }
                                         if confirmed {
                                             last_holding_plan = std::time::Instant::now();
