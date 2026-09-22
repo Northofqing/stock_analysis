@@ -11495,7 +11495,24 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
 /// 由 render_r12 文本标注"不可回测" (用户已确认)。
 /// 研究窗口 = 近 30 自然日；网络拉取 + SQLite 读表在
 /// spawn_blocking 内；任一来源或结构失败均显式失败，不发布部分结果。
-const R12_TECHNICAL_BARS_PUBLISHED: bool = false;
+///
+/// BR-239 发布状态 (2026-09-22 用户决策「R-12 明天发布」): TechnicalBars
+/// 生产能力**已发布**, gate 放行真实 backtest。逃生口
+/// `R12_TECHNICAL_BARS_UNPUBLISH=1` 显式回退到未发布语义 (不物理外发,
+/// 状态机收口) — 只有精确 "1" 触发, 便于出问题时无需改代码即回滚。
+fn r12_technical_bars_published() -> bool {
+    r12_technical_bars_published_from(
+        std::env::var("R12_TECHNICAL_BARS_UNPUBLISH")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// 逃生子句独立成函以便测试注入: env 是进程全局的, 直接读会让并行测试
+/// 互相污染 (同 `paper_sell_paused` 的注入边界精神)。
+fn r12_technical_bars_published_from(unpublish: Option<&str>) -> bool {
+    !matches!(unpublish, Some("1"))
+}
 
 fn r12_has_auditable_result(result: &stock_analysis::review::backtest::R12BacktestResult) -> bool {
     !result.virtual_buy.is_empty()
@@ -11563,13 +11580,14 @@ mod tests_r12_review_audit {
 
 async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
     date: &str,
+    published: bool,
     runner: Runner,
 ) -> crate::review_batch::ReviewTaskOutcome
 where
     Runner: FnOnce(String) -> RunnerFuture,
     RunnerFuture: std::future::Future<Output = crate::review_batch::ReviewTaskOutcome>,
 {
-    if !R12_TECHNICAL_BARS_PUBLISHED {
+    if !published {
         let reason =
             "TechnicalBars production capability unpublished; provider_calls=0 loader_calls=0";
         log::warn!("[R-12][BR-239] disabled capability=TechnicalBars reason={reason}");
@@ -11580,9 +11598,11 @@ where
 }
 
 async fn dispatch_r12_backtest_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
-    dispatch_r12_backtest_outcome_with_runner(date, |owned_date| async move {
-        dispatch_r12_backtest_after_capability(&owned_date).await
-    })
+    dispatch_r12_backtest_outcome_with_runner(
+        date,
+        r12_technical_bars_published(),
+        |owned_date| async move { dispatch_r12_backtest_after_capability(&owned_date).await },
+    )
     .await
 }
 
@@ -15533,6 +15553,62 @@ pub async fn dispatch_r06_failure_real(_date: &str, _banner: &BannerCtx) -> bool
 mod tests_r_dispatchers {
     use super::*;
 
+    /// R-12 发布 (2026-09-22 用户决策「R-12 明天发布」): TechnicalBars 生产
+    /// 能力默认发布; 逃生口 `R12_TECHNICAL_BARS_UNPUBLISH=1` 显式回退到
+    /// BR-239 未发布语义。只有精确 "1" 触发回退。
+    #[test]
+    fn r12_technical_bars_published_by_default_with_unpublish_escape_hatch() {
+        assert!(
+            r12_technical_bars_published_from(None),
+            "R-12 TechnicalBars 默认应为已发布"
+        );
+        assert!(
+            !r12_technical_bars_published_from(Some("1")),
+            "R12_TECHNICAL_BARS_UNPUBLISH=1 应回退到未发布"
+        );
+        assert!(
+            r12_technical_bars_published_from(Some("0")),
+            "只有精确 \"1\" 才触发回退, \"0\" 不触发"
+        );
+        assert!(
+            r12_technical_bars_published_from(Some("")),
+            "空串不应触发回退"
+        );
+    }
+
+    /// 发布后 gate 放行: loader 实际被调用且不再返回 Disabled。
+    #[tokio::test]
+    async fn r12_published_technical_bars_runs_loader_instead_of_disabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&loader_calls);
+        let outcome = dispatch_r12_backtest_outcome_with_runner(
+            "2026-08-17",
+            true,
+            move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                crate::review_batch::ReviewTaskOutcome::no_data("TEST_CODE loader reached")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            loader_calls.load(Ordering::SeqCst),
+            1,
+            "发布后 loader 必须被调用一次"
+        );
+        assert!(
+            !matches!(
+                outcome,
+                crate::review_batch::ReviewTaskOutcome::Disabled { .. }
+            ),
+            "发布后不应返回 Disabled (BR-239 门已放行)"
+        );
+    }
+
+    /// BR-239 逃生口保留: published=false 时维持未发布语义, loader 不被调用。
     #[tokio::test]
     async fn br239_r12_unpublished_technical_bars_is_disabled_before_loader() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15540,14 +15616,17 @@ mod tests_r_dispatchers {
 
         let loader_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&loader_calls);
-        let outcome =
-            dispatch_r12_backtest_outcome_with_runner("2026-08-17", move |_| async move {
+        let outcome = dispatch_r12_backtest_outcome_with_runner(
+            "2026-08-17",
+            false,
+            move |_| async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 crate::review_batch::ReviewTaskOutcome::no_data(
                     "TEST_CODE loader unexpectedly called",
                 )
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
