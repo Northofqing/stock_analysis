@@ -909,11 +909,7 @@ pub(crate) fn require_external_capability(
 ) -> Result<(), GatewayError> {
     let operation = method.native_operation();
     let family = format!("{operation:?}");
-    require_external_capability_family(
-        capabilities,
-        &family,
-        std::slice::from_ref(&operation),
-    )
+    require_external_capability_family(capabilities, &family, std::slice::from_ref(&operation))
 }
 
 fn known_external_method(operation: ExternalOperation) -> ExternalMethod {
@@ -2701,6 +2697,14 @@ struct ExternalClientState {
     prepared: crate::grpc_client::client::PreparedExternalEndpoint,
 }
 
+fn market_announcements_request(trading_date: NaiveDate, limit: u32) -> (Operation, Value) {
+    let date = trading_date.format("%Y-%m-%d").to_string();
+    (
+        Operation::MarketAnnouncements,
+        serde_json::json!({"start": date, "end": date, "limit": limit}),
+    )
+}
+
 impl GrpcSource {
     #[cfg(test)]
     pub(crate) fn from_macro_loopback_test_client(client: GrpcMarketClient, addr: String) -> Self {
@@ -2958,12 +2962,7 @@ impl GrpcSource {
         diagnostic: Option<&str>,
     ) -> Option<GatewayError> {
         ConnectedBoardQueries::restore_directory_status(
-            profile,
-            request_id,
-            code,
-            details,
-            trailer,
-            diagnostic,
+            profile, request_id, code, details, trailer, diagnostic,
         )
     }
 
@@ -3357,6 +3356,29 @@ impl GrpcSource {
             .query_op(Operation::Announcements, serde_json::json!({}))
             .await?;
         convert::announcements(&q)
+    }
+
+    /// R-08 whole-market discovery. The single-security `Announcements` RPC
+    /// cannot represent a trading date without an instrument.
+    pub async fn market_announcements_async(
+        &self,
+        trading_date: NaiveDate,
+        limit: u32,
+    ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+        let (operation, params) = market_announcements_request(trading_date, limit);
+        let q = self.query_op(operation, params).await?;
+        let batch = convert::market_announcements(&q)?;
+        if batch.records().len() > limit as usize {
+            return Err(GatewayError::invalid_evidence(
+                "MarketAnnouncements",
+                Some(batch.evidence().provider),
+                format!(
+                    "market announcement record count {} exceeds requested limit {limit}",
+                    batch.records().len()
+                ),
+            ));
+        }
+        Ok(batch)
     }
 
     pub async fn global_news_async(
@@ -4107,6 +4129,17 @@ mod tests {
                         // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
 
     #[test]
+    fn br161_market_announcements_request_binds_business_date_and_limit_to_wire() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+        let (operation, params) = market_announcements_request(date, 300);
+        assert_eq!(operation, Operation::MarketAnnouncements);
+        assert_eq!(
+            params,
+            serde_json::json!({"start":"2026-09-22","end":"2026-09-22","limit":300})
+        );
+    }
+
+    #[test]
     fn br253_t0_order_book_requires_a_nonempty_all_record_batch() {
         assert!(complete_t0_batch_proves_order_book(7, 7, 0));
         assert!(!complete_t0_batch_proves_order_book(7, 6, 1));
@@ -4742,16 +4775,9 @@ mod tests {
     #[test]
     fn br238_external_capability_duplicate_rows_accept_ready_provider_in_either_order() {
         let method = known_external_method(ExternalOperation::GlobalNews);
-        let unadmitted = br238_external_capability_row(
-            "diagnostic",
-            ExternalAdmissionState::Unadmitted,
-            false,
-        );
-        let ready = br238_external_capability_row(
-            "ready",
-            ExternalAdmissionState::Admitted,
-            true,
-        );
+        let unadmitted =
+            br238_external_capability_row("diagnostic", ExternalAdmissionState::Unadmitted, false);
+        let ready = br238_external_capability_row("ready", ExternalAdmissionState::Admitted, true);
 
         for rows in [
             vec![ready.clone(), unadmitted.clone()],
@@ -4765,16 +4791,9 @@ mod tests {
     #[test]
     fn br238_external_capability_duplicate_rows_accept_later_runtime_provider() {
         let method = known_external_method(ExternalOperation::GlobalNews);
-        let runtime_unavailable = br238_external_capability_row(
-            "cold",
-            ExternalAdmissionState::Admitted,
-            false,
-        );
-        let ready = br238_external_capability_row(
-            "ready",
-            ExternalAdmissionState::Admitted,
-            true,
-        );
+        let runtime_unavailable =
+            br238_external_capability_row("cold", ExternalAdmissionState::Admitted, false);
+        let ready = br238_external_capability_row("ready", ExternalAdmissionState::Admitted, true);
 
         for rows in [
             vec![ready.clone(), runtime_unavailable.clone()],
@@ -4788,16 +4807,10 @@ mod tests {
     #[test]
     fn br238_external_capability_duplicate_failures_classify_across_all_rows() {
         let method = known_external_method(ExternalOperation::GlobalNews);
-        let unadmitted = br238_external_capability_row(
-            "diagnostic",
-            ExternalAdmissionState::Unadmitted,
-            false,
-        );
-        let runtime_unavailable = br238_external_capability_row(
-            "cold",
-            ExternalAdmissionState::Admitted,
-            false,
-        );
+        let unadmitted =
+            br238_external_capability_row("diagnostic", ExternalAdmissionState::Unadmitted, false);
+        let runtime_unavailable =
+            br238_external_capability_row("cold", ExternalAdmissionState::Admitted, false);
 
         for rows in [
             vec![runtime_unavailable.clone(), unadmitted.clone()],
@@ -4816,8 +4829,8 @@ mod tests {
             );
         }
 
-        let error = require_external_capability(&[], method)
-            .expect_err("an absent method remains missing");
+        let error =
+            require_external_capability(&[], method).expect_err("an absent method remains missing");
         assert_eq!(error.reason_code(), "external_capability_missing");
         assert!(!error.retryable());
         assert_eq!(
@@ -4844,11 +4857,7 @@ mod tests {
 
         let all_runtime_unavailable = [
             runtime_unavailable,
-            br238_external_capability_row(
-                "cold_two",
-                ExternalAdmissionState::Admitted,
-                false,
-            ),
+            br238_external_capability_row("cold_two", ExternalAdmissionState::Admitted, false),
         ];
         let error = require_external_capability(&all_runtime_unavailable, method)
             .expect_err("admitted rows without a runtime provider remain unavailable");

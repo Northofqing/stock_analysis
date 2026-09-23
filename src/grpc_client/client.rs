@@ -8,13 +8,12 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     market_event_service_client::MarketEventServiceClient as ExternalMarketEventServiceClient,
     system_service_client::SystemServiceClient as ExternalSystemServiceClient,
     CapabilitiesRequest as ExternalCapabilitiesRequest,
-    CapabilitiesResponse as ExternalCapabilitiesResponse, HealthRequest as ExternalHealthRequest,
+    CapabilitiesResponse as ExternalCapabilitiesResponse, EventCursor as ExternalEventCursor,
+    EventFilter as ExternalEventFilter, HealthRequest as ExternalHealthRequest,
     HealthResponse as ExternalHealthResponse,
-    EventCursor as ExternalEventCursor, EventFilter as ExternalEventFilter,
     ListenerStatusRequest as ExternalListenerStatusRequest,
     ListenerStatusResponse as ExternalListenerStatusResponse,
-    MarketEventEnvelope as ExternalMarketEventEnvelope,
-    RequestContext as ExternalRequestContext,
+    MarketEventEnvelope as ExternalMarketEventEnvelope, RequestContext as ExternalRequestContext,
     SetWatchlistRequest as ExternalSetWatchlistRequest,
     SetWatchlistResponse as ExternalSetWatchlistResponse,
     SubscribeRequest as ExternalSubscribeRequest,
@@ -55,14 +54,14 @@ mod external_control_attempt_tests;
 #[path = "external_control_loopback_fixture.rs"]
 pub(crate) mod external_control_loopback_fixture;
 #[cfg(test)]
-#[path = "external_query_wire_fixture.rs"]
-pub(crate) mod external_query_wire_fixture;
-#[cfg(test)]
 #[path = "external_mtls_attempt_tests.rs"]
 mod external_mtls_attempt_tests;
 #[cfg(test)]
 #[path = "external_native_control_tests.rs"]
 mod external_native_control_tests;
+#[cfg(test)]
+#[path = "external_query_wire_fixture.rs"]
+pub(crate) mod external_query_wire_fixture;
 #[path = "macro_attempt.rs"]
 pub(crate) mod macro_attempt;
 #[cfg(test)]
@@ -399,10 +398,8 @@ impl GrpcMarketClient {
         request_id: &str,
         response: &ExternalCapabilitiesResponse,
     ) -> Result<(), GrpcError> {
-        let catalog = external_control_attempt::validated_external_provider_catalog(
-            request_id,
-            response,
-        )?;
+        let catalog =
+            external_control_attempt::validated_external_provider_catalog(request_id, response)?;
         self.external_provider_catalog = Some(catalog);
         Ok(())
     }
@@ -413,10 +410,9 @@ impl GrpcMarketClient {
         request_id: &'a str,
     ) -> StatusErrorContext<'a> {
         match (method, self.external_provider_catalog.as_ref()) {
-            (
-                crate::grpc_contract::methods::MethodIdentity::External(method),
-                Some(catalog),
-            ) => StatusErrorContext::external_data(method, request_id, catalog),
+            (crate::grpc_contract::methods::MethodIdentity::External(method), Some(catalog)) => {
+                StatusErrorContext::external_data(method, request_id, catalog)
+            }
             _ => StatusErrorContext::data(method, request_id),
         }
     }
@@ -620,12 +616,14 @@ impl GrpcMarketClient {
             ProfileQueryRequest::Local(request) => {
                 let mut request = tonic::Request::new(request);
                 self.attach_request_auth(&mut request)?;
-                self.data_call_authorized(op, ProfileAuthorizedRequest::Local(request)).await
+                self.data_call_authorized(op, ProfileAuthorizedRequest::Local(request))
+                    .await
             }
             ProfileQueryRequest::External(request) => {
                 let mut request = tonic::Request::new(request);
                 self.attach_request_auth(&mut request)?;
-                self.data_call_authorized(op, ProfileAuthorizedRequest::External(request)).await
+                self.data_call_authorized(op, ProfileAuthorizedRequest::External(request))
+                    .await
             }
         };
         match outcome {
@@ -641,9 +639,11 @@ impl GrpcMarketClient {
                 parse_query_response(&request_id, op, response).map_err(GrpcError::from)
             }
             DataCallAuthorized::External(ExternalQueryCall::Response { message, evidence }) => {
-                let payload = evidence
-                    .payload()
-                    .ok_or_else(|| crate::grpc_client::external_query_transport::wire_error("external_response_wire_invalid"))?;
+                let payload = evidence.payload().ok_or_else(|| {
+                    crate::grpc_client::external_query_transport::wire_error(
+                        "external_response_wire_invalid",
+                    )
+                })?;
                 admit_external_payload(payload)?;
                 crate::grpc_client::envelope::parse_external_query_response(
                     &request_id,
@@ -698,6 +698,7 @@ impl GrpcMarketClient {
             Operation::MoneyFlows => data.money_flows(req).await,
             Operation::SecurityMetadata => data.security_metadata(req).await,
             Operation::Announcements => data.announcements(req).await,
+            Operation::MarketAnnouncements => data.market_announcements(req).await,
             Operation::GlobalNews => data.global_news(req).await,
             Operation::EconomicCalendar => data.economic_calendar(req).await,
             Operation::FuturesDelivery => data.futures_delivery(req).await,
@@ -1050,10 +1051,11 @@ pub(crate) fn build_native_profile_query_request(
         ContractProfile::LocalBridgeV1 => build_query_request(operation, payload)
             .map(ProfileQueryRequest::Local)
             .map_err(GrpcError::from),
-        ContractProfile::ExternalV1 =>
+        ContractProfile::ExternalV1 => {
             crate::grpc_client::external_v1::build_external_query_request(operation, payload)
                 .map(ProfileQueryRequest::External)
-                .map_err(map_external_contract_error),
+                .map_err(map_external_contract_error)
+        }
     }
 }
 
@@ -1177,6 +1179,34 @@ mod tests {
             }))
         }
 
+                async fn market_announcements(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+                    let inner = req.into_inner();
+                    let params: serde_json::Value = serde_json::from_slice(
+                        &inner.payload.ok_or_else(|| Status::invalid_argument("missing payload"))?.data,
+                    ).map_err(|_| Status::invalid_argument("invalid payload"))?;
+                    if params != serde_json::json!({"start":"2026-09-22","end":"2026-09-22","limit":300}) {
+                        return Err(Status::invalid_argument("market announcement request shape"));
+                    }
+                    Ok(Response::new(QueryResponse {
+                        request_id: inner.context.ok_or_else(|| Status::invalid_argument("missing context"))?.request_id,
+                        operation: Operation::MarketAnnouncements as i32,
+                        admission: AdmissionState::Admitted as i32,
+                        selected_provider: "Cninfo".into(),
+                        batch_id: "market-announcements-b1".into(),
+                        complete: true,
+                        observed_at: "2026-09-22T20:44:10+08:00".into(),
+                        source_at: "2026-09-22T20:44:10+08:00".into(),
+                        source: "cninfo-market".into(),
+                        diagnostic_blocker: String::new(),
+                        records: vec![CanonicalPayload {
+                            schema: "magic.market.market_announcements.batch".into(),
+                            schema_version: 1,
+                            content_type: "application/json; charset=utf-8".into(),
+                            data: b"[]".to_vec(),
+                        }],
+                    }))
+                }
+
                 // tonic 生成的 MarketDataService trait 共 60 个方法 (上游 55 + 本地扩展 5),
                 // 全部必须实现。这里只有 realtime_quotes 是真实桩; 其余 59 个
                 // (proto RPC 名 camelCase) 全部 unimplemented。
@@ -1207,7 +1237,6 @@ mod tests {
         company_filings,
         global_news,
         announcements,
-        market_announcements,
         investor_questions,
         policy_documents,
         security_profiles,
@@ -1287,6 +1316,22 @@ mod tests {
         assert_eq!(payload.schema, "market.realtime_quotes");
         let parsed: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
         assert_eq!(parsed[0]["code"], "600519");
+    }
+
+    #[tokio::test]
+    async fn query_market_announcements_sends_the_exact_business_request() {
+        let addr = spawn_mock().await;
+        let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
+        let result = client
+            .query(
+                Operation::MarketAnnouncements,
+                serde_json::json!({"start":"2026-09-22","end":"2026-09-22","limit":300}),
+            )
+            .await
+            .expect("whole-market request must reach the matching RPC");
+        assert_eq!(result.selected_provider, "Cninfo");
+        assert_eq!(result.batch_id, "market-announcements-b1");
+        assert!(result.complete);
     }
 
     #[tokio::test]
@@ -1418,17 +1463,17 @@ mod tests {
             Some("grpc-mtls:magic-market.local".to_string()),
         );
         let external_request = build_native_profile_query_request(
-                external.profile,
-                Operation::SecurityMetadata,
-                serde_json::json!({
-                    "instruments": [{
-                        "exchange": "Shanghai",
-                        "code": "600396",
-                        "asset_class": "Equity"
-                    }]
-                }),
-            )
-            .expect("delivered external request");
+            external.profile,
+            Operation::SecurityMetadata,
+            serde_json::json!({
+                "instruments": [{
+                    "exchange": "Shanghai",
+                    "code": "600396",
+                    "asset_class": "Equity"
+                }]
+            }),
+        )
+        .expect("delivered external request");
         let ProfileQueryRequest::External(external_request) = external_request else {
             panic!("external profile must build native external request")
         };
@@ -1438,11 +1483,11 @@ mod tests {
         );
 
         let invalid = build_native_profile_query_request(
-                external.profile,
-                Operation::SecurityMetadata,
-                serde_json::json!({"instruments": []}),
-            )
-            .expect_err("invalid external parameters must fail closed");
+            external.profile,
+            Operation::SecurityMetadata,
+            serde_json::json!({"instruments": []}),
+        )
+        .expect_err("invalid external parameters must fail closed");
         assert!(matches!(invalid, GrpcError::InvalidArgument { .. }));
 
         let undelivered = build_native_profile_query_request(
@@ -1450,7 +1495,7 @@ mod tests {
             Operation::RealtimeQuotes,
             serde_json::json!({}),
         )
-            .expect_err("undelivered external contract must not reach I/O");
+        .expect_err("undelivered external contract must not reach I/O");
         assert!(matches!(undelivered, GrpcError::Unimplemented { .. }));
     }
 

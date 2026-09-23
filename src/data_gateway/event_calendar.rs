@@ -38,9 +38,9 @@ impl EventCalendarGateway {
     ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
         let request_hash = acquisition_request_hash(CAPABILITY, format!("{trading_date}:{limit}"));
         // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
-        match super::grpc_source::bridge_for("Announcements") {
+        match super::grpc_source::bridge_for("MarketAnnouncements") {
             Ok(bridge) => {
-                let result = bridge.announcements_async().await;
+                let result = bridge.market_announcements_async(trading_date, limit).await;
                 let audit_provider = result
                     .as_ref()
                     .map(|b| b.evidence().provider)

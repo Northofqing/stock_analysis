@@ -2,7 +2,7 @@
 //! 调用方遇到未知 schema/version 必须停止解析, 不能忽略或猜字段)。
 //!
 //! 初始以 data_gateway 返回类型的 JSON 为准, 冻结 24 个生产 op,
-//! 后续扩展至 40 个（含本地扩展 op，见 ops.rs implemented_operations）；
+//! 后续扩展至 41 个（含本地扩展 op，见 ops.rs implemented_operations）；
 //! schema 名约定: "<域>.<数据族>", 版本从 1 起。
 use crate::grpc_client::pb::magic::market::v1::Operation;
 
@@ -47,6 +47,11 @@ const SCHEMAS: &[OpSchema] = &[
     OpSchema {
         operation: Operation::Announcements,
         schema_name: "news.announcements",
+        schema_version: 1,
+    },
+    OpSchema {
+        operation: Operation::MarketAnnouncements,
+        schema_name: "news.market_announcements",
         schema_version: 1,
     },
     OpSchema {
@@ -230,8 +235,8 @@ mod tests {
 
     #[test]
     fn every_implemented_op_has_frozen_schema() {
-        // 40 个已实现 op 全部有 schema (M1 扩展 + M4c ChainBatch + BR-251 BenchmarkBars)。
-        assert_eq!(SCHEMAS.len(), 40);
+        // 已实现 op 全部有冻结 schema，包括全市场公告发现。
+        assert_eq!(SCHEMAS.len(), 41);
         for op in crate::grpc_contract::ops::implemented_operations() {
             assert!(schema_for(op).is_some(), "op {op:?} 缺 schema");
         }

@@ -1402,9 +1402,44 @@ pub fn foreign_exchange(
 /// {"announcement_id","code","category","title","published_at","url"}。
 /// category 可空 (JSON null → None)。
 pub fn announcements(q: &QueryResult) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
-    let capability = "Announcements";
+    let records = parse_records(q, "Announcements")?;
+    announcement_records(q, "Announcements", records)
+}
+
+pub fn market_announcements(
+    q: &QueryResult,
+) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+    let records = parse_market_announcement_records(q)?;
+    announcement_records(q, "MarketAnnouncements", records)
+}
+
+fn parse_market_announcement_records(q: &QueryResult) -> Result<Vec<Value>, GatewayError> {
+    const CAPABILITY: &str = "MarketAnnouncements";
+    if !q.complete {
+        return Err(err(
+            CAPABILITY,
+            "响应 complete=false, 不得接纳 partial batch",
+        ));
+    }
+    let mut records = Vec::new();
+    for payload in &q.records {
+        let value: Value = serde_json::from_slice(&payload.data)
+            .map_err(|error| err(CAPABILITY, format!("records 非 JSON: {error}")))?;
+        match value {
+            Value::Object(_) => records.push(value),
+            Value::Array(rows) if rows.iter().all(Value::is_object) => records.extend(rows),
+            _ => return Err(err(CAPABILITY, "records 必须是公告对象或公告对象数组")),
+        }
+    }
+    Ok(records)
+}
+
+fn announcement_records(
+    q: &QueryResult,
+    capability: &'static str,
+    parsed: Vec<Value>,
+) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
     let ev = evidence_of(q, capability)?;
-    let parsed = parse_records(q, capability)?;
     if parsed.is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(ev));
     }
@@ -4188,9 +4223,7 @@ pub fn outcome_daily_bars(q: &QueryResult) -> Result<RawOutcomeFetch, OutcomeTra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc_client::envelope::{
-        AcquisitionProvenance, CanonicalRecord, QueryAdmission,
-    };
+    use crate::grpc_client::envelope::{AcquisitionProvenance, CanonicalRecord, QueryAdmission};
     use chrono::TimeZone;
 
     fn mk_q(data: &str, provider: &str, source: &str) -> QueryResult {
@@ -4210,6 +4243,40 @@ mod tests {
             provenance: AcquisitionProvenance::LocalWireSource(source.to_string()),
             diagnostic_blocker: String::new(),
         }
+    }
+
+    #[test]
+    fn market_announcements_accepts_per_record_payloads_and_verified_empty() {
+        let row = serde_json::json!({
+            "announcement_id": "A1",
+            "code": "600519",
+            "category": null,
+            "title": "公告",
+            "published_at": "2026-09-22T20:44:10+08:00",
+            "url": "https://example.com/A1"
+        });
+        let mut query = mk_q(&row.to_string(), "Cninfo", "cninfo-market");
+        let mut second_row = row.clone();
+        second_row["announcement_id"] = serde_json::json!("A2");
+        query.records.push(CanonicalRecord {
+            schema: "x".to_owned(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".to_owned(),
+            data: serde_json::json!([second_row]).to_string().into_bytes(),
+        });
+        let batch = market_announcements(&query).expect("逐条与数组 payload 可组成同一批次");
+        let GatewayBatch::Available { records, .. } = batch else {
+            panic!("nonempty batch must be available");
+        };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].announcement_id, "A1");
+        assert_eq!(records[1].announcement_id, "A2");
+
+        query.records.clear();
+        assert!(matches!(
+            market_announcements(&query),
+            Ok(GatewayBatch::VerifiedEmpty(_))
+        ));
     }
 
     fn benchmark_request() -> crate::data_gateway::BenchmarkRequest {

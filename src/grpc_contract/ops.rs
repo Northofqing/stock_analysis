@@ -73,7 +73,7 @@ pub fn method_name(op: Operation) -> &'static str {
     }
 }
 
-/// 生产实际用到的 40 个 op（含 BR-251 历史基准入口）。
+/// 生产实际用到的 41 个 op（含 BR-251 历史基准入口）。
 pub fn implemented_operations() -> Vec<Operation> {
     use Operation::*;
     vec![
@@ -84,6 +84,7 @@ pub fn implemented_operations() -> Vec<Operation> {
         MoneyFlows,
         SecurityMetadata,
         Announcements,
+        MarketAnnouncements,
         GlobalNews,
         EconomicCalendar,
         FuturesDelivery,
@@ -148,8 +149,8 @@ mod tests {
     }
 
     #[test]
-    fn implemented_set_is_40_and_within_62() {
-        assert_eq!(implemented_operations().len(), 40);
+    fn implemented_set_is_41_and_within_62() {
+        assert_eq!(implemented_operations().len(), 41);
         assert!(implemented_operations()
             .iter()
             .all(|op| !matches!(op, Operation::Unspecified)));
@@ -161,6 +162,7 @@ mod tests {
     #[test]
     fn realtime_quotes_is_implemented() {
         assert!(is_implemented(Operation::RealtimeQuotes));
+        assert!(is_implemented(Operation::MarketAnnouncements));
         assert!(!is_implemented(Operation::OptionData));
     }
 }
