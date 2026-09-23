@@ -1408,6 +1408,8 @@ pub enum Intent {
     Hold,
     /// 加仓
     Add,
+    /// 成本止损参考线触及后暂停加仓并核查风险
+    StopLossReview,
     /// 做T
     T0,
 }
@@ -1419,13 +1421,14 @@ impl Intent {
             Intent::Clear => "清仓",
             Intent::Hold => "持有观望",
             Intent::Add => "加仓",
+            Intent::StopLossReview => "止损核查",
             Intent::T0 => "做T",
         }
     }
 }
 
 /// T-03 持仓操作建议
-/// v12 §14.1 T-03 HoldingPlan 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
+/// T-03 HoldingPlan 模板渲染；价位由持仓成本计算，仅作为成本参考。
 pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) -> String {
     let hhmm = params.hhmm;
     let mut out = format!(
@@ -1447,7 +1450,7 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
         ));
     }
     out.push_str(&format!(
-        "\n支撑{} | 压力{} | 硬止损{}",
+        "\n成本参考价位: 下沿{} | 上沿{} | 止损线{}",
         fmt_price(params.support),
         fmt_price(params.pressure),
         fmt_price(params.stop),
@@ -20513,7 +20516,7 @@ mod tests {
         assert!(s.contains("动作倾向: 逢高减仓"));
         assert!(s.contains("现价12.30 成本11.80 可用3000股"));
         assert!(s.contains("减仓观察区: 12.45~12.60"));
-        assert!(s.contains("支撑11.95 | 压力12.70 | 硬止损11.95"));
+        assert!(s.contains("成本参考价位: 下沿11.95 | 上沿12.70 | 止损线11.95"));
         assert!(s.contains("· 跌破5日线且放量"));
         assert!(s.contains("· 板块热度转Fade"));
         assert!(s.contains("理由: 放量冲高回落; 主力净流出0.8亿"));
@@ -22087,6 +22090,7 @@ mod tests {
         assert_eq!(Intent::Clear.label(), "清仓");
         assert_eq!(Intent::Hold.label(), "持有观望");
         assert_eq!(Intent::Add.label(), "加仓");
+        assert_eq!(Intent::StopLossReview.label(), "止损核查");
         assert_eq!(Intent::T0.label(), "做T");
     }
 
@@ -25421,7 +25425,7 @@ mod tests {
 
     #[test]
     fn t03_text_exact_format() {
-        // T-03 持仓建议: 验证拼接输出与 v13-push-templates.md §14.1 T-03 模板逐行一致
+        // T-03 持仓建议: 验证动作、价位来源和免责声明。
         let s = render_holding_plan(
             &banner_normal(),
             HoldingPlanParams {
@@ -25445,7 +25449,7 @@ mod tests {
         assert!(s.contains("🎯 持仓建议 XX科技(TEST_CODE_000001)（13:42）"));
         assert!(s.contains("动作倾向: 逢高减仓"));
         assert!(s.contains("现价12.30 成本11.80 可用3000股"));
-        assert!(s.contains("支撑11.95 | 压力12.70 | 硬止损11.95"));
+        assert!(s.contains("成本参考价位: 下沿11.95 | 上沿12.70 | 止损线11.95"));
         assert!(s.ends_with("辅助建议, 非下单指令"));
     }
 

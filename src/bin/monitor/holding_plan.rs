@@ -45,7 +45,10 @@ pub(super) fn prepare_holding_plan_messages_with(
             continue;
         }
         let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
-        let intent = if pnl_pct > 5.0 {
+        let stop = item.cost_price * 0.92;
+        let intent = if quote.price <= stop {
+            push_templates::Intent::StopLossReview
+        } else if pnl_pct > 5.0 {
             push_templates::Intent::Reduce
         } else if pnl_pct < -3.0 {
             push_templates::Intent::Add
@@ -53,12 +56,15 @@ pub(super) fn prepare_holding_plan_messages_with(
             push_templates::Intent::Hold
         };
         let reason = match intent {
+            push_templates::Intent::StopLossReview => {
+                format!("浮亏 {pnl_pct:.1}% 已触及成本止损参考线，暂停加仓并核查风险")
+            }
             push_templates::Intent::Reduce => {
                 format!("浮盈 {pnl_pct:.1}% 触发减仓观察 (>+5%)")
             }
             push_templates::Intent::Add => format!("浮亏 {pnl_pct:.1}% 触发加仓观察 (<-3%)"),
             push_templates::Intent::Hold => format!("浮盈 {pnl_pct:.1}%, 持有观望区间"),
-            _ => unreachable!("T-03 只产出 Reduce/Add/Hold"),
+            _ => unreachable!("T-03 只产出 StopLossReview/Reduce/Add/Hold"),
         };
         let reasons = vec![reason];
         let text = push_templates::render_holding_plan(
@@ -71,10 +77,11 @@ pub(super) fn prepare_holding_plan_messages_with(
                 price: quote.price,
                 cost: item.cost_price,
                 avail: u32::try_from(item.quantity).unwrap_or(u32::MAX),
-                reduce_zone: Some((item.cost_price * 1.02, item.cost_price * 1.05)),
+                reduce_zone: (intent != push_templates::Intent::StopLossReview)
+                    .then_some((item.cost_price * 1.02, item.cost_price * 1.05)),
                 support: item.cost_price * 0.95,
                 pressure: item.cost_price * 1.10,
-                stop: item.cost_price * 0.92,
+                stop,
                 invalidations: &[],
                 reasons: &reasons,
             },
@@ -436,7 +443,38 @@ mod tests {
     }
 
     #[test]
-    fn hold_position_keeps_the_existing_fixed_example() {
+    fn loss_at_or_below_stop_suspends_adding_and_calls_for_review() {
+        for price in [9.19, 9.20] {
+            let prepared = prepare_holding_plan_messages_with(
+                &push_templates::BannerCtx::test_default(),
+                || {
+                    Ok(Some(snapshot_with(
+                        "TEST_CODE_AT_OR_BELOW_STOP",
+                        vec![position("000001", "止损核查票", 200, 10.0)],
+                    )))
+                },
+                |_| {
+                    Ok(quote_batch_with(
+                        vec![quote("000001", "止损核查票", price)],
+                        "TEST_CODE_AT_OR_BELOW_STOP_BATCH",
+                        Some("2026-09-10T09:29:58+08:00"),
+                    ))
+                },
+                now,
+            )
+            .expect("prepare at-or-below-stop holding plan");
+
+            assert_eq!(prepared.len(), 1, "price={price}");
+            assert_eq!(canonical(&prepared[0])["intent"], "止损核查");
+            assert!(prepared[0].text.contains("动作倾向: 止损核查"));
+            assert!(prepared[0].text.contains("成本参考价位"));
+            assert!(prepared[0].text.contains("暂停加仓并核查风险"));
+            assert!(!prepared[0].text.contains("减仓观察区"));
+        }
+    }
+
+    #[test]
+    fn hold_position_uses_cost_reference_levels() {
         let snapshot = snapshot_with(
             "TEST_CODE_HOLD",
             vec![position("600000", "持有票", u64::from(u32::MAX) + 1, 10.0)],
@@ -462,7 +500,7 @@ mod tests {
             .contains("现价10.00 成本10.00 可用4294967295股"));
         assert!(prepared[0]
             .text
-            .contains("支撑9.50 | 压力11.00 | 硬止损9.20"));
+            .contains("成本参考价位: 下沿9.50 | 上沿11.00 | 止损线9.20"));
     }
 
     #[test]
