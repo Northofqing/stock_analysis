@@ -43,6 +43,31 @@ pub fn net_return_pct(buy_price: f64, sell_price: f64, quantity: u64) -> f64 {
         * 100.0
 }
 
+/// Net return for a FIFO sale whose buy-side fee was allocated from its
+/// original buy fills. The sell-side fee is charged once for this sell fill.
+pub fn net_return_pct_with_allocated_buy_fee(
+    buy_notional: f64,
+    sell_notional: f64,
+    allocated_buy_fee: f64,
+) -> Result<f64, String> {
+    if !buy_notional.is_finite()
+        || buy_notional <= 0.0
+        || !sell_notional.is_finite()
+        || sell_notional <= 0.0
+        || !allocated_buy_fee.is_finite()
+        || allocated_buy_fee < 0.0
+    {
+        return Err("FIFO fee inputs must be finite and positive".to_owned());
+    }
+    let sell_fee = fill_adverse_cost(FillSide::Sell, sell_notional);
+    let result =
+        (sell_notional - buy_notional - allocated_buy_fee - sell_fee) / buy_notional * 100.0;
+    if !result.is_finite() {
+        return Err("FIFO net return is not finite".to_owned());
+    }
+    Ok(result)
+}
+
 /// 按成交行构建费率口径 FillCostLedger (喂 economic_position 引擎).
 ///
 /// `fills` = (fill_id, side, notional). basis_id 冻结口径版本:
@@ -117,5 +142,23 @@ mod tests {
         assert_eq!(ledger.costs.len(), 2);
         assert!((ledger.costs[0].adverse_cost - 5.0).abs() < 1e-9);
         assert!((ledger.costs[1].adverse_cost - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn three_buy_fills_charge_three_buy_commissions_on_one_sell() {
+        let ledger = lot_rate_fill_cost_ledger(&[
+            (1, FillSide::Buy, 1000.0),
+            (2, FillSide::Buy, 1000.0),
+            (3, FillSide::Buy, 1000.0),
+            (4, FillSide::Sell, 3000.0),
+        ])
+        .expect("four fill cost facts");
+        let buy_fee: f64 = ledger.costs[..3].iter().map(|cost| cost.adverse_cost).sum();
+        let total_fee: f64 = ledger.costs.iter().map(|cost| cost.adverse_cost).sum();
+        let net = net_return_pct_with_allocated_buy_fee(3000.0, 3000.0, buy_fee)
+            .expect("valid FIFO fee evidence");
+        assert!((buy_fee - 15.0).abs() < 1e-9);
+        assert!((total_fee - 23.0).abs() < 1e-9);
+        assert!((net + 23.0 / 3000.0 * 100.0).abs() < 1e-9, "net={net}");
     }
 }

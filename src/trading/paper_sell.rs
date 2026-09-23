@@ -27,7 +27,7 @@ use crate::database::paper_inventory_failure_audit::{
     PaperInventorySourceFact,
 };
 use crate::database::DatabaseManager;
-use crate::pipeline::position_tracker::{evaluate_sell_rules, SellEvaluation};
+use crate::pipeline::position_tracker::{evaluate_sell_rules_with_net_return, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
 use crate::trading::paper_lot_ledger::{
     parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill, PaperPositionInventory,
@@ -47,6 +47,8 @@ pub struct PaperPosition {
     pub quantity: i64,
     /// 可卖批次加权成本
     pub avg_buy_price: f64,
+    /// 每笔原始买入佣金按 FIFO 剩余可卖股数分摊的 Scenario 成本。
+    pub buy_fee_cost: f64,
     /// 最早可卖批次的买入日期
     pub first_buy_date: chrono::NaiveDate,
     /// 绑定评估日、成交身份与剩余批次的规范化审计证据。
@@ -60,7 +62,7 @@ pub struct PaperSellResult {
     pub name: String,
     pub quantity: i64,
     pub price: f64,
-    /// 净收益率（未扣往返交易成本，展示用）
+    /// 净收益率（逐笔买入成本分摊 + 本次卖出费用，Scenario 口径）
     pub return_rate_pct: f64,
     pub reason: String,
 }
@@ -251,6 +253,7 @@ fn project_sellable_positions(
             name: inventory.name,
             quantity: i64::from(inventory.sellable_quantity),
             avg_buy_price,
+            buy_fee_cost: inventory.sellable_buy_fee,
             first_buy_date,
             inventory_audit_evidence,
         });
@@ -574,6 +577,13 @@ fn evaluate_and_sell(
     })?;
 
     // 4. 四大铁律判定（BR-134 共用纯函数）
+    let buy_notional = pos.avg_buy_price * pos.quantity as f64;
+    let sell_notional = quote.price * pos.quantity as f64;
+    let net_pct = crate::performance::fee_evidence::net_return_pct_with_allocated_buy_fee(
+        buy_notional,
+        sell_notional,
+        pos.buy_fee_cost,
+    )?;
     let eval = SellEvaluation {
         code: &pos.code,
         name: &pos.name,
@@ -588,7 +598,7 @@ fn evaluate_and_sell(
         boll_macd: Some(&indicators.boll_macd),
         today,
     };
-    let Some(reason) = evaluate_sell_rules(&eval) else {
+    let Some(reason) = evaluate_sell_rules_with_net_return(&eval, net_pct) else {
         return Ok(None);
     };
 
@@ -602,13 +612,6 @@ fn evaluate_and_sell(
 
     // 6. 虚拟卖出（跌停/滑点判定 + INSERT paper_trades + order_audit）
     let gross_pct = (quote.price / pos.avg_buy_price - 1.0) * 100.0;
-    // 评估 #1: 卡片收益率由毛转净 (lot.rs 逐笔成本: 佣金最低5 + 印花税卖出侧).
-    let net_pct =
-        stock_analysis::performance::fee_evidence::net_return_pct(
-            pos.avg_buy_price,
-            quote.price,
-            pos.quantity as u64,
-        );
     if cancelled.load(Ordering::SeqCst) { return Ok(None); }
     let (cash, total, pos_pct) = io.portfolio_state(&pos.code, quote.price, cancelled)?;
     let signal = PaperSignal {
@@ -847,6 +850,7 @@ mod tests {
         // FIFO 卖出最老的 100 股后，剩余为 100@10 + 100@12。
         assert_eq!(pos.quantity, 200);
         assert_eq!(pos.avg_buy_price, 11.0);
+        assert!((pos.buy_fee_cost - 7.5).abs() < 1e-9);
         assert_eq!(
             pos.first_buy_date,
             chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap()
@@ -905,6 +909,7 @@ mod tests {
 
         assert_eq!(position.quantity, 200);
         assert_eq!(position.avg_buy_price, 10.0);
+        assert!((position.buy_fee_cost - 5.0).abs() < 1e-9);
         assert_eq!(position.first_buy_date, date(2026, 8, 3));
     }
 

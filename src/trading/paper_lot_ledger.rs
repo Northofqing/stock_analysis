@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
+use crate::performance::fee_evidence::{fill_adverse_cost, FillSide};
+
 /// 解析持久化纸面成交的规范时间。禁止 SQLite/调用方把 `now`、仅日期或仅时间
 /// 补造成事实；执行账本与策略研究共用同一严格边界。
 pub(crate) fn parse_paper_fill_timestamp(
@@ -46,6 +48,8 @@ pub(crate) struct PaperPositionInventory {
     pub sellable_quantity: u32,
     pub locked_quantity: u32,
     pub sellable_avg_price: Option<f64>,
+    /// Scenario buy-side fees allocated from each original fill to its open sellable shares.
+    pub sellable_buy_fee: f64,
     pub earliest_sellable_date: Option<chrono::NaiveDate>,
     as_of_date: chrono::NaiveDate,
     source_fill_ids: Vec<i64>,
@@ -65,9 +69,10 @@ impl PaperPositionInventory {
             .iter()
             .map(|lot| {
                 format!(
-                    "{}@{}@{}@{:016x}@{}",
+                    "{}@{}@{}@{}@{:016x}@{}",
                     lot.buy_fill_id,
                     lot.bought_at.format("%Y-%m-%dT%H:%M:%S%.9f"),
+                    lot.original_quantity,
                     lot.remaining_quantity,
                     lot.price.to_bits(),
                     if lot.sellable { "sellable" } else { "locked" }
@@ -80,8 +85,8 @@ impl PaperPositionInventory {
             |price| format!("{:016x}", price.to_bits()),
         );
         format!(
-            "BR134_FIFO_V1;as_of={};source_fill_ids={source_fill_ids};open_lots={open_lots};sellable_quantity={};locked_quantity={};sellable_avg_price_bits={sellable_avg_price_bits}",
-            self.as_of_date, self.sellable_quantity, self.locked_quantity
+            "BR134_FIFO_V2;as_of={};source_fill_ids={source_fill_ids};open_lots={open_lots};sellable_quantity={};locked_quantity={};sellable_avg_price_bits={sellable_avg_price_bits};fee_basis=lot-rates-v1;sellable_buy_fee_bits={:016x}",
+            self.as_of_date, self.sellable_quantity, self.locked_quantity, self.sellable_buy_fee.to_bits()
         )
     }
 }
@@ -90,6 +95,7 @@ impl PaperPositionInventory {
 struct PaperLotAuditEvidence {
     buy_fill_id: i64,
     bought_at: chrono::NaiveDateTime,
+    original_quantity: u32,
     remaining_quantity: u32,
     price: f64,
     sellable: bool,
@@ -99,6 +105,7 @@ struct PaperLotAuditEvidence {
 struct OpenPaperLot {
     buy_fill_id: i64,
     bought_at: chrono::NaiveDateTime,
+    original_quantity: u32,
     remaining_quantity: u32,
     price: f64,
 }
@@ -169,6 +176,7 @@ pub(crate) fn rebuild_paper_positions(
             "buy" => state.lots.push_back(OpenPaperLot {
                 buy_fill_id: fill.id,
                 bought_at: fill.occurred_at,
+                original_quantity: quantity,
                 remaining_quantity: quantity,
                 price,
             }),
@@ -231,6 +239,7 @@ fn inventory_from_state(
     let mut sellable_quantity = 0_u32;
     let mut locked_quantity = 0_u32;
     let mut sellable_cost = 0.0_f64;
+    let mut sellable_buy_fee = 0.0_f64;
     let mut earliest_sellable_date = None;
     let mut open_lots = Vec::with_capacity(lots.len());
 
@@ -247,6 +256,18 @@ fn inventory_from_state(
             if !sellable_cost.is_finite() {
                 return Err(format!("paper position {code} sellable cost invalid"));
             }
+            let original_notional = lot.price * f64::from(lot.original_quantity);
+            if !original_notional.is_finite() {
+                return Err(format!(
+                    "paper position {code} original buy notional invalid"
+                ));
+            }
+            sellable_buy_fee += fill_adverse_cost(FillSide::Buy, original_notional)
+                * f64::from(lot.remaining_quantity)
+                / f64::from(lot.original_quantity);
+            if !sellable_buy_fee.is_finite() {
+                return Err(format!("paper position {code} allocated buy fee invalid"));
+            }
             earliest_sellable_date = Some(
                 earliest_sellable_date.map_or(bought_date, |current: chrono::NaiveDate| {
                     current.min(bought_date)
@@ -255,6 +276,7 @@ fn inventory_from_state(
             open_lots.push(PaperLotAuditEvidence {
                 buy_fill_id: lot.buy_fill_id,
                 bought_at: lot.bought_at,
+                original_quantity: lot.original_quantity,
                 remaining_quantity: lot.remaining_quantity,
                 price: lot.price,
                 sellable: true,
@@ -266,6 +288,7 @@ fn inventory_from_state(
             open_lots.push(PaperLotAuditEvidence {
                 buy_fill_id: lot.buy_fill_id,
                 bought_at: lot.bought_at,
+                original_quantity: lot.original_quantity,
                 remaining_quantity: lot.remaining_quantity,
                 price: lot.price,
                 sellable: false,
@@ -296,6 +319,7 @@ fn inventory_from_state(
         sellable_quantity,
         locked_quantity,
         sellable_avg_price,
+        sellable_buy_fee,
         earliest_sellable_date,
         as_of_date,
         source_fill_ids,
@@ -338,6 +362,7 @@ mod tests {
         assert_eq!(positions[0].sellable_quantity, 200);
         assert_eq!(positions[0].locked_quantity, 100);
         assert_eq!(positions[0].sellable_avg_price, Some(10.0));
+        assert!((positions[0].sellable_buy_fee - 5.0).abs() < 1e-9);
         assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
     }
 
@@ -352,7 +377,7 @@ mod tests {
 
         assert_eq!(
             positions[0].audit_evidence(),
-            "BR134_FIFO_V1;as_of=2026-08-05;source_fill_ids=1,2;open_lots=1@2026-08-03T10:00:00.000000000@200@4024000000000000@sellable|2@2026-08-05T10:00:00.000000000@100@4028000000000000@locked;sellable_quantity=200;locked_quantity=100;sellable_avg_price_bits=4024000000000000"
+            "BR134_FIFO_V2;as_of=2026-08-05;source_fill_ids=1,2;open_lots=1@2026-08-03T10:00:00.000000000@200@200@4024000000000000@sellable|2@2026-08-05T10:00:00.000000000@100@100@4028000000000000@locked;sellable_quantity=200;locked_quantity=100;sellable_avg_price_bits=4024000000000000;fee_basis=lot-rates-v1;sellable_buy_fee_bits=4014000000000000"
         );
     }
 
@@ -370,7 +395,29 @@ mod tests {
         assert_eq!(positions[0].sellable_quantity, 200);
         assert_eq!(positions[0].locked_quantity, 0);
         assert_eq!(positions[0].sellable_avg_price, Some(11.0));
+        assert!((positions[0].sellable_buy_fee - 7.5).abs() < 1e-9);
         assert_eq!(positions[0].earliest_sellable_date, Some(date(2026, 8, 3)));
+    }
+
+    #[test]
+    fn three_buy_lots_keep_three_commission_floors_for_one_sell() {
+        let fills = vec![
+            fill(1, "buy", 10.0, 100, "2026-08-03 10:00:00"),
+            fill(2, "buy", 10.0, 100, "2026-08-03 10:01:00"),
+            fill(3, "buy", 10.0, 100, "2026-08-03 10:02:00"),
+        ];
+        let position = rebuild_paper_positions(&fills, date(2026, 8, 4))
+            .expect("three valid buy fills")
+            .remove(0);
+        assert_eq!(position.sellable_quantity, 300);
+        assert!((position.sellable_buy_fee - 15.0).abs() < 1e-9);
+        let net = crate::performance::fee_evidence::net_return_pct_with_allocated_buy_fee(
+            position.sellable_avg_price.unwrap() * f64::from(position.sellable_quantity),
+            3000.0,
+            position.sellable_buy_fee,
+        )
+        .expect("valid FIFO net return");
+        assert!((net + 23.0 / 3000.0 * 100.0).abs() < 1e-9);
     }
 
     #[test]

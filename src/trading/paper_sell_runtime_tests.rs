@@ -19,6 +19,7 @@ impl PaperSellReadIo for SlowQuoteReadIo {
                 name: code.to_owned(),
                 quantity: 100,
                 avg_buy_price: 10.0,
+                buy_fee_cost: 5.0,
                 first_buy_date: today.pred_opt().expect("fixture previous date"),
                 inventory_audit_evidence: "TEST_CODE_UNUSED_NO_QUOTE".to_owned(),
             })
@@ -174,6 +175,7 @@ impl PaperSellReadIo for SaleReadIo {
                 name: suffix.to_owned(),
                 quantity: 100,
                 avg_buy_price: 10.0,
+                buy_fee_cost: 5.0,
                 first_buy_date: today.pred_opt().unwrap(),
                 inventory_audit_evidence: "BR134_FIFO_V1;TEST_CODE_IN_MEMORY".to_owned(),
             })

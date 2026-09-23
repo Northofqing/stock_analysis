@@ -191,7 +191,21 @@ pub struct SellEvaluation<'a> {
 ///
 /// T+1 锁仓（buy_date == today）不在此函数内判定，由调用方检查。
 pub fn evaluate_sell_rules(e: &SellEvaluation<'_>) -> Option<String> {
-    let return_rate = net_return_rate(e.buy_price, e.current_price, e.quantity);
+    evaluate_sell_rules_with_net_return(
+        e,
+        net_return_rate(e.buy_price, e.current_price, e.quantity),
+    )
+}
+
+/// Use a caller's fill-backed net return for the percentage-based sell rules.
+/// Paper inventory supplies this after allocating each original buy fee by FIFO.
+pub fn evaluate_sell_rules_with_net_return(
+    e: &SellEvaluation<'_>,
+    return_rate: f64,
+) -> Option<String> {
+    if !return_rate.is_finite() {
+        return None;
+    }
     let hold_days = (e.today - e.buy_date).num_days();
 
     // P0-2: ATR 动态止损替代硬编码 8%
@@ -1289,6 +1303,39 @@ mod tests {
         assert!(
             evaluate_sell_rules(&eval).is_some(),
             "小仓位逐笔成本应让止损更早触发"
+        );
+    }
+
+    #[test]
+    fn paper_sell_rule_uses_costed_fifo_return_at_profit_threshold() {
+        use super::{evaluate_sell_rules, evaluate_sell_rules_with_net_return, SellEvaluation};
+        let today = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let eval = SellEvaluation {
+            code: "TEST_CODE_600000",
+            name: "测试",
+            buy_price: 10.0,
+            buy_date: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+            current_price: 12.05,
+            quantity: 300,
+            ma5: Some(12.10),
+            ma20: None,
+            ma60: None,
+            atr: None,
+            boll_macd: None,
+            today,
+        };
+        assert!(
+            evaluate_sell_rules(&eval).is_some(),
+            "one aggregated buy clears 20%"
+        );
+        let costed_return_pct =
+            crate::performance::fee_evidence::net_return_pct_with_allocated_buy_fee(
+                3000.0, 3615.0, 15.0,
+            )
+            .expect("three buy fees");
+        assert!(
+            evaluate_sell_rules_with_net_return(&eval, costed_return_pct).is_none(),
+            "three actual buy commissions keep net profit below 20%"
         );
     }
 }
