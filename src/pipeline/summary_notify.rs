@@ -107,7 +107,8 @@ pub(super) async fn send_summary_notification_to(
     notifier.save_report_to_dir(&artifacts.report, &artifacts.filename, output_dir)?;
 
     match notifier.send(&artifacts.report).await {
-        Ok(_) => info!("✓ 股票分析报告推送成功"),
+        Ok(true) => info!("✓ 股票分析报告推送成功"),
+        Ok(false) => error!("股票分析报告推送失败：所有渠道均未成功"),
         Err(e) => error!("推送通知失败: {}", e),
     }
 

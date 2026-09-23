@@ -1,7 +1,7 @@
 //! Registered business rules: BR-162, BR-213.
 //! 三种运行模式：单次分析 / 仅大盘复盘 / 龙虎榜选股分析。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use log::info;
 use stock_analysis::config;
@@ -173,13 +173,32 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     info!("产业链联动分析报告已保存: {}", path);
 
     if send_notify {
-        match notifier.send(&report).await {
-            Ok(true) => info!("产业链联动分析报告已推送"),
-            Ok(false) => log::warn!("产业链联动分析报告推送失败（所有渠道均未成功）"),
-            Err(e) => log::warn!("产业链联动分析报告推送异常: {}", e),
-        }
+        require_chain_notification_success(notifier.send(&report).await)?;
     }
     Ok(())
+}
+
+fn require_chain_notification_success(result: Result<bool>) -> Result<()> {
+    match result.context("产业链联动分析报告推送异常")? {
+        true => {
+            info!("产业链联动分析报告已推送");
+            Ok(())
+        }
+        false => anyhow::bail!("产业链联动分析报告推送失败（所有渠道均未成功）"),
+    }
+}
+
+#[cfg(test)]
+mod tests_chain_delivery {
+    use super::require_chain_notification_success;
+
+    #[test]
+    fn failed_chain_send_keeps_the_scheduled_run_retryable() {
+        assert!(require_chain_notification_success(Ok(true)).is_ok());
+        assert!(require_chain_notification_success(Ok(false)).is_err());
+        assert!(require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
+            .is_err());
+    }
 }
 
 /// 龙虎榜选股分析模式。
