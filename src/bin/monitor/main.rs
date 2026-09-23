@@ -1682,8 +1682,22 @@ fn evaluated_data_health() -> Result<stock_analysis::monitor::data_mode::DataHea
     Ok(dm_evaluate(&input, None))
 }
 
+struct AccountModeMetricsBatch {
+    metrics: stock_analysis::risk::account_mode::PortfolioMetrics,
+    account_fact: Option<push_templates::AccountSnapshotFact>,
+}
+
+impl AccountModeMetricsBatch {
+    fn incomplete() -> Self {
+        Self {
+            metrics: stock_analysis::risk::account_mode::PortfolioMetrics::incomplete(),
+            account_fact: None,
+        }
+    }
+}
+
 fn build_banner(
-    am_metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
+    batch: &AccountModeMetricsBatch,
     account_mode: stock_analysis::risk::action_gate::AccountMode,
     data_health: &stock_analysis::monitor::data_mode::DataHealth,
 ) -> push_templates::BannerCtx {
@@ -1716,9 +1730,10 @@ fn build_banner(
 
     push_templates::BannerCtx {
         account_mode,
-        total_pos: am_metrics.total_pos_cheng,
-        today_pnl: am_metrics.today_pnl_pct,
-        account_metrics_complete: am_metrics.is_complete(),
+        total_pos: batch.metrics.total_pos_cheng,
+        today_pnl: batch.metrics.today_pnl_pct,
+        account_metrics_complete: batch.metrics.is_complete(),
+        account_fact: batch.account_fact.clone(),
         data_mode,
         data_missing_note,
     }
@@ -1726,7 +1741,7 @@ fn build_banner(
 
 #[cfg(test)]
 mod tests_account_banner_values {
-    use super::build_banner;
+    use super::{build_banner, current_day_pnl_pct, push_templates, AccountModeMetricsBatch};
     use stock_analysis::monitor::data_mode::{DataHealth, DataMode};
     use stock_analysis::risk::account_mode::PortfolioMetrics;
     use stock_analysis::risk::action_gate::AccountMode;
@@ -1776,7 +1791,14 @@ mod tests_account_banner_values {
                 prev_mode: None,
                 eta: None,
             };
-            let banner = build_banner(&metrics, account_mode, &data_health);
+            let banner = build_banner(
+                &AccountModeMetricsBatch {
+                    metrics,
+                    account_fact: None,
+                },
+                account_mode,
+                &data_health,
+            );
 
             assert_eq!(banner.total_pos, total_pos);
             assert_eq!(banner.today_pnl, today_pnl);
@@ -1784,6 +1806,65 @@ mod tests_account_banner_values {
             assert_eq!(banner.account_mode.label(), account_mode_label);
             assert_eq!(banner.data_mode.label(), data_mode.label());
         }
+    }
+
+    #[test]
+    fn build_banner_carries_the_metric_snapshots_fact_date_and_source() {
+        let batch = AccountModeMetricsBatch {
+            metrics: PortfolioMetrics::complete(0.3, 0, 5),
+            account_fact: Some(push_templates::AccountSnapshotFact {
+                effective_at: chrono::DateTime::parse_from_rfc3339(
+                    "2026-09-21T15:00:00+08:00",
+                )
+                .expect("account snapshot time"),
+                source: "TEST_CODE_USER_CONFIRMED".to_string(),
+            }),
+        };
+        let banner = build_banner(
+            &batch,
+            AccountMode::Normal,
+            &DataHealth {
+                mode: DataMode::Full,
+                missing: Vec::new(),
+                prev_mode: None,
+                eta: None,
+            },
+        );
+
+        let rendered = banner.render();
+        assert!(rendered.contains("2026-09-21截图日盈亏+0.3%"), "{rendered}");
+        assert!(rendered.contains("source=TEST_CODE_USER_CONFIRMED"), "{rendered}");
+    }
+
+    #[test]
+    fn historical_snapshot_cannot_supply_current_day_risk_pnl() {
+        let friday = chrono::DateTime::parse_from_rfc3339("2026-09-18T15:00:00+08:00")
+            .expect("friday snapshot");
+        let monday = chrono::DateTime::parse_from_rfc3339("2026-09-21T09:00:00+08:00")
+            .expect("monday evaluation");
+        assert_eq!(current_day_pnl_pct(friday, friday, -1.5), Some(-1.5));
+        assert_eq!(current_day_pnl_pct(friday, monday, -1.5), None);
+        let metrics = PortfolioMetrics {
+            today_pnl_pct: current_day_pnl_pct(friday, monday, -1.5),
+            consecutive_stop_loss_n: Some(0),
+            total_pos_cheng: Some(5),
+        };
+        assert!(!metrics.is_complete());
+        let evaluation = stock_analysis::risk::account_mode::evaluate(
+            &metrics,
+            None,
+            &Default::default(),
+        );
+        assert_eq!(evaluation.mode, AccountMode::ReduceOnly);
+    }
+
+    #[test]
+    fn account_fact_day_uses_shanghai_time_for_offset_timestamps() {
+        let snapshot_utc = chrono::DateTime::parse_from_rfc3339("2026-09-21T16:30:00Z")
+            .expect("UTC account fact");
+        let evaluation = chrono::DateTime::parse_from_rfc3339("2026-09-22T09:00:00+08:00")
+            .expect("Shanghai evaluation");
+        assert_eq!(current_day_pnl_pct(snapshot_utc, evaluation, 0.3), Some(0.3));
     }
 }
 
@@ -2185,15 +2266,15 @@ pub async fn refresh_banner_state() -> Result<(), String> {
         ),
     );
 
-    let am_metrics = match am_metrics_res {
+    let batch = match am_metrics_res {
         Ok(Ok(m)) => m,
         Ok(Err(error)) => {
             log::warn!("[AccountMode][BR-103] metrics unavailable; retaining explicit incomplete banner: {error}");
-            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+            AccountModeMetricsBatch::incomplete()
         }
         Err(error) => {
             log::warn!("[AccountMode][BR-103] metrics worker unavailable; retaining explicit incomplete banner: {error}");
-            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+            AccountModeMetricsBatch::incomplete()
         }
     };
 
@@ -2211,12 +2292,12 @@ pub async fn refresh_banner_state() -> Result<(), String> {
         .account_mode
         .to_thresholds();
     let account_mode =
-        stock_analysis::risk::account_mode::evaluate(&am_metrics, prev_mode, &thresholds).mode;
+        stock_analysis::risk::account_mode::evaluate(&batch.metrics, prev_mode, &thresholds).mode;
     let data_health = evaluated_data_health()?;
-    if !am_metrics.is_complete() {
+    if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(&am_metrics, account_mode, &data_health))?;
+    store_banner(build_banner(&batch, account_mode, &data_health))?;
     Ok(())
 }
 
@@ -2228,8 +2309,8 @@ pub async fn refresh_banner_state() -> Result<(), String> {
 
 ///   - 由 evaluate_account_mode_hook 调用 (caller 已有 metrics, 复用)
 
-pub async fn refresh_banner_state_with_metrics(
-    am_metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
+async fn refresh_banner_state_with_metrics(
+    batch: &AccountModeMetricsBatch,
 
     lib_mode: stock_analysis::risk::action_gate::AccountMode,
 ) -> Result<(), String> {
@@ -2238,10 +2319,10 @@ pub async fn refresh_banner_state_with_metrics(
     // actually take. Without refreshing the note here the cached slot stays
     // None for the whole process, so a persisted valuation is rendered as
     // "收盘估值不可用" — reporting known data as missing.
-    if !am_metrics.is_complete() {
+    if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(am_metrics, lib_mode, &data_health))
+    store_banner(build_banner(batch, lib_mode, &data_health))
 }
 
 /// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
@@ -2269,7 +2350,7 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
 
     // 1. 装 metrics
 
-    let metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
+    let batch = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
         Ok(Ok(m)) => m,
 
         Ok(Err(e)) => {
@@ -2277,7 +2358,7 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
                 "[AccountMode-hook][BR-108] metrics unavailable; evaluate conservatively: {}",
                 e
             );
-            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+            AccountModeMetricsBatch::incomplete()
         }
 
         Err(e) => {
@@ -2285,9 +2366,10 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
                 "[AccountMode-hook][BR-108] metrics task failed; evaluate conservatively: {:?}",
                 e
             );
-            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+            AccountModeMetricsBatch::incomplete()
         }
     };
+    let metrics = &batch.metrics;
 
     // 2. 恢复 prev (从 DB 末次变更记录)
 
@@ -2325,14 +2407,14 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         .to_thresholds();
     let now_local = chrono::Local::now().time();
     let evaluation = stock_analysis::risk::account_mode::evaluate_with_reset(
-        &metrics,
+        metrics,
         prev,
         &thresholds,
         now_local,
     );
     let evaluated_mode = evaluation.mode;
 
-    if let Err(error) = refresh_banner_state_with_metrics(&metrics, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
         log::error!("[AccountMode-hook] banner evaluation failed: {error}");
         return false;
     }
@@ -2354,7 +2436,7 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
     }
 
     let notification = match push_templates::push_account_mode_change(
-        &metrics,
+        metrics,
         prev,
         latest.as_ref(),
         Some(&banner),
@@ -2381,7 +2463,7 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
 
     // Refresh once more after the orchestration so the shared state remains
     // aligned even when a reset transition was persisted during this call.
-    if let Err(error) = refresh_banner_state_with_metrics(&metrics, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
         log::error!("[AccountMode-hook] final banner refresh failed: {error}");
         return false;
     }
@@ -2414,8 +2496,18 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// → 保守 Err (旧事实不得用于重开交易门).
 
-fn compute_account_mode_metrics_blocking(
-) -> Result<stock_analysis::risk::account_mode::PortfolioMetrics, String> {
+fn current_day_pnl_pct(
+    snapshot_at: chrono::DateTime<chrono::FixedOffset>,
+    evaluated_at: chrono::DateTime<chrono::FixedOffset>,
+    pnl_pct: f64,
+) -> Option<f64> {
+    let china_offset = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("China offset");
+    (snapshot_at.with_timezone(&china_offset).date_naive()
+        == evaluated_at.with_timezone(&china_offset).date_naive())
+    .then_some(pnl_pct)
+}
+
+fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, String> {
     let observed_at = chrono::Local::now().fixed_offset();
     let summary = stock_analysis::database::user_account_summary::latest()
         .map_err(|error| format!("BR-103 latest user account summary: {error}"))?
@@ -2424,6 +2516,12 @@ fn compute_account_mode_metrics_blocking(
     // 重置窗口 (BR-021). 更旧的事实不应用于账户模式判定 (fail-closed).
     let effective_at = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
         .map_err(|error| format!("BR-103 summary effective_at unparseable: {error}"))?;
+    let china_offset = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("China offset");
+    let effective_at = effective_at.with_timezone(&china_offset);
+    let observed_at = observed_at.with_timezone(&china_offset);
+    if summary.source.trim().is_empty() {
+        return Err("BR-103 account summary source is empty".to_string());
+    }
     let age = observed_at.signed_duration_since(effective_at);
     if age < chrono::Duration::zero() {
         return Err(format!(
@@ -2436,16 +2534,21 @@ fn compute_account_mode_metrics_blocking(
     if summary.total_assets <= 0.0 {
         return Err("BR-103 total assets must be positive for account mode".to_string());
     }
-    let today_pnl_pct = summary.daily_pnl / summary.total_assets * 100.0;
-    if !today_pnl_pct.is_finite() {
+    let snapshot_pnl_pct = summary.daily_pnl / summary.total_assets * 100.0;
+    if !snapshot_pnl_pct.is_finite() {
         return Err("BR-103 daily PnL ratio is non-finite".to_string());
     }
+    let today_pnl_pct = current_day_pnl_pct(
+        effective_at,
+        observed_at,
+        snapshot_pnl_pct,
+    );
     let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
     // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
     // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
     // 账本重建失败 → Err (不允许放行交易门).
-    let as_of = chrono::Local::now().date_naive();
+    let as_of = observed_at.date_naive();
     let cost_ledger = {
         use stock_analysis::performance::economic_position::query_economic_fills_through;
         use stock_analysis::performance::fee_evidence::{lot_rate_fill_cost_ledger, FillSide};
@@ -2498,11 +2601,17 @@ fn compute_account_mode_metrics_blocking(
         .collect();
     let consecutive_stop_loss_n = count_consecutive_realized_losses(&realized)?;
 
-    Ok(stock_analysis::risk::account_mode::PortfolioMetrics::complete(
-        today_pnl_pct,
-        consecutive_stop_loss_n,
-        total_pos_cheng,
-    ))
+    Ok(AccountModeMetricsBatch {
+        metrics: stock_analysis::risk::account_mode::PortfolioMetrics {
+            today_pnl_pct,
+            consecutive_stop_loss_n: Some(consecutive_stop_loss_n),
+            total_pos_cheng: Some(total_pos_cheng),
+        },
+        account_fact: Some(push_templates::AccountSnapshotFact {
+            effective_at,
+            source: summary.source,
+        }),
+    })
 }
 
 /// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
@@ -6833,6 +6942,7 @@ async fn e2e_all_templates_run(
         total_pos: Some(0),
         today_pnl: Some(0.0),
         account_metrics_complete: true,
+        account_fact: None,
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     };

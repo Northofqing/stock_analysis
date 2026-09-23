@@ -1115,25 +1115,32 @@ impl fmt::Debug for CapturedBanner {
     }
 }
 
-/// v12 §14.0 全局横幅入参
-///
-/// `total_pos` 仓位成数 (0~10). `today_pnl` 日盈亏百分比 (已带正负号).
-/// 账户指标尚未形成真实完整批次时保持 `None`，禁止显示为 0。
-/// `data_missing_note` 仅在 Degraded/Unsafe 出现, 例如 "缺盘口深度".
+/// 与指标同批读取的用户确认账户截图来源。
+#[derive(Clone, Debug)]
+pub struct AccountSnapshotFact {
+    pub effective_at: chrono::DateTime<chrono::FixedOffset>,
+    pub source: String,
+}
+
+/// v12 §14.0 全局横幅入参。
+/// `today_pnl` 是用户截图所属日期的盈亏百分比，数值完整不代表实时有效。
+/// 完整指标只有携带同批 `account_fact` 才能在横幅显示盈亏数值。
+/// `data_missing_note` 仅在 Degraded/Unsafe 出现。
 #[derive(Clone, Debug)]
 pub struct BannerCtx {
     pub account_mode: AccountMode,
     pub total_pos: Option<u8>,
     pub today_pnl: Option<f64>,
-    /// True only when P&L, consecutive stop losses, and position were all
-    /// present in the same real account evaluation batch.
+    /// 指标数值完整；不表示账户事实来自当前交易日。
     pub account_metrics_complete: bool,
+    /// 与仓位和盈亏指标同一次读取的用户确认截图事实。
+    pub account_fact: Option<AccountSnapshotFact>,
     pub data_mode: DataMode,
     pub data_missing_note: Option<String>,
 }
 
 impl BannerCtx {
-    /// 测试用 BannerCtx (Normal/Full, 仓位 0, 日盈亏 0.0)
+    /// 测试用 BannerCtx；未绑定截图事实，渲染时不显示盈亏数值。
     #[cfg(test)]
     pub fn test_default() -> Self {
         Self {
@@ -1141,6 +1148,7 @@ impl BannerCtx {
             total_pos: Some(0),
             today_pnl: Some(0.0),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -1148,8 +1156,8 @@ impl BannerCtx {
 
     /// 渲染 §14.0 横幅 (1~2 行).
     ///
-    /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
-    /// 第 2 行 (可选): `[⚠️ {data_missing_note}]` — 仅 Degraded/Unsafe 时出现
+    /// 第 1 行带账户事实日期，缺同批来源时显示“盈亏事实未绑定”。
+    /// 后续行可携带数据缺口和账户来源说明。
     pub fn render(&self) -> String {
         self.capture().render().to_string()
     }
@@ -1162,11 +1170,12 @@ impl BannerCtx {
         &self,
         source: &impl BannerExternalNoteSource,
     ) -> CapturedBanner {
-        let closing_valuation = (!self.account_metrics_complete)
+        let needs_external_account_note =
+            !self.account_metrics_complete && self.account_fact.is_none();
+        let closing_valuation = needs_external_account_note
             .then(|| source.closing_valuation_note())
             .flatten();
-        let user_confirmed_account = (!self.account_metrics_complete
-            && closing_valuation.is_none())
+        let user_confirmed_account = (needs_external_account_note && closing_valuation.is_none())
         .then(|| source.user_confirmed_account_note())
         .flatten();
         let position = if !self.account_metrics_complete && self.total_pos.is_some() {
@@ -1179,8 +1188,20 @@ impl BannerCtx {
             "日盈亏批次不完整".to_string()
         } else {
             self.today_pnl.map_or_else(
-                || "日盈亏缺失".to_string(),
-                |value| format!("日盈亏{value:+.1}%"),
+                || {
+                    if self.account_fact.is_some() {
+                        "当前日盈亏未确认".to_string()
+                    } else {
+                        "日盈亏缺失".to_string()
+                    }
+                },
+                |value| match self.account_fact.as_ref() {
+                    Some(fact) => format!(
+                        "{}截图日盈亏{value:+.1}%",
+                        fact.effective_at.date_naive()
+                    ),
+                    None => "盈亏事实未绑定".to_string(),
+                },
             )
         };
         let line1 = format!(
@@ -1191,12 +1212,20 @@ impl BannerCtx {
             pnl,
             self.data_mode.label(),
         );
-        let account_note = (!self.account_metrics_complete).then(|| {
-            account_status_note_from_values(
+        let account_note = if let Some(fact) = self.account_fact.as_ref() {
+            Some(format!(
+                "用户确认账户快照截至 {}，source={}；非实时账户；收盘估值价格日未绑定",
+                fact.effective_at.to_rfc3339(),
+                fact.source
+            ))
+        } else if !self.account_metrics_complete {
+            Some(account_status_note_from_values(
                 closing_valuation.as_deref(),
                 user_confirmed_account.as_deref(),
-            )
-        });
+            ))
+        } else {
+            None
+        };
         let mut rendered = line1;
         if let Some(note) = self
             .data_missing_note
@@ -1217,7 +1246,10 @@ impl BannerCtx {
 pub(crate) fn paper_risk_context_from_banner(
     banner: &BannerCtx,
 ) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
-    if !banner.account_metrics_complete || banner.total_pos.is_none() || banner.today_pnl.is_none()
+    if !banner.account_metrics_complete
+        || banner.account_fact.is_none()
+        || banner.total_pos.is_none()
+        || banner.today_pnl.is_none()
     {
         return Err("BR-134 complete account metrics are unavailable".to_string());
     }
@@ -16100,6 +16132,7 @@ mod tests_r_dispatchers {
             total_pos: Some(0),
             today_pnl: Some(0.0),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -16116,6 +16149,7 @@ mod tests_r_dispatchers {
             total_pos: Some(0),
             today_pnl: Some(0.0),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -18183,6 +18217,7 @@ pub fn build_test_template_catalog(
         total_pos: Some(0),
         today_pnl: Some(0.0),
         account_metrics_complete: true,
+        account_fact: None,
         data_mode: DataMode::Full,
         data_missing_note: None,
     };
@@ -19769,9 +19804,59 @@ mod tests {
             total_pos: Some(5),
             today_pnl: Some(0.3),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
+    }
+
+    #[test]
+    fn complete_metrics_without_bound_account_fact_do_not_claim_undated_daily_pnl() {
+        let rendered = banner_normal().render();
+        assert!(rendered.contains("盈亏事实未绑定"), "{rendered}");
+        assert!(!rendered.contains("日盈亏+0.3%"), "{rendered}");
+    }
+
+    #[test]
+    fn complete_metrics_display_the_bound_snapshot_date_and_source() {
+        let mut banner = banner_normal();
+        banner.account_fact = Some(AccountSnapshotFact {
+            effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
+                .expect("snapshot time"),
+            source: "TEST_CODE_USER_CONFIRMED".to_string(),
+        });
+
+        let rendered = banner.render();
+        assert!(rendered.contains("2026-09-21截图日盈亏+0.3%"), "{rendered}");
+        assert!(rendered.contains("账户快照截至 2026-09-21T15:00:00+08:00"), "{rendered}");
+        assert!(rendered.contains("source=TEST_CODE_USER_CONFIRMED"), "{rendered}");
+        assert!(rendered.contains("收盘估值价格日未绑定"), "{rendered}");
+    }
+
+    #[test]
+    fn historical_snapshot_banner_uses_bound_fact_without_rereading_latest() {
+        struct ForbiddenExternalNotes;
+        impl BannerExternalNoteSource for ForbiddenExternalNotes {
+            fn closing_valuation_note(&self) -> Option<String> {
+                panic!("must not read a later valuation")
+            }
+            fn user_confirmed_account_note(&self) -> Option<String> {
+                panic!("must not read a later account snapshot")
+            }
+        }
+
+        let mut banner = banner_normal();
+        banner.account_metrics_complete = false;
+        banner.today_pnl = None;
+        banner.account_fact = Some(AccountSnapshotFact {
+            effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-18T15:00:00+08:00")
+                .expect("friday snapshot"),
+            source: "TEST_CODE_FRIDAY_SNAPSHOT".to_string(),
+        });
+        let rendered = banner.capture_with_external_notes(&ForbiddenExternalNotes);
+        assert!(rendered.render().contains("当前日盈亏未确认"));
+        assert!(rendered.render().contains("2026-09-18T15:00:00+08:00"));
+        assert!(rendered.render().contains("source=TEST_CODE_FRIDAY_SNAPSHOT"));
     }
 
     struct NoBannerExternalNotes;
@@ -19795,7 +19880,7 @@ mod tests {
     #[test]
     fn banner_normal_full_format() {
         let b = banner_normal();
-        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]");
     }
 
     #[test]
@@ -19820,6 +19905,7 @@ mod tests {
             total_pos: Some(7),
             today_pnl: Some(-2.45),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
         };
@@ -19862,15 +19948,19 @@ mod tests {
 
         let closing_reads = Cell::new(0);
         let user_summary_reads = Cell::new(0);
-        let captured = banner_normal().capture_with_external_notes(&CountingExternalNotes {
+        let mut banner = banner_normal();
+        banner.account_fact = Some(AccountSnapshotFact {
+            effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
+                .expect("bound snapshot time"),
+            source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+        });
+        let captured = banner.capture_with_external_notes(&CountingExternalNotes {
             closing_reads: &closing_reads,
             user_summary_reads: &user_summary_reads,
         });
 
-        assert_eq!(
-            captured.render(),
-            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"
-        );
+        assert!(captured.render().contains("2026-09-21截图日盈亏+0.3%"));
+        assert!(captured.render().contains("source=TEST_CODE_BOUND_ACCOUNT"));
         assert!(!captured.render().contains("TEST_CODE_OLD_CLOSING"));
         assert!(!captured.render().contains("TEST_CODE_OLD_ACCOUNT"));
         assert_eq!(closing_reads.get(), 0);
@@ -19906,6 +19996,7 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -19962,6 +20053,7 @@ mod tests {
             total_pos: Some(7),
             today_pnl: Some(-2.45),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -20007,6 +20099,7 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -20049,6 +20142,7 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
@@ -20065,6 +20159,7 @@ mod tests {
             total_pos: Some(7),
             today_pnl: Some(2.45),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: None,
         };
@@ -20085,9 +20180,17 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
+        assert!(paper_risk_context_from_banner(&banner).is_err());
+    }
+
+    #[test]
+    fn br134_complete_numbers_without_account_fact_cannot_create_paper_risk_context() {
+        let banner = banner_normal();
+        assert!(banner.account_metrics_complete);
         assert!(paper_risk_context_from_banner(&banner).is_err());
     }
 
@@ -20098,6 +20201,7 @@ mod tests {
             total_pos: Some(4),
             today_pnl: Some(0.2),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -20110,6 +20214,11 @@ mod tests {
         let banner = BannerCtx {
             account_mode: AccountMode::Frozen,
             data_mode: DataMode::Unsafe,
+            account_fact: Some(AccountSnapshotFact {
+                effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
+                    .expect("bound account time"),
+                source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+            }),
             ..BannerCtx::test_default()
         };
         let context = paper_risk_context_from_banner(&banner).unwrap();
@@ -20130,11 +20239,12 @@ mod tests {
             total_pos: Some(6),
             today_pnl: Some(-1.6),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Degraded,
             data_missing_note: Some("缺盘口深度".to_string()),
         };
         let s = b.render();
-        assert!(s.starts_with("[🟡 ReduceOnly | 仓位6成 | 日盈亏-1.6% | 数据Degraded]"));
+        assert!(s.starts_with("[🟡 ReduceOnly | 仓位6成 | 盈亏事实未绑定 | 数据Degraded]"));
         assert!(s.contains("[⚠️ 缺盘口深度: 本条不含承接判断]"));
     }
 
@@ -20145,11 +20255,12 @@ mod tests {
             total_pos: Some(0),
             today_pnl: Some(-2.1),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: Some("不该出现".to_string()),
         };
         // Full 模式下 data_missing_note 被忽略
-        assert_eq!(b.render(), "[🔴 Frozen | 仓位0成 | 日盈亏-2.1% | 数据Full]");
+        assert_eq!(b.render(), "[🔴 Frozen | 仓位0成 | 盈亏事实未绑定 | 数据Full]");
     }
 
     #[test]
@@ -20221,6 +20332,7 @@ mod tests {
             total_pos: Some(7),
             today_pnl: Some(-2.45),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
         };
@@ -20289,6 +20401,7 @@ mod tests {
             total_pos: Some(5),
             today_pnl: Some(0.3),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -20307,7 +20420,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n\
+            "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n\
              📡 数据状态变更（11:00）\n\
              Unsafe → Full\n\
              受影响: (无)\n\
@@ -20413,6 +20526,7 @@ mod tests {
             total_pos: Some(7),
             today_pnl: Some(-2.45),
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("TEST_CODE_QUOTE_MISSING".to_string()),
         };
@@ -20511,7 +20625,7 @@ mod tests {
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },
         );
-        assert!(s.contains("[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"));
+        assert!(s.contains("[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]"));
         assert!(s.contains("🎯 持仓建议 XX科技(TEST_CODE_000001)（13:42）"));
         assert!(s.contains("动作倾向: 逢高减仓"));
         assert!(s.contains("现价12.30 成本11.80 可用3000股"));
@@ -21182,7 +21296,7 @@ mod tests {
         assert_eq!(
             prepared.message(),
             concat!(
-                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
                 "🌅 竞价热点量能 Top2（09:25:00）\n",
                 "  股票FIRST(FIRST) 高开+1.4% 量比4.5 []\n",
                 "  股票SECOND(SECOND) 高开+2.5% 量比2.3 []\n",
@@ -21636,7 +21750,7 @@ mod tests {
         assert_eq!(
             frozen,
             concat!(
-                "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]\n",
+                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
                 "🌅 竞价热点量能 Top1（09:25）\n",
                 "  共享渲染(TEST_CODE_000001) 高开+3.4% 量比5.6 [TEST_TAG]\n",
                 "情绪判读: 强承接, 观察池今日可操作\n",
@@ -25417,10 +25531,11 @@ mod tests {
             total_pos: Some(5),
             today_pnl: Some(0.3),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
-        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]");
     }
 
     #[test]
@@ -25445,7 +25560,7 @@ mod tests {
             },
         );
         // 验证 5 个关键字段精确出现
-        assert!(s.contains("[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"));
+        assert!(s.contains("[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]"));
         assert!(s.contains("🎯 持仓建议 XX科技(TEST_CODE_000001)（13:42）"));
         assert!(s.contains("动作倾向: 逢高减仓"));
         assert!(s.contains("现价12.30 成本11.80 可用3000股"));
@@ -25673,6 +25788,7 @@ mod tests {
             total_pos: Some(5),
             today_pnl: Some(0.3),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -25840,6 +25956,7 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
@@ -25912,6 +26029,11 @@ mod tests {
             total_pos: Some(4),
             today_pnl: Some(0.2),
             account_metrics_complete: true,
+            account_fact: Some(AccountSnapshotFact {
+                effective_at: chrono::DateTime::parse_from_rfc3339("2026-07-06T15:00:00+08:00")
+                    .expect("bound account time"),
+                source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+            }),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -26313,6 +26435,7 @@ mod tests {
             total_pos: None,
             today_pnl: None,
             account_metrics_complete: false,
+            account_fact: None,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("Quote/Kline/MoneyFlow/News/OrderBook".to_string()),
         };
@@ -26531,6 +26654,7 @@ mod tests {
             total_pos: Some(5),
             today_pnl: Some(-1.6),
             account_metrics_complete: true,
+            account_fact: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
