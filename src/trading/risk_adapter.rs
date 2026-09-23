@@ -145,23 +145,25 @@ pub fn pre_trade_check(
         ));
     }
 
-    // 3. 现金底
-    let guard = CashGuard {
-        floor_pct: *CASH_FLOOR_PCT,
-    };
-    if let Some(alert) = check_cash(current_cash, total_value, &guard) {
-        if alert.below_floor {
-            log::warn!(
-                "[risk_adapter] 拒 {}({}): 现金占比 {:.1}% < 底 {}%",
-                signal.name,
-                signal.code,
-                alert.cash_pct,
-                *CASH_FLOOR_PCT
-            );
-            return Err(format!(
-                "现金占比 {:.1}% 不足底限 {}%",
-                alert.cash_pct, *CASH_FLOOR_PCT
-            ));
+    // 3. 现金底只约束买入；卖出降低敞口，不应被低现金反向拦截。
+    if signal.direction == Direction::Buy {
+        let guard = CashGuard {
+            floor_pct: *CASH_FLOOR_PCT,
+        };
+        if let Some(alert) = check_cash(current_cash, total_value, &guard) {
+            if alert.below_floor {
+                log::warn!(
+                    "[risk_adapter] 拒 {}({}): 现金占比 {:.1}% < 底 {}%",
+                    signal.name,
+                    signal.code,
+                    alert.cash_pct,
+                    *CASH_FLOOR_PCT
+                );
+                return Err(format!(
+                    "现金占比 {:.1}% 不足底限 {}%",
+                    alert.cash_pct, *CASH_FLOOR_PCT
+                ));
+            }
         }
     }
 
@@ -340,6 +342,12 @@ mod tests {
         let r = pre_trade_check(&s, 50.0, 10000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("现金"));
+    }
+
+    #[test]
+    fn allows_sell_when_cash_is_below_floor() {
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Sell);
+        assert!(pre_trade_check(&s, 50.0, 1000.0, 100000.0, 5.0).is_ok());
     }
 
     #[test]
