@@ -66,6 +66,7 @@ magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.gi
 magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
 magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
 magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+
 plotters = "0.3"
 futures = "0.3"
 fs2 = "0.4.3"
@@ -117,6 +118,8 @@ magic-gateway = [
 # (tonic-build 0.14 只保留 Service codegen; tonic-prost-build 传递依赖 tonic-build)
 tonic-prost-build = "0.14"
 toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 pam = "0.7"           # PAM 跨平台认证 (Linux/macOS, 用 0.7 因 0.8 与 rustc 1.97+ 编译失败)
@@ -143,3 +146,8 @@ incremental = false
 # backtraces and symbols at debug=0.
 debug = 0
 incremental = false
+
+# Local backport of upstream TDX server-rotation fix (98207a4). Keep all other
+# magic providers on the pinned 75ee2a2 release to preserve their contracts.
+[patch."https://github.com/Northofqing/magic-market-data-rs.git"]
+magic-tdx-rs = { path = "vendor/magic-tdx-rs" }

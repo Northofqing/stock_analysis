@@ -1,5 +1,5 @@
 //! 编译 magic.market.v1 proto (合同唯一源, 不得修改):
-//! - 上游合同: client-bundle/market.proto (用户维护, 原样引用);
+//! - 旧本机服务合同: provider_host_contract/market.proto (固定兼容快照);
 //! - 本地扩展 / 旧 bundle 兼容声明:
 //!   * 当前上游已发布 Operation/RPC 56-60；旧 bundle 缺失时仍按精确声明补入;
 //!   * Operation 61 CHAIN_BATCH 与 62 BENCHMARK_BARS 仍仅供本地 grpc_market_server 使用;
@@ -7,7 +7,8 @@
 //!   * 当前上游已发布前 5 个派生 RPC；ChainBatch RPC 仍为本地扩展。
 //!
 //! 合并 proto 生成到 OUT_DIR (按每条精确声明幂等补齐),
-//! 上游合同文件本身零修改 — 上游更新 proto 后本地自动跟随。
+//! 当前上游合同文件零修改；旧服务使用独立的固定快照。
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 #[path = "build_support/magic_tdx_lock.rs"]
@@ -20,13 +21,16 @@ fn main() {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lock_path = manifest_dir.join("Cargo.lock");
-    let magic_tdx_revision = locked_magic_tdx_revision(&lock_path);
+    let magic_tdx_revision = locked_magic_tdx_revision(&manifest_dir, &lock_path);
     println!("cargo:rustc-env=MAGIC_TDX_DEPENDENCY_REVISION={magic_tdx_revision}");
     println!("cargo:rerun-if-changed={}", lock_path.display());
     println!("cargo:rerun-if-changed=build_support/magic_tdx_lock.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let upstream = "client-bundle/market.proto";
+    // The legacy provider host reserves operation IDs 61/62 for local RPCs.
+    // Pin its compatible contract snapshot so a newer ignored client-bundle
+    // cannot silently collide with those IDs during a recovery build.
+    let upstream = "provider_host_contract/market.proto";
     let content = std::fs::read_to_string(upstream)
         .unwrap_or_else(|e| panic!("read {upstream}: {e} (上游合同必须存在)"));
     let merged_content = merge_local_extensions(&content);
@@ -44,7 +48,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-fn locked_magic_tdx_revision(lock_path: &std::path::Path) -> String {
+fn locked_magic_tdx_revision(
+    manifest_dir: &std::path::Path,
+    lock_path: &std::path::Path,
+) -> String {
     const PACKAGE: &str = "magic-tdx-rs";
     let lock_bytes = std::fs::read_to_string(lock_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", lock_path.display()));
@@ -66,15 +73,63 @@ fn locked_magic_tdx_revision(lock_path: &std::path::Path) -> String {
             matches.len()
         );
     };
-    let source = package
-        .get("source")
-        .and_then(toml::Value::as_str)
-        .unwrap_or_else(|| panic!("{PACKAGE} must have a locked Git source"));
-    let revision =
-        magic_tdx_lock::exact_locked_magic_tdx_revision(source).unwrap_or_else(|error| {
-            panic!("{PACKAGE} source is not an exact locked revision: {error}")
-        });
-    revision.to_owned()
+    if let Some(source) = package.get("source").and_then(toml::Value::as_str) {
+        return magic_tdx_lock::exact_locked_magic_tdx_revision(source)
+            .unwrap_or_else(|error| {
+                panic!("{PACKAGE} source is not an exact locked revision: {error}")
+            })
+            .to_owned();
+    }
+
+    // The legacy local provider host carries a narrow backport of upstream
+    // 98207a4. Its provenance must identify the actual vendored bytes, rather
+    // than falsely claiming to be the unmodified 75ee2a2 Git dependency.
+    let manifest: toml::Value = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .expect("read Cargo.toml")
+        .parse()
+        .expect("parse Cargo.toml");
+    let patch_path = manifest
+        .get("patch")
+        .and_then(|patch| patch.get("https://github.com/Northofqing/magic-market-data-rs.git"))
+        .and_then(|patch| patch.get(PACKAGE))
+        .and_then(|patch| patch.get("path"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        patch_path,
+        Some("vendor/magic-tdx-rs"),
+        "{PACKAGE} has no admitted local backport"
+    );
+    let vendor = manifest_dir.join("vendor/magic-tdx-rs");
+    let mut files = vec![vendor.join("Cargo.toml")];
+    collect_source_files(&vendor.join("src"), &mut files);
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(&vendor).expect("vendor source path");
+        let bytes =
+            std::fs::read(&file).unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+        hash.update(relative.to_string_lossy().as_bytes());
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    println!("cargo:rerun-if-changed={}", vendor.display());
+    format!(
+        "75ee2a2+backport-98207a4+sha256:{}",
+        hex::encode(hash.finalize())
+    )
+}
+
+fn collect_source_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+    for entry in
+        std::fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+    {
+        let path = entry.expect("vendor source entry").path();
+        if path.is_dir() {
+            collect_source_files(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 /// 本地扩展块 (注释解释来源与用户决策)。

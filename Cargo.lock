@@ -2713,7 +2713,6 @@ dependencies = [
 [[package]]
 name = "magic-tdx-rs"
 version = "0.2.0"
-source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
 dependencies = [
  "crc32fast",
  "encoding_rs",

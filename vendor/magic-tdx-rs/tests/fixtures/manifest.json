@@ -1,0 +1,3 @@
+[
+  {"path":"protocol/security_count_one.bin","sha256":"5dafc94b81eb2843494f2f8db1ba9585cf1e01323953542949c4871fabf13754","operation":"security_count","expected_record_count":1,"contains_live_data":false}
+]

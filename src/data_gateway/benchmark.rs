@@ -2565,26 +2565,35 @@ mod tests {
 
         let lock: toml::Value = toml::from_str(include_str!("../../Cargo.lock"))
             .expect("TEST_CODE Cargo.lock must be valid TOML");
-        let sources: Vec<_> = lock["package"]
+        let packages: Vec<_> = lock["package"]
             .as_array()
             .expect("TEST_CODE Cargo.lock packages")
             .iter()
             .filter(|package| package["name"].as_str() == Some("magic-tdx-rs"))
-            .filter_map(|package| package["source"].as_str())
             .collect();
         assert_eq!(
-            sources.len(),
+            packages.len(),
             1,
-            "TEST_CODE magic-tdx source must be unique"
+            "TEST_CODE magic-tdx package must be unique"
         );
-        let (_, resolved_revision) = sources[0]
-            .rsplit_once('#')
-            .expect("TEST_CODE magic-tdx source must contain a resolved revision");
-        assert_eq!(super::TDX_DEPENDENCY_REVISION, resolved_revision);
-        assert_eq!(resolved_revision.len(), 40);
-        assert!(resolved_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        if let Some(source) = packages[0].get("source").and_then(toml::Value::as_str) {
+            let (_, resolved_revision) = source
+                .rsplit_once('#')
+                .expect("TEST_CODE magic-tdx source must contain a resolved revision");
+            assert_eq!(super::TDX_DEPENDENCY_REVISION, resolved_revision);
+            assert_eq!(resolved_revision.len(), 40);
+            assert!(resolved_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        } else {
+            let digest = super::TDX_DEPENDENCY_REVISION
+                .strip_prefix("75ee2a2+backport-98207a4+sha256:")
+                .expect("TEST_CODE vendored TDX provenance");
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
 
         let attestation = BenchmarkProviderAttestation::production_default();
         assert_eq!(
@@ -2592,7 +2601,7 @@ mod tests {
             super::BenchmarkIdentityAttestation::RequestBoundTdxHs300V1
         );
         let contract = super::TdxIndexProtocolContract::tdx_hs300_v1();
-        assert_eq!(contract.dependency_revision, resolved_revision);
+        assert_eq!(contract.dependency_revision, super::TDX_DEPENDENCY_REVISION);
     }
 
     #[test]

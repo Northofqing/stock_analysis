@@ -1,0 +1,15 @@
+[package]
+name = "magic-tdx-rs"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[dependencies]
+magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+flate2 = "1"
+crc32fast = "1"
+encoding_rs = "0.8"
+regex = "1"
+tokio = { version = "1.50", features = ["net","io-util","rt","rt-multi-thread","time","sync","macros","test-util"] }
