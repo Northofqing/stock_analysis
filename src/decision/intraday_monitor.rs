@@ -30,6 +30,7 @@ const VOLUME_SURGE_THRESHOLD: f64 = 5.0;
 const MAX_CANDIDATES: i64 = 50;
 /// 盘后整盘扫候选上限 (review fix: 消除魔数, 与 MAX_CANDIDATES 区分)
 const MAX_EVENING_CANDIDATES: i64 = 100;
+const PUSHED_STOCK_BUY_PLAN_PREFIX: &str = "pushed-stock-buy-v1:";
 
 /// 综合分评分
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +59,11 @@ struct Candidate {
 }
 
 impl Candidate {
+    fn buy_plan_id(&self) -> String {
+        // The row ID survives a process restart and is shared by intraday and evening scans.
+        format!("{PUSHED_STOCK_BUY_PLAN_PREFIX}{}", self.id)
+    }
+
     fn push_time_parsed(&self) -> Result<DateTime<Local>, String> {
         // 字符串无时区, 用 NaiveDateTime 解析 + assume_local (避免 UTC→+08:00 偏移 8h)
         chrono::NaiveDateTime::parse_from_str(&self.push_time, "%Y-%m-%d %H:%M:%S%.3f")
@@ -97,6 +103,40 @@ fn paper_limit_flags(quote: &crate::broker::ExecutionQuote) -> (bool, bool) {
     )
 }
 
+/// A previous scan may have committed paper_trades and crashed before consuming
+/// the source push. Reconcile from that durable fact even after the one-hour
+/// decision window expires; no quote or account snapshot is needed to do so.
+fn reconcile_persisted_candidate_buys(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    now: &DateTime<Local>,
+) -> Result<usize, String> {
+    let recovered = diesel::sql_query(
+        "UPDATE pushed_stocks
+         SET consumed_at = ?, consumed_by = 'paper_trade_recovery',
+             outcome = (SELECT paper_trades.virtual_reason FROM paper_trades
+                        WHERE paper_trades.plan_id = ? || pushed_stocks.id
+                          AND paper_trades.code = pushed_stocks.code
+                          AND paper_trades.direction = 'buy' LIMIT 1)
+         WHERE consumed_at IS NULL
+           AND EXISTS (SELECT 1 FROM paper_trades
+                       WHERE paper_trades.plan_id = ? || pushed_stocks.id
+                         AND paper_trades.code = pushed_stocks.code
+                         AND paper_trades.direction = 'buy')",
+    )
+    .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+    .bind::<diesel::sql_types::Text, _>(PUSHED_STOCK_BUY_PLAN_PREFIX)
+    .bind::<diesel::sql_types::Text, _>(PUSHED_STOCK_BUY_PLAN_PREFIX)
+    .execute(conn)
+    .map_err(|error| format!("reconcile persisted candidate buys: {error}"))?;
+    if recovered > 0 {
+        log::warn!(
+            "[intraday_monitor] 从已落库模拟买入恢复 {} 条未消费候选",
+            recovered
+        );
+    }
+    Ok(recovered)
+}
+
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
     ///
@@ -127,6 +167,7 @@ impl IntradayMonitor {
         let mut conn = DatabaseManager::get()
             .get_conn()
             .map_err(|e| format!("DB 连接失败: {}", e))?;
+        reconcile_persisted_candidate_buys(&mut conn, &now)?;
 
         // 1. 扫推送票池 (review fix Issue #4: 参数化绑定替代 format! 拼接)
         let candidates: Vec<Candidate> = diesel::sql_query(
@@ -186,7 +227,7 @@ impl IntradayMonitor {
                 };
                 let (is_limit_up, is_limit_down) = paper_limit_flags(&execution_quote);
                 let paper_signal = PaperSignal {
-                    plan_id: format!("intraday-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
+                    plan_id: cand.buy_plan_id(),
                     code: cand.code.clone(),
                     name: cand.name.clone(),
                     direction: Direction::Buy,
@@ -222,23 +263,31 @@ impl IntradayMonitor {
                     total,
                     pos_pct,
                 ) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         // 4. 标记 consumed (review fix Issue #4: 参数化绑定)
-                        let outcome = signal.source;
+                        let strategy_outcome = signal.source;
                         diesel::sql_query(
                             "UPDATE pushed_stocks SET consumed_at = ?, consumed_by = 'intraday_monitor', outcome = ? \
                              WHERE id = ?",
                         )
                         .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-                        .bind::<diesel::sql_types::Text, _>(outcome)
+                        .bind::<diesel::sql_types::Text, _>(strategy_outcome)
                         .bind::<diesel::sql_types::Integer, _>(cand.id)
                         .execute(&mut conn)
                         .map_err(|e| format!("update consumed_at: {}", e))?;
-                        emitted += 1;
-                        log::info!(
-                            "[intraday_monitor] 入候选 {}({}) source={} score={:.1} → 推 paper_trade",
-                            cand.name, cand.code, signal.source, signal.score
-                        );
+                        if outcome.inserted {
+                            emitted += 1;
+                            log::info!(
+                                "[intraday_monitor] 入候选 {}({}) source={} score={:.1} → 推 paper_trade",
+                                cand.name, cand.code, signal.source, signal.score
+                            );
+                        } else {
+                            log::info!(
+                                "[intraday_monitor] {}({}) 已有模拟买入，仅补候选消费标记",
+                                cand.name,
+                                cand.code
+                            );
+                        }
                     }
                     Err(e) => {
                         log::warn!(
@@ -428,6 +477,7 @@ where
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
+    reconcile_persisted_candidate_buys(&mut conn, &now)?;
 
     // review fix Issue #4: 参数化绑定
     let candidates: Vec<Candidate> = diesel::sql_query(
@@ -481,7 +531,7 @@ where
         };
         let (is_limit_up, is_limit_down) = paper_limit_flags(&execution_quote);
         let paper_signal = PaperSignal {
-            plan_id: format!("evening-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
+            plan_id: cand.buy_plan_id(),
             code: cand.code.clone(),
             name: cand.name.clone(),
             direction: Direction::Buy,
@@ -510,7 +560,7 @@ where
             }
         };
         match paper_trade::simulate(&paper_signal, execution_quote.price, cash, total, pos_pct) {
-            Ok(_) => {
+            Ok(outcome) => {
                 // review fix Issue #4: 参数化绑定
                 diesel::sql_query(
                     "UPDATE pushed_stocks SET consumed_at = ?, consumed_by = 'evening_review', outcome = 'Momentum' \
@@ -520,12 +570,20 @@ where
                 .bind::<diesel::sql_types::Integer, _>(cand.id)
                 .execute(&mut conn)
                 .map_err(|e| format!("evening update: {}", e))?;
-                emitted += 1;
-                log::info!(
-                    "[evening_review] Momentum 命中 {}({}) → 推 paper_trade",
-                    cand.name,
-                    cand.code
-                );
+                if outcome.inserted {
+                    emitted += 1;
+                    log::info!(
+                        "[evening_review] Momentum 命中 {}({}) → 推 paper_trade",
+                        cand.name,
+                        cand.code
+                    );
+                } else {
+                    log::info!(
+                        "[evening_review] {}({}) 已有模拟买入，仅补候选消费标记",
+                        cand.name,
+                        cand.code
+                    );
+                }
             }
             Err(e) => {
                 log::warn!("[evening_review] 拒 {}({}): {}", cand.name, cand.code, e);
@@ -1007,7 +1065,128 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn br134_reduce_only_context_rejects_buy_without_consuming_candidate() {
+    fn br126_replay_after_trade_before_consumption_does_not_buy_twice() {
+        #[derive(diesel::QueryableByName)]
+        struct TradeIdentity {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            plan_id: String,
+        }
+
+        let mut guard = prepare_execution_account();
+        let code = unique_code("CRASH_REPLAY");
+        guard.codes.push(code.clone());
+        let id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code: code.clone(),
+                name: "成交后消费前重放".to_string(),
+                push_kind: "P-02".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({
+                    "vol_ratio": 6.0,
+                    "price_chg_pct": 1.0,
+                    "push_subkind": "VolumeSurge"
+                })
+                .to_string(),
+                source: "preopen".to_string(),
+            })
+            .expect("record replay candidate");
+        guard.push_ids.push(id);
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(
+                (Local::now() - Duration::minutes(1))
+                    .format("%Y-%m-%d %H:%M:%S%.3f")
+                    .to_string(),
+            )
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut conn)
+            .expect("place candidate inside decision window");
+
+        assert_eq!(
+            IntradayMonitor
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .expect("first buy"),
+            1
+        );
+        let first: Vec<TradeIdentity> = diesel::sql_query(
+            "SELECT plan_id FROM paper_trades WHERE code = ? AND direction = 'buy'",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .load(&mut conn)
+        .expect("first persisted trade");
+        assert_eq!(first.len(), 1);
+
+        // Emulate a crash after paper_trades commits but before pushed_stocks is consumed.
+        diesel::sql_query(
+            "UPDATE pushed_stocks SET consumed_at = NULL, consumed_by = NULL, outcome = NULL WHERE id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut conn)
+        .expect("restore unconsumed candidate");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        assert_eq!(
+            IntradayMonitor
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .expect("immediate replay after crash"),
+            0
+        );
+        let replayed: Vec<TradeIdentity> = diesel::sql_query(
+            "SELECT plan_id FROM paper_trades WHERE code = ? AND direction = 'buy'",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .load(&mut conn)
+        .expect("trade identities after replay");
+        assert_eq!(replayed.len(), 1, "replayed candidate created a second buy");
+        assert_eq!(replayed[0].plan_id, first[0].plan_id);
+        assert!(consumption(id).consumed_at.is_some());
+
+        diesel::sql_query(
+            "UPDATE pushed_stocks SET consumed_at = NULL, consumed_by = NULL, outcome = NULL WHERE id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut conn)
+        .expect("restore candidate for replay after reservation expiry");
+        diesel::sql_query(
+            "UPDATE order_idempotency SET reserved_at = datetime('now', '-61 seconds') \
+             WHERE business_order_id = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&first[0].plan_id)
+        .execute(&mut conn)
+        .expect("expire short reservation to test durable idempotency");
+        assert_eq!(
+            IntradayMonitor
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .expect("replay after reservation expiry"),
+            0
+        );
+        assert!(consumption(id).consumed_at.is_some());
+
+        diesel::sql_query(
+            "UPDATE pushed_stocks SET consumed_at = NULL, consumed_by = NULL, outcome = NULL, push_time = ? WHERE id = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(
+            (Local::now() - Duration::hours(2))
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut conn)
+        .expect("restore stale candidate after trade commit");
+        assert_eq!(
+            IntradayMonitor
+                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .expect("replay after decision window"),
+            0
+        );
+        assert!(consumption(id).consumed_at.is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br134_reduce_only_context_allows_paper_buy_after_20260922_policy() {
         let mut guard = prepare_execution_account();
         let code = unique_code("REDUCE_ONLY");
         guard.codes.push(code.clone());
@@ -1046,13 +1225,13 @@ mod tests {
         assert_eq!(
             IntradayMonitor
                 .tick_with_portfolio_state(context, admitted_test_portfolio_state)
-                .expect("risk-gated tick"),
-            0
+                .expect("account mode is informational for paper buy"),
+            1
         );
         let row = consumption(id);
-        assert!(row.consumed_at.is_none());
-        assert!(row.consumed_by.is_none());
-        assert!(row.outcome.is_none());
+        assert!(row.consumed_at.is_some());
+        assert_eq!(row.consumed_by.as_deref(), Some("intraday_monitor"));
+        assert_eq!(row.outcome.as_deref(), Some("VolumeSurge"));
     }
 
     #[test]
@@ -1205,6 +1384,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn evening_failure_debounce_is_explicit_and_resettable() {
+        let _guard = prepare_execution_account();
         let review_date = NaiveDate::from_ymd_opt(2198, 1, 4).unwrap();
         *EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(chrono::Utc::now());
