@@ -2675,15 +2675,21 @@ impl DatabaseManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         #[cfg(test)]
+        if let Some(path) = db_path.as_ref() {
+            return Err(format!(
+                "unit-test global database does not accept explicit path {}; use open_isolated_for_test",
+                path.display()
+            )
+            .into());
+        }
+
+        #[cfg(test)]
         if DB_INSTANCE.get().is_some() {
             return Ok(());
         }
 
         #[cfg(test)]
-        let path = {
-            let _ = db_path;
-            unit_test_database_path().clone()
-        };
+        let path = unit_test_database_path().clone();
 
         #[cfg(not(test))]
         let path = db_path.unwrap_or_else(|| {
@@ -2693,6 +2699,35 @@ impl DatabaseManager {
             p
         });
 
+        let db = Self::open_at_path(path)?;
+        DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
+        info!("数据库初始化完成");
+
+        Ok(())
+    }
+
+    /// Test callers that need a particular file own this manager directly;
+    /// the process-wide singleton always uses its isolated shared fixture.
+    #[cfg(test)]
+    pub(crate) fn open_isolated_for_test(
+        path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let parent = path
+            .parent()
+            .ok_or("isolated test database requires a parent directory")?
+            .canonicalize()?;
+        let temp_root = std::env::temp_dir().canonicalize()?;
+        let test_named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("TEST_CODE_") && name.ends_with(".db"));
+        if !parent.starts_with(temp_root) || !test_named {
+            return Err("isolated test database must be a TEST_CODE_*.db file under the OS temporary directory".into());
+        }
+        Self::open_at_path(path)
+    }
+
+    fn open_at_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let database_url = path.to_string_lossy().to_string();
         info!("初始化数据库: {}", database_url);
 
@@ -2880,7 +2915,7 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
 
         drop(conn);
-        let db = DatabaseManager {
+        Ok(DatabaseManager {
             pool,
             attribution_pool,
             attribution_connection_source,
@@ -2889,11 +2924,7 @@ impl DatabaseManager {
             allow_unattested_attribution_reads_for_test: false,
             selection_connection_source: None,
             selection_schema_authority: None,
-        };
-        DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
-        info!("数据库初始化完成");
-
-        Ok(())
+        })
     }
 
     /// Construct the operational pool from the opaque GlobalSchema owner
@@ -4635,14 +4666,6 @@ mod tests {
         wal_autocheckpoint: i32,
     }
 
-    // v14.1 review fix: RAII test DB guard, panic 时 Drop 兜底清理
-    struct TestDbGuard(&'static str);
-    impl Drop for TestDbGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-
     struct TemporarySqliteDatabase(PathBuf);
 
     impl TemporarySqliteDatabase {
@@ -4746,12 +4769,8 @@ mod tests {
         }
     }
 
-    // OnceCell 单例全局共享，测试共用同一路径避免竞态
-    static TEST_DB: &str = "./test_data/test.db";
-
     fn init_db_for_test() {
-        std::fs::create_dir_all("./test_data").ok();
-        let _ = DatabaseManager::init(Some(PathBuf::from(TEST_DB)));
+        DatabaseManager::init(None).expect("shared test database init");
     }
 
     #[test]
@@ -4759,6 +4778,66 @@ mod tests {
         init_db_for_test();
         let db = DatabaseManager::get();
         assert!(db.get_conn().is_ok());
+    }
+
+    #[test]
+    fn explicit_test_database_paths_are_isolated_instead_of_remapped() {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
+        let root = tempfile::tempdir().expect("isolated test database root");
+        let first_path = root.path().join("TEST_CODE_first.db");
+        let second_path = root.path().join("TEST_CODE_second.db");
+        DatabaseManager::init(None).expect("shared fixture init");
+        let shared = DatabaseManager::get();
+        DatabaseManager::init(None).expect("repeated shared fixture init");
+        assert!(std::ptr::eq(shared, DatabaseManager::get()));
+        let rejected = DatabaseManager::init(Some(first_path.clone()))
+            .expect_err("global test singleton must not silently ignore an explicit path");
+        assert!(rejected.to_string().contains("open_isolated_for_test"));
+        assert!(
+            DatabaseManager::open_isolated_for_test(PathBuf::from("data/stock_analysis.db"))
+                .is_err()
+        );
+
+        let first = DatabaseManager::open_isolated_for_test(first_path.clone()).unwrap();
+        let second = DatabaseManager::open_isolated_for_test(second_path.clone()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (first_count, second_count) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut conn = first.get_conn().unwrap();
+                diesel::sql_query("CREATE TABLE TEST_CODE_b12_marker (id INTEGER PRIMARY KEY)")
+                    .execute(&mut conn)
+                    .unwrap();
+                diesel::sql_query("INSERT INTO TEST_CODE_b12_marker (id) VALUES (1)")
+                    .execute(&mut conn)
+                    .unwrap();
+                ready_tx.send(()).unwrap();
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'TEST_CODE_b12_marker'",
+                )
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count
+            });
+            let reader = scope.spawn(move || {
+                ready_rx.recv().expect("first isolated writer completed");
+                let mut conn = second.get_conn().unwrap();
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'TEST_CODE_b12_marker'",
+                )
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count
+            });
+            (writer.join().unwrap(), reader.join().unwrap())
+        });
+        assert_eq!((first_count, second_count), (1, 0));
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
     }
 
     #[test]
@@ -6021,14 +6100,10 @@ mod tests {
         use crate::schema::stock_position;
         use diesel::prelude::*;
 
-        let test_db = "./test_data/test_backfill_st_type.db";
-        std::fs::create_dir_all("./test_data").ok();
-        let _ = std::fs::remove_file(test_db);
-        let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
-        // review fix: RAII guard, panic 时 Drop 清理 test_db
-        let _guard = TestDbGuard(test_db);
-
-        let db = DatabaseManager::get();
+        let isolated = tempfile::tempdir().expect("isolated ST backfill database root");
+        let test_db = isolated.path().join("TEST_CODE_backfill_st_type.db");
+        let db = DatabaseManager::open_isolated_for_test(test_db)
+            .expect("isolated ST backfill database");
 
         // Insert 4 测试持仓: 真正 ST 开头 + 子串含 ST (非 ST 类) + 普通 + *ST
         let cases = vec![
@@ -6088,14 +6163,10 @@ mod tests {
         use crate::schema::stock_position;
         use diesel::prelude::*;
 
-        let test_db = "./test_data/test_upsert_preserve_st.db";
-        std::fs::create_dir_all("./test_data").ok();
-        let _ = std::fs::remove_file(test_db);
-        let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
-        // review fix: RAII guard
-        let _guard = TestDbGuard(test_db);
-
-        let db = DatabaseManager::get();
+        let isolated = tempfile::tempdir().expect("isolated ST upsert database root");
+        let test_db = isolated.path().join("TEST_CODE_upsert_preserve_st.db");
+        let db =
+            DatabaseManager::open_isolated_for_test(test_db).expect("isolated ST upsert database");
 
         // 1. 首次 insert, st_type=None
         db.save_position(&NewStockPosition {

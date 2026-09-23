@@ -905,9 +905,7 @@ mod tests {
 
     #[test]
     fn test_process_ann_with_empty_code_name_parses_title() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
-            "./test_data/test_ai.db",
-        )));
+        crate::database::DatabaseManager::init(None).expect("shared test database init");
         let mut nm = NewsMonitor::new();
         nm.linker.register_position("TEST_CODE_002421", "达实智能"); // L1过滤需要
                                                                      // 模拟API返回空code/name，但标题含公司名
@@ -934,9 +932,7 @@ mod tests {
 
     #[test]
     fn test_unrelated_stock_filtered_out() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
-            "./test_data/test_ai.db",
-        )));
+        crate::database::DatabaseManager::init(None).expect("shared test database init");
         let mut nm = NewsMonitor::new();
         // 科森科技不在持仓/自选 → L1过滤
         let ann = announcement::Announcement {

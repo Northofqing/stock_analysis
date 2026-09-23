@@ -586,16 +586,16 @@ mod tests {
         }
     }
 
-    // B-002 DAO 测试约束: DatabaseManager 是 OnceCell 单例, init() 仅生效一次.
-    // 全部 DAO 测试共用同一份 ./test_data/test.db, 用唯一 date 隔离, 不假定空表.
+    // The board DAO lifecycle uses its own file so another test's global
+    // singleton cannot change the assertions or lose its database to cleanup.
     const TEST_DATE: &str = "2099-01-01"; // 远期日期, 不与生产 / 其他测试冲突
 
-    /// B-002 综合测试: 一次 init 验证 round-trip + 排序 + INSERT OR REPLACE.
-    /// 拆 3 个独立测试因 OnceCell 限制都共享同一 DB, 写在一起避免干扰.
+    /// B-002 综合测试: 独立数据库验证 round-trip + 排序 + INSERT OR REPLACE.
     #[test]
     fn test_board_rotations_dao_lifecycle() {
         let test_data_dir = Path::new("./test_data");
-        let test_db = std::path::PathBuf::from("./test_data/test.db");
+        let isolated = tempfile::tempdir().expect("isolated board rotations database root");
+        let test_db = isolated.path().join("TEST_CODE_board_rotations.db");
         std::fs::create_dir_all(test_data_dir)
             .expect("create TEST_CODE board rotations test data directory");
         let cleanup_probe = test_data_dir.join(format!(
@@ -608,11 +608,8 @@ mod tests {
             .expect("remove existing TEST_CODE concept cleanup probe");
         remove_test_file_if_present(&cleanup_probe)
             .expect("accept missing TEST_CODE concept cleanup probe");
-        remove_test_file_if_present(&test_db)
-            .expect("remove exact TEST_CODE board rotations database if present");
-        DatabaseManager::init(Some(test_db))
+        let db = DatabaseManager::open_isolated_for_test(test_db)
             .expect("initialize exact TEST_CODE board rotations database");
-        let db = DatabaseManager::get();
 
         // === 场景 1: round-trip, 2 个 board 写入, 验证字段 + 排序 ===
         db.save_board_rotations(

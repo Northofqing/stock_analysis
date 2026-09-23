@@ -211,7 +211,6 @@ mod tests {
     use super::*;
     use crate::models::NewStockPosition;
     use diesel::prelude::*;
-    use std::path::PathBuf;
 
     fn unique_code(label: &str) -> String {
         format!(
@@ -262,8 +261,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_stock_repository_roundtrip() {
-        std::fs::create_dir_all("./test_data").ok();
-        let _ = DatabaseManager::init(Some(PathBuf::from("./test_data/test.db")));
+        DatabaseManager::init(None).expect("shared test database init");
         let db = DatabaseManager::get();
 
         // 使用 TEST_ 前缀代码与真实标的硬隔离（AGENTS.md 2.5）

@@ -179,9 +179,7 @@ mod tests {
     use chrono::NaiveDate;
 
     fn init_db() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
-            "./test_data/test.db",
-        )));
+        crate::database::DatabaseManager::init(None).expect("shared test database init");
     }
 
     fn pos(code: &str, name: &str, cost: f64, stop: f64) -> Position {

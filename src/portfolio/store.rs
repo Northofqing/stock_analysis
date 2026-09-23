@@ -528,16 +528,8 @@ mod tests {
     use super::*;
     use crate::market_domain::ProviderId;
     use chrono::{TimeZone, Utc};
-    use std::path::PathBuf;
-
-    const TEST_DB: &str = "./test_data/test.db";
-
     fn init() {
-        std::fs::create_dir_all("./test_data").ok();
-        // DB 可能已被其他测试初始化，忽略重复初始化错误
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::init(Some(PathBuf::from(TEST_DB)))
-        }));
+        crate::database::DatabaseManager::init(None).expect("shared test database init");
     }
 
     fn metadata(code: &str, name: &str, batch_id: &str) -> MarketSecurityIdentity {
