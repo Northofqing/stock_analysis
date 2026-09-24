@@ -645,38 +645,6 @@ pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), 
     Ok((ledger.cash, ledger.total_value, pos_pct))
 }
 
-/// 最新券商账户汇总（append-only user_account_summary）。
-/// 返回 (total_assets, available_cash, securities_market_value, daily_pnl)。
-fn account_snapshot_summary() -> Result<(f64, f64, f64, f64), String> {
-    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
-    let mut conn = db
-        .get_conn()
-        .map_err(|error| format!("DB 连接失败: {error}"))?;
-    #[derive(diesel::QueryableByName)]
-    struct AccountSummaryRow {
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        total_assets: f64,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        available_cash: f64,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        securities_market_value: f64,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        daily_pnl: f64,
-    }
-    let summary: AccountSummaryRow = diesel::sql_query(
-        "SELECT total_assets, available_cash, securities_market_value, daily_pnl \
-         FROM user_account_summary ORDER BY id DESC LIMIT 1",
-    )
-    .get_result(&mut conn)
-    .map_err(|error| format!("account summary unavailable: {error}"))?;
-    Ok((
-        summary.total_assets,
-        summary.available_cash,
-        summary.securities_market_value,
-        summary.daily_pnl,
-    ))
-}
-
 /// BR-151 快照模式 ledger 刷新（intraday_monitor tick 生产入口每 30s 无条件调用）。
 ///
 /// 用最新券商账户汇总 upsert 当日 ledger（created_at=CURRENT_TIMESTAMP 刷新，
@@ -704,9 +672,13 @@ fn check_scan_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(),
 
 fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
     check_scan_cancelled(cancelled)?;
-    let (snapshot_total, available_cash, snapshot_market, snapshot_pnl) =
-        account_snapshot_summary()?;
     let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    // 数值与有效日必须来自同一条按 effective_at 选出的账户事实。
+    let summary = crate::database::user_account_summary::latest()?
+        .ok_or_else(|| "account summary unavailable: no confirmed summary".to_string())?;
+    let snapshot_date = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
+        .map_err(|error| format!("snapshot effective_at invalid: {error}"))?
+        .date_naive();
     let mut conn = db
         .get_conn()
         .map_err(|error| format!("DB 连接失败: {error}"))?;
@@ -715,15 +687,15 @@ fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomi
 
     // 口径分派：快照新鲜（用户当天上传）→ 快照为准；过期 → 持仓 × 实时价自算。
     let (total_assets, cash, market_value, daily_pnl) =
-        if latest_snapshot_effective_date(&mut conn)? == Some(today) {
+        if snapshot_date == today {
             (
-                snapshot_total,
-                available_cash,
-                snapshot_market,
-                snapshot_pnl,
+                summary.total_assets,
+                summary.available_cash,
+                summary.securities_market_value,
+                summary.daily_pnl,
             )
         } else {
-            estimate_ledger_from_positions(&mut conn, available_cash, today, cancelled)?
+            estimate_ledger_from_positions(&mut conn, summary.available_cash, today, cancelled)?
         };
 
     // upsert 当日 ledger（created_at 每 tick 刷新 → age≤30s 结构门通过）
@@ -751,29 +723,6 @@ fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomi
     .get_result(&mut conn)
     .map_err(|error| format!("account ledger unavailable: {error}"))?;
     validate_ledger_state(&ledger, &today_str, chrono::Utc::now().naive_utc())
-}
-
-/// 最新券商汇总 effective_at 的日期（东八区，作为「用户是否当天上传」判据）。
-/// 无汇总行 → None（`account_snapshot_summary` 前置已保证有行，防御性返回）。
-fn latest_snapshot_effective_date(
-    conn: &mut SqliteConnection,
-) -> Result<Option<NaiveDate>, String> {
-    #[derive(QueryableByName)]
-    struct EffectiveDateRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        effective_at: String,
-    }
-    let row: Option<EffectiveDateRow> =
-        diesel::sql_query("SELECT effective_at FROM user_account_summary ORDER BY id DESC LIMIT 1")
-            .get_result(conn)
-            .optional()
-            .map_err(|error| format!("snapshot effective_at unavailable: {error}"))?;
-    row.map(|r| {
-        chrono::DateTime::parse_from_rfc3339(&r.effective_at)
-            .map(|dt| dt.date_naive())
-            .map_err(|error| format!("snapshot effective_at invalid: {error}"))
-    })
-    .transpose()
 }
 
 /// 快照过期自算路径：最新持仓明细 × 估值价 → 市值；总资产 = 市值 + 快照现金；

@@ -130,6 +130,8 @@ mod tests {
             .expect("older summary");
         save_with_conn(&mut conn, &summary("2026-07-25T15:00:00+08:00", 20.0))
             .expect("newer summary");
+        save_with_conn(&mut conn, &summary("2026-07-23T15:00:00+08:00", -30.0))
+            .expect("older summary imported later");
         let latest = latest_with_conn(&mut conn)
             .expect("latest read")
             .expect("persisted summary");
