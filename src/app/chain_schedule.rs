@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use super::modes::run_chain_analysis_mode_with_send_guard;
@@ -26,6 +26,28 @@ impl ChainPhase {
             Self::Preopen => "preopen",
             Self::Postclose => "postclose",
         }
+    }
+
+    fn window(self) -> (NaiveTime, NaiveTime) {
+        match self {
+            Self::Preopen => (
+                NaiveTime::from_hms_opt(9, 5, 0).unwrap(),
+                NaiveTime::from_hms_opt(9, 15, 0).unwrap(),
+            ),
+            Self::Postclose => (
+                NaiveTime::from_hms_opt(15, 30, 0).unwrap(),
+                NaiveTime::from_hms_opt(15, 35, 0).unwrap(),
+            ),
+        }
+    }
+
+    pub fn starts_in_window(self, date: NaiveDate, observed_at: NaiveDateTime) -> bool {
+        let (start, end) = self.window();
+        observed_at.date() == date && observed_at.time() >= start && observed_at.time() < end
+    }
+
+    fn is_overdue(self, date: NaiveDate, observed_at: NaiveDateTime) -> bool {
+        observed_at.date() == date && observed_at.time() >= self.window().1
     }
 }
 
@@ -73,6 +95,13 @@ pub struct ChainAttemptEvidence {
     pub resolution_note: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainMissEvidence {
+    pub detected_at: String,
+    pub latest_attempt_no: Option<i64>,
+    pub latest_state: Option<String>,
+}
+
 impl ChainScheduleStore {
     pub fn production() -> Self {
         Self::new(
@@ -108,7 +137,22 @@ impl ChainScheduleStore {
                  updated_at TEXT NOT NULL,
                  resolution_note TEXT,
                  PRIMARY KEY (phase, schedule_date, attempt_no)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS chain_schedule_miss_v1 (
+                 phase TEXT NOT NULL CHECK (phase IN ('preopen', 'postclose')),
+                 schedule_date TEXT NOT NULL,
+                 detected_at TEXT NOT NULL,
+                 latest_attempt_no INTEGER,
+                 latest_state TEXT,
+                 PRIMARY KEY (phase, schedule_date),
+                 CHECK ((latest_attempt_no IS NULL) = (latest_state IS NULL))
+             );
+             CREATE TRIGGER IF NOT EXISTS chain_schedule_miss_no_update
+             BEFORE UPDATE ON chain_schedule_miss_v1
+             BEGIN SELECT RAISE(ABORT, 'chain schedule miss is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS chain_schedule_miss_no_delete
+             BEFORE DELETE ON chain_schedule_miss_v1
+             BEGIN SELECT RAISE(ABORT, 'chain schedule miss is immutable'); END;",
         )?;
         Ok(connection)
     }
@@ -168,6 +212,78 @@ impl ChainScheduleStore {
             .optional()?;
         let status = status_from_state(attempt.as_ref().map(|row| row.state.as_str()))?;
         Ok((status, attempt))
+    }
+
+    /// A missed window records absence of a confirmed weak acceptance. It is
+    /// observational only: no analysis, notification, or retry is triggered.
+    pub fn record_missed_window(
+        &self,
+        phase: ChainPhase,
+        date: NaiveDate,
+        observed_at: DateTime<FixedOffset>,
+    ) -> Result<Option<ChainMissEvidence>> {
+        if !phase.is_overdue(date, observed_at.naive_local()) {
+            return Ok(None);
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest = Self::latest_state(&transaction, phase, date)?;
+        if status_from_state(latest.as_ref().map(|(_, state)| state.as_str()))?
+            != ChainScheduleStatus::Ready
+        {
+            return Ok(None);
+        }
+        let evidence = ChainMissEvidence {
+            detected_at: observed_at.to_rfc3339(),
+            latest_attempt_no: latest.as_ref().map(|(number, _)| *number),
+            latest_state: latest.map(|(_, state)| state),
+        };
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO chain_schedule_miss_v1
+             (phase, schedule_date, detected_at, latest_attempt_no, latest_state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                phase.as_str(),
+                date.to_string(),
+                evidence.detected_at,
+                evidence.latest_attempt_no,
+                evidence.latest_state,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((inserted == 1).then_some(evidence))
+    }
+
+    pub fn inspect_miss(
+        &self,
+        phase: ChainPhase,
+        date: NaiveDate,
+    ) -> Result<Option<ChainMissEvidence>> {
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("只读打开产业链调度状态库 {}", self.path.display()))?;
+        let installed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chain_schedule_miss_v1')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !installed {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT detected_at, latest_attempt_no, latest_state
+                 FROM chain_schedule_miss_v1 WHERE phase = ?1 AND schedule_date = ?2",
+                params![phase.as_str(), date.to_string()],
+                |row| {
+                    Ok(ChainMissEvidence {
+                        detected_at: row.get(0)?,
+                        latest_attempt_no: row.get(1)?,
+                        latest_state: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn begin_send(&self, phase: ChainPhase, date: NaiveDate, report_path: &str) -> Result<i64> {
@@ -291,6 +407,13 @@ pub async fn run_scheduled_chain_analysis(
         ChainScheduleStatus::Ready => {}
     }
 
+    anyhow::ensure!(
+        phase.starts_in_window(date, Local::now().naive_local()),
+        "产业链 {} {} 已不在新报告发送窗口，禁止窗口外重新采集并发送",
+        phase.as_str(),
+        date
+    );
+
     let filename = scheduled_report_filename(phase, date, Utc::now());
     let mut attempt_no = None;
     run_chain_analysis_mode_with_send_guard(true, Some(&filename), |report_path| {
@@ -306,6 +429,108 @@ pub async fn run_scheduled_chain_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missed_window_is_recorded_once_without_authorizing_a_late_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chain.sqlite3");
+        let store = ChainScheduleStore::new(&path);
+        let date = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let in_window = date.and_hms_opt(15, 34, 59).unwrap();
+        let overdue = DateTime::parse_from_rfc3339("2026-09-24T15:35:00+08:00").unwrap();
+        assert!(ChainPhase::Postclose.starts_in_window(date, in_window));
+        assert!(!ChainPhase::Postclose.starts_in_window(date, overdue.naive_local()));
+        assert_eq!(
+            store
+                .record_missed_window(
+                    ChainPhase::Postclose,
+                    date,
+                    DateTime::parse_from_rfc3339("2026-09-24T15:34:59+08:00").unwrap(),
+                )
+                .unwrap(),
+            None
+        );
+        assert!(!path.exists());
+
+        let first = store
+            .record_missed_window(ChainPhase::Postclose, date, overdue)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.detected_at, "2026-09-24T15:35:00+08:00");
+        assert_eq!(first.latest_attempt_no, None);
+        assert_eq!(
+            ChainScheduleStore::new(&path)
+                .record_missed_window(
+                    ChainPhase::Postclose,
+                    date,
+                    DateTime::parse_from_rfc3339("2026-09-24T22:25:00+08:00").unwrap(),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.inspect_miss(ChainPhase::Postclose, date).unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            store.status(ChainPhase::Postclose, date).unwrap(),
+            ChainScheduleStatus::Ready
+        );
+        assert!(!ChainPhase::Postclose.starts_in_window(date, date.and_hms_opt(22, 25, 0).unwrap()));
+        assert_eq!(
+            store
+                .record_missed_window(
+                    ChainPhase::Postclose,
+                    date,
+                    DateTime::parse_from_rfc3339("2026-09-25T00:00:00+08:00").unwrap(),
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn uncertain_or_closed_send_is_not_misclassified_as_missed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ChainScheduleStore::new(directory.path().join("chain.sqlite3"));
+        let date = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let late = DateTime::parse_from_rfc3339("2026-09-24T16:00:00+08:00").unwrap();
+        store
+            .begin_send(ChainPhase::Postclose, date, "reports/postclose.md")
+            .unwrap();
+        assert_eq!(
+            store
+                .record_missed_window(ChainPhase::Postclose, date, late)
+                .unwrap(),
+            None
+        );
+        store
+            .resolve_uncertain(
+                ChainPhase::Postclose,
+                date,
+                ManualResolution::Delivered,
+                "渠道日志已核对",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .record_missed_window(ChainPhase::Postclose, date, late)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.inspect_miss(ChainPhase::Postclose, date).unwrap(),
+            None
+        );
+
+        let preopen_end = DateTime::parse_from_rfc3339("2026-09-24T09:15:00+08:00").unwrap();
+        assert!(!ChainPhase::Preopen.starts_in_window(date, preopen_end.naive_local()));
+        let preopen_miss = store
+            .record_missed_window(ChainPhase::Preopen, date, preopen_end)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preopen_miss.latest_attempt_no, None);
+    }
 
     #[test]
     fn sending_attempt_survives_restart_and_requires_manual_resolution() {

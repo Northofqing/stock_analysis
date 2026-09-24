@@ -9145,8 +9145,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 15:30-15:34 窗口: 当日涨停池 + 当日快讯 → LLM 产业链报告 → 推送。
             // 与 15:10 断点 A 落库 (chain_daily, 不推送) 互补: 15:10 只写库,
             // 15:30 出报告推用户。发送前写持久 attempt；状态不明须人工裁定。
-            if now.hour() == 15 && (30..35).contains(&now.minute()) {
-                let today = now.date_naive();
+            let chain_now = chrono::Local::now().naive_local();
+            let chain_today = chain_now.date();
+            if calendar::is_trading_day(chain_today)
+                && ChainPhase::Postclose.starts_in_window(chain_today, chain_now)
+            {
+                let today = chain_today;
                 match run_scheduled_chain_analysis(
                     &ChainScheduleStore::production(), ChainPhase::Postclose, today,
                 ).await {
@@ -9160,6 +9164,22 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     Err(error) => {
                         log::error!("[产业链][盘后15:30] 链分析未完成，请核对发送状态: {error}");
                     }
+                }
+            }
+            if calendar::is_trading_day(chain_today) {
+                match ChainScheduleStore::production().record_missed_window(
+                    ChainPhase::Postclose,
+                    chain_today,
+                    chrono::Local::now().fixed_offset(),
+                ) {
+                    Ok(Some(miss)) => log::warn!(
+                        "[产业链][盘后15:30] 发送窗口已错过且无渠道弱接受，停止自动补发 date={} detected_at={} latest_attempt={:?} latest_state={:?}",
+                        chain_today, miss.detected_at, miss.latest_attempt_no, miss.latest_state
+                    ),
+                    Ok(None) => {},
+                    Err(error) => log::error!(
+                        "[产业链][盘后15:30] 错过窗口记录失败 date={}: {error}", chain_today
+                    ),
                 }
             }
             // Fix 4 (review): PerformanceEngine 15:05 cron 接入 (写 paper_performance_snapshot)
@@ -9642,8 +9662,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 交易日, 与 15:30 盘后 (当日) 各自独立报告文件。
             // 2026-08-07 补偿原则: 窗口放宽到 9:05-9:14 (9:15 后错过竞价参考
             // 意义, 且 9:10 预检/9:20 竞价紧随) — 9:09 后启动的 monitor 仍补做。
-            if now.hour() == 9 && (5..15).contains(&now.minute()) {
-                let today = now.date_naive();
+            let chain_now = chrono::Local::now().naive_local();
+            let chain_today = chain_now.date();
+            if calendar::is_trading_day(chain_today)
+                && ChainPhase::Preopen.starts_in_window(chain_today, chain_now)
+            {
+                let today = chain_today;
                 match run_scheduled_chain_analysis(
                     &ChainScheduleStore::production(), ChainPhase::Preopen, today,
                 ).await {
@@ -9657,6 +9681,22 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     Err(error) => {
                         log::error!("[产业链][盘前9:05] 链分析未完成，请核对发送状态: {error}");
                     }
+                }
+            }
+            if calendar::is_trading_day(chain_today) {
+                match ChainScheduleStore::production().record_missed_window(
+                    ChainPhase::Preopen,
+                    chain_today,
+                    chrono::Local::now().fixed_offset(),
+                ) {
+                    Ok(Some(miss)) => log::warn!(
+                        "[产业链][盘前9:05] 发送窗口已错过且无渠道弱接受，停止自动补发 date={} detected_at={} latest_attempt={:?} latest_state={:?}",
+                        chain_today, miss.detected_at, miss.latest_attempt_no, miss.latest_state
+                    ),
+                    Ok(None) => {},
+                    Err(error) => log::error!(
+                        "[产业链][盘前9:05] 错过窗口记录失败 date={}: {error}", chain_today
+                    ),
                 }
             }
             tokio::time::sleep(PAPER_DECISION_TICK).await;

@@ -66,5 +66,11 @@ fn main() -> Result<()> {
             attempt.resolution_note.as_deref().unwrap_or("")
         );
     }
+    if let Some(miss) = store.inspect_miss(phase, date)? {
+        println!(
+            "missed_window_at={} latest_attempt={:?} latest_state={:?}",
+            miss.detected_at, miss.latest_attempt_no, miss.latest_state
+        );
+    }
     Ok(())
 }
