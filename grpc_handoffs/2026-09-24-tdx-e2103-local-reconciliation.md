@@ -30,3 +30,9 @@
 - 保留 BR-171 人工确认门槛；300005 的 90 日窗口须先完成独立事实核验与当前批次的证据绑定确认。
 - 688277 的长窗口须在本机 BR-092 建立可验证的停复牌例外后重新验收；短窗口和长窗口分别计数。
 - 按新的 `Custom` 归因重新观察本机路由失败，再决定哪些属于提供者、准入规则或桥接传输。旧审计行无法追溯出被遮蔽的原始 provider/trailer。
+
+## 下游审计修正上线验收（2026-09-24 11:11 CST）
+
+定向回归 `cargo test --lib historical_bridge_failure_does_not_claim_tdx_provider -- --test-threads=1` 通过，`monitor` 和 `selection_activation_prepare` 的 release 构建通过。新 `monitor` SHA-256 为 `d76e4d8a2e88ad0318d59ade63ad6ba2dca4cf2a110f5feb4854aa9d48c728a2`。激活修订值 `1b0207c5365e0261254106d274531b340b70df113aaad4a4d808875a991d7c70` 从 11:07 CST 生效；launchd 在生效后重启，PID `59531` 于 11:07:20 启动。从此次启动日志锚点第 `646349` 行起，`capability=disabled` 为 0。
+
+截至 `2026-09-24T03:11:05.257Z`，此次启动后的 `HistoricalDailyBars` 审计已有 `Tdx / available / accepted=26`、`Tdx / partial / manual_confirmation_required=5`、`Baidu / unavailable / router_sources_exhausted=8`、`Custom / unavailable / no_verified_batch=3`。`Custom` 新行证明缺少提供者证据的桥接错误不再假记为 TDX；这些计数仍是审计行而非去重的 RPC 次数，也不代表长窗口规则问题已修复。
