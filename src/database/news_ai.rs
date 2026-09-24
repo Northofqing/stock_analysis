@@ -2756,6 +2756,223 @@ mod tests {
     }
 
     #[test]
+    fn br172_and_counted_reentry_share_one_physical_delivery() {
+        use crate::durable_delivery::{
+            AuthoritativeDeliveryRequest, AuthoritativeSinkPort, AuthoritativeSinkResult,
+            CoordinatorConfig, DecisionState, DeliveryEnvelope, DeliverySubKind,
+            DurableDeliveryCoordinator, DurableDeliveryError, ImmutableAppendPort,
+            PushKind as CountedPushKind, TypedReceipt,
+        };
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Append {
+            records: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
+        }
+
+        impl ImmutableAppendPort for Append {
+            fn append_exact(
+                &self,
+                _record_kind: &str,
+                identity: &str,
+                canonical_bytes: &[u8],
+                sha256: &str,
+            ) -> crate::durable_delivery::Result<String> {
+                let mut records = self.records.lock().expect("append records");
+                let value = (canonical_bytes.to_vec(), sha256.to_owned());
+                match records.get(identity) {
+                    Some(previous) if previous != &value => Err(
+                        DurableDeliveryError::ImmutableAppendConflict(identity.to_owned()),
+                    ),
+                    Some(_) => Ok(format!("test://{identity}")),
+                    None => {
+                        records.insert(identity.to_owned(), value);
+                        Ok(format!("test://{identity}"))
+                    }
+                }
+            }
+        }
+
+        struct Sink(AtomicUsize);
+
+        impl AuthoritativeSinkPort for Sink {
+            fn sink_identity(&self) -> &str {
+                "TEST_CODE_BR172_COUNTED_SINK"
+            }
+
+            fn deliver(&self, _request: &AuthoritativeDeliveryRequest) -> AuthoritativeSinkResult {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                AuthoritativeSinkResult::Accepted(TypedReceipt {
+                    channel: "TEST_CODE_CHANNEL".to_owned(),
+                    provider: "TEST_CODE_PROVIDER".to_owned(),
+                    message_id: "TEST_CODE_BR172_COUNTED_MESSAGE".to_owned(),
+                    platform_message_id: None,
+                    accepted_at: Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap(),
+                    latency_ms: Some(1),
+                })
+            }
+        }
+
+        let mut conn = connection();
+        let audited = audited_assessment(&mut conn, "TEST_CODE_BR172_COUNTED", "TEST_CODE_600519");
+        let delivery = audited.delivery();
+        let NewsAiReserveOutcome::Reserved(reservation) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).expect("BR-172 reserve")
+        else {
+            panic!("new assessment must reserve");
+        };
+
+        std::fs::create_dir_all("data/test").expect("TEST_CODE namespace parent");
+        let namespace = tempfile::Builder::new()
+            .prefix("TEST_CODE_BR172_COUNTED_")
+            .tempdir_in("data/test")
+            .expect("isolated counted namespace");
+        let test_code = namespace
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+            namespace.path().join("durable_delivery.sqlite3"),
+            &test_code,
+            format!("owner-{test_code}-0123456789abcdef"),
+        ))
+        .expect("isolated counted coordinator");
+        let identity = delivery.identity().sha256();
+        let text = delivery.render_card();
+        let subject_hash = hex::encode(Sha256::digest(text.as_bytes()));
+        let counted = DeliveryEnvelope::new(
+            "2026-07-27",
+            CountedPushKind::NewsAiAnalysis,
+            DeliverySubKind::None,
+            "SSE:EQUITY:TEST_CODE_600519",
+            format!("news-ai-analysis:2026-07-27:TEST_CODE_600519:{identity}"),
+            identity,
+            identity.as_bytes().to_vec(),
+            subject_hash,
+            text.into_bytes(),
+            false,
+            None,
+        )
+        .expect("exact counted envelope");
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap();
+        let append = Append::default();
+        let sink = Arc::new(Sink(AtomicUsize::new(0)));
+        let first = coordinator
+            .prepare(&counted, 1, now)
+            .expect("counted prepare");
+        assert_eq!(first.state, DecisionState::Reserved);
+        coordinator
+            .reconcile_all_pending(&append, now)
+            .expect("counted prepare audit");
+        let sinks: Vec<crate::durable_delivery::AuthoritativeSink> = vec![sink.clone()];
+        let resumed = coordinator
+            .resume_deliverable(&counted.decision_identity, &sinks, now)
+            .expect("counted physical delivery");
+        assert_eq!(resumed.sink_calls, 1);
+        coordinator
+            .reconcile_all_pending(&append, now)
+            .expect("counted delivery audit");
+        assert_eq!(
+            coordinator
+                .decision_state(&counted.decision_identity)
+                .unwrap(),
+            DecisionState::Delivered
+        );
+
+        // Keep the production adapter's order: counted delivery becomes
+        // durable before the BR-172 sink marker is written.
+        begin_news_ai_sink_attempt_on_conn(&mut conn, delivery, &reservation)
+            .expect("BR-172 sink marker");
+        let audit_id = format!("TEST_CODE_COUNTED_{}", counted.decision_identity);
+        let audit = record_news_ai_delivered_on_conn(&mut conn, delivery, &reservation, &audit_id)
+            .expect("BR-172 delivered audit");
+        link_news_ai_prediction_on_conn(&mut conn, delivery, &reservation, &audit)
+            .expect("BR-172 prediction link");
+
+        let replay = coordinator
+            .prepare(&counted, 1, now)
+            .expect("counted replay");
+        assert_eq!(replay.state, DecisionState::Delivered);
+        assert_eq!(replay.sink_calls, 0);
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap(),
+            NewsAiReserveOutcome::Deduped
+        ));
+
+        // A second source-bound assessment for the same ticket is denied by
+        // the real counted cooldown. BR-172 must close its reservation without
+        // claiming that the second card reached the physical sink.
+        let second = audited_assessment(
+            &mut conn,
+            "TEST_CODE_BR172_COUNTED_SECOND",
+            "TEST_CODE_600519",
+        );
+        let second_delivery = second.delivery();
+        let NewsAiReserveOutcome::Reserved(second_reservation) =
+            reserve_news_ai_delivery_on_conn(&mut conn, second_delivery)
+                .expect("second BR-172 reserve")
+        else {
+            panic!("second assessment must reserve independently");
+        };
+        let second_identity = second_delivery.identity().sha256();
+        let second_text = second_delivery.render_card();
+        let second_counted = DeliveryEnvelope::new(
+            "2026-07-27",
+            CountedPushKind::NewsAiAnalysis,
+            DeliverySubKind::None,
+            "SSE:EQUITY:TEST_CODE_600519",
+            format!("news-ai-analysis:2026-07-27:TEST_CODE_600519:{second_identity}"),
+            second_identity,
+            second_identity.as_bytes().to_vec(),
+            hex::encode(Sha256::digest(second_text.as_bytes())),
+            second_text.into_bytes(),
+            false,
+            None,
+        )
+        .expect("second exact counted envelope");
+        let denied = coordinator
+            .prepare(&second_counted, 1, now)
+            .expect("counted cooldown decision");
+        assert_eq!(denied.state, DecisionState::RejectedAuditPending);
+        assert_eq!(denied.sink_calls, 0);
+        coordinator
+            .reconcile_all_pending(&append, now)
+            .expect("persist counted cooldown rejection audit");
+        assert_eq!(
+            coordinator
+                .decision_state(&second_counted.decision_identity)
+                .unwrap(),
+            DecisionState::RejectedDurable
+        );
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        rollback_news_ai_delivery_on_conn(
+            &mut conn,
+            second_delivery,
+            &second_reservation,
+            "BR172_PRE_SINK_NOT_DELIVERED:durable delivery terminal state=RejectedDurable",
+        )
+        .expect("BR-172 rollback after counted denial");
+        assert!(is_news_ai_terminal_denial_for_fact_on_conn(
+            &mut conn,
+            second_delivery.fact(),
+            second_delivery.analysis_version(),
+        )
+        .unwrap());
+        assert!(matches!(
+            reserve_news_ai_delivery_on_conn(&mut conn, second_delivery).unwrap(),
+            NewsAiReserveOutcome::Deduped
+        ));
+        validate_news_ai_delivery_audit(&mut conn).expect("BR-172 chain remains valid");
+        drop(coordinator);
+    }
+
+    #[test]
     fn br172_repeated_sink_failure_is_not_mistaken_for_terminal_policy_denial() {
         let mut conn = connection();
         let sibling =
