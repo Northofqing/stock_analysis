@@ -23,7 +23,8 @@ use crate::monitor::data_quality::{
 };
 
 use super::review::{
-    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_routed_gateway_result, BatchEvidence, GatewayBatch,
+    GatewayError,
 };
 use super::security_lifecycle::SecurityLifecycleContext;
 use super::security_lifecycle::{
@@ -223,17 +224,11 @@ impl HistoricalBarsGateway {
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(bridge) => {
                 let result = bridge.daily_bars(code, days);
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                let audited =
-                    audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result)?;
+                let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
             }
             Err(error) => {
-                let audited =
-                    audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error))?;
+                let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error))?;
                 return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
             }
         }
@@ -257,17 +252,11 @@ impl HistoricalBarsGateway {
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(bridge) => {
                 let result = bridge.daily_bars_async(&code, days).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                let audited =
-                    audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result)?;
+                let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code, audited);
             }
             Err(error) => {
-                let audited =
-                    audit_gateway_result(CAPABILITY, ProviderId::Tdx, &request_hash, Err(error))?;
+                let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error))?;
                 return AdmittedDailyBars::from_audited_batch(code, audited);
             }
         }
@@ -665,4 +654,47 @@ pub(super) async fn finalize_outcome_sequence_async(
             format!("outcome daily-bars confirmation task failed: {error}"),
         )
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct AuditProviderRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        provider: String,
+    }
+
+    #[tokio::test]
+    async fn historical_bridge_failure_does_not_claim_tdx_provider() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        let result = HistoricalBarsGateway::new()
+            .daily_bars_async("399991", 5)
+            .await;
+
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable bridge must fail closed");
+        assert_eq!(error.provider(), None);
+
+        let request_hash = acquisition_request_hash(CAPABILITY, "399991:5");
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT provider FROM data_acquisition_audit \
+             WHERE capability = 'HistoricalDailyBars' AND request_hash = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(request_hash)
+        .get_result::<AuditProviderRow>(&mut *connection)
+        .expect("bridge failure must be audited");
+        assert_eq!(row.provider, "Custom");
+    }
 }
