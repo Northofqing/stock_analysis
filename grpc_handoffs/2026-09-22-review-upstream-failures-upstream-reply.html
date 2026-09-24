@@ -1,0 +1,926 @@
+<title>R-08 与 R-09 上游核实</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+
+<style>
+  :root {
+    --ground: #F1F4F7;
+    --surface: #FFFFFF;
+    --surface-2: #E9EEF3;
+    --ink: #0E1621;
+    --ink-soft: #35434F;
+    --muted: #5F6E7C;
+    --rule: #D8E0E7;
+    --rule-strong: #B9C5CF;
+    --accent: #0F5D6B;
+    --accent-soft: #E0EDEF;
+    --ok: #176B45;
+    --ok-soft: #E2F0E8;
+    --warn: #8A5300;
+    --warn-soft: #F6EAD6;
+    --bad: #9C2317;
+    --bad-soft: #F7E4E1;
+    --shadow: 0 1px 2px rgba(14, 22, 33, .06), 0 8px 24px -16px rgba(14, 22, 33, .22);
+
+    --serif: 'Noto Serif SC', 'Songti SC', Georgia, serif;
+    --sans: 'Noto Sans SC', -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, 'Cascadia Mono', Consolas, 'Noto Sans SC', monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0C1218;
+      --surface: #141D26;
+      --surface-2: #1D2833;
+      --ink: #E5EBF1;
+      --ink-soft: #C2CDD7;
+      --muted: #93A2B0;
+      --rule: #26323E;
+      --rule-strong: #3A4854;
+      --accent: #58B7C7;
+      --accent-soft: #16333A;
+      --ok: #57BE87;
+      --ok-soft: #14301F;
+      --warn: #D9A247;
+      --warn-soft: #322514;
+      --bad: #E4796A;
+      --bad-soft: #341A16;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -18px rgba(0, 0, 0, .8);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0C1218;
+    --surface: #141D26;
+    --surface-2: #1D2833;
+    --ink: #E5EBF1;
+    --ink-soft: #C2CDD7;
+    --muted: #93A2B0;
+    --rule: #26323E;
+    --rule-strong: #3A4854;
+    --accent: #58B7C7;
+    --accent-soft: #16333A;
+    --ok: #57BE87;
+    --ok-soft: #14301F;
+    --warn: #D9A247;
+    --warn-soft: #322514;
+    --bad: #E4796A;
+    --bad-soft: #341A16;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -18px rgba(0, 0, 0, .8);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15.5px;
+    line-height: 1.72;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    padding-inline: 20px;
+    padding-block: 0 72px;
+  }
+
+  .wrap {
+    max-width: 980px;
+    margin-inline: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-block: 46px 26px;
+    border-bottom: 2px solid var(--ink);
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  h1 {
+    font-family: var(--serif);
+    font-weight: 700;
+    font-size: clamp(28px, 5vw, 42px);
+    line-height: 1.24;
+    letter-spacing: -.01em;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  .standfirst {
+    color: var(--ink-soft);
+    max-width: var(--measure);
+    margin: 0;
+  }
+
+  .standfirst code { font-size: .88em; }
+
+  .masthead-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 20px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  /* ---------- verdict band ---------- */
+
+  .verdicts {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .verdicts > .band-head {
+    padding: 12px 20px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .verdict {
+    display: grid;
+    grid-template-columns: 32px 1fr;
+    gap: 4px 14px;
+    padding: 18px 20px;
+    border-top: 1px solid var(--rule);
+  }
+
+  .verdict:first-of-type { border-top: 0; }
+
+  .verdict-num {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+    padding-top: 3px;
+  }
+
+  .verdict-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .verdict-body p { margin: 0; max-width: var(--measure); color: var(--ink-soft); }
+  .verdict-body p strong { color: var(--ink); font-weight: 700; }
+
+  /* ---------- chips ---------- */
+
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .06em;
+    padding: 2px 9px;
+    border-radius: 2px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .chip-done { background: var(--ok-soft); color: var(--ok); border-color: var(--ok); }
+  .chip-fix  { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .chip-open { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+  .chip-dead { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+
+  /* ---------- sections ---------- */
+
+  section { display: flex; flex-direction: column; gap: 18px; }
+
+  .sec-head {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--rule-strong);
+  }
+
+  h2 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(20px, 3vw, 25px);
+    line-height: 1.34;
+    letter-spacing: -.005em;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: .1em;
+    color: var(--accent);
+  }
+
+  h3 {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 15px;
+    letter-spacing: .01em;
+    margin: 6px 0 0;
+  }
+
+  p { margin: 0; max-width: var(--measure); }
+  section > p { max-width: var(--measure); }
+
+  ul, ol { margin: 0; padding-left: 1.3em; max-width: var(--measure); display: flex; flex-direction: column; gap: 7px; }
+  li::marker { color: var(--muted); }
+
+  code {
+    font-family: var(--mono);
+    font-size: .87em;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: .08em .34em;
+    word-break: break-word;
+  }
+
+  pre {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.65;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    border-radius: 2px;
+    padding: 14px 16px;
+    margin: 0;
+    overflow-x: auto;
+    color: var(--ink-soft);
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; color: inherit; }
+
+  strong { font-weight: 700; color: var(--ink); }
+
+  /* ---------- tables ---------- */
+
+  .table-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: var(--surface);
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13.5px;
+  }
+
+  caption {
+    caption-side: top;
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    color: var(--muted);
+  }
+
+  th, td {
+    text-align: left;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+
+  thead th {
+    background: var(--surface-2);
+    font-weight: 500;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: 0; }
+
+  td.k { white-space: nowrap; color: var(--ink); font-weight: 500; }
+  td.v { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+  .r-ok   { color: var(--ok);   background: var(--ok-soft);   font-weight: 500; }
+  .r-fail { color: var(--bad);  background: var(--bad-soft);  font-weight: 500; }
+  .r-warn { color: var(--warn); background: var(--warn-soft); font-weight: 500; }
+
+  /* ---------- callout ---------- */
+
+  .callout {
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--warn);
+    border-radius: 2px;
+    background: var(--surface);
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .callout-label {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--warn);
+  }
+
+  .callout.is-accent { border-left-color: var(--accent); }
+  .callout.is-accent .callout-label { color: var(--accent); }
+
+  /* ---------- ask list ---------- */
+
+  .asks {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    counter-reset: ask;
+  }
+
+  .ask {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 14px;
+    align-items: baseline;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 14px 18px;
+  }
+
+  .ask-n {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+  }
+
+  .ask p { max-width: var(--measure); }
+
+  /* ---------- footer ---------- */
+
+  footer {
+    border-top: 1px solid var(--rule-strong);
+    padding-top: 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.8;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (max-width: 520px) {
+    body { font-size: 15px; }
+    .page { padding-inline: 16px; padding-block: 0 56px; }
+    .verdict { grid-template-columns: 1fr; padding: 16px; }
+    .verdict-num { padding-top: 0; }
+    .ask { grid-template-columns: 1fr; }
+    th, td { padding: 9px 12px; }
+  }
+</style>
+
+<div class="page">
+  <div class="wrap">
+
+    <header class="masthead">
+      <div class="eyebrow">上游回复 · magic-market-data-rs</div>
+      <h1>R-08 与 R-09 上游核实</h1>
+      <p class="standfirst">
+        针对 <code>2026-09-22-review-upstream-failures.md</code>(19:00 复盘批次)的核实结论、判别证据,
+        以及明确不声称的部分。
+      </p>
+      <div class="masthead-meta">
+        <span>2026-09-22</span>
+        <span>·</span>
+        <span>批次 13 任务 / 交付 5 / 失败 2</span>
+        <span>·</span>
+        <span>证据采集 22:13–22:28 CST</span>
+      </div>
+    </header>
+
+    <!-- ================= 结论 ================= -->
+    <div class="verdicts">
+      <div class="band-head">结论先行</div>
+
+      <div class="verdict">
+        <div class="verdict-num">01</div>
+        <div class="verdict-body">
+          <span><span class="chip chip-done">已定位</span></span>
+          <p>
+            <strong>R-08 与 R-09 不同源, 且都不是「服务端某共享组件」故障。</strong>
+            R-08 的 operation 现已完全正常(实测 300 条 complete); R-09 是一条<strong>真实的上游传输故障,
+            且不在服务端</strong>。
+          </p>
+        </div>
+      </div>
+
+      <div class="verdict">
+        <div class="verdict-num">02</div>
+        <div class="verdict-body">
+          <span><span class="chip chip-fix">映射纠正</span></span>
+          <p>
+            先纠正一个映射: R-08 的「EventCalendar 事件日历」对应的是 <code>MarketAnnouncements</code>
+            (巨潮全市场公告), <strong>不是 <code>EconomicCalendar</code></strong>。后者按设计 fail-closed,
+            而且它<strong>不可能</strong>返回 <code>internal</code> —— 如果 R-08 真的调的是它, 你方会拿到
+            <code>UNIMPLEMENTED</code>。
+          </p>
+        </div>
+      </div>
+
+      <div class="verdict">
+        <div class="verdict-num">03</div>
+        <div class="verdict-body">
+          <span><span class="chip chip-done">已定位</span></span>
+          <p>
+            R-09 的真因已定位到<strong>一条 URL 路径</strong>: <code>push2.eastmoney.com</code> /
+            <code>push2delay.eastmoney.com</code> 的 <code>/api/qt/clist/get</code>。同一主机、同一 TLS
+            会话下的<strong>其它路径全部正常</strong>。该路径被四个能力共享 —— 这是「共享组件」的正确答案,
+            但它是一条<strong>共享的上游 URL 路径, 不是服务端组件</strong>, 也不在
+            R-08 / LimitPools / HistoricalBars 的链路上。
+          </p>
+        </div>
+      </div>
+
+      <div class="verdict">
+        <div class="verdict-num">04</div>
+        <div class="verdict-body">
+          <span><span class="chip chip-fix">已修复</span></span>
+          <p>
+            <strong>你方第 3 条建议已采纳并落地</strong>, 同时修复了一个已确认的上游缺陷
+            (LimitPools 路由早停)。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= 1 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 1</div>
+        <h2>映射纠正: R-08 是 <code>MarketAnnouncements</code>, 不是 <code>EconomicCalendar</code></h2>
+      </div>
+
+      <p>
+        <code>docs/data-sources-inventory.md:29</code> 记录你方
+        <code>src/data_gateway/event_calendar.rs:18-19</code>(R-08-announcements)依赖巨潮资讯网
+        cninfo-market, 即上游的 <code>Operation::MarketAnnouncements</code>(BR-161 按交易日拉取全市场公告)。
+        文件名 <code>event_calendar.rs</code> 是这条链路上游被叫成「EventCalendar」的来源。
+      </p>
+
+      <p><code>EconomicCalendar</code> 是<strong>另一个</strong> operation, 状态完全不同:</p>
+
+      <ul>
+        <li>金十免费日历 / API 于 2025-12-01 退役, 该 operation 上游<strong>未准入</strong>, 只保留显式诊断路径;</li>
+        <li>对它的调用返回 <code>UNIMPLEMENTED</code> / <code>capability_unadmitted</code>
+            (<code>grpc-external-api.md:12,490,725</code>);</li>
+        <li>因此它<strong>不会</strong>产生 <code>internal</code>。</li>
+      </ul>
+
+      <div class="callout is-accent">
+        <div class="callout-label">判别方法</div>
+        <p>
+          在你方日志里: 若 R-08 的失败码是 <code>UNIMPLEMENTED</code> 就该查日历语义; 是
+          <code>internal</code> 就只可能来自 <code>MarketAnnouncements</code> 链路。
+        </p>
+        <p>
+          <strong>若要复跑, 请用 <code>{"start":"YYYY-MM-DD","end":"YYYY-MM-DD","limit":300}</code>,
+          不要发 <code>{}</code></strong> —— <code>{}</code> 会得到
+          <code>InvalidArgument: missing field start</code>, 合同明确禁止用它调用这个 operation。
+        </p>
+      </div>
+    </section>
+
+    <!-- ================= 2 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 2</div>
+        <h2>R-08 实测: 当前完全正常</h2>
+      </div>
+
+      <p>2026-09-22 22:13 CST(19:00 批次之后 3 小时), 对生产 registry 实测:</p>
+
+      <div class="table-scroll">
+        <table>
+          <caption>MarketAnnouncements · 生产 registry</caption>
+          <thead>
+            <tr><th>请求</th><th>结果</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="v">{"start":"2026-09-22","end":"2026-09-22","limit":300}</td>
+              <td class="r-ok">OK · Cninfo · complete=true · 300 条 · source_at=2026-09-22T20:44:10+08:00</td>
+            </tr>
+            <tr>
+              <td class="v">同上 limit=50 + 显式 pin Cninfo</td>
+              <td class="r-ok">OK · Cninfo · complete=true · 50 条 · 同一 source_at</td>
+            </tr>
+            <tr>
+              <td class="v">{"start":"2026-09-15","end":"2026-09-22","limit":300}</td>
+              <td class="r-ok">OK · Cninfo · complete=true · 300 条</td>
+            </tr>
+            <tr>
+              <td class="v">对照: {}</td>
+              <td class="r-fail">InvalidArgument(合同禁止)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        <strong>19:00 那一次无法回溯定因</strong>, 原因是当时服务端<strong>没有留下任何记录</strong> ——
+        这正是你方第 3 条指出的问题, 现已修复(见 §5)。现在再发生同类失败, 可以用 request_id 直接定位。
+      </p>
+    </section>
+
+    <!-- ================= 3 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 3</div>
+        <h2>R-09 实测: 真实上游传输故障, 定位到一条 URL 路径</h2>
+      </div>
+
+      <h3>3.1 从服务端看</h3>
+      <p>2026-09-22 22:14 CST, 生产 registry 实测, 全部返回同一个结果:</p>
+
+      <pre><code>Code: Unavailable
+Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed
+         without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get
+         attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&amp;pz=100&amp;...
+reason_code=provider_unavailable   retryable=true</code></pre>
+
+      <div class="table-scroll">
+        <table>
+          <caption>覆盖矩阵 · 全部同形失败, 所以与请求无关</caption>
+          <thead>
+            <tr><th>变量</th><th>取值</th><th>结果</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="k">kind</td><td class="v">VolumeRatio / MainNetInflow</td><td class="r-fail">都失败</td></tr>
+            <tr><td class="k">路由</td><td class="v">pin Eastmoney / 不 pin(自动)</td><td class="r-fail">都失败</td></tr>
+            <tr><td class="k">limit</td><td class="v">10 / 100</td><td class="r-fail">都失败</td></tr>
+            <tr><td class="k">trading_date</td><td class="v">2026-09-22(当日) / 2026-09-21(上一交易日)</td><td class="r-fail">都失败</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        你方的 <code>provider=Some(Eastmoney)</code> 与 <code>retryable=true</code> 与此完全一致;
+        你方的 <code>source_transport_failed</code> 就是对这个 <code>Unavailable</code> 的分类, 是对的。
+      </p>
+
+      <h3>3.2 从本机直连看(关键判别)</h3>
+      <p>同一台主机上直接发请求, <strong>同一主机、同一 TLS 会话</strong>, 只有一条路径失败:</p>
+
+      <div class="table-scroll">
+        <table>
+          <caption>本机直连 · 逐 URL</caption>
+          <thead>
+            <tr><th>URL</th><th>结果</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="v">https://www.eastmoney.com/</td><td class="r-ok">200</td></tr>
+            <tr><td class="v">https://push2his.eastmoney.com/api/qt/stock/kline/get?...</td><td class="r-ok">200</td></tr>
+            <tr><td class="v">https://datacenter-web.eastmoney.com/api/data/v1/get?...</td><td class="r-ok">200</td></tr>
+            <tr><td class="v">https://push2.eastmoney.com/api/qt/ulist.np/get?...</td><td class="r-ok">200</td></tr>
+            <tr><td class="v">https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?...</td><td class="r-ok">200</td></tr>
+            <tr><td class="v">https://push2.eastmoney.com/api/qt/clist/get?...</td><td class="r-fail">连接被重置</td></tr>
+            <tr><td class="v">https://push2delay.eastmoney.com/api/qt/clist/get?...</td><td class="r-fail">连接被重置</td></tr>
+            <tr><td class="v">http://push2.eastmoney.com/api/qt/clist/get?...(80 端口)</td><td class="r-fail">空回复</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout is-accent">
+        <div class="callout-label">结论</div>
+        <p>
+          <code>clist</code> 用最短查询串(<code>?pn=1&amp;pz=5</code>)与完整查询串、<code>pz</code> 取
+          5/10/100 都是同样结果, HTTP 与 HTTPS 都失败。
+          <strong>⇒ 不是主机不可达、不是 TLS、不是 DNS、不是请求形状, 而是
+          <code>/api/qt/clist/get</code> 这条 URL 路径级的阻断 / 重置。</strong>
+        </p>
+      </div>
+
+      <h3>3.3 共享范围: 四个能力</h3>
+      <p>按端点常量(<code>crates/magic-eastmoney-rs/src/</code>):</p>
+
+      <div class="table-scroll">
+        <table>
+          <caption>谁在用 /api/qt/clist/get</caption>
+          <thead>
+            <tr><th>能力</th><th>端点</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="k">ProviderTopNRankings(R-09)</td><td class="v">push2 + push2delay /api/qt/clist/get</td></tr>
+            <tr><td class="k">BoardFlows(板块资金流)</td><td class="v">push2 /api/qt/clist/get</td></tr>
+            <tr><td class="k">MarketRankings</td><td class="v">push2 + push2delay /api/qt/clist/get</td></tr>
+            <tr><td class="k">PostCloseFlows</td><td class="v">push2 + push2delay /api/qt/clist/get</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>实测确认其中两个(2026-09-22 22:18 CST):</p>
+
+      <ul>
+        <li><code>BoardFlows</code> → <code>UNAVAILABLE</code>, 报文指名
+            <code>push2.eastmoney.com/api/qt/clist/get</code></li>
+        <li><code>PostCloseFlows</code> → <code>UNAVAILABLE</code>, 报文指名
+            <code>push2delay.eastmoney.com/api/qt/clist/get</code></li>
+      </ul>
+
+      <p>
+        <strong>所以你方「是否同源」的答案是: 有共享, 但共享的是一条上游 URL 路径, 不是服务端组件。</strong>
+        它<strong>不解释</strong> R-08、LimitPools、HistoricalBars: LimitPools 走
+        <code>push2ex.eastmoney.com</code>(不同主机), 与 clist 无关。
+      </p>
+
+      <h3>3.4 这条路径为什么断, 还需要一次判别</h3>
+      <p>
+        本机(<code>10.211.55.3</code>)没有直连公网: <strong>所有</strong>域名都解析到
+        <code>198.18.0.0/15</code>(RFC 2544 保留测试网段, 不可能是东财真实地址), 直连真实 IP 全部不可达
+        —— 出网经过 Mac 宿主上的 fake-IP 代理。因此「阻断」发生在这条出网路径上, 两个候选:
+      </p>
+
+      <ul>
+        <li><strong>(a)</strong> 代理侧针对该 URL 的规则 / 上游连接失败;</li>
+        <li><strong>(b)</strong> 代理的<strong>出口 IP 被东财针对 clist 反爬拦截</strong>(clist 是被抓取最多的端点,
+            被 RST 而不是 403/429 也符合边缘反爬形态)。</li>
+      </ul>
+
+      <p>
+        区分方法: 换一条出口(例如不经代理直连, 或换出口 IP)再取同一 URL。
+        <strong>这一层不在上游仓库内</strong>, 上游能确认的是: 服务端没有把它变成 <code>internal</code>,
+        分类(<code>provider_unavailable</code>, <code>retryable=true</code>)是正确的, 且四个能力的失败可以
+        归到同一个原因。
+      </p>
+    </section>
+
+    <!-- ================= 4 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 4</div>
+        <h2>顺带确认并修复的上游缺陷: LimitPools 路由早停</h2>
+      </div>
+
+      <p>
+        这是本次核实中发现的<strong>唯一一处上游代码缺陷</strong>, 与你方同日 09:15–09:25 的 LimitPools
+        <code>internal</code> 窗口对应, 已修复。
+      </p>
+
+      <ul>
+        <li>BR-059 原文的推进理由: 两种结果推进到下一个候选,
+            「<strong>because each is a fact about that candidate rather than about the request</strong>」。</li>
+        <li>Eastmoney 是 LimitPools 的<strong>第一个</strong>注册候选, 其适配器要求源端 <code>qdate</code>
+            等于请求交易日。盘前 <code>qdate</code> 还是上一交易日, 于是第一个候选返回
+            <code>FailedPrecondition</code>, 而它当时被当作「不可重试且非 scope decline」
+            ⇒ <strong>路由停止, 后面两个候选从未被询问</strong>。</li>
+        <li>服务端当天自己的记录正是这个形态: 09:13–09:24 共 35 条
+            <code>event=provider_route_failure stage=provider_route_stopped attempt_count=1
+            attempts=Eastmoney:source_precondition</code>。</li>
+        <li>修复: <code>execute_limit_pool_route</code> 增加第三个推进条件。Gate A 见
+            <code>docs/superpowers/specs/2026-09-22-limit-pool-source-precondition-fallthrough-design.md</code>。
+            唯一客户端可见变化: 仍然失败的那种情况由 <code>provider_route_stopped</code> 变为
+            <code>provider_route_exhausted</code>(更准确, 因为路由确实试遍了所有候选)。</li>
+      </ul>
+
+      <p>
+        实测判别(过去交易日 2026-09-21, 过去日期是同一段代码的确定性替身): Eastmoney 返回
+        <code>FailedPrecondition</code>(qdate 2026-09-22 ≠ 2026-09-21), 而
+        <strong>Tonghuashun(Upper, 完整 10 条)与 HithinkFinance(Upper 10 / Broken 10 / Lower 2)
+        都返回完整且日期正确的批次</strong>; 未 pin 的生产路由失败。对当前日 2026-09-22 三者全部成功。
+      </p>
+
+      <div class="callout">
+        <div class="callout-label">明确不声称</div>
+        <p>
+          09:15–09:25 窗口是否恢复<strong>未</strong>验证 —— 该窗口只在盘前存在, 本次证据在收盘后取得。
+        </p>
+        <p>
+          可证伪的复跑: 下一个交易日在 09:15–09:25 发同一请求, 读
+          <code>stage=provider_route_exhausted attempts=...</code>。若尝试列表里出现了后两个候选,
+          人为早停已消除; 若窗口仍然失败, 剩余原因是候选自身的就绪度, 不是这个缺陷。
+        </p>
+      </div>
+    </section>
+
+    <!-- ================= 5 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 5</div>
+        <h2>你方第 3 条建议: 已采纳并落地</h2>
+      </div>
+
+      <p>新增一条有界服务端记录, 覆盖所有「服务端自己失败」的 fail-closed 出口:</p>
+
+      <pre><code>ts=&lt;RFC3339&gt; level=ERROR target=grpc_server event=service_failure \
+  stage=&lt;reason_code&gt; request_id="&lt;id&gt;" operation=&lt;operation&gt;</code></pre>
+
+      <ul>
+        <li>覆盖 <code>source_precondition_failed</code> / <code>invalid_evidence</code> /
+            <code>internal</code> / <code>provider_unavailable</code> / <code>blocking_worker</code>;</li>
+        <li><strong>永不携带失败消息</strong>(BR-057: 上游文本不进日志), 只带关联键与分类,
+            都是低基数、仓库自有的;</li>
+        <li>纯请求错误(你方自己写错的请求)仍然不记录, 避免一个坏客户端把自己的错误变成服务端日志量。</li>
+      </ul>
+
+      <div class="callout is-accent">
+        <div class="callout-label">为什么 provider_unavailable 是关键一条</div>
+        <p>
+          它是唯一由两个分支产生的 reason code, 原先只有一个分支记录。实测 2026-09-22 全天,
+          R-09 / BoardFlows / PostCloseFlows 的整段故障在服务端 stderr <strong>零记录</strong>
+          —— 当天日志总共 90 行, 没有任何一行提到这三个 operation。
+        </p>
+        <p>
+          也就是说<strong>一次持续 3 小时以上、影响四个能力的 Provider 传输故障, 在服务端是完全不可见的</strong>;
+          而现在 <code>grep 'request_id="&lt;你方 id&gt;"'</code> 可以直接回答「这个请求服务端做了什么」。
+        </p>
+      </div>
+
+      <p>
+        关于<strong>按 operation 健康度自检</strong>: 我们<strong>没有</strong>加主动探测 ——
+        那会引入额外的上游调用, 并且有把 fail-open 引入数据路径的风险。现在能做的是按
+        operation + reason code 聚合失败记录。
+      </p>
+    </section>
+
+    <!-- ================= 6 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 6</div>
+        <h2>你方第 2 条: HistoricalBars 逐码 flaky —— 实测是确定性的, 不存在逐码状态</h2>
+      </div>
+
+      <p>
+        2026-09-22 22:24–22:28 CST, 形状 <code>interval=Day, limit=5, 无 start/end</code>, 6 个码
+        (600519 / 601398 / 000001 / 300750 / 002594 / 920403)× 7 条路由, <strong>连跑两遍</strong>:
+      </p>
+
+      <div class="table-scroll">
+        <table>
+          <caption>HistoricalBars · 6 码 × 7 路由 · 两遍</caption>
+          <thead>
+            <tr><th>路由</th><th>6 个码的结果</th><th>两遍是否一致</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="k">自动</td>
+              <td class="r-ok">全部 OK · Tencent · complete=true · 5 条(920403 为 1 条)</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">Baidu</td>
+              <td class="r-warn">全部 Unimplemented: trading-calendar / adjacent-session / corporate-action continuity evidence remain unproved</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">Tencent</td>
+              <td class="r-ok">全部 OK · complete=true · 5 条(920403 为 1 条)</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">Sina</td>
+              <td class="r-ok">全部 OK · complete=true · 5 条</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">HithinkFinance</td>
+              <td class="r-warn">全部 InvalidArgument: explicit start date is required</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">EmQuant</td>
+              <td class="r-warn">全部 InvalidArgument: 需要显式 start/end 且排除未结束的源交易日</td>
+              <td class="v">一致</td>
+            </tr>
+            <tr>
+              <td class="k">Tdx</td>
+              <td class="r-fail">全部 FailedPrecondition [E2103]: response length mismatch · security bar row 0 is truncated</td>
+              <td class="v">一致</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>原始输出附在同目录 <code>2026-09-22-historical-bars-determinism-probe.txt</code>。</p>
+
+      <h3>结论</h3>
+      <ul>
+        <li>
+          <strong>没有任何一条路由出现「同请求不同码成功 / 失败交替」</strong>: 每条路由对 6 个码的表现完全一致,
+          第二遍与第一遍逐字一致。⇒ 你方「服务端对部分标的的 verified batch 校验状态不一致」的假设
+          <strong>不成立</strong> —— 服务端在这条链路上没有逐标的的状态, 结果是 (提供方, 请求形状) 的纯函数。
+        </li>
+        <li>
+          <strong>「部分码 Baidu 成功」在这个形状下无法复现</strong>: Baidu 对 6 个码<strong>一律</strong>是
+          scope decline(<code>Unimplemented</code>), 两遍都是。Baidu 的失败是准入事实(交易日历 / 相邻交易日 /
+          公司行为连续性证据未证明), 不是逐码的。
+        </li>
+        <li>
+          每条路由的失败都是<strong>确定性的合同 / 准入事实</strong>, 不是 flaky: Baidu 是 scope,
+          HithinkFinance 与 EmQuant 是请求形状(需要显式日期), <strong>Tdx 是解码失败</strong>。
+        </li>
+        <li><strong>自动路由当前是好的</strong>(走 Tencent, 6 个码全部 complete)。</li>
+      </ul>
+
+      <div class="callout">
+        <div class="callout-label">顺带发现 · 另行跟进</div>
+        <p>
+          <code>Tdx</code> 路由对每个码都返回
+          <code>FailedPrecondition [E2103] response length mismatch: security bar row 0 is truncated</code>,
+          100% 可复现 —— 这是上游 TDX 日线解码的确定性缺陷, 我们会单独处理。与你方本次报告无关。
+        </p>
+      </div>
+    </section>
+
+    <!-- ================= 7 ================= -->
+    <section>
+      <div class="sec-head">
+        <div class="sec-num">§ 7</div>
+        <h2>需要你方提供的判别数据</h2>
+      </div>
+
+      <div class="asks">
+        <div class="ask">
+          <div class="ask-n">01</div>
+          <p>
+            <strong>R-08 实际调用的 operation</strong>: 请打出你方 <code>event_calendar.rs</code>
+            那次失败响应的 <code>code</code> 与 <code>reason_code</code>(<code>internal</code> 还是
+            <code>UNIMPLEMENTED</code>)。这决定它是 <code>MarketAnnouncements</code> 链路问题
+            还是日历语义问题。
+          </p>
+        </div>
+        <div class="ask">
+          <div class="ask-n">02</div>
+          <p>
+            <strong>R-09 的出口</strong>: 若你方另有一条不经同一代理的出网路径, 请对
+            <code>https://push2.eastmoney.com/api/qt/clist/get?pn=1&amp;pz=5</code> 取一次,
+            用来区分 §3.4 的 (a)/(b)。
+          </p>
+        </div>
+        <div class="ask">
+          <div class="ask-n">03</div>
+          <p>
+            <strong>HistoricalBars 失败时的确切请求形状</strong>(是否带 <code>start</code>/<code>end</code>、
+            <code>limit</code> 取值)与当时被判为 <code>no_verified_batch</code> 的 code 列表(见 §6)。
+          </p>
+        </div>
+        <div class="ask">
+          <div class="ask-n">04</div>
+          <p>
+            后续所有上游失败请求请带上 <strong>request_id</strong>, 现在服务端侧可与之对齐。
+          </p>
+        </div>
+      </div>
+
+      <div class="callout is-accent">
+        <div class="callout-label">你方 19:00 批次的对应关系</div>
+        <p>
+          R-03 / R-04 / R-11 / R-13 / A-10 已交付, R-07 expected_wait —— 本回复只处理 R-08 与 R-09。
+          同日 09:15–09:25 LimitPools <code>internal</code> 的自愈与全天 HistoricalBars
+          <code>no_verified_batch</code> 的逐码 flaky 已在 §4 / §6 覆盖。
+        </p>
+      </div>
+    </section>
+
+    <footer>
+      <div>magic-market-data-rs · 上游核实回复</div>
+      <div>证据采集 2026-09-22 22:13–22:28 CST · 生产 registry 与生产 gRPC 服务端</div>
+      <div>附件: 2026-09-22-r08-r09-clist-probe-raw.txt · 2026-09-22-historical-bars-determinism-probe.txt</div>
+    </footer>
+
+  </div>
+</div>

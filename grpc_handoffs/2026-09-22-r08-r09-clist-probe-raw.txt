@@ -1,0 +1,226 @@
+# R-08 / R-09 probe raw output (2026-09-22 22:11-22:19 CST)
+
+Two passes are included. Pass 1 is retained deliberately: it is the reason the
+probe's own defect is documented rather than hidden. Pass 1 nested
+`preferredProvider` inside `context`, where it is not a field, so every pinned
+call died at request-parse time with exit=1 and never reached the server. Pass 3
+(`review-r08-r09-probe2.ps1`) places it at the top level of QueryRequest, which is
+where `market.proto:92` puts it, and is the pass the reply cites.
+
+Every captured line has been passed through a redaction filter; the gRPC authorization token does not appear in this file.
+now=2026-09-22 22:11:14 trading_date=2026-09-22
+
+##### R-08: MarketAnnouncements (CNInfo whole-market discovery) #####
+===== market-announcements-exact  (method=MarketAnnouncements provider='')
+  payload={"start":"2026-09-22","end":"2026-09-22","limit":300}
+  exit=0  -
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=300
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none - this failure emitted no record>
+
+===== market-announcements-small  (method=MarketAnnouncements provider='')
+  payload={"start":"2026-09-22","end":"2026-09-22","limit":5}
+  exit=0  -
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=5
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none - this failure emitted no record>
+
+===== market-announcements-both-limit  (method=MarketAnnouncements provider='')
+  payload={"start":"2026-09-15","end":"2026-09-22","limit":300}
+  exit=0  -
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=300
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none - this failure emitted no record>
+
+===== market-announcements-cninfo  (method=MarketAnnouncements provider='Cninfo')
+  payload={"start":"2026-09-22","end":"2026-09-22","limit":50}
+  exit=1  -
+  new_server_log: <none - this failure emitted no record>
+
+##### R-08 alternate reading: the instrument Announcements contract, incl. the {} misuse the contract forbids #####
+===== announcements-empty-json  (method=Announcements provider='')
+  payload={}
+  exit=67  ERROR: Code: InvalidArgument Message: invalid announcements request: missing field `instrument` at line 1 column 2
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:11:35 GMT
+  trailer: magic-error-detail-bin: Ch9yMDhyMDktYW5ub3VuY2VtZW50cy1lbXB0eS1qc29uEBIiD2ludmFsaWRfcmVxdWVzdDAC
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none - this failure emitted no record>
+
+===== announcements-per-instrument  (method=Announcements provider='')
+  payload={"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"start":"2026-09-15","end":"2026-09-22","limit":5}
+  exit=73  ERROR: Code: FailedPrecondition Message: CNInfo paginated response is incomplete: CNInfo returned no announcements for 600519
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:11:36 GMT
+  trailer: magic-error-detail-bin: CiNyMDhyMDktYW5ub3VuY2VtZW50cy1wZXItaW5zdHJ1bWVudBASIhpzb3VyY2VfcHJlY29uZGl0aW9uX2ZhaWxlZDAC
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none - this failure emitted no record>
+
+
+##### R-09: ProviderTopNRankings (Eastmoney provider Top-N) #####
+===== topn-volumeratio-eastmoney  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":100,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=1  -
+  new_server_log: <none - this failure emitted no record>
+
+===== topn-mainnetinflow-eastmoney  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"MainNetInflow","trading_date":"2026-09-22","limit":100,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=1  -
+  new_server_log: <none - this failure emitted no record>
+
+===== topn-volumeratio-auto  (method=ProviderTopNRankings provider='')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":100,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f10&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80 ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:11:41 GMT
+  trailer: magic-error-detail-bin: ChxyMDhyMDktdG9wbi12b2x1bWVyYXRpby1hdXRvEDYiFHByb3ZpZGVyX3VuYXZhaWxhYmxlKAEwAg==
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none - this failure emitted no record>
+
+===== topn-volumeratio-eastmoney-small  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=1  -
+  new_server_log: <none - this failure emitted no record>
+
+===== topn-prev-trading-date-eastmoney  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-21","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=1  -
+  new_server_log: <none - this failure emitted no record>
+
+done=2026-09-22 22:11:41
+
+
+====================================================================================================
+now=2026-09-22 22:13:53 trading_date=2026-09-22
+
+##### R-08: MarketAnnouncements (CNInfo whole-market discovery) #####
+===== ma-exact  (method=MarketAnnouncements provider='')
+  payload={"start":"2026-09-22","end":"2026-09-22","limit":300}
+  exit=0  OK
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=300
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none>
+
+===== ma-cninfo  (method=MarketAnnouncements provider='Cninfo')
+  payload={"start":"2026-09-22","end":"2026-09-22","limit":50}
+  exit=0  OK
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=50
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none>
+
+===== ma-range-cninfo  (method=MarketAnnouncements provider='Cninfo')
+  payload={"start":"2026-09-15","end":"2026-09-22","limit":300}
+  exit=0  OK
+  -> admission=ADMISSION_STATE_ADMITTED selectedProvider=Cninfo complete=True sourceAt=2026-09-22T20:44:10+08:00 records=300
+  trailer: Response trailers received:
+  trailer: (empty)
+  trailer: Sent 1 request and received 1 response
+  new_server_log: <none>
+
+===== ma-empty-json  (method=MarketAnnouncements provider='')
+  payload={}
+  exit=67  ERROR: Code: InvalidArgument Message: invalid market_announcements request: missing field `start` at line 1 column 2
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:14 GMT
+  trailer: magic-error-detail-bin: ChRyMDhyMDktbWEtZW1wdHktanNvbhATIg9pbnZhbGlkX3JlcXVlc3QwAg==
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+
+##### R-09: ProviderTopNRankings (Eastmoney provider Top-N) #####
+===== topn-volratio-em  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f10&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80%2Bf%3A%212%2Cm%3A1%2 ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:19 GMT
+  trailer: magic-error-detail-bin: ChdyMDhyMDktdG9wbi12b2xyYXRpby1lbRA2IhRwcm92aWRlcl91bmF2YWlsYWJsZSgBMAI=
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+===== topn-mainnet-em  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"MainNetInflow","trading_date":"2026-09-22","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f62&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80%2Bf%3A%212%2Cm%3A1%2 ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:25 GMT
+  trailer: magic-error-detail-bin: ChZyMDhyMDktdG9wbi1tYWlubmV0LWVtEDYiFHByb3ZpZGVyX3VuYXZhaWxhYmxlKAEwAg==
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+===== topn-volratio-auto  (method=ProviderTopNRankings provider='')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f10&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80%2Bf%3A%212%2Cm%3A1%2 ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:31 GMT
+  trailer: magic-error-detail-bin: ChlyMDhyMDktdG9wbi12b2xyYXRpby1hdXRvEDYiFHByb3ZpZGVyX3VuYXZhaWxhYmxlKAEwAg==
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+===== topn-volratio-prevday  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-21","limit":10,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f10&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80%2Bf%3A%212%2Cm%3A1%2 ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:37 GMT
+  trailer: magic-error-detail-bin: ChxyMDhyMDktdG9wbi12b2xyYXRpby1wcmV2ZGF5EDYiFHByb3ZpZGVyX3VuYXZhaWxhYmxlKAEwAg==
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+===== topn-volratio-100-em  (method=ProviderTopNRankings provider='Eastmoney')
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":100,"filter_identity":"m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:262144+f:!2"}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney provider Top-N HTTPS endpoints failed without one valid response: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d15&fltt=2&invt=2&fid=f10&fs=m%3A0%2Bt%3A6%2Bf%3A%212%2Cm%3A0%2Bt%3A13%2Bf%3A%212%2Cm%3A0%2Bt%3A80%2Bf%3A%212%2Cm%3A1% ...
+  trailer: Response trailers received:
+  trailer: content-type: application/grpc
+  trailer: date: Tue, 22 Sep 2026 14:14:43 GMT
+  trailer: magic-error-detail-bin: ChtyMDhyMDktdG9wbi12b2xyYXRpby0xMDAtZW0QNiIUcHJvdmlkZXJfdW5hdmFpbGFibGUoATAC
+  trailer: Sent 1 request and received 0 responses
+  new_server_log: <none>
+
+done=2026-09-22 22:14:43
+
+
+====================================================================================================
+now=2026-09-22 22:18:52 trading_date=2026-09-22
+
+===== board-flows  (method=BoardFlows)
+  payload={"category":"Concept","interval":"Day1","limit":10}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&fltt=2&invt=2&fid=f62&fs=m%3A90%2Bt%3A3&fields=f12%2Cf14%2Cf3%2Cf62%2Cf184%2Cf204%2Cf205%2Cf206%2Cf66%2Cf72%2Cf78%2Cf84%2Cf124: Network Error: Network Error: Error encountered i ...
+  >>> names the clist endpoint: SHARES THE BLOCKED PATH
+
+===== market-rankings  (method=MarketRankings)
+  payload={"kind":"Industry","limit":10}
+  exit=76  ERROR: Code: Unimplemented Message: Eastmoney full-market ranking kind Industry is not source-proven
+  >>> does not name clist
+
+===== post-close-flows  (method=PostCloseFlows)
+  payload={"trading_date":"2026-09-22","limit":10}
+  exit=78  ERROR: Code: Unavailable Message: HTTPS transport error: all Eastmoney post-close HTTPS endpoints failed without a complete snapshot: https://push2delay.eastmoney.com/api/qt/clist/get attempt 3: https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=10&po=1&np=1&ut=8dec03ba335b81bf4ebdf7b29ec27d1 ...
+  >>> names the clist endpoint: SHARES THE BLOCKED PATH
+
+===== topn-control  (method=ProviderTopNRankings)
+  payload={"kind":"VolumeRatio","trading_date":"2026-09-22","limit":10,"filter_identity":"m:0+t:6+f:!2"}
+  exit=67  ERROR: Code: InvalidArgument Message: Eastmoney provider Top-N request filter identity does not match the admitted A-share filter
+  >>> does not name clist
+
+===== popularity-control  (method=Popularity)
+  payload={"limit":10}
+  exit=73  ERROR: Code: FailedPrecondition Message: Eastmoney protocol error: Eastmoney source code 920229 implies Beijing exchange, not Shenzhen
+  >>> does not name clist
+
+done=2026-09-22 22:18:58

@@ -1,0 +1,71 @@
+now=2026-09-22 22:24:21   shape: interval=Day limit=5, no start/end
+
+===== provider=<auto> =====
+600519     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+601398     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+000001     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+300750     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+002594     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+920403     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=1
+
+===== provider=Baidu =====
+600519     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+601398     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+000001     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+300750     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+002594     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+920403     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+
+===== provider=Tencent =====
+600519     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+601398     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+000001     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+300750     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+002594     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+920403     Tencent          OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=1
+
+===== provider=Sina =====
+600519     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+601398     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+000001     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+300750     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+002594     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+920403     Sina             OK adm=ADMISSION_STATE_ADMITTED prov=Sina complete=True n=5
+
+===== provider=HithinkFinance =====
+600519     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+601398     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+000001     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+300750     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+002594     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+920403     HithinkFinance   FAIL InvalidArgument: explicit start date is required
+
+===== provider=EmQuant =====
+600519     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+601398     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+000001     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+300750     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+002594     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+920403     EmQuant          FAIL InvalidArgument: EmQuant production bars require explicit start and end dates that exclude an unfinished source day
+
+===== provider=Tdx =====
+600519     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+601398     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+000001     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+300750     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+002594     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+920403     Tdx              FAIL FailedPrecondition: [E2103] response length mismatch: security bar row 0 is truncated
+
+===== determinism re-check: auto + Baidu, second pass =====
+600519     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+601398     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+000001     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+300750     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+002594     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=5
+920403     <auto>           OK adm=ADMISSION_STATE_ADMITTED prov=Tencent complete=True n=1
+600519     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+601398     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+000001     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+300750     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+002594     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
+920403     Baidu            FAIL Unimplemented: trading-calendar, adjacent-session and corporate-action continuity evidence remain unproved
