@@ -75,7 +75,9 @@ pub struct ChainAttemptEvidence {
 
 impl ChainScheduleStore {
     pub fn production() -> Self {
-        Self::new(crate::production_root::production_root().join("data/chain_schedule.sqlite3"))
+        Self::new(
+            stock_analysis::production_root::production_root().join("data/chain_schedule.sqlite3"),
+        )
     }
 
     pub fn new(path: impl Into<PathBuf>) -> Self {
