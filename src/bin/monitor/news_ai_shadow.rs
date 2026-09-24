@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use stock_analysis::calendar::{self, MarketSession};
 use stock_analysis::data_gateway::instrument_identity::resolve_production_equity;
@@ -24,9 +25,13 @@ use stock_analysis::news::aggregator::AdmittedGlobalNewsBatch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_ASSESSMENTS_PER_TICK: usize = 5;
+const MAX_CANDIDATE_INSPECTIONS_PER_TICK: usize = 40;
 const DAILY_HISTORY_DAYS: usize = 60;
 
 static NEWS_AI_BATCH_PERMIT: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(1)));
+// NEWS_AI_BATCH_PERMIT keeps the worker single-flight, so its cursor can be
+// advanced after each bounded scan without concurrent writers.
+static NEXT_NEWS_AI_CANDIDATE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NewAnalysisCapability {
@@ -279,25 +284,48 @@ async fn run_same_tick_batches(
     let mut retained = 0_usize;
     let mut deferred = 0_usize;
     let mut deduped = 0_usize;
+    // 2026-09-22 NewsAI counted 准入接线后: counted 准入拒绝 (PerTicket 1200s
+    // 冷却窗内同票) 是**设计内的正常丢弃**, 不是故障。单开计数避免污染
+    // failed= 与 WARN 级别 (真实故障 ReserveFailed/RollbackFailed/
+    // PostSinkCommitFailed 才能与"按设计丢弃"区分)。
+    let mut denied = 0_usize;
     let mut failed = 0_usize;
-    for candidate in candidates {
-        match assess_candidate(analyzer.as_ref(), &status, &candidate).await {
-            Ok(CandidateOutcome::Governed { existing, delivery }) => match delivery {
-                NewsAiGovernedDeliveryOutcome::Pushed { .. } => pushed += 1,
-                NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered { .. } => {
-                    link_recovered += 1;
-                }
-                NewsAiGovernedDeliveryOutcome::RetainedNoDelivery { .. } => retained += 1,
-                NewsAiGovernedDeliveryOutcome::Deduped { .. } => deduped += 1,
-                other => {
-                    failed += 1;
-                    log::warn!(
+    let mut budget = CandidateVisitBudget::new(
+        candidates.len(),
+        NEXT_NEWS_AI_CANDIDATE.load(Ordering::Relaxed),
+    );
+    while let Some(index) = budget.next_index() {
+        let candidate = &candidates[index];
+        let did_work = match assess_candidate(analyzer.as_ref(), &status, candidate).await {
+            Ok(CandidateOutcome::Governed { existing, delivery }) => {
+                let did_work = !matches!(&delivery, NewsAiGovernedDeliveryOutcome::Deduped { .. });
+                match delivery {
+                    NewsAiGovernedDeliveryOutcome::Pushed { .. } => pushed += 1,
+                    NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered { .. } => {
+                        link_recovered += 1;
+                    }
+                    NewsAiGovernedDeliveryOutcome::RetainedNoDelivery { .. } => retained += 1,
+                    NewsAiGovernedDeliveryOutcome::Deduped { .. } => deduped += 1,
+                    // counted 准入拒绝: 设计内丢弃, info 级, 不计入 failed。
+                    NewsAiGovernedDeliveryOutcome::Denied { reason, .. } => {
+                        denied += 1;
+                        log::info!(
+                        "[NewsAI][BR-172] counted admission denied key={} existing={} reason={reason}",
+                        candidate.key,
+                        existing
+                    );
+                    }
+                    other => {
+                        failed += 1;
+                        log::warn!(
                         "[NewsAI][BR-172] governed delivery incomplete key={} existing={} outcome={other:?}",
                         candidate.key,
                         existing
                     );
+                    }
                 }
-            },
+                did_work
+            }
             Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing }) => {
                 deferred += 1;
                 log::warn!(
@@ -306,6 +334,11 @@ async fn run_same_tick_batches(
                     existing,
                     status.governed_delivery_recovery
                 );
+                !existing
+            }
+            Ok(CandidateOutcome::TerminalDenied) => {
+                denied += 1;
+                false
             }
             Err(error) => {
                 failed += 1;
@@ -313,16 +346,20 @@ async fn run_same_tick_batches(
                     "[NewsAI][BR-172] candidate failed key={} error={error}",
                     candidate.key
                 );
+                true
             }
-        }
+        };
+        budget.record_work(did_work);
     }
+    NEXT_NEWS_AI_CANDIDATE.store(budget.next_start(), Ordering::Relaxed);
     log::info!(
-        "[NewsAI][BR-172] completed pushed={} link_recovered={} retained_neutral={} deferred_delivery={} deduped={} failed={}",
+        "[NewsAI][BR-172] completed pushed={} link_recovered={} retained_neutral={} deferred_delivery={} deduped={} admission_denied={} failed={}",
         pushed,
         link_recovered,
         retained,
         deferred,
         deduped,
+        denied,
         failed
     );
 }
@@ -333,6 +370,52 @@ struct NewsAiCandidate {
     batch: AdmittedGlobalNewsBatch,
     record_index: usize,
     target_code: String,
+}
+
+/// Inspect a bounded portion of the admitted batch and spend the per-tick
+/// quota only on actual new/recovery work. Completed identities do not occupy
+/// the first five slots forever; repeated failures still move the cursor so a
+/// later candidate gets a turn on the next tick.
+struct CandidateVisitBudget {
+    total: usize,
+    start: usize,
+    inspected: usize,
+    worked: usize,
+}
+
+impl CandidateVisitBudget {
+    fn new(total: usize, start: usize) -> Self {
+        Self {
+            total,
+            start: if total == 0 { 0 } else { start % total },
+            inspected: 0,
+            worked: 0,
+        }
+    }
+
+    fn next_index(&mut self) -> Option<usize> {
+        if self.total == 0
+            || self.inspected >= self.total.min(MAX_CANDIDATE_INSPECTIONS_PER_TICK)
+            || self.worked >= MAX_ASSESSMENTS_PER_TICK
+        {
+            return None;
+        }
+        let index = (self.start + self.inspected) % self.total;
+        self.inspected += 1;
+        Some(index)
+    }
+
+    fn record_work(&mut self, did_work: bool) {
+        self.worked += usize::from(did_work);
+    }
+
+    fn next_start(&self) -> usize {
+        if self.total == 0 {
+            0
+        } else {
+            (self.start + self.inspected) % self.total
+        }
+    }
 }
 
 fn exact_candidates(batches: &[AdmittedGlobalNewsBatch]) -> Vec<NewsAiCandidate> {
@@ -374,10 +457,7 @@ fn exact_candidates(batches: &[AdmittedGlobalNewsBatch]) -> Vec<NewsAiCandidate>
             }
         }
     }
-    unique
-        .into_values()
-        .take(MAX_ASSESSMENTS_PER_TICK)
-        .collect()
+    unique.into_values().collect()
 }
 
 enum CandidateOutcome {
@@ -388,6 +468,7 @@ enum CandidateOutcome {
     AwaitingDeliveryRecovery {
         existing: bool,
     },
+    TerminalDenied,
 }
 
 /// BR-249: 读取目标股产业链上下文。
@@ -462,6 +543,20 @@ async fn assess_candidate(
         &candidate.target_code,
     )
     .map_err(|error| error.to_string())?;
+    // This indexed read is a scheduling hint for a counted decision that can
+    // never be reopened under the frozen identity. Every nonterminal state
+    // still takes the fully validated BR-172 audit path below.
+    let terminal_fact = fact.clone();
+    let terminal_denial = tokio::task::spawn_blocking(move || {
+        stock_analysis::database::get_db()
+            .is_news_ai_terminal_denial_for_fact(&terminal_fact, NEWS_AI_ANALYSIS_VERSION)
+    })
+    .await
+    .map_err(|error| format!("terminal NewsAI decision lookup task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    if terminal_denial {
+        return Ok(CandidateOutcome::TerminalDenied);
+    }
     // BR-250: 注入证券名称供卡片渲染; 解析失败保持 None, 不阻塞评估。
     let name_code = candidate.target_code.clone();
     let name = resolve_target_name(&name_code).await;
@@ -623,6 +718,16 @@ impl NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort {
         };
         match super::notify::send_preflighted_news_ai_analysis_v3(prepared, &mut sink_attempt).await
         {
+            // 2026-09-22: counted 准入拒绝 (预算满 / 冷却头 / launch gate) —
+            // 卡片从未交给 sink, 按 `Denied` 收口 (不是 sink 故障)。
+            // `deliver_governed_news_ai` 会走 `rollback` 把 BR-172 从
+            // `Reserved` 收口到 `RolledBack`, 不留悬挂状态。
+            super::notify::NewsAiNotifyOutcome::AdmissionDenied(reason) => {
+                NewsAiPhysicalPushOutcome::Denied(reason)
+            }
+            // Preparation failed before the counted sink attempt. The core
+            // rolls Reserved back for SinkError; reporting Denied here would
+            // incorrectly count a capability failure as a policy rejection.
             super::notify::NewsAiNotifyOutcome::PreSinkError(reason) => {
                 NewsAiPhysicalPushOutcome::SinkError(reason)
             }
@@ -651,7 +756,19 @@ impl NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort {
                 }
             }
             super::notify::NewsAiNotifyOutcome::SinkError(reason) => {
-                post_sink_failure(delivery, reservation, None, reason).await
+                // counted 未给出 Delivered；BR-172 marker 尚未写入。由核心
+                // state machine 从 Reserved rollback，后续是否能重试只由
+                // counted 决策的权威状态决定。
+                NewsAiPhysicalPushOutcome::SinkError(reason)
+            }
+            super::notify::NewsAiNotifyOutcome::CountedDeliveredMarkerFailed(reason) => {
+                // counted 已确认 Delivered，但 BR-172 marker 尚未落库，当前
+                // Reserved 无法合法写 post_sink_recovery。保留 Reserved，下一轮
+                // 读取同一 counted 决策并只补 marker 与专属审计。
+                NewsAiPhysicalPushOutcome::PostSinkFailure {
+                    delivery_audit_event_id: None,
+                    reason,
+                }
             }
             super::notify::NewsAiNotifyOutcome::PostSinkAuditFailed { audit, reason } => {
                 post_sink_failure(delivery, reservation, audit, reason).await
@@ -684,14 +801,28 @@ impl NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort {
         &self,
         delivery: &GovernedNewsAiDelivery,
         reservation: &NewsAiDeliveryReservation,
+        reason: &str,
     ) -> Result<(), String> {
+        // 2026-09-23 对抗性复审 F5a: 真实拒绝原因此前在 port 边界被丢弃, 账本
+        // 只留下无语义常量。保留 `BR172_PRE_SINK_NOT_DELIVERED:` 前缀以维持可
+        // 检索性, 后缀是深状态机传来的真实原因。
+        // `rolled_back` 行的 reason 列有 CHECK 非空约束 (`database/news_ai.rs`),
+        // 且 `validate_exact_text` 要求首尾无空白 —— 故先 trim, 为空则回退到
+        // 无后缀常量: 任何分支都不会写出空 reason, 也不会写出带首尾空白的
+        // reason 而让 rollback 失败。
+        let trimmed = reason.trim();
+        let rollback_reason = if trimmed.is_empty() {
+            "BR172_PRE_SINK_NOT_DELIVERED".to_owned()
+        } else {
+            format!("BR172_PRE_SINK_NOT_DELIVERED:{trimmed}")
+        };
         let delivery = delivery.clone();
         let reservation = reservation.clone();
         tokio::task::spawn_blocking(move || {
             stock_analysis::database::get_db().rollback_news_ai_delivery(
                 &delivery,
                 &reservation,
-                "BR172_PRE_SINK_NOT_DELIVERED",
+                &rollback_reason,
             )
         })
         .await
@@ -743,6 +874,71 @@ const fn news_market_context(session: MarketSession) -> NewsMarketContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stock_analysis::data_gateway::{BatchEvidence, GlobalNewsRecord};
+    use stock_analysis::market_domain::{ProviderId, SourceEvidence};
+
+    #[test]
+    fn br172_sixth_admitted_news_item_remains_eligible_after_five_seen_items() {
+        let observed = chrono::Utc::now();
+        let records = (0..6)
+            .map(|index| GlobalNewsRecord {
+                item_id: format!("item-{index}"),
+                title: format!("news {index}"),
+                summary: None,
+                content: None,
+                publisher: "test source".to_owned(),
+                canonical_url: format!("https://example.invalid/news/{index}"),
+                published_at: observed,
+                observed_at: observed,
+                instruments: vec!["600519".to_owned()],
+                topics: vec![],
+                language: "zh".to_owned(),
+                evidence: SourceEvidence::new(
+                    ProviderId::Eastmoney,
+                    observed.to_rfc3339(),
+                    "batch-six",
+                )
+                .expect("source evidence"),
+            })
+            .collect();
+        let batch = AdmittedGlobalNewsBatch::from_parts(
+            records,
+            BatchEvidence {
+                provider: ProviderId::Eastmoney,
+                source: "test source".to_owned(),
+                source_at: None,
+                observed_at: observed.to_rfc3339(),
+                batch_id: "batch-six".to_owned(),
+            },
+        );
+
+        let candidates = exact_candidates(&[batch]);
+        assert_eq!(candidates.len(), 6);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.key.contains("item-5")));
+    }
+
+    #[test]
+    fn br172_completed_prefix_does_not_starve_sixth_item_or_remove_work_limit() {
+        let mut first_tick = CandidateVisitBudget::new(6, 0);
+        let mut visited = Vec::new();
+        while let Some(index) = first_tick.next_index() {
+            visited.push(index);
+            first_tick.record_work(index == 5);
+        }
+        assert_eq!(visited, vec![0, 1, 2, 3, 4, 5]);
+
+        let mut all_new = CandidateVisitBudget::new(6, 0);
+        let mut first_five = Vec::new();
+        while let Some(index) = all_new.next_index() {
+            first_five.push(index);
+            all_new.record_work(true);
+        }
+        assert_eq!(first_five, vec![0, 1, 2, 3, 4]);
+        let mut second_tick = CandidateVisitBudget::new(6, all_new.next_start());
+        assert_eq!(second_tick.next_index(), Some(5));
+    }
 
     #[test]
     fn session_mapping_requires_realtime_only_during_market_windows() {
@@ -763,11 +959,25 @@ mod tests {
     #[test]
     fn governed_adapter_uses_exact_delivery_without_order_capability() {
         let source = include_str!("news_ai_shadow.rs");
-        assert!(source.contains("deliver_governed_news_ai"));
-        assert!(source.contains("reserve_news_ai_delivery"));
-        assert!(source.contains("link_news_ai_prediction"));
+        let candidate = source
+            .split("async fn assess_candidate")
+            .nth(1)
+            .expect("candidate implementation")
+            .split("struct ProductionNewsAiDeliveryPort")
+            .next()
+            .expect("candidate implementation boundary");
+        assert!(candidate.contains("deliver_governed_news_ai"));
+        let production = source
+            .split("impl NewsAiGovernedDeliveryPort for ProductionNewsAiDeliveryPort")
+            .nth(1)
+            .expect("production port implementation")
+            .split("const fn news_market_context")
+            .next()
+            .expect("production port boundary");
+        assert!(production.contains("reserve_news_ai_delivery"));
+        assert!(production.contains("link_news_ai_prediction"));
         for (prefix, suffix) in [("place_", "order"), ("Trading", "Bus")] {
-            assert!(!source.contains(&format!("{prefix}{suffix}")));
+            assert!(!production.contains(&format!("{prefix}{suffix}")));
         }
     }
 
@@ -777,7 +987,10 @@ mod tests {
         let push = source
             .find("async fn push(")
             .expect("production NewsAI delivery port push method");
-        let production = &source[push..];
+        let production = source[push..]
+            .split("async fn commit(")
+            .next()
+            .expect("production push method boundary");
         let preflight = production
             .find("preflight_news_ai_analysis_v3")
             .expect("typed NewsAI governance preflight");
@@ -788,6 +1001,10 @@ mod tests {
         assert!(preflight < physical_send);
         assert!(production.contains("NewsAiPreflightRejection::Denied"));
         assert!(production.contains("NewsAiNotifyOutcome::PreSinkError"));
+        // 准入拒绝从 Reserved rollback；此断言只覆盖该方法的映射，
+        // counted 与 BR-172 的状态行为由隔离测试另行验证。
+        assert!(production.contains("NewsAiNotifyOutcome::AdmissionDenied"));
+        assert!(production.contains("NewsAiPhysicalPushOutcome::Denied"));
 
         let marker_impl = source
             .split("impl super::notify::PhysicalSinkAttemptMarker")

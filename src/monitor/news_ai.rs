@@ -1114,6 +1114,7 @@ impl AuditedNewsAiAssessment {
                 assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
                 identity,
                 chain,
+                rendered_card: None,
             },
         })
     }
@@ -1147,12 +1148,27 @@ impl AuditedNewsAiAssessment {
                 identity,
                 // BR-249: 持久化重建路径无链快照；渲染卡如实标注。
                 chain: None,
+                rendered_card: None,
             },
         })
     }
 
     pub fn delivery(&self) -> &GovernedNewsAiDelivery {
         &self.delivery
+    }
+
+    pub(crate) fn with_frozen_card(mut self, card: String) -> Result<Self, NewsAiError> {
+        if card.trim().is_empty()
+            || !card.contains(self.delivery.identity.sha256())
+            || !card.contains(&self.delivery.assessment_audit_record_sha256)
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted delivery card is empty or detached from its audited identity"
+                    .to_owned(),
+            ));
+        }
+        self.delivery.rendered_card = Some(card);
+        Ok(self)
     }
 }
 
@@ -1166,6 +1182,8 @@ pub struct GovernedNewsAiDelivery {
     identity: NewsAiDeliveryIdentity,
     /// BR-249: 评估时的产业链上下文快照。DB 重建路径（恢复推送）为 None。
     chain: Option<NewsAiChainContext>,
+    /// First rendered card, frozen with its audited assessment before delivery.
+    rendered_card: Option<String>,
 }
 
 impl GovernedNewsAiDelivery {
@@ -1189,9 +1207,22 @@ impl GovernedNewsAiDelivery {
         &self.identity
     }
 
+    pub fn business_date(&self) -> chrono::NaiveDate {
+        let market_timezone = chrono::FixedOffset::east_opt(8 * 3600)
+            .expect("Asia/Shanghai UTC offset is valid");
+        self.assessment
+            .receipt()
+            .completed_at()
+            .with_timezone(&market_timezone)
+            .date_naive()
+    }
+
     /// Render only immutable source/model/audit evidence. This card does not
     /// infer holdings, prices or trading actions and has no default values.
     pub fn render_card(&self) -> String {
+        if let Some(card) = &self.rendered_card {
+            return card.clone();
+        }
         let impact = match self.assessment.impact() {
             NewsImpact::MajorNegative => "重大负面",
             NewsImpact::Negative => "负面",
@@ -1374,10 +1405,11 @@ pub enum NewsAiPhysicalPushOutcome {
     Pushed(NewsAiDeliveryAuditReceipt),
     Deduped,
     Denied(String),
-    /// Definitive failure before the physical sink was attempted.
+    /// No confirmed delivery: preparation failed or the sink authoritatively
+    /// rejected the attempt. The reservation can be rolled back.
     SinkError(String),
-    /// Sink was attempted or accepted, so retry is forbidden even when the
-    /// post-sink audit could not be completed.
+    /// Counted delivery may already be accepted. Recovery may repeat audit
+    /// work for the same frozen card, but counted owns physical idempotence.
     PostSinkFailure {
         delivery_audit_event_id: Option<String>,
         reason: String,
@@ -1493,10 +1525,15 @@ pub trait NewsAiGovernedDeliveryPort: Send + Sync {
         delivery_audit: &NewsAiDeliveryAuditReceipt,
     ) -> Result<NewsAiPredictionLinkReceipt, String>;
 
+    /// Release a reservation whose card never reached the sink. `reason` is
+    /// the port-side denial/failure text that explains the release, so the
+    /// BR-172 `rolled_back` row can record *why*; an empty string means the
+    /// caller has no specific reason to add.
     async fn rollback(
         &self,
         delivery: &GovernedNewsAiDelivery,
         reservation: &NewsAiDeliveryReservation,
+        reason: &str,
     ) -> Result<(), String>;
 }
 
@@ -1615,7 +1652,9 @@ where
         }
         NewsAiPhysicalPushOutcome::Denied(reason) => {
             let original = format!("denied:{reason}");
-            match port.rollback(delivery, &reservation).await {
+            // F5a: the ledger must show *why* the reservation was released,
+            // so the real denial reason travels into the rollback row.
+            match port.rollback(delivery, &reservation, &reason).await {
                 Ok(()) => NewsAiGovernedDeliveryOutcome::Denied {
                     delivery_identity_sha256: identity,
                     reason,
@@ -1629,7 +1668,9 @@ where
         }
         NewsAiPhysicalPushOutcome::SinkError(reason) => {
             let original = format!("sink_error:{reason}");
-            match port.rollback(delivery, &reservation).await {
+            // Preserve the counted transport reason in the BR-172 rollback
+            // row; a retryable sink fault is not a strategy denial.
+            match port.rollback(delivery, &reservation, &reason).await {
                 Ok(()) => NewsAiGovernedDeliveryOutcome::SinkError {
                     delivery_identity_sha256: identity,
                     reason,
@@ -1662,7 +1703,7 @@ async fn rollback_or_failure<P>(
 where
     P: NewsAiGovernedDeliveryPort + ?Sized,
 {
-    match port.rollback(delivery, reservation).await {
+    match port.rollback(delivery, reservation, "").await {
         Ok(()) => NewsAiGovernedDeliveryOutcome::Deduped {
             delivery_identity_sha256: identity,
         },
@@ -3265,6 +3306,7 @@ mod tests {
             &self,
             _delivery: &GovernedNewsAiDelivery,
             _reservation: &NewsAiDeliveryReservation,
+            _reason: &str,
         ) -> Result<(), String> {
             self.actions.lock().unwrap().push("rollback");
             Ok(())
@@ -3392,6 +3434,7 @@ mod tests {
             &self,
             _delivery: &GovernedNewsAiDelivery,
             _reservation: &NewsAiDeliveryReservation,
+            _reason: &str,
         ) -> Result<(), String> {
             Err("TEST_CODE_LINK_RECOVERY_MUST_NOT_ROLLBACK".to_owned())
         }
@@ -3438,6 +3481,146 @@ mod tests {
         assert_eq!(
             port.commit_calls.load(std::sync::atomic::Ordering::SeqCst),
             2
+        );
+    }
+
+    /// 2026-09-22: counted 准入拒绝时 BR-172 必须正确收口。
+    ///
+    /// NewsAI 分析卡接入 counted 准入层后, 预算满 / 冷却头 / launch gate
+    /// 拒绝会以 `NewsAiPhysicalPushOutcome::Denied` 从 port 返回 (见
+    /// `ProductionNewsAiDeliveryPort::push` 对
+    /// `NewsAiNotifyOutcome::AdmissionDenied` 的映射)。BR-172 仍处于
+    /// Reserved，深状态机必须 rollback 收口，也不得 commit 预测链。
+    /// 卡片从未交给 sink, 因此也没有重发资格问题。
+    #[tokio::test]
+    async fn br172_counted_admission_denial_rolls_back_and_never_commits() {
+        struct AdmissionDeniedPort {
+            actions: std::sync::Mutex<Vec<&'static str>>,
+            rollback_reason: std::sync::Mutex<Option<String>>,
+            push_outcome: NewsAiPhysicalPushOutcome,
+        }
+
+        impl AdmissionDeniedPort {
+            fn new(push_outcome: NewsAiPhysicalPushOutcome) -> Self {
+                Self {
+                    actions: std::sync::Mutex::new(Vec::new()),
+                    rollback_reason: std::sync::Mutex::new(None),
+                    push_outcome,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl NewsAiGovernedDeliveryPort for AdmissionDeniedPort {
+            async fn reserve(
+                &self,
+                delivery: &GovernedNewsAiDelivery,
+            ) -> Result<NewsAiReserveOutcome, String> {
+                self.actions.lock().unwrap().push("reserve");
+                Ok(NewsAiReserveOutcome::Reserved(
+                    NewsAiDeliveryReservation::try_new(
+                        delivery.identity().sha256(),
+                        "TEST_CODE_RESERVATION_001",
+                    )
+                    .unwrap(),
+                ))
+            }
+
+            async fn push(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+            ) -> NewsAiPhysicalPushOutcome {
+                self.actions.lock().unwrap().push("push");
+                self.push_outcome.clone()
+            }
+
+            async fn commit(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+                _delivery_audit: &NewsAiDeliveryAuditReceipt,
+            ) -> Result<NewsAiPredictionLinkReceipt, String> {
+                self.actions.lock().unwrap().push("commit");
+                Err("TEST_CODE_ADMISSION_DENIED_MUST_NOT_COMMIT".to_owned())
+            }
+
+            async fn rollback(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+                reason: &str,
+            ) -> Result<(), String> {
+                self.actions.lock().unwrap().push("rollback");
+                // F5a: the denial reason must reach the rollback row.
+                self.rollback_reason
+                    .lock()
+                    .unwrap()
+                    .replace(reason.to_owned());
+                Ok(())
+            }
+        }
+
+        let request = request();
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        let audited =
+            AuditedNewsAiAssessment::try_from_assessment_audit(request, assessment, &"a".repeat(64))
+                .unwrap();
+        let port = AdmissionDeniedPort::new(NewsAiPhysicalPushOutcome::Denied(
+            "daily_budget_full".to_owned(),
+        ));
+
+        let outcome = deliver_governed_news_ai(&audited, &port).await;
+        assert!(
+            matches!(
+                outcome,
+                NewsAiGovernedDeliveryOutcome::Denied { ref reason, .. } if reason == "daily_budget_full"
+            ),
+            "counted 准入拒绝必须收敛为 Denied, got {outcome:?}"
+        );
+        assert_eq!(
+            *port.actions.lock().unwrap(),
+            vec!["reserve", "push", "rollback"],
+            "准入拒绝必须 rollback 收口且绝不 commit 预测链"
+        );
+        // F5a: 深状态机必须把真实拒绝原因交给 rollback (而不是只留一个
+        // 无语义的常量), 否则账本无法回答"为什么被拒"。
+        assert_eq!(
+            port.rollback_reason.lock().unwrap().as_deref(),
+            Some("daily_budget_full"),
+            "rollback 必须携带真实 Denied reason"
+        );
+
+        let port = AdmissionDeniedPort::new(NewsAiPhysicalPushOutcome::SinkError(
+            "presentation_token_unavailable".to_owned(),
+        ));
+        let outcome = deliver_governed_news_ai(&audited, &port).await;
+        assert!(matches!(
+            outcome,
+            NewsAiGovernedDeliveryOutcome::SinkError { ref reason, .. }
+                if reason == "presentation_token_unavailable"
+        ));
+        assert_eq!(*port.actions.lock().unwrap(), vec!["reserve", "push", "rollback"]);
+        assert_eq!(
+            port.rollback_reason.lock().unwrap().as_deref(),
+            Some("presentation_token_unavailable")
         );
     }
 

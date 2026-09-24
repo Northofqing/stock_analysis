@@ -15,14 +15,14 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     system_service_client::SystemServiceClient, AdmissionState,
     CanonicalPayload as ExternalCanonicalPayload, CapabilitiesRequest, CapabilitiesResponse,
     Capability, ErrorDetail as ExternalErrorDetail, EventCursor as ExternalEventCursor,
-    EventFilter as ExternalEventFilter,
-    HealthRequest, HealthResponse, Operation,
+    EventFilter as ExternalEventFilter, HealthRequest, HealthResponse,
     ListenerStatusRequest as ExternalListenerStatusRequest,
     ListenerStatusResponse as ExternalListenerStatusResponse,
-    MarketEventEnvelope as ExternalMarketEventEnvelope, QueryRequest as ExternalQueryRequest,
-    QueryResponse as ExternalQueryResponse, RequestContext,
+    MarketEventEnvelope as ExternalMarketEventEnvelope, Operation,
+    QueryRequest as ExternalQueryRequest, QueryResponse as ExternalQueryResponse, RequestContext,
     SetWatchlistRequest as ExternalSetWatchlistRequest,
-    SetWatchlistResponse as ExternalSetWatchlistResponse, SubscribeRequest as ExternalSubscribeRequest,
+    SetWatchlistResponse as ExternalSetWatchlistResponse,
+    SubscribeRequest as ExternalSubscribeRequest,
 };
 use crate::grpc_client::pb::magic::market::v1::{
     AdmissionState as LocalAdmissionState, CanonicalPayload, Operation as LocalOperation,
@@ -1098,7 +1098,10 @@ async fn grpc_dual_contract_external_global_news_accepts_generated_unknown_group
             assert_eq!(native.source_at, TEST_SOURCE_AT);
             assert_eq!(native.records.len(), 1);
             assert!(native.diagnostic_blocker.is_empty());
-            assert_ne!(native.encode_to_vec().as_slice(), expected_payload.as_slice());
+            assert_ne!(
+                native.encode_to_vec().as_slice(),
+                expected_payload.as_slice()
+            );
 
             let ExternalMacroAttemptCompletion::Unary(inner) = completion else {
                 panic!("TEST_CODE expected External unknown-group unary completion");
@@ -1452,17 +1455,18 @@ async fn external_mtls_listener_status_preserves_replay_subscriber_and_agent_cou
                 .await
                 .expect("TEST_CODE External Listener mTLS client");
             let before_wrong_profile = fixture.snapshot();
-            let wrong_profile_error = match tokio::time::timeout(
-                Duration::from_secs(1),
-                client.get_listener_status(),
-            )
-            .await
-            .expect("TEST_CODE Local Listener wrong-profile deadline")
-            {
-                Err(error) => error,
-                Ok(_) => panic!("External profile must reject Local Listener before RPC"),
-            };
-            assert!(matches!(&wrong_profile_error, GrpcError::FailedPrecondition { .. }));
+            let wrong_profile_error =
+                match tokio::time::timeout(Duration::from_secs(1), client.get_listener_status())
+                    .await
+                    .expect("TEST_CODE Local Listener wrong-profile deadline")
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("External profile must reject Local Listener before RPC"),
+                };
+            assert!(matches!(
+                &wrong_profile_error,
+                GrpcError::FailedPrecondition { .. }
+            ));
             assert_eq!(wrong_profile_error.details().code, "event_profile_mismatch");
             assert_eq!(fixture.snapshot(), before_wrong_profile);
 
@@ -1485,7 +1489,10 @@ async fn external_mtls_listener_status_preserves_replay_subscriber_and_agent_cou
                 observed.listener_status_requests[0].as_slice(),
             )
             .expect("TEST_CODE External generated Listener request");
-            assert_eq!(request.encode_to_vec(), observed.listener_status_requests[0]);
+            assert_eq!(
+                request.encode_to_vec(),
+                observed.listener_status_requests[0]
+            );
             let context = request
                 .context
                 .expect("TEST_CODE External Listener request context");
@@ -1498,10 +1505,10 @@ async fn external_mtls_listener_status_preserves_replay_subscriber_and_agent_cou
                 "TEST_CODE_EXTERNAL_GENERATION"
             );
             assert_eq!(
-                external_status.latest.as_ref().map(|cursor| (
-                    cursor.generation.as_str(),
-                    cursor.sequence,
-                )),
+                external_status
+                    .latest
+                    .as_ref()
+                    .map(|cursor| (cursor.generation.as_str(), cursor.sequence,)),
                 Some(("TEST_CODE_EXTERNAL_GENERATION", 44)),
             );
             assert!(external_status.capabilities.is_empty());
@@ -1525,11 +1532,17 @@ async fn external_mtls_listener_status_preserves_replay_subscriber_and_agent_cou
                 observed.listener_status_responses[0].as_slice(),
             )
             .expect("TEST_CODE External generated Listener response");
-            assert_eq!(external_wire.encode_to_vec(), observed.listener_status_responses[0]);
+            assert_eq!(
+                external_wire.encode_to_vec(),
+                observed.listener_status_responses[0]
+            );
             assert_eq!(external_status, external_wire);
             assert_eq!(
                 (
-                    external_status.replay_oldest.as_ref().map(|cursor| cursor.sequence),
+                    external_status
+                        .replay_oldest
+                        .as_ref()
+                        .map(|cursor| cursor.sequence),
                     external_status.replay_event_count,
                     external_status.replay_bytes,
                     external_status.active_subscribers,
@@ -1738,10 +1751,7 @@ async fn external_mtls_set_watchlist_status_decodes_external_detail_without_retr
             let mut client = GrpcMarketClient::connect_client_bundle(fixture.bundle_path())
                 .await
                 .expect("TEST_CODE External SetWatchlist status mTLS client");
-            let instruments = vec![
-                "EQUITY:SH:600396".to_owned(),
-                "EQUITY:SZ:000001".to_owned(),
-            ];
+            let instruments = vec!["EQUITY:SH:600396".to_owned(), "EQUITY:SZ:000001".to_owned()];
             let error = tokio::time::timeout(
                 Duration::from_secs(5),
                 client.set_external_watchlist(instruments.clone()),
@@ -1752,8 +1762,11 @@ async fn external_mtls_set_watchlist_status_decodes_external_detail_without_retr
 
             let observed = fixture.snapshot();
             assert_eq!(observed.watchlist_authorized, vec![true]);
-            assert_eq!(observed.watchlist_requests.len(), 1,
-                "TEST_CODE mutating SetWatchlist status must not be retried");
+            assert_eq!(
+                observed.watchlist_requests.len(),
+                1,
+                "TEST_CODE mutating SetWatchlist status must not be retried"
+            );
             assert!(observed.watchlist_responses.is_empty());
             assert_eq!(observed.watchlist_status_details.len(), 1);
             assert!(observed.subscribe_requests.is_empty());
@@ -1762,10 +1775,9 @@ async fn external_mtls_set_watchlist_status_decodes_external_detail_without_retr
             assert_eq!(observed.capabilities_calls, 0);
             assert_eq!(observed.data_calls, 0);
 
-            let request = ExternalSetWatchlistRequest::decode(
-                observed.watchlist_requests[0].as_slice(),
-            )
-            .expect("TEST_CODE External generated SetWatchlist status request");
+            let request =
+                ExternalSetWatchlistRequest::decode(observed.watchlist_requests[0].as_slice())
+                    .expect("TEST_CODE External generated SetWatchlist status request");
             assert_eq!(request.encode_to_vec(), observed.watchlist_requests[0]);
             let context = request
                 .context
@@ -1773,11 +1785,13 @@ async fn external_mtls_set_watchlist_status_decodes_external_detail_without_retr
             assert_eq!(context.protocol_version, 1);
             assert!(!context.request_id.is_empty());
             assert_eq!(request.instruments, instruments);
-            let wire_detail = ExternalErrorDetail::decode(
-                observed.watchlist_status_details[0].as_slice(),
-            )
-            .expect("TEST_CODE External SetWatchlist status detail");
-            assert_eq!(wire_detail.encode_to_vec(), observed.watchlist_status_details[0]);
+            let wire_detail =
+                ExternalErrorDetail::decode(observed.watchlist_status_details[0].as_slice())
+                    .expect("TEST_CODE External SetWatchlist status detail");
+            assert_eq!(
+                wire_detail.encode_to_vec(),
+                observed.watchlist_status_details[0]
+            );
             assert_eq!(wire_detail.request_id, context.request_id);
             assert_eq!(wire_detail.provider, "Tdx");
             assert_eq!(wire_detail.reason_code, "unavailable");
@@ -1793,14 +1807,13 @@ async fn external_mtls_set_watchlist_status_decodes_external_detail_without_retr
                 .strip_prefix("sha256:")
                 .expect("TEST_CODE public request correlation prefix");
             assert_eq!(correlation_digest.len(), 64);
-            assert!(correlation_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(correlation_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
             assert_ne!(correlation, context.request_id);
             assert!(!correlation.contains(context.request_id.as_str()));
             assert_eq!(error.details().provider.as_deref(), Some("Tdx"));
-            assert_eq!(
-                error.details().reason_code.as_deref(),
-                Some("unavailable")
-            );
+            assert_eq!(error.details().reason_code.as_deref(), Some("unavailable"));
             assert_eq!(error.details().retryable, Some(true));
             drop(client);
         }))

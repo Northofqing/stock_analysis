@@ -20,7 +20,19 @@ pub const ENVELOPE_VERSION: i64 = 1;
 // BusinessDateOnce review delivery per business date and is budget-exempt;
 // the preceding business day's Accepted wall time cannot create a rolling
 // 86,400-second denial on the next business date.
-pub const POLICY_VERSION: i64 = 6;
+// 2026-09-22: v7 — NewsAI 分析卡 ("🧠 AI 新闻证据分析") 接入 counted 准入层:
+// 新 durable kind NewsAiAnalysis (PerTicket Rolling 1200s) 且 **豁免 30 槽
+// 日预算** (单日 55 张会把预算吃穿并饿死其他链路 — 8/13 做T / 9/22 PaperSell
+// 两次同款事故)。v7 = 策略表重编译 (seed_and_verify_policy_catalog 的
+// BR-214 upsert 重播在启动时自动生效, 无需 schema 迁移: v6 升级
+// 69ed98ee 同形态) + 新 envelope decision_identity 刷新。
+/// 策略版本。**每次 bump 必须同步重锁 `w12_legacy_envelope_keeps_exact_identity_and_canonical_bytes`
+/// 的 decision_identity golden** —— 该 golden 内含本常量（经 `DecisionIdentityMaterial`），
+/// bump 后必然改变。不重锁会让下次 bump 看起来像"代码漂移"（历史上 v1→2→3→5→6
+/// 一路带病，2026-09-22 才查实是设计使然而非缺陷）。
+///
+/// 2026-09-22: 6 → 7（NewsAiAnalysis counted 准入发布）。
+pub const POLICY_VERSION: i64 = 7;
 pub const DAILY_BUDGET_LIMIT: i64 = 30;
 pub(crate) const MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN: &str = "manual-delivery-accepted-audit-v1";
 
@@ -237,10 +249,14 @@ pub enum PushKind {
     AccountMode,
     // 2026-09-20: 候选台升级 counted (MU-auction-candidates 接线)。
     CandidateBoard,
+    // 2026-09-22: NewsAI 分析卡 ("🧠 AI 新闻证据分析") 接入 counted 准入层。
+    // 独立 kind (不复用 NewsToIdea — D-01 卡占用它且计入预算; 不进
+    // DailyReportSubKind 家族)。准入策略见 compiled_policy_catalog。
+    NewsAiAnalysis,
 }
 
 impl PushKind {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::HoldingPlan,
         Self::HoldingEvent,
         Self::T0Advice,
@@ -286,6 +302,7 @@ impl PushKind {
         Self::MarketActionAlert,
         Self::AccountMode,
         Self::CandidateBoard,
+        Self::NewsAiAnalysis,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -335,6 +352,7 @@ impl PushKind {
             Self::MarketActionAlert => "MarketActionAlert",
             Self::AccountMode => "AccountMode",
             Self::CandidateBoard => "CandidateBoard",
+            Self::NewsAiAnalysis => "NewsAiAnalysis",
         }
     }
 
@@ -385,6 +403,7 @@ impl PushKind {
             Self::MarketActionAlert => "market_action_alert_v1",
             Self::AccountMode => "account_mode_v1",
             Self::CandidateBoard => "candidate_board_v1",
+            Self::NewsAiAnalysis => "news_ai_analysis_v1",
         }
     }
 
@@ -676,6 +695,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // BR-241: required opening delivery owns one global claim per business
         // date and must not be starved by unrelated intraday budget use.
         (PreopenNewsHot, Global, Some(86_400), BusinessDateOnce),
+        // 2026-09-22 用户决策: NewsAI 分析卡 ("🧠 AI 新闻证据分析") 接入
+        // counted 准入层。单日 55 张 (9/22 实证) 若计入预算会吃穿 30 槽并
+        // 饿死其他链路 — 与 BR-237 复盘类/9-22 PaperSell 执行确认同原理的
+        // 豁免。冷却 PerTicket Rolling 1200s (镜像被取代的 D-01 NewsToIdea
+        // L4 20 min/票: 同票同批新闻不连发, 批量多票互不阻塞)。
+        (NewsAiAnalysis, PerTicket, Some(1_200), Rolling),
     ]
     .into_iter()
     .map(
@@ -715,6 +740,9 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
                     | PushKind::AccountMode
                     | PushKind::PaperSell
                     | PushKind::PaperTrade
+                    // 2026-09-22: NewsAI 分析卡单日 55 张会吃穿 30 槽
+                    // (用户明确决策: AI 分析卡不得饿死其他链路)。
+                    | PushKind::NewsAiAnalysis
             ),
             policy_version: POLICY_VERSION,
         },

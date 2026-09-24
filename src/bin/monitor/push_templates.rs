@@ -6776,6 +6776,102 @@ pub fn build_news_to_idea_counted_binding(
     .map_err(|error| format!("D-01 counted binding 构造失败 code={code}: {error}"))
 }
 
+/// 2026-09-22: NewsAI 分析卡的 BR-196 测试目录呈现 (test-catalog preview)。
+///
+/// 生产渲染器是 NewsAI 引擎的 `GovernedNewsAiDelivery::render_card()`
+/// (src/monitor/news_ai.rs), 它需要一次真实的模型评估 + 审计回执, 测试目录
+/// 无法构造。此处按同一行结构渲染一张 TEST_CODE 预览卡, 让 BR-196 Active
+/// 家族有可渲染的 preview (`build_active_catalog` 强制要求), 行标签与生产
+/// 卡保持同形以便人工比对漂移。
+pub fn render_news_ai_analysis(code: &str, hhmm: &str) -> String {
+    format!(
+        "🧠 AI 新闻证据分析\n\
+         标的：TEST_CODE 受益（{code}）\n\
+         产业链：板块：TEST_CODE 算力；归属主线：TEST_CODE 算力\n\
+         标题：TEST_CODE 业绩超预期\n\
+         来源：TEST_CODE_SOURCE / Em\n\
+         发布时间：{hhmm}\n\
+         影响：Positive（置信度 80%）\n\
+         核心逻辑：TEST_CODE 证据链完整\n\
+         不确定性：TEST_CODE 披露口径\n\
+         模型：TEST_CODE_PROVIDER / TEST_CODE_MODEL\n\
+         模型响应：TEST_CODE_RESPONSE\n\
+         证据哈希：{}\n\
+         评估审计：{}\n\
+         投递身份：{}\n\
+         ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
+        "0".repeat(64),
+        "1".repeat(64),
+        "2".repeat(64),
+    )
+}
+
+/// 2026-09-22: NewsAI 分析卡 ("🧠 AI 新闻证据分析") counted binding。
+///
+/// 该卡此前由 BR-172 专用状态机 (`news_ai_delivery_event`) 物理直推, 绕过
+/// counted 协调器 — 无 `delivery_decisions` 决策行、不消耗预算、不受冷却
+/// 约束 (9/22 单日 55 张实证)。本构造器把它接进 counted 准入层。
+///
+/// - occurrence = `news-ai-analysis:{业务日}:{code}:{delivery identity}`。
+///   identity 已是 assessment+target+analysis_version 的 sha256
+///   (`delivery.identity().sha256()`), 天然逐事件唯一 → 不同新闻事件对同票
+///   各自独立成卡 (不会被冒名复用); 同一事件重入则复用同一决策 (幂等)。
+/// - canonical = 业务日 + 票 + 渲染 sha256 (LLM 非确定 → 分析后才构造,
+///   G5b/I-02/D-01 模式)。
+/// - PerTicket scope: 镜像 policy 行 1200s/票 冷却, 批量多票互不阻塞。
+/// - retry_authorized=false: LLM 输出非确定, 且分析内容按当时新闻时刻锚定 —
+///   重发会写出与首次不同的分析, 不是同一事实的补偿 (I-01/I-02 论据)。
+pub fn build_news_ai_analysis_counted_binding(
+    business_date: chrono::NaiveDate,
+    code: &str,
+    delivery_identity_sha256: &str,
+    text: &str,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    use sha2::{Digest, Sha256};
+
+    if delivery_identity_sha256.len() != 64
+        || !delivery_identity_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "NewsAI 分析卡 delivery identity 必须是 lowercase SHA-256 hex: {delivery_identity_sha256}"
+        ));
+    }
+    let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+    let canonical = serde_json::json!({
+        "schema": "news-ai-analysis-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": code,
+        "delivery_identity_sha256": delivery_identity_sha256,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_bytes = canonical.to_string().into_bytes();
+    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
+    // 权威交易所解析 (配方 §4); 解析失败 fail-closed — 不能退回 Global scope,
+    // 否则逐票冷却会退化成全局阻塞。
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("NewsAI 分析卡证券身份解析失败 code={code}: {error}"))?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        business_date,
+        format!("news-ai-analysis:{business_date}:{code}:{delivery_identity_sha256}"),
+        canonical_bytes,
+        crate::durable_delivery_runtime::CountedDeliveryScope::Ticket {
+            instrument: identity.instrument().clone(),
+        },
+        subject_hash,
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+    .map_err(|error| format!("NewsAI 分析卡 counted binding 构造失败 code={code}: {error}"))
+}
+
 /// MU-auction-volume: P-02 竞价热点量能 counted binding (2026-09-20):
 /// occurrence auction-volume:{业务日}:{hhmm} (每槽一卡, I-01 模式);
 /// canonical = 业务日 + 渲染 sha256; Global scope (旧 L4 空 code
@@ -18211,7 +18307,8 @@ pub fn build_test_template_catalog(
     use stock_analysis::market_domain::{DragonTigerSide, Exchange as CoreExchange, ProviderId};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
-    const EXPECTED_CATALOG_TOTAL: usize = 58;
+    // 2026-09-22: NewsAI 分析卡 (U-04-news-ai-analysis) 全 7 触点 → 59。
+    const EXPECTED_CATALOG_TOTAL: usize = 59;
     let banner = BannerCtx {
         account_mode: AccountMode::Normal,
         total_pos: Some(0),
@@ -18908,6 +19005,11 @@ pub fn build_test_template_catalog(
                 action: Some(NewsAction::Observe),
             },
         ),
+    );
+    // 2026-09-22: NewsAI 分析卡接入 counted 准入层 (全 7 触点新增家族)。
+    push(
+        "U-04-news-ai-analysis",
+        render_news_ai_analysis("TEST_CODE_600009", hhmm),
     );
     push(
         "A-10-catalyst-review",
@@ -23376,6 +23478,54 @@ mod tests {
             binding.scope(),
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
+    }
+
+    /// 2026-09-22: NewsAI 分析卡 counted binding — occurrence 逐票逐事件
+    /// (delivery identity 已经是 assessment+target 的 sha256, 天然唯一),
+    /// PerTicket scope (镜像 policy 行 1200s/票 冷却),
+    /// retry_authorized=false (LLM 非确定 + 卡片内容时刻锚定: 重发会写出
+    /// 与首次不同的分析, 不是同一事实的补偿)。
+    #[test]
+    fn news_ai_analysis_counted_binding_is_per_ticket_without_replay() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 22).expect("valid date");
+        let identity = "a".repeat(64);
+        let binding =
+            build_news_ai_analysis_counted_binding(date, "600703", &identity, "🧠 AI 新闻证据分析")
+                .expect("valid binding");
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            format!("news-ai-analysis:2026-09-22:600703:{identity}")
+        );
+        // 同票同 identity 同文本 → 同 occurrence (decision 回放稳定)
+        let again =
+            build_news_ai_analysis_counted_binding(date, "600703", &identity, "🧠 AI 新闻证据分析")
+                .expect("valid binding");
+        assert_eq!(
+            again.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        assert_eq!(
+            binding.delivery_subject_hash(),
+            again.delivery_subject_hash()
+        );
+        // 不同票 → 不同 occurrence (逐票冷却, 批量多票互不阻塞)
+        let other = build_news_ai_analysis_counted_binding(
+            date,
+            "000813",
+            &"b".repeat(64),
+            "🧠 AI 新闻证据分析",
+        )
+        .expect("valid binding");
+        assert_ne!(
+            other.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        assert!(!binding.retry_authorized());
+        assert_eq!(binding.business_date(), date);
+        assert!(matches!(
+            binding.scope(),
+            crate::durable_delivery_runtime::CountedDeliveryScope::Ticket { .. }
+        ));
     }
 
     #[test]

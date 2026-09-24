@@ -1439,9 +1439,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         let mapped = statement.query_map([], policy_from_row)?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    if rows.len() != 48 {
+    if rows.len() != 49 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 48 rows, got {}",
+            "seeded policy catalog must have 49 rows, got {}",
             rows.len()
         )));
     }
@@ -1449,9 +1449,9 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
         .iter()
         .map(|row| row.push_kind)
         .collect::<BTreeSet<_>>();
-    if distinct.len() != 45 {
+    if distinct.len() != 46 {
         return Err(DurableDeliveryError::PolicyMismatch(format!(
-            "seeded policy catalog must have 45 kinds, got {}",
+            "seeded policy catalog must have 46 kinds, got {}",
             distinct.len()
         )));
     }

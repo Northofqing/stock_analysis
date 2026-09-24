@@ -4,11 +4,10 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     market_data_service_server::{MarketDataService, MarketDataServiceServer},
     market_event_service_server::{MarketEventService, MarketEventServiceServer},
     system_service_server::{SystemService, SystemServiceServer},
-    AdmissionState, BuildIdentity, CapabilitiesRequest, CapabilitiesResponse, Capability,
-    CanonicalPayload, ErrorDetail, EventCursor, HealthRequest, HealthResponse,
-    ListenerStatusRequest, ListenerStatusResponse, MarketEventEnvelope, Operation,
-    ProviderAttemptDetail, QueryRequest, QueryResponse, ReplayRequest, RuntimeObservability,
-    SetWatchlistRequest, SetWatchlistResponse,
+    AdmissionState, BuildIdentity, CanonicalPayload, CapabilitiesRequest, CapabilitiesResponse,
+    Capability, ErrorDetail, EventCursor, HealthRequest, HealthResponse, ListenerStatusRequest,
+    ListenerStatusResponse, MarketEventEnvelope, Operation, ProviderAttemptDetail, QueryRequest,
+    QueryResponse, ReplayRequest, RuntimeObservability, SetWatchlistRequest, SetWatchlistResponse,
     SubscribeRequest,
 };
 use prost::bytes::BufMut as _;
@@ -89,7 +88,9 @@ enum DataReply {
     Success,
     UnavailableStatus,
     RetryThenSuccess,
-    ProviderAttemptsStatus { unpublished_provider: bool },
+    ProviderAttemptsStatus {
+        unpublished_provider: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -458,8 +459,7 @@ impl SystemService for ExternalControlService {
 impl MarketEventService for ExternalControlService {
     type SubscribeStream =
         tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
-    type ReplayStream =
-        tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
+    type ReplayStream = tokio_stream::wrappers::ReceiverStream<Result<MarketEventEnvelope, Status>>;
 
     async fn subscribe(
         &self,
@@ -1255,9 +1255,12 @@ impl Drop for ExternalControlLoopbackServer {
     }
 }
 
-pub(crate) const TEST_CODE_MTLS_CA_CERT: &[u8] = include_bytes!("testdata/external_mtls/ca-cert.pem");
-pub(crate) const TEST_CODE_MTLS_SERVER_CERT: &[u8] = include_bytes!("testdata/external_mtls/server-cert.pem");
-pub(crate) const TEST_CODE_MTLS_SERVER_KEY: &[u8] = include_bytes!("testdata/external_mtls/server-key.pem");
+pub(crate) const TEST_CODE_MTLS_CA_CERT: &[u8] =
+    include_bytes!("testdata/external_mtls/ca-cert.pem");
+pub(crate) const TEST_CODE_MTLS_SERVER_CERT: &[u8] =
+    include_bytes!("testdata/external_mtls/server-cert.pem");
+pub(crate) const TEST_CODE_MTLS_SERVER_KEY: &[u8] =
+    include_bytes!("testdata/external_mtls/server-key.pem");
 const TEST_CODE_MTLS_CLIENT_CERT: &[u8] = include_bytes!("testdata/external_mtls/client-cert.pem");
 const TEST_CODE_MTLS_CLIENT_KEY: &[u8] = include_bytes!("testdata/external_mtls/client-key.pem");
 
@@ -1340,8 +1343,8 @@ impl ExternalMtlsMacroFixture {
         .await
     }
 
-    pub(crate) async fn bind_data_retry_then_zero_length_success_for_test(
-    ) -> Result<Self, String> {
+    pub(crate) async fn bind_data_retry_then_zero_length_success_for_test() -> Result<Self, String>
+    {
         let fixture = Self::bind_with_modes_for_test(
             HealthReply::Success,
             Some(CapabilitiesReply::Success),
@@ -1451,9 +1454,7 @@ impl ExternalMtlsMacroFixture {
             move |connection| match connection {
                 Ok(connection) => {
                     let reject = {
-                        let mut state = accept_state
-                            .lock()
-                            .expect("TEST_CODE mTLS TCP capture");
+                        let mut state = accept_state.lock().expect("TEST_CODE mTLS TCP capture");
                         state.observation.tcp_accepts += 1;
                         state.reject_new_connections
                     };

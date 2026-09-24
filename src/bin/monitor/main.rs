@@ -6821,16 +6821,19 @@ impl TemplateTestSummary {
         // 2026-09-20: SnapshotStale (MU-snapshot-stale) 全 7 触点 →
         // 未激活 (57,13,3,73)/(53,11,0,64), 激活 news (59,11,3,73)/
         // (55,9,0,64)。
+        // 2026-09-22: NewsAI 分析卡 (U-04-news-ai-analysis) 全 7 触点 →
+        // 未激活 (59,13,3,75)/(55,11,0,66), 激活 news (61,11,3,75)/
+        // (57,9,0,66)。
         let activated_news = self.family_disabled_total == 11;
         let expected_family = if activated_news {
-            (60, 11, 3, 74)
+            (61, 11, 3, 75)
         } else {
-            (58, 13, 3, 74)
+            (59, 13, 3, 75)
         };
         let expected_kind = if activated_news {
-            (56, 9, 0, 65)
+            (57, 9, 0, 66)
         } else {
-            (54, 11, 0, 65)
+            (55, 11, 0, 66)
         };
         let lifecycle_complete = self.manifest_version == br196_test_delivery::MANIFEST_VERSION
             && self.manifest_sha256.len() == 64
@@ -7108,15 +7111,16 @@ mod tests_br196_monitor_test_acceptance {
             news_capability_sha256: "b".repeat(64),
             // BR-135 (2026-08-22) 退休外部 reminder 家族，PushKind 闭集不变。
             // 2026-09-20: SnapshotStale (MU-snapshot-stale) 全 7 触点 +1。
-            family_active_total: 58,
+            // 2026-09-22: NewsAI 分析卡 (U-04-news-ai-analysis) 全 7 触点 +1。
+            family_active_total: 59,
             family_disabled_total: 13,
             family_retired_total: 3,
-            family_total: 74,
-            push_kind_active_total: 54,
+            family_total: 75,
+            push_kind_active_total: 55,
             push_kind_disabled_total: 11,
             push_kind_retired_total: 0,
-            push_kind_total: 65,
-            rendered_family_total: 58,
+            push_kind_total: 66,
+            rendered_family_total: 59,
             governance_smoke_attempted: br196_test_delivery::governance_smoke_identity_count(),
             governance_smoke_passed: br196_test_delivery::governance_smoke_identity_count(),
             live_acceptance_opted_in: false,
@@ -7128,7 +7132,7 @@ mod tests_br196_monitor_test_acceptance {
             batches_pushed: 0,
             families_pushed: 0,
             receipt_audit_appended: 0,
-            explicit_dry_run_family_total: 58,
+            explicit_dry_run_family_total: 59,
             failed: 0,
         }
     }
@@ -7173,7 +7177,7 @@ mod tests_br196_monitor_test_acceptance {
     fn br196_renderer_catalog_is_closed_unique_and_nonempty() {
         let catalog = push_templates::build_test_template_catalog("2026-07-31", "10:30")
             .expect("complete TEST_CODE renderer catalog");
-        assert_eq!(catalog.len(), 58);
+        assert_eq!(catalog.len(), 59);
         let ids = catalog
             .iter()
             .map(|preview| preview.template_id)
@@ -7203,6 +7207,10 @@ mod tests_br196_monitor_test_acceptance {
             "S-04-earnings-miss",
             "S-05-analyst-upgrade",
             "S-06-market-action-alert",
+            // 2026-09-22: NewsAI 分析卡接入 counted 准入层 — 全 7 触点新增
+            // 家族必须在验收目录里可渲染 (否则 BR-196 Active 家族缺 preview
+            // 会让 --test 启动即拒)。
+            "U-04-news-ai-analysis",
         ] {
             assert!(ids.contains(mandatory), "missing {mandatory}");
         }

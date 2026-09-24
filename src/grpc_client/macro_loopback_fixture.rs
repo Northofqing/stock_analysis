@@ -321,8 +321,8 @@ impl MacroLoopbackServer {
         };
         let serving = service.clone();
         let accept_state = Arc::clone(&service.state);
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(
-            move |connection| {
+        let incoming =
+            tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |connection| {
                 if connection.is_ok() {
                     accept_state
                         .lock()
@@ -330,8 +330,7 @@ impl MacroLoopbackServer {
                         .tcp_accepts += 1;
                 }
                 connection
-            },
-        );
+            });
         let (shutdown, receive) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -381,11 +380,7 @@ impl MacroLoopbackServer {
     }
 
     pub(crate) fn snapshot_with_tcp_for_test(&self) -> (usize, MacroObservation) {
-        let state = self
-            .service
-            .state
-            .lock()
-            .expect("TEST_CODE Macro snapshot");
+        let state = self.service.state.lock().expect("TEST_CODE Macro snapshot");
         (state.tcp_accepts, state.observation.clone())
     }
 

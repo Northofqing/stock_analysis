@@ -59,17 +59,19 @@ pub(super) fn project_response(
     mut response: QueryResponse,
 ) -> Result<QueryResult, GrpcError> {
     apply_acquisition_authority(profile, acquisition_authority, &mut response)?;
-    let mut result = parse_query_response(request_id, operation, response).map_err(GrpcError::from)?;
+    let mut result =
+        parse_query_response(request_id, operation, response).map_err(GrpcError::from)?;
     if profile == ContractProfile::ExternalV1 {
-        result.provenance = crate::grpc_client::envelope::AcquisitionProvenance::ExternalMtlsAuthority(
-            acquisition_authority
-                .ok_or_else(|| {
-                    crate::grpc_client::external_query_transport::wire_error(
-                        "external_acquisition_authority_missing",
-                    )
-                })?
-                .to_owned(),
-        );
+        result.provenance =
+            crate::grpc_client::envelope::AcquisitionProvenance::ExternalMtlsAuthority(
+                acquisition_authority
+                    .ok_or_else(|| {
+                        crate::grpc_client::external_query_transport::wire_error(
+                            "external_acquisition_authority_missing",
+                        )
+                    })?
+                    .to_owned(),
+            );
     }
     Ok(result)
 }
@@ -201,13 +203,8 @@ pub(super) async fn execute(
                             "external_acquisition_authority_missing",
                         )
                     })?;
-                    parse_external_query_response(
-                        request_id,
-                        operation,
-                        authority,
-                        message,
-                    )
-                    .map_err(GrpcError::from)
+                    parse_external_query_response(request_id, operation, authority, message)
+                        .map_err(GrpcError::from)
                 });
             UnaryAttemptCompletion {
                 response_bytes,

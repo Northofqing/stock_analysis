@@ -466,9 +466,7 @@ pub(crate) fn validated_external_provider_catalog(
     response: &CapabilitiesResponse,
 ) -> Result<ExternalProviderCatalog, GrpcError> {
     validate_capabilities_response_id(request_id, response)?;
-    Ok(ExternalProviderCatalog::from_request_id_validated_capabilities(
-        response,
-    ))
+    Ok(ExternalProviderCatalog::from_request_id_validated_capabilities(response))
 }
 
 fn request_mismatch() -> GrpcError {

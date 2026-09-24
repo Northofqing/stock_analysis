@@ -1346,9 +1346,45 @@ pub async fn deliver_counted_binding(
         }
     };
     match deliver_envelope(envelope).await {
+        Ok(evidence)
+            if kind == PushKind::NewsAiAnalysis
+                && evidence.state == DecisionState::RejectedDurable =>
+        {
+            match rejected_news_ai_sink_evidence(evidence.decision_identity.clone()).await {
+                Ok(Some(rejection)) => {
+                    news_ai_sink_rejection_outcome(&evidence.decision_identity, &rejection)
+                }
+                Ok(None) => outcome_from_state(evidence.state),
+                Err(error) => PushOutcome::SinkError(error),
+            }
+        }
         Ok(evidence) => outcome_from_state(evidence.state),
         Err(error) => PushOutcome::SinkError(error),
     }
+}
+
+fn news_ai_sink_rejection_outcome(
+    decision_identity: &str,
+    rejection: &stock_analysis::durable_delivery::TypedRejection,
+) -> PushOutcome {
+    PushOutcome::SinkError(format!(
+        "counted_sink_rejected reason_code={} retry_authorized={} decision={}",
+        rejection.reason_code, rejection.retry_authorized, decision_identity,
+    ))
+}
+
+async fn rejected_news_ai_sink_evidence(
+    decision_identity: String,
+) -> Result<Option<stock_analysis::durable_delivery::TypedRejection>, String> {
+    let state = runtime_state()?;
+    tokio::task::spawn_blocking(move || {
+        state
+            .coordinator
+            .rejected_sink_evidence(&decision_identity)
+            .map_err(|error| format!("read rejected NewsAI sink {decision_identity}: {error}"))
+    })
+    .await
+    .map_err(|error| format!("read rejected NewsAI sink task failed: {error}"))?
 }
 
 /// BR-196 presentation-gated durable envelope entry. The descriptor token is
@@ -2141,11 +2177,13 @@ fn deliver_envelope_blocking(
         .map_err(|error| format!("prepare counted decision {decision_identity}: {error}"))?;
     let mut reconciled_hydrations = reconcile_current_decision(state, &decision_identity)?;
 
-    if state
+    let prepared_state = state
         .coordinator
         .decision_state(&decision_identity)
-        .map_err(|error| format!("read prepared decision {decision_identity}: {error}"))?
-        == DecisionState::Reserved
+        .map_err(|error| format!("read prepared decision {decision_identity}: {error}"))?;
+    if prepared_state == DecisionState::Reserved
+        || (envelope.push_kind == DurablePushKind::NewsAiAnalysis
+            && prepared_state == DecisionState::RejectedDurable)
     {
         state
             .coordinator
@@ -2329,6 +2367,8 @@ fn durable_kind_and_sub_kind_with_override(
         K::AccountMode => (D::AccountMode, DeliverySubKind::None),
         // 2026-09-20: 候选台升级 counted (MU-auction-candidates 接线)。
         K::CandidateBoard => (D::CandidateBoard, DeliverySubKind::None),
+        // 2026-09-22: NewsAI 分析卡接入 counted 准入层 (独立 kind, 无子段)。
+        K::NewsAiAnalysis => (D::NewsAiAnalysis, DeliverySubKind::None),
         K::PaperTrade => (D::PaperTrade, DeliverySubKind::None),
         K::ReviewMarket => (D::ReviewMarket, DeliverySubKind::None),
         K::ReviewLhb => (D::ReviewLhb, DeliverySubKind::None),
@@ -3317,6 +3357,44 @@ mod tests {
             Some((DurablePushKind::SnapshotStale, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::SnapshotStale));
+    }
+
+    #[test]
+    fn news_ai_analysis_kind_maps_to_durable_news_ai_analysis() {
+        // 2026-09-22: NewsAI 分析卡升级 counted — 新 kind (不复用 NewsToIdea,
+        // 因为 D-01「新闻驱动个股」卡占用该 kind 且计入 30 槽预算), 无
+        // sub_kind (不进 DailyReportSubKind 家族)。
+        assert_eq!(
+            durable_kind_and_sub_kind(PushKind::NewsAiAnalysis),
+            Some((DurablePushKind::NewsAiAnalysis, DeliverySubKind::None))
+        );
+        assert!(is_counted_kind(PushKind::NewsAiAnalysis));
+        // generic governor 对 counted kind fail-closed: 必须拿不到非 counted 路径
+        assert_eq!(
+            durable_kind_and_sub_kind_with_override(
+                PushKind::NewsAiAnalysis,
+                Some(DailyReportSubKind::FactorIC)
+            ),
+            Some((DurablePushKind::NewsAiAnalysis, DeliverySubKind::None)),
+            "NewsAiAnalysis 不接受 DailyReport 子段覆盖"
+        );
+    }
+
+    #[test]
+    fn news_ai_typed_sink_rejection_is_a_failure_not_policy_denial() {
+        let rejection = stock_analysis::durable_delivery::TypedRejection {
+            reason_code: "magiclaw_cli_spawn_failed".to_owned(),
+            evidence: b"TEST_CODE_spawn_failure".to_vec(),
+            retry_authorized: true,
+            observed_at: Utc::now(),
+        };
+        let PushOutcome::SinkError(reason) =
+            news_ai_sink_rejection_outcome("TEST_CODE_DECISION", &rejection)
+        else {
+            panic!("typed sink rejection must count as a failure");
+        };
+        assert!(reason.contains("reason_code=magiclaw_cli_spawn_failed"));
+        assert!(reason.contains("retry_authorized=true"));
     }
 
     #[test]

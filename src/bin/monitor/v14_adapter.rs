@@ -1260,6 +1260,11 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::ReviewBacktest => (HoldingHealth, "review_backtest", Severity::Normal),
         // R-13 T+1 关注票核对: 非交易建议, 与 R-12 同档
         PushKind::WatchlistTracking => (HoldingHealth, "watchlist_tracking", Severity::Normal),
+        // 2026-09-22: NewsAI 分析卡接入 counted 准入层 — 新闻驱动的模型
+        // 分析卡, 与被取代的 D-01 NewsToIdea 同源同档 (NewsCatalyst /
+        // Normal)。该映射只服务 generic governor 与 L7 记录; counted 准入
+        // 走 v14_gate_counted_binding。
+        PushKind::NewsAiAnalysis => (NewsCatalyst, "news_ai_analysis", Severity::Normal),
     }
 }
 

@@ -109,6 +109,23 @@ BEGIN
     );
 END;
 
+CREATE TABLE IF NOT EXISTS news_ai_delivery_card (
+    assessment_id TEXT PRIMARY KEY NOT NULL,
+    rendered_text TEXT NOT NULL CHECK (length(trim(rendered_text)) > 0),
+    rendered_sha256 TEXT NOT NULL CHECK (length(rendered_sha256) = 64),
+    FOREIGN KEY(assessment_id) REFERENCES news_ai_assessment(assessment_id)
+);
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_delivery_card_no_update
+BEFORE UPDATE ON news_ai_delivery_card
+BEGIN
+    SELECT RAISE(ABORT, 'BR-172 NewsAI delivery card is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_delivery_card_no_delete
+BEFORE DELETE ON news_ai_delivery_card
+BEGIN
+    SELECT RAISE(ABORT, 'BR-172 NewsAI delivery card is immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS news_ai_delivery_event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
@@ -431,6 +448,14 @@ struct PersistedAssessmentRow {
     minimum_retention_years: i32,
     #[diesel(sql_type = Text)]
     created_at: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct PersistedDeliveryCardRow {
+    #[diesel(sql_type = Text)]
+    rendered_text: String,
+    #[diesel(sql_type = Text)]
+    rendered_sha256: String,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -1154,9 +1179,14 @@ pub(crate) fn validate_news_ai_delivery_audit(
 
         let prior = states.get(&canonical.delivery_identity_sha256);
         let transition_valid = match canonical.state {
-            DeliveryEventState::Reserved => {
-                prior.is_none_or(|prior| prior.state == DeliveryEventState::RolledBack)
-            }
+            DeliveryEventState::Reserved => prior.is_none_or(|prior| {
+                matches!(
+                    prior.state,
+                    DeliveryEventState::RolledBack
+                        | DeliveryEventState::SinkStarted
+                        | DeliveryEventState::PostSinkRecovery
+                )
+            }),
             DeliveryEventState::SinkStarted => prior.is_some_and(|prior| {
                 prior.state == DeliveryEventState::Reserved
                     && prior.reservation_id == canonical.reservation_id
@@ -1168,8 +1198,10 @@ pub(crate) fn validate_news_ai_delivery_audit(
                 ) && prior.reservation_id == canonical.reservation_id
             }),
             DeliveryEventState::Delivered => prior.is_some_and(|prior| {
-                prior.state == DeliveryEventState::SinkStarted
-                    && prior.reservation_id == canonical.reservation_id
+                prior.reservation_id == canonical.reservation_id
+                    && (prior.state == DeliveryEventState::SinkStarted
+                        || (prior.state == DeliveryEventState::PostSinkRecovery
+                            && prior.delivery_audit_event_id == canonical.delivery_audit_event_id))
             }),
             DeliveryEventState::PredictionLinked => prior.is_some_and(|prior| {
                 prior.state == DeliveryEventState::Delivered
@@ -1299,6 +1331,63 @@ fn latest_delivery_event(
     .map_err(NewsAiAssessmentAuditError::from)
 }
 
+fn link_recovery_from_event(
+    identity: &str,
+    latest: &PersistedDeliveryEventRow,
+) -> NewsAiAssessmentAuditResult<crate::monitor::news_ai::NewsAiReserveOutcome> {
+    let audit_event_id = latest
+        .delivery_audit_event_id
+        .as_deref()
+        .ok_or_else(|| audit("delivered NewsAI row is missing authoritative audit event ID"))?;
+    let reservation = crate::monitor::news_ai::NewsAiDeliveryReservation::try_new(
+        identity,
+        &latest.reservation_id,
+    )
+    .map_err(|error| {
+        audit(format!(
+            "persisted link recovery reservation rejected: {error}"
+        ))
+    })?;
+    let delivery_audit =
+        crate::monitor::news_ai::NewsAiDeliveryAuditReceipt::try_new(identity, audit_event_id)
+            .map_err(|error| audit(format!("persisted link recovery audit rejected: {error}")))?;
+    crate::monitor::news_ai::NewsAiDeliveryLinkRecovery::try_new(reservation, delivery_audit)
+        .map(crate::monitor::news_ai::NewsAiReserveOutcome::LinkPending)
+        .map_err(|error| audit(format!("persisted link recovery rejected: {error}")))
+}
+
+/// A counted decision with this exact identity is durably rejected. Its
+/// pre-sink policy denial is final even after the ticket cooldown expires;
+/// only a new analysis version can create a new counted decision. Transport
+/// errors and other preflight failures remain retryable.
+fn is_counted_terminal_denial_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "BR172_PRE_SINK_NOT_DELIVERED:durable delivery terminal state=RejectedDurable"
+            | "BR172_PRE_SINK_NOT_DELIVERED:durable delivery terminal state=ManualResolvedRejected"
+    )
+}
+
+/// Scheduling hint only. A matching terminal rollback is safe to skip; any
+/// other state still enters the fully validated audit path before work.
+fn is_news_ai_terminal_denial_for_fact_on_conn(
+    conn: &mut SqliteConnection,
+    fact: &crate::monitor::news_ai::AdmittedNewsFact,
+    analysis_version: &str,
+) -> NewsAiAssessmentAuditResult<bool> {
+    let identity = source_identity_from_fact(fact, analysis_version)?;
+    let assessment_id = core_assessment_id(&identity);
+    let latest = latest_delivery_event(conn, &assessment_id)?;
+    Ok(latest.is_some_and(|event| {
+        event.assessment_id == assessment_id
+            && event.state == DeliveryEventState::RolledBack.as_str()
+            && event
+                .reason
+                .as_deref()
+                .is_some_and(is_counted_terminal_denial_reason)
+    }))
+}
+
 pub(crate) fn reserve_news_ai_delivery_on_conn(
     conn: &mut SqliteConnection,
     delivery: &crate::monitor::news_ai::GovernedNewsAiDelivery,
@@ -1326,7 +1415,16 @@ pub(crate) fn reserve_news_ai_delivery_on_conn(
     if let Some(latest) = latest_delivery_event(conn, identity)? {
         let state = DeliveryEventState::parse(&latest.state)?;
         return match state {
-            DeliveryEventState::RolledBack => reserve_new_delivery(conn, delivery),
+            DeliveryEventState::RolledBack => {
+                if latest
+                    .reason
+                    .as_deref()
+                    .is_some_and(is_counted_terminal_denial_reason)
+                {
+                    return Ok(crate::monitor::news_ai::NewsAiReserveOutcome::Deduped);
+                }
+                reserve_new_delivery(conn, delivery)
+            }
             DeliveryEventState::Reserved => {
                 crate::monitor::news_ai::NewsAiDeliveryReservation::try_new(
                     identity,
@@ -1335,37 +1433,36 @@ pub(crate) fn reserve_news_ai_delivery_on_conn(
                 .map(crate::monitor::news_ai::NewsAiReserveOutcome::Reserved)
                 .map_err(|error| audit(format!("persisted reservation rejected: {error}")))
             }
-            DeliveryEventState::Delivered => {
-                let audit_event_id =
-                    latest.delivery_audit_event_id.as_deref().ok_or_else(|| {
-                        audit("delivered NewsAI row is missing authoritative audit event ID")
-                    })?;
-                let reservation = crate::monitor::news_ai::NewsAiDeliveryReservation::try_new(
-                    identity,
-                    &latest.reservation_id,
-                )
-                .map_err(|error| {
-                    audit(format!(
-                        "persisted link recovery reservation rejected: {error}"
-                    ))
-                })?;
-                let delivery_audit = crate::monitor::news_ai::NewsAiDeliveryAuditReceipt::try_new(
-                    identity,
-                    audit_event_id,
-                )
-                .map_err(|error| {
-                    audit(format!("persisted link recovery audit rejected: {error}"))
-                })?;
-                crate::monitor::news_ai::NewsAiDeliveryLinkRecovery::try_new(
-                    reservation,
-                    delivery_audit,
-                )
-                .map(crate::monitor::news_ai::NewsAiReserveOutcome::LinkPending)
-                .map_err(|error| audit(format!("persisted link recovery rejected: {error}")))
+            DeliveryEventState::Delivered => link_recovery_from_event(identity, &latest),
+            DeliveryEventState::SinkStarted | DeliveryEventState::PostSinkRecovery => {
+                // New assessments freeze the exact card before any counted
+                // decision. A legacy attempted card without that snapshot is
+                // ambiguous and must remain parked for manual review.
+                if load_frozen_delivery_card(conn, delivery.assessment().assessment_id())?.is_none()
+                {
+                    return Ok(crate::monitor::news_ai::NewsAiReserveOutcome::Deduped);
+                }
+                if state == DeliveryEventState::PostSinkRecovery
+                    && latest.delivery_audit_event_id.is_some()
+                {
+                    append_delivery_event(
+                        conn,
+                        identity,
+                        delivery.assessment().assessment_id(),
+                        &latest.reservation_id,
+                        DeliveryEventState::Delivered,
+                        latest.delivery_audit_event_id.as_deref(),
+                        None,
+                        None,
+                    )?;
+                    return link_recovery_from_event(identity, &latest);
+                }
+                // The counted decision already holds the only physical send.
+                // A new BR-172 reservation will re-read that decision and
+                // append only missing analytics/audit state.
+                reserve_new_delivery(conn, delivery)
             }
-            DeliveryEventState::SinkStarted
-            | DeliveryEventState::PredictionLinked
-            | DeliveryEventState::PostSinkRecovery => {
+            DeliveryEventState::PredictionLinked => {
                 Ok(crate::monitor::news_ai::NewsAiReserveOutcome::Deduped)
             }
         };
@@ -1750,6 +1847,78 @@ pub(crate) fn append_news_ai_assessment_on_conn(
     })
 }
 
+fn load_frozen_delivery_card(
+    conn: &mut SqliteConnection,
+    assessment_id: &str,
+) -> NewsAiAssessmentAuditResult<Option<String>> {
+    let row = diesel::sql_query(
+        "SELECT rendered_text, rendered_sha256
+           FROM news_ai_delivery_card
+          WHERE assessment_id = ?",
+    )
+    .bind::<Text, _>(assessment_id)
+    .get_result::<PersistedDeliveryCardRow>(conn)
+    .optional()?;
+    row.map(|row| {
+        let actual = hex::encode(Sha256::digest(row.rendered_text.as_bytes()));
+        if row.rendered_text.trim().is_empty() || row.rendered_sha256 != actual {
+            return Err(audit(format!(
+                "frozen NewsAI card is invalid for assessment {assessment_id}"
+            )));
+        }
+        Ok(row.rendered_text)
+    })
+    .transpose()
+}
+
+fn freeze_delivery_card(
+    conn: &mut SqliteConnection,
+    assessment_id: &str,
+    rendered_text: &str,
+) -> NewsAiAssessmentAuditResult<String> {
+    if let Some(existing) = load_frozen_delivery_card(conn, assessment_id)? {
+        return Ok(existing);
+    }
+    if rendered_text.trim().is_empty() {
+        return Err(invalid("NewsAI delivery card is empty"));
+    }
+    let rendered_sha256 = hex::encode(Sha256::digest(rendered_text.as_bytes()));
+    diesel::sql_query(
+        "INSERT INTO news_ai_delivery_card (assessment_id, rendered_text, rendered_sha256)
+         VALUES (?, ?, ?)",
+    )
+    .bind::<Text, _>(assessment_id)
+    .bind::<Text, _>(rendered_text)
+    .bind::<Text, _>(&rendered_sha256)
+    .execute(conn)?;
+    Ok(rendered_text.to_owned())
+}
+
+fn append_audited_news_ai_assessment_on_conn(
+    conn: &mut SqliteConnection,
+    request: crate::monitor::news_ai::NewsAiRequest,
+    assessment: crate::monitor::news_ai::NewsAiAssessment,
+) -> NewsAiAssessmentAuditResult<crate::monitor::news_ai::AuditedNewsAiAssessment> {
+    let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment)?;
+    conn.immediate_transaction::<_, NewsAiAssessmentAuditError, _>(|conn| {
+        let receipt = insert_assessment_in_transaction(conn, &input)?;
+        let audited = crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            &receipt.record_hash,
+        )
+        .map_err(|error| audit(format!("fresh assessment delivery binding failed: {error}")))?;
+        let card = freeze_delivery_card(
+            conn,
+            audited.delivery().assessment().assessment_id(),
+            &audited.delivery().render_card(),
+        )?;
+        audited
+            .with_frozen_card(card)
+            .map_err(|error| audit(format!("freeze delivery card failed: {error}")))
+    })
+}
+
 pub(crate) fn has_news_ai_assessment_for_fact_on_conn(
     conn: &mut SqliteConnection,
     fact: &crate::monitor::news_ai::AdmittedNewsFact,
@@ -1812,18 +1981,35 @@ pub(crate) fn load_audited_news_ai_assessment_for_fact_on_conn(
     };
     let link = load_chain_for_row(conn, row.id)?;
     let persisted = persisted_delivery_assessment(&row)?;
-    crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_assessment_audit(
-        fact.clone(),
-        analysis_version,
-        persisted,
-        &link.record_hash,
-    )
-    .map(Some)
-    .map_err(|error| {
-        audit(format!(
-            "persisted assessment delivery binding failed: {error}"
-        ))
-    })
+    let audited =
+        crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_assessment_audit(
+            fact.clone(),
+            analysis_version,
+            persisted,
+            &link.record_hash,
+        )
+        .map_err(|error| {
+            audit(format!(
+                "persisted assessment delivery binding failed: {error}"
+            ))
+        })?;
+    let Some(card) = load_frozen_delivery_card(conn, &assessment_id)? else {
+        if let Some(event) = latest_delivery_event(conn, &assessment_id)? {
+            if matches!(
+                DeliveryEventState::parse(&event.state)?,
+                DeliveryEventState::SinkStarted | DeliveryEventState::PostSinkRecovery
+            ) {
+                return Err(audit(format!(
+                    "NewsAI assessment {assessment_id} has prior sink state without a frozen delivery card"
+                )));
+            }
+        }
+        return Ok(Some(audited));
+    };
+    audited
+        .with_frozen_card(card)
+        .map(Some)
+        .map_err(|error| audit(format!("persisted delivery card binding failed: {error}")))
 }
 
 impl DatabaseManager {
@@ -1858,14 +2044,10 @@ impl DatabaseManager {
         request: crate::monitor::news_ai::NewsAiRequest,
         assessment: crate::monitor::news_ai::NewsAiAssessment,
     ) -> NewsAiAssessmentAuditResult<crate::monitor::news_ai::AuditedNewsAiAssessment> {
-        let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment)?;
-        let receipt = self.append_news_ai_assessment(&input)?;
-        crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_assessment_audit(
-            request,
-            assessment,
-            &receipt.record_hash,
-        )
-        .map_err(|error| audit(format!("fresh assessment delivery binding failed: {error}")))
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
+        append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment)
     }
 
     pub fn load_audited_news_ai_assessment_for_fact(
@@ -1877,6 +2059,17 @@ impl DatabaseManager {
             .get_conn()
             .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
         load_audited_news_ai_assessment_for_fact_on_conn(&mut conn, fact, analysis_version)
+    }
+
+    pub fn is_news_ai_terminal_denial_for_fact(
+        &self,
+        fact: &crate::monitor::news_ai::AdmittedNewsFact,
+        analysis_version: &str,
+    ) -> NewsAiAssessmentAuditResult<bool> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
+        is_news_ai_terminal_denial_for_fact_on_conn(&mut conn, fact, analysis_version)
     }
 
     pub fn reserve_news_ai_delivery(
@@ -2068,6 +2261,20 @@ mod tests {
         crate::monitor::news_ai::NewsAiRequest,
         crate::monitor::news_ai::NewsAiAssessment,
     ) {
+        core_assessment_for("TEST_CODE_NEWS_ITEM_CORE", "TEST_CODE_600519")
+    }
+
+    /// Same admitted market evidence and model response as `core_assessment`,
+    /// with the source item and target ticket selectable so a test can build a
+    /// second, distinct NewsAI identity for the same ticket (F5b cooldown
+    /// evidence) or for another ticket.
+    fn core_assessment_for(
+        item_id: &str,
+        target_code: &str,
+    ) -> (
+        crate::monitor::news_ai::NewsAiRequest,
+        crate::monitor::news_ai::NewsAiAssessment,
+    ) {
         use crate::data_gateway::{BatchEvidence, GlobalNewsRecord};
         use crate::monitor::news_ai::{
             AdmittedNewsFact, ModelCallReceipt, NewsAiAssessment, NewsAiRequest, NewsMarketContext,
@@ -2089,16 +2296,21 @@ mod tests {
             observed_at: observed(observed_at),
             batch_id: "TEST_CODE_NEWS_BATCH_CORE".to_owned(),
         };
+        // The fact seam requires the item to name the target instrument.
+        let instrument = target_code
+            .strip_prefix("TEST_CODE_")
+            .unwrap_or(target_code)
+            .to_owned();
         let record = GlobalNewsRecord {
-            item_id: "TEST_CODE_NEWS_ITEM_CORE".to_owned(),
+            item_id: item_id.to_owned(),
             title: "TEST_CODE exact source-bound contract".to_owned(),
             summary: Some("TEST_CODE disclosed contract evidence".to_owned()),
             content: None,
             publisher: "TEST_CODE publisher".to_owned(),
-            canonical_url: "https://example.com/TEST_CODE_NEWS_ITEM_CORE".to_owned(),
+            canonical_url: format!("https://example.com/{item_id}"),
             published_at,
             observed_at,
-            instruments: vec!["600519".to_owned()],
+            instruments: vec![instrument],
             topics: vec!["TEST_CODE contract".to_owned()],
             language: "zh-CN".to_owned(),
             evidence: SourceEvidence::new(
@@ -2110,7 +2322,7 @@ mod tests {
             .with_source_at(published_at.to_rfc3339())
             .expect("source time"),
         };
-        let fact = AdmittedNewsFact::from_global(&record, &news_batch, "TEST_CODE_600519")
+        let fact = AdmittedNewsFact::from_global(&record, &news_batch, target_code)
             .expect("admitted fact");
         let latest = NaiveDate::from_ymd_opt(2026, 7, 24).expect("latest trading day");
         let daily_bars = (0..20)
@@ -2122,7 +2334,7 @@ mod tests {
             })
             .collect();
         let market = NewsMarketSnapshot::try_from_input(NewsMarketEvidenceInput {
-            target_code: "TEST_CODE_600519".to_owned(),
+            target_code: target_code.to_owned(),
             context: NewsMarketContext::PostClose,
             as_of: observed_at,
             latest_completed_trading_day: latest,
@@ -2275,6 +2487,148 @@ mod tests {
     }
 
     #[test]
+    fn news_ai_recovery_reuses_the_first_rendered_card() {
+        let mut conn = connection();
+        let (request, assessment) = core_assessment();
+        let initial =
+            append_audited_news_ai_assessment_on_conn(&mut conn, request.clone(), assessment)
+                .unwrap();
+        let changed_display_fact = request
+            .fact()
+            .clone()
+            .with_target_name("恢复时变化的名称".to_owned());
+        let recovered = load_audited_news_ai_assessment_for_fact_on_conn(
+            &mut conn,
+            &changed_display_fact,
+            request.analysis_version(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            initial.delivery().render_card(),
+            recovered.delivery().render_card()
+        );
+        assert_eq!(
+            initial.delivery().business_date(),
+            recovered.delivery().business_date()
+        );
+    }
+
+    #[test]
+    fn legacy_sink_attempt_without_frozen_card_cannot_be_replayed() {
+        let mut conn = connection();
+        let (request, assessment) = core_assessment();
+        let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment).unwrap();
+        append_news_ai_assessment_on_conn(&mut conn, &input).unwrap();
+        let audited = load_audited_news_ai_assessment_for_fact_on_conn(
+            &mut conn,
+            request.fact(),
+            request.analysis_version(),
+        )
+        .unwrap()
+        .unwrap();
+        let NewsAiReserveOutcome::Reserved(reservation) =
+            reserve_news_ai_delivery_on_conn(&mut conn, audited.delivery()).unwrap()
+        else {
+            panic!("first attempt must reserve");
+        };
+        begin_news_ai_sink_attempt_on_conn(&mut conn, audited.delivery(), &reservation).unwrap();
+        let error = load_audited_news_ai_assessment_for_fact_on_conn(
+            &mut conn,
+            request.fact(),
+            request.analysis_version(),
+        )
+        .expect_err("an attempted legacy card has no stable recovery identity");
+        assert!(error.to_string().contains("without a frozen delivery card"));
+    }
+
+    #[test]
+    fn frozen_sink_started_recovers_with_new_audit_reservation() {
+        let mut conn = connection();
+        let (request, assessment) = core_assessment();
+        let audited = append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment)
+            .expect("freeze first card");
+        let delivery = audited.delivery();
+        let NewsAiReserveOutcome::Reserved(first) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap()
+        else {
+            panic!("first reservation expected");
+        };
+        begin_news_ai_sink_attempt_on_conn(&mut conn, delivery, &first).unwrap();
+
+        let NewsAiReserveOutcome::Reserved(recovery) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap()
+        else {
+            panic!("frozen card must be eligible for audit-only recovery");
+        };
+        assert_ne!(first.reservation_id(), recovery.reservation_id());
+        begin_news_ai_sink_attempt_on_conn(&mut conn, delivery, &recovery).unwrap();
+        record_news_ai_post_sink_recovery_on_conn(
+            &mut conn,
+            delivery,
+            &recovery,
+            None,
+            "delivery audit write failed",
+        )
+        .unwrap();
+        let NewsAiReserveOutcome::Reserved(after_audit_failure) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap()
+        else {
+            panic!("missing audit receipt must reopen only BR-172 audit work");
+        };
+        assert_ne!(
+            recovery.reservation_id(),
+            after_audit_failure.reservation_id()
+        );
+        validate_news_ai_delivery_audit(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn post_sink_recovery_with_audit_receipt_links_without_new_reservation() {
+        let mut conn = connection();
+        let (request, assessment) = core_assessment();
+        let audited = append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment)
+            .expect("freeze first card");
+        let delivery = audited.delivery();
+        let NewsAiReserveOutcome::Reserved(reservation) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap()
+        else {
+            panic!("first reservation expected");
+        };
+        begin_news_ai_sink_attempt_on_conn(&mut conn, delivery, &reservation).unwrap();
+        record_news_ai_post_sink_recovery_on_conn(
+            &mut conn,
+            delivery,
+            &reservation,
+            Some("TEST_CODE_DELIVERY_AUDIT"),
+            "L7 write failed",
+        )
+        .unwrap();
+
+        let NewsAiReserveOutcome::LinkPending(recovery) =
+            reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap()
+        else {
+            panic!("persisted authoritative audit must recover the prediction link");
+        };
+        assert_eq!(
+            recovery.reservation().reservation_id(),
+            reservation.reservation_id()
+        );
+        assert_eq!(
+            recovery.delivery_audit().audit_event_id(),
+            "TEST_CODE_DELIVERY_AUDIT"
+        );
+        link_news_ai_prediction_on_conn(
+            &mut conn,
+            delivery,
+            recovery.reservation(),
+            recovery.delivery_audit(),
+        )
+        .expect("link only, without another physical attempt");
+        validate_news_ai_delivery_audit(&mut conn).unwrap();
+    }
+
+    #[test]
     fn br172_rolled_back_delivery_remains_retryable() {
         let mut conn = connection();
         let (request, assessment) = core_assessment();
@@ -2306,6 +2660,150 @@ mod tests {
         };
         assert_ne!(retry.reservation_id(), first.reservation_id());
         validate_news_ai_delivery_audit(&mut conn).unwrap();
+    }
+
+    /// Exact counted decision terminal state persisted by the production port.
+    const COUNTED_TERMINAL_DENIAL: &str =
+        "BR172_PRE_SINK_NOT_DELIVERED:durable delivery terminal state=RejectedDurable";
+
+    fn audited_assessment(
+        conn: &mut SqliteConnection,
+        item_id: &str,
+        target_code: &str,
+    ) -> crate::monitor::news_ai::AuditedNewsAiAssessment {
+        let (request, assessment) = core_assessment_for(item_id, target_code);
+        let input =
+            NewsAiAssessmentAuditInput::from_core(&request, &assessment).expect("audit projection");
+        append_news_ai_assessment_on_conn(conn, &input).expect("append assessment");
+        load_audited_news_ai_assessment_for_fact_on_conn(
+            conn,
+            request.fact(),
+            request.analysis_version(),
+        )
+        .expect("load audited assessment")
+        .expect("persisted assessment must remain delivery eligible")
+    }
+
+    /// Drive one card through the BR-172 audit to `prediction_linked`.
+    fn deliver_card(
+        conn: &mut SqliteConnection,
+        audited: &crate::monitor::news_ai::AuditedNewsAiAssessment,
+    ) {
+        let delivery = audited.delivery();
+        let NewsAiReserveOutcome::Reserved(reservation) =
+            reserve_news_ai_delivery_on_conn(conn, delivery).expect("reserve")
+        else {
+            panic!("unseen identity must reserve");
+        };
+        begin_news_ai_sink_attempt_on_conn(conn, delivery, &reservation).expect("begin");
+        let audit = record_news_ai_delivered_on_conn(
+            conn,
+            delivery,
+            &reservation,
+            "TEST_CODE_PERSISTED_ENVELOPE_ID",
+        )
+        .expect("record delivered");
+        link_news_ai_prediction_on_conn(conn, delivery, &reservation, &audit).expect("link");
+    }
+
+    /// One full denied round: reserve → begin → rollback.
+    fn denied_round(
+        conn: &mut SqliteConnection,
+        audited: &crate::monitor::news_ai::AuditedNewsAiAssessment,
+        reason: &str,
+    ) -> crate::monitor::news_ai::NewsAiReserveOutcome {
+        let delivery = audited.delivery();
+        let outcome = reserve_news_ai_delivery_on_conn(conn, delivery).expect("reserve");
+        if let NewsAiReserveOutcome::Reserved(reservation) = &outcome {
+            begin_news_ai_sink_attempt_on_conn(conn, delivery, reservation).expect("begin");
+            rollback_news_ai_delivery_on_conn(conn, delivery, reservation, reason)
+                .expect("rollback");
+        }
+        outcome
+    }
+
+    #[test]
+    fn br172_counted_terminal_denial_stops_after_one_rollback() {
+        let mut conn = connection();
+        let audited = audited_assessment(&mut conn, "TEST_CODE_NEWS_ITEM_CORE", "TEST_CODE_600519");
+        let delivery = audited.delivery();
+        assert!(!is_news_ai_terminal_denial_for_fact_on_conn(
+            &mut conn,
+            delivery.fact(),
+            delivery.analysis_version()
+        )
+        .unwrap());
+
+        assert!(matches!(
+            denied_round(&mut conn, &audited, COUNTED_TERMINAL_DENIAL),
+            NewsAiReserveOutcome::Reserved(_)
+        ));
+        assert!(is_news_ai_terminal_denial_for_fact_on_conn(
+            &mut conn,
+            delivery.fact(),
+            delivery.analysis_version()
+        )
+        .unwrap());
+        let events = count(&mut conn, "news_ai_delivery_event");
+        for _ in 0..3 {
+            assert!(matches!(
+                reserve_news_ai_delivery_on_conn(&mut conn, delivery).unwrap(),
+                NewsAiReserveOutcome::Deduped
+            ));
+        }
+        assert_eq!(count(&mut conn, "news_ai_delivery_event"), events);
+        validate_news_ai_delivery_audit(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn br172_repeated_sink_failure_is_not_mistaken_for_terminal_policy_denial() {
+        let mut conn = connection();
+        let sibling =
+            audited_assessment(&mut conn, "TEST_CODE_NEWS_ITEM_SIBLING", "TEST_CODE_600519");
+        deliver_card(&mut conn, &sibling);
+        let audited = audited_assessment(&mut conn, "TEST_CODE_NEWS_ITEM_CORE", "TEST_CODE_600519");
+        let fault = "BR172_PRE_SINK_NOT_DELIVERED:counted_sink_rejected reason_code=magiclaw_cli_spawn_failed retry_authorized=true";
+
+        for _ in 0..2 {
+            assert!(matches!(
+                denied_round(&mut conn, &audited, fault),
+                NewsAiReserveOutcome::Reserved(_)
+            ));
+        }
+        assert!(!is_news_ai_terminal_denial_for_fact_on_conn(
+            &mut conn,
+            audited.delivery().fact(),
+            audited.delivery().analysis_version()
+        )
+        .unwrap());
+        assert!(matches!(
+            reserve_news_ai_delivery_on_conn(&mut conn, audited.delivery()).unwrap(),
+            NewsAiReserveOutcome::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn br172_preflight_denial_remains_retryable() {
+        let mut conn = connection();
+        let audited = audited_assessment(&mut conn, "TEST_CODE_NEWS_ITEM_CORE", "TEST_CODE_600519");
+        assert!(matches!(
+            denied_round(
+                &mut conn,
+                &audited,
+                "BR172_PRE_SINK_NOT_DELIVERED:launch_gate_stage"
+            ),
+            NewsAiReserveOutcome::Reserved(_)
+        ));
+        assert!(!is_news_ai_terminal_denial_for_fact_on_conn(
+            &mut conn,
+            audited.delivery().fact(),
+            audited.delivery().analysis_version()
+        )
+        .unwrap());
+        assert!(matches!(
+            reserve_news_ai_delivery_on_conn(&mut conn, audited.delivery()).unwrap(),
+            NewsAiReserveOutcome::Reserved(_)
+        ));
     }
 
     #[test]

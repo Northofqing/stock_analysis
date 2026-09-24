@@ -39,7 +39,7 @@ const fn descriptor(
     }
 }
 
-const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 60] = [
+const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 61] = [
     descriptor(
         "T-01-account-mode",
         PushKind::AccountMode,
@@ -408,9 +408,19 @@ const PRODUCTION_PRESENTATION_DESCRIPTORS: [ProductionPresentationDescriptor; 60
         "paper_sell_dispatcher",
         "render_paper_sell",
     ),
+    descriptor(
+        // 2026-09-22: NewsAI 分析卡 ("🧠 AI 新闻证据分析") 接入 counted
+        // 准入层。此前该卡经 BR-172 专用状态机物理直推, 没有生产呈现
+        // tuple — 接入 `push_counted_with_binding` 必须补注册 (全 7 触点
+        // Unit, MU-snapshot-stale 先例)。family 走 N- 新闻系列。
+        "U-04-news-ai-analysis",
+        PushKind::NewsAiAnalysis,
+        "news_ai_dispatcher",
+        "render_news_ai_analysis",
+    ),
 ];
 
-pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 60] {
+pub(super) fn descriptors() -> &'static [ProductionPresentationDescriptor; 61] {
     &PRODUCTION_PRESENTATION_DESCRIPTORS
 }
 
@@ -458,6 +468,30 @@ mod tests {
             PushKind::ReviewLhb,
             "legacy",
             "render_review_lhb",
+        )
+        .is_err());
+    }
+
+    /// 2026-09-22: NewsAI 分析卡接入 counted 准入层 — 必须有自己的生产
+    /// 呈现 tuple, 才能拿到 `ProductionPresentationToken` 进
+    /// `push_counted_with_binding`。family 走 N- 新闻系列 (N-01/N-02 之后)。
+    #[test]
+    fn news_ai_analysis_presentation_token_is_registered() {
+        let token = acquire_token(
+            "U-04-news-ai-analysis",
+            PushKind::NewsAiAnalysis,
+            "news_ai_dispatcher",
+            "render_news_ai_analysis",
+        )
+        .expect("NewsAI 分析卡生产呈现 tuple 必须已注册");
+        assert_eq!(token.descriptor().push_kind, PushKind::NewsAiAnalysis);
+        assert_eq!(token.descriptor().family_key, "U-04-news-ai-analysis");
+        // 换 renderer seam → 拒绝 (keep BR-196 精确 tuple 查找语义)
+        assert!(acquire_token(
+            "U-04-news-ai-analysis",
+            PushKind::NewsAiAnalysis,
+            "news_ai_dispatcher",
+            "render_news_to_idea",
         )
         .is_err());
     }

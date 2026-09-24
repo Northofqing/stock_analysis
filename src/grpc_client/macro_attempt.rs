@@ -184,12 +184,11 @@ impl MacroRequestState {
         retry: RetryPolicy,
         identity: MacroQueryIdentity,
     ) -> Result<Self, GrpcError> {
-        let request =
-            super::build_native_profile_query_request(
-                profile,
-                identity.operation(),
-                identity.payload(),
-            )?;
+        let request = super::build_native_profile_query_request(
+            profile,
+            identity.operation(),
+            identity.payload(),
+        )?;
         Ok(Self {
             identity,
             request,
@@ -231,12 +230,11 @@ impl MacroRequestState {
         if request.encode_to_vec() != restored.request_bytes {
             return Err(session_mismatch());
         }
-        let mut expected =
-            super::build_native_profile_query_request(
-                profile,
-                identity.operation(),
-                identity.payload(),
-            )?;
+        let mut expected = super::build_native_profile_query_request(
+            profile,
+            identity.operation(),
+            identity.payload(),
+        )?;
         match &mut expected {
             ProfileQueryRequest::Local(request) => {
                 request

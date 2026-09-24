@@ -6,13 +6,13 @@ use super::model::{
     FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
     FoundationTerminalRecord, ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence,
     ManualDisposition, ManualResolutionAuthorizationCanonical, ManualResolutionCommand,
-    P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PolicyRow, PrepareOutcome,
+    P01DedicatedTerminalQuery, P01DedicatedTerminalRecord, PolicyRow, PrepareOutcome, PushKind,
     ReconcileSummary, RejectedSinkResultCanonical, Result, ResumeOutcome,
     ReviewTerminalReplayAttempt, ReviewTerminalReplayCompletion,
     ReviewTerminalReplayCompletionCanonical, ReviewTerminalReplayCompletionState,
     ReviewTerminalReplayInput, ReviewTerminalReplayStartCanonical, ScheduleHydration,
-    ScheduleHydrationState, TaskTransitionCanonical, UncertainSinkResultCanonical, WindowMode,
-    DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+    ScheduleHydrationState, TaskTransitionCanonical, TypedRejection, UncertainSinkResultCanonical,
+    WindowMode, DAILY_BUDGET_LIMIT, MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
 };
 use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
@@ -2987,6 +2987,39 @@ impl DurableDeliveryCoordinator {
         })
     }
 
+    /// Preserve the typed physical rejection of a terminal decision. A
+    /// pre-sink policy denial has no authoritative sink attempt and returns
+    /// None, so callers can keep the two outcomes separate.
+    pub fn rejected_sink_evidence(
+        &self,
+        decision_identity: &str,
+    ) -> Result<Option<TypedRejection>> {
+        self.with_connection(|connection| {
+            let stored = load_decision(connection, decision_identity)?.ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
+            })?;
+            if stored.state != DecisionState::RejectedDurable {
+                return Ok(None);
+            }
+            let Some(attempt_identity) = stored.current_attempt_identity else {
+                return Ok(None);
+            };
+            let (canonical, expected_sha256) = load_exact_terminal_sink_result(
+                connection,
+                decision_identity,
+                &attempt_identity,
+                "Rejected",
+            )?;
+            if sha256_hex(&canonical) != expected_sha256 {
+                return Err(DurableDeliveryError::PolicyMismatch(format!(
+                    "rejected sink result hash mismatch for {decision_identity}"
+                )));
+            }
+            let rejection = RejectedSinkResultCanonical::parse_exact(&canonical)?.rejection;
+            Ok(Some(rejection))
+        })
+    }
+
     pub(crate) fn inspect_foundation_terminal(
         &self,
         decision_identity: &str,
@@ -5134,6 +5167,14 @@ impl DurableDeliveryCoordinator {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
                 })?;
             if current.state != DecisionState::RejectedDurable || !current.retry_authorized {
+                return Ok(false);
+            }
+            // NewsAI uses a frozen rendered card, so a definitive pre-send
+            // transport rejection can be retried under the same identity.
+            // Keep the limit local to this kind: one first attempt plus two
+            // recovery attempts, even if every sink call rejects again.
+            if envelope.push_kind == PushKind::NewsAiAnalysis && current.reservation_generation >= 3
+            {
                 return Ok(false);
             }
             let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;

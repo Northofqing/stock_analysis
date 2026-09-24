@@ -5663,11 +5663,11 @@ fn br214_daily_review_kinds_are_business_date_once() {
         );
     }
     assert_eq!(
-        POLICY_VERSION, 6,
+        POLICY_VERSION, 7,
         "BR-245: TomorrowWatch Global BusinessDateOnce budget-exempt policy changed \
          policy semantics, POLICY_VERSION must be bumped because it is decision_identity hash \
          material (bumped 4 -> 5 on 2026-08-18; 5 -> 6 on 2026-09-22: PaperSell/PaperTrade \
-         budget exemption)"
+         budget exemption; 6 -> 7 on 2026-09-22: NewsAI 分析卡 counted 准入 + 预算豁免)"
     );
 }
 
@@ -7540,16 +7540,52 @@ fn policy_catalog_has_forty_five_kinds_and_forty_eight_rows() {
     // 2026-09-20: 实盘异常告警升级 counted → 43 kind/46 row。
     // 2026-09-20: 账户模式卡升级 counted → 44 kind/47 row。
     // 2026-09-20: 候选台升级 counted → 45 kind/48 row。
+    // 2026-09-22: NewsAI 分析卡升级 counted → 46 kind/49 row。
     let fixture = Fixture::new("CATALOG");
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_policy_catalog"),
-        48
+        49
     );
     assert_eq!(
         fixture.query_i64("SELECT COUNT(DISTINCT push_kind) FROM delivery_policy_catalog"),
-        45
+        46
     );
-    assert_eq!(compiled_policy_catalog().len(), 48);
+    assert_eq!(compiled_policy_catalog().len(), 49);
+}
+
+#[test]
+fn news_ai_analysis_policy_is_per_ticket_rolling_and_budget_exempt() {
+    // 2026-09-22 用户决策: NewsAI 分析卡 ("🧠 AI 新闻证据分析") 接入 counted
+    // 准入层。卡片量大 (2026-09-22 单日 55 张) — 若计入 30 槽日预算会吃穿
+    // 预算并饿死其他链路 (8/13 做T 烧满预算 / 9/22 PaperSell 止损潮两次
+    // 同款事故), 故豁免日预算; 冷却保持逐票 1200s (镜像 D-01 NewsToIdea
+    // 的 L4 20min/票, 同一批新闻不会对同票连发)。
+    let row = compiled_policy_catalog()
+        .into_iter()
+        .find(|row| row.push_kind == PushKind::NewsAiAnalysis)
+        .expect("news-ai-analysis durable policy");
+
+    assert_eq!(row.sub_kind, DeliverySubKind::None);
+    assert_eq!(row.cooldown_scope, CooldownScope::PerTicket);
+    assert_eq!(row.base_cooldown_secs, Some(1_200));
+    assert_eq!(row.override_cooldown_secs, None);
+    assert_eq!(row.window_mode, WindowMode::Rolling);
+    assert!(
+        !row.counts_against_daily_budget,
+        "AI 分析卡量大 (单日 55 张), 必须豁免 30 槽日预算"
+    );
+    assert_eq!(row.policy_version, POLICY_VERSION);
+    assert_eq!(row.push_kind.stable_template_id(), "news_ai_analysis_v1");
+}
+
+#[test]
+fn policy_version_seven_carries_the_news_ai_analysis_policy_change() {
+    // POLICY_VERSION 是 decision_identity 哈希材料 — 策略语义变更必须 bump,
+    // 否则新策略决策会与旧策略决策 identity 碰撞 (BR-214 契约)。
+    assert_eq!(
+        POLICY_VERSION, 7,
+        "2026-09-22 NewsAI 分析卡 counted 准入 (新 kind + 预算豁免) 必须 bump"
+    );
 }
 
 #[test]
@@ -7753,7 +7789,7 @@ fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows(
             "BusinessDateOnce".to_owned(),
             86_400,
             0,
-            6 // 2026-09-22: POLICY_VERSION 5→6 (PaperSell/PaperTrade 预算豁免)
+            7 // 2026-09-22: POLICY_VERSION 6→7 (NewsAI 分析卡 counted 准入 + 预算豁免)
         )
     );
     assert_eq!(
@@ -8135,6 +8171,57 @@ fn generic_disposition_is_required_and_task_transition_is_optional() {
 }
 
 #[test]
+fn news_ai_sink_rejection_preserves_reason_and_caps_same_identity_retries() {
+    let fixture = Fixture::new("NEWS_AI_BOUNDED_SINK_RETRY");
+    let append = MemoryAppendPort::default();
+    let card = envelope(
+        "NEWS_AI_BOUNDED_SINK_RETRY",
+        PushKind::NewsAiAnalysis,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    prepare_reserved(&fixture, &card, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), true)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    for generation in 1..=3 {
+        let attempted = fixture
+            .coordinator
+            .resume_deliverable(
+                &card.decision_identity,
+                &sinks,
+                now() + chrono::Duration::seconds(generation),
+            )
+            .expect("one definitive sink rejection");
+        assert_eq!(attempted.sink_calls, 1);
+        reconcile_terminal(
+            &fixture,
+            &append,
+            DecisionState::RejectedDurable,
+            &card.decision_identity,
+        );
+        let rejection = fixture
+            .coordinator
+            .rejected_sink_evidence(&card.decision_identity)
+            .unwrap()
+            .expect("typed sink rejection");
+        assert_eq!(rejection.reason_code, "TEST_CODE_DEFINITE_REJECTION");
+        assert!(rejection.retry_authorized);
+    }
+    let capped = fixture
+        .coordinator
+        .resume_deliverable(
+            &card.decision_identity,
+            &sinks,
+            now() + chrono::Duration::seconds(4),
+        )
+        .expect("retry cap must preserve the terminal decision");
+    assert_eq!(capped.sink_calls, 0);
+    assert_eq!(capped.state, DecisionState::RejectedDurable);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn pre_sink_denial_is_atomic_durable_and_hydratable() {
     let fixture = Fixture::new("DENIAL");
     let append = MemoryAppendPort::default();
@@ -8162,6 +8249,11 @@ fn pre_sink_denial_is_atomic_durable_and_hydratable() {
         DecisionState::RejectedDurable,
         &envelope.decision_identity,
     );
+    assert!(fixture
+        .coordinator
+        .rejected_sink_evidence(&envelope.decision_identity)
+        .unwrap()
+        .is_none());
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_disposition_payloads"),
         1
@@ -9781,13 +9873,22 @@ fn w12_legacy_envelope_keeps_exact_identity_and_canonical_bytes() {
     );
     let canonical = legacy.canonical_bytes().expect("canonical legacy envelope");
 
+    // 2026-09-22: 此 golden 绑定 `POLICY_VERSION`。`DecisionIdentityMaterial`
+    // 显式含 `policy_version` 字段 (model.rs:1047), 而 schema.rs 的注释写明
+    // "the POLICY_VERSION bump yields fresh decision identity" —— 即身份随版本
+    // 变更是**有意设计**。故此值在每次 bump 后必然改变, 不是代码漂移。
+    // 现值对应 POLICY_VERSION = 7 (2026-09-22 NewsAiAnalysis 发布)。
+    // ⚠️ 后续 bump POLICY_VERSION 时必须同步重锁本 golden (见 model.rs 常量处注释)。
     assert_eq!(
         legacy.decision_identity,
-        "fd2b10332c1a463dcd5e9fc74e85f388e695bd27679ba61b45878691f5803056"
+        "fb1a9126049943aa3786b6f8b5fd2dc49df6e0b6725d3c0659363a9d3a82b2c5"
     );
+    // 2026-09-22 查实: canonical 字节**同样**含 policy_version (非仅 decision_identity),
+    // 故此 golden 也随 POLICY_VERSION bump 改变 —— 本测试没有任何版本无关部分。
+    // 现值对应 POLICY_VERSION = 7。
     assert_eq!(
         sha256_hex(&canonical),
-        "5e431e42aa9db00e7a548d490fea575b8c8ba8f882d22d4ceb9ac1843f4fe32f"
+        "aa4a8bafa19f4d82637d8d53ea07141e47c58d0a4c5d0ed05bee7214276aae91"
     );
     assert!(!canonical
         .windows(b"foundation_binding".len())

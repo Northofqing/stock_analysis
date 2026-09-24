@@ -194,6 +194,14 @@ pub enum PushKind {
     NewsFlashCritical,
     /// v17.4: 4 时段 (9:30/11:30/13:00/15:00) 聚合 Top3 (ℹ️ 1次/窗口/日)
     NewsFlashAggregated,
+    // ============= 2026-09-22: NewsAI 分析卡接入 counted 准入层 =============
+    /// NewsAI 分析卡 ("🧠 AI 新闻证据分析", 原 BR-172 专用状态机物理直推)。
+    ///
+    /// 独立 kind — 不复用 `NewsToIdea` (D-01「新闻驱动个股」卡占用它且计入
+    /// 30 槽日预算), 也不塞进 `DailyReportSubKind` (那是 DailyReport 家族的
+    /// 子段, 与此卡语义无关)。counted 策略行 = PerTicket Rolling 1200s +
+    /// **豁免 30 槽日预算** (单日 55 张会把预算吃穿并饿死其他链路)。
+    NewsAiAnalysis,
 }
 
 #[allow(
@@ -333,6 +341,9 @@ impl PushKind {
             | PushKind::AnalystUpgrade => PushLevel::Important,
             // v17.4 能力1: 高分新闻即时推重要级 (聚合 NewsFlashAggregated 走默认 Info)
             | PushKind::NewsFlashCritical => PushLevel::Important,
+            // 2026-09-22: NewsAI 分析卡 — Important, 与被取代的 D-01
+            // NewsToIdea 同级 (launch_gate_check 的 Emergency 短路语义不变)。
+            | PushKind::NewsAiAnalysis => PushLevel::Important,
             // v15.3 D5: 实盘异常是紧急级
             | PushKind::MarketActionAlert => PushLevel::Emergency,
             // R-12 盘后回测: 参考级 (非交易建议, 仅统计)
@@ -378,6 +389,12 @@ impl PushKind {
                 | PushKind::IntradayMarket
                 | PushKind::NewsCatalyst
                 | PushKind::NewsToIdea
+                // 2026-09-22 (对抗性复审 F3): NewsAiAnalysis 与同族 D-01 NewsToIdea
+                // 同为个股新闻分析/建议卡, 必须走同一治理上下文 (CountedCombinedAccount,
+                // 读 banner 的 account/data_mode)。漏登记会静默降到 CountedSourceOnly
+                // (进程本地 data health, is_frozen=false) —— 即该 kind 的 Frozen 账户
+                // 模式门被关闭, 且是隐式无断言耦合。
+                | PushKind::NewsAiAnalysis
                 | PushKind::IndustryChainIntraday
                 | PushKind::PostFixedPriceOrder
                 | PushKind::PostFixedPriceFill
@@ -456,6 +473,10 @@ impl PushKind {
             PushKind::AttributionDaily => None,
             // G5b 深链归因 (2026-08-22): 同 AttributionDaily — 调用方按日去重
             PushKind::G5bAttribution => None,
+            // 2026-09-22: NewsAI 分析卡 — 20 min/票 (镜像被取代的 D-01
+            // NewsToIdea L4)。L4 值只作 legacy metadata; counted coordinator
+            // 是唯一准入 owner (policy 行 PerTicket 1200s 才是权威)。
+            PushKind::NewsAiAnalysis => Some(1200),
             _ => Some(1800), // 默认 30min
         }
     }
@@ -479,7 +500,9 @@ impl PushKind {
             | PostFixedPriceFill
             | StPriceLimitChanged
             | BlockTradeIntradayConfirm
-            | BlockTradePriceRange => CooldownScope::PerTicket,
+            | BlockTradePriceRange
+            // 2026-09-22: NewsAI 分析卡 — 逐票 (counted policy 行同域)
+            | NewsAiAnalysis => CooldownScope::PerTicket,
             // 交付物 A (2026-08-20): 虚拟盘归因日推 — 全局冷却域 (每日 1 次, 无 code 维度)
             AttributionDaily => CooldownScope::Global,
             // G5b 深链归因 (2026-08-22): 全局冷却域 (每日 ≤3 条, 同 15:05 单点)
@@ -563,6 +586,8 @@ impl PushKind {
             PushKind::EarningsMiss => "业绩低于预期",
             PushKind::AnalystUpgrade => "卖方评级上调",
             PushKind::MarketActionAlert => "实盘异常",
+            // 2026-09-22: NewsAI 分析卡
+            PushKind::NewsAiAnalysis => "AI 新闻证据分析",
         }
     }
 
@@ -2159,8 +2184,16 @@ pub enum NewsAiNotifyOutcome {
     Pushed {
         audit: stock_analysis::event::PersistedDeliveryAuditReceipt,
     },
+    /// 2026-09-22: counted 准入拒绝 (预算满 / 冷却头 / launch gate /
+    /// envelope 拒绝) — 卡片从未交给 sink。与 `PreSinkError` 分开命名, 因为
+    /// 它是**明确的准入裁决**而非故障: BR-172 侧按 `Denied` 收口 (rollback),
+    /// 不产生 `sink_error` 语义的错误记账。
+    AdmissionDenied(String),
     PreSinkError(String),
     SinkError(String),
+    /// counted 已持久 Delivered，但 BR-172 仍是 Reserved；重入同一 counted
+    /// identity 后只补 marker/审计，不可把它当作未投递准入拒绝。
+    CountedDeliveredMarkerFailed(String),
     PostSinkAuditFailed {
         audit: Option<stock_analysis::event::PersistedDeliveryAuditReceipt>,
         reason: String,
@@ -2504,6 +2537,73 @@ pub(super) struct NewsAiPreparedPhysicalSink {
     event: stock_analysis::push_l1::SignalEvent,
     kind: PushKind,
     text: String,
+    /// 2026-09-22: counted admission material. Built during preflight so that
+    /// every pre-sink governance decision (including the BR-172 counted
+    /// binding) is complete while the durable ledger is still `Reserved`.
+    counted_binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+}
+
+/// 2026-09-22: how a counted admission outcome maps onto the BR-172 physical
+/// segment. Pure classification so the
+/// "admission denied ⇒ nothing reaches the sink, BR-172 rolls back" contract
+/// is executable without a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NewsAiCountedAdmission {
+    /// counted 决策终态 `Delivered` — 物理投递已由 counted sink 完成,
+    /// 可以继续 BR-172 `record` 收口。
+    Admitted,
+    /// counted **准入拒绝** (预算满 / 冷却头 / launch gate / envelope 拒绝)
+    /// 或契约漂移: 卡片从未交给 sink。必须映射为
+    /// `NewsAiPhysicalPushOutcome::Denied`, 由 `deliver_governed_news_ai`
+    /// 从 Reserved 走 rollback 收口。
+    Rejected(String),
+    /// counted 尚未确认 Delivered：可能是准备故障，也可能是物理结果不确定。
+    /// BR-172 从 Reserved rollback；是否能再次物理投递由 counted 决策控制。
+    AttemptedFailure(String),
+}
+
+/// counted `PushOutcome` → BR-172 物理段结论。
+///
+/// `outcome_from_state` 只产出 `Pushed`/`Denied`/`SinkError` 三种; `Deduped`
+/// 不在 counted 终态映射内, 出现即是契约漂移, 按拒绝处理 (fail-closed)。
+pub(super) fn classify_counted_admission(outcome: &PushOutcome) -> NewsAiCountedAdmission {
+    match outcome {
+        PushOutcome::Pushed => NewsAiCountedAdmission::Admitted,
+        PushOutcome::Denied(reason) => NewsAiCountedAdmission::Rejected(reason.clone()),
+        PushOutcome::SinkError(reason) => NewsAiCountedAdmission::AttemptedFailure(reason.clone()),
+        PushOutcome::Deduped => NewsAiCountedAdmission::Rejected(
+            "counted_delivery_returned_legacy_dedup".to_owned(),
+        ),
+    }
+}
+
+async fn record_news_ai_counted_delivery(
+    counted: &PushOutcome,
+    marker: &mut dyn PhysicalSinkAttemptMarker,
+) -> Result<(), NewsAiNotifyOutcome> {
+    match classify_counted_admission(counted) {
+        NewsAiCountedAdmission::Rejected(reason) => {
+            Err(NewsAiNotifyOutcome::AdmissionDenied(reason))
+        }
+        NewsAiCountedAdmission::AttemptedFailure(reason) => {
+            Err(NewsAiNotifyOutcome::SinkError(reason))
+        }
+        NewsAiCountedAdmission::Admitted => marker.mark_sink_started().await.map_err(|reason| {
+            NewsAiNotifyOutcome::CountedDeliveredMarkerFailed(format!(
+                "counted Delivered but BR-172 sink marker failed: {reason}"
+            ))
+        }),
+    }
+}
+
+fn settle_news_ai_post_counted_audits<T>(
+    analytics: Result<(), String>,
+    authoritative: Result<T, String>,
+) -> Result<T, String> {
+    if let Err(error) = analytics {
+        log::warn!("[NewsAI][L7] analytics record failed after counted Delivered: {error}");
+    }
+    authoritative
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2513,7 +2613,10 @@ pub(super) enum NewsAiPreflightRejection {
 }
 
 pub(super) fn news_ai_common_gate_status() -> NewsAiCommonGateStatus {
-    let kind = PushKind::NewsToIdea;
+    // 2026-09-22: NewsAI 分析卡有自己的 counted kind (NewsAiAnalysis), level
+    // 与被取代的 NewsToIdea 同为 Important — launch gate 行为等价 (只有
+    // Emergency 会短路放行, 两者都不命中)。
+    let kind = PushKind::NewsAiAnalysis;
     if !launch_gate_check(kind) {
         return NewsAiCommonGateStatus::LaunchStageDenied;
     }
@@ -2554,7 +2657,7 @@ pub(super) fn preflight_news_ai_analysis_v3(
 ) -> Result<NewsAiPreparedPhysicalSink, NewsAiPreflightRejection> {
     use crate::v14_adapter::{self, V14Gate};
 
-    let kind = PushKind::NewsToIdea;
+    let kind = PushKind::NewsAiAnalysis;
     match news_ai_common_gate_status() {
         NewsAiCommonGateStatus::Ready => {}
         NewsAiCommonGateStatus::LaunchStageDenied => {
@@ -2594,20 +2697,59 @@ pub(super) fn preflight_news_ai_analysis_v3(
             "news_ai_rendered_card_empty".to_owned(),
         ));
     }
-    Ok(NewsAiPreparedPhysicalSink { event, kind, text })
+    // 业务日固定为已审计模型完成时的本地日期，跨日恢复沿用同一 counted
+    // identity；票号取 fact 的 target_code (与
+    // `event.code` 同一事实源, 已在上面的绑定校验里对齐)。
+    let counted_binding = crate::push_templates::build_news_ai_analysis_counted_binding(
+        delivery.business_date(),
+        delivery.fact().target_code(),
+        delivery.identity().sha256(),
+        &text,
+    )
+    .map_err(NewsAiPreflightRejection::Error)?;
+    Ok(NewsAiPreparedPhysicalSink {
+        event,
+        kind,
+        text,
+        counted_binding,
+    })
 }
 
-/// BR-172 sole physical NewsAI sink entry. The opaque marker performs the
-/// durable `Reserved -> SinkStarted` transition only after transport setup and
-/// immediately before the real CLI/HTTP request. No Launch/L5/audit-health
-/// decisions occur after that transition.
+/// BR-172 sole physical NewsAI sink entry — **now routed through the counted
+/// admission layer** (2026-09-22).
+///
+/// ## 权威分层 (哪层说了算)
+///
+/// - **counted `delivery_decisions` 决策行 = 投递准入权威**: 预算 / 冷却 /
+///   launch gate / envelope 裁决与物理 sink 全部由
+///   `push_counted_with_binding` → durable coordinator 拥有。卡片只有在
+///   counted 决策终态 `Delivered` 时才真的发出。
+/// - **`news_ai_delivery_event` (BR-172) = NewsAI 专属审计链**: 保留
+///   reserve/begin/record 三段 (`deliver_governed_news_ai` 编排), 与 counted
+///   决策行并存 = 双重审计。它不再具有"能不能发"的否决权 — 只记录这次
+///   NewsAI 投递走过了哪几个状态、由哪条审计回执背书。
+///
+/// ## 顺序
+///
+/// 1. preflight (含 counted binding 构造) 已在 ledger `Reserved` 时完成;
+/// 2. counted 准入 + 物理投递；counted 决策是可恢复的物理权威;
+/// 3. counted Delivered 后才记录 BR-172 `SinkStarted`。两步之间崩溃时，
+///    重入同一冻结卡片只会读取 counted 已有决定，不再次物理外发;
+/// 4. 准入拒绝 → `AdmissionDenied` → port 映射 `Denied` →
+///    `deliver_governed_news_ai` 从 Reserved rollback 收口;
+/// 5. 准入通过 → 发布 NewsAI 专属投递审计回执 → `record` 收口 (Delivered)。
 pub(super) async fn send_preflighted_news_ai_analysis_v3(
     prepared: NewsAiPreparedPhysicalSink,
     marker: &mut dyn PhysicalSinkAttemptMarker,
 ) -> NewsAiNotifyOutcome {
     use crate::v14_adapter;
 
-    let NewsAiPreparedPhysicalSink { event, kind, text } = prepared;
+    let NewsAiPreparedPhysicalSink {
+        event,
+        kind,
+        text,
+        counted_binding,
+    } = prepared;
 
     let started = std::time::Instant::now();
     if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
@@ -2619,59 +2761,63 @@ pub(super) async fn send_preflighted_news_ai_analysis_v3(
             "news_ai_exact_sink_attempt_boundary_unavailable_for_l6".to_owned(),
         );
     }
-    let delivered = match push_wechat_with_attempt_marker(&text, Some(marker)).await {
-        PushWechatAttemptOutcome::RejectedBeforeAttempt(reason) => {
+    if dry_run_push_active() {
+        // 隔离 dry-run 路径不进入 counted 协调器: 既不产生决策行也不外发
+        // (production 配置下 counted sink 会以
+        // `production_dry_run_configuration_rejected` 拒绝, 但提前短路可避免
+        // 为一次不会发生的外发写下决策行)。
+        return NewsAiNotifyOutcome::PreSinkError(
+            "news_ai_physical_sink_disabled_by_dry_run".to_owned(),
+        );
+    }
+    let token = match crate::presentation_registry::acquire_token(
+        "U-04-news-ai-analysis",
+        kind,
+        "news_ai_dispatcher",
+        "render_news_ai_analysis",
+    ) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::error!("[NewsAI][BR-196] counted 准备失败: {reason}");
             return NewsAiNotifyOutcome::PreSinkError(reason);
         }
-        PushWechatAttemptOutcome::SimulatedWithoutPhysicalAttempt => {
-            return NewsAiNotifyOutcome::PreSinkError(
-                "news_ai_physical_sink_disabled_by_dry_run".to_owned(),
+    };
+
+    let counted = push_counted_with_binding(token, &text, None, counted_binding).await;
+    if let Err(outcome) = record_news_ai_counted_delivery(&counted, marker).await {
+        if let NewsAiNotifyOutcome::AdmissionDenied(reason) = &outcome {
+            log::info!(
+                "[NewsAI][BR-192] counted 准入拒绝, 不物理外发 template={} reason={reason}",
+                kind.stable_template_id()
             );
         }
-        PushWechatAttemptOutcome::Attempted(delivered) => delivered,
-    };
+        return outcome;
+    }
+
+    // counted 已把卡片发出并记入 counted 投递审计链。下面记录 NewsAI 专属
+    // 审计回执 (BR-172 `record` 的 `authoritative_delivery_audit_event_id`) —
+    // 这是"双重审计"的第二条链, 与 counted 决策行/投递审计并存。
     let channel = current_send_channel();
-    let l7_result = v14_adapter::v14_record_delivery(&event, kind, &text, delivered, channel);
-    let outcome = if delivered { "Pushed" } else { "SinkError" };
+    let l7_result = v14_adapter::v14_record_delivery(&event, kind, &text, true, channel);
     let audit_result = stock_analysis::event::publish_delivery_with_receipt(
         &kind.stable_template_id(),
         event.code.as_deref(),
-        outcome,
+        "Pushed",
         channel,
         text.len(),
         started.elapsed().as_millis() as u64,
     );
-    let mut audit_errors = Vec::new();
-    if let Err(error) = l7_result {
-        audit_errors.push(format!("L7 analytics: {error}"));
-    }
-    let authoritative_audit = match audit_result {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            audit_errors.push(format!("delivery hash-chain: {error}"));
-            None
-        }
-    };
-    if !delivered {
-        return NewsAiNotifyOutcome::SinkError(if audit_errors.is_empty() {
-            "push_wechat returned false".to_owned()
-        } else {
-            format!("push_wechat returned false; {}", audit_errors.join("; "))
-        });
-    }
-    if audit_errors.is_empty() {
-        match authoritative_audit {
-            Some(audit) => NewsAiNotifyOutcome::Pushed { audit },
-            None => NewsAiNotifyOutcome::PostSinkAuditFailed {
-                audit: None,
-                reason: "authoritative delivery audit receipt missing after success".to_owned(),
-            },
-        }
-    } else {
-        NewsAiNotifyOutcome::PostSinkAuditFailed {
-            audit: authoritative_audit,
-            reason: audit_errors.join("; "),
-        }
+    // L7 is observational analytics. A telemetry write failure cannot turn
+    // an accepted counted delivery into an incomplete BR-172 delivery.
+    match settle_news_ai_post_counted_audits(
+        l7_result,
+        audit_result.map_err(|error| error.to_string()),
+    ) {
+        Ok(audit) => NewsAiNotifyOutcome::Pushed { audit },
+        Err(error) => NewsAiNotifyOutcome::PostSinkAuditFailed {
+            audit: None,
+            reason: format!("delivery hash-chain: {error}"),
+        },
     }
 }
 
@@ -6604,6 +6750,145 @@ mod tests {
         .filter(|k| k.is_legacy_v17_5())
         .collect();
         assert_eq!(all_legacy_hits.len(), 3);
+    }
+
+    // ============== 2026-09-22: NewsAI 分析卡接入 counted 准入层 ==============
+
+    /// NewsAI 分析卡 ("🧠 AI 新闻证据分析") 的 kind 元数据必须与
+    /// counted policy 行 (PerTicket 1200s) 和 D-01 NewsToIdea 的 L4 语义
+    /// 一致; level 必须与被取代的 NewsToIdea 相同 (Important), 否则
+    /// `launch_gate_check` 的 Emergency 短路语义会漂移。
+    #[test]
+    fn news_ai_analysis_kind_metadata_matches_its_counted_policy() {
+        assert_eq!(PushKind::NewsAiAnalysis.level(), PushLevel::Important);
+        assert_eq!(PushKind::NewsAiAnalysis.cooldown_secs(), Some(1200));
+        assert_eq!(
+            PushKind::NewsAiAnalysis.cooldown_scope(),
+            CooldownScope::PerTicket
+        );
+        assert_eq!(
+            PushKind::NewsAiAnalysis.stable_template_id(),
+            "news_ai_analysis_v1"
+        );
+        // 2026-09-22 (对抗性复审 F3): 治理上下文来源必须与同族 D-01 一致。
+        // requires_banner=true → counted 门取 CountedCombinedAccount (读 banner
+        // 的 account/data_mode, is_frozen 来自 banner); 漏登记会静默降到
+        // CountedSourceOnly (进程本地 data health, is_frozen=false) —— 即该 kind
+        // 的 Frozen 账户模式门被静默关闭。此前是无断言保护的隐式耦合。
+        assert!(
+            PushKind::NewsAiAnalysis.requires_banner(),
+            "NewsAiAnalysis 必须走 CountedCombinedAccount (同族 D-01 NewsToIdea)"
+        );
+        assert_eq!(
+            PushKind::NewsAiAnalysis.requires_banner(),
+            PushKind::NewsToIdea.requires_banner(),
+            "NewsAiAnalysis 与 D-01 NewsToIdea 的治理上下文来源必须一致"
+        );
+    }
+
+    /// counted 准入结果 → BR-172 物理段结果的全部 4 个分支。
+    ///
+    /// 关键契约 (用户决策 #5): `Denied` 是 **准入拒绝** (预算满 / 冷却头 /
+    /// launch gate / envelope 拒绝), 卡片从未交给 sink — 必须映射为
+    /// `NewsAiPhysicalPushOutcome::Denied`, 由 `deliver_governed_news_ai`
+    /// 走 rollback 收口, 绝不留下悬挂 Reserved/SinkStarted。
+    #[test]
+    fn counted_admission_denial_never_reaches_the_physical_sink() {
+        let denied = PushOutcome::Denied("durable delivery terminal state=RejectedDurable".into());
+        assert_eq!(
+            classify_counted_admission(&denied),
+            NewsAiCountedAdmission::Rejected(
+                "durable delivery terminal state=RejectedDurable".to_owned()
+            )
+        );
+
+        // SinkError = sink 前失败或结果不确定 — 同样不得重发, 也要 rollback。
+        let sink_error = PushOutcome::SinkError("authoritative sink result is uncertain".into());
+        assert_eq!(
+            classify_counted_admission(&sink_error),
+            NewsAiCountedAdmission::AttemptedFailure(
+                "authoritative sink result is uncertain".to_owned()
+            )
+        );
+
+        // Pushed = counted 决策终态 Delivered。
+        assert_eq!(
+            classify_counted_admission(&PushOutcome::Pushed),
+            NewsAiCountedAdmission::Admitted
+        );
+
+        // Deduped 不在 counted 终态映射内 (outcome_from_state 只产出
+        // Pushed/Denied/SinkError); 若出现即是契约漂移, 必须按拒绝处理。
+        assert!(matches!(
+            classify_counted_admission(&PushOutcome::Deduped),
+            NewsAiCountedAdmission::Rejected(_)
+        ));
+    }
+
+    struct RecordingNewsAiMarker {
+        calls: usize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PhysicalSinkAttemptMarker for RecordingNewsAiMarker {
+        async fn mark_sink_started(&mut self) -> Result<(), String> {
+            self.calls += 1;
+            if self.fail {
+                Err("marker write failed".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn news_ai_marker_waits_for_counted_delivered() {
+        let mut marker = RecordingNewsAiMarker {
+            calls: 0,
+            fail: false,
+        };
+        assert!(matches!(
+            record_news_ai_counted_delivery(&PushOutcome::Denied("policy".to_owned()), &mut marker)
+                .await,
+            Err(NewsAiNotifyOutcome::AdmissionDenied(_))
+        ));
+        assert!(matches!(
+            record_news_ai_counted_delivery(
+                &PushOutcome::SinkError("prepare failed".to_owned()),
+                &mut marker,
+            )
+            .await,
+            Err(NewsAiNotifyOutcome::SinkError(_))
+        ));
+        assert_eq!(marker.calls, 0, "no counted delivery means no BR-172 sink marker");
+        assert_eq!(
+            record_news_ai_counted_delivery(&PushOutcome::Pushed, &mut marker).await,
+            Ok(())
+        );
+        assert_eq!(marker.calls, 1);
+
+        marker.fail = true;
+        assert!(matches!(
+            record_news_ai_counted_delivery(&PushOutcome::Pushed, &mut marker).await,
+            Err(NewsAiNotifyOutcome::CountedDeliveredMarkerFailed(_))
+        ));
+    }
+
+    #[test]
+    fn news_ai_l7_failure_does_not_block_authoritative_delivery_receipt() {
+        assert_eq!(
+            settle_news_ai_post_counted_audits::<&str>(
+                Err("L7 unavailable".to_owned()),
+                Ok("persisted receipt"),
+            ),
+            Ok("persisted receipt")
+        );
+        assert!(settle_news_ai_post_counted_audits::<&str>(
+            Ok(()),
+            Err("delivery audit unavailable".to_owned()),
+        )
+        .is_err());
     }
 
     // ============== v17.6 §2.2: is_low_priority_v17_6 标 3 variants ==============

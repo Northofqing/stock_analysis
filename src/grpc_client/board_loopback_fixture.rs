@@ -1046,9 +1046,7 @@ pub(crate) async fn spawn_dragon_tiger_success_loopback(
 
 /// Macro integration owns this handle before making the first connection, so
 /// setup failures can explicitly join the parent server as well as its own.
-pub(crate) async fn spawn_macro_parent_listener(
-    records: &[u8],
-) -> (String, BoardLoopbackServer) {
+pub(crate) async fn spawn_macro_parent_listener(records: &[u8]) -> (String, BoardLoopbackServer) {
     spawn_board_loopback_service(
         false,
         "Tdx",
@@ -1224,26 +1222,21 @@ async fn spawn_board_loopback_service(
     };
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let incoming_state = Arc::clone(&state);
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(
-        move |accepted| {
-            if accepted.is_ok() {
-                incoming_state
-                    .lock()
-                    .expect("TEST_CODE board TCP accept")
-                    .tcp_accepts += 1;
-            }
-            accepted
-        },
-    );
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |accepted| {
+        if accepted.is_ok() {
+            incoming_state
+                .lock()
+                .expect("TEST_CODE board TCP accept")
+                .tcp_accepts += 1;
+        }
+        accepted
+    });
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(MarketDataServiceServer::new(service))
-            .serve_with_incoming_shutdown(
-                incoming,
-                async move {
-                    let _ = shutdown_rx.await;
-                },
-            )
+            .serve_with_incoming_shutdown(incoming, async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .expect("TEST_CODE board loopback server");
     });
