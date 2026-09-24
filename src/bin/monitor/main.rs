@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stock_analysis::calendar::{self, current_session, is_market_active, MarketSession};
 
-use stock_analysis::app::modes::run_chain_analysis_mode;
+use stock_analysis::app::chain_schedule::{
+    run_scheduled_chain_analysis, ChainPhase, ChainScheduleOutcome, ChainScheduleStore,
+};
 
 use stock_analysis::monitor::detector::{
     AlertCategory, AlertDetail, AlertEvent, AlertLevel, Detector, DetectorConfig, StockSnapshot,
@@ -9142,31 +9144,21 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 2026-08-07 用户决策: 新闻收集 + AI 链分析每日推送 (盘后)。
             // 15:30-15:34 窗口: 当日涨停池 + 当日快讯 → LLM 产业链报告 → 推送。
             // 与 15:10 断点 A 落库 (chain_daily, 不推送) 互补: 15:10 只写库,
-            // 15:30 出报告推用户。失败保留重试资格, 成功才封口。
+            // 15:30 出报告推用户。发送前写持久 attempt；状态不明须人工裁定。
             if now.hour() == 15 && (30..35).contains(&now.minute()) {
-                static CHAIN_POST_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
-                    std::sync::Mutex::new(None);
                 let today = now.date_naive();
-                let already_run = CHAIN_POST_LAST
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map(|d| d == today)
-                    .unwrap_or(false);
-                if !already_run {
-                    match run_chain_analysis_mode(true).await {
-                        Ok(()) => {
-                            log::info!(
-                                "[产业链][盘后15:30] 新闻+AI 链分析完成并推送 (date={})",
-                                today
-                            );
-                            *CHAIN_POST_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(today);
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "[产业链][盘后15:30] 链分析推送失败, 保留重试资格: {error}"
-                            );
-                        }
+                match run_scheduled_chain_analysis(
+                    &ChainScheduleStore::production(), ChainPhase::Postclose, today,
+                ).await {
+                    Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
+                        "[产业链][盘后15:30] 新闻+AI 链分析完成，渠道弱接受 (date={})", today
+                    ),
+                    Ok(ChainScheduleOutcome::AlreadyClosed) => {},
+                    Ok(ChainScheduleOutcome::NeedsReview) => log::warn!(
+                        "[产业链][盘后15:30] 发送状态不明，停止自动重发，需人工核对 (date={})", today
+                    ),
+                    Err(error) => {
+                        log::error!("[产业链][盘后15:30] 链分析未完成，请核对发送状态: {error}");
                     }
                 }
             }
@@ -9645,33 +9637,25 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             }
             // 2026-08-07 用户决策: 新闻收集 + AI 链分析每日推送 (盘前)。
             // 9:05-9:09 窗口: 财联社快讯 → LLM 产业链分析 (business_date=昨日
-            // 涨停池 + 最新新闻背景) → 报告推送, 竞价参考。失败保留重试资格,
-            // 成功才封口 (v15.x 出声原则)。注意 business_date 为昨日已完成
+            // 涨停池 + 最新新闻背景) → 报告推送, 竞价参考。发送前失败可重试,
+            // 发送状态不明时须人工裁定。注意 business_date 为昨日已完成
             // 交易日, 与 15:30 盘后 (当日) 各自独立报告文件。
             // 2026-08-07 补偿原则: 窗口放宽到 9:05-9:14 (9:15 后错过竞价参考
             // 意义, 且 9:10 预检/9:20 竞价紧随) — 9:09 后启动的 monitor 仍补做。
             if now.hour() == 9 && (5..15).contains(&now.minute()) {
-                static CHAIN_PREOPEN_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
-                    std::sync::Mutex::new(None);
                 let today = now.date_naive();
-                let already_run = CHAIN_PREOPEN_LAST
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map(|d| d == today)
-                    .unwrap_or(false);
-                if !already_run {
-                    match run_chain_analysis_mode(true).await {
-                        Ok(()) => {
-                            log::info!(
-                                "[产业链][盘前9:05] 新闻+AI 链分析完成并推送 (date={})",
-                                today
-                            );
-                            *CHAIN_PREOPEN_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(today);
-                        }
-                        Err(error) => {
-                            log::error!("[产业链][盘前9:05] 链分析推送失败, 保留重试资格: {error}");
-                        }
+                match run_scheduled_chain_analysis(
+                    &ChainScheduleStore::production(), ChainPhase::Preopen, today,
+                ).await {
+                    Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
+                        "[产业链][盘前9:05] 新闻+AI 链分析完成，渠道弱接受 (date={})", today
+                    ),
+                    Ok(ChainScheduleOutcome::AlreadyClosed) => {},
+                    Ok(ChainScheduleOutcome::NeedsReview) => log::warn!(
+                        "[产业链][盘前9:05] 发送状态不明，停止自动重发，需人工核对 (date={})", today
+                    ),
+                    Err(error) => {
+                        log::error!("[产业链][盘前9:05] 链分析未完成，请核对发送状态: {error}");
                     }
                 }
             }

@@ -104,6 +104,17 @@ pub async fn run_market_review_only() -> Result<()> {
 
 /// 产业链联动分析模式：涨停池 → 概念聚类 → 产业链上下游定位（LLM）→ 报告 + 推送。
 pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
+    run_chain_analysis_mode_with_send_guard(send_notify, None, |_| Ok(())).await
+}
+
+/// The scheduler uses the guard to record a durable attempt after the report is
+/// saved and immediately before the first external notification call. CLI runs
+/// retain their invocation-local behavior.
+pub async fn run_chain_analysis_mode_with_send_guard(
+    send_notify: bool,
+    scheduled_filename: Option<&str>,
+    before_send: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
@@ -164,15 +175,21 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     let notifier = NotificationService::from_env();
     // 文件名带时段: 9:05 盘前 (business_date=昨日) / 15:30 盘后 (当日) / CLI
     // 各时段独立文件, 避免 9:05 盘前报告覆盖昨日盘后报告 (2026-08-07 接入时间线)。
-    let filename = format!(
+    let default_filename = format!(
         "chain_analysis_{}_{}.md",
         business_date.format("%Y%m%d"),
         chrono::Local::now().format("%H%M")
     );
-    let path = notifier.save_report_to_file(&report, Some(&filename))?;
+    let filename = scheduled_filename.unwrap_or(&default_filename);
+    let path = notifier.save_report_to_file(&report, Some(filename))?;
     info!("产业链联动分析报告已保存: {}", path);
 
     if send_notify {
+        anyhow::ensure!(
+            notifier.is_available(),
+            "产业链联动分析报告没有可用通知渠道"
+        );
+        before_send(&path)?;
         require_chain_notification_success(notifier.send(&report).await)?;
     }
     Ok(())
@@ -193,11 +210,13 @@ mod tests_chain_delivery {
     use super::require_chain_notification_success;
 
     #[test]
-    fn failed_chain_send_keeps_the_scheduled_run_retryable() {
+    fn chain_send_rejects_weak_failure() {
         assert!(require_chain_notification_success(Ok(true)).is_ok());
         assert!(require_chain_notification_success(Ok(false)).is_err());
-        assert!(require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
-            .is_err());
+        assert!(
+            require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
+                .is_err()
+        );
     }
 }
 
