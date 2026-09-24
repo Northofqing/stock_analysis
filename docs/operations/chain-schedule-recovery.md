@@ -1,6 +1,6 @@
 # 盘前／盘后产业链报告跨重启状态
 
-monitor 分别按自然日和 `preopen`、`postclose` 记录发送状态，数据库位于生产工作目录的 `data/chain_schedule.sqlite3`。报告保存在 `reports/chain_analysis_schedule_YYYYMMDD_<phase>.md`。CLI `--chain-analysis` 仍是单次调用，不使用这份调度状态。
+monitor 分别按自然日和 `preopen`、`postclose` 记录发送状态，数据库位于生产根目录的 `data/chain_schedule.sqlite3`。报告保存在 `reports/chain_analysis_schedule_YYYYMMDD_<phase>_<生成时间>.md`；人工重试会生成新文件，旧报告保留。CLI `--chain-analysis` 仍是单次调用，不使用这份调度状态。
 
 在通知发送前，monitor 写入 `sending`。渠道只提供弱接受结果：如果进程崩溃或发送返回失败，`sending` 保持不变，重启后也不自动重发，以免外部已经接收而再次推送。若至少一个渠道返回接受，状态转为 `weak_accepted`，同一天同一时段不再运行。分析、取数、保存报告或无可用渠道在写入 `sending` 前失败时，窗口内可自动重试。
 

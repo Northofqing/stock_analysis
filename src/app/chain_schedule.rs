@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use super::modes::run_chain_analysis_mode_with_send_guard;
@@ -265,6 +265,19 @@ fn status_from_state(state: Option<&str>) -> Result<ChainScheduleStatus> {
     }
 }
 
+fn scheduled_report_filename(
+    phase: ChainPhase,
+    date: NaiveDate,
+    generated_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "chain_analysis_schedule_{}_{}_{}.md",
+        date.format("%Y%m%d"),
+        phase.as_str(),
+        generated_at.format("%Y%m%dT%H%M%S%fZ")
+    )
+}
+
 pub async fn run_scheduled_chain_analysis(
     store: &ChainScheduleStore,
     phase: ChainPhase,
@@ -276,11 +289,7 @@ pub async fn run_scheduled_chain_analysis(
         ChainScheduleStatus::Ready => {}
     }
 
-    let filename = format!(
-        "chain_analysis_schedule_{}_{}.md",
-        date.format("%Y%m%d"),
-        phase.as_str()
-    );
+    let filename = scheduled_report_filename(phase, date, Utc::now());
     let mut attempt_no = None;
     run_chain_analysis_mode_with_send_guard(true, Some(&filename), |report_path| {
         attempt_no = Some(store.begin_send(phase, date, report_path)?);
@@ -391,5 +400,31 @@ mod tests {
             store.status(ChainPhase::Preopen, date).unwrap(),
             ChainScheduleStatus::Ready
         );
+    }
+
+    #[test]
+    fn manual_retry_keeps_the_first_attempt_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let first_at = DateTime::parse_from_rfc3339("2026-09-24T07:30:00.000000001Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_at = DateTime::parse_from_rfc3339("2026-09-24T07:30:00.000000002Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = directory.path().join(scheduled_report_filename(
+            ChainPhase::Postclose,
+            date,
+            first_at,
+        ));
+        let retry = directory.path().join(scheduled_report_filename(
+            ChainPhase::Postclose,
+            date,
+            retry_at,
+        ));
+        std::fs::write(&first, "first attempt").unwrap();
+        std::fs::write(&retry, "manual retry").unwrap();
+        assert_ne!(first, retry);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "first attempt");
     }
 }
