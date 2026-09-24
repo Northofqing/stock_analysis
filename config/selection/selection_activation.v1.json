@@ -1,1 +1,1 @@
-{"schema_version":"selection-config-activation-v1","expected_config_hash":"912d154a5d3f80501d951955711fb3deef4632694516f831035706910f89fb37","effective_from":"2026-09-23T01:00:00.000000000Z","reviewed_by":"claude-deploy-20260923-monitor-restore","reviewed_at":"2026-09-23T00:58:23.318009000Z"}
+{"schema_version":"selection-config-activation-v1","expected_config_hash":"8440a0c39ed0fa0cbcd5806258ac1964dcb840c2e50ad2a4a5fa4f01caeb95ef","effective_from":"2026-09-24T00:07:19.000000000Z","reviewed_by":"codex-deploy-20260924","reviewed_at":"2026-09-24T00:06:12.456057000Z"}
