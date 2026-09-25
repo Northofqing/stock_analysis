@@ -23,4 +23,5 @@
 - 含真实 v12 旧终态的 v12→v13→v14 迁移测试已通过：五条旧终态、运行头、StageFinal、五条审计及其审计链逐行保持，`foreign_key_check` 为零，重开后仍恢复原 EconomicCalendar 结果。v14 catalog 三条定向测试和未来版本拒绝测试也已通过。
 - 2026-09-26：v13 已连接计划只有 Gateway(5) request plan、没有 attempt 的续跑用例通过。旧请求行保留，v14 补 `OperationRetired` / `NotCalled`，四个新闻源继续执行，旧 RPC 零调用，重开后终态可读。
 - 2026-09-26：Web pace 夹具生成了真实 v12 dimension 行，外键指向旧 query terminal。用 `VACUUM INTO` 对暂停写入的数据库做一致性副本，再在副本上升级 v13、v14：旧请求、attempt、结果、终态、dimension、审计及审计链逐行保持，外键关联仍可联接，`foreign_key_check` 为零；原 pace 重开用例继续通过。
-- v14 Models 后续写入尚未单独验证。`BusinessIntentStore::chain_post_close()` 仍为生产拒绝入口，当前没有自动升级旧库的生产接线；完整 v12 成功场景在本机触及固定 15 秒预算，不能用它声称这些缺口已关闭。
+- 2026-09-26：v14 完整 Models/Search/Report 用例通过。四个新闻源加退役终态进入同一完整链，Models 三项效果与最终 artifact 持久化；重开后无模型或旧 EconomicCalendar 远程重放。共用夹具的 v13 用例复测也通过。
+- `BusinessIntentStore::chain_post_close()` 仍为生产拒绝入口，当前没有自动升级旧库的生产接线；完整 v12 成功场景在本机触及固定 15 秒预算，不能作为 v12 完整报告成功的证据。

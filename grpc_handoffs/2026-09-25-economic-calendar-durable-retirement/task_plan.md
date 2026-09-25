@@ -15,7 +15,8 @@
 - 真实旧 v12 五 Gateway 终态经 v13 升到 v14，运行头、旧终态、StageFinal、审计与审计链逐行保持；外键检查及重开恢复通过。
 - v13 旧连接计划有 Gateway(5) request plan、无 attempt 的 v14 续跑通过：保留请求事实、补退役终态、四个新闻源继续执行、旧 RPC 零调用。
 - 真实 v12 dimension 行引用旧终态的副本升级 v14 通过，旧行、审计链及外键关系保持，原 pace 重开行为也通过。
-- 尚需验证 v14 Models 后续写入，并设计受控的生产迁移入口；当前 `BusinessIntentStore::chain_post_close()` 仍返回 `ProductionRefused`。未完成前不宣称存量运行已在生产安全切换。
+- v14 Models/Search/Report 完整运行、三项效果持久化及重开无远程重放通过；v13 共用测试也通过。
+- 尚需设计受控的生产迁移入口；当前 `BusinessIntentStore::chain_post_close()` 仍返回 `ProductionRefused`。未完成前不宣称存量运行已在生产安全切换。
 
 ## 实施阶段
 

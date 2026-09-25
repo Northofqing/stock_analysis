@@ -1,4 +1,4 @@
-//! V13 vertical slice: the full post-close chain runs to a committed
+//! V13/V14 vertical slice: the full post-close chain runs to a committed
 //! Models/Search/Report artifact, a reopen replays every journaled effect with
 //! zero remote calls, and a begun-unconfirmed model call fails closed on reopen.
 use super::*;
@@ -6,6 +6,7 @@ use crate::grpc_client::client::macro_full_loopback_fixture::MacroFullLoopbackSe
 use crate::pipeline::chain_analysis::preparation::{
     ModelStage, ModelsObservationClock, PreparationStage,
 };
+use crate::search_service::macro_news::runner::QueryKey;
 
 impl ModelsObservationClock for MacroClock {
     fn models_local_observation(&self) -> DateTime<chrono::FixedOffset> {
@@ -330,12 +331,24 @@ async fn v13_parent(
 
 #[tokio::test]
 async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_remote_calls() {
+    models_completion_scenario(false).await;
+}
+
+#[tokio::test]
+async fn single_user_v14_prepare_completes_models_and_reopen_replays_without_remote_calls() {
+    models_completion_scenario(true).await;
+}
+
+async fn models_completion_scenario(v14: bool) {
     let mut fixture = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut macro_server = None;
     let body = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
         let (stocks, config, intent, parent_head, parent_source, queries) =
             v13_parent(&mut fixture, &mut parent_server, "TEST_CODE_RUN_V13_MODELS").await;
+        if v14 {
+            fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+        }
         macro_server = Some(MacroFullLoopbackServer::bind().await);
         let server = macro_server.as_ref().unwrap();
         server.release_all();
@@ -368,8 +381,8 @@ async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_rem
                 ),
             )
             .unwrap();
-        let mut io = local
-            .models_preparation_io_v13(
+        let mut io = if v14 {
+            local.models_preparation_io_v14(
                 lease,
                 &queries,
                 &clock,
@@ -379,7 +392,18 @@ async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_rem
                 &search_service,
                 &analyzer,
             )
-            .unwrap();
+        } else {
+            local.models_preparation_io_v13(
+                lease,
+                &queries,
+                &clock,
+                FixedClusterConfiguration::resolve(Some("2")),
+                &parent_source,
+                &macro_source,
+                &search_service,
+                &analyzer,
+            )
+        }.unwrap();
         let prepared = prepare_chain_analysis_with_io(
             NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
             stocks.clone(),
@@ -408,6 +432,17 @@ async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_rem
         );
         assert!(prepared.report().contains("TEST_CODE_V13_总览原响应 Ω"));
         assert!(!prepared.macro_context().is_empty());
+        if v14 {
+            let recovery = local.inspect_macro(&intent).unwrap();
+            let retired = recovery.query_terminal(QueryKey::Gateway(5)).unwrap();
+            assert!(!retired.was_called());
+            assert!(matches!(retired.native(),
+                crate::search_service::macro_news::NativeOutcome::Economic(Err(error))
+                    if error.reason_code() == "operation_retired"));
+            assert!(!server.snapshot().calls.iter().any(|call| call.call ==
+                crate::grpc_client::client::macro_full_loopback_fixture::Call::Gateway(
+                    crate::grpc_client::client::macro_full_loopback_fixture::Lane::E)));
+        }
         let first_artifact = prepared.to_artifact_bytes().unwrap();
         let first_report = prepared.report().to_owned();
         let first_head = local.inspect_run(&intent).unwrap().head_version();
@@ -466,8 +501,8 @@ async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_rem
                 ),
             )
             .unwrap();
-        let mut io = local
-            .models_preparation_io_v13(
+        let mut io = if v14 {
+            local.models_preparation_io_v14(
                 lease,
                 &queries,
                 &reopen_clock,
@@ -477,7 +512,18 @@ async fn single_user_v13_prepare_completes_models_and_reopen_replays_without_rem
                 &search_service,
                 &reopened_analyzer,
             )
-            .unwrap();
+        } else {
+            local.models_preparation_io_v13(
+                lease,
+                &queries,
+                &reopen_clock,
+                FixedClusterConfiguration::resolve(Some("2")),
+                &parent_source,
+                &macro_source,
+                &search_service,
+                &reopened_analyzer,
+            )
+        }.unwrap();
         let replayed = prepare_chain_analysis_with_io(
             NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
             stocks.clone(),
