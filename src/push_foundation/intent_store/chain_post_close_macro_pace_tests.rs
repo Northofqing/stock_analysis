@@ -249,7 +249,7 @@ async fn single_user_local_web_pace_reopens_after_only_saved_remaining_delay() {
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {}
                 }
             };
-            let (dimension_version, dimension_bytes, recorded_at, selected, pace_due) = dimension;
+            let (dimension_version, dimension_bytes, recorded_at, selected, pace_due) = dimension.clone();
             assert_eq!(selected, Some(2));
             assert_eq!(pace_due - recorded_at, 300_000);
             assert!(clock.now.get().get() < pace_due);
@@ -334,6 +334,49 @@ async fn single_user_local_web_pace_reopens_after_only_saved_remaining_delay() {
             reader.connection.close().unwrap();
             sql_reader.connection.close().unwrap();
             drop(local);
+
+            // Snapshot a confirmed v12 dimension whose foreign key points at
+            // an old query terminal. Migrate only the copy so the pace replay
+            // below still exercises its original v12 database.
+            let copy_directory = tempfile::tempdir().unwrap();
+            let copied_database = copy_directory.path().join("dimension-migration.sqlite");
+            let source = rusqlite::Connection::open(&database).unwrap();
+            source.execute("VACUUM INTO ?1", [copied_database.to_str().unwrap()]).unwrap();
+            source.close().unwrap();
+            let mut copied_store = BusinessIntentStore::open(&copied_database).unwrap();
+            let old_rows = pace_database_snapshot(&copied_store.connection, baseline.intent.as_str());
+            assert_eq!(old_rows, confirmed_database);
+            let old_audit_chain = historical_all_rows(&copied_store.connection,
+                "SELECT * FROM data_acquisition_audit_chain ORDER BY acquisition_audit_id");
+            let referenced_old_terminal = |connection: &rusqlite::Connection| -> i64 {
+                connection.query_row(
+                    "SELECT count(*) FROM chain_post_close_macro_dimension_terminals d \
+                     JOIN chain_post_close_macro_query_terminals t \
+                       ON t.intent_id=d.intent_id AND t.run_version=d.last_query_terminal_version \
+                     WHERE d.intent_id=?1",
+                    [baseline.intent.as_str()], |row| row.get(0),
+                ).unwrap()
+            };
+            assert_eq!(referenced_old_terminal(&copied_store.connection), 1);
+            ChainPostClose { store: &mut copied_store }.migrate_schema_v12_to_v13().unwrap();
+            assert_eq!(pace_database_snapshot(&copied_store.connection, baseline.intent.as_str()), old_rows);
+            ChainPostClose { store: &mut copied_store }.migrate_schema_v13_to_v14().unwrap();
+            assert_eq!(pace_database_snapshot(&copied_store.connection, baseline.intent.as_str()), old_rows);
+            assert_eq!(historical_all_rows(&copied_store.connection,
+                "SELECT * FROM data_acquisition_audit_chain ORDER BY acquisition_audit_id"), old_audit_chain);
+            assert_eq!(referenced_old_terminal(&copied_store.connection), 1);
+            assert_eq!(dimension_one(&copied_store.connection, baseline.intent.as_str()), Some(dimension));
+            let foreign_key_violations: i64 = copied_store.connection.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(foreign_key_violations, 0);
+            let mut copied_local = copied_store.single_user_local_chain_post_close(&baseline.config).unwrap();
+            let migrated = copied_local.inspect_macro(&baseline.intent).unwrap();
+            assert_eq!(migrated.plan_bytes(), plan_bytes);
+            assert_eq!(copied_local.inspect_run(&baseline.intent).unwrap().head_version(), first_head);
+            drop(copied_local);
+            copied_store.connection.close().unwrap();
+            drop(copy_directory);
             drop(macro_source);
             business.reopen();
 
