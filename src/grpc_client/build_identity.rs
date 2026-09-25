@@ -129,6 +129,12 @@ pub fn qualify_public_health(response: &HealthResponse) -> Result<(), BuildIdent
     qualify_identity(response.build_identity.as_ref(), &expected_identity()?)
 }
 
+pub(crate) fn qualify_public_build_identity(
+    identity: &BuildIdentity,
+) -> Result<(), BuildIdentityError> {
+    qualify_identity(Some(identity), &expected_identity()?)
+}
+
 #[cfg(test)]
 pub(crate) fn test_public_build_identity() -> BuildIdentity {
     let expected = expected_identity().expect("public deployment metadata is complete");

@@ -27,6 +27,18 @@ const REQUEST_HASH: &str = "fb86badeeebfca14c04928026fe295416a2a47c6534250291c06
 
 #[tokio::test]
 async fn historical_unqualified_health_cannot_begin_capabilities_after_reopen() {
+    historical_health_without_result_identity_cannot_begin_capabilities_after_reopen(1).await;
+}
+
+#[tokio::test]
+async fn historical_v2_health_without_result_identity_cannot_begin_capabilities_after_reopen() {
+    historical_health_without_result_identity_cannot_begin_capabilities_after_reopen(2).await;
+}
+
+async fn historical_health_without_result_identity_cannot_begin_capabilities_after_reopen(
+    raw_version: u32,
+) {
+    assert!(matches!(raw_version, 1 | 2));
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let baseline = setup_external_parent(
@@ -134,8 +146,9 @@ async fn historical_unqualified_health_cannot_begin_capabilities_after_reopen() 
         .to_owned();
     let original_deadline = confirmed.plan().deadline_at();
 
-    // Reconstruct a valid historical V1 Health fact: it recorded live+ready,
-    // but neither the row nor its response carried a verified build identity.
+    // Restore the historical row's actual format without manufacturing V3
+    // identity fields. V1 had only live+ready; V2 qualified the response's
+    // build but still did not bind the result row to request wire identity.
     let connection = business.connection();
     let original: Vec<u8> = connection.query_row(
         "SELECT bytes FROM chain_post_close_macro_control_attempt_results WHERE intent_id=?1 AND control_ordinal=1",
@@ -148,9 +161,16 @@ async fn historical_unqualified_health_cannot_begin_capabilities_after_reopen() 
             .as_slice(),
     )
     .unwrap();
-    response.build_identity = None;
-    value["version"] = serde_json::json!(1);
+    if raw_version == 1 {
+        response.build_identity = None;
+    }
+    value["version"] = serde_json::json!(raw_version);
     value["response"] = serde_json::to_value(response.encode_to_vec()).unwrap();
+    value.as_object_mut().unwrap().remove("wire_identity");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("verified_build_identity");
     let historical: macro_codec::ControlRawResult = serde_json::from_value(value).unwrap();
     let bytes = macro_codec::encode(&historical).unwrap();
     let trigger: String = connection.query_row(
@@ -188,7 +208,7 @@ async fn historical_unqualified_health_cannot_begin_capabilities_after_reopen() 
     let health = &recovered.readiness_episodes()[0].controls()[0];
     assert_eq!(health.request_id(), original_request_id);
     assert_eq!(health.outcome(), Some(MacroControlOutcome::Ready));
-    assert_eq!(health.qualification_version, Some(1));
+    assert_eq!(health.qualification_version, Some(raw_version));
     let lease = local
         .resume_run(
             &baseline.intent,
@@ -1573,19 +1593,78 @@ pub(super) fn raw_control_bytes(database: &std::path::Path, intent: &IntentId, o
 }
 
 pub(super) fn assert_response_raw(bytes: &[u8], response: &[u8]) {
-    let actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(actual.as_object().unwrap().len(), 7);
+    let mut actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let kind = match actual["wire_identity"]["method"].as_str().unwrap() {
+        "Health" => ExternalControlKind::Health,
+        "Capabilities" => ExternalControlKind::Capabilities,
+        other => panic!("unexpected control method: {other}"),
+    };
+    let id = match kind {
+        ExternalControlKind::Health => {
+            let decoded = HealthResponse::decode(response).unwrap();
+            assert_eq!(decoded.encode_to_vec(), response);
+            assert!(crate::grpc_client::build_identity::qualify_public_health(&decoded).is_ok());
+            decoded.request_id
+        }
+        ExternalControlKind::Capabilities => {
+            let decoded = CapabilitiesResponse::decode(response).unwrap();
+            assert_eq!(decoded.encode_to_vec(), response);
+            decoded.request_id
+        }
+    };
+    assert_bound_control_result(&mut actual, kind, &id, true);
     assert_eq!(actual, serde_json::json!({
-        "version": 2, "connect_unavailable": false, "response": response,
+        "version": 3, "connect_unavailable": false, "response": response,
         "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
     }));
 }
 
-pub(super) fn assert_connect_unavailable_raw(bytes: &[u8]) {
-    let actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(actual.as_object().unwrap().len(), 7);
+fn assert_bound_control_result(
+    actual: &mut serde_json::Value,
+    kind: ExternalControlKind,
+    request_id: &str,
+    expected_build: bool,
+) {
+    assert_eq!(actual["version"], 3);
+    let object = actual.as_object_mut().unwrap();
+    let identity = object.remove("wire_identity").unwrap();
+    assert_eq!(identity, serde_json::json!({
+        "profile": "ExternalV1",
+        "method": kind,
+        "request_id": request_id,
+        "client_descriptor_sha256":
+            crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+    }));
+    let build = object.remove("verified_build_identity");
+    if expected_build {
+        let identity = test_external_build_identity();
+        assert_eq!(build, Some(serde_json::json!({
+            "service_version": identity.service_version,
+            "source_revision": identity.source_revision,
+            "contract_sha256": identity.contract_sha256,
+            "binary_sha256": identity.binary_sha256,
+            "identity_error": identity.identity_error,
+        })));
+    } else {
+        assert_eq!(build, None);
+    }
+    assert_eq!(object.len(), 7);
+}
+
+pub(super) fn assert_connect_unavailable_raw(
+    bytes: &[u8],
+    kind: ExternalControlKind,
+    request_id: &str,
+) {
+    let mut actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_bound_control_result(
+        &mut actual,
+        kind,
+        request_id,
+        kind == ExternalControlKind::Capabilities,
+    );
     assert_eq!(actual, serde_json::json!({
-        "version": 2, "connect_unavailable": true, "response": null,
+        "version": 3, "connect_unavailable": true, "response": null,
         "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
     }));
 }
@@ -1625,12 +1704,28 @@ fn assert_raw(
     expected_response: Option<&[u8]>,
     request_id: &str,
 ) {
+    let kind = if matches!(
+        case,
+        RejectionCase::HealthConnectUnavailable
+            | RejectionCase::HealthNotReady
+            | RejectionCase::HealthStatus(_)
+            | RejectionCase::HealthMismatchedId
+    ) {
+        ExternalControlKind::Health
+    } else {
+        ExternalControlKind::Capabilities
+    };
     if case.is_connect_unavailable() {
-        assert_connect_unavailable_raw(bytes);
+        assert_connect_unavailable_raw(bytes, kind, request_id);
         return;
     }
-    let actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(actual.as_object().map(|object| object.len()), Some(7));
+    let mut actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_bound_control_result(
+        &mut actual,
+        kind,
+        request_id,
+        kind == ExternalControlKind::Capabilities,
+    );
     let status_case = match case {
         RejectionCase::HealthStatus(value) | RejectionCase::CapabilitiesStatus(value) => {
             Some(value)
@@ -1648,7 +1743,7 @@ fn assert_raw(
     } else {
         (None, serde_json::json!("Absent"))
     };
-    assert_eq!(actual.get("version"), Some(&serde_json::json!(2)));
+    assert_eq!(actual.get("version"), Some(&serde_json::json!(3)));
     assert_eq!(
         actual.get("connect_unavailable"),
         Some(&serde_json::json!(case.is_connect_unavailable()))

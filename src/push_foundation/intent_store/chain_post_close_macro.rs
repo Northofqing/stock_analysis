@@ -187,7 +187,7 @@ impl MacroControlRecovery {
     }
     pub(crate) fn authorizes_new_external_effect(&self) -> bool {
         self.outcome == Some(MacroControlOutcome::Ready)
-            && self.qualification_version == Some(2)
+            && self.qualification_version == Some(3)
             && self.request.has_wire_identity()
     }
     pub(crate) fn response_bytes(&self) -> Option<&[u8]> {
@@ -1587,7 +1587,7 @@ impl LocalChainPostClose<'_> {
         &mut self,
         mut lease: RunLease,
         call: ControlCall,
-        raw: codec::ControlRawResult,
+        mut raw: codec::ControlRawResult,
         now: UtcMicros,
     ) -> Result<(RunLease, MacroControlOutcome)> {
         let transaction = self
@@ -1620,6 +1620,24 @@ impl LocalChainPostClose<'_> {
                 && call.episode_ordinal == 1
                 && call.request_sha == raw_digest(control.request.request_bytes()).as_str(),
         )?;
+        if control.request.has_wire_identity() {
+            let health = if call.control_ordinal == 2 {
+                let health = episode
+                    .controls
+                    .first()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                Some((
+                    &health.request,
+                    health
+                        .response
+                        .as_deref()
+                        .ok_or(ChainPostCloseError::SchemaRejected)?,
+                ))
+            } else {
+                None
+            };
+            raw.bind_external_identity(&control.request, health)?;
+        }
         let projected = raw.project(&control.request)?;
         let outcome = if projected.is_ok() {
             MacroControlOutcome::Ready

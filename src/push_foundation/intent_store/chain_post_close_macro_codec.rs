@@ -26,7 +26,7 @@ use crate::grpc_client::errors::{
     restore_persisted_status_error, GrpcError, PersistedErrorDetailTrailer, StatusErrorContext,
 };
 use crate::grpc_client::external_pb::magic::market::v1::{
-    CapabilitiesRequest, CapabilitiesResponse, HealthRequest, HealthResponse,
+    BuildIdentity, CapabilitiesRequest, CapabilitiesResponse, HealthRequest, HealthResponse,
     Operation as ExternalOperation, QueryRequest as ExternalQueryRequest,
     QueryResponse as ExternalQueryResponse,
 };
@@ -794,6 +794,78 @@ pub(super) struct ControlRawResult {
     details: Option<Vec<u8>>,
     trailer: Trailer,
     diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wire_identity: Option<ControlWireIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_build_identity: Option<VerifiedBuildIdentity>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlWireIdentity {
+    profile: String,
+    method: ExternalControlKind,
+    request_id: String,
+    client_descriptor_sha256: String,
+}
+
+impl ControlWireIdentity {
+    fn capture(request: &ControlRequest) -> Result<Self> {
+        request.validate()?;
+        require(request.has_wire_identity())?;
+        Ok(Self {
+            profile: "ExternalV1".to_owned(),
+            method: request.kind(),
+            request_id: request.request_id().to_owned(),
+            client_descriptor_sha256: EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.to_owned(),
+        })
+    }
+
+    fn validate(&self, request: &ControlRequest) -> Result<()> {
+        require(
+            request.has_wire_identity()
+                && self.profile == "ExternalV1"
+                && self.method == request.kind()
+                && self.request_id == request.request_id()
+                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+                && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedBuildIdentity {
+    service_version: String,
+    source_revision: String,
+    contract_sha256: String,
+    binary_sha256: String,
+    identity_error: String,
+}
+
+impl VerifiedBuildIdentity {
+    fn from_qualified_health(response: &HealthResponse) -> Option<Self> {
+        crate::grpc_client::build_identity::qualify_public_health(response).ok()?;
+        let identity = response.build_identity.as_ref()?;
+        Some(Self {
+            service_version: identity.service_version.clone(),
+            source_revision: identity.source_revision.clone(),
+            contract_sha256: identity.contract_sha256.clone(),
+            binary_sha256: identity.binary_sha256.clone(),
+            identity_error: identity.identity_error.clone(),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let identity = BuildIdentity {
+            service_version: self.service_version.clone(),
+            source_revision: self.source_revision.clone(),
+            contract_sha256: self.contract_sha256.clone(),
+            binary_sha256: self.binary_sha256.clone(),
+            identity_error: self.identity_error.clone(),
+        };
+        require(crate::grpc_client::build_identity::qualify_public_build_identity(&identity).is_ok())
+    }
 }
 
 impl ControlRawResult {
@@ -821,6 +893,8 @@ impl ControlRawResult {
                 details: None,
                 trailer: Trailer::Absent,
                 diagnostic: error.safe_diagnostic().map(str::to_owned),
+                wire_identity: None,
+                verified_build_identity: None,
             },
             ExternalControlResultMaterial::Response { bytes, .. } => Self {
                 version: 2,
@@ -830,6 +904,8 @@ impl ControlRawResult {
                 details: None,
                 trailer: Trailer::Absent,
                 diagnostic: None,
+                wire_identity: None,
+                verified_build_identity: None,
             },
             ExternalControlResultMaterial::Status {
                 code,
@@ -848,16 +924,87 @@ impl ControlRawResult {
                     MacroTrailerMaterial::Malformed => Trailer::Malformed,
                 },
                 diagnostic: error.safe_diagnostic().map(str::to_owned),
+                wire_identity: None,
+                verified_build_identity: None,
             },
         }
+    }
+
+    pub(super) fn bind_external_identity(
+        &mut self,
+        request: &ControlRequest,
+        health: Option<(&ControlRequest, &[u8])>,
+    ) -> Result<()> {
+        require(
+            self.version == 2
+                && self.wire_identity.is_none()
+                && self.verified_build_identity.is_none(),
+        )?;
+        let identity = ControlWireIdentity::capture(request)?;
+        let build = match request.kind() {
+            ExternalControlKind::Health => {
+                require(health.is_none())?;
+                self.response.as_deref().and_then(|bytes| {
+                    let response = HealthResponse::decode(bytes).ok()?;
+                    (response.encode_to_vec() == bytes
+                        && response.request_id == request.request_id())
+                        .then_some(response)
+                        .as_ref()
+                        .and_then(VerifiedBuildIdentity::from_qualified_health)
+                })
+            }
+            ExternalControlKind::Capabilities => {
+                let (health_request, bytes) = health.ok_or(ChainPostCloseError::SchemaRejected)?;
+                health_request.validate()?;
+                require(
+                    health_request.has_wire_identity()
+                        && health_request.kind() == ExternalControlKind::Health
+                        && health_request.endpoint == request.endpoint
+                        && health_request.authority == request.authority
+                        && health_request.id != request.id,
+                )?;
+                let response = HealthResponse::decode(bytes)
+                    .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                require(
+                    response.encode_to_vec() == bytes
+                        && response.request_id == health_request.request_id(),
+                )?;
+                Some(
+                    VerifiedBuildIdentity::from_qualified_health(&response)
+                        .ok_or(ChainPostCloseError::SchemaRejected)?,
+                )
+            }
+        };
+        self.wire_identity = Some(identity);
+        self.verified_build_identity = build;
+        self.version = 3;
+        Ok(())
     }
 
     pub(super) fn project(
         &self,
         request: &ControlRequest,
     ) -> Result<std::result::Result<(), GatewayError>> {
-        require(matches!(self.version, 1 | 2))?;
+        require(matches!(self.version, 1 | 2 | 3))?;
         request.validate()?;
+        if self.version == 3 {
+            self.wire_identity
+                .as_ref()
+                .ok_or(ChainPostCloseError::SchemaRejected)?
+                .validate(request)?;
+            if let Some(build) = &self.verified_build_identity {
+                build.validate()?;
+            }
+            require(if request.kind() == ExternalControlKind::Capabilities {
+                self.verified_build_identity.is_some()
+            } else if self.response.is_none() {
+                self.verified_build_identity.is_none()
+            } else {
+                true
+            })?;
+        } else {
+            require(self.wire_identity.is_none() && self.verified_build_identity.is_none())?;
+        }
         match (
             self.connect_unavailable,
             &self.response,
@@ -884,6 +1031,9 @@ impl ControlRawResult {
                         if let Err(error) =
                             validate_health_response_id(request.request_id(), &response)
                         {
+                            if self.version == 3 {
+                                require(self.verified_build_identity.is_none())?;
+                            }
                             require(self.diagnostic.as_deref() == error.safe_diagnostic())?;
                             return Ok(Err(
                                 crate::data_gateway::grpc_source::map_external_connection_error(
@@ -892,6 +1042,12 @@ impl ControlRawResult {
                             ));
                         }
                         require(self.diagnostic.is_none())?;
+                        if self.version == 3 {
+                            require(
+                                self.verified_build_identity
+                                    == VerifiedBuildIdentity::from_qualified_health(&response),
+                            )?;
+                        }
                         if self.version == 1 {
                             // Preserve the meaning of historical control rows.
                             // V1 recorded only live+ready; reinterpreting its
@@ -1531,13 +1687,22 @@ mod tests {
             wrong_material = material.clone();
             wrong_material.request_id.push('X');
             assert!(stored.matches_material(&wrong_material).is_err());
-            assert!(MacroControlRecovery {
+            assert!(!MacroControlRecovery {
                 request: stored.clone(),
                 begin: Some(1),
                 result: Some(2),
                 outcome: Some(MacroControlOutcome::Ready),
                 response: None,
                 qualification_version: Some(2),
+            }
+            .authorizes_new_external_effect());
+            assert!(MacroControlRecovery {
+                request: stored.clone(),
+                begin: Some(1),
+                result: Some(2),
+                outcome: Some(MacroControlOutcome::Ready),
+                response: None,
+                qualification_version: Some(3),
             }
             .authorizes_new_external_effect());
             let original = serde_json::to_value(&stored).unwrap();
@@ -1574,6 +1739,194 @@ mod tests {
             }
             .authorizes_new_external_effect());
         }
+    }
+
+    #[test]
+    fn new_external_control_results_bind_request_and_verified_health_build() {
+        let control_request = |kind, id: &str| {
+            let context = crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                protocol_version: 1,
+                request_id: id.to_owned(),
+            };
+            ControlRequest::capture(ExternalControlRequestMaterial {
+                kind,
+                request_bytes: match kind {
+                    ExternalControlKind::Health => HealthRequest {
+                        context: Some(context),
+                    }
+                    .encode_to_vec(),
+                    ExternalControlKind::Capabilities => CapabilitiesRequest {
+                        context: Some(context),
+                    }
+                    .encode_to_vec(),
+                },
+                request_id: id.to_owned(),
+                profile: ContractProfile::ExternalV1,
+                endpoint_uri: "https://example.com".to_owned(),
+                acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
+            })
+            .unwrap()
+        };
+        let health_request = control_request(ExternalControlKind::Health, "TEST_CODE_HEALTH");
+        let health_response = HealthResponse {
+            request_id: health_request.request_id().to_owned(),
+            live: true,
+            ready: true,
+            build_identity: Some(crate::grpc_client::build_identity::test_public_build_identity()),
+            ..Default::default()
+        };
+        let health_bytes = health_response.encode_to_vec();
+        let raw_response = |bytes: &[u8]| {
+            serde_json::from_value::<ControlRawResult>(serde_json::json!({
+                "version": 2,
+                "connect_unavailable": false,
+                "response": bytes,
+                "code": null,
+                "details": null,
+                "trailer": "Absent",
+                "diagnostic": null,
+            }))
+            .unwrap()
+        };
+        let mut health_raw = raw_response(&health_bytes);
+        health_raw.bind_external_identity(&health_request, None).unwrap();
+        assert_eq!(health_raw.version(), 3);
+        assert!(health_raw.project(&health_request).unwrap().is_ok());
+        let mut mismatched_response = health_response.clone();
+        mismatched_response.request_id = "TEST_CODE_WRONG_ID".to_owned();
+        let mut mismatched_raw = raw_response(&mismatched_response.encode_to_vec());
+        mismatched_raw
+            .bind_external_identity(&health_request, None)
+            .unwrap();
+        assert!(mismatched_raw.project(&health_request).unwrap().is_err());
+        let mut fabricated = serde_json::to_value(&mismatched_raw).unwrap();
+        fabricated["verified_build_identity"] =
+            serde_json::to_value(health_raw.verified_build_identity.as_ref().unwrap()).unwrap();
+        let fabricated: ControlRawResult = serde_json::from_value(fabricated).unwrap();
+        assert!(fabricated.project(&health_request).is_err());
+        let saved = serde_json::to_value(&health_raw).unwrap();
+        for (field, replacement) in [
+            ("profile", serde_json::json!("LocalBridgeV1")),
+            ("method", serde_json::json!("Capabilities")),
+            ("request_id", serde_json::json!("TEST_CODE_WRONG_ID")),
+            ("client_descriptor_sha256", serde_json::json!("0".repeat(64))),
+        ] {
+            let mut changed = saved.clone();
+            changed["wire_identity"][field] = replacement;
+            let changed: ControlRawResult = serde_json::from_value(changed).unwrap();
+            assert!(changed.project(&health_request).is_err(), "{field}");
+        }
+        let mut changed = saved.clone();
+        changed["verified_build_identity"]["binary_sha256"] = serde_json::json!("0".repeat(64));
+        let changed: ControlRawResult = serde_json::from_value(changed).unwrap();
+        assert!(changed.project(&health_request).is_err());
+        let mut historical_v2 = saved;
+        historical_v2["version"] = serde_json::json!(2);
+        historical_v2.as_object_mut().unwrap().remove("wire_identity");
+        historical_v2
+            .as_object_mut()
+            .unwrap()
+            .remove("verified_build_identity");
+        let historical_v2: ControlRawResult = serde_json::from_value(historical_v2).unwrap();
+        assert!(historical_v2.project(&health_request).unwrap().is_ok());
+        assert_eq!(historical_v2.version(), 2);
+
+        let capabilities_request =
+            control_request(ExternalControlKind::Capabilities, "TEST_CODE_CAPABILITIES");
+        let capabilities_response = CapabilitiesResponse {
+            request_id: capabilities_request.request_id().to_owned(),
+            ..Default::default()
+        };
+        let mut capabilities_raw = raw_response(&capabilities_response.encode_to_vec());
+        capabilities_raw
+            .bind_external_identity(
+                &capabilities_request,
+                Some((&health_request, health_bytes.as_slice())),
+            )
+            .unwrap();
+        assert_eq!(capabilities_raw.version(), 3);
+        assert!(capabilities_raw.verified_build_identity.is_some());
+        assert!(capabilities_raw.project(&capabilities_request).is_ok());
+        let mut missing_build = serde_json::to_value(&capabilities_raw).unwrap();
+        missing_build
+            .as_object_mut()
+            .unwrap()
+            .remove("verified_build_identity");
+        let missing_build: ControlRawResult = serde_json::from_value(missing_build).unwrap();
+        assert!(missing_build.project(&capabilities_request).is_err());
+        let mut wrong_health = health_response;
+        wrong_health.build_identity.as_mut().unwrap().binary_sha256.push('X');
+        let mut raw = raw_response(&capabilities_response.encode_to_vec());
+        assert!(raw
+            .bind_external_identity(
+                &capabilities_request,
+                Some((&health_request, wrong_health.encode_to_vec().as_slice())),
+            )
+            .is_err());
+        let mut other_health_request = health_request.clone();
+        other_health_request.endpoint = "https://other.example.com".to_owned();
+        let mut raw = raw_response(&capabilities_response.encode_to_vec());
+        assert!(raw
+            .bind_external_identity(
+                &capabilities_request,
+                Some((&other_health_request, health_bytes.as_slice())),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn external_v3_control_status_conflicting_carriers_drop_provider_evidence() {
+        let id = "TEST_CODE_CONTROL_STATUS";
+        let request = ControlRequest::capture(ExternalControlRequestMaterial {
+            kind: ExternalControlKind::Health,
+            request_bytes: HealthRequest {
+                context: Some(
+                    crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                        protocol_version: 1,
+                        request_id: id.to_owned(),
+                    },
+                ),
+            }
+            .encode_to_vec(),
+            request_id: id.to_owned(),
+            profile: ContractProfile::ExternalV1,
+            endpoint_uri: "https://example.com".to_owned(),
+            acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
+        })
+        .unwrap();
+        let detail = crate::grpc_client::external_pb::magic::market::v1::ErrorDetail {
+            request_id: id.to_owned(),
+            provider: "Eastmoney".to_owned(),
+            reason_code: "unavailable".to_owned(),
+            retryable: false,
+            ..Default::default()
+        };
+        let mut conflict = detail.clone();
+        conflict.reason_code = "provider_unavailable".to_owned();
+        let status = |trailer: Vec<u8>| {
+            let mut raw: ControlRawResult = serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "connect_unavailable": false,
+                "response": null,
+                "code": 14,
+                "details": detail.encode_to_vec(),
+                "trailer": { "Bytes": trailer },
+                "diagnostic": null,
+            }))
+            .unwrap();
+            raw.bind_external_identity(&request, None).unwrap();
+            raw
+        };
+        let matched = status(detail.encode_to_vec())
+            .project(&request)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(matched.provider(), Some(crate::market_domain::ProviderId::Eastmoney));
+        let conflicting = status(conflict.encode_to_vec())
+            .project(&request)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(conflicting.provider(), None);
     }
 
     fn external_v2_material(

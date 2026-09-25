@@ -509,7 +509,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             // readable, but lack the identities required for a new data effect.
             require(current.readiness_episodes.first().is_some_and(|episode| {
                 episode.controls.first().is_some_and(|health| {
-                    health.qualification_version == Some(2)
+                    health.qualification_version == Some(3)
                         && health.request.has_wire_identity()
                 })
             }))?;
@@ -610,7 +610,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         control.request.matches_material(&material)?;
         let health_result = if ordinal == 2 {
             require(episode.controls[0].outcome == Some(old::MacroControlOutcome::Ready))?;
-            require(episode.controls[0].qualification_version == Some(2)
+            require(episode.controls[0].qualification_version == Some(3)
                 && episode.controls[0].request.has_wire_identity())?;
             Some(
                 episode.controls[0]
@@ -779,7 +779,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
     pub(super) fn record_control(
         &mut self,
         mut ticket: Ticket,
-        raw: codec::ControlRawResult,
+        mut raw: codec::ControlRawResult,
     ) -> anyhow::Result<Snapshot> {
         let (ordinal, kind) = match ticket.step {
             Step::Health => (1, "Health"),
@@ -810,6 +810,25 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             .and_then(|episode| episode.controls.get(ordinal as usize - 1))
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         require(control.begin == Some(ticket.begin) && control.result.is_none())?;
+        if control.request.has_wire_identity() {
+            let health = if ordinal == 2 {
+                let health = current
+                    .readiness_episodes
+                    .first()
+                    .and_then(|episode| episode.controls.first())
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                Some((
+                    &health.request,
+                    health
+                        .response
+                        .as_deref()
+                        .ok_or(ChainPostCloseError::SchemaRejected)?,
+                ))
+            } else {
+                None
+            };
+            raw.bind_external_identity(&control.request, health)?;
+        }
         let projected = raw.project(&control.request)?;
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);

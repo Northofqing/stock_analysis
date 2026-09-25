@@ -178,7 +178,11 @@ async fn single_user_external_macro_confirmed_health_then_capabilities_connect_f
             control_tests::assert_response_raw(&health_raw, &checkpoint.health.response_bytes);
             let capabilities_raw =
                 control_tests::raw_control_bytes(&database, &baseline.intent, 2);
-            control_tests::assert_connect_unavailable_raw(&capabilities_raw);
+            control_tests::assert_connect_unavailable_raw(
+                &capabilities_raw,
+                crate::grpc_client::client::external_control_attempt::ExternalControlKind::Capabilities,
+                &checkpoint.capabilities.id,
+            );
             let receipt = control_tests::assert_connect_unavailable_source(&terminal);
             assert_eq!(
                 terminal.pending_source_identities(),
