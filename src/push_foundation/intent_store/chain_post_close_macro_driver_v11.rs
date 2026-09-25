@@ -317,6 +317,11 @@ async fn drive_external(
                 intent,
             ));
         }
+        if !controls[0].authorizes_new_external_effect() {
+            // Historical V1 Ready remains a confirmed fact, but its missing
+            // build identity cannot authorize another control or data effect.
+            return Err(pending());
+        }
         if controls[1].begin_version().is_none() {
             let mut attempt = prepared
                 .resume_capabilities_attempt(controls[1].request_material())

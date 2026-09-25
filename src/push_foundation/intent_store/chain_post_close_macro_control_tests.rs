@@ -17,12 +17,226 @@ use crate::grpc_client::pb::magic::market::v1::{
     AdmissionState as LocalAdmissionState, Operation as LocalOperation,
 };
 use crate::push_foundation::intent_store::chain_post_close::macro_codec;
+use crate::push_foundation::intent_store::chain_post_close::macro_driver_v11;
 use crate::push_foundation::intent_store::chain_post_close::macro_stage::MacroControlOutcome;
 
 const AUTHORITY: &str = "grpc-mtls:macro.test.invalid";
 const STARTED_LOCAL: &str = "2026-09-14T15:31:00+08:00";
 const OBSERVED_UTC: &str = "2026-09-14T07:31:00+00:00";
 const REQUEST_HASH: &str = "fb86badeeebfca14c04928026fe295416a2a47c6534250291c066f3a74b67b9c";
+
+#[tokio::test]
+async fn historical_unqualified_health_cannot_begin_capabilities_after_reopen() {
+    let mut business = V2BusinessFixture::new();
+    let mut parent_server = None;
+    let baseline = setup_external_parent(
+        &mut business,
+        &mut parent_server,
+        "TEST_CODE_LEGACY_HEALTH_ADMISSION",
+    )
+    .await;
+    let external = ExternalMtlsMacroFixture::bind_data_success_for_test()
+        .await
+        .unwrap();
+    let source =
+        GrpcSource::from_external_macro_bundle_for_test(external.bundle_path().to_path_buf());
+    let started = micros(STARTED_LOCAL);
+    let clock = MacroClock {
+        now: Cell::new(UtcMicros::try_new(started).unwrap()),
+        observation: DateTime::parse_from_rfc3339(STARTED_LOCAL).unwrap(),
+        observation_calls: Cell::new(0),
+    };
+    let search = macro_search_service(&[GeneralWebResearchProvider::SerpApi]);
+    let database = business.database();
+    let mut local = business
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&baseline.config)
+        .unwrap();
+    let lease = local
+        .resume_run(
+            &baseline.intent,
+            macro_lease(
+                "TEST_CODE_LEGACY_HEALTH_OWNER_A",
+                started,
+                started + 2_000_000,
+                baseline.head,
+            ),
+        )
+        .unwrap();
+    let mut drive = Box::pin(macro_driver_v11::drive(
+        &mut local,
+        lease,
+        &source,
+        &clock,
+        Rc::new(Cell::new(false)),
+        &search,
+    ));
+    let watchdog = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut drive => panic!("Health drive returned early"),
+            _ = tokio::task::yield_now() => {}
+        }
+        if !external.snapshot().health_requests.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < watchdog,
+            "Health receipt watchdog"
+        );
+    }
+    external.release_health();
+    let ready = async {
+        let watchdog = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut reader = BusinessIntentStore::open(&database).unwrap();
+            let mut read_local = reader
+                .single_user_local_chain_post_close(&baseline.config)
+                .unwrap();
+            let recovery = read_local.inspect_macro(&baseline.intent).unwrap();
+            drop(read_local);
+            reader.connection.close().unwrap();
+            let health = &recovery.readiness_episodes()[0].controls()[0];
+            if health.outcome() == Some(MacroControlOutcome::Ready) {
+                assert_eq!(
+                    recovery.readiness_episodes()[0].controls()[1].begin_version(),
+                    None
+                );
+                break recovery;
+            }
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "Health result watchdog"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
+    let confirmed = tokio::select! {
+        biased;
+        recovery = ready => recovery,
+        _ = &mut drive => panic!("Health drive escaped result boundary"),
+    };
+    drop(drive);
+    drop(local);
+    let original_head = business
+        .connection()
+        .query_row(
+            "SELECT head_version FROM chain_post_close_runs WHERE intent_id=?1",
+            [baseline.intent.as_str()],
+            |row| row.get::<_, u64>(0),
+        )
+        .unwrap();
+    let original_request_id = confirmed.readiness_episodes()[0].controls()[0]
+        .request_id()
+        .to_owned();
+    let original_deadline = confirmed.plan().deadline_at();
+
+    // Reconstruct a valid historical V1 Health fact: it recorded live+ready,
+    // but neither the row nor its response carried a verified build identity.
+    let connection = business.connection();
+    let original: Vec<u8> = connection.query_row(
+        "SELECT bytes FROM chain_post_close_macro_control_attempt_results WHERE intent_id=?1 AND control_ordinal=1",
+        [baseline.intent.as_str()], |row| row.get(0),
+    ).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let mut response = HealthResponse::decode(
+        serde_json::from_value::<Vec<u8>>(value["response"].clone())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    response.build_identity = None;
+    value["version"] = serde_json::json!(1);
+    value["response"] = serde_json::to_value(response.encode_to_vec()).unwrap();
+    let historical: macro_codec::ControlRawResult = serde_json::from_value(value).unwrap();
+    let bytes = macro_codec::encode(&historical).unwrap();
+    let trigger: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='chain_post_close_macro_control_attempt_results_update'",
+        [], |row| row.get(0),
+    ).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER chain_post_close_macro_control_attempt_results_update")
+        .unwrap();
+    connection.execute(
+        "UPDATE chain_post_close_macro_control_attempt_results SET bytes=?1,byte_length=?2,sha256=?3 WHERE intent_id=?4 AND control_ordinal=1",
+        rusqlite::params![bytes, bytes.len(), raw_digest(&bytes).as_str(), baseline.intent.as_str()],
+    ).unwrap();
+    connection.execute_batch(&trigger).unwrap();
+    business.reopen();
+
+    let before = external.snapshot();
+    assert_eq!(before.capabilities_calls, 0);
+    assert_eq!(before.data_calls, 0);
+    let reopened_source =
+        GrpcSource::from_external_macro_bundle_for_test(external.bundle_path().to_path_buf());
+    let reopened_clock = MacroClock {
+        now: Cell::new(UtcMicros::try_new(started + 3_000_000).unwrap()),
+        observation: DateTime::parse_from_rfc3339(STARTED_LOCAL).unwrap(),
+        observation_calls: Cell::new(0),
+    };
+    let mut local = business
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&baseline.config)
+        .unwrap();
+    let recovered = local.inspect_macro(&baseline.intent).unwrap();
+    assert_eq!(recovered.plan().deadline_at(), original_deadline);
+    let health = &recovered.readiness_episodes()[0].controls()[0];
+    assert_eq!(health.request_id(), original_request_id);
+    assert_eq!(health.outcome(), Some(MacroControlOutcome::Ready));
+    assert_eq!(health.qualification_version, Some(1));
+    let lease = local
+        .resume_run(
+            &baseline.intent,
+            macro_lease(
+                "TEST_CODE_LEGACY_HEALTH_OWNER_B",
+                started + 3_000_000,
+                started + 10_000_000,
+                original_head,
+            ),
+        )
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        macro_driver_v11::drive(
+            &mut local,
+            lease,
+            &reopened_source,
+            &reopened_clock,
+            Rc::new(Cell::new(false)),
+            &search,
+        ),
+    )
+    .await
+    .expect("historical Health admission watchdog");
+    let error = result.err().expect("historical Health must stay pending");
+    assert!(matches!(
+        error.downcast_ref::<PreparationStop>(),
+        Some(PreparationStop::StageNotMigrated {
+            next: UnmigratedStage::Macro
+        })
+    ));
+    assert_eq!(
+        external.snapshot(),
+        before,
+        "historical Health must cause no new RPC"
+    );
+    let after = local.inspect_macro(&baseline.intent).unwrap();
+    assert_eq!(after.plan().deadline_at(), original_deadline);
+    assert_eq!(
+        after.readiness_episodes()[0].controls()[0].request_id(),
+        original_request_id
+    );
+    assert_eq!(
+        after.readiness_episodes()[0].controls()[1].begin_version(),
+        None
+    );
+    assert!(after.attempts().is_empty());
+}
 
 pub(super) struct ExternalParentBaseline {
     pub(super) endpoint: String,

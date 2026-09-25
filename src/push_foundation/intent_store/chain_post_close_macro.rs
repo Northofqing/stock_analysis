@@ -185,6 +185,9 @@ impl MacroControlRecovery {
     pub(crate) fn outcome(&self) -> Option<MacroControlOutcome> {
         self.outcome
     }
+    pub(crate) fn authorizes_new_external_effect(&self) -> bool {
+        self.outcome == Some(MacroControlOutcome::Ready) && self.qualification_version == Some(2)
+    }
     pub(crate) fn response_bytes(&self) -> Option<&[u8]> {
         self.response.as_deref()
     }
@@ -1503,7 +1506,7 @@ impl LocalChainPostClose<'_> {
         )?;
         let health_result = if control_ordinal == 2 {
             let health = &episode.controls[0];
-            require(health.outcome == Some(MacroControlOutcome::Ready))?;
+            require(health.authorizes_new_external_effect())?;
             health.result
         } else {
             None
@@ -1696,10 +1699,13 @@ impl LocalChainPostClose<'_> {
         let request_sha = raw_digest(&request.bytes).as_str().to_owned();
         let readiness_result =
             if recovery.plan.profile() == crate::grpc_client::client::ContractProfile::ExternalV1 {
-                recovery
+                let episode = recovery
                     .readiness_episodes
                     .first()
-                    .and_then(MacroReadinessEpisodeRecovery::ready_result_version)
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                require(episode.controls[0].authorizes_new_external_effect())?;
+                episode
+                    .ready_result_version()
                     .ok_or(ChainPostCloseError::SchemaRejected)
                     .map(Some)?
             } else {
