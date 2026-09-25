@@ -278,6 +278,20 @@ impl GatewayError {
         }
     }
 
+    pub fn retired_operation(
+        capability: &'static str,
+        provider: Option<ProviderId>,
+    ) -> Self {
+        Self {
+            capability,
+            provider,
+            audit_outcome: "unavailable",
+            reason_code: "operation_retired",
+            retryable: false,
+            message: "gRPC operation is retired; use a versioned replacement".to_owned(),
+        }
+    }
+
     pub(super) fn invalid_evidence(
         capability: &'static str,
         provider: Option<ProviderId>,

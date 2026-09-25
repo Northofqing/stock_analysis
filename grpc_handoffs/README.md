@@ -10,6 +10,8 @@
 
 上线前身份对账：[ExternalV1 Health 构建身份资格](2026-09-25-external-build-identity-qualification.md)。仓内客户端已钉住公开部署元数据；当前服务是否仍匹配须由上游提供当次构建身份和真实 Health 证据。
 
+退役调用处理：[生产宏观搜索的 EconomicCalendar 停止调用与新产品边界](2026-09-25-retired-economic-calendar-production-path.md)。旧审计身份保留，生产宏观搜索明确报告 `operation_retired`；两个新经济数据产品仍需分别接线和真实批次验收。
+
 ## 范围
 
 - 运行事实只覆盖 2026-09-16 00:47–00:49（Asia/Shanghai）的本机 `127.0.0.1:18082`：两次运行 GetHealth 检查命令都在 dial 阶段超时，没有 HealthResponse、Capabilities，也没有已发送业务 RPC 的证据。

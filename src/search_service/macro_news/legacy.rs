@@ -13,6 +13,7 @@ use crate::data_gateway::grpc_source::{
     GrpcSource,
 };
 use crate::data_gateway::{GatewayError, GlobalNewsProvider};
+use crate::market_domain::ProviderId;
 use crate::grpc_client::client::{
     external_control_attempt::ExternalControlCompletion,
     macro_attempt::{
@@ -220,6 +221,20 @@ impl<'providers> MacroStepIo for Legacy<'providers> {
     type Call = BoxFuture<'providers, anyhow::Result<Returned<Step, Material>>>;
     type Wait = BoxFuture<'providers, anyhow::Result<()>>;
     fn open(&mut self) -> anyhow::Result<Snapshot> {
+        // Keep Gateway(5)'s historical identity and audit slot, but never
+        // acquire the retired EconomicCalendar RPC in the live Legacy search.
+        let economic = QueryKey::Gateway(5);
+        if self.state.terminal(economic).is_none() {
+            self.terminal(
+                economic,
+                QueryOutcome::Native(NativeOutcome::Economic(Err(
+                    GatewayError::retired_operation(
+                        crate::data_gateway::economic_calendar::CAPABILITY,
+                        Some(ProviderId::Jin10),
+                    ),
+                ))),
+            );
+        }
         // Initialization can fail before the first scheduling step; settle the
         // five logical Gateway acquisitions just as the old wrappers did.
         for ordinal in 1..=5 {
@@ -629,5 +644,54 @@ impl<'providers> MacroStepIo for Legacy<'providers> {
                 anyhow::bail!("Legacy Macro cannot manufacture a durable budget terminal")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn live_legacy_macro_keeps_retired_economic_slot_without_acquiring_it() {
+        crate::database::DatabaseManager::init(None).expect("isolated unit-test audit database");
+        let mut adapter = Legacy {
+            registrations: &[],
+            source: None,
+            local: None,
+            external: None,
+            requests: BTreeMap::new(),
+            audited: BTreeSet::new(),
+            started: tokio::time::Instant::now(),
+            version: 0,
+            state: Snapshot {
+                budget: BudgetMode::CallerOwned,
+                definition: Definition {
+                    observed_date: "2026年09月25日".to_owned(),
+                    research_limit: 3,
+                    candidates: Vec::new(),
+                    external_news: false,
+                },
+                local: RouteState::Unprepared,
+                external: RouteState::Ready,
+                queries: BTreeMap::new(),
+                dimensions: BTreeMap::new(),
+                final_output: None,
+            },
+        };
+        let snapshot = adapter.open().expect("retired slot settles");
+        let Some(QueryOutcome::Native(NativeOutcome::Economic(Err(error)))) =
+            snapshot.terminal(QueryKey::Gateway(5))
+        else {
+            panic!("retired economic slot must be an explicit failure");
+        };
+        assert_eq!(error.reason_code(), "operation_retired");
+        assert!(!error.retryable());
+        assert!(super::super::render_release_section(Err(error.clone()))
+            .contains("reason_code=operation_retired"));
+        assert!(adapter.audited.contains(&QueryKey::Gateway(5)));
+        assert!(adapter.requests.is_empty());
+        assert!(snapshot.terminal(QueryKey::Gateway(1)).is_none());
     }
 }
