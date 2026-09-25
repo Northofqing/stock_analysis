@@ -123,6 +123,7 @@ impl SystemService for ExternalQueryWireService {
             ExternalCapabilitiesBehavior::Auction
                 | ExternalCapabilitiesBehavior::ReleaseObservations
                 | ExternalCapabilitiesBehavior::ReleaseSchedule
+                | ExternalCapabilitiesBehavior::CatalogLifecycle
         ) {
             return Err(Status::unimplemented(
                 "TEST_CODE External query wire Health is out of scope",
@@ -935,6 +936,14 @@ impl ExternalQueryWireFixture {
     pub(crate) async fn bind_catalog_lifecycle() -> Result<Self, String> {
         Self::bind_catalog_scenario(
             ExternalQueryWireReply::CatalogLifecycleStatus,
+            ExternalCapabilitiesBehavior::CatalogLifecycle,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_catalog_lifecycle_requested_provider() -> Result<Self, String> {
+        Self::bind_catalog_scenario(
+            ExternalQueryWireReply::CatalogRequestedProviderStatus,
             ExternalCapabilitiesBehavior::CatalogLifecycle,
         )
         .await

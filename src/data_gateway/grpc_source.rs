@@ -3087,6 +3087,12 @@ impl GrpcSource {
                 .await
                 .map_err(map_external_connection_error)?;
             require_external_capability(&capabilities, method)?;
+            self.external_client
+                .lock()
+                .await
+                .as_mut()
+                .expect("cached ExternalV1 client exists during qualification")
+                .client = client;
             return Ok(());
         }
         let bundle = self.external_bundle.as_ref().ok_or_else(|| {
@@ -4210,13 +4216,112 @@ pub async fn fetch_chain_batch_grpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc_client::client::external_query_wire_fixture::ExternalQueryWireFixture;
     use crate::grpc_client::errors::{ErrorDetail, GrpcError};
     use crate::grpc_client::pb::magic::market::v1 as pb;
     use crate::market_domain::ProviderId;
     use chrono::TimeZone;
+    use futures::FutureExt as _;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
-                        // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+    // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_cached_capabilities_refresh_updates_status_catalog() {
+        let mut fixture = Some(
+            ExternalQueryWireFixture::bind_catalog_lifecycle_requested_provider()
+                .await
+                .unwrap(),
+        );
+        let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            async {
+                let fixture = fixture.as_ref().unwrap();
+                let source = GrpcSource::from_external_macro_bundle_for_test(
+                    fixture.bundle_path().to_path_buf(),
+                );
+                let method = known_external_method(ExternalOperation::GlobalNews);
+
+                fixture.release_capabilities();
+                source
+                    .ensure_external_connected(method)
+                    .await
+                    .expect_err("TEST_CODE first Capabilities request ID is wrong");
+                fixture.release_capabilities();
+                source.ensure_external_connected(method).await.unwrap();
+                let mut initial = source
+                    .external_client
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .clone();
+                fixture.release();
+                let eastmoney = initial
+                    .query(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .expect_err("TEST_CODE catalog status");
+                assert!(eastmoney.details().provider_attempts.accepted().is_some());
+
+                fixture.release_capabilities();
+                source
+                    .ensure_external_connected(method)
+                    .await
+                    .expect_err("TEST_CODE Capabilities refresh unavailable");
+                fixture.release_capabilities();
+                source
+                    .ensure_external_connected(method)
+                    .await
+                    .expect_err("TEST_CODE replacement Capabilities request ID is wrong");
+                fixture.release_capabilities();
+                source.ensure_external_connected(method).await.unwrap();
+
+                let mut refreshed = source
+                    .external_client
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .clone();
+                fixture.release();
+                let cailianpress = refreshed
+                    .query(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Cailianpress","limit":20}),
+                    )
+                    .await
+                    .expect_err("TEST_CODE replacement catalog status");
+                assert!(cailianpress
+                    .details()
+                    .provider_attempts
+                    .accepted()
+                    .is_some());
+                fixture.release();
+                let removed = refreshed
+                    .query(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .expect_err("TEST_CODE removed catalog status");
+                assert!(removed.details().provider_attempts.accepted().is_none());
+                assert_eq!(fixture.snapshot().capabilities_calls, 5);
+            },
+        ))
+        .catch_unwind()
+        .await;
+
+        fixture.take().unwrap().finish().await.unwrap();
+        match body {
+            Ok(result) => result.expect("TEST_CODE catalog refresh deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 
     #[test]
     fn br161_market_announcements_request_binds_business_date_and_limit_to_wire() {
