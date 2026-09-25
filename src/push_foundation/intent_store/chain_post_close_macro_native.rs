@@ -167,7 +167,7 @@ impl DataResult {
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
         provider_catalog: Option<&ExternalProviderCatalog>,
     ) -> Result<Self> {
-        let raw = RawResult::capture_external(completion);
+        let raw = RawResult::capture_external_bound(completion, identity, request)?;
         let (processed, _, _) = raw.project_for(identity, request, attempt, provider_catalog)?;
         let native = native_bytes(&NativeOutcome::project(
             identity,

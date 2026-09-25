@@ -284,7 +284,7 @@ fn prepare_damage(
         }
         CorruptionCase::DataRawVersion => {
             let original = blob(row, 9);
-            let damaged = replace_once(&original, br#""version":2"#, br#""version":3"#);
+            let damaged = replace_once(&original, br#""version":3"#, br#""version":4"#);
             let (length, digest) = blob_digest(&damaged);
             row[9] = rusqlite::types::Value::Blob(damaged.clone());
             row[10] = rusqlite::types::Value::Integer(length);

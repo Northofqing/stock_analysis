@@ -474,8 +474,10 @@ async fn single_user_external_v12_macro_provider_attempts_survive_complete_stage
                 let result_json: serde_json::Value =
                     serde_json::from_slice(&result_bytes).unwrap();
                 assert_eq!(result_json["version"], 2);
-                assert_eq!(result_json["raw"]["version"], 2);
+                assert_eq!(result_json["raw"]["version"], 3);
                 assert!(result_json["raw"]["external_wire"].is_object());
+                assert_eq!(result_json["raw"]["wire_identity"]["profile"], "ExternalV1");
+                assert_eq!(result_json["raw"]["wire_identity"]["method"], "OPERATION_GLOBAL_NEWS");
 
                 let terminal_bytes =
                     query_terminal_bytes(&fact_reader, &baseline.intent, gateway);

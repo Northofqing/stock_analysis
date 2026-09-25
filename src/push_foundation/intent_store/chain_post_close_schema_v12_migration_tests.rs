@@ -946,6 +946,53 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
                 parent_server.as_ref().unwrap().membership_snapshot();
             let audit_before = business.count("data_acquisition_audit");
 
+            // The current writer emits RawResult V3. Rebuild only this test
+            // fixture's confirmed data row as its original V2 format so the
+            // migration still proves historical bytes remain readable.
+            let connection = business.connection();
+            let current: Vec<u8> = connection
+                .query_row(
+                    "SELECT bytes FROM chain_post_close_macro_attempt_results WHERE intent_id=?1",
+                    [intent.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut historical: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            assert_eq!(historical["version"], 3);
+            assert!(historical
+                .as_object_mut()
+                .unwrap()
+                .remove("wire_identity")
+                .is_some());
+            historical["version"] = serde_json::json!(2);
+            let historical: macro_codec::RawResult = serde_json::from_value(historical).unwrap();
+            let historical_bytes = macro_codec::encode(&historical).unwrap();
+            let trigger: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='chain_post_close_macro_attempt_results_update'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute_batch("DROP TRIGGER chain_post_close_macro_attempt_results_update")
+                .unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE chain_post_close_macro_attempt_results SET bytes=?1,byte_length=?2,sha256=?3 WHERE intent_id=?4",
+                        rusqlite::params![
+                            historical_bytes,
+                            historical_bytes.len(),
+                            raw_digest(&historical_bytes).as_str(),
+                            intent.as_str()
+                        ],
+                    )
+                    .unwrap(),
+                1
+            );
+            connection.execute_batch(&trigger).unwrap();
+
             let old_begin: (u64, Vec<u8>, i64, String) = business
                 .connection()
                 .query_row(
@@ -1283,8 +1330,9 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
             assert_eq!(native_result_json["version"], serde_json::json!(2));
             assert_eq!(native_result_json["query"], serde_json::json!({"Gateway": 2}));
             assert_eq!(native_result_json["attempt"], serde_json::json!(1));
-            assert_eq!(native_result_json["raw"]["version"], serde_json::json!(2));
+            assert_eq!(native_result_json["raw"]["version"], serde_json::json!(3));
             assert!(native_result_json["raw"].get("external_wire").is_some());
+            assert_eq!(native_result_json["raw"]["wire_identity"]["profile"], "ExternalV1");
             assert!(native_result_json.get("native").is_some());
             assert!(native_result_json.get("native_sha256").is_some());
             assert_eq!(native_response, external_server.as_ref().unwrap().snapshot().data_responses[1]);

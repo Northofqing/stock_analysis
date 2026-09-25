@@ -835,13 +835,12 @@ async fn single_user_external_macro_confirmed_data_retry_reopens_after_remaining
             assert_eq!(ErrorDetail::decode(status_details.as_slice()).unwrap(), expected_detail);
             let first_raw = data_result_bytes(&database, &intent, 1);
             let first_raw_json: serde_json::Value = serde_json::from_slice(&first_raw).unwrap();
-            // An External status carries the captured (empty) body material, so
-            // the raw result is v2 and binds the client descriptor.
-            assert_eq!(first_raw_json.as_object().unwrap().len(), 10);
+            // New External status facts bind the request and descriptor in V3.
+            assert_eq!(first_raw_json.as_object().unwrap().len(), 11);
             assert_eq!(
                 first_raw_json,
                 serde_json::json!({
-                    "version": 2,
+                    "version": 3,
                     "connect_unavailable": false,
                     "response": null,
                     "code": tonic::Code::Unavailable as i32,
@@ -862,6 +861,13 @@ async fn single_user_external_macro_confirmed_data_retry_reopens_after_remaining
                                     crate::grpc_client::external_query_transport::EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
                             }
                         }
+                    },
+                    "wire_identity": {
+                        "profile": "ExternalV1",
+                        "method": "OPERATION_GLOBAL_NEWS",
+                        "request_id": checkpoint.data.id,
+                        "client_descriptor_sha256":
+                            crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
                     },
                 })
             );
@@ -1151,7 +1157,7 @@ async fn single_user_external_macro_confirmed_data_retry_reopens_after_remaining
             assert_eq!(second.response_bytes(), Some(response_bytes.as_slice()));
             let second_raw = data_result_bytes(&database, &intent, 2);
             let second_raw_json: serde_json::Value = serde_json::from_slice(&second_raw).unwrap();
-            assert_eq!(second_raw_json["version"], 2);
+            assert_eq!(second_raw_json["version"], 3);
             assert_eq!(second_raw_json["connect_unavailable"], false);
             assert_eq!(
                 second_raw_json["response"],
@@ -1164,6 +1170,9 @@ async fn single_user_external_macro_confirmed_data_retry_reopens_after_remaining
             assert_eq!(second_raw_json["decision"], "NoRetry");
             assert!(second_raw_json["backoff_ms"].is_null());
             let external_wire = &second_raw_json["external_wire"];
+            assert_eq!(second_raw_json["wire_identity"]["profile"], "ExternalV1");
+            assert_eq!(second_raw_json["wire_identity"]["method"], "OPERATION_GLOBAL_NEWS");
+            assert_eq!(second_raw_json["wire_identity"]["request_id"], checkpoint.data.id);
             assert_eq!(
                 external_wire["material"],
                 "external-unary-response-evidence-v1"
@@ -1749,7 +1758,7 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
             assert_eq!(
                 raw_json,
                 serde_json::json!({
-                    "version": 2,
+                    "version": 3,
                     "connect_unavailable": false,
                     "response": null,
                     "code": null,
@@ -1764,9 +1773,15 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
                         "method": "OPERATION_GLOBAL_NEWS",
                         "client_descriptor_sha256": EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
                         "evidence": case.evidence_json(),
-                    }
+                    },
+                    "wire_identity": {
+                        "profile": "ExternalV1",
+                        "method": "OPERATION_GLOBAL_NEWS",
+                        "request_id": checkpoint.data.id,
+                        "client_descriptor_sha256": EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                    },
                 }),
-                "{} exact committed RawResult V2",
+                "{} exact committed RawResult V3",
                 case.label()
             );
             let recovered = local.inspect_macro(&baseline.intent).unwrap();
@@ -1959,6 +1974,46 @@ async fn single_user_external_macro_real_v2_tamper_rejects_before_any_resend() {
             )
             .await;
             let database = business.database();
+            // Preserve the original V2 corruption matrix after the live
+            // writer advanced to V3. This row has already been confirmed;
+            // only its test fixture representation is restored to V2.
+            let current = data_result_bytes(&database, &confirmed.intent, 1);
+            let mut historical: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            assert_eq!(historical["version"], 3);
+            assert!(historical
+                .as_object_mut()
+                .unwrap()
+                .remove("wire_identity")
+                .is_some());
+            historical["version"] = serde_json::json!(2);
+            let historical: macro_codec::RawResult = serde_json::from_value(historical).unwrap();
+            let historical_bytes = macro_codec::encode(&historical).unwrap();
+            let connection = business.connection();
+            let trigger: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='chain_post_close_macro_attempt_results_update'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute_batch("DROP TRIGGER chain_post_close_macro_attempt_results_update")
+                .unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE chain_post_close_macro_attempt_results SET bytes=?1,byte_length=?2,sha256=?3 WHERE intent_id=?4 AND attempt_ordinal=1",
+                        rusqlite::params![
+                            historical_bytes,
+                            historical_bytes.len(),
+                            raw_digest(&historical_bytes).as_str(),
+                            confirmed.intent.as_str()
+                        ],
+                    )
+                    .unwrap(),
+                1
+            );
+            connection.execute_batch(&trigger).unwrap();
             let legal = data_result_bytes(&database, &confirmed.intent, 1);
             let legal_json: serde_json::Value = serde_json::from_slice(&legal).unwrap();
             assert_eq!(legal_json["version"], 2);

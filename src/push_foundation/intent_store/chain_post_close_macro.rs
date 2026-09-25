@@ -1754,7 +1754,14 @@ impl LocalChainPostClose<'_> {
             crate::grpc_client::client::ContractProfile::LocalBridgeV1,
             &completion.processed,
         );
-        self.record_macro_raw_result(lease, call, raw, expected, now)
+        self.record_macro_raw_result(
+            lease,
+            call,
+            raw,
+            crate::grpc_client::client::ContractProfile::LocalBridgeV1,
+            expected,
+            now,
+        )
     }
 
     pub(super) fn record_external_macro_result(
@@ -1777,14 +1784,22 @@ impl LocalChainPostClose<'_> {
                 ))
             }
         };
-        self.record_macro_raw_result(lease, call, raw, expected, now)
+        self.record_macro_raw_result(
+            lease,
+            call,
+            raw,
+            crate::grpc_client::client::ContractProfile::ExternalV1,
+            expected,
+            now,
+        )
     }
 
     fn record_macro_raw_result(
         &mut self,
         mut lease: RunLease,
         call: Call,
-        raw: RawResult,
+        mut raw: RawResult,
+        profile: crate::grpc_client::client::ContractProfile,
         expected_gateway: NewsResult,
         now: UtcMicros,
     ) -> Result<RunLease> {
@@ -1801,6 +1816,7 @@ impl LocalChainPostClose<'_> {
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         require(
             recovery.has_unconfirmed_effect()
+                && recovery.plan.profile() == profile
                 && last.ordinal == call.ordinal
                 && last.begin == call.begin
                 && call.intent == lease.intent_id.as_str()
@@ -1812,6 +1828,9 @@ impl LocalChainPostClose<'_> {
                 && call.readiness_result == last.readiness_result
                 && call.request_sha == raw_digest(&recovery.plan.request.bytes).as_str(),
         )?;
+        if profile == crate::grpc_client::client::ContractProfile::ExternalV1 {
+            raw.bind_external_identity(&codec::first_identity(), &recovery.plan.request)?;
+        }
         let provider_catalog =
             historical_provider_catalog(&recovery.readiness_episodes, last.readiness_result);
         let (gateway, _, _) =

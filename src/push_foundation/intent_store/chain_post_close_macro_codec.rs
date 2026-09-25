@@ -32,7 +32,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
 };
 use crate::grpc_client::external_query_transport::{
     admit_external_payload, wire_error, ExternalQueryMethod, ExternalWireEvidenceV1,
-    ExternalWireMaterialV1,
+    ExternalWireMaterialV1, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
 };
 use crate::grpc_client::pb::magic::market::v1::{Operation, QueryRequest, QueryResponse};
 use crate::grpc_client::provider_attempts::{ExternalProviderCatalog, ProviderAttempts};
@@ -980,6 +980,42 @@ pub(super) struct RecoveredResult {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWireIdentity {
+    profile: String,
+    method: ExternalQueryMethod,
+    request_id: String,
+    client_descriptor_sha256: String,
+}
+
+impl RawWireIdentity {
+    fn capture(request: &Request, identity: &MacroQueryIdentity) -> Result<Self> {
+        request.validate_for(identity)?;
+        require(
+            request.checked_contract_profile()? == ContractProfile::ExternalV1
+                && identity.method(ContractProfile::ExternalV1)
+                    == Some(MethodIdentity::External(external_global_news())),
+        )?;
+        Ok(Self {
+            profile: "ExternalV1".to_owned(),
+            method: ExternalQueryMethod::GlobalNews,
+            request_id: request.id.clone(),
+            client_descriptor_sha256: EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.to_owned(),
+        })
+    }
+
+    fn validate(&self, request: &Request, method: MethodIdentity) -> Result<()> {
+        require(
+            self.profile == "ExternalV1"
+                && method == MethodIdentity::External(external_global_news())
+                && self.method == ExternalQueryMethod::GlobalNews
+                && self.request_id == request.id
+                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+        )
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawResult {
     version: u32,
     connect_unavailable: bool,
@@ -992,6 +1028,8 @@ pub(super) struct RawResult {
     backoff_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     external_wire: Option<ExternalWireEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wire_identity: Option<RawWireIdentity>,
 }
 
 impl RawResult {
@@ -1019,6 +1057,7 @@ impl RawResult {
                 MacroContinuation::Terminal => None,
             },
             external_wire: completion.external_wire.clone(),
+            wire_identity: None,
         }
     }
 
@@ -1049,8 +1088,30 @@ impl RawResult {
                     MacroContinuation::Terminal => None,
                 },
                 external_wire: None,
+                wire_identity: None,
             },
         }
+    }
+
+    pub(super) fn capture_external_bound(
+        completion: &ExternalMacroAttemptCompletion,
+        identity: &MacroQueryIdentity,
+        request: &Request,
+    ) -> Result<Self> {
+        let mut raw = Self::capture_external(completion);
+        raw.bind_external_identity(identity, request)?;
+        Ok(raw)
+    }
+
+    pub(super) fn bind_external_identity(
+        &mut self,
+        identity: &MacroQueryIdentity,
+        request: &Request,
+    ) -> Result<()> {
+        require(matches!(self.version, 1 | 2) && self.wire_identity.is_none())?;
+        self.wire_identity = Some(RawWireIdentity::capture(request, identity)?);
+        self.version = 3;
+        Ok(())
     }
 
     pub(super) fn continuation(&self) -> MacroContinuation {
@@ -1086,13 +1147,21 @@ impl RawResult {
         RetryDecision,
         Option<ProviderAttempts>,
     )> {
-        require(matches!(self.version, 1 | 2) && ordinal > 0 && ordinal <= request.policy.0)?;
+        require(matches!(self.version, 1 | 2 | 3) && ordinal > 0 && ordinal <= request.policy.0)?;
         request.validate_for(identity)?;
         let profile = request.checked_contract_profile()?;
         let method = identity
             .method(profile)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        if self.version == 2 {
+        if self.version == 3 {
+            self.wire_identity
+                .as_ref()
+                .ok_or(ChainPostCloseError::SchemaRejected)?
+                .validate(request, method)?;
+        } else {
+            require(self.wire_identity.is_none())?;
+        }
+        if matches!(self.version, 2 | 3) && !self.connect_unavailable {
             if self.code.is_none() {
                 let (processed, decision) = self.project_external_v2(identity, request, ordinal)?;
                 return Ok((processed, decision, None));
@@ -1104,6 +1173,8 @@ impl RawResult {
             require(
                 !self.connect_unavailable && self.response.is_none() && self.details.is_some(),
             )?;
+        } else if self.version == 3 {
+            require(self.connect_unavailable && self.external_wire.is_none())?;
         } else {
             require(self.external_wire.is_none())?;
         }
@@ -1298,7 +1369,8 @@ impl RawResult {
                 trailer: self.trailer,
             },
             (true, None, None, None) => RecoveredWire::ConnectUnavailable,
-            (false, None, None, None) if self.version == 2 && self.external_wire.is_some() => {
+            (false, None, None, None)
+                if matches!(self.version, 2 | 3) && self.external_wire.is_some() => {
                 RecoveredWire::LocalWireFailure
             }
             _ => return Err(ChainPostCloseError::SchemaRejected),
@@ -1385,6 +1457,7 @@ pub(super) fn native_bytes(result: &NewsResult) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::grpc_client::external_query_transport::ExternalFrameFailureV1;
+    use crate::push_foundation::intent_store::chain_post_close::macro_native::DataResult;
     use sha2::{Digest as _, Sha256};
 
     fn external_v2_material(
@@ -1480,6 +1553,58 @@ mod tests {
             processed.unwrap().source(),
             "grpc-mtls:TEST_CODE_s2.invalid"
         );
+    }
+
+    #[test]
+    fn new_external_data_result_binds_request_and_descriptor_identity() {
+        let (identity, request, completion) = external_v2_material(&[0x5a, 0x00]);
+        let stored = DataResult::capture_external(
+            crate::search_service::macro_news::runner::QueryKey::Gateway(1),
+            &identity,
+            &request,
+            1,
+            &completion,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stored.raw.version, 3);
+        stored.project(&identity, &request, None).unwrap();
+
+        let captured = serde_json::to_value(&stored).unwrap();
+        for (field, replacement) in [
+            ("profile", serde_json::json!("LocalBridgeV1")),
+            ("method", serde_json::json!("OPERATION_SECURITY_METADATA")),
+            ("request_id", serde_json::json!("TEST_CODE_WRONG_ID")),
+            ("client_descriptor_sha256", serde_json::json!("0".repeat(64))),
+        ] {
+            let mut changed = captured.clone();
+            changed["raw"]["wire_identity"][field] = replacement;
+            let restored: DataResult = serde_json::from_value(changed).unwrap();
+            assert!(restored.project(&identity, &request, None).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn external_v3_connect_unavailable_keeps_request_identity_and_retry() {
+        let (identity, mut request, _) = external_v2_material(&[]);
+        request.policy.0 = 1;
+        let completion = ExternalMacroAttemptCompletion::ConnectUnavailable {
+            error: GrpcError::Unavailable {
+                details: Box::default(),
+            },
+            retry_decision: RetryDecision::RetryBackoff,
+            continuation: MacroContinuation::Terminal,
+        };
+        let raw = RawResult::capture_external_bound(&completion, &identity, &request).unwrap();
+        assert_eq!(raw.version, 3);
+        assert!(raw.response.is_none() && raw.external_wire.is_none());
+        let (processed, decision, attempts) = raw.project_for(&identity, &request, 1, None).unwrap();
+        assert!(matches!(processed, Err(GrpcError::Unavailable { .. })));
+        assert_eq!(decision, RetryDecision::RetryBackoff);
+        assert!(attempts.is_none());
+        let mut changed = raw.clone();
+        changed.wire_identity.as_mut().unwrap().request_id = "TEST_CODE_WRONG_ID".to_owned();
+        assert!(changed.project_for(&identity, &request, 1, None).is_err());
     }
 
     #[test]
@@ -2132,6 +2257,7 @@ mod tests {
             decision: "NoRetry".to_owned(),
             backoff_ms: None,
             external_wire: None,
+            wire_identity: None,
         };
 
         assert!(matches!(
@@ -2159,6 +2285,7 @@ mod tests {
             decision: "NoRetry".to_owned(),
             backoff_ms: None,
             external_wire: None,
+            wire_identity: None,
         };
         let (processed, decision, provider_attempts) =
             raw.project_for(&identity, &request, 1, None).unwrap();
