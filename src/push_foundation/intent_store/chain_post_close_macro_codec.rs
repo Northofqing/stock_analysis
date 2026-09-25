@@ -1119,19 +1119,22 @@ impl RawResult {
                         && self.backoff_ms.is_none()
                         && self.decision == "NoRetry",
                 )?;
-                let response = QueryResponse::decode(bytes.as_slice())
-                    .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                require(response.encode_to_vec() == *bytes)?;
-                (
+                let processed = if profile == ContractProfile::ExternalV1 {
+                    require(method == MethodIdentity::External(external_global_news()))?;
+                    Self::project_external_payload(request, bytes)
+                } else {
+                    let response = QueryResponse::decode(bytes.as_slice())
+                        .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                    require(response.encode_to_vec() == *bytes)?;
                     project_macro_response(
                         identity,
                         profile,
                         request.authority.as_deref(),
                         &request.id,
                         response,
-                    ),
-                    RetryDecision::NoRetry,
-                )
+                    )
+                };
+                (processed, RetryDecision::NoRetry)
             }
             (false, None, Some(code), Some(details)) => {
                 let trailer = match &self.trailer {
@@ -1238,19 +1241,7 @@ impl RawResult {
                 protobuf_payload, ..
             } => {
                 require(self.response.as_deref() == Some(protobuf_payload.as_slice()))?;
-                admit_external_payload(protobuf_payload).and_then(|()| {
-                    let response = ExternalQueryResponse::decode(protobuf_payload.as_slice())
-                        .map_err(|_| wire_error("external_response_wire_invalid"))?;
-                    crate::grpc_client::envelope::parse_external_query_response(
-                        &request.id,
-                        Operation::GlobalNews,
-                        request.authority.as_deref().ok_or_else(|| {
-                            wire_error("external_acquisition_authority_missing")
-                        })?,
-                        response,
-                    )
-                    .map_err(GrpcError::from)
-                })
+                Self::project_external_payload(request, protobuf_payload)
             }
             ExternalWireMaterialV1::Missing { .. }
             | ExternalWireMaterialV1::Overflow { .. }
@@ -1267,6 +1258,25 @@ impl RawResult {
                     .and_then(|error| error.safe_diagnostic()),
         )?;
         Ok((processed, RetryDecision::NoRetry))
+    }
+
+    fn project_external_payload(
+        request: &Request,
+        bytes: &[u8],
+    ) -> std::result::Result<crate::grpc_client::envelope::QueryResult, GrpcError> {
+        admit_external_payload(bytes)?;
+        let response = ExternalQueryResponse::decode(bytes)
+            .map_err(|_| wire_error("external_response_wire_invalid"))?;
+        crate::grpc_client::envelope::parse_external_query_response(
+            &request.id,
+            Operation::GlobalNews,
+            request
+                .authority
+                .as_deref()
+                .ok_or_else(|| wire_error("external_acquisition_authority_missing"))?,
+            response,
+        )
+        .map_err(GrpcError::from)
     }
 
     pub(super) fn into_recovered(
@@ -1450,6 +1460,26 @@ mod tests {
             external_wire: Some(evidence),
         });
         (identity, request, completion)
+    }
+
+    #[test]
+    fn legacy_external_response_with_proven_method_uses_frozen_external_decoder() {
+        // Empty field 11 is legal on the External wire but cannot round-trip
+        // through the Local response's canonical source field.
+        let (identity, request, completion) = external_v2_material(&[0x5a, 0x00]);
+        let mut raw = RawResult::capture_external(&completion);
+        assert_eq!(raw.version, 2);
+        raw.version = 1;
+        raw.external_wire = None;
+        let (processed, decision, attempts) = raw
+            .project_for(&identity, &request, 1, None)
+            .expect("historical External profile and method identify the frozen decoder");
+        assert_eq!(decision, RetryDecision::NoRetry);
+        assert!(attempts.is_none());
+        assert_eq!(
+            processed.unwrap().source(),
+            "grpc-mtls:TEST_CODE_s2.invalid"
+        );
     }
 
     #[test]
