@@ -769,6 +769,7 @@ impl ReadinessEpisodePlan {
                 && self.required_operation == ExternalOperation::GlobalNews as i32
                 && self.health.kind() == ExternalControlKind::Health
                 && self.capabilities.kind() == ExternalControlKind::Capabilities
+                && self.health.version == self.capabilities.version
                 && self.health.endpoint == self.capabilities.endpoint
                 && self.health.authority == self.capabilities.authority
                 && self.health.id != self.capabilities.id,

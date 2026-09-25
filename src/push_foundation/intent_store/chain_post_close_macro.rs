@@ -208,6 +208,16 @@ pub(crate) struct MacroReadinessEpisodeRecovery {
 }
 
 impl MacroReadinessEpisodeRecovery {
+    pub(crate) fn authorizes_new_data_effect(&self) -> bool {
+        self.ready_result.is_some()
+            && self.controls.len() == 2
+            && self
+                .controls
+                .iter()
+                .all(MacroControlRecovery::authorizes_new_external_effect)
+            && self.controls[1].result == self.ready_result
+    }
+
     pub(crate) fn episode_ordinal(&self) -> u32 {
         self.plan.episode_ordinal()
     }
@@ -220,6 +230,88 @@ impl MacroReadinessEpisodeRecovery {
     }
     pub(crate) fn ready_result_version(&self) -> Option<u64> {
         self.ready_result
+    }
+}
+
+#[cfg(test)]
+mod control_identity_tests {
+    use super::*;
+    use prost::Message as _;
+
+    #[test]
+    fn mixed_historical_capabilities_result_cannot_authorize_new_data() {
+        use crate::grpc_client::client::ContractProfile;
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            CapabilitiesRequest, HealthRequest, RequestContext,
+        };
+
+        let material = |kind, id: &str| {
+            let context = RequestContext {
+                protocol_version: 1,
+                request_id: id.to_owned(),
+            };
+            ExternalControlRequestMaterial {
+                kind,
+                request_bytes: match kind {
+                    ExternalControlKind::Health => HealthRequest {
+                        context: Some(context),
+                    }
+                    .encode_to_vec(),
+                    ExternalControlKind::Capabilities => CapabilitiesRequest {
+                        context: Some(context),
+                    }
+                    .encode_to_vec(),
+                },
+                request_id: id.to_owned(),
+                profile: ContractProfile::ExternalV1,
+                endpoint_uri: "https://example.com".to_owned(),
+                acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
+            }
+        };
+        let plan = codec::ReadinessEpisodePlan::new(
+            material(ExternalControlKind::Health, "TEST_CODE_HEALTH"),
+            material(ExternalControlKind::Capabilities, "TEST_CODE_CAPABILITIES"),
+        )
+        .unwrap();
+        let [health_request, capabilities_request] = plan.controls();
+        let mut episode = MacroReadinessEpisodeRecovery {
+            plan: plan.clone(),
+            plan_version: 1,
+            initiating_source: codec::first_identity(),
+            controls: vec![
+                MacroControlRecovery {
+                    request: health_request.clone(),
+                    begin: Some(1),
+                    result: Some(2),
+                    outcome: Some(MacroControlOutcome::Ready),
+                    response: None,
+                    qualification_version: Some(3),
+                },
+                MacroControlRecovery {
+                    request: capabilities_request.clone(),
+                    begin: Some(3),
+                    result: Some(4),
+                    outcome: Some(MacroControlOutcome::Ready),
+                    response: None,
+                    qualification_version: Some(2),
+                },
+            ],
+            ready_result: Some(4),
+            provider_catalog: None,
+        };
+        assert!(!episode.authorizes_new_data_effect());
+        episode.controls[1].qualification_version = Some(3);
+        assert!(episode.authorizes_new_data_effect());
+
+        let mut mixed_plan = serde_json::to_value(&plan).unwrap();
+        mixed_plan["capabilities"]["version"] = serde_json::json!(1);
+        mixed_plan["capabilities"].as_object_mut().unwrap().remove("method");
+        mixed_plan["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_descriptor_sha256");
+        let mixed_plan: codec::ReadinessEpisodePlan = serde_json::from_value(mixed_plan).unwrap();
+        assert!(mixed_plan.validate().is_err());
     }
 }
 
@@ -1720,7 +1812,7 @@ impl LocalChainPostClose<'_> {
                     .readiness_episodes
                     .first()
                     .ok_or(ChainPostCloseError::SchemaRejected)?;
-                require(episode.controls[0].authorizes_new_external_effect())?;
+                require(episode.authorizes_new_data_effect())?;
                 episode
                     .ready_result_version()
                     .ok_or(ChainPostCloseError::SchemaRejected)

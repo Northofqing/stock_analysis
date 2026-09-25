@@ -18,6 +18,6 @@
 - 旧 Health 恢复、正常 V2 控制恢复和 Health 不就绪回归：通过；`git diff --check` 通过。
 - V3 数据身份逐字段篡改、连接不可用时的身份与重试、v12 完整阶段重开、v11 数据重试重开、旧 V2 混合迁移、未知 V4 拒绝、V2 原始证据篡改零重发及缺失 wire 证据恢复：定向测试通过。
 - 控制请求 V2 的 Health/Capabilities typed 方法、descriptor、跨 profile 和请求 ID 篡改，V1 历史请求匹配且不授予新 effect、历史 Health 拒绝新 Capabilities、v11 控制及数据重试重开、v12 完整阶段重开：定向测试通过。
-- 控制结果 V3 的 profile/typed 方法/request ID/descriptor/build identity 逐字段篡改、跨 endpoint 拒绝、Health/Capabilities 写入与重开、持久化 status 双载体冲突、旧 V1/V2 Ready 只保留事实且零新 RPC、未知 V4 拒绝：定向回归通过。旧版本夹具移除 V3 专有字段，未把新 bytes 冒充旧版本。控制异常矩阵 17 个用例、Capabilities 连接失败重开及 v11/v12 正常数据路径也通过。
+- 控制结果 V3 的 profile/typed 方法/request ID/descriptor/build identity 逐字段篡改、跨 endpoint 拒绝、Health/Capabilities 写入与重开、持久化 status 双载体冲突、旧 V1/V2 Ready 只保留事实且零新 RPC、未知 V4 拒绝：定向回归通过。数据 effect 同时要求 Health 和 Capabilities 两条 V3 Ready；混合 V1/V2 控制请求计划与旧 V2 Capabilities 结果不能借新 Health 授权数据调用。旧版本夹具移除 V3 专有字段，未把新 bytes 冒充旧版本。控制异常矩阵 17 个用例、Capabilities 连接失败重开及 v11/v12 正常数据路径也通过。
 
 这仅关闭上述本地恢复缺口及 Macro External 数据结果、控制请求和控制结果的新格式切片。S6 仍需审计其他持久化消费者及 Unknown 不重发全矩阵；本次结果不代表全链路验收。未据此宣称完整 S6 验收或生产部署完成；若后续发现服务端返回的数据本身不合合同，另在本目录记录上游交接。

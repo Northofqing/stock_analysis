@@ -507,12 +507,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         {
             // Historical V1 Health results and control requests remain
             // readable, but lack the identities required for a new data effect.
-            require(current.readiness_episodes.first().is_some_and(|episode| {
-                episode.controls.first().is_some_and(|health| {
-                    health.qualification_version == Some(3)
-                        && health.request.has_wire_identity()
-                })
-            }))?;
+            require(current
+                .readiness_episodes
+                .first()
+                .is_some_and(old::MacroReadinessEpisodeRecovery::authorizes_new_data_effect))?;
             Some(
                 current
                     .readiness_episodes
