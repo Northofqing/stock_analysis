@@ -693,8 +693,17 @@ fn instrument_news_request_params(
 /// D2: gRPC 错误 → GatewayError 分类保真映射 (query_op 共用)。
 /// 服务端 Fetch 失败 (handlers.rs) 携带 ErrorDetail (provider/reason_code/retryable),
 /// 客户端据此重建分类 — 不再折叠为默认 unavailable+provider=None (BR-170 pre-fix 形态)。
-/// 明确错误码 (invalid_argument/unimplemented/…): 重试不会变好 → invalid_request 不重试。
+/// 明确错误码 (invalid_argument/unimplemented/…): 重试不会变好 → invalid_request 不重试；
+/// 已退役 EconomicCalendar 保留独立的 operation_retired 分类。
 fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
+    if op == Operation::EconomicCalendar
+        && e.details().reason_code.as_deref() == Some("operation_retired")
+    {
+        return GatewayError::retired_operation(
+            crate::data_gateway::economic_calendar::CAPABILITY,
+            Some(ProviderId::Jin10),
+        );
+    }
     let method = crate::grpc_contract::ops::method_name(op);
     let message = format!("gRPC {method} 查询失败: {e}");
     match e {
@@ -4509,6 +4518,22 @@ mod tests {
         assert_eq!(g.audit_outcome(), "unavailable");
         assert!(g.retryable());
         assert!(g.message().contains("BoardConstituents"));
+    }
+
+    #[test]
+    fn map_query_error_preserves_retired_economic_calendar_reason() {
+        let error = GrpcError::Unimplemented {
+            details: Box::new(ErrorDetail {
+                provider: Some("Jin10".to_owned()),
+                reason_code: Some("operation_retired".to_owned()),
+                retryable: Some(false),
+                ..Default::default()
+            }),
+        };
+        let gateway = map_query_error(Operation::EconomicCalendar, &error);
+        assert_eq!(gateway.reason_code(), "operation_retired");
+        assert_eq!(gateway.provider(), Some(ProviderId::Jin10));
+        assert!(!gateway.retryable());
     }
 
     /// D2: 服务端未知 provider 名 (新增 provider 未同步 parse_provider) →

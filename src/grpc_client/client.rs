@@ -576,6 +576,16 @@ impl GrpcMarketClient {
         op: Operation,
         payload: serde_json::Value,
     ) -> Result<QueryResult, GrpcError> {
+        if op == Operation::EconomicCalendar {
+            return Err(GrpcError::Unimplemented {
+                details: Box::new(ErrorDetail {
+                    provider: Some("Jin10".to_owned()),
+                    reason_code: Some("operation_retired".to_owned()),
+                    retryable: Some(false),
+                    ..ErrorDetail::default()
+                }),
+            });
+        }
         if !crate::grpc_contract::ops::is_implemented(op) {
             return Err(GrpcError::Unimplemented {
                 details: Box::default(),
@@ -1426,6 +1436,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, GrpcError::Unimplemented { .. }));
+    }
+
+    #[tokio::test]
+    async fn retired_economic_calendar_query_is_rejected_before_wire_io() {
+        let mut client = GrpcMarketClient::from_channel(
+            lazy_test_channel(),
+            ContractProfile::LocalBridgeV1,
+            ClientAuthorization::Environment,
+            None,
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.query(Operation::EconomicCalendar, serde_json::json!({})),
+        )
+        .await
+        .expect("retired operation must not wait for network")
+        .unwrap_err();
+        assert!(matches!(error, GrpcError::Unimplemented { .. }));
+        assert_eq!(error.details().reason_code.as_deref(), Some("operation_retired"));
+        assert_eq!(error.details().provider.as_deref(), Some("Jin10"));
+        assert_eq!(error.details().retryable, Some(false));
     }
 
     #[tokio::test]
