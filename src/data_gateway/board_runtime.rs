@@ -1,6 +1,6 @@
 //! BR-164/BR-188 evidence-preserving board discovery and flow Gateway runtime.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 
 use crate::market_domain::{InstrumentId, ProviderId};
@@ -119,13 +119,6 @@ impl MembershipRequest {
     pub(crate) fn request_hash(&self) -> &str {
         &self.request_hash
     }
-
-    pub(crate) fn audit_provider<T>(result: &Result<GatewayBatch<T>, GatewayError>) -> ProviderId {
-        result
-            .as_ref()
-            .map(|batch| batch.evidence().provider)
-            .unwrap_or(ProviderId::Tdx)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,21 +170,11 @@ impl BoardDataGateway {
         match super::grpc_source::bridge_for("BoardDirectory") {
             Ok(bridge) => {
                 let result = bridge.board_directory_async(kind, limit).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(
-                    DIRECTORY_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(DIRECTORY_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     DIRECTORY_CAPABILITY,
-                    ProviderId::Tdx,
                     &request_hash,
                     Err(error),
                 );
@@ -210,18 +193,15 @@ impl BoardDataGateway {
         match super::grpc_source::bridge_for("BoardConstituents") {
             Ok(bridge) => {
                 let result = bridge.board_constituents_async(request.code()).await;
-                let audit_provider = MembershipRequest::audit_provider(&result);
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     MEMBERSHIP_CAPABILITY,
-                    audit_provider,
                     request.request_hash(),
                     result,
                 );
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     MEMBERSHIP_CAPABILITY,
-                    ProviderId::Tdx,
                     request.request_hash(),
                     Err(error),
                 );
@@ -246,18 +226,15 @@ impl BoardDataGateway {
         match super::grpc_source::bridge_for("BoardConstituents") {
             Ok(bridge) => {
                 let result = bridge.board_constituents(request.code());
-                let audit_provider = MembershipRequest::audit_provider(&result);
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     MEMBERSHIP_CAPABILITY,
-                    audit_provider,
                     request.request_hash(),
                     result,
                 );
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     MEMBERSHIP_CAPABILITY,
-                    ProviderId::Tdx,
                     request.request_hash(),
                     Err(error),
                 );
@@ -278,24 +255,10 @@ impl BoardDataGateway {
         match super::grpc_source::bridge_for("BoardFlows") {
             Ok(bridge) => {
                 let result = bridge.board_flows_async(kind, limit).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(
-                    FLOW_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(FLOW_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    FLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(FLOW_CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -317,24 +280,10 @@ impl BoardDataGateway {
         match super::grpc_source::bridge_for("BoardFlows") {
             Ok(bridge) => {
                 let result = bridge.board_flows(kind, limit);
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(
-                    FLOW_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(FLOW_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    FLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(FLOW_CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -449,6 +398,13 @@ fn a_share_instrument(code: &str, capability: &'static str) -> Result<Instrument
 mod no_magic_bridge_tests {
     use super::BoardDataGateway;
     use crate::database::DatabaseManager;
+    use diesel::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct AuditProviderRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        provider: String,
+    }
 
     #[test]
     fn grpc_env_guard_blocking_membership_uses_bridge_when_enabled() {
@@ -471,5 +427,18 @@ mod no_magic_bridge_tests {
             !error.message().contains("legacy local transport fallback"),
             "blocking entry must try the configured bridge: {error}"
         );
+        assert_eq!(error.provider(), None);
+
+        let request = super::MembershipRequest::try_new("TEST_CODE_600519").unwrap();
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT provider FROM data_acquisition_audit \
+             WHERE capability = 'board-memberships' AND request_hash = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(request.request_hash().to_owned())
+        .get_result::<AuditProviderRow>(&mut *connection)
+        .expect("bridge failure must be audited");
+        assert_eq!(row.provider, "Custom");
     }
 }

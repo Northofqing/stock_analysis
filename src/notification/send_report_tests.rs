@@ -1,4 +1,7 @@
-use super::{NotificationChannel, NotificationConfig, NotificationSendReport, NotificationService};
+use super::{
+    NotificationChannel, NotificationCompletion, NotificationConfig, NotificationSendReport,
+    NotificationService,
+};
 use crate::monitor::push_job::WeakOutcomeKind;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -257,6 +260,7 @@ async fn no_channels_report_is_empty_and_legacy_send_is_false() {
 
     assert!(report.attempts().is_empty());
     assert!(!report.has_success());
+    assert_eq!(report.completion(), NotificationCompletion::NoTargets);
     assert!(!service.send("TEST_CODE no channels").await.unwrap());
 }
 
@@ -271,6 +275,8 @@ async fn custom_success_and_false_are_distinct_weak_observations() {
     let service = test_service(config, vec![NotificationChannel::Custom]);
 
     let report = service.send_report("TEST_CODE mixed custom").await;
+
+    assert_eq!(report.completion(), NotificationCompletion::Partial);
 
     assert_attempts(
         &report,

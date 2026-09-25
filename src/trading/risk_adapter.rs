@@ -165,6 +165,43 @@ pub fn pre_trade_check(
                 ));
             }
         }
+
+        let order_notional = signal.price * f64::from(signal.quantity);
+        let commission = crate::strategy::lot::min_commission(order_notional);
+        let projected_total = total_value - commission;
+        let projected_cash = current_cash - order_notional - commission;
+        if !order_notional.is_finite()
+            || !commission.is_finite()
+            || !projected_total.is_finite()
+            || projected_total <= 0.0
+            || !projected_cash.is_finite()
+            || projected_cash < 0.0
+        {
+            return Err(format!(
+                "预计成交后账户无效: cash={projected_cash:.2} total={projected_total:.2}"
+            ));
+        }
+
+        let projected_position_value =
+            current_position_pct / 100.0 * total_value + order_notional;
+        // Concentration is measured against the same pre-trade account basis
+        // supplied by the ledger. Commission is charged to projected cash;
+        // it must not turn an exact 10% position into an artificial breach.
+        let projected_position_pct = projected_position_value / total_value * 100.0;
+        if projected_position_pct > *MAX_POSITION_PCT {
+            return Err(format!(
+                "预计单票仓位 {:.3}% 超限 {}%（成交额 {:.2}，佣金 {:.2}）",
+                projected_position_pct, *MAX_POSITION_PCT, order_notional, commission
+            ));
+        }
+
+        let projected_cash_pct = projected_cash / projected_total * 100.0;
+        if projected_cash_pct < *CASH_FLOOR_PCT {
+            return Err(format!(
+                "预计现金占比 {:.3}% 不足底限 {}%（成交额 {:.2}，佣金 {:.2}）",
+                projected_cash_pct, *CASH_FLOOR_PCT, order_notional, commission
+            ));
+        }
     }
 
     // 4. DataMode
@@ -314,16 +351,17 @@ mod tests {
     }
 
     #[test]
-    fn allows_buy_at_position_boundary_10pct() {
+    fn rejects_buy_at_position_boundary_when_order_would_cross_limit() {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
-        assert!(r.is_ok());
+        let error = r.expect_err("projected position must be checked after the order");
+        assert!(error.contains("预计单票仓位"), "{error}");
     }
 
     #[test]
-    fn allows_buy_at_position_exactly_10pct() {
+    fn allows_buy_only_when_projected_position_stays_within_10pct() {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
-        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
+        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 4.0);
         assert!(r.is_ok());
     }
 
@@ -355,6 +393,18 @@ mod tests {
         let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 30000.0, 100000.0, 5.0);
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn rejects_buy_when_post_trade_cash_including_commission_crosses_floor() {
+        let mut s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
+        s.price = 10.0;
+        s.quantity = 100;
+        s.limit_down_price = Some(9.0);
+        s.limit_up_price = Some(11.0);
+        let error = pre_trade_check(&s, 10.0, 15_500.0, 100_000.0, 0.0)
+            .expect_err("pre-trade cash may be above 15%, but the projected cash is below it");
+        assert!(error.contains("预计现金占比"), "{error}");
     }
 
     // ---- 4. DataMode ----

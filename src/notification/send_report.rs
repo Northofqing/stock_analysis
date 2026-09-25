@@ -2,6 +2,14 @@ use crate::monitor::push_job::WeakOutcomeKind;
 
 use super::NotificationChannel;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotificationCompletion {
+    NoTargets,
+    AllFailed,
+    Partial,
+    AllAccepted,
+}
+
 /// One actual notification target observed during a single send_report call.
 ///
 /// target_index is only its zero-based position in this invocation. It is not
@@ -60,8 +68,26 @@ impl NotificationSendReport {
     }
 
     pub fn has_success(&self) -> bool {
+        self.accepted_count() > 0
+    }
+
+    pub fn accepted_count(&self) -> usize {
         self.attempts
             .iter()
-            .any(|attempt| attempt.outcome == WeakOutcomeKind::Accepted)
+            .filter(|attempt| attempt.outcome == WeakOutcomeKind::Accepted)
+            .count()
+    }
+
+    pub fn unknown_count(&self) -> usize {
+        self.attempts.len().saturating_sub(self.accepted_count())
+    }
+
+    pub fn completion(&self) -> NotificationCompletion {
+        match (self.accepted_count(), self.unknown_count()) {
+            (0, 0) => NotificationCompletion::NoTargets,
+            (0, _) => NotificationCompletion::AllFailed,
+            (_, 0) => NotificationCompletion::AllAccepted,
+            _ => NotificationCompletion::Partial,
+        }
     }
 }

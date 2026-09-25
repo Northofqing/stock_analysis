@@ -73,9 +73,7 @@ pub async fn verify_predictions() {
     // 1. 循环过去 7 天 (覆盖周一周二补跑周末遗漏 + 节假日), 每一天都查 pending.
     for offset in 1..=7i64 {
         let pred_date = today_date - chrono::Duration::days(offset);
-        let target_date = pred_date + chrono::Duration::days(1);
         let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
-        let target_date_s = target_date.format("%Y-%m-%d").to_string();
 
         let pending = match db.get_pending_predictions(&pred_date_s) {
             Ok(v) => v,
@@ -83,7 +81,7 @@ pub async fn verify_predictions() {
                 log::warn!(
                     "[Prediction] 查 pending ({} → {}) 失败: {}",
                     pred_date_s,
-                    target_date_s,
+                    "row.target_date",
                     e
                 );
                 continue;
@@ -108,6 +106,7 @@ pub async fn verify_predictions() {
                 continue;
             }
             let direction = pred.pred_direction.as_str();
+            let target_date_s = pred.target_date.as_str();
 
             // 2-4. 共享 verify 逻辑: 读 close + 算 actual_change + 判定 hit
             // verify_one 内部向前找最近交易日 (修复 C-1: 周末/节假日不静默 skip)
@@ -128,13 +127,18 @@ pub async fn verify_predictions() {
             };
 
             // 5. 写回
-            if let Err(e) = db.update_prediction_result(
-                &pred_date_s,
-                Some(code),
+            if let Err(e) = db.update_prediction_result_by_id(
+                pred.id,
                 outcome.actual_change,
                 outcome.hit,
             ) {
-                log::warn!("[Prediction] {} {} 写回失败: {}", code, pred_date_s, e);
+                log::warn!(
+                    "[Prediction] id={} {} {} 写回失败: {}",
+                    pred.id,
+                    code,
+                    pred_date_s,
+                    e
+                );
                 skipped += 1;
                 continue;
             }

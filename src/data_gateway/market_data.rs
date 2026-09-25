@@ -13,7 +13,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use super::parse_evidence_instant;
 use super::review::{
-    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_routed_gateway_result, BatchEvidence, GatewayBatch,
+    GatewayError,
 };
 
 const CAPABILITY: &str = "RealtimeMarketQuotes";
@@ -187,19 +188,10 @@ impl MarketDataGateway {
         match super::grpc_source::bridge_for("RealtimeQuotes") {
             Ok(bridge) => {
                 let result = bridge.realtime_quotes(codes);
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
@@ -284,4 +276,46 @@ fn validate_admitted_projection(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::DatabaseManager;
+    use diesel::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct AuditProviderRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        provider: String,
+    }
+
+    #[test]
+    fn realtime_bridge_failure_without_provider_is_audited_as_custom() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        let result = MarketDataGateway::new().realtime_quotes(&["399992".to_owned()]);
+
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable bridge must fail closed");
+        assert_eq!(error.provider(), None);
+
+        let request_hash = acquisition_request_hash(CAPABILITY, "399992");
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT provider FROM data_acquisition_audit \
+             WHERE capability = 'RealtimeMarketQuotes' AND request_hash = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(request_hash)
+        .get_result::<AuditProviderRow>(&mut *connection)
+        .expect("bridge failure must be audited");
+        assert_eq!(row.provider, "Custom");
+    }
 }

@@ -5,7 +5,7 @@
 //!   cargo run --bin backfill_predictions -- 30
 //!
 //! 实现: 循环过去 N 天的每个日期, 把 prediction_tracker 中 hit IS NULL 的行,
-//!       按 (pred_date+1) 作为 target_date 重跑 verify 逻辑。
+//!       按每条记录已冻结的 target_date 重跑 verify 逻辑。
 //!       核心 verify 计算复用 `monitor::prediction::verify_one`, 与生产盘后回填保持一致。
 //!
 //! 配合 `tools/one_shot/backfill_predictions.sh` 使用。
@@ -33,9 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for offset in 1..=days {
         let pred_date = today - Duration::days(offset);
-        let target_date = pred_date + Duration::days(1);
         let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
-        let target_date_s = target_date.format("%Y-%m-%d").to_string();
 
         let pending = db.get_pending_predictions(&pred_date_s)?;
         if pending.is_empty() {
@@ -43,9 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!(
-            "[backfill] {} -> {}: {} 条 pending",
+            "[backfill] {}: {} 条 pending（逐行使用冻结 target_date）",
             pred_date_s,
-            target_date_s,
             pending.len()
         );
 
@@ -62,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 code,
                 &pred_date_s,
-                &target_date_s,
+                &pred.target_date,
                 &pred.pred_direction,
             )
             .await
@@ -70,12 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
 
-            db.update_prediction_result(
-                &pred_date_s,
-                Some(code),
-                outcome.actual_change,
-                outcome.hit,
-            )?;
+            db.update_prediction_result_by_id(pred.id, outcome.actual_change, outcome.hit)?;
             total += 1;
             if outcome.hit {
                 hit_count += 1;

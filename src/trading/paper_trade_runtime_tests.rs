@@ -224,7 +224,7 @@ fn paper_runtime_nested_valuation_cancel_stops_fallback_and_remaining_positions(
             requests: Mutex::new(Vec::new()),
         };
         let error = estimate_ledger_from_snapshot_with_reads(
-            &snapshot, &mut conn, 50_000.0, today, &cancelled, &reads,
+            &snapshot, &mut conn, 50_000.0, 0.0, today, &cancelled, &reads,
         )
         .expect_err("nested valuation must stop after shutdown");
         assert!(error.contains("cancelled"), "{error}");
@@ -248,7 +248,7 @@ fn paper_runtime_normal_nested_valuation_preserves_prices_fallback_and_daily_pnl
             requests: Mutex::new(Vec::new()),
         };
         let result = estimate_ledger_from_snapshot_with_reads(
-            &snapshot, &mut conn, 50_000.0, today, &cancelled, &reads,
+            &snapshot, &mut conn, 50_000.0, 0.0, today, &cancelled, &reads,
         )
         .expect("real nested valuation");
         if fail_first {

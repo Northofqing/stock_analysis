@@ -372,6 +372,15 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
 
 #[tokio::test]
 async fn v14_resumes_v13_connected_request_plan_without_economic_attempt() {
+    v14_resumes_v13_economic_plan(false).await;
+}
+
+#[tokio::test]
+async fn v14_preserves_v13_unconfirmed_economic_attempt_on_reopen() {
+    v14_resumes_v13_economic_plan(true).await;
+}
+
+async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
     let mut fixture = V2BusinessFixture::new();
     let (parent_endpoint, parent_server) = spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
     let server = MacroFullLoopbackServer::bind().await;
@@ -440,12 +449,23 @@ async fn v14_resumes_v13_connected_request_plan_without_economic_attempt() {
     let mut local = fixture.store.as_mut().unwrap()
         .single_user_local_chain_post_close(&config).unwrap();
     let lease = local.resume_run(&intent, macro_lease(
-        "TEST_CODE_RETIRED_RESUME_MACRO", started_at, started_at + 60_000_000, parent_head,
+        "TEST_CODE_RETIRED_RESUME_MACRO", started_at,
+        started_at + if unconfirmed_attempt { 2_000_000 } else { 60_000_000 }, parent_head,
     )).unwrap();
     let mut live = crate::push_foundation::intent_store::chain_post_close::macro_live::Live::open(
         &mut local, lease, &clock, std::rc::Rc::new(Cell::new(false)),
     ).unwrap();
+    let economic_request = requests.iter()
+        .find(|(query, _, _)| *query == QueryKey::Gateway(5)).unwrap().1.clone();
     live.initialize(clock.macro_request_observation(), connected.endpoint(), requests, None, &web).unwrap();
+    if unconfirmed_attempt {
+        // The durable begin has committed, but no response was confirmed before
+        // the process disappeared. Retirement cannot reinterpret this as NotCalled.
+        let ticket = live.begin_data(
+            QueryKey::Gateway(5), 1, economic_request, connected.endpoint(),
+        ).unwrap();
+        drop(ticket);
+    }
     let planned_lease = live.into_lease();
     drop(local);
     let old_request_count: i64 = fixture.connection().query_row(
@@ -453,6 +473,78 @@ async fn v14_resumes_v13_connected_request_plan_without_economic_attempt() {
         [intent.as_str()], |row| row.get(0),
     ).unwrap();
     assert_eq!(old_request_count, 1);
+    if unconfirmed_attempt {
+        let mut local = fixture.store.as_mut().unwrap()
+            .single_user_local_chain_post_close(&config).unwrap();
+        let original = local.inspect_macro(&intent).unwrap();
+        let original_head = local.inspect_run(&intent).unwrap().head_version();
+        assert!(original.has_unconfirmed_effect());
+        assert_eq!(original.attempts().len(), 1);
+        assert_eq!(original.attempts()[0].query_key(), QueryKey::Gateway(5));
+        assert!(original.query_terminal(QueryKey::Gateway(5)).is_none());
+        let plan_bytes = original.plan_bytes().to_vec();
+        let request_bytes = original.attempts()[0].request_bytes().to_vec();
+        let begin_version = original.attempts()[0].begin_version();
+        drop(local);
+        drop(planned_lease);
+        fixture.reopen();
+        fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+
+        clock.now.set(UtcMicros::try_new(started_at + 3_000_000).unwrap());
+        let mut local = fixture.store.as_mut().unwrap()
+            .single_user_local_chain_post_close(&config).unwrap();
+        let lease = local.resume_run(&intent, macro_lease(
+            "TEST_CODE_RETIRED_UNKNOWN_REOPENED", started_at + 3_000_000,
+            started_at + 10_000_000, original_head,
+        )).unwrap();
+        let resumed_head = local.inspect_run(&intent).unwrap().head_version();
+        assert!(resumed_head > original_head);
+        let mut io = local.macro_preparation_io_v14(
+            lease, &queries, &clock, FixedClusterConfiguration::resolve(Some("2")),
+            &parent_source, &macro_source, &search_service,
+        ).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(10),
+            prepare_chain_analysis_with_io(
+                NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks, None, &mut io,
+            ),
+        ).await.expect("TEST_CODE Unknown must stop promptly")
+            .expect_err("TEST_CODE retirement must not clear an unconfirmed attempt");
+        assert!(matches!(stopped.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::IncompleteOnReopen { intent_id }) if intent_id == intent.as_str()));
+        drop(io);
+        let recovered = local.inspect_macro(&intent).unwrap();
+        assert!(recovered.has_unconfirmed_effect());
+        assert!(!recovered.is_complete());
+        assert_eq!(recovered.plan_bytes(), plan_bytes);
+        assert_eq!(recovered.attempts().len(), 1);
+        let attempt = &recovered.attempts()[0];
+        assert_eq!(attempt.query_key(), QueryKey::Gateway(5));
+        assert_eq!(attempt.begin_version(), begin_version);
+        assert_eq!(attempt.request_bytes(), request_bytes);
+        assert!(attempt.result_version().is_none());
+        assert!(attempt.result_material().is_none());
+        assert!(attempt.response_bytes().is_none());
+        assert!(recovered.query_terminal(QueryKey::Gateway(5)).is_none());
+        assert_eq!(local.inspect_run(&intent).unwrap().head_version(), resumed_head);
+        drop(local);
+        assert_eq!(fixture.count("chain_post_close_macro_retired_terminals"), 0);
+        assert!(server.snapshot().calls.is_empty(), "TEST_CODE Unknown must stop all new Macro effects");
+        drop(connected);
+        drop(queries);
+        drop(parent_source);
+        drop(macro_source);
+        fixture.reopen();
+        let reopened = fixture.store.as_mut().unwrap()
+            .single_user_local_chain_post_close(&config).unwrap()
+            .inspect_macro(&intent).unwrap();
+        assert!(reopened.has_unconfirmed_effect());
+        assert_eq!(reopened.plan_bytes(), plan_bytes);
+        assert_eq!(reopened.attempts()[0].request_bytes(), request_bytes);
+        assert!(reopened.query_terminal(QueryKey::Gateway(5)).is_none());
+        server.finish().await.unwrap();
+        parent_server.finish().await;
+        return;
+    }
     fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
 
     let mut local = fixture.store.as_mut().unwrap()

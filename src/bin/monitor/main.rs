@@ -2924,7 +2924,7 @@ async fn evaluate_data_mode_hook() {
                 }
             };
             match &result {
-                pt::ModeDispatchResult::EstablishedSilently => {
+                pt::ModeDispatchResult::AwaitingStableWindow => {
                     // 抖动窗口内跳过 → 出声 (BR-225c, v15 静默路径可见)
                     if pending_since.is_none() && prev.is_some() && prev != Some(health.mode) {
                         log::warn!(
@@ -2940,9 +2940,13 @@ async fn evaluate_data_mode_hook() {
                         });
                     }
                 }
-                pt::ModeDispatchResult::Delivery(_) => {
+                pt::ModeDispatchResult::EstablishedSilently => {
                     *pending = None;
                 }
+                pt::ModeDispatchResult::Delivery(notify::PushOutcome::Pushed) => {
+                    *pending = None;
+                }
+                pt::ModeDispatchResult::Delivery(_) => {}
             }
             result
         }
@@ -3919,6 +3923,35 @@ const POSITION_CHAIN_REFRESH_PERIOD: std::time::Duration = std::time::Duration::
 
 static OPENING_STATIC_LAST_BANNER: Lazy<std::sync::Mutex<Option<String>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
+
+fn noon_paper_review_is_complete(outcome: &review_batch::ReviewTaskOutcome) -> bool {
+    matches!(
+        outcome,
+        review_batch::ReviewTaskOutcome::Delivered { .. }
+            | review_batch::ReviewTaskOutcome::NoData { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests_noon_paper_review_completion {
+    use super::*;
+
+    #[test]
+    fn only_delivered_or_authoritative_no_data_seals_the_noon_window() {
+        assert!(noon_paper_review_is_complete(
+            &review_batch::ReviewTaskOutcome::delivered(1)
+        ));
+        assert!(noon_paper_review_is_complete(
+            &review_batch::ReviewTaskOutcome::no_data("no exact review record")
+        ));
+        assert!(!noon_paper_review_is_complete(
+            &review_batch::ReviewTaskOutcome::failed(true, "temporary sink failure")
+        ));
+        assert!(!noon_paper_review_is_complete(
+            &review_batch::ReviewTaskOutcome::disabled("paper_review", "activation denied")
+        ));
+    }
+}
 
 fn opening_failure_banner(
     readiness_key: &'static str,
@@ -9196,9 +9229,15 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     .unwrap_or(false);
                 if !already {
                     let date_str = today.format("%Y-%m-%d").to_string();
-                    let ok = push_templates::dispatch_paper_review_noon(&date_str).await;
-                    log::info!("[v17.4 §5.2] 13:00 虚拟仓午盘快照: pushed={}", ok);
-                    *NOON_SNAP_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                    let outcome = push_templates::dispatch_paper_review_noon(&date_str).await;
+                    log::info!(
+                        "[v17.4 §5.2] 13:00 虚拟仓午盘快照: status={} outcome={:?}",
+                        outcome.status_label(),
+                        outcome
+                    );
+                    if noon_paper_review_is_complete(&outcome) {
+                        *NOON_SNAP_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                    }
                 }
             }
             if now.hour() == 15 && now.minute() == 5 {

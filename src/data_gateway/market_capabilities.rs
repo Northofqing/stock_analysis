@@ -9,7 +9,7 @@ use crate::market_domain::ProviderId;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use super::review::{
-    acquisition_request_hash, audit_gateway_result, audit_gateway_result_with_receipt,
+    acquisition_request_hash, audit_gateway_result_with_receipt, audit_routed_gateway_result,
     AuditedGatewayBatch, GatewayBatch, GatewayError,
 };
 
@@ -160,24 +160,10 @@ impl MarketCapabilitiesGateway {
         match super::grpc_source::bridge_for("MinuteData") {
             Ok(bridge) => {
                 let result = bridge.minute_data_async(&storage_code).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(
-                    MINUTE_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(MINUTE_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    MINUTE_CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(MINUTE_CAPABILITY, &request_hash, Err(error));
             }
         }
         // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
@@ -195,21 +181,11 @@ impl MarketCapabilitiesGateway {
         match super::grpc_source::bridge_for("OrderBooks") {
             Ok(bridge) => {
                 let result = bridge.order_books_async(&storage_codes).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(
-                    ORDER_BOOK_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(ORDER_BOOK_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     ORDER_BOOK_CAPABILITY,
-                    ProviderId::Tdx,
                     &request_hash,
                     Err(error),
                 );
@@ -233,21 +209,11 @@ impl MarketCapabilitiesGateway {
         match super::grpc_source::bridge_for("MoneyFlows") {
             Ok(bridge) => {
                 let result = bridge.money_flows_async(&storage_codes).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(
-                    MONEY_FLOW_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(MONEY_FLOW_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     MONEY_FLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
                     &request_hash,
                     Err(error),
                 );
@@ -268,24 +234,10 @@ impl MarketCapabilitiesGateway {
         match super::grpc_source::bridge_for("SecurityMetadata") {
             Ok(bridge) => {
                 let result = bridge.security_metadata_async(&storage_codes).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(
-                    METADATA_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(METADATA_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    METADATA_CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(METADATA_CAPABILITY, &request_hash, Err(error));
             }
         }
     }
@@ -378,6 +330,7 @@ mod observation_tests {
     use crate::database::attribution_reports::{
         AttributionDatabaseAccess, AttributionDatabaseSession,
     };
+    use crate::database::DatabaseManager;
     use diesel::prelude::*;
     use diesel::sql_types::{BigInt, Text};
 
@@ -391,6 +344,43 @@ mod observation_tests {
         request_hash: String,
         #[diesel(sql_type = Text)]
         record_hash: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct AuditProviderRow {
+        #[diesel(sql_type = Text)]
+        provider: String,
+    }
+
+    #[tokio::test]
+    async fn metadata_bridge_failure_without_provider_is_audited_as_custom() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        let result = MarketCapabilitiesGateway::new()
+            .security_metadata(&["399993".to_owned()])
+            .await;
+
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable bridge must fail closed");
+        assert_eq!(error.provider(), None);
+
+        let request_hash = acquisition_request_hash(METADATA_CAPABILITY, "399993");
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT provider FROM data_acquisition_audit \
+             WHERE capability = 'SecurityMetadata' AND request_hash = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<Text, _>(request_hash)
+        .get_result::<AuditProviderRow>(&mut *connection)
+        .expect("bridge failure must be audited");
+        assert_eq!(row.provider, "Custom");
     }
 
     #[test]

@@ -11,7 +11,8 @@ use super::instrument_identity::resolve_production_equity;
 #[cfg(test)]
 use super::instrument_identity::resolve_test_equity;
 use super::review::{
-    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_routed_gateway_result, BatchEvidence, GatewayBatch,
+    GatewayError,
 };
 use super::t0_evidence::{T0Batch, T0Evidence, T0FiveMinuteBar, T0_QUOTE_MAX_AGE_SECS};
 
@@ -54,28 +55,14 @@ impl IntradayShapeGateway {
                 let storage_code = match validate_requested_code(&requested_code) {
                     Ok(valid) => valid,
                     Err(error) => {
-                        return audit_gateway_result(
-                            CAPABILITY,
-                            ProviderId::Tdx,
-                            &request_hash,
-                            Err(error),
-                        )
+                        return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error))
                     }
                 };
                 let result = bridge.intraday_shape_async(&storage_code).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tdx);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Tdx,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
     }
@@ -399,7 +386,46 @@ fn rfc3339(value: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::data_gateway::t0_evidence::{T0BookLevel, T0Quote, T0Rejection};
+    use crate::database::DatabaseManager;
     use chrono::TimeZone;
+    use diesel::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct AuditProviderRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        provider: String,
+    }
+
+    #[tokio::test]
+    async fn intraday_bridge_failure_without_provider_is_audited_as_custom() {
+        let _env = super::super::grpc_source::test_grpc_env_guard();
+        DatabaseManager::init(None).expect("TEST_CODE audit database init");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        super::super::grpc_source::reset_bridge();
+
+        let result = IntradayShapeGateway::new()
+            .current_shape("TEST_CODE_600396")
+            .await;
+
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        super::super::grpc_source::reset_bridge();
+
+        let error = result.expect_err("unreachable bridge must fail closed");
+        assert_eq!(error.provider(), None);
+
+        let request_hash = acquisition_request_hash(CAPABILITY, "TEST_CODE_600396");
+        let mut connection = DatabaseManager::get().get_conn().unwrap();
+        let row = diesel::sql_query(
+            "SELECT provider FROM data_acquisition_audit \
+             WHERE capability = 'IntradayShape' AND request_hash = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(request_hash)
+        .get_result::<AuditProviderRow>(&mut *connection)
+        .expect("bridge failure must be audited");
+        assert_eq!(row.provider, "Custom");
+    }
 
     fn book() -> [T0BookLevel; 5] {
         std::array::from_fn(|index| T0BookLevel {

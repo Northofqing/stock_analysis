@@ -2170,11 +2170,44 @@ fn deliver_envelope_blocking(
         .counted_delivery_critical_section
         .lock()
         .map_err(|_| "BR-239 counted delivery critical-section mutex poisoned".to_owned())?;
+
+    // DataMode cards are periodic observations of one status fact. Once the
+    // first card owns a v2 occurrence, later ticks (and a restarted process)
+    // must advance that frozen envelope instead of admitting newly rendered
+    // HH:MM/banner bytes as another physical-send decision.
+    if envelope.push_kind == DurablePushKind::DataMode
+        && envelope
+            .schedule_occurrence_identity
+            .starts_with("data-mode-v2:")
+    {
+        let existing = state
+            .coordinator
+            .inspect_exact_occurrence_owner(
+                &envelope.business_date,
+                envelope.push_kind,
+                envelope.sub_kind,
+                &envelope.scope_key,
+                &envelope.schedule_occurrence_identity,
+            )
+            .map_err(|error| format!("inspect frozen DataMode occurrence: {error}"))?;
+        if let Some(owner) = existing {
+            return advance_prepared_envelope(state, owner.envelope);
+        }
+    }
+
     let decision_identity = envelope.decision_identity.clone();
     state
         .coordinator
         .prepare(&envelope, 1, Utc::now())
         .map_err(|error| format!("prepare counted decision {decision_identity}: {error}"))?;
+    advance_prepared_envelope(state, envelope)
+}
+
+fn advance_prepared_envelope(
+    state: &RuntimeState,
+    envelope: DeliveryEnvelope,
+) -> Result<DurableDispatchEvidence, String> {
+    let decision_identity = envelope.decision_identity.clone();
     let mut reconciled_hydrations = reconcile_current_decision(state, &decision_identity)?;
 
     let prepared_state = state
@@ -2770,6 +2803,25 @@ mod tests {
         }
     }
 
+    struct UncertainCountingSink {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AuthoritativeSinkPort for UncertainCountingSink {
+        fn sink_identity(&self) -> &str {
+            "TEST_CODE_DATA_MODE_UNCERTAIN_SINK"
+        }
+
+        fn deliver(&self, _request: &AuthoritativeDeliveryRequest) -> AuthoritativeSinkResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            AuthoritativeSinkResult::Uncertain(stock_analysis::durable_delivery::TypedUncertainty {
+                reason_code: "TEST_CODE_DATA_MODE_UNCERTAIN".to_owned(),
+                evidence: b"TEST_CODE_DATA_MODE_UNCERTAIN_EVIDENCE".to_vec(),
+                observed_at: Utc::now(),
+            })
+        }
+    }
+
     fn hydration_envelope(label: &str, business_date: &str) -> DeliveryEnvelope {
         DeliveryEnvelope::new(
             business_date,
@@ -2925,6 +2977,102 @@ mod tests {
             second.expect("second delivery succeeds").state,
             DecisionState::Delivered
         );
+    }
+
+    #[test]
+    fn data_mode_unknown_reuses_frozen_occurrence_without_blind_resend_after_reopen() {
+        let test_code = format!(
+            "TEST_CODE_DATA_MODE_FROZEN_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let namespace_dir = TestNamespaceDir::new(&test_code);
+        let database_path = namespace_dir.path().join("durable_delivery.sqlite3");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let occurrence = "data-mode-v2:2026-09-26:Unsafe:TEST_CODE_FACT";
+        let build = |label: &str, rendered: &str| {
+            DeliveryEnvelope::new(
+                "2026-09-26",
+                DurablePushKind::DataMode,
+                DeliverySubKind::None,
+                "GLOBAL",
+                occurrence,
+                format!("TEST_CODE_DATA_MODE_EVIDENCE_{label}"),
+                format!("TEST_CODE_DATA_MODE_SOURCE_{label}").into_bytes(),
+                format!("TEST_CODE_DATA_MODE_SUBJECT_{label}"),
+                rendered.as_bytes().to_vec(),
+                true,
+                None,
+            )
+            .expect("valid DataMode envelope")
+        };
+        let state = RuntimeState {
+            namespace: RuntimeNamespace::Test {
+                test_code: test_code.clone(),
+            },
+            coordinator: Arc::new(
+                DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+                    &database_path,
+                    &test_code,
+                    format!("owner-first-{test_code}-0123456789abcdef"),
+                ))
+                .expect("open first DataMode coordinator"),
+            ),
+            append: Arc::new(
+                DurableDeliveryImmutableAppend::for_test_code(&test_code)
+                    .expect("bind DataMode immutable append"),
+            ),
+            sink: Arc::new(UncertainCountingSink {
+                calls: Arc::clone(&calls),
+            }),
+            counted_delivery_critical_section: Mutex::new(()),
+            producer_ready: AtomicBool::new(true),
+            schedule_hydrations: Mutex::new(Vec::new()),
+            queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
+        };
+
+        let first = deliver_envelope_blocking(&state, build("FIRST", "数据状态变更（10:21）"))
+            .expect("first uncertain DataMode attempt is durably classified");
+        assert_eq!(first.state, DecisionState::UncertainManualReview);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let same_process =
+            deliver_envelope_blocking(&state, build("NEXT_MINUTE", "数据状态变更（10:22）"))
+                .expect("same fact reuses the frozen occurrence");
+        assert_eq!(same_process.decision_identity, first.decision_identity);
+        assert_eq!(same_process.state, DecisionState::UncertainManualReview);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let restarted = RuntimeState {
+            namespace: RuntimeNamespace::Test {
+                test_code: test_code.clone(),
+            },
+            coordinator: Arc::new(
+                DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+                    &database_path,
+                    &test_code,
+                    format!("owner-restart-{test_code}-0123456789abcdef"),
+                ))
+                .expect("reopen DataMode coordinator"),
+            ),
+            append: Arc::new(
+                DurableDeliveryImmutableAppend::for_test_code(&test_code)
+                    .expect("rebind DataMode immutable append"),
+            ),
+            sink: Arc::new(UncertainCountingSink {
+                calls: Arc::clone(&calls),
+            }),
+            counted_delivery_critical_section: Mutex::new(()),
+            producer_ready: AtomicBool::new(true),
+            schedule_hydrations: Mutex::new(Vec::new()),
+            queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
+        };
+        let after_reopen =
+            deliver_envelope_blocking(&restarted, build("AFTER_REOPEN", "数据状态变更（10:23）"))
+                .expect("restart reuses the frozen occurrence");
+        assert_eq!(after_reopen.decision_identity, first.decision_identity);
+        assert_eq!(after_reopen.state, DecisionState::UncertainManualReview);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -1252,9 +1252,25 @@ impl AnalysisPipeline {
         if self.config.single_notify && self.config.send_notification {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
-            match self.notifier.send(&report).await {
-                Ok(_) => info!("[{}] 单股推送成功", code_clone),
-                Err(e) => error!("[{}] 单股推送失败: {}", code_clone, e),
+            let delivery = self.notifier.send_report(&report).await;
+            match delivery.completion() {
+                crate::notification::NotificationCompletion::AllAccepted => {
+                    info!("[{}] 单股推送全部渠道弱接受", code_clone)
+                }
+                crate::notification::NotificationCompletion::Partial => error!(
+                    "[{}] 单股推送部分成功: accepted={} unknown={}",
+                    code_clone,
+                    delivery.accepted_count(),
+                    delivery.unknown_count()
+                ),
+                crate::notification::NotificationCompletion::AllFailed => error!(
+                    "[{}] 单股推送全部失败: targets={}",
+                    code_clone,
+                    delivery.attempts().len()
+                ),
+                crate::notification::NotificationCompletion::NoTargets => {
+                    error!("[{}] 单股推送失败: 未配置可用渠道", code_clone)
+                }
             }
         }
 

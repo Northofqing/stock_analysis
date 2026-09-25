@@ -18,7 +18,7 @@ use crate::market_domain::SourceEvidence;
 use crate::news::aggregator::AdmittedGlobalNewsBatch;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -106,6 +106,105 @@ enum AdmittedNewsSourceRecord {
     Sina(SinaInstrumentNewsRecord),
 }
 
+const NEWS_FACT_RECOVERY_SNAPSHOT_VERSION: u8 = 1;
+const NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverySourceEvidence {
+    provider: ProviderId,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+}
+
+impl RecoverySourceEvidence {
+    fn from_source(value: &SourceEvidence) -> Self {
+        Self {
+            provider: value.provider(),
+            source_at: value.source_at().map(str::to_owned),
+            observed_at: value.observed_at().to_owned(),
+            batch_id: value.batch_id().to_owned(),
+        }
+    }
+
+    fn into_source(self) -> Result<SourceEvidence, NewsAiError> {
+        let evidence = SourceEvidence::new(self.provider, self.observed_at, self.batch_id)
+            .map_err(|error| NewsAiError::AnalysisAuditFailed(error.to_string()))?;
+        match self.source_at {
+            Some(source_at) => evidence
+                .with_source_at(source_at)
+                .map_err(|error| NewsAiError::AnalysisAuditFailed(error.to_string())),
+            None => Ok(evidence),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryBatchEvidence {
+    provider: ProviderId,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+}
+
+impl RecoveryBatchEvidence {
+    fn from_batch(value: &BatchEvidence) -> Self {
+        Self {
+            provider: value.provider,
+            source: value.source.clone(),
+            source_at: value.source_at.clone(),
+            observed_at: value.observed_at.clone(),
+            batch_id: value.batch_id.clone(),
+        }
+    }
+
+    fn into_batch(self) -> BatchEvidence {
+        BatchEvidence {
+            provider: self.provider,
+            source: self.source,
+            source_at: self.source_at,
+            observed_at: self.observed_at,
+            batch_id: self.batch_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RecoveryNewsRecord {
+    Global {
+        item_id: String,
+        title: String,
+        summary: Option<String>,
+        content: Option<String>,
+        publisher: String,
+        canonical_url: String,
+        published_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        instruments: Vec<String>,
+        topics: Vec<String>,
+        language: String,
+        evidence: RecoverySourceEvidence,
+    },
+    Sina {
+        item: crate::data_provider::news_item::NewsItem,
+        evidence: RecoverySourceEvidence,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsFactRecoverySnapshot {
+    schema_version: u8,
+    record: RecoveryNewsRecord,
+    batch: RecoveryBatchEvidence,
+    target_code: String,
+    target_name: Option<String>,
+}
+
 /// A source record that remains inseparable from its original batch evidence
 /// and exact target instrument.
 #[derive(Debug, Clone)]
@@ -121,6 +220,114 @@ pub struct AdmittedNewsFact {
 }
 
 impl AdmittedNewsFact {
+    pub(crate) fn recovery_snapshot_canonical(&self) -> Result<Vec<u8>, NewsAiError> {
+        let record = match &self.record {
+            AdmittedNewsSourceRecord::Global(record) => RecoveryNewsRecord::Global {
+                item_id: record.item_id.clone(),
+                title: record.title.clone(),
+                summary: record.summary.clone(),
+                content: record.content.clone(),
+                publisher: record.publisher.clone(),
+                canonical_url: record.canonical_url.clone(),
+                published_at: record.published_at,
+                observed_at: record.observed_at,
+                instruments: record.instruments.clone(),
+                topics: record.topics.clone(),
+                language: record.language.clone(),
+                evidence: RecoverySourceEvidence::from_source(&record.evidence),
+            },
+            AdmittedNewsSourceRecord::Sina(record) => RecoveryNewsRecord::Sina {
+                item: record.persistence_item().clone(),
+                evidence: RecoverySourceEvidence::from_source(record.evidence()),
+            },
+        };
+        let snapshot = NewsFactRecoverySnapshot {
+            schema_version: NEWS_FACT_RECOVERY_SNAPSHOT_VERSION,
+            record,
+            batch: RecoveryBatchEvidence::from_batch(&self.batch),
+            target_code: self.target_code.clone(),
+            target_name: self.target_name.clone(),
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+            NewsAiError::AnalysisAuditFailed(format!(
+                "NewsAI recovery snapshot serialization failed: {error}"
+            ))
+        })?;
+        if bytes.len() > NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(NewsAiError::AnalysisAuditFailed(format!(
+                "NewsAI recovery snapshot exceeds {NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_recovery_snapshot(bytes: &[u8]) -> Result<Self, NewsAiError> {
+        if bytes.is_empty() || bytes.len() > NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "NewsAI recovery snapshot size is invalid".to_owned(),
+            ));
+        }
+        let snapshot: NewsFactRecoverySnapshot = serde_json::from_slice(bytes).map_err(|error| {
+            NewsAiError::AnalysisAuditFailed(format!(
+                "NewsAI recovery snapshot parse failed: {error}"
+            ))
+        })?;
+        if snapshot.schema_version != NEWS_FACT_RECOVERY_SNAPSHOT_VERSION
+            || serde_json::to_vec(&snapshot).map_err(|error| {
+                NewsAiError::AnalysisAuditFailed(format!(
+                    "NewsAI recovery snapshot canonicalization failed: {error}"
+                ))
+            })? != bytes
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "NewsAI recovery snapshot is not canonical v1".to_owned(),
+            ));
+        }
+        let batch = snapshot.batch.into_batch();
+        let mut fact = match snapshot.record {
+            RecoveryNewsRecord::Global {
+                item_id,
+                title,
+                summary,
+                content,
+                publisher,
+                canonical_url,
+                published_at,
+                observed_at,
+                instruments,
+                topics,
+                language,
+                evidence,
+            } => Self::from_global_parts(
+                &GlobalNewsRecord {
+                    item_id,
+                    title,
+                    summary,
+                    content,
+                    publisher,
+                    canonical_url,
+                    published_at,
+                    observed_at,
+                    instruments,
+                    topics,
+                    language,
+                    evidence: evidence.into_source()?,
+                },
+                &batch,
+                &snapshot.target_code,
+            )?,
+            RecoveryNewsRecord::Sina { item, evidence } => Self::from_sina(
+                &SinaInstrumentNewsRecord::new(item, evidence.into_source()?),
+                &batch,
+                &snapshot.target_code,
+            )?,
+        };
+        if let Some(target_name) = snapshot.target_name {
+            fact = fact.with_target_name(target_name);
+        }
+        Ok(fact)
+    }
+
     pub fn from_admitted_global(
         admitted: &AdmittedGlobalNewsBatch,
         record_index: usize,
@@ -2881,6 +3088,42 @@ mod tests {
         assert_eq!(fact.source_batch_id(), "TEST_CODE_NEWS_BATCH");
         assert_eq!(fact.target_code(), "TEST_CODE_600519");
         assert_eq!(fact.target_name(), None, "BR-250 构造缺省无名称");
+    }
+
+    #[test]
+    fn br172_recovery_snapshot_reconstructs_fact_without_live_batch() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let fact = AdmittedNewsFact::from_global(
+            &global_record(observed_at),
+            &news_batch(observed_at),
+            "TEST_CODE_600519",
+        )
+        .expect("exact evidence must be admitted")
+        .with_target_name("TEST_CODE_名称".to_owned());
+
+        let snapshot = fact
+            .recovery_snapshot_canonical()
+            .expect("freeze admitted fact for recovery");
+        let recovered = AdmittedNewsFact::from_recovery_snapshot(&snapshot)
+            .expect("reconstruct admitted fact without a live provider batch");
+
+        assert_eq!(recovered.provider(), fact.provider());
+        assert_eq!(recovered.source(), fact.source());
+        assert_eq!(recovered.source_batch_id(), fact.source_batch_id());
+        assert_eq!(recovered.item_id(), fact.item_id());
+        assert_eq!(recovered.target_code(), fact.target_code());
+        assert_eq!(recovered.target_name(), fact.target_name());
+        assert_eq!(recovered.title(), fact.title());
+        assert_eq!(recovered.summary(), fact.summary());
+        assert_eq!(recovered.content(), fact.content());
+        assert_eq!(recovered.published_at(), fact.published_at());
+        assert_eq!(recovered.observed_at(), fact.observed_at());
+        assert_eq!(
+            recovered
+                .recovery_snapshot_canonical()
+                .expect("re-freeze recovered fact"),
+            snapshot
+        );
     }
 
     #[test]

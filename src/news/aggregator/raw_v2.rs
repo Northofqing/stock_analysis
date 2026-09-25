@@ -1102,6 +1102,11 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
             "source_precondition_failed",
             error.retryable(),
         ),
+        "external_transport_unavailable" => (
+            "external_transport_unavailable",
+            "external_transport_unavailable",
+            error.retryable(),
+        ),
         "internal" => ("internal", "internal", error.retryable()),
         _ => (
             "provider_error_mapping_missing",
@@ -1327,6 +1332,24 @@ mod tests {
             assert_eq!(unavailable.reason_code(), "invalid_evidence");
             assert!(!unavailable.retryable());
         }
+    }
+
+    #[test]
+    fn external_transport_unavailable_keeps_its_gateway_reason() {
+        let error = crate::data_gateway::grpc_source::map_external_connection_error(
+            crate::grpc_client::errors::GrpcError::Unavailable {
+                details: Box::new(crate::grpc_client::errors::ErrorDetail::default()),
+            },
+        );
+
+        assert_eq!(
+            classify_gateway_error(&error),
+            (
+                "external_transport_unavailable",
+                "external_transport_unavailable",
+                true,
+            )
+        );
     }
 
     #[tokio::test]

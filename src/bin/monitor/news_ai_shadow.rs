@@ -13,6 +13,7 @@ use std::sync::Arc;
 use stock_analysis::calendar::{self, MarketSession};
 use stock_analysis::data_gateway::instrument_identity::resolve_production_equity;
 use stock_analysis::data_gateway::{HistoricalBarsGateway, MarketDataGateway};
+use stock_analysis::database::news_ai::NewsAiPendingRecovery;
 use stock_analysis::llm::LlmRegistry;
 use stock_analysis::monitor::news_ai::{
     deliver_governed_news_ai, AdmittedNewsFact, GovernedNewsAiDelivery, NewsAIAnalyzer,
@@ -273,61 +274,77 @@ async fn run_same_tick_batches(
     status: NewsAiRuntimeStatus,
     _permit: OwnedSemaphorePermit,
 ) {
+    let mut stats = NewsAiRunStats::default();
+    let mut recovered_work = 0_usize;
+    if status.governed_delivery_recovery == GovernedDeliveryRecoveryCapability::Enabled {
+        let pending = tokio::task::spawn_blocking(|| {
+            stock_analysis::database::get_db()
+                .load_pending_news_ai_recoveries(MAX_ASSESSMENTS_PER_TICK)
+        })
+        .await;
+        match pending {
+            Ok(Ok(pending)) => {
+                for recovery in pending {
+                    match recovery {
+                        NewsAiPendingRecovery::Ready(audited) => {
+                            let key = audited
+                                .delivery()
+                                .assessment()
+                                .assessment_id()
+                                .to_owned();
+                            let outcome = deliver_governed_news_ai(
+                                &audited,
+                                &ProductionNewsAiDeliveryPort,
+                            )
+                            .await;
+                            recovered_work += usize::from(stats.record_governed(
+                                &key,
+                                true,
+                                outcome,
+                            ));
+                        }
+                        NewsAiPendingRecovery::ManualReview {
+                            assessment_id,
+                            reason,
+                        } => {
+                            stats.deferred += 1;
+                            log::warn!(
+                                "[NewsAI][BR-172] pending assessment requires manual review assessment_id={} reason={}",
+                                assessment_id,
+                                reason
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                stats.failed += 1;
+                log::warn!("[NewsAI][BR-172] durable pending scan failed: {error}");
+            }
+            Err(error) => {
+                stats.failed += 1;
+                log::warn!("[NewsAI][BR-172] durable pending scan task failed: {error}");
+            }
+        }
+    }
+
     let candidates = exact_candidates(&batches);
     if candidates.is_empty() {
         log::debug!("[NewsAI][BR-172] no exact source-bound equity target");
-        return;
     }
-
-    let mut pushed = 0_usize;
-    let mut link_recovered = 0_usize;
-    let mut retained = 0_usize;
-    let mut deferred = 0_usize;
-    let mut deduped = 0_usize;
-    // 2026-09-22 NewsAI counted 准入接线后: counted 准入拒绝 (PerTicket 1200s
-    // 冷却窗内同票) 是**设计内的正常丢弃**, 不是故障。单开计数避免污染
-    // failed= 与 WARN 级别 (真实故障 ReserveFailed/RollbackFailed/
-    // PostSinkCommitFailed 才能与"按设计丢弃"区分)。
-    let mut denied = 0_usize;
-    let mut failed = 0_usize;
-    let mut budget = CandidateVisitBudget::new(
+    let mut budget = CandidateVisitBudget::with_worked(
         candidates.len(),
         NEXT_NEWS_AI_CANDIDATE.load(Ordering::Relaxed),
+        recovered_work,
     );
     while let Some(index) = budget.next_index() {
         let candidate = &candidates[index];
         let did_work = match assess_candidate(analyzer.as_ref(), &status, candidate).await {
             Ok(CandidateOutcome::Governed { existing, delivery }) => {
-                let did_work = !matches!(&delivery, NewsAiGovernedDeliveryOutcome::Deduped { .. });
-                match delivery {
-                    NewsAiGovernedDeliveryOutcome::Pushed { .. } => pushed += 1,
-                    NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered { .. } => {
-                        link_recovered += 1;
-                    }
-                    NewsAiGovernedDeliveryOutcome::RetainedNoDelivery { .. } => retained += 1,
-                    NewsAiGovernedDeliveryOutcome::Deduped { .. } => deduped += 1,
-                    // counted 准入拒绝: 设计内丢弃, info 级, 不计入 failed。
-                    NewsAiGovernedDeliveryOutcome::Denied { reason, .. } => {
-                        denied += 1;
-                        log::info!(
-                        "[NewsAI][BR-172] counted admission denied key={} existing={} reason={reason}",
-                        candidate.key,
-                        existing
-                    );
-                    }
-                    other => {
-                        failed += 1;
-                        log::warn!(
-                        "[NewsAI][BR-172] governed delivery incomplete key={} existing={} outcome={other:?}",
-                        candidate.key,
-                        existing
-                    );
-                    }
-                }
-                did_work
+                stats.record_governed(&candidate.key, existing, delivery)
             }
             Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing }) => {
-                deferred += 1;
+                stats.deferred += 1;
                 log::warn!(
                     "[NewsAI][BR-172] assessment retained for governed delivery recovery key={} existing={} governed_delivery_recovery={}",
                     candidate.key,
@@ -337,11 +354,11 @@ async fn run_same_tick_batches(
                 !existing
             }
             Ok(CandidateOutcome::TerminalDenied) => {
-                denied += 1;
+                stats.denied += 1;
                 false
             }
             Err(error) => {
-                failed += 1;
+                stats.failed += 1;
                 log::warn!(
                     "[NewsAI][BR-172] candidate failed key={} error={error}",
                     candidate.key
@@ -354,14 +371,62 @@ async fn run_same_tick_batches(
     NEXT_NEWS_AI_CANDIDATE.store(budget.next_start(), Ordering::Relaxed);
     log::info!(
         "[NewsAI][BR-172] completed pushed={} link_recovered={} retained_neutral={} deferred_delivery={} deduped={} admission_denied={} failed={}",
-        pushed,
-        link_recovered,
-        retained,
-        deferred,
-        deduped,
-        denied,
-        failed
+        stats.pushed,
+        stats.link_recovered,
+        stats.retained,
+        stats.deferred,
+        stats.deduped,
+        stats.denied,
+        stats.failed
     );
+}
+
+#[derive(Default)]
+struct NewsAiRunStats {
+    pushed: usize,
+    link_recovered: usize,
+    retained: usize,
+    deferred: usize,
+    deduped: usize,
+    denied: usize,
+    failed: usize,
+}
+
+impl NewsAiRunStats {
+    fn record_governed(
+        &mut self,
+        key: &str,
+        existing: bool,
+        delivery: NewsAiGovernedDeliveryOutcome,
+    ) -> bool {
+        let did_work = !matches!(&delivery, NewsAiGovernedDeliveryOutcome::Deduped { .. });
+        match delivery {
+            NewsAiGovernedDeliveryOutcome::Pushed { .. } => self.pushed += 1,
+            NewsAiGovernedDeliveryOutcome::PredictionLinkRecovered { .. } => {
+                self.link_recovered += 1;
+            }
+            NewsAiGovernedDeliveryOutcome::RetainedNoDelivery { .. } => self.retained += 1,
+            NewsAiGovernedDeliveryOutcome::Deduped { .. } => self.deduped += 1,
+            // counted 准入拒绝是设计内丢弃，不污染 failed 指标。
+            NewsAiGovernedDeliveryOutcome::Denied { reason, .. } => {
+                self.denied += 1;
+                log::info!(
+                    "[NewsAI][BR-172] counted admission denied key={} existing={} reason={reason}",
+                    key,
+                    existing
+                );
+            }
+            other => {
+                self.failed += 1;
+                log::warn!(
+                    "[NewsAI][BR-172] governed delivery incomplete key={} existing={} outcome={other:?}",
+                    key,
+                    existing
+                );
+            }
+        }
+        did_work
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -385,11 +450,15 @@ struct CandidateVisitBudget {
 
 impl CandidateVisitBudget {
     fn new(total: usize, start: usize) -> Self {
+        Self::with_worked(total, start, 0)
+    }
+
+    fn with_worked(total: usize, start: usize, worked: usize) -> Self {
         Self {
             total,
             start: if total == 0 { 0 } else { start % total },
             inspected: 0,
-            worked: 0,
+            worked,
         }
     }
 
@@ -1102,6 +1171,29 @@ mod tests {
             status.candidate_execution(false),
             CandidateExecution::RejectNewAnalysisUnavailable
         );
+    }
+
+    #[test]
+    fn br172_empty_live_batch_does_not_bypass_persisted_pending_scan() {
+        let source = include_str!("news_ai_shadow.rs");
+        let runner = source
+            .split("async fn run_same_tick_batches(")
+            .nth(1)
+            .expect("same-tick runner")
+            .split("struct NewsAiCandidate")
+            .next()
+            .expect("same-tick runner boundary");
+        let durable_scan = runner
+            .find("load_pending_news_ai_recoveries")
+            .expect("independent durable pending scan");
+        let live_candidates = runner
+            .find("exact_candidates(&batches)")
+            .expect("live-batch candidates");
+
+        assert!(durable_scan < live_candidates);
+        assert!(!runner.contains(
+            "if candidates.is_empty() {\n        log::debug!(\"[NewsAI][BR-172] no exact source-bound equity target\");\n        return;"
+        ));
     }
 
     #[test]

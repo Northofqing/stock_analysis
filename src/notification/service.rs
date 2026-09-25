@@ -222,15 +222,13 @@ impl NotificationService {
         }
 
         let report = NotificationSendReport::from_attempts(attempts);
-        let accepted_count = report
-            .attempts()
-            .iter()
-            .filter(|attempt| attempt.outcome() == WeakOutcomeKind::Accepted)
-            .count();
-        let unknown_count = report.attempts().len() - accepted_count;
+        let accepted_count = report.accepted_count();
+        let unknown_count = report.unknown_count();
         info!(
-            "通知发送完成：弱成功 {} 个，状态未知 {} 个",
-            accepted_count, unknown_count
+            "通知发送完成：completion={:?} 弱成功 {} 个，状态未知 {} 个",
+            report.completion(),
+            accepted_count,
+            unknown_count
         );
         report
     }

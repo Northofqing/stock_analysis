@@ -8302,6 +8302,65 @@ fn decision_dedup_requires_identical_canonical_bytes() {
 }
 
 #[test]
+fn exact_occurrence_owner_freezes_the_first_data_mode_card_across_reopen() {
+    let fixture = Fixture::new("DATA_MODE_OCCURRENCE_OWNER");
+    let occurrence = "data-mode-v2:2026-09-26:Unsafe:TEST_CODE_FACT";
+    let first = DeliveryEnvelope::new(
+        "2026-09-26",
+        PushKind::DataMode,
+        DeliverySubKind::None,
+        "GLOBAL",
+        occurrence,
+        "TEST_CODE_DATA_MODE_EVIDENCE_A",
+        b"TEST_CODE_DATA_MODE_SOURCE_A".to_vec(),
+        "TEST_CODE_DATA_MODE_SUBJECT_A",
+        "数据状态变更（10:21）".as_bytes().to_vec(),
+        true,
+        None,
+    )
+    .expect("first DataMode envelope");
+    let rerendered = DeliveryEnvelope::new(
+        "2026-09-26",
+        PushKind::DataMode,
+        DeliverySubKind::None,
+        "GLOBAL",
+        occurrence,
+        "TEST_CODE_DATA_MODE_EVIDENCE_B",
+        b"TEST_CODE_DATA_MODE_SOURCE_B".to_vec(),
+        "TEST_CODE_DATA_MODE_SUBJECT_B",
+        "数据状态变更（10:22）".as_bytes().to_vec(),
+        true,
+        None,
+    )
+    .expect("rerendered DataMode envelope");
+    assert_ne!(first.decision_identity, rerendered.decision_identity);
+
+    fixture
+        .coordinator
+        .prepare(&first, 1, now())
+        .expect("persist first DataMode decision");
+
+    let assert_frozen_owner = |coordinator: &DurableDeliveryCoordinator| {
+        let owner = coordinator
+            .inspect_exact_occurrence_owner(
+                "2026-09-26",
+                PushKind::DataMode,
+                DeliverySubKind::None,
+                "GLOBAL",
+                occurrence,
+            )
+            .expect("inspect exact occurrence owner")
+            .expect("first envelope owns the occurrence");
+        assert_eq!(owner.envelope, first);
+        assert_eq!(owner.state, DecisionState::Reserved);
+    };
+
+    assert_frozen_owner(&fixture.coordinator);
+    let reopened = fixture.second_coordinator("DATA_MODE_OCCURRENCE_OWNER_REOPEN");
+    assert_frozen_owner(&reopened);
+}
+
+#[test]
 fn source_binding_is_frozen_and_participates_in_replay_conflict_detection() {
     let fixture = Fixture::new("SOURCE_BINDING");
     let envelope = envelope(

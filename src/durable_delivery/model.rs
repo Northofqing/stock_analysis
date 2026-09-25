@@ -1915,6 +1915,16 @@ pub struct ReviewTaskOccurrenceEvidence {
     pub schedule_hydration: Option<ScheduleHydration>,
 }
 
+/// Immutable owner of one exact producer occurrence.
+///
+/// This is intentionally read-only: callers may resume the stored decision,
+/// but must never substitute newly rendered bytes for the frozen envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactOccurrenceOwner {
+    pub envelope: DeliveryEnvelope,
+    pub state: DecisionState,
+}
+
 /// Read-only evidence for one authoritative BusinessDateOnce claim.
 ///
 /// Unlike `ReviewTaskOccurrenceEvidence`, this type does not require or imply

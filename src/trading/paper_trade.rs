@@ -656,8 +656,9 @@ pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), 
 /// 计算出来」）：
 /// - 最新券商汇总 effective_at 日期 == 今天 → 用户当天上传 → 以快照 4 字段
 ///   为准（真实账户证据：total_assets/cash/market_value/daily_pnl）。
-/// - 快照过期 → `estimate_ledger_from_positions`：持仓明细 × 实时行情估值 +
-///   快照现金；daily_pnl = 今日总资产 − 昨日 ledger（自动计算每日收益）。
+/// - 快照过期 → 绑定同一 effective_at 的持仓明细，以实时行情重估证券市值，
+///   同时保留账户总资产中无法归入证券市值/可用现金的非负残差；有昨日基准时
+///   daily_pnl = 今日总资产 − 昨日 ledger，首个基准日记 0 而不虚构盈利。
 pub fn refresh_account_ledger_from_snapshot() -> Result<(), String> {
     refresh_account_ledger_from_snapshot_with_cancel(&std::sync::atomic::AtomicBool::new(false))
 }
@@ -670,15 +671,26 @@ fn check_scan_cancelled(cancelled: &std::sync::atomic::AtomicBool) -> Result<(),
     }
 }
 
-fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+fn refresh_account_ledger_from_snapshot_with_cancel(
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
     check_scan_cancelled(cancelled)?;
     let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
     // 数值与有效日必须来自同一条按 effective_at 选出的账户事实。
     let summary = crate::database::user_account_summary::latest()?
         .ok_or_else(|| "account summary unavailable: no confirmed summary".to_string())?;
-    let snapshot_date = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
-        .map_err(|error| format!("snapshot effective_at invalid: {error}"))?
-        .date_naive();
+    let snapshot_effective_at = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
+        .map_err(|error| format!("snapshot effective_at invalid: {error}"))?;
+    let snapshot_date = snapshot_effective_at.date_naive();
+    let position_snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
+        .map_err(|error| format!("持仓快照读取失败: {error}"))?
+        .ok_or_else(|| "无持仓快照，无法绑定账户估值事实 (BR-234b)".to_string())?;
+    validate_account_position_binding(snapshot_effective_at, position_snapshot.effective_at)?;
+    let other_assets = account_other_assets(
+        summary.total_assets,
+        summary.securities_market_value,
+        summary.available_cash,
+    )?;
     let mut conn = db
         .get_conn()
         .map_err(|error| format!("DB 连接失败: {error}"))?;
@@ -695,7 +707,14 @@ fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomi
                 summary.daily_pnl,
             )
         } else {
-            estimate_ledger_from_positions(&mut conn, summary.available_cash, today, cancelled)?
+            estimate_ledger_from_snapshot_with_cancel(
+                &position_snapshot,
+                &mut conn,
+                summary.available_cash,
+                other_assets,
+                today,
+                cancelled,
+            )?
         };
 
     // upsert 当日 ledger（created_at 每 tick 刷新 → age≤30s 结构门通过）
@@ -725,21 +744,6 @@ fn refresh_account_ledger_from_snapshot_with_cancel(cancelled: &std::sync::atomi
     validate_ledger_state(&ledger, &today_str, chrono::Utc::now().naive_utc())
 }
 
-/// 快照过期自算路径：最新持仓明细 × 估值价 → 市值；总资产 = 市值 + 快照现金；
-/// daily_pnl = 总资产 − 昨日 ledger（无昨日行 → 0，首日）。
-/// 持仓快照缺失 → Err 出声（无授权证据不臆造估值）。
-fn estimate_ledger_from_positions(
-    conn: &mut SqliteConnection,
-    cash: f64,
-    today: NaiveDate,
-    cancelled: &std::sync::atomic::AtomicBool,
-) -> Result<(f64, f64, f64, f64), String> {
-    let snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
-        .map_err(|error| format!("持仓快照读取失败: {error}"))?
-        .ok_or_else(|| "无持仓快照，无法自算估值 (BR-234b)".to_string())?;
-    estimate_ledger_from_snapshot_with_cancel(&snapshot, conn, cash, today, cancelled)
-}
-
 /// 估值纯函数（自算口径主体）：给定持仓快照 → (total, cash, market, daily_pnl)。
 /// 与 DB 读取解耦，便于不落库的确定性测试。
 #[cfg(test)]
@@ -749,23 +753,40 @@ fn estimate_ledger_from_snapshot(
     cash: f64,
     today: NaiveDate,
 ) -> Result<(f64, f64, f64, f64), String> {
-    estimate_ledger_from_snapshot_with_cancel(snapshot, conn, cash, today, &std::sync::atomic::AtomicBool::new(false))
+    estimate_ledger_from_snapshot_with_cancel(
+        snapshot,
+        conn,
+        cash,
+        0.0,
+        today,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
 }
 
 fn estimate_ledger_from_snapshot_with_cancel(
     snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
     conn: &mut SqliteConnection,
     cash: f64,
+    other_assets: f64,
     today: NaiveDate,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(f64, f64, f64, f64), String> {
-    estimate_ledger_from_snapshot_with_reads(snapshot, conn, cash, today, cancelled, &ProductionValuationReads)
+    estimate_ledger_from_snapshot_with_reads(
+        snapshot,
+        conn,
+        cash,
+        other_assets,
+        today,
+        cancelled,
+        &ProductionValuationReads,
+    )
 }
 
 fn estimate_ledger_from_snapshot_with_reads(
     snapshot: &crate::database::user_position_snapshot::UserPositionSnapshot,
     conn: &mut SqliteConnection,
     cash: f64,
+    other_assets: f64,
     today: NaiveDate,
     cancelled: &std::sync::atomic::AtomicBool,
     reads: &impl ValuationReads,
@@ -773,10 +794,11 @@ fn estimate_ledger_from_snapshot_with_reads(
     let mut market_value = 0.0;
     for item in &snapshot.items {
         check_scan_cancelled(cancelled)?;
-        market_value += item.quantity as f64 * valuation_price_with_reads(&item.code, cancelled, reads)?;
+        market_value += item.quantity as f64
+            * valuation_price_with_reads(&item.code, cancelled, reads)?;
     }
     check_scan_cancelled(cancelled)?;
-    let total = market_value + cash;
+    let total = estimated_account_total(market_value, cash, other_assets);
 
     #[derive(QueryableByName)]
     struct PrevTotalRow {
@@ -790,8 +812,53 @@ fn estimate_ledger_from_snapshot_with_reads(
     .get_result(conn)
     .optional()
     .map_err(|error| format!("prev ledger unavailable: {error}"))?;
-    let daily_pnl = total - prev.map_or(0.0, |row| row.total_value);
+    let daily_pnl = daily_pnl_from_previous_total(total, prev.map(|row| row.total_value));
     Ok((total, cash, market_value, daily_pnl))
+}
+
+fn daily_pnl_from_previous_total(total: f64, previous_total: Option<f64>) -> f64 {
+    previous_total.map_or(0.0, |previous| total - previous)
+}
+
+fn account_other_assets(
+    total_assets: f64,
+    securities_market_value: f64,
+    available_cash: f64,
+) -> Result<f64, String> {
+    if !total_assets.is_finite()
+        || !securities_market_value.is_finite()
+        || !available_cash.is_finite()
+        || total_assets < 0.0
+        || securities_market_value < 0.0
+        || available_cash < 0.0
+    {
+        return Err("account valuation components must be finite and non-negative".to_owned());
+    }
+    let residual = total_assets - securities_market_value - available_cash;
+    if residual < -0.01 {
+        return Err(format!(
+            "account total is below market value plus available cash: residual={residual:.2}"
+        ));
+    }
+    Ok(residual.max(0.0))
+}
+
+fn estimated_account_total(market_value: f64, cash: f64, other_assets: f64) -> f64 {
+    market_value + cash + other_assets
+}
+
+fn validate_account_position_binding(
+    account_effective_at: chrono::DateTime<chrono::FixedOffset>,
+    position_effective_at: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<(), String> {
+    if account_effective_at != position_effective_at {
+        return Err(format!(
+            "account/position effective_at mismatch: account={} position={}",
+            account_effective_at.to_rfc3339(),
+            position_effective_at.to_rfc3339()
+        ));
+    }
+    Ok(())
 }
 
 /// 单只估值价：实时价优先（broker::quote_price，BR-218 5s 门）；
@@ -1900,6 +1967,39 @@ mod tests {
         assert_eq!(total, 50_000.0);
         assert_eq!(cash, 40_000.0);
         assert!((pnl - 2_000.0).abs() < 1e-9, "pnl={pnl}");
+    }
+
+    #[test]
+    fn first_valuation_without_a_previous_baseline_has_zero_daily_pnl() {
+        assert_eq!(daily_pnl_from_previous_total(50_000.0, None), 0.0);
+        assert_eq!(
+            daily_pnl_from_previous_total(50_000.0, Some(48_000.0)),
+            2_000.0
+        );
+    }
+
+    #[test]
+    fn stale_valuation_preserves_unexplained_account_assets() {
+        let residual = account_other_assets(59_201.32, 38_234.00, 14_307.22)
+            .expect("finite account residual");
+        assert!((residual - 6_660.10).abs() < 0.000_001);
+        assert!((estimated_account_total(38_000.0, 14_307.22, residual) - 58_967.32).abs()
+            < 0.000_001);
+    }
+
+    #[test]
+    fn account_and_position_snapshots_must_share_the_same_effective_fact_time() {
+        let account = chrono::DateTime::parse_from_rfc3339("2026-09-24T22:59:00+08:00")
+            .expect("account time");
+        let same = chrono::DateTime::parse_from_rfc3339("2026-09-24T22:59:00+08:00")
+            .expect("position time");
+        let different = chrono::DateTime::parse_from_rfc3339("2026-09-24T23:01:00+08:00")
+            .expect("different position time");
+
+        validate_account_position_binding(account, same).expect("same capture is bound");
+        assert!(validate_account_position_binding(account, different)
+            .expect_err("independently latest facts must not be spliced")
+            .contains("effective_at mismatch"));
     }
 
     /// BR-234b fail-closed：实时行情不可用（无 provider）且日K无数据 →

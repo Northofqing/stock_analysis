@@ -106,10 +106,25 @@ pub(super) async fn send_summary_notification_to(
 
     notifier.save_report_to_dir(&artifacts.report, &artifacts.filename, output_dir)?;
 
-    match notifier.send(&artifacts.report).await {
-        Ok(true) => info!("✓ 股票分析报告推送成功"),
-        Ok(false) => error!("股票分析报告推送失败：所有渠道均未成功"),
-        Err(e) => error!("推送通知失败: {}", e),
+    let delivery = notifier.send_report(&artifacts.report).await;
+    match delivery.completion() {
+        crate::notification::NotificationCompletion::AllAccepted => {
+            info!("✓ 股票分析报告全部渠道弱接受")
+        }
+        crate::notification::NotificationCompletion::Partial => info!(
+            "股票分析报告部分渠道弱接受: accepted={} unknown={}",
+            delivery.accepted_count(),
+            delivery.unknown_count()
+        ),
+        crate::notification::NotificationCompletion::AllFailed => {
+            anyhow::bail!(
+                "股票分析报告所有 {} 个渠道均未确认成功",
+                delivery.attempts().len()
+            );
+        }
+        crate::notification::NotificationCompletion::NoTargets => {
+            anyhow::bail!("股票分析报告没有可用通知渠道");
+        }
     }
 
     Ok(())
@@ -210,7 +225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_commit_writes_reports_and_uses_disabled_real_notifier_adapter() {
+    async fn summary_commit_writes_reports_but_reports_disabled_delivery_as_failure() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
@@ -223,7 +238,7 @@ mod tests {
         let value = result();
         let summary = backtest();
 
-        send_summary_notification_to(
+        let error = send_summary_notification_to(
             &notifier,
             &[value],
             Some(&summary),
@@ -232,7 +247,8 @@ mod tests {
             &output_dir,
         )
         .await
-        .expect("isolated summary commit");
+        .expect_err("disabled notifier must not masquerade as completed delivery");
+        assert!(error.to_string().contains("没有可用通知渠道"));
 
         let names = std::fs::read_dir(&output_dir)
             .expect("summary output directory")

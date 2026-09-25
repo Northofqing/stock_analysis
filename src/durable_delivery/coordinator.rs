@@ -2,7 +2,7 @@ use super::model::{
     compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
     AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkResult, AuthorityWatermark, CoordinatorConfig, DecisionState,
-    DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError,
+    DeliveryDispositionCanonical, DeliveryEnvelope, DurableDeliveryError, ExactOccurrenceOwner,
     FoundationDeliveryBinding, FoundationTerminalDisposition, FoundationTerminalQuery,
     FoundationTerminalRecord, ImmutableAppendPort, ManualAcceptedDeliveryAuditEvidence,
     ManualDisposition, ManualResolutionAuthorizationCanonical, ManualResolutionCommand,
@@ -2984,6 +2984,97 @@ impl DurableDeliveryCoordinator {
             load_decision(connection, decision_identity)?
                 .map(|stored| stored.state)
                 .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.to_owned()))
+        })
+    }
+
+    /// Return the immutable owner of one exact producer occurrence.
+    ///
+    /// Unlike cooldown/window claims, an occurrence is producer-defined. This
+    /// lookup does not admit a new envelope and therefore lets a producer
+    /// reuse the first frozen card when a later tick renders different display
+    /// bytes for the same business fact. Multiple owners fail closed.
+    pub fn inspect_exact_occurrence_owner(
+        &self,
+        business_date: &str,
+        push_kind: super::model::PushKind,
+        sub_kind: super::model::DeliverySubKind,
+        scope_key: &str,
+        occurrence_identity: &str,
+    ) -> Result<Option<ExactOccurrenceOwner>> {
+        super::model::validate_business_date(business_date)?;
+        if scope_key.trim().is_empty() || occurrence_identity.trim().is_empty() {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "exact_occurrence_identity_invalid".to_owned(),
+            ));
+        }
+        let policy = compiled_policy_catalog()
+            .into_iter()
+            .find(|row| row.push_kind == push_kind && row.sub_kind == sub_kind)
+            .ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(format!(
+                    "exact occurrence has no compiled policy for {push_kind}/{sub_kind}"
+                ))
+            })?;
+        let expected_scope = match policy.cooldown_scope {
+            super::model::CooldownScope::Global => "GLOBAL",
+            super::model::CooldownScope::PerTicket => scope_key,
+        };
+        if scope_key != expected_scope {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "exact occurrence scope mismatch for {push_kind}/{sub_kind}: {scope_key}"
+            )));
+        }
+
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT decision_identity
+                 FROM delivery_decisions
+                 WHERE business_date=?1 AND push_kind=?2 AND sub_kind=?3 AND scope_key=?4
+                 ORDER BY created_at ASC, decision_identity ASC",
+            )?;
+            let decision_identities = statement
+                .query_map(
+                    params![business_date, push_kind.as_str(), sub_kind.as_str(), scope_key],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let mut owner = None;
+            for decision_identity in decision_identities {
+                let stored = load_decision(connection, &decision_identity)?.ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(decision_identity.clone())
+                })?;
+                if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "exact occurrence envelope hash mismatch for {decision_identity}"
+                    )));
+                }
+                let envelope = parse_envelope(&stored.envelope_canonical)?;
+                if envelope.canonical_bytes()? != stored.envelope_canonical
+                    || envelope.decision_identity != decision_identity
+                    || envelope.business_date != business_date
+                    || envelope.push_kind != push_kind
+                    || envelope.sub_kind != sub_kind
+                    || envelope.scope_key != scope_key
+                {
+                    return Err(DurableDeliveryError::PolicyMismatch(format!(
+                        "exact occurrence envelope binding mismatch for {decision_identity}"
+                    )));
+                }
+                if envelope.schedule_occurrence_identity != occurrence_identity {
+                    continue;
+                }
+                if owner.is_some() {
+                    return Err(DurableDeliveryError::IsolationViolation(format!(
+                        "multiple decisions own exact occurrence {occurrence_identity}"
+                    )));
+                }
+                owner = Some(ExactOccurrenceOwner {
+                    envelope,
+                    state: stored.state,
+                });
+            }
+            Ok(owner)
         })
     }
 

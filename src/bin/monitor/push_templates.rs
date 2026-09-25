@@ -5719,25 +5719,27 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 /// v17.4 §5.2 (BR-083): 13:00 午盘虚拟仓快照 (AC38).
 /// 与 evening 全量复盘共用 PushKind::PaperReview (cooldown 86400/票),
 /// dedup code 用 "noon-{code}" 前缀隔离两窗口 (否则午盘推完 evening 被 L4 拦).
-pub async fn dispatch_paper_review_noon(date: &str) -> bool {
+pub async fn dispatch_paper_review_noon(date: &str) -> crate::review_batch::ReviewTaskOutcome {
     let snapshot = match load_paper_review_snapshot_real(date).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             log_dispatcher_attempt("A-01-noon", false, 0, "paper_review_snapshot empty");
             log::info!("[A-01-noon] 13:00 快照: virtual_observation 无数据, 跳过");
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::no_data(
+                "virtual observation has no exact noon review record",
+            );
         }
         Err(error) => {
             log::error!("[A-01-noon][BR-104] batch rejected: {error}");
             log_dispatcher_attempt("A-01-noon", false, 0, &error);
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::failed(true, error);
         }
     };
     let params = build_paper_review_from_snapshot(&snapshot);
     let noon_code = noon_dedup_code(&snapshot.code);
-    let result = push_paper_review(&noon_code, params).await;
-    log_dispatcher_attempt("A-01-noon", result, 1, "");
-    result
+    let result = push_paper_review_outcome(&noon_code, params).await;
+    log_dispatcher_attempt("A-01-noon", result.is_pushed(), 1, "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, 1)
 }
 
 /// BR-083: 午盘快照 dedup code (纯函数, 供单测)
@@ -6514,17 +6516,25 @@ pub fn build_limit_boards_counted_binding(
 }
 
 /// MU-data-mode counted binding (2026-09-20): occurrence
-/// data-mode:{业务日}:{old:?}:{new:?} — 变迁对即身份 (BR-116 committed-mode
-/// 去重语义, 同日多次变迁互不杀身份); canonical = 业务日 + 变迁对 + 渲染
-/// sha256; Global scope; retry_authorized=true (系统健康告警必达 + 内容为
-/// 状态变迁事实, 补发仍有效 — A-12 先例)。
+/// data-mode-v2:{业务日}:{new:?}:{fact_sha256} — 当前模式和能力事实拥有稳定
+/// 身份，进程重启后不依赖内存中的 prev；首版渲染仍完整冻结在 envelope。
+/// Global scope; retry_authorized=true (系统健康告警必达 + 内容为状态事实)。
 pub fn build_data_mode_counted_binding(
     business_date: chrono::NaiveDate,
     prev_mode: Option<stock_analysis::monitor::data_mode::DataMode>,
     new_mode: stock_analysis::monitor::data_mode::DataMode,
+    fact_fingerprint: &str,
     text: &str,
 ) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
     use sha2::{Digest, Sha256};
+
+    if fact_fingerprint.len() != 64
+        || !fact_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("数据模式事实指纹必须是小写 SHA-256 hex".to_owned());
+    }
 
     let old_str = prev_mode
         .map(|mode| format!("{mode:?}"))
@@ -6532,17 +6542,18 @@ pub fn build_data_mode_counted_binding(
     let new_str = format!("{new_mode:?}");
     let rendered_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
     let canonical = serde_json::json!({
-        "schema": "data-mode-v1",
+        "schema": "data-mode-v2",
         "business_date": business_date.format("%Y-%m-%d").to_string(),
         "old": old_str,
         "new": new_str,
+        "fact_fingerprint": fact_fingerprint,
         "rendered_sha256": rendered_sha256,
     });
     let canonical_bytes = canonical.to_string().into_bytes();
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
-        format!("data-mode:{business_date}:{old_str}:{new_str}"),
+        format!("data-mode-v2:{business_date}:{new_str}:{fact_fingerprint}"),
         canonical_bytes,
         crate::durable_delivery_runtime::CountedDeliveryScope::Global,
         subject_hash,
@@ -10373,6 +10384,16 @@ fn candidate_snapshot_persist(date: &str, codes: &std::collections::BTreeSet<Str
     }
 }
 
+fn candidate_prediction_target_date(
+    prediction_date: chrono::NaiveDate,
+) -> Result<chrono::NaiveDate, String> {
+    let mut target = prediction_date;
+    for _ in 0..5 {
+        target = stock_analysis::calendar::verified_next_a_share_trading_day(target)?;
+    }
+    Ok(target)
+}
+
 /// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
 pub async fn dispatch_candidate_board(date: &str) -> bool {
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
@@ -10418,28 +10439,38 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
         .map(|entry| (entry.code.clone(), entry.heat_score.unwrap_or(50.0)))
         .collect();
     if !strong_samples.is_empty() {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let target = (chrono::Local::now().date_naive() + chrono::Duration::days(5))
-            .format("%Y-%m-%d")
-            .to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            use stock_analysis::database::DatabaseManager;
-            let db = DatabaseManager::get();
-            for (code, score) in strong_samples {
-                let _ = db.save_prediction(
-                    &today,
-                    &target,
-                    None,
-                    Some(&code),
-                    "up",
-                    score,
-                    Some("candidate-strong"),
-                    None,
-                    None,
-                );
+        let target_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| format!("invalid prediction date: {error}"))
+            .and_then(candidate_prediction_target_date);
+        match target_date {
+            Ok(target_date) => {
+                let prediction_date = date.to_owned();
+                let target_date = target_date.format("%Y-%m-%d").to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    use stock_analysis::database::DatabaseManager;
+                    let db = DatabaseManager::get();
+                    for (code, score) in strong_samples {
+                        let _ = db.save_prediction(
+                            &prediction_date,
+                            &target_date,
+                            None,
+                            Some(&code),
+                            "up",
+                            score,
+                            Some("candidate-strong"),
+                            None,
+                            None,
+                        );
+                    }
+                })
+                .await;
             }
-        })
-        .await;
+            Err(error) => log::warn!(
+                "[BR-232] 候选样本未保存：预测日或权威交易日历不可用 date={} error={}",
+                date,
+                error
+            ),
+        }
     }
     candidate_snapshot_persist(date, &codes_now);
     let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
@@ -11825,9 +11856,7 @@ async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
     let mut hit_count = 0usize;
     for offset in 1..=days {
         let pred_date = today - Duration::days(offset);
-        let target_date = pred_date + Duration::days(1);
         let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
-        let target_date_s = target_date.format("%Y-%m-%d").to_string();
         let db = stock_analysis::database::DatabaseManager::get();
         let Ok(pending) = db.get_pending_predictions(&pred_date_s) else {
             continue;
@@ -11843,7 +11872,7 @@ async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
                 db,
                 code,
                 &pred_date_s,
-                &target_date_s,
+                &pred.target_date,
                 &pred.pred_direction,
             )
             .await
@@ -11851,12 +11880,7 @@ async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
                 continue;
             };
             if db
-                .update_prediction_result(
-                    &pred_date_s,
-                    Some(code),
-                    outcome.actual_change,
-                    outcome.hit,
-                )
+                .update_prediction_result_by_id(pred.id, outcome.actual_change, outcome.hit)
                 .is_ok()
             {
                 total += 1;
@@ -17173,6 +17197,7 @@ enum DataModeDispatchReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataModeNotificationPlan {
     EstablishSilently,
+    AwaitStableWindow,
     Dispatch {
         previous: Option<stock_analysis::monitor::data_mode::DataMode>,
         current: stock_analysis::monitor::data_mode::DataMode,
@@ -17213,7 +17238,7 @@ fn data_mode_notification_plan(
                     reason: DataModeDispatchReason::Transition,
                 }
             } else {
-                DataModeNotificationPlan::EstablishSilently
+                DataModeNotificationPlan::AwaitStableWindow
             }
         }
         // BR-135: a changed stable missing-capability fingerprint is a new
@@ -17232,6 +17257,7 @@ fn data_mode_notification_plan(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModeDispatchResult {
     EstablishedSilently,
+    AwaitingStableWindow,
     Delivery(crate::notify::PushOutcome),
 }
 
@@ -17255,10 +17281,30 @@ pub async fn push_data_mode_change(
 
     let health = dm_evaluate(input, prev);
 
+    let fact_fingerprint = {
+        use sha2::{Digest, Sha256};
+        let mut missing = health
+            .missing
+            .iter()
+            .map(|capability| capability.label().to_owned())
+            .collect::<Vec<_>>();
+        missing.sort();
+        let canonical = serde_json::json!({
+            "schema": "data-mode-status-fact-v2",
+            "mode": format!("{:?}", health.mode),
+            "missing": missing,
+            "eta": health.eta.as_deref(),
+        });
+        hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
+    };
+
     let (prev_mode, new_mode, dispatch_reason) =
         match data_mode_notification_plan(input, prev, unsafe_fact_changed, pending_stable_since) {
             DataModeNotificationPlan::EstablishSilently => {
                 return Ok(ModeDispatchResult::EstablishedSilently);
+            }
+            DataModeNotificationPlan::AwaitStableWindow => {
+                return Ok(ModeDispatchResult::AwaitingStableWindow);
             }
             DataModeNotificationPlan::Dispatch {
                 previous,
@@ -17333,6 +17379,7 @@ pub async fn push_data_mode_change(
                 chrono::Local::now().date_naive(),
                 prev_mode,
                 new_mode,
+                &fact_fingerprint,
                 &text,
             )
             .and_then(|binding| {
@@ -19414,6 +19461,16 @@ mod tests_br232_tomorrow_watch_quotes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_prediction_target_is_the_fifth_verified_trading_day() {
+        let friday = chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        assert_eq!(
+            candidate_prediction_target_date(friday).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+            "the checked-in calendar must skip the weekend and National Day closure"
+        );
+    }
 
     #[tokio::test]
     async fn br242_review_ai_timeout_drops_future_before_worker_returns() {
@@ -23576,42 +23633,58 @@ mod tests {
     }
 
     #[test]
-    fn u10_counted_binding_is_per_transition_with_replay() {
+    fn u10_data_mode_occurrence_is_stable_per_status_fact() {
         use stock_analysis::monitor::data_mode::DataMode as LibDM;
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
+        let degraded_fact = "a".repeat(64);
         let binding = build_data_mode_counted_binding(
             date,
             Some(LibDM::Full),
             LibDM::Degraded,
-            "数据模式降级",
+            &degraded_fact,
+            "数据模式降级（10:21）",
         )
         .expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
-            "data-mode:2026-09-20:Full:Degraded"
+            format!("data-mode-v2:2026-09-20:Degraded:{degraded_fact}")
         );
-        // 同变迁对同事实 → 同 occurrence (decision 回放稳定)
+        // 重启丢失 prev 且分钟/横幅重渲染时，同一状态事实仍复用 occurrence。
         let again = build_data_mode_counted_binding(
             date,
-            Some(LibDM::Full),
+            None,
             LibDM::Degraded,
-            "数据模式降级",
+            &degraded_fact,
+            "数据模式降级（10:22）",
         )
         .expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
         );
-        // 同日反向变迁 (Degraded→Full) → 不同 occurrence (日级头不会吞掉)
+        // 模式恢复或真正不同的风险事实必须获得新 occurrence。
         let reverse = build_data_mode_counted_binding(
             date,
             Some(LibDM::Degraded),
             LibDM::Full,
+            &"b".repeat(64),
             "数据模式恢复",
         )
         .expect("valid binding");
         assert_ne!(
             reverse.schedule_occurrence_identity(),
+            binding.schedule_occurrence_identity()
+        );
+        let changed_fact = build_data_mode_counted_binding(
+            date,
+            Some(LibDM::Full),
+            LibDM::Degraded,
+            &"c".repeat(64),
+            "数据模式降级（能力集合已变化）",
+        )
+        .expect("valid changed fact binding");
+        assert_ne!(
+            changed_fact.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
         );
         // 健康告警必达 → retry_authorized=true, Global scope
@@ -26482,6 +26555,40 @@ mod tests {
             result.unwrap(),
             ModeDispatchResult::EstablishedSilently
         ));
+    }
+
+    #[tokio::test]
+    async fn br225c_pending_stable_window_is_not_a_confirmed_notification() {
+        use stock_analysis::monitor::data_mode::{
+            Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+        };
+
+        let input = DataHealthInput {
+            capabilities: vec![
+                CapabilityStatus::fresh(Capability::Quote, 1),
+                CapabilityStatus::missing(Capability::Kline),
+                CapabilityStatus::fresh(Capability::MoneyFlow, 1),
+                CapabilityStatus::fresh(Capability::News, 1),
+                CapabilityStatus::missing(Capability::OrderBook),
+            ],
+            critical_max_age_secs: 120,
+            orderbook_max_age_secs: 600,
+        };
+
+        let result = push_data_mode_change(
+            &input,
+            Some(LibDM::Full),
+            false,
+            Some(&banner_normal_full()),
+            None,
+        )
+        .await
+        .expect("pending stable-window transition should be a valid no-delivery result");
+
+        assert!(
+            !result.is_confirmed(),
+            "a transition still inside the stable window has not notified the user"
+        );
     }
 
     #[test]

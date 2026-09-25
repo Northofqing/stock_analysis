@@ -4140,6 +4140,45 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Ok(rows)
     }
 
+    /// Update exactly one immutable prediction row.
+    ///
+    /// Backfill workers must use the row id returned by `get_pending_predictions`.
+    /// A `(pred_date, stock_code)` pair is not unique because multiple models and
+    /// horizons may legitimately emit predictions for the same instrument.
+    pub fn update_prediction_result_by_id(
+        &self,
+        prediction_id: i32,
+        actual_change: f64,
+        hit: bool,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if prediction_id <= 0 {
+            return Err(invalid_input(format!(
+                "prediction_id 必须为正整数: {prediction_id}"
+            ))
+            .into());
+        }
+        if !actual_change.is_finite() || actual_change.abs() > 20.0 {
+            return Err(invalid_input(format!(
+                "actual_change 必须有限且绝对值不超过 20%: {actual_change}"
+            ))
+            .into());
+        }
+
+        use diesel::sql_types::{Double, Integer, Text};
+        let mut conn = self.get_conn()?;
+        let result_text = if hit { "命中" } else { "未命中" };
+        let rows = diesel::sql_query(
+            "UPDATE prediction_tracker SET actual_change = ?1, hit = ?2, actual_result = ?3 \
+             WHERE id = ?4 AND hit IS NULL",
+        )
+        .bind::<Double, _>(actual_change)
+        .bind::<Integer, _>(hit as i32)
+        .bind::<Text, _>(result_text)
+        .bind::<Integer, _>(prediction_id)
+        .execute(&mut *conn)?;
+        Ok(rows)
+    }
+
     /// 按 stock_code + pred_date 查询 prediction 记录
     ///
     /// 修复 R-1: 用于 verify_predictions 真实回填后, 测试断言 hit/actual_change。
@@ -5569,6 +5608,45 @@ mod tests {
         assert_eq!(stored.actual_change, Some(1.25));
         assert_eq!(stored.hit, Some(1));
         assert_eq!(stored.actual_result.as_deref(), Some("命中"));
+
+        let same_day_code = format!("TEST_CODE_SAME_DAY_{suffix}");
+        for detail in ["model-a", "model-b"] {
+            db.save_prediction(
+                &today,
+                &target,
+                None,
+                Some(&same_day_code),
+                "看多",
+                70.0,
+                Some(detail),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let pending_same_day = db
+            .get_pending_predictions(&today)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.stock_code.as_deref() == Some(same_day_code.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(pending_same_day.len(), 2);
+        assert_eq!(
+            db.update_prediction_result_by_id(pending_same_day[0].id, 2.5, true)
+                .unwrap(),
+            1
+        );
+        let still_pending = db
+            .get_pending_predictions(&today)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.stock_code.as_deref() == Some(same_day_code.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "result backfill must update one immutable prediction row, not every same-day model"
+        );
         assert!((0.0..=1.0).contains(&db.get_prediction_hit_rate(1).unwrap()));
         assert_eq!(
             db.update_prediction_result(&today, Some("TEST_CODE_MISSING"), 0.5, false)
@@ -5669,9 +5747,10 @@ mod tests {
             .is_err());
 
         diesel::sql_query(
-            "DELETE FROM prediction_tracker WHERE stock_code = ?1 OR theme_name = ?2",
+            "DELETE FROM prediction_tracker WHERE stock_code IN (?1, ?2) OR theme_name = ?3",
         )
         .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(&same_day_code)
         .bind::<diesel::sql_types::Text, _>(&theme)
         .execute(&mut conn)
         .unwrap();
