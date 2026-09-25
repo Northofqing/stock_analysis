@@ -96,6 +96,199 @@ fn assert_models_stop(error: &anyhow::Error) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_without_rpc() {
+    let mut business = V2BusinessFixture::new();
+    let mut parent_server = None;
+    let mut external_server = None;
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
+            let baseline = control_tests::setup_external_parent(
+                &mut business,
+                &mut parent_server,
+                "TEST_CODE_EXTERNAL_V12_HEALTH_UNKNOWN",
+            )
+            .await;
+            assert_eq!(
+                business
+                    .chain_post_close()
+                    .migrate_schema_v11_to_v12()
+                    .unwrap()
+                    .schema_version(),
+                12
+            );
+            external_server = Some(
+                ExternalMtlsMacroFixture::bind_data_provider_attempts_for_test(false)
+                    .await
+                    .unwrap(),
+            );
+            let external = external_server.as_ref().unwrap();
+            let source = GrpcSource::from_external_macro_bundle_for_test(
+                external.bundle_path().to_path_buf(),
+            );
+            let search = macro_search_service(&[]);
+            let started_at = micros("2026-09-14T15:31:00+08:00");
+            let clock = MacroClock {
+                now: Cell::new(UtcMicros::try_new(started_at).unwrap()),
+                observation: DateTime::parse_from_rfc3339("2026-09-14T15:31:00+08:00").unwrap(),
+                observation_calls: Cell::new(0),
+            };
+            let mut local = business
+                .store
+                .as_mut()
+                .unwrap()
+                .single_user_local_chain_post_close(&baseline.config)
+                .unwrap();
+            let lease = local
+                .resume_run(
+                    &baseline.intent,
+                    macro_lease(
+                        "TEST_CODE_EXTERNAL_V12_HEALTH_FAULT",
+                        started_at,
+                        started_at + 1_000_000,
+                        baseline.head,
+                    ),
+                )
+                .unwrap();
+            let mut io = local
+                .macro_preparation_io_v12(
+                    lease,
+                    &baseline.queries,
+                    &clock,
+                    FixedClusterConfiguration::resolve(Some("2")),
+                    &baseline.source,
+                    &source,
+                    &search,
+                )
+                .unwrap();
+            let mut prepared = Box::pin(prepare_chain_analysis_with_io(
+                NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+                baseline.stocks.clone(),
+                None,
+                &mut io,
+            ));
+            let receipt_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut prepared => panic!(
+                        "TEST_CODE v12 Health returned before receipt: {result:?}"
+                    ),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if external.snapshot().health_requests.len() == 1 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < receipt_deadline,
+                    "TEST_CODE v12 Health receipt watchdog"
+                );
+            }
+            drop(prepared);
+            drop(io);
+            let pending = local.inspect_macro(&baseline.intent).unwrap();
+            assert!(pending.has_unconfirmed_effect());
+            let original_plan = pending.plan_bytes().to_vec();
+            let control = &pending.readiness_episodes()[0].controls()[0];
+            assert!(control.begin_version().is_some());
+            assert_eq!(control.result_version(), None);
+            let original_health_request_id = control.request_id().to_owned();
+            let original_health_request = control.request_bytes().to_vec();
+            assert_eq!(external.snapshot().data_calls, 0);
+            drop(pending);
+            drop(local);
+            external.release_health();
+            let wire_before = external.snapshot();
+            external.set_reject_new_connections_for_test(true);
+
+            business.reopen();
+            let reopened_clock = MacroClock {
+                now: Cell::new(UtcMicros::try_new(started_at + 3_000_000).unwrap()),
+                observation: DateTime::parse_from_rfc3339("2026-09-14T15:34:00+08:00")
+                    .unwrap(),
+                observation_calls: Cell::new(0),
+            };
+            let mut reopened_local = business
+                .store
+                .as_mut()
+                .unwrap()
+                .single_user_local_chain_post_close(&baseline.config)
+                .unwrap();
+            let reopened_head = reopened_local
+                .inspect_run(&baseline.intent)
+                .unwrap()
+                .head_version();
+            let lease = reopened_local
+                .resume_run(
+                    &baseline.intent,
+                    macro_lease(
+                        "TEST_CODE_EXTERNAL_V12_HEALTH_REOPEN",
+                        started_at + 3_000_000,
+                        started_at + 4_000_000,
+                        reopened_head,
+                    ),
+                )
+                .unwrap();
+            let mut reopened_io = reopened_local
+                .macro_preparation_io_v12(
+                    lease,
+                    &baseline.queries,
+                    &reopened_clock,
+                    FixedClusterConfiguration::resolve(Some("2")),
+                    &baseline.source,
+                    &source,
+                    &search,
+                )
+                .unwrap();
+            let stopped = prepare_chain_analysis_with_io(
+                NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+                baseline.stocks.clone(),
+                None,
+                &mut reopened_io,
+            )
+            .await
+            .expect_err("TEST_CODE v12 pending Health must remain Unknown");
+            assert!(matches!(
+                stopped.downcast_ref::<PreparationStop>(),
+                Some(PreparationStop::IncompleteOnReopen { intent_id })
+                    if intent_id == baseline.intent.as_str()
+            ));
+            assert!(matches!(
+                stopped.downcast_ref::<ChainPostCloseError>(),
+                Some(ChainPostCloseError::IncompleteEffect { intent_id })
+                    if intent_id == baseline.intent.as_str()
+            ));
+            drop(reopened_io);
+            let recovered = reopened_local.inspect_macro(&baseline.intent).unwrap();
+            assert!(recovered.has_unconfirmed_effect());
+            assert_eq!(recovered.plan_bytes(), original_plan);
+            let recovered_control = &recovered.readiness_episodes()[0].controls()[0];
+            assert_eq!(recovered_control.result_version(), None);
+            assert_eq!(recovered_control.request_id(), original_health_request_id);
+            assert_eq!(recovered_control.request_bytes(), original_health_request);
+            let wire_after = external.snapshot();
+            assert_eq!(wire_after.tcp_accepts, wire_before.tcp_accepts);
+            assert_eq!(wire_after.health_requests, wire_before.health_requests);
+            assert_eq!(wire_after.capabilities_requests, wire_before.capabilities_requests);
+            assert_eq!(wire_after.data_calls, 0);
+        }))
+        .catch_unwind()
+        .await;
+
+    control_tests::cleanup_external_case(
+        &mut business,
+        &mut parent_server,
+        &mut external_server,
+        "v12 External Health Unknown reopen",
+    )
+    .await;
+    drop(business);
+    match body {
+        Ok(result) => result.expect("TEST_CODE v12 Health Unknown body deadline"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn single_user_external_v12_macro_provider_attempts_survive_complete_stage_and_true_reopen() {
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;

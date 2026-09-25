@@ -19,5 +19,12 @@
 - V3 数据身份逐字段篡改、连接不可用时的身份与重试、v12 完整阶段重开、v11 数据重试重开、旧 V2 混合迁移、未知 V4 拒绝、V2 原始证据篡改零重发及缺失 wire 证据恢复：定向测试通过。
 - 控制请求 V2 的 Health/Capabilities typed 方法、descriptor、跨 profile 和请求 ID 篡改，V1 历史请求匹配且不授予新 effect、历史 Health 拒绝新 Capabilities、v11 控制及数据重试重开、v12 完整阶段重开：定向测试通过。
 - 控制结果 V3 的 profile/typed 方法/request ID/descriptor/build identity 逐字段篡改、跨 endpoint 拒绝、Health/Capabilities 写入与重开、持久化 status 双载体冲突、旧 V1/V2 Ready 只保留事实且零新 RPC、未知 V4 拒绝：定向回归通过。数据 effect 同时要求 Health 和 Capabilities 两条 V3 Ready；混合 V1/V2 控制请求计划与旧 V2 Capabilities 结果不能借新 Health 授权数据调用。旧版本夹具移除 V3 专有字段，未把新 bytes 冒充旧版本。控制异常矩阵 17 个用例、Capabilities 连接失败重开及 v11/v12 正常数据路径也通过。
+- v12 Health 控制请求已发送、回执未确认时取消，重开真实数据库后保持 Unknown：定向回归验证原计划与 Health 请求身份保留，控制结果仍为空，且没有新增 Health、Capabilities 或数据请求。v11 另有 Health/Capabilities 回执取消及结果提交失败的零重发回归；v12 其他故障点尚未逐一覆盖。
 
-这仅关闭上述本地恢复缺口及 Macro External 数据结果、控制请求和控制结果的新格式切片。S6 仍需审计其他持久化消费者及 Unknown 不重发全矩阵；本次结果不代表全链路验收。未据此宣称完整 S6 验收或生产部署完成；若后续发现服务端返回的数据本身不合合同，另在本目录记录上游交接。
+## 其他持久化解码入口审计（2026-09-25）
+
+- 枚举 `src/` 的 `restore_persisted_status_error`、`QueryResponse::decode`、`HealthResponse::decode` 和 `CapabilitiesResponse::decode` 调用点后，非测试持久化恢复入口集中在 Macro codec、Board/DragonTiger 的 gateway 恢复包装器及 position-concept 的直接 status 恢复。Macro 数据结果先从保存的请求确定 profile 和 typed method：External GlobalNews 走原生 `ExternalQueryResponse`，Local 才走 Local `QueryResponse`；控制结果按保存的 External 请求和版本恢复。
+- BoardDirectory 的持久化请求由 `chain_post_close_board_codec.rs` 拒绝 External profile；BoardConstituents 的 `chain_post_close_concept_rpc_codec.rs` 只接受 `LocalBridgeV1`，position-concept 与 concept RPC 的 status/response 恢复均从该已校验请求取 profile。DragonTiger 的 occurrence 恢复核对数据库 profile 为 `LocalBridgeV1` 后才传给 gateway status/response 恢复。`grpc_source.rs` 的包装器按传入 profile 构建 typed method，所有上述持久化调用方均使用已校验的请求 profile。因此本次枚举范围内未发现另一个把已证明的 External response 送入 Local 解码器的入口。
+- 此处是调用点与校验链的静态审计，不等于 S6 全矩阵验收。仍需覆盖重连 build identity 变化、其他 Unknown 故障点及跨模块的端到端恢复；发现服务端数据不合合同时另开本目录上游交接。
+
+这仅关闭上述本地恢复缺口及 Macro External 数据结果、控制请求和控制结果的新格式切片。S6 仍需动态验收其他持久化消费者及 Unknown 不重发全矩阵；本次结果不代表全链路验收。未据此宣称完整 S6 验收或生产部署完成；若后续发现服务端返回的数据本身不合合同，另在本目录记录上游交接。
