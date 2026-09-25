@@ -6,7 +6,7 @@
 //! are never used to guess an upstream payload.
 
 use crate::grpc_client::external_pb::magic::market::v1::{
-    CanonicalPayload, QueryRequest, RequestContext,
+    CanonicalPayload, Operation as ExternalOperation, QueryRequest, RequestContext,
 };
 use crate::grpc_client::pb::magic::market::v1::Operation;
 use crate::market_domain::{AssetClass, InstrumentId};
@@ -117,6 +117,42 @@ pub fn build_external_query_request(
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
 
+    assemble_request(schema, schema_version, preferred_provider, data)
+}
+
+/// New External-only operations cannot be represented by LocalBridgeV1's
+/// Operation enum: ordinal 61 names a different Local method.
+pub fn build_external_native_query_request(
+    operation: ExternalOperation,
+    params: Value,
+) -> Result<QueryRequest, ExternalContractError> {
+    let (schema, schema_version, preferred_provider, data) = match operation {
+        ExternalOperation::CurrentAuctionObservations => {
+            ensure_only_keys(&params, &["instruments", "stage"])?;
+            let instruments = required_instruments(&params)?;
+            let stage = params
+                .get("stage")
+                .and_then(Value::as_str)
+                .filter(|stage| matches!(*stage, "live" | "final"))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            (
+                "magic.market.current_auction_observations.request",
+                1,
+                "HithinkFinance".to_owned(),
+                serde_json::json!({"instruments": instruments, "stage": stage}),
+            )
+        }
+        _ => return Err(ExternalContractError::UndeliveredOperation),
+    };
+    assemble_request(schema, schema_version, preferred_provider, data)
+}
+
+fn assemble_request(
+    schema: &str,
+    schema_version: u32,
+    preferred_provider: String,
+    data: Value,
+) -> Result<QueryRequest, ExternalContractError> {
     let data = serde_json::to_vec(&data).map_err(|_| ExternalContractError::Serialize)?;
     Ok(QueryRequest {
         context: Some(RequestContext {
@@ -196,12 +232,41 @@ fn parse_iso_date(value: &Value) -> Result<NaiveDate, ExternalContractError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
     use serde_json::{json, Value};
 
     fn payload_json(request: QueryRequest) -> (String, Value, bool) {
         let payload = request.payload.expect("external request payload");
         let data = serde_json::from_slice(&payload.data).expect("external request JSON");
         (payload.schema, data, request.allow_unadmitted)
+    }
+
+    #[test]
+    fn current_auction_live_request_uses_external_61_and_hithink_contract() {
+        let request = build_external_native_query_request(
+            ExternalOperation::CurrentAuctionObservations,
+            json!({
+                "instruments": [{
+                    "exchange": "Shanghai", "code": "600519", "asset_class": "Equity"
+                }],
+                "stage": "live"
+            }),
+        )
+        .expect("published CurrentAuctionObservations contract");
+        assert_eq!(request.preferred_provider, "HithinkFinance");
+        let payload = request.payload.expect("versioned auction payload");
+        assert_eq!(payload.schema, "magic.market.current_auction_observations.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({
+                "instruments": [{
+                    "exchange": "Shanghai", "code": "600519", "asset_class": "Equity"
+                }],
+                "stage": "live"
+            })
+        );
+        assert!(!request.allow_unadmitted);
     }
 
     #[test]

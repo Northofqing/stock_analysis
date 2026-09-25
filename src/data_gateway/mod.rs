@@ -9,6 +9,7 @@ pub mod capital;
 pub mod chain_intelligence;
 pub mod company;
 pub mod consensus;
+pub mod current_auction_observations;
 pub mod dragon_tiger;
 pub mod economic_calendar;
 pub mod event_calendar;
@@ -58,6 +59,10 @@ pub use chain_intelligence::{
 };
 pub use company::CompanyDataGateway;
 pub use consensus::ConsensusDataGateway;
+pub use current_auction_observations::{
+    AuctionStage, CurrentAuctionObservation, CurrentAuctionObservationsGateway,
+    CurrentAuctionRequest,
+};
 pub use dragon_tiger::{
     DragonTigerGateway, DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
 };

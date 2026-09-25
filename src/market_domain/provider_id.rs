@@ -13,6 +13,8 @@ pub enum ProviderId {
     Baostock,
     Baidu,
     Tonghuashun,
+    /// Official Hithink Finance Fuyao acquisition route (record source remains Tonghuashun).
+    HithinkFinance,
     Iwencai,
     Cninfo,
     Cailianpress,

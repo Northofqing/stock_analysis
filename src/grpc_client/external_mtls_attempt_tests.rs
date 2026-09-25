@@ -806,6 +806,42 @@ async fn grpc_dual_contract_external_three_query_routes_use_generated_client_and
     }
 }
 
+#[tokio::test]
+async fn current_auction_external_61_uses_generated_rpc_and_preserves_nullable_record() {
+    let fixture = ExternalQueryWireFixture::bind_generated_routes()
+        .await
+        .expect("External generated auction fixture");
+    let prepared = GrpcMarketClient::prepare_client_bundle(fixture.bundle_path())
+        .expect("auction bundle");
+    let mut client = prepared.connect_once().await.expect("auction mTLS connection");
+    fixture.release();
+    let result = tokio::time::timeout(Duration::from_secs(10), client.query_external_native(
+            Operation::CurrentAuctionObservations,
+            serde_json::json!({
+                "instruments": [{
+                    "exchange": "Shanghai", "code": "600519", "asset_class": "Equity"
+                }],
+                "stage": "live"
+            }),
+        ))
+        .await
+        .expect("auction query deadline")
+        .expect("generated auction result");
+    assert_eq!(result.selected_provider, "HithinkFinance");
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].schema, "magic.market.current_auction_observation");
+    let record: serde_json::Value = serde_json::from_slice(&result.records[0].data).unwrap();
+    assert_eq!(record["auction_price"], serde_json::Value::Null);
+    assert_eq!(record["auction_volume_ratio"], serde_json::Value::Null);
+    assert_eq!(record["auction_unmatched"], -321.0);
+    assert!(result.source_at.is_empty());
+    let observation = fixture.snapshot();
+    assert_eq!(observation.methods, ["current_auction_observations"]);
+    assert!(observation.unexpected_methods.is_empty());
+    drop(client);
+    fixture.finish().await.expect("auction fixture cleanup");
+}
+
 #[derive(Clone, Copy)]
 enum ExternalWireBoundaryCase {
     NonEmptySource,

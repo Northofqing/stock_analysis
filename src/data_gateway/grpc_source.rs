@@ -794,6 +794,10 @@ pub(crate) fn map_external_connection_error_ref(error: &GrpcError) -> GatewayErr
 }
 
 pub(crate) fn map_external_query_error(operation: Operation, error: &GrpcError) -> GatewayError {
+    map_external_query_error_named(&format!("{operation:?}"), error)
+}
+
+fn map_external_query_error_named(operation: &str, error: &GrpcError) -> GatewayError {
     let details = error.details();
     let provider = details
         .provider
@@ -830,8 +834,8 @@ pub(crate) fn map_external_query_error(operation: Operation, error: &GrpcError) 
         .diagnostic_message
         .as_ref()
         .map(|diagnostic| diagnostic.as_str())
-        .map(|diagnostic| format!("ExternalV1 {operation:?} 查询失败: {diagnostic}"))
-        .unwrap_or_else(|| format!("ExternalV1 {operation:?} 查询失败"));
+        .map(|diagnostic| format!("ExternalV1 {operation} 查询失败: {diagnostic}"))
+        .unwrap_or_else(|| format!("ExternalV1 {operation} 查询失败"));
     GatewayError::classified(
         "GrpcExternalV1",
         provider,
@@ -1121,7 +1125,6 @@ fn reason_code_static(s: &str) -> &'static str {
 /// 一一对应)。变更时必须同步 — hooked_ops_match_bridge_for_call_sites 单测
 /// 直接扫 src/data_gateway 源码断言集合相等, 防 rot (Spec Evidence Rule)。
 pub const HOOKED_OPS: &[&str] = &[
-    "Announcements",
     "BlockTrades",
     "BoardConstituents",
     "BoardDirectory",
@@ -1131,6 +1134,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "Consensus",
     "ChainBatch",
     "CorporateActions",
+    "CurrentAuctionObservations",
     "DragonTiger",
     "EconomicCalendar",
     "FinancialStatements",
@@ -1144,6 +1148,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "InstrumentNews",
     "IntradayShape",
     "LimitPools",
+    "MarketAnnouncements",
     "MarketStatistics",
     "MinuteData",
     "MoneyFlows",
@@ -3160,6 +3165,57 @@ impl GrpcSource {
             .query(operation, params)
             .await
             .map_err(|error| map_external_query_error(operation, &error))
+    }
+
+    async fn query_external_native_op(
+        &self,
+        operation: ExternalOperation,
+        params: Value,
+    ) -> Result<QueryResult, GatewayError> {
+        crate::grpc_client::external_v1::build_external_native_query_request(
+            operation,
+            params.clone(),
+        )
+        .map_err(|_| {
+            GatewayError::classified(
+                "GrpcExternalV1",
+                None,
+                "invalid_request",
+                "external_contract_rejected",
+                false,
+                "ExternalV1 operation 或参数未在交付合同中冻结",
+            )
+        })?;
+        self.ensure_external_connected(known_external_method(operation))
+            .await?;
+        let mut client = self
+            .external_client
+            .lock()
+            .await
+            .as_ref()
+            .expect("ensure_external_connected 后必有 external client")
+            .client
+            .clone();
+        client
+            .query_external_native(operation, params)
+            .await
+            .map_err(|error| map_external_query_error_named(&format!("{operation:?}"), &error))
+    }
+
+    pub async fn current_auction_observations_async(
+        &self,
+        request: &crate::data_gateway::current_auction_observations::CurrentAuctionRequest,
+    ) -> Result<
+        GatewayBatch<crate::data_gateway::current_auction_observations::CurrentAuctionObservation>,
+        GatewayError,
+    > {
+        let response = self
+            .query_external_native_op(
+                ExternalOperation::CurrentAuctionObservations,
+                request.params(),
+            )
+            .await?;
+        crate::data_gateway::current_auction_observations::convert_response(request, &response)
     }
 
     // ---------- 6 个首批 op (M2) ----------

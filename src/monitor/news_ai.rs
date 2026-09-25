@@ -2398,6 +2398,7 @@ const fn provider_tag(provider: ProviderId) -> &'static str {
         ProviderId::Baostock => "baostock",
         ProviderId::Baidu => "baidu",
         ProviderId::Tonghuashun => "tonghuashun",
+        ProviderId::HithinkFinance => "hithink_finance",
         ProviderId::Iwencai => "iwencai",
         ProviderId::Cninfo => "cninfo",
         ProviderId::Cailianpress => "cailianpress",

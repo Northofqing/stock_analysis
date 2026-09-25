@@ -32,6 +32,8 @@ pub(crate) enum ExternalQueryMethod {
     GlobalNews,
     #[serde(rename = "OPERATION_INSTRUMENT_NEWS")]
     InstrumentNews,
+    #[serde(rename = "OPERATION_CURRENT_AUCTION_OBSERVATIONS")]
+    CurrentAuctionObservations,
 }
 
 impl ExternalQueryMethod {
@@ -42,6 +44,7 @@ impl ExternalQueryMethod {
             Self::SecurityMetadata => "SecurityMetadata",
             Self::GlobalNews => "GlobalNews",
             Self::InstrumentNews => "InstrumentNews",
+            Self::CurrentAuctionObservations => "CurrentAuctionObservations",
         }
     }
 
@@ -52,6 +55,9 @@ impl ExternalQueryMethod {
             }
             Self::GlobalNews => "/magic.market.v1.MarketDataService/GlobalNews",
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
+            Self::CurrentAuctionObservations => {
+                "/magic.market.v1.MarketDataService/CurrentAuctionObservations"
+            }
         }
     }
 
@@ -75,6 +81,16 @@ impl ExternalQueryMethod {
             Operation::SecurityMetadata => Some(Self::SecurityMetadata),
             Operation::GlobalNews => Some(Self::GlobalNews),
             Operation::InstrumentNews => Some(Self::InstrumentNews),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_external_operation(
+        operation: crate::grpc_client::external_pb::magic::market::v1::Operation,
+    ) -> Option<Self> {
+        use crate::grpc_client::external_pb::magic::market::v1::Operation;
+        match operation {
+            Operation::CurrentAuctionObservations => Some(Self::CurrentAuctionObservations),
             _ => None,
         }
     }
@@ -241,6 +257,9 @@ impl ExternalQueryTransport {
             ExternalQueryMethod::SecurityMetadata => self.client.security_metadata(request).await,
             ExternalQueryMethod::GlobalNews => self.client.global_news(request).await,
             ExternalQueryMethod::InstrumentNews => self.client.instrument_news(request).await,
+            ExternalQueryMethod::CurrentAuctionObservations => {
+                self.client.current_auction_observations(request).await
+            }
         };
         match response {
             Err(status) => ExternalQueryCall::UnaryStatus {

@@ -11,6 +11,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     CapabilitiesResponse as ExternalCapabilitiesResponse, EventCursor as ExternalEventCursor,
     EventFilter as ExternalEventFilter, HealthRequest as ExternalHealthRequest,
     HealthResponse as ExternalHealthResponse,
+    Operation as ExternalOperation,
     ListenerStatusRequest as ExternalListenerStatusRequest,
     ListenerStatusResponse as ExternalListenerStatusResponse,
     MarketEventEnvelope as ExternalMarketEventEnvelope, RequestContext as ExternalRequestContext,
@@ -595,6 +596,87 @@ impl GrpcMarketClient {
                         attempt += 1;
                     }
                     _ => return Err(err),
+                },
+            }
+        }
+    }
+
+    /// Query a method that exists only in ExternalV1. Its operation identity
+    /// must never pass through the LocalBridgeV1 enum with colliding ordinals.
+    pub async fn query_external_native(
+        &mut self,
+        operation: ExternalOperation,
+        params: serde_json::Value,
+    ) -> Result<QueryResult, GrpcError> {
+        if self.profile != ContractProfile::ExternalV1 {
+            return Err(GrpcError::Unimplemented {
+                details: Box::default(),
+            });
+        }
+        let route = ExternalQueryMethod::from_external_operation(operation).ok_or_else(|| {
+            GrpcError::Unimplemented {
+                details: Box::default(),
+            }
+        })?;
+        let method = crate::grpc_contract::methods::ExternalMethod::try_from_operation(operation)
+            .map(crate::grpc_contract::methods::MethodIdentity::External)
+            .map_err(|_| GrpcError::Unimplemented {
+                details: Box::default(),
+            })?;
+        let request = crate::grpc_client::external_v1::build_external_native_query_request(
+            operation, params,
+        )
+        .map_err(map_external_contract_error)?;
+        let request_id = request
+            .context
+            .as_ref()
+            .map(|context| context.request_id.clone())
+            .ok_or_else(|| crate::grpc_client::external_query_transport::wire_error(
+                "external_request_context_missing",
+            ))?;
+        let authority = self.acquisition_authority.clone().ok_or_else(|| {
+            crate::grpc_client::external_query_transport::wire_error(
+                "external_acquisition_authority_missing",
+            )
+        })?;
+        let mut attempt = 1;
+        loop {
+            let mut authorized = tonic::Request::new(request.clone());
+            self.attach_request_auth(&mut authorized)?;
+            let outcome = match &mut self.data {
+                DataTransport::External(data) => data.call(route, authorized).await,
+                DataTransport::Local(_) => unreachable!("ExternalV1 profile/data invariant"),
+            };
+            let result = match outcome {
+                ExternalQueryCall::Response { message, evidence } => {
+                    evidence.validate(route)?;
+                    let payload = evidence.payload().ok_or_else(|| {
+                        crate::grpc_client::external_query_transport::wire_error(
+                            "external_response_wire_invalid",
+                        )
+                    })?;
+                    admit_external_payload(payload)?;
+                    crate::grpc_client::envelope::parse_external_native_query_response(
+                        &request_id, operation, &authority, message,
+                    )
+                    .map_err(GrpcError::from)
+                }
+                ExternalQueryCall::UnaryStatus { status, .. } => Err(GrpcError::from_status(
+                    status,
+                    self.data_status_context(method, &request_id),
+                )),
+                ExternalQueryCall::LocalWireFailure { error, .. } => Err(error),
+            };
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) => match retry_decision(&error) {
+                    RetryDecision::RetryBackoff | RetryDecision::RetryBounded
+                        if attempt < self.retry.max_attempts =>
+                    {
+                        tokio::time::sleep(self.retry.backoff(attempt)).await;
+                        attempt += 1;
+                    }
+                    _ => return Err(error),
                 },
             }
         }

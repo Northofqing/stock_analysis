@@ -193,9 +193,23 @@ pub(crate) fn parse_external_query_response(
     authority: &str,
     resp: crate::grpc_client::external_pb::magic::market::v1::QueryResponse,
 ) -> Result<QueryResult, EnvelopeError> {
-    use crate::grpc_client::external_pb::magic::market::v1::{
-        AdmissionState as ExternalAdmission, Operation as ExternalOperation,
+    use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
+    let expected_external = match expected_operation {
+        Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
+        Operation::GlobalNews => ExternalOperation::GlobalNews,
+        Operation::InstrumentNews => ExternalOperation::InstrumentNews,
+        _ => return Err(EnvelopeError::OperationMismatch(expected_operation as i32, resp.operation)),
     };
+    parse_external_native_query_response(expected_request_id, expected_external, authority, resp)
+}
+
+pub(crate) fn parse_external_native_query_response(
+    expected_request_id: &str,
+    expected_operation: crate::grpc_client::external_pb::magic::market::v1::Operation,
+    authority: &str,
+    resp: crate::grpc_client::external_pb::magic::market::v1::QueryResponse,
+) -> Result<QueryResult, EnvelopeError> {
+    use crate::grpc_client::external_pb::magic::market::v1::AdmissionState as ExternalAdmission;
     if resp.request_id.is_empty() {
         return Err(EnvelopeError::MissingRequestId);
     }
@@ -205,15 +219,9 @@ pub(crate) fn parse_external_query_response(
             resp.request_id,
         ));
     }
-    let expected_external = match expected_operation {
-        Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
-        Operation::GlobalNews => ExternalOperation::GlobalNews,
-        Operation::InstrumentNews => ExternalOperation::InstrumentNews,
-        _ => return Err(EnvelopeError::OperationMismatch(expected_operation as i32, resp.operation)),
-    };
-    if resp.operation != expected_external as i32 {
+    if resp.operation != expected_operation as i32 {
         return Err(EnvelopeError::OperationMismatch(
-            expected_external as i32,
+            expected_operation as i32,
             resp.operation,
         ));
     }

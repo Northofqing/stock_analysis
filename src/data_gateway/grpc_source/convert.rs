@@ -79,6 +79,7 @@ pub fn parse_provider(s: &str) -> Result<ProviderId, GatewayError> {
         "Baostock" => ProviderId::Baostock,
         "Baidu" => ProviderId::Baidu,
         "Tonghuashun" => ProviderId::Tonghuashun,
+        "HithinkFinance" => ProviderId::HithinkFinance,
         "Iwencai" => ProviderId::Iwencai,
         "Cninfo" => ProviderId::Cninfo,
         "Cailianpress" => ProviderId::Cailianpress,

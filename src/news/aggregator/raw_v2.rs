@@ -558,6 +558,7 @@ const fn provider_id_wire_name(provider: ProviderId) -> &'static str {
         ProviderId::Baostock => "Baostock",
         ProviderId::Baidu => "Baidu",
         ProviderId::Tonghuashun => "Tonghuashun",
+        ProviderId::HithinkFinance => "HithinkFinance",
         ProviderId::Iwencai => "Iwencai",
         ProviderId::Cninfo => "Cninfo",
         ProviderId::Cailianpress => "Cailianpress",
