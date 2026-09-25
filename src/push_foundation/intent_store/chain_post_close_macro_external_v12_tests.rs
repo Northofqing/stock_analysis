@@ -95,8 +95,7 @@ fn assert_models_stop(error: &anyhow::Error) {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_without_rpc() {
+async fn assert_v12_control_receipt_cancelled_reopens_unknown(cancel_capabilities: bool) {
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
@@ -105,7 +104,11 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
             let baseline = control_tests::setup_external_parent(
                 &mut business,
                 &mut parent_server,
-                "TEST_CODE_EXTERNAL_V12_HEALTH_UNKNOWN",
+                if cancel_capabilities {
+                    "TEST_CODE_EXTERNAL_V12_CAPABILITIES_UNKNOWN"
+                } else {
+                    "TEST_CODE_EXTERNAL_V12_HEALTH_UNKNOWN"
+                },
             )
             .await;
             assert_eq!(
@@ -183,20 +186,46 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
                     "TEST_CODE v12 Health receipt watchdog"
                 );
             }
+            if cancel_capabilities {
+                external.release_health();
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut prepared => panic!(
+                            "TEST_CODE v12 Capabilities returned before receipt: {result:?}"
+                        ),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    if external.snapshot().capabilities_requests.len() == 1 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < receipt_deadline,
+                        "TEST_CODE v12 Capabilities receipt watchdog"
+                    );
+                }
+            }
             drop(prepared);
             drop(io);
             let pending = local.inspect_macro(&baseline.intent).unwrap();
             assert!(pending.has_unconfirmed_effect());
             let original_plan = pending.plan_bytes().to_vec();
-            let control = &pending.readiness_episodes()[0].controls()[0];
+            let controls = pending.readiness_episodes()[0].controls();
+            let original_health_result = controls[0].result_version();
+            assert_eq!(original_health_result.is_some(), cancel_capabilities);
+            let control = &controls[usize::from(cancel_capabilities)];
             assert!(control.begin_version().is_some());
             assert_eq!(control.result_version(), None);
-            let original_health_request_id = control.request_id().to_owned();
-            let original_health_request = control.request_bytes().to_vec();
+            let original_request_id = control.request_id().to_owned();
+            let original_request = control.request_bytes().to_vec();
             assert_eq!(external.snapshot().data_calls, 0);
             drop(pending);
             drop(local);
-            external.release_health();
+            if cancel_capabilities {
+                external.release_capabilities();
+            } else {
+                external.release_health();
+            }
             let wire_before = external.snapshot();
             external.set_reject_new_connections_for_test(true);
 
@@ -221,7 +250,7 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
                 .resume_run(
                     &baseline.intent,
                     macro_lease(
-                        "TEST_CODE_EXTERNAL_V12_HEALTH_REOPEN",
+                        "TEST_CODE_EXTERNAL_V12_CONTROL_REOPEN",
                         started_at + 3_000_000,
                         started_at + 4_000_000,
                         reopened_head,
@@ -246,7 +275,7 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
                 &mut reopened_io,
             )
             .await
-            .expect_err("TEST_CODE v12 pending Health must remain Unknown");
+            .expect_err("TEST_CODE v12 pending control must remain Unknown");
             assert!(matches!(
                 stopped.downcast_ref::<PreparationStop>(),
                 Some(PreparationStop::IncompleteOnReopen { intent_id })
@@ -261,10 +290,12 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
             let recovered = reopened_local.inspect_macro(&baseline.intent).unwrap();
             assert!(recovered.has_unconfirmed_effect());
             assert_eq!(recovered.plan_bytes(), original_plan);
-            let recovered_control = &recovered.readiness_episodes()[0].controls()[0];
+            let controls = recovered.readiness_episodes()[0].controls();
+            assert_eq!(controls[0].result_version(), original_health_result);
+            let recovered_control = &controls[usize::from(cancel_capabilities)];
             assert_eq!(recovered_control.result_version(), None);
-            assert_eq!(recovered_control.request_id(), original_health_request_id);
-            assert_eq!(recovered_control.request_bytes(), original_health_request);
+            assert_eq!(recovered_control.request_id(), original_request_id);
+            assert_eq!(recovered_control.request_bytes(), original_request);
             let wire_after = external.snapshot();
             assert_eq!(wire_after.tcp_accepts, wire_before.tcp_accepts);
             assert_eq!(wire_after.health_requests, wire_before.health_requests);
@@ -278,14 +309,24 @@ async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_witho
         &mut business,
         &mut parent_server,
         &mut external_server,
-        "v12 External Health Unknown reopen",
+        "v12 External control Unknown reopen",
     )
     .await;
     drop(business);
     match body {
-        Ok(result) => result.expect("TEST_CODE v12 Health Unknown body deadline"),
+        Ok(result) => result.expect("TEST_CODE v12 control Unknown body deadline"),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_user_external_v12_health_receipt_cancelled_reopens_unknown_without_rpc() {
+    assert_v12_control_receipt_cancelled_reopens_unknown(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_user_external_v12_capabilities_receipt_cancelled_reopens_unknown_without_rpc() {
+    assert_v12_control_receipt_cancelled_reopens_unknown(true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

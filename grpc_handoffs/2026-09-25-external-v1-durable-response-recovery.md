@@ -19,7 +19,7 @@
 - V3 数据身份逐字段篡改、连接不可用时的身份与重试、v12 完整阶段重开、v11 数据重试重开、旧 V2 混合迁移、未知 V4 拒绝、V2 原始证据篡改零重发及缺失 wire 证据恢复：定向测试通过。
 - 控制请求 V2 的 Health/Capabilities typed 方法、descriptor、跨 profile 和请求 ID 篡改，V1 历史请求匹配且不授予新 effect、历史 Health 拒绝新 Capabilities、v11 控制及数据重试重开、v12 完整阶段重开：定向测试通过。
 - 控制结果 V3 的 profile/typed 方法/request ID/descriptor/build identity 逐字段篡改、跨 endpoint 拒绝、Health/Capabilities 写入与重开、持久化 status 双载体冲突、旧 V1/V2 Ready 只保留事实且零新 RPC、未知 V4 拒绝：定向回归通过。数据 effect 同时要求 Health 和 Capabilities 两条 V3 Ready；混合 V1/V2 控制请求计划与旧 V2 Capabilities 结果不能借新 Health 授权数据调用。旧版本夹具移除 V3 专有字段，未把新 bytes 冒充旧版本。控制异常矩阵 17 个用例、Capabilities 连接失败重开及 v11/v12 正常数据路径也通过。
-- v12 Health 控制请求已发送、回执未确认时取消，重开真实数据库后保持 Unknown：定向回归验证原计划与 Health 请求身份保留，控制结果仍为空，且没有新增 Health、Capabilities 或数据请求。v11 另有 Health/Capabilities 回执取消及结果提交失败的零重发回归；v12 其他故障点尚未逐一覆盖。
+- v12 Health 或 Capabilities 控制请求已发送、回执未确认时取消，重开真实数据库后保持 Unknown：两条定向回归验证原计划与目标请求身份保留、目标控制结果仍为空，且没有新增 Health、Capabilities 或数据请求；Capabilities 路径还验证先前已确认的 Health 结果版本保持不变。v11 另有 Health/Capabilities 回执取消及结果提交失败的零重发回归；v12 结果提交失败等故障点尚未逐一覆盖。
 
 ## 其他持久化解码入口审计（2026-09-25）
 
