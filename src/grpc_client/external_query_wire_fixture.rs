@@ -31,6 +31,21 @@ const TEST_RECORD_DATA: &[u8] = br#"{"item_id":"TEST_CODE_EXTERNAL_NEWS_001","ti
 const TEST_AUCTION_RECORD_DATA: &[u8] = r#"{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"name":"贵州茅台","requested_stage":"live","auction_phase":"matching","data_status":"live","auction_price":null,"pre_close_price":1316.01,"auction_pct":null,"auction_volume_shares":0.0,"auction_amount":0.0,"auction_unmatched":-321.0,"auction_turnover_pct":null,"auction_volume_ratio":null,"auction_yesterday_ratio_pct":null,"float_market_cap":1653000000000.0,"last_price":null,"open_price":null,"evidence":{"provider":"Tonghuashun","source_at":null,"observed_at":"unix-ms:1788956044416","batch_id":"TEST_CODE_HITHINK_AUCTION_BATCH"}}"#.as_bytes();
 const TEST_RELEASE_RECORD_DATA: &[u8] = r#"{"event_id":"202607250001","indicator_id":950,"country":"中国","name":"规模以上工业企业利润","period":"6月","scheduled_at":"2026-07-25T09:30:00+08:00","released_at":"2026-07-25T09:30:01+08:00","previous":"-9.1","consensus":null,"actual":"0","revised":null,"unit":"%","importance":3,"impact":"1","evidence":{"provider":"Jin10","source_at":"2026-07-25 09:30:01","observed_at":"1784943002.000000000","batch_id":"TEST_CODE_JIN10_RELEASE_BATCH"}}"#.as_bytes();
 
+fn test_schedule_record_data(release_date: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "release_id":10,
+        "release_name":"Consumer Price Index",
+        "release_date":release_date,
+        "release_last_updated":"2026-08-01 09:30:00-05",
+        "evidence":{
+            "provider":"Fred", "source_at":null,
+            "observed_at":"1789257600.000000000",
+            "batch_id":"TEST_CODE_FRED_SCHEDULE_BATCH"
+        }
+    }))
+    .expect("TEST_CODE schedule record JSON")
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExternalQueryWireObservation {
     pub(crate) tcp_accepts: usize,
@@ -69,6 +84,7 @@ enum ExternalCapabilitiesBehavior {
     },
     Auction,
     ReleaseObservations,
+    ReleaseSchedule,
 }
 
 #[derive(Default)]
@@ -106,6 +122,7 @@ impl SystemService for ExternalQueryWireService {
             behavior,
             ExternalCapabilitiesBehavior::Auction
                 | ExternalCapabilitiesBehavior::ReleaseObservations
+                | ExternalCapabilitiesBehavior::ReleaseSchedule
         ) {
             return Err(Status::unimplemented(
                 "TEST_CODE External query wire Health is out of scope",
@@ -255,6 +272,18 @@ impl SystemService for ExternalQueryWireService {
                     runtime_available: true,
                     provider: "Jin10".to_owned(),
                     exact_scope: "TEST_CODE_ROLLING_RELEASE_WINDOW".to_owned(),
+                    blocker: String::new(),
+                    diagnostic_available: true,
+                }],
+            },
+            ExternalCapabilitiesBehavior::ReleaseSchedule => CapabilitiesResponse {
+                request_id,
+                capabilities: vec![Capability {
+                    operation: Operation::EconomicReleaseSchedule as i32,
+                    repository_admission: AdmissionState::Admitted as i32,
+                    runtime_available: true,
+                    provider: "Fred".to_owned(),
+                    exact_scope: "TEST_CODE_FRED_DATE_RANGE".to_owned(),
                     blocker: String::new(),
                     diagnostic_available: true,
                 }],
@@ -457,6 +486,40 @@ impl ExternalQueryWireService {
                 diagnostic_blocker: String::new(),
             }));
         }
+        if operation == Operation::EconomicReleaseSchedule {
+            let payload = request.payload.as_ref().ok_or_else(|| {
+                Status::invalid_argument("TEST_CODE schedule payload missing")
+            })?;
+            let body: serde_json::Value = serde_json::from_slice(&payload.data)
+                .map_err(|_| Status::invalid_argument("TEST_CODE schedule JSON invalid"))?;
+            if payload.schema != "magic.market.economic_release_schedule.request"
+                || payload.schema_version != 1
+                || requested_provider != "Fred"
+                || body != serde_json::json!({"start":"2026-09-13","end":"2026-10-13","limit":20})
+            {
+                return Err(Status::invalid_argument("TEST_CODE schedule request contract"));
+            }
+            return Ok(Response::new(QueryResponse {
+                request_id,
+                operation: operation as i32,
+                admission: AdmissionState::Admitted as i32,
+                selected_provider: "Fred".to_owned(),
+                batch_id: "TEST_CODE_FRED_SCHEDULE_BATCH".to_owned(),
+                complete: true,
+                observed_at: "1789257600.000000000".to_owned(),
+                source_at: String::new(),
+                records: ["2026-09-15", "2026-09-16"]
+                    .into_iter()
+                    .map(|date| CanonicalPayload {
+                        schema: "magic.market.economic_release_schedule_entry".to_owned(),
+                        schema_version: 1,
+                        content_type: "application/json; charset=utf-8".to_owned(),
+                        data: test_schedule_record_data(date),
+                    })
+                    .collect(),
+                diagnostic_blocker: String::new(),
+            }));
+        }
         Ok(Response::new(QueryResponse {
             request_id,
             operation: operation as i32,
@@ -545,6 +608,13 @@ macro_rules! external_query_wire_service {
                 self.respond(request, "economic_release_observations", Operation::EconomicReleaseObservations).await
             }
 
+            async fn economic_release_schedule(
+                &self,
+                request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                self.respond(request, "economic_release_schedule", Operation::EconomicReleaseSchedule).await
+            }
+
             $(async fn $method(
                 &self,
                 request: Request<QueryRequest>,
@@ -627,7 +697,6 @@ external_query_wire_service!(
     t0_evidence,
     outcome_daily_bars,
     upper_limit_pool_review,
-    economic_release_schedule,
 );
 
 #[derive(Clone, Copy)]
@@ -840,6 +909,15 @@ impl ExternalQueryWireFixture {
             ExternalQueryWireRoute::Generated,
             ExternalQueryWireReply::Success,
             ExternalCapabilitiesBehavior::ReleaseObservations,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_qualified_release_schedule() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::Success,
+            ExternalCapabilitiesBehavior::ReleaseSchedule,
         )
         .await
     }

@@ -36,6 +36,8 @@ pub(crate) enum ExternalQueryMethod {
     CurrentAuctionObservations,
     #[serde(rename = "OPERATION_ECONOMIC_RELEASE_OBSERVATIONS")]
     EconomicReleaseObservations,
+    #[serde(rename = "OPERATION_ECONOMIC_RELEASE_SCHEDULE")]
+    EconomicReleaseSchedule,
 }
 
 impl ExternalQueryMethod {
@@ -48,6 +50,7 @@ impl ExternalQueryMethod {
             Self::InstrumentNews => "InstrumentNews",
             Self::CurrentAuctionObservations => "CurrentAuctionObservations",
             Self::EconomicReleaseObservations => "EconomicReleaseObservations",
+            Self::EconomicReleaseSchedule => "EconomicReleaseSchedule",
         }
     }
 
@@ -63,6 +66,9 @@ impl ExternalQueryMethod {
             }
             Self::EconomicReleaseObservations => {
                 "/magic.market.v1.MarketDataService/EconomicReleaseObservations"
+            }
+            Self::EconomicReleaseSchedule => {
+                "/magic.market.v1.MarketDataService/EconomicReleaseSchedule"
             }
         }
     }
@@ -98,6 +104,7 @@ impl ExternalQueryMethod {
         match operation {
             Operation::CurrentAuctionObservations => Some(Self::CurrentAuctionObservations),
             Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
+            Operation::EconomicReleaseSchedule => Some(Self::EconomicReleaseSchedule),
             _ => None,
         }
     }
@@ -269,6 +276,9 @@ impl ExternalQueryTransport {
             }
             ExternalQueryMethod::EconomicReleaseObservations => {
                 self.client.economic_release_observations(request).await
+            }
+            ExternalQueryMethod::EconomicReleaseSchedule => {
+                self.client.economic_release_schedule(request).await
             }
         };
         match response {

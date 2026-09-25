@@ -1,13 +1,13 @@
-//! Secret-safe opening-readiness probe for the authenticated market client bundle (BR-238).
+//! Secret-safe opening-readiness and selected native-query probe for the authenticated bundle.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use stock_analysis::data_gateway::instrument_identity::resolve_production_equity;
 use stock_analysis::data_gateway::GlobalNewsProvider;
 use stock_analysis::grpc_client::client::GrpcMarketClient;
-use stock_analysis::grpc_client::envelope::QueryResult;
+use stock_analysis::grpc_client::envelope::{QueryAdmission, QueryResult};
 use stock_analysis::grpc_client::errors::GrpcError;
 use stock_analysis::grpc_client::external_pb::magic::market::v1::{
     AdmissionState as ExternalAdmissionState, Capability as ExternalCapability,
@@ -19,6 +19,9 @@ const DIRECT_EXTERNAL_OPERATIONS: &[ExternalOperation] = &[
     ExternalOperation::SecurityMetadata,
     ExternalOperation::GlobalNews,
     ExternalOperation::InstrumentNews,
+    ExternalOperation::CurrentAuctionObservations,
+    ExternalOperation::EconomicReleaseObservations,
+    ExternalOperation::EconomicReleaseSchedule,
 ];
 
 const DIRECT_GLOBAL_NEWS_PROVIDERS: [&str; 4] = ["Eastmoney", "Cailianpress", "Jin10", "ThePaper"];
@@ -51,14 +54,187 @@ const STATIC_OPENING_CAPABILITY_FAMILIES: &[(&str, &[ExternalOperation])] = &[
 ];
 
 #[derive(Parser)]
-#[command(about = "Secret-safe authenticated market bundle readiness probe")]
+#[command(about = "Secret-safe authenticated market bundle readiness and native-query probe")]
 struct Args {
     #[arg(long)]
     bundle: PathBuf,
     #[arg(long)]
     opening: bool,
+    #[arg(long, value_enum)]
+    native_operation: Option<NativeOperation>,
     #[arg(long, default_value = "600396")]
     code: String,
+    #[arg(long, default_value = "live")]
+    stage: String,
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+    #[arg(long)]
+    country: Option<String>,
+    #[arg(long)]
+    start: Option<String>,
+    #[arg(long)]
+    end: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeOperation {
+    CurrentAuctionObservations,
+    EconomicReleaseObservations,
+    EconomicReleaseSchedule,
+}
+
+struct NativeQuerySpec {
+    operation: ExternalOperation,
+    params: serde_json::Value,
+    provider: &'static str,
+    record_provider: &'static str,
+    record_schema: &'static str,
+    record_source_at: bool,
+}
+
+fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<NativeQuerySpec> {
+    let spec = match selection {
+        NativeOperation::CurrentAuctionObservations => {
+            if !matches!(args.stage.as_str(), "live" | "final") {
+                anyhow::bail!("auction stage must be live or final");
+            }
+            let instrument = resolve_production_equity(&args.code, None)
+                .map_err(|error| anyhow::anyhow!("auction instrument is invalid: {error}"))?
+                .instrument()
+                .clone();
+            NativeQuerySpec {
+                operation: ExternalOperation::CurrentAuctionObservations,
+                params: serde_json::json!({"instruments":[instrument],"stage":args.stage.as_str()}),
+                provider: "HithinkFinance",
+                record_provider: "Tonghuashun",
+                record_schema: "magic.market.current_auction_observation",
+                record_source_at: false,
+            }
+        }
+        NativeOperation::EconomicReleaseObservations => {
+            let request = stock_analysis::data_gateway::EconomicReleaseObservationsRequest::new(
+                args.limit,
+                args.country.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("release request is invalid: {error}"))?;
+            let mut params = serde_json::json!({"limit":request.limit()});
+            if let Some(country) = request.country() {
+                params["country"] = serde_json::Value::String(country.to_owned());
+            }
+            NativeQuerySpec {
+                operation: ExternalOperation::EconomicReleaseObservations,
+                params,
+                provider: "Jin10",
+                record_provider: "Jin10",
+                record_schema: "magic.market.economic_release_observation",
+                record_source_at: true,
+            }
+        }
+        NativeOperation::EconomicReleaseSchedule => {
+            let start = args
+                .start
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--start is required"))?;
+            let end = args
+                .end
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--end is required"))?;
+            let start = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                .map_err(|error| anyhow::anyhow!("--start is invalid: {error}"))?;
+            let end = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .map_err(|error| anyhow::anyhow!("--end is invalid: {error}"))?;
+            let request = stock_analysis::data_gateway::EconomicReleaseScheduleRequest::new(
+                start, end, args.limit,
+            )
+            .map_err(|error| anyhow::anyhow!("schedule request is invalid: {error}"))?;
+            NativeQuerySpec {
+                operation: ExternalOperation::EconomicReleaseSchedule,
+                params: serde_json::json!({
+                    "start":request.start(),"end":request.end(),"limit":request.limit()
+                }),
+                provider: "Fred",
+                record_provider: "Fred",
+                record_schema: "magic.market.economic_release_schedule_entry",
+                record_source_at: false,
+            }
+        }
+    };
+    Ok(spec)
+}
+
+async fn run_native_query(
+    client: &mut GrpcMarketClient,
+    capabilities: &[ExternalCapability],
+    args: &Args,
+    selection: NativeOperation,
+) -> anyhow::Result<()> {
+    let spec = native_query_spec(args, selection)?;
+    if !capability_ready(capabilities, spec.operation) {
+        anyhow::bail!("selected native operation has no admitted runtime capability");
+    }
+    let result = client
+        .query_external_native(spec.operation, spec.params)
+        .await
+        .map_err(|error| structured_probe_error("native query failed", error))?;
+    if result.admission != QueryAdmission::Admitted
+        || !result.complete
+        || !result.diagnostic_blocker.is_empty()
+        || result.selected_provider != spec.provider
+        || result.batch_id.is_empty()
+        || result.observed_at.is_empty()
+        || !result.source().starts_with("grpc-mtls:")
+    {
+        anyhow::bail!("native response envelope is not qualified");
+    }
+    if (!spec.record_source_at && !result.source_at.is_empty())
+        || (spec.record_source_at && (result.records.is_empty() != result.source_at.is_empty()))
+    {
+        anyhow::bail!("native batch source-time policy conflicts with contract");
+    }
+    for record in &result.records {
+        if record.schema != spec.record_schema
+            || record.schema_version != 1
+            || record.content_type != "application/json; charset=utf-8"
+        {
+            anyhow::bail!("native record schema/version/content type conflicts with contract");
+        }
+        let value: serde_json::Value = serde_json::from_slice(&record.data)
+            .map_err(|_| anyhow::anyhow!("native record JSON is invalid"))?;
+        let evidence = value
+            .get("evidence")
+            .ok_or_else(|| anyhow::anyhow!("native record evidence is absent"))?;
+        let record_source_at = evidence
+            .get("source_at")
+            .ok_or_else(|| anyhow::anyhow!("native record source_at is absent"))?;
+        let record_source_at_matches = if spec.record_source_at {
+            record_source_at
+                .as_str()
+                .is_some_and(|source_at| !source_at.is_empty())
+        } else {
+            record_source_at.is_null()
+        };
+        if evidence.get("provider").and_then(serde_json::Value::as_str)
+            != Some(spec.record_provider)
+            || evidence.get("batch_id").and_then(serde_json::Value::as_str)
+                != Some(result.batch_id.as_str())
+            || evidence
+                .get("observed_at")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            || !record_source_at_matches
+        {
+            anyhow::bail!("native record evidence conflicts with contract");
+        }
+    }
+    println!(
+        "native operation={:?} provider={} admission=ADMITTED complete=true records={} schema={} batch_id_present=true observed_at_present=true source_at_present={} evidence_shape=ok",
+        spec.operation,
+        spec.provider,
+        result.records.len(),
+        spec.record_schema,
+        !result.source_at.is_empty(),
+    );
+    Ok(())
 }
 
 fn capability_ready(capabilities: &[ExternalCapability], operation: ExternalOperation) -> bool {
@@ -124,8 +300,8 @@ fn structured_probe_error(context: &str, error: GrpcError) -> anyhow::Error {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
-    if !args.opening {
-        anyhow::bail!("only the explicit --opening readiness profile is supported");
+    if args.opening == args.native_operation.is_some() {
+        anyhow::bail!("select exactly one of --opening or --native-operation");
     }
     let bundle = canonical_bundle_path(&args.bundle)?;
 
@@ -150,6 +326,9 @@ async fn main() -> anyhow::Result<()> {
         .get_external_capabilities()
         .await
         .map_err(|error| anyhow::anyhow!("bundle capabilities unavailable: {error}"))?;
+    if let Some(selection) = args.native_operation {
+        return run_native_query(&mut client, &capabilities, &args, selection).await;
+    }
     for &(family, operations) in STATIC_OPENING_CAPABILITY_FAMILIES {
         let ready = capability_family_ready(&capabilities, operations);
         let alternatives = operations
@@ -582,6 +761,15 @@ mod tests {
         assert!(external_contract_ready(ExternalOperation::SecurityMetadata));
         assert!(external_contract_ready(ExternalOperation::GlobalNews));
         assert!(external_contract_ready(ExternalOperation::InstrumentNews));
+        assert!(external_contract_ready(
+            ExternalOperation::CurrentAuctionObservations
+        ));
+        assert!(external_contract_ready(
+            ExternalOperation::EconomicReleaseObservations
+        ));
+        assert!(external_contract_ready(
+            ExternalOperation::EconomicReleaseSchedule
+        ));
         assert!(!external_contract_ready(ExternalOperation::RealtimeQuotes));
         assert!(!external_contract_ready(
             ExternalOperation::BoardConstituents
@@ -589,6 +777,76 @@ mod tests {
         assert!(!external_contract_ready(
             ExternalOperation::UpperLimitPoolReview
         ));
+    }
+
+    #[test]
+    fn native_probe_cli_selects_three_published_requests() {
+        let auction = Args::try_parse_from([
+            "probe",
+            "--bundle",
+            "/tmp/TEST_CODE_bundle",
+            "--native-operation",
+            "current-auction-observations",
+            "--stage",
+            "final",
+        ])
+        .expect("auction probe args");
+        let auction_spec = native_query_spec(&auction, auction.native_operation.unwrap())
+            .expect("auction request");
+        assert_eq!(
+            auction_spec.operation,
+            ExternalOperation::CurrentAuctionObservations
+        );
+        assert_eq!(auction_spec.params["stage"], "final");
+
+        let observations = Args::try_parse_from([
+            "probe",
+            "--bundle",
+            "/tmp/TEST_CODE_bundle",
+            "--native-operation",
+            "economic-release-observations",
+            "--limit",
+            "20",
+            "--country",
+            "中国",
+        ])
+        .expect("Jin10 probe args");
+        let observations_spec =
+            native_query_spec(&observations, observations.native_operation.unwrap())
+                .expect("Jin10 request");
+        assert_eq!(
+            observations_spec.operation,
+            ExternalOperation::EconomicReleaseObservations
+        );
+        assert_eq!(
+            observations_spec.params,
+            serde_json::json!({"limit":20,"country":"中国"})
+        );
+
+        let schedule = Args::try_parse_from([
+            "probe",
+            "--bundle",
+            "/tmp/TEST_CODE_bundle",
+            "--native-operation",
+            "economic-release-schedule",
+            "--start",
+            "2026-09-13",
+            "--end",
+            "2026-10-13",
+        ])
+        .expect("FRED probe args");
+        let schedule_spec =
+            native_query_spec(&schedule, schedule.native_operation.unwrap()).expect("FRED request");
+        assert_eq!(
+            schedule_spec.operation,
+            ExternalOperation::EconomicReleaseSchedule
+        );
+        assert_eq!(
+            schedule_spec.params,
+            serde_json::json!({
+                "start":"2026-09-13","end":"2026-10-13","limit":20
+            })
+        );
     }
 
     #[test]

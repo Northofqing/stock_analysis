@@ -164,6 +164,33 @@ pub fn build_external_native_query_request(
                 data,
             )
         }
+        ExternalOperation::EconomicReleaseSchedule => {
+            ensure_only_keys(&params, &["start", "end", "limit"])?;
+            let start = parse_iso_date(
+                params
+                    .get("start")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            let end = parse_iso_date(
+                params
+                    .get("end")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            if end < start || end.signed_duration_since(start).num_days() > 365 {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| (1..=100).contains(limit))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            (
+                "magic.market.economic_release_schedule.request",
+                1,
+                "Fred".to_owned(),
+                serde_json::json!({"start":start,"end":end,"limit":limit}),
+            )
+        }
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
     assemble_request(schema, schema_version, preferred_provider, data)
@@ -305,6 +332,24 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&payload.data).unwrap(),
             json!({"limit": 20, "country": "中国"})
+        );
+        assert!(!request.allow_unadmitted);
+    }
+
+    #[test]
+    fn economic_release_schedule_uses_fred_date_only_external_63_contract() {
+        let request = build_external_native_query_request(
+            ExternalOperation::EconomicReleaseSchedule,
+            json!({"start":"2026-09-13","end":"2026-10-13","limit":20}),
+        )
+        .expect("published FRED release schedule contract");
+        assert_eq!(request.preferred_provider, "Fred");
+        let payload = request.payload.expect("versioned schedule payload");
+        assert_eq!(payload.schema, "magic.market.economic_release_schedule.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"start":"2026-09-13","end":"2026-10-13","limit":20})
         );
         assert!(!request.allow_unadmitted);
     }
