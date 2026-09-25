@@ -3536,10 +3536,10 @@ impl GrpcSource {
     pub async fn economic_calendar_async(
         &self,
     ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
-        let q = self
-            .query_op(Operation::EconomicCalendar, serde_json::json!({}))
-            .await?;
-        convert::economic_calendar(&q)
+        Err(GatewayError::retired_operation(
+            crate::data_gateway::economic_calendar::CAPABILITY,
+            Some(ProviderId::Jin10),
+        ))
     }
 
     pub async fn futures_delivery_async(
@@ -4225,6 +4225,22 @@ mod tests {
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
     // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_economic_calendar_does_not_initialize_transport() {
+        let source = GrpcSource {
+            addr: "http://127.0.0.1:1".to_owned(),
+            client: AsyncMutex::new(None),
+            external_bundle: None,
+            external_client: AsyncMutex::new(None),
+            local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+            external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let error = source.economic_calendar_async().await.unwrap_err();
+        assert_eq!(error.reason_code(), "operation_retired");
+        assert!(!error.retryable());
+        assert!(source.client.lock().await.is_none());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn external_cached_capabilities_refresh_updates_status_catalog() {

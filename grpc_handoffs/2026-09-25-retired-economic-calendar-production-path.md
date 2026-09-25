@@ -7,7 +7,9 @@
 - `client-bundle/grpc-external-api.md` 明确 `EconomicCalendar` 当前未准入；已发布观测是 `EconomicReleaseObservations`，未来日期级日程是 `EconomicReleaseSchedule`。两者语义和 Provider 身份不同，不能把旧 operation 改名后继续解释旧数据。
 - 现有生产链 `monitor` → chain preparation → `SearchService` → `macro_news::legacy` → `runner` 仍包含 `Gateway(5)`；该槽的持久/审计身份是 `EconomicCalendar`，旧 Local 请求载荷为 `{}`。调用链之前可到达 `data.economic_calendar(req)`。
 - 下游在 `Legacy::open` 为 `Gateway(5)` 放入 `operation_retired`、不可重试的不可用终态，并按原审计槽结算。宏观报告显示该原因，其他新闻源继续独立查询；旧 RPC 不再由这条生产宏观搜索路径发出。没有改写历史 `EconomicCalendar` identity、SQL 约束或既有批次。
-- `chain_post_close` 的独立持久宏观执行器和 `EconomicCalendarGateway` 尚有旧身份/调用代码；本次未将其误报为已经迁移。启用这些路径前，须另行迁移或加入相同门。
+- `EconomicCalendarGateway::latest_releases` 与 `GrpcSource::economic_calendar_async` 的直接入口也返回不可重试的 `operation_retired`，不再打开 Local 桥或发送旧 RPC；Gateway 仍使用原能力名与请求散列写审计失败记录。
+- `chain_post_close` 的独立持久宏观执行器仍会构造 `Gateway(5)` 的旧 Local 请求，并可经 `AuthorizedMacroAttempt` 发出 RPC。它的终态/恢复受 v12/v13 持久表约束：`LocalRouteUnavailable` 只适用于计划中真实观测到断连的路径，不能把“已退役”伪装成断连来复用。需增加明确的、可恢复的退役终态及相应 schema 迁移，才能关闭这条路径；当前不得宣称整个 `EconomicCalendar` RPC 已全面退役。
+- 定向验证：`cargo test --lib retired_economic_calendar_does_not_initialize_transport` 通过（2026-09-25）；它证明 `GrpcSource` 的旧入口返回退役错误时没有初始化 Local 连接，不覆盖持久执行器的重放路径。
 
 ## 后续产品接线边界
 

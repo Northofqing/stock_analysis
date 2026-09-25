@@ -31,7 +31,7 @@ pub struct EconomicReleaseFact {
     pub evidence: SourceEvidence,
 }
 
-/// Production seam for the released Jin10 economic-release provider.
+/// Legacy EconomicCalendar seam retained for historical audit identity.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EconomicCalendarGateway;
 
@@ -45,19 +45,16 @@ impl EconomicCalendarGateway {
         limit: u32,
         country: Option<&str>,
     ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
-        let country = country.map(str::to_owned);
-        // P4 M3 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
-        match super::grpc_source::bridge_for("EconomicCalendar") {
-            Ok(bridge) => {
-                let result = bridge.economic_calendar_async().await;
-                return audit_macro_query(limit, country.as_deref(), result);
-            }
-            Err(error) => {
-                return audit_macro_query(limit, country.as_deref(), Err(error));
-            }
-        }
-        // no-feature (monitor 零 magic): library transport 不存在。
-        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+        // The historical operation has no admitted provider contract. Preserve
+        // its audit identity while refusing new acquisitions through this seam.
+        audit_macro_query(
+            limit,
+            country,
+            Err(GatewayError::retired_operation(
+                CAPABILITY,
+                Some(ProviderId::Jin10),
+            )),
+        )
     }
 }
 
