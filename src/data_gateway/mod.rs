@@ -12,6 +12,7 @@ pub mod consensus;
 pub mod current_auction_observations;
 pub mod dragon_tiger;
 pub mod economic_calendar;
+pub mod economic_release_observations;
 pub mod event_calendar;
 pub mod evidence_time;
 pub mod exchange_calendar_authority;
@@ -67,6 +68,9 @@ pub use dragon_tiger::{
     DragonTigerGateway, DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
 };
 pub use economic_calendar::{EconomicCalendarGateway, EconomicReleaseFact};
+pub use economic_release_observations::{
+    EconomicReleaseObservationsGateway, EconomicReleaseObservationsRequest,
+};
 pub use event_calendar::{EventAnnouncement, EventCalendarGateway};
 pub use evidence_time::parse_evidence_instant;
 pub use exchange_calendar_authority::{

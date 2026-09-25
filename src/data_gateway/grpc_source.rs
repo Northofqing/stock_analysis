@@ -1137,6 +1137,7 @@ pub const HOOKED_OPS: &[&str] = &[
     "CurrentAuctionObservations",
     "DragonTiger",
     "EconomicCalendar",
+    "EconomicReleaseObservations",
     "FinancialStatements",
     "ForeignExchange",
     "FundFlowSeries",
@@ -3216,6 +3217,19 @@ impl GrpcSource {
             )
             .await?;
         crate::data_gateway::current_auction_observations::convert_response(request, &response)
+    }
+
+    pub async fn economic_release_observations_async(
+        &self,
+        request: &crate::data_gateway::economic_release_observations::EconomicReleaseObservationsRequest,
+    ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
+        let response = self
+            .query_external_native_op(
+                ExternalOperation::EconomicReleaseObservations,
+                request.params(),
+            )
+            .await?;
+        crate::data_gateway::economic_release_observations::convert_response(request, &response)
     }
 
     // ---------- 6 个首批 op (M2) ----------

@@ -142,6 +142,28 @@ pub fn build_external_native_query_request(
                 serde_json::json!({"instruments": instruments, "stage": stage}),
             )
         }
+        ExternalOperation::EconomicReleaseObservations => {
+            ensure_only_keys(&params, &["limit", "country"])?;
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| *limit > 0 && *limit <= u32::MAX as u64)
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            let mut data = serde_json::json!({"limit": limit});
+            if let Some(country) = params.get("country") {
+                let country = country
+                    .as_str()
+                    .filter(|country| !country.is_empty())
+                    .ok_or(ExternalContractError::InvalidParameters)?;
+                data["country"] = Value::String(country.to_owned());
+            }
+            (
+                "magic.market.economic_release_observations.request",
+                1,
+                "Jin10".to_owned(),
+                data,
+            )
+        }
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
     assemble_request(schema, schema_version, preferred_provider, data)
@@ -265,6 +287,24 @@ mod tests {
                 }],
                 "stage": "live"
             })
+        );
+        assert!(!request.allow_unadmitted);
+    }
+
+    #[test]
+    fn economic_release_observations_preserve_limit_and_country_in_external_62_payload() {
+        let request = build_external_native_query_request(
+            ExternalOperation::EconomicReleaseObservations,
+            json!({"limit": 20, "country": "中国"}),
+        )
+        .expect("published Jin10 rolling release contract");
+        assert_eq!(request.preferred_provider, "Jin10");
+        let payload = request.payload.expect("versioned release payload");
+        assert_eq!(payload.schema, "magic.market.economic_release_observations.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"limit": 20, "country": "中国"})
         );
         assert!(!request.allow_unadmitted);
     }

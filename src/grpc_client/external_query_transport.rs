@@ -34,6 +34,8 @@ pub(crate) enum ExternalQueryMethod {
     InstrumentNews,
     #[serde(rename = "OPERATION_CURRENT_AUCTION_OBSERVATIONS")]
     CurrentAuctionObservations,
+    #[serde(rename = "OPERATION_ECONOMIC_RELEASE_OBSERVATIONS")]
+    EconomicReleaseObservations,
 }
 
 impl ExternalQueryMethod {
@@ -45,6 +47,7 @@ impl ExternalQueryMethod {
             Self::GlobalNews => "GlobalNews",
             Self::InstrumentNews => "InstrumentNews",
             Self::CurrentAuctionObservations => "CurrentAuctionObservations",
+            Self::EconomicReleaseObservations => "EconomicReleaseObservations",
         }
     }
 
@@ -57,6 +60,9 @@ impl ExternalQueryMethod {
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
             Self::CurrentAuctionObservations => {
                 "/magic.market.v1.MarketDataService/CurrentAuctionObservations"
+            }
+            Self::EconomicReleaseObservations => {
+                "/magic.market.v1.MarketDataService/EconomicReleaseObservations"
             }
         }
     }
@@ -91,6 +97,7 @@ impl ExternalQueryMethod {
         use crate::grpc_client::external_pb::magic::market::v1::Operation;
         match operation {
             Operation::CurrentAuctionObservations => Some(Self::CurrentAuctionObservations),
+            Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
             _ => None,
         }
     }
@@ -259,6 +266,9 @@ impl ExternalQueryTransport {
             ExternalQueryMethod::InstrumentNews => self.client.instrument_news(request).await,
             ExternalQueryMethod::CurrentAuctionObservations => {
                 self.client.current_auction_observations(request).await
+            }
+            ExternalQueryMethod::EconomicReleaseObservations => {
+                self.client.economic_release_observations(request).await
             }
         };
         match response {
