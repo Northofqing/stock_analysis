@@ -25,6 +25,7 @@ use crate::search_service::{
 };
 use futures::{future::LocalBoxFuture, FutureExt};
 use std::{cell::Cell, rc::Rc, time::Duration};
+use super::schema;
 
 
 pub(super) async fn drive(
@@ -37,6 +38,7 @@ pub(super) async fn drive(
 ) -> anyhow::Result<(RunLease, String)> {
     let intent = lease.intent_id.as_str().to_owned();
     let result = async {
+        let retired_layout = schema::runtime_layout_version(&local.store.connection)? >= 14;
         let mut live = Live::open(local, lease, clock, cancelled)?;
         if let Some(output) = live
             .current()
@@ -71,7 +73,7 @@ pub(super) async fn drive(
                 current.plan.endpoint() == route.endpoint()
                     && current.plan.profile() == route.profile(),
             )?;
-            if let Some(local) = &local_queries {
+            if let Some(local) = local_queries.as_ref().filter(|_| !retired_layout) {
                 codec::require(
                     current
                         .full
@@ -112,7 +114,7 @@ pub(super) async fn drive(
                     route.endpoint().to_owned(),
                 ));
             }
-            if let Some(local) = &local_queries {
+            if let Some(local) = local_queries.as_ref().filter(|_| !retired_layout) {
                 let identity =
                     crate::grpc_client::client::macro_attempt::MacroQueryIdentity::EconomicCalendar;
                 requests.push((
@@ -150,6 +152,7 @@ pub(super) async fn drive(
             local: local_queries,
             external,
             connected_external: None,
+            retired_layout,
         };
         let output = runner::run(&mut adapter).await?;
         Ok((adapter.live.into_lease(), output))
@@ -171,6 +174,7 @@ struct Durable<'local, 'store, 'clock> {
     local: Option<ConnectedMacroQueries>,
     external: Option<PreparedExternalEndpoint>,
     connected_external: Option<GrpcMarketClient>,
+    retired_layout: bool,
 }
 
 enum AdapterTicket {
@@ -197,6 +201,7 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
     type Wait = LocalBoxFuture<'clock, anyhow::Result<()>>;
     fn open(&mut self) -> anyhow::Result<Snapshot> {
         self.live.settle_legacy_local_unavailable()?;
+        self.live.settle_operation_retired()?;
         if self.live.needs_historical_rejection() {
             self.live.checkpoint()?;
             let definition = self.live.snapshot()?.definition;
@@ -238,6 +243,9 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
     {
         let (ticket, attempt) = match step {
             Step::Data { query, attempt } => {
+                if self.retired_layout && query == QueryKey::Gateway(5) {
+                    return Err(ChainPostCloseError::RetiredEconomicCalendarAttemptBlocked.into());
+                }
                 let snapshot = self.live.snapshot()?;
                 let identity = snapshot.definition.identity(query)?;
                 if let crate::grpc_client::client::macro_attempt::MacroQueryIdentity::SemanticSearch { provider,query:ref text,limit } = identity {

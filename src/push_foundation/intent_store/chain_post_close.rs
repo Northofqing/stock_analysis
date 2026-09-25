@@ -120,6 +120,8 @@ pub(crate) enum ChainPostCloseError {
     LegacyPlanExecutionUnsupported,
     #[error("Macro plan lacks original independent Local route evidence")]
     MissingPersistedLocalRoute,
+    #[error("retired EconomicCalendar cannot start or resume a durable RPC attempt")]
+    RetiredEconomicCalendarAttemptBlocked,
     #[error("chain post-close SQLite connection safeguards are unavailable")]
     ConnectionSafeguardFailed,
     #[error("chain post-close storage operation failed: {operation}")]
@@ -1327,6 +1329,31 @@ impl<'store> LocalChainPostClose<'store> {
         )
     }
 
+    pub(crate) fn macro_preparation_io_v14<'local, 'provider, C>(
+        &'local mut self,
+        lease: RunLease,
+        queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C,
+        configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource,
+        source: &'provider GrpcSource,
+        search_service: &'provider SearchService,
+    ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
+    where
+        C: MacroObservationClock,
+    {
+        self.macro_preparation_io_at_layout(
+            lease,
+            queries,
+            clock,
+            configuration,
+            parent_source,
+            source,
+            search_service,
+            MacroLayout::V14,
+        )
+    }
+
     fn macro_preparation_io_at_layout<'local, 'provider, C>(
         &'local mut self,
         lease: RunLease,
@@ -1346,6 +1373,7 @@ impl<'store> LocalChainPostClose<'store> {
             match layout {
                 MacroLayout::V11 => 11,
                 MacroLayout::V12 => 12,
+                MacroLayout::V14 => 14,
             },
         )?;
         self.recover_macro_parent(&lease, clock.now())?;
@@ -1392,7 +1420,51 @@ impl<'store> LocalChainPostClose<'store> {
     where
         C: ModelsObservationClock,
     {
-        schema::verify_runtime_layout_version(&self.store.connection, 13)?;
+        self.models_preparation_io_at_layout(
+            lease, queries, clock, configuration, parent_source, source,
+            search_service, analyzer, 13, MacroLayout::V12,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn models_preparation_io_v14<'local, 'provider, C>(
+        &'local mut self,
+        lease: RunLease,
+        queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C,
+        configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource,
+        source: &'provider GrpcSource,
+        search_service: &'provider SearchService,
+        analyzer: &'provider crate::analyzer::GeminiAnalyzer,
+    ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
+    where
+        C: ModelsObservationClock,
+    {
+        self.models_preparation_io_at_layout(
+            lease, queries, clock, configuration, parent_source, source,
+            search_service, analyzer, 14, MacroLayout::V14,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn models_preparation_io_at_layout<'local, 'provider, C>(
+        &'local mut self,
+        lease: RunLease,
+        queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C,
+        configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource,
+        source: &'provider GrpcSource,
+        search_service: &'provider SearchService,
+        analyzer: &'provider crate::analyzer::GeminiAnalyzer,
+        expected_layout: i64,
+        macro_layout: MacroLayout,
+    ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
+    where
+        C: ModelsObservationClock,
+    {
+        schema::verify_runtime_layout_version(&self.store.connection, expected_layout)?;
         self.recover_macro_parent(&lease, clock.now())?;
         self.admit_board(&lease, clock.now())?;
         let lease = self.fix_cluster_configuration(lease, configuration, clock.now())?;
@@ -1414,7 +1486,7 @@ impl<'store> LocalChainPostClose<'store> {
                 source,
                 clock,
                 search_service,
-                layout: MacroLayout::V12,
+                layout: macro_layout,
             }),
             models_input: Some(ModelsInput {
                 analyzer,
@@ -1605,10 +1677,10 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
         schema::verify_v12_read_pass(connection, proof)?;
     }
     let recovery = inspect_run_on_with_catalog(connection, intent_id, layout_version, proof)?;
-    if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13) {
+    if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
         concept_rpc::validate_concept_rpc_facts(connection, intent_id)?;
     }
-    let validated_positions = if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13) {
+    let validated_positions = if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
         let concepts = inspect_concept_batch_from_recovery_on(connection, intent_id, &recovery)?;
         let parent = cluster::validate_existing_cluster_facts_scoped(
             connection,
@@ -1657,7 +1729,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
     } else {
         None
     };
-    if matches!(layout_version, 9 | 10 | 11 | 12 | 13) {
+    if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14) {
         if let Some(proof) = proof {
             position_concept_rpc::validate_facts_after_position_validation(
                 connection,
@@ -1678,7 +1750,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
             )?;
         }
     }
-    let dragon_tiger = if matches!(layout_version, 10 | 11 | 12 | 13) {
+    let dragon_tiger = if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
         Some(
             dragon_tiger::validate_facts_and_capture_final_after_position_validation_scoped(
                 connection,
@@ -1692,7 +1764,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
     } else {
         None
     };
-    let (macro_recovery, consumed) = if matches!(layout_version, 11 | 12 | 13) {
+    let (macro_recovery, consumed) = if matches!(layout_version, 11 | 12 | 13 | 14) {
         let dragon_tiger = dragon_tiger.ok_or(ChainPostCloseError::SchemaRejected)?;
         let macro_recovery = macro_stage::load_on_after_dragon_validation_scoped(
             connection,
@@ -1901,7 +1973,7 @@ fn validate_run_fact_versions_body(
     head: u64,
     layout_version: i64,
 ) -> Result<(), ChainPostCloseError> {
-    if matches!(layout_version, 10 | 11 | 12 | 13) {
+    if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
         let tables = [
             "chain_post_close_stage_begins",
             "chain_post_close_stage_results",
@@ -1939,7 +2011,7 @@ fn validate_run_fact_versions_body(
             "chain_post_close_dragon_tiger_finals",
         ];
         let mut unique = HashSet::new();
-        let macro_tables = if matches!(layout_version, 11 | 12 | 13) {
+        let macro_tables = if matches!(layout_version, 11 | 12 | 13 | 14) {
             macro_stage::TABLES.as_slice()
         } else {
             &[]
@@ -1954,11 +2026,17 @@ fn validate_run_fact_versions_body(
         } else {
             &[]
         };
+        let retired_tables = if layout_version >= 14 {
+            &[macro_recovery::RETIRED_TABLE][..]
+        } else {
+            &[]
+        };
         for table in tables
             .into_iter()
             .chain(macro_tables.iter().copied())
             .chain(full_tables.iter().copied())
             .chain(models_tables.iter().copied())
+            .chain(retired_tables.iter().copied())
         {
             let sql = format!(
                 "SELECT run_version FROM {table} WHERE intent_id=?1 AND run_version IS NOT NULL"
@@ -2153,7 +2231,7 @@ pub(super) fn validate_all_runs_at_layout(
     if layout_version >= 12 {
         schema::verify_parent_layout_v12(transaction)?;
     }
-    if !matches!(layout_version, 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13) {
+    if !matches!(layout_version, 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
         return Err(ChainPostCloseError::UnsupportedVersion);
     }
     validate_owned_foreign_keys(transaction)?;
@@ -2191,10 +2269,10 @@ pub(super) fn validate_all_runs_at_layout(
             parent.as_ref(),
             layout_version,
         )?;
-        if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13) {
+        if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
             concept_rpc::validate_concept_rpc_fact_rows(transaction, &intent)?;
         }
-        if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13) {
+        if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
             positions::validate_existing_position_facts_at_layout(
                 transaction,
                 &intent,
@@ -2203,10 +2281,10 @@ pub(super) fn validate_all_runs_at_layout(
                 layout_version,
             )?;
         }
-        if matches!(layout_version, 9 | 10 | 11 | 12 | 13) {
+        if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14) {
             position_concept_rpc::validate_facts(transaction, &intent, &recovery, layout_version)?;
         }
-        if matches!(layout_version, 10 | 11 | 12 | 13) {
+        if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
             dragon_tiger::validate_facts_at_layout(
                 transaction,
                 &intent,
@@ -2214,7 +2292,7 @@ pub(super) fn validate_all_runs_at_layout(
                 layout_version,
             )?;
         }
-        if matches!(layout_version, 11 | 12 | 13) {
+        if matches!(layout_version, 11 | 12 | 13 | 14) {
             macro_stage::validate_facts(transaction, &intent, &recovery)?;
         }
         if layout_version >= 13 {
@@ -2971,6 +3049,7 @@ enum BoardSource<'provider> {
 enum MacroLayout {
     V11,
     V12,
+    V14,
 }
 
 struct MacroInput<'provider> {
@@ -3867,7 +3946,7 @@ where
                     }
                     .into());
                 }
-                MacroLayout::V12 => {
+                MacroLayout::V12 | MacroLayout::V14 => {
                     let (lease, output) = macro_driver::drive(
                         self.local,
                         lease,
@@ -4371,6 +4450,12 @@ impl ChainPostClose<'_> {
         &mut self,
     ) -> Result<ChainPostCloseSchemaReceipt, ChainPostCloseError> {
         schema::migrate_v13(&mut self.store.connection)
+    }
+
+    pub(crate) fn migrate_schema_v13_to_v14(
+        &mut self,
+    ) -> Result<ChainPostCloseSchemaReceipt, ChainPostCloseError> {
+        schema::migrate_v14(&mut self.store.connection)
     }
 
     pub(crate) fn migrate_schema_v7_to_v8(

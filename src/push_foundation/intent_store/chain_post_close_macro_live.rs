@@ -397,6 +397,21 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                     .to_owned(),
             };
             writer.terminal(&definition, &terminal, &outcome)?;
+        } else if catalog.layout() >= 14 {
+            let outcome = native::operation_retired_outcome();
+            let terminal = native::QueryTerminal {
+                version: 2,
+                query: QueryKey::Gateway(5),
+                plan_version,
+                plan_sha256: plan_sha,
+                request_plan_version: None,
+                request_sha256: None,
+                cause: native::TerminalCause::OperationRetired,
+                native_sha256: raw_digest(&native::native_bytes(&outcome)?)
+                    .as_str()
+                    .to_owned(),
+            };
+            writer.terminal(&definition, &terminal, &outcome)?;
         }
         let receipt = writer.receipt(initial_head)?;
         drop(writer);
@@ -942,6 +957,59 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         transaction
             .commit()
             .map_err(|_| storage("legacy Macro Local observation terminal commit"))?;
+        self.lease.head = candidate.head;
+        self.current = current;
+        gate.after_commit(receipt, false)
+    }
+
+    pub(super) fn settle_operation_retired(&mut self) -> anyhow::Result<()> {
+        if schema::runtime_layout_version(&self.local.store.connection)? < 14 {
+            return Ok(());
+        }
+        let needed = self.current.as_ref().is_some_and(|current| {
+            current.full.as_ref().is_some_and(|full| {
+                full.local.state == plan3::LocalRouteState::ObservedConnected
+                    && !full.terminals.contains_key(&QueryKey::Gateway(5))
+                    && !current.attempts.iter().any(|attempt| attempt.query == QueryKey::Gateway(5))
+            })
+        });
+        if !needed {
+            return Ok(());
+        }
+        self.checkpoint()?;
+        let gate = self.gate();
+        let transaction = self.local.store.connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage("retired Macro EconomicCalendar terminal"))?;
+        let now = gate.sample(false)?;
+        let catalog = schema::verify_v12_transaction(&transaction)?;
+        require(catalog.layout() >= 14)?;
+        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
+        let full = current.full.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(full.local.state == plan3::LocalRouteState::ObservedConnected
+            && !full.terminals.contains_key(&QueryKey::Gateway(5))
+            && !current.attempts.iter().any(|attempt| attempt.query == QueryKey::Gateway(5)))?;
+        let outcome = native::operation_retired_outcome();
+        let value = native::QueryTerminal {
+            version: 2,
+            query: QueryKey::Gateway(5),
+            plan_version: current.plan_version,
+            plan_sha256: raw_digest(&current.plan_bytes).as_str().to_owned(),
+            request_plan_version: None,
+            request_sha256: None,
+            cause: native::TerminalCause::OperationRetired,
+            native_sha256: raw_digest(&native::native_bytes(&outcome)?).as_str().to_owned(),
+        };
+        let initial_head = self.lease.head;
+        let mut candidate = transaction_lease_candidate(&self.lease);
+        let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
+        writer.terminal(&full.snapshot.definition, &value, &outcome)?;
+        let receipt = writer.receipt(initial_head)?;
+        drop(writer);
+        let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
+        gate.sample(false)?;
+        transaction.commit().map_err(|_| storage("retired Macro EconomicCalendar commit"))?;
         self.lease.head = candidate.head;
         self.current = current;
         gate.after_commit(receipt, false)
@@ -1527,6 +1595,7 @@ impl<'transaction, 'connection, 'state> Writer<'transaction, 'connection, 'state
                     native::TerminalCause::HistoricalControlRejected { control_result_version, .. } => ("HistoricalControlRejected",None,Some(control_result_version),"NotCalled"),
                     native::TerminalCause::RequestRejected => ("RequestRejected",None,None,"NotCalled"),
                     native::TerminalCause::LocalRouteUnavailable => ("LocalRouteUnavailable",None,None,"NotCalled"),
+                    native::TerminalCause::OperationRetired => ("OperationRetired",None,None,"NotCalled"),
                 };
                 let mut values = vec![text(phase),Value::Integer(item.into()),Value::Integer(candidate.into()),number(value.plan_version)?,text(&value.plan_sha256),
                     optional_number(value.request_plan_version)?,optional_text(value.request_sha256.as_deref()),text(cause),optional_number(data)?,optional_number(control)?,
@@ -1536,7 +1605,7 @@ impl<'transaction, 'connection, 'state> Writer<'transaction, 'connection, 'state
                         optional_text(receipt.previous_outcome.as_deref()),text(&receipt.current_outcome)],
                     None => vec![Value::Null;7],
                 });
-                (recovery::TABLES[0],"phase,item_ordinal,candidate_ordinal,plan_version,plan_sha256,request_plan_version,request_sha256,cause_kind,data_result_version,control_result_version,call_state,native_bytes,native_length,native_sha256,audit_id,audit_record_hash,audit_capability,audit_provider,audit_request_hash,previous_outcome,current_outcome",codec::encode(value)?,values)
+                (if matches!(&value.cause, native::TerminalCause::OperationRetired) { recovery::RETIRED_TABLE } else { recovery::TABLES[0] },"phase,item_ordinal,candidate_ordinal,plan_version,plan_sha256,request_plan_version,request_sha256,cause_kind,data_result_version,control_result_version,call_state,native_bytes,native_length,native_sha256,audit_id,audit_record_hash,audit_capability,audit_provider,audit_request_hash,previous_outcome,current_outcome",codec::encode(value)?,values)
             }
             Body::Dimension(value) => (recovery::TABLES[1],"dimension,plan_version,plan_sha256,outcome,last_query_terminal_version,selected_candidate_ordinal,pace_due",codec::encode(value)?,
                 vec![Value::Integer(value.dimension.into()),number(value.plan_version)?,text(&value.plan_sha256),text(if value.selected_candidate.is_some() { "SelectedResearchOnly" }

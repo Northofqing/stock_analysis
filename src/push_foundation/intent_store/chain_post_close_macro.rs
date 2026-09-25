@@ -530,7 +530,11 @@ pub(super) fn facts(
     intent: &IntentId,
     table: &str,
 ) -> Result<Vec<Fact>> {
-    require(TABLES.contains(&table) || super::macro_recovery::TABLES.contains(&table))?;
+    require(
+        TABLES.contains(&table)
+            || super::macro_recovery::TABLES.contains(&table)
+            || table == super::macro_recovery::RETIRED_TABLE,
+    )?;
     let mut statement=transaction.prepare(&format!("SELECT run_id,run_context_sha256,input_sha256,lease_owner,lease_generation,prior_head_version,run_version,recorded_at,bytes,byte_length,sha256 FROM {table} WHERE intent_id=?1 ORDER BY run_version"))
         .map_err(|_|storage("macro facts"))?;
     let rows = statement
@@ -1368,7 +1372,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("macro inspect"))?;
         require(matches!(
             schema::runtime_layout_version(&transaction)?,
-            11 | 12 | 13
+            11 | 12 | 13 | 14
         ))?;
         let (_, recovery) = inspect_run_and_macro_on(&transaction, intent)?;
         let recovery = recovery.ok_or(ChainPostCloseError::MacroNotStarted)?;
@@ -1407,7 +1411,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("macro parent"))?;
         require(matches!(
             schema::runtime_layout_version(&transaction)?,
-            11 | 12 | 13
+            11 | 12 | 13 | 14
         ))?;
         let (_, _, parent) =
             inspect_run_and_macro_scoped(&transaction, &lease.intent_id, |run, _, validated| {

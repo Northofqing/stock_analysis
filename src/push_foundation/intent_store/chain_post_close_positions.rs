@@ -794,7 +794,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("begin"))?;
         let layout_version = schema::runtime_layout_version(&transaction)?;
         // runtime_layout_version has attested the exact current catalog above.
-        if !matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13) {
+        if !matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
             return Err(ChainPostCloseError::UnsupportedVersion);
         }
         let recovery = inspect_run_on_at_layout(&transaction, &lease.intent_id, layout_version)?;
@@ -918,7 +918,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("begin"))?;
         let layout_version = schema::runtime_layout_version(&transaction)?;
         // runtime_layout_version has attested the exact current catalog above.
-        if !matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13) {
+        if !matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
             return Err(ChainPostCloseError::UnsupportedVersion);
         }
         let recovery = inspect_run_on_at_layout(&transaction, &lease.intent_id, layout_version)?;

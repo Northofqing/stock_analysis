@@ -4,6 +4,7 @@ use super::ChainPostCloseError;
 use crate::data_gateway::review::store_gateway_error;
 use crate::data_gateway::GatewayBatch;
 use crate::grpc_client::client::macro_attempt::MacroQueryIdentity;
+use crate::grpc_client::client::ContractProfile;
 use crate::grpc_client::provider_attempts::ExternalProviderCatalog;
 use crate::monitor::push_job::raw_digest;
 use crate::search_service::macro_news::runner::QueryKey;
@@ -126,6 +127,15 @@ pub(super) fn local_unavailable_outcome(
     Ok(NativeOutcome::Economic(Err(error)))
 }
 
+pub(super) fn operation_retired_outcome() -> NativeOutcome {
+    NativeOutcome::Economic(Err(
+        crate::data_gateway::GatewayError::retired_operation(
+            crate::data_gateway::economic_calendar::CAPABILITY,
+            Some(crate::market_domain::ProviderId::Jin10),
+        ),
+    ))
+}
+
 pub(super) fn request_rejected_outcome(
     definition: &crate::search_service::macro_news::runner::Definition,
     query: QueryKey,
@@ -167,7 +177,11 @@ impl DataResult {
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
         provider_catalog: Option<&ExternalProviderCatalog>,
     ) -> Result<Self> {
-        let raw = RawResult::capture_external_bound(completion, identity, request)?;
+        let raw = if request.checked_contract_profile()? == ContractProfile::ExternalV1 {
+            RawResult::capture_external_bound(completion, identity, request)?
+        } else {
+            RawResult::capture_external(completion)
+        };
         let (processed, _, _) = raw.project_for(identity, request, attempt, provider_catalog)?;
         let native = native_bytes(&NativeOutcome::project(
             identity,
@@ -235,6 +249,7 @@ pub(super) enum TerminalCause {
     },
     RequestRejected,
     LocalRouteUnavailable,
+    OperationRetired,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

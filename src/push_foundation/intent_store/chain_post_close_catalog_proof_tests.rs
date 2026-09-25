@@ -110,6 +110,44 @@ fn install_v12(fixture: &mut V2BusinessFixture) {
     );
 }
 
+#[test]
+fn v14_retired_terminal_sidecar_migrates_sealed_v13_catalog() {
+    let mut fixture = V2BusinessFixture::new();
+    install_v12(&mut fixture);
+    assert_eq!(
+        fixture
+            .chain_post_close()
+            .migrate_schema_v12_to_v13()
+            .unwrap()
+            .schema_version(),
+        13
+    );
+    let old_terminals: i64 = fixture
+        .connection()
+        .query_row("SELECT count(*) FROM chain_post_close_macro_query_terminals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .chain_post_close()
+            .migrate_schema_v13_to_v14()
+            .unwrap()
+            .schema_version(),
+        14
+    );
+    assert_eq!(fixture.chain_post_close().verify_schema().unwrap().schema_version(), 14);
+    let new_terminals: i64 = fixture
+        .connection()
+        .query_row("SELECT count(*) FROM chain_post_close_macro_retired_terminals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(new_terminals, 0);
+    assert_eq!(
+        fixture.connection().query_row(
+            "SELECT count(*) FROM chain_post_close_macro_query_terminals", [], |row| row.get::<_, i64>(0)
+        ).unwrap(),
+        old_terminals
+    );
+}
+
 fn catalog_snapshot(connection: &Connection) -> CatalogSnapshot {
     CatalogSnapshot {
         schema_cookie: connection

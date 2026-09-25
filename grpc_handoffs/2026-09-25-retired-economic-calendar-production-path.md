@@ -9,10 +9,11 @@
 - 下游在 `Legacy::open` 为 `Gateway(5)` 放入 `operation_retired`、不可重试的不可用终态，并按原审计槽结算。宏观报告显示该原因，其他新闻源继续独立查询；旧 RPC 不再由这条生产宏观搜索路径发出。没有改写历史 `EconomicCalendar` identity、SQL 约束或既有批次。
 - `EconomicCalendarGateway::latest_releases` 与 `GrpcSource::economic_calendar_async` 的直接入口也返回不可重试的 `operation_retired`，不再打开 Local 桥或发送旧 RPC；Gateway 仍使用原能力名与请求散列写审计失败记录。
 - 普通 `GrpcMarketClient::query(EconomicCalendar, ...)` 在构造业务请求前返回带 `Jin10`、`operation_retired`、`retryable=false` 的 `Unimplemented`，即使调用者绕过 Gateway 也不触发旧 RPC。该门不适用于独立持久执行器的 `AuthorizedMacroAttempt`，不能据此宣称它已关闭。
-- `chain_post_close` 的独立持久宏观执行器仍会构造 `Gateway(5)` 的旧 Local 请求，并可经 `AuthorizedMacroAttempt` 发出 RPC。它的终态/恢复受 v12/v13 持久表约束：`LocalRouteUnavailable` 只适用于计划中真实观测到断连的路径，不能把“已退役”伪装成断连来复用。需增加明确的、可恢复的退役终态及相应 schema 迁移，才能关闭这条路径；当前不得宣称整个 `EconomicCalendar` RPC 已全面退役。
-- v12/v13 的 `chain_post_close_macro_query_terminals.cause_kind` 有固定 `CHECK`，其他终态表以 `(intent_id,run_version)` 外键引用它。简单新增 Rust cause 不可写入；直接延迟外键后换表的 SQLite 最小试验在 `COMMIT` 仍失败（`FOREIGN KEY constraint failed`）。后续迁移须保留旧表与哈希链、明确新 cause 的 SQL 约束和恢复投影，并在含既有引用行的数据库上验证原子升级。
+- `chain_post_close` 的独立持久宏观执行器现有显式 v14 入口：连接的 Local 路线写入独立 `OperationRetired` / `NotCalled` 终态，不生成新 `Gateway(5)` 请求计划，也不向旧 RPC 发请求；四个新闻源继续执行。旧计划如已有 Gateway(5) attempt，则保持失败关闭，不把可能已发生的调用记成 `NotCalled`。旧 v12/v13 数据库仍需显式迁移，不能因代码存在而声称所有存量执行器已经切换。
+- v12/v13 的 `chain_post_close_macro_query_terminals.cause_kind` 有固定 `CHECK`，其他终态表以 `(intent_id,run_version)` 外键引用它。v14 因此新增独立退役终态表，保留旧表与旧行，不关闭外键；SQL guard、审计及 Rust 恢复共同校验退役事实。
 - 定向验证：`cargo test --lib retired_economic_calendar_does_not_initialize_transport` 通过（2026-09-25）；它证明 `GrpcSource` 的旧入口返回退役错误时没有初始化 Local 连接，不覆盖持久执行器的重放路径。
-- 普通客户端与映射分别经 `cargo test --lib retired_economic_calendar_query_is_rejected_before_wire_io`、`cargo test --lib map_query_error_preserves_retired_economic_calendar_reason` 通过（2026-09-25）；前者在无服务通道上立即返回，后者保留退役分类。仍未覆盖持久执行器。
+- 普通客户端与映射分别经 `cargo test --lib retired_economic_calendar_query_is_rejected_before_wire_io`、`cargo test --lib map_query_error_preserves_retired_economic_calendar_reason` 通过（2026-09-25）；前者在无服务通道上立即返回，后者保留退役分类。
+- v14 三条定向测试通过（2026-09-25）：catalog 封印、空库迁移、真实 Local loopback 无旧 RPC 与重开恢复。真实 v12 五 Gateway 终态经 v13→v14 迁移后，旧终态、StageFinal、审计链逐行保持，外键检查为零；未来版本拒绝测试也通过。尚未覆盖已有 dimension 外键引用行、旧连接计划只有 request plan 的续跑、v14 Models 后续写入。v12 完整成功用例在本机触及固定 15 秒预算，不能作为通过证据；v12 五 Gateway 已确认后的预算到期用例通过。
 
 ## 后续产品接线边界
 

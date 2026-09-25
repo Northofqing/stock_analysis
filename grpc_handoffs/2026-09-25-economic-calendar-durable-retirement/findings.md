@@ -13,3 +13,12 @@
 用内存 SQLite 的最小父表/子表（子表一行 FK 引用父表）试验：`foreign_keys=ON`、事务内 `defer_foreign_keys=ON`、复制父表、DROP、RENAME 后 `foreign_key_check=[]`，但 `COMMIT` 仍报 `FOREIGN KEY constraint failed`。若在 `BEGIN IMMEDIATE` 前设 `foreign_keys=OFF`，事务内复制/换表并执行 `foreign_key_check=[]`，提交后设回 `foreign_keys=ON`，原引用行仍可联接且检查通过。这仅证明 SQLite 技术可行；正式迁移要在本仓同一事务内做 v13 catalog/事实验真、完整 FK 校验、v14 catalog 封印、失败回滚和旧行不可变检查。
 
 更稳妥的候选设计是新增独立 v14 `OperationRetired` 终态表，不重建有外键引用的 v12 表，也不关闭外键。它仍要求 12 个 Macro guard 把新表纳入 run-version 冲突检查和 Gateway(5) 完成计数；恢复需把新表追加为第 13 个事实组，保持旧组索引不变。此方案与旧表并存，须通过混合旧/新事实的全链恢复测试后才能采用。
+
+## 2026-09-25 实施与验证进度
+
+- 已采用独立 v14 sidecar：旧 `chain_post_close_macro_query_terminals` 及其外键保持原状，v14 新表只接受 `Gateway(5)`、`OperationRetired`、`NotCalled` 和 `operation_retired` 审计。12 个 Macro guard 与 3 个 Models guard 已按新布局重新封印。
+- 新 v14 Local 计划不再生成 `Gateway(5)` request plan；连接路线下在计划事务写退役终态。旧连接计划若只有 request plan 而没有 attempt，恢复时允许保留该请求事实并补退役终态；若已有 attempt，则不伪造 `NotCalled`，后续调用 fail closed。
+- `v14_connected_local_retires_economic_without_rpc_and_reopens_terminal` 已通过：loopback 服务端只收到另外四个 Gateway 调用，退役终态及审计在重开数据库后可读。
+- 排查中发现持久执行器将 LocalBridgeV1 新闻结果强制绑定到 ExternalV1 线身份；已按 profile 分支修正。原 v12 五 Gateway 确认后预算到期用例通过。原 v12 完整成功场景在当前机器上运行到 Web 研究阶段后耗尽固定 15 秒预算，不能作为本次迁移通过的证据。
+- 含真实 v12 旧终态的 v12→v13→v14 迁移测试已通过：五条旧终态、运行头、StageFinal、五条审计及其审计链逐行保持，`foreign_key_check` 为零，重开后仍恢复原 EconomicCalendar 结果。v14 catalog 三条定向测试和未来版本拒绝测试也已通过。
+- 已有 dimension 行引用旧终态的迁移样本、v13 旧连接计划只有 request plan 的恢复、以及 v14 Models 后续写入尚未单独验证。完整 v12 成功场景在当前机器上触及固定 15 秒预算，不能用它声称这些缺口已关闭。

@@ -7,7 +7,13 @@
 - `Durable::admit(Step::Data { query: Gateway(5) })` 会经 `AuthorizedMacroAttempt::execute` 到 Local 旧 RPC。普通 `GrpcMarketClient::query` 的退役门不覆盖此路径。
 - v12/v13 `chain_post_close_macro_query_terminals` 的 `cause_kind` 固定 `CHECK`；`LocalRouteUnavailable` 只对真实 `ObservedUnavailable` 计划有效。Rust 单独加 cause 或把已连接路线伪装成断连都不成立。
 - 其他表以 `(intent_id,run_version)` 外键引用终态表。SQLite 最小试验表明只开 `defer_foreign_keys` 换表后 `COMMIT` 仍报外键失败；在迁移事务前暂关外键、事务内换表与 `foreign_key_check`、提交后恢复外键的试验可行。正式方案还须满足本仓的冻结 DDL、catalog attestation 和旧行校验。
-- 当前工作树最新布局是 13；v13 的 Macro 写入 guard 限定最新布局=13。新布局除了终态表还须重新封印相关 guard。
+- 当前工作树已封印布局 14；v14 的 Macro 与 Models 写入 guard 已重新注册。旧 v12/v13 数据库仍需依次显式迁移到 v14，不能仅因安装新二进制就认为已经切换。
+
+## 当前进度
+
+- 新 v14 Local 计划的无旧 RPC、`operation_retired`/`NotCalled`、四个其他新闻调用及重开恢复测试通过。
+- 真实旧 v12 五 Gateway 终态经 v13 升到 v14，运行头、旧终态、StageFinal、审计与审计链逐行保持；外键检查及重开恢复通过。
+- 还需覆盖旧 dimension 外键引用行、旧连接计划有 request plan 无 attempt 的续跑、v14 Models 后续写入。未覆盖前不宣称所有 v13 存量运行已完成安全切换。
 
 ## 实施阶段
 

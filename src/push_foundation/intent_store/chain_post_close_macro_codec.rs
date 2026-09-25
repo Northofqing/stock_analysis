@@ -303,7 +303,7 @@ impl Request {
             .expect("validated Macro request contract profile")
     }
 
-    fn checked_contract_profile(&self) -> Result<ContractProfile> {
+    pub(super) fn checked_contract_profile(&self) -> Result<ContractProfile> {
         match self.profile.as_str() {
             "LocalBridgeV1" => Ok(ContractProfile::LocalBridgeV1),
             "ExternalV1" => Ok(ContractProfile::ExternalV1),

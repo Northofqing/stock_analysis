@@ -1630,7 +1630,7 @@ fn request_hash(kind: BoardKind) -> Result<&'static str, ChainPostCloseError> {
 fn verify_board_layout(connection: &Connection) -> Result<i64, ChainPostCloseError> {
     let version = schema::runtime_layout_version(connection)?;
     // runtime_layout_version has just attested this exact current catalog.
-    if matches!(version, 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13) {
+    if matches!(version, 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
         Ok(version)
     } else {
         Err(ChainPostCloseError::UnsupportedVersion)

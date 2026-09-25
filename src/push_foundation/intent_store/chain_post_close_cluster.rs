@@ -602,7 +602,7 @@ pub(super) fn validate_existing_cluster_facts_scoped(
 fn verify_cluster_layout(connection: &Connection) -> Result<(), ChainPostCloseError> {
     match schema::runtime_layout_version(connection)? {
         // The unversioned facade has already attested the exact catalog.
-        4..=13 => Ok(()),
+        4..=14 => Ok(()),
         _ => Err(ChainPostCloseError::UnsupportedVersion),
     }
 }

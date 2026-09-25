@@ -24,7 +24,7 @@ use super::{
 fn verify_concept_rpc_layout(connection: &Connection) -> Result<(), ChainPostCloseError> {
     match schema::runtime_layout_version(connection)? {
         // The current runtime reader attests the exact catalog before returning.
-        7 | 8 | 9 | 10 | 11 | 12 | 13 => Ok(()),
+        7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 => Ok(()),
         _ => Err(ChainPostCloseError::UnsupportedVersion),
     }
 }

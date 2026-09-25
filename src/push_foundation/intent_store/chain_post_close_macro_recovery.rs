@@ -5,7 +5,7 @@ use super::{
         self as old, Fact, FactExpectedDigests, MacroAttemptRecovery, MacroNewsRecovery,
         MacroRecovery,
     },
-    storage, ChainPostCloseError, RunRecovery,
+    schema, storage, ChainPostCloseError, RunRecovery,
 };
 use crate::data_gateway::GlobalNewsProvider;
 use crate::database::data_acquisition_audit::{
@@ -29,6 +29,7 @@ pub(super) const TABLES: [&str; 4] = [
     "chain_post_close_macro_finalize_begins",
     "chain_post_close_macro_stage_finals",
 ];
+pub(super) const RETIRED_TABLE: &str = "chain_post_close_macro_retired_terminals";
 
 pub(super) struct RequestRecovery {
     pub(super) fact: Fact,
@@ -254,9 +255,11 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
     run: &'run RunRecovery,
     validated: Option<&dragon_tiger::ValidatedDragonTiger<'transaction, 'connection, 'run>>,
 ) -> Result<Option<MacroRecovery>> {
+    let retired_layout = schema::runtime_layout_version(transaction)? >= 14;
     let mut groups = old::TABLES
         .iter()
         .chain(TABLES.iter())
+        .chain(std::iter::once(&RETIRED_TABLE).take(usize::from(retired_layout)))
         .map(|table| old::facts(transaction, intent, table))
         .collect::<Result<Vec<_>>>()?;
     if groups[0].is_empty() {
@@ -668,9 +671,23 @@ fn finish_recovery(
             },
         );
     }
-    for fact in &groups[8] {
+    for (fact, table) in groups[8]
+        .iter()
+        .map(|fact| (fact, TABLES[0]))
+        .chain(
+            groups
+                .get(12)
+                .into_iter()
+                .flatten()
+                .map(|fact| (fact, RETIRED_TABLE)),
+        )
+    {
         bound(fact, plan)?;
         let value: native::QueryTerminal = codec::decode(&fact.bytes)?;
+        require(
+            (table == RETIRED_TABLE)
+                == matches!(&value.cause, native::TerminalCause::OperationRetired),
+        )?;
         type Extra = (
             String,
             u8,
@@ -695,7 +712,7 @@ fn finish_recovery(
             Option<String>,
         );
         let extra: Extra = transaction.query_row(
-            "SELECT phase,item_ordinal,candidate_ordinal,plan_version,plan_sha256,request_plan_version,request_sha256,cause_kind,data_result_version,control_result_version,call_state,native_bytes,native_length,native_sha256,audit_id,audit_record_hash,audit_capability,audit_provider,audit_request_hash,previous_outcome,current_outcome FROM chain_post_close_macro_query_terminals WHERE intent_id=?1 AND run_version=?2",
+            &format!("SELECT phase,item_ordinal,candidate_ordinal,plan_version,plan_sha256,request_plan_version,request_sha256,cause_kind,data_result_version,control_result_version,call_state,native_bytes,native_length,native_sha256,audit_id,audit_record_hash,audit_capability,audit_provider,audit_request_hash,previous_outcome,current_outcome FROM {table} WHERE intent_id=?1 AND run_version=?2"),
             params![intent.as_str(),fact.version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?,row.get(18)?,row.get(19)?,row.get(20)?)))
             .map_err(|_| storage("full macro terminal"))?;
         require(
@@ -712,6 +729,7 @@ fn finish_recovery(
                 && raw_digest(&extra.11).as_str() == extra.13,
         )?;
         let request = requests.get(&value.query);
+        let retired = matches!(&value.cause, native::TerminalCause::OperationRetired);
         let outcome = match value.cause {
             native::TerminalCause::DataResult { version } => {
                 let (cause, outcome) = terminal_results
@@ -799,12 +817,29 @@ fn finish_recovery(
                 )?;
                 native::local_unavailable_outcome(&local)?
             }
+            native::TerminalCause::OperationRetired => {
+                require(
+                    value.query == QueryKey::Gateway(5)
+                        && local.state == plan3::LocalRouteState::ObservedConnected
+                        && extra.7 == "OperationRetired"
+                        && extra.8.is_none()
+                        && extra.9.is_none()
+                        && extra.10 == "NotCalled"
+                        && value.request_plan_version.is_none()
+                        && value.request_sha256.is_none()
+                        && !recovery
+                            .attempts
+                            .iter()
+                            .any(|attempt| attempt.query == value.query),
+                )?;
+                native::operation_retired_outcome()
+            }
         };
         require(
-            extra.5 == request.map(|request| request.fact.version)
-                && extra.6
-                    == request
-                        .map(|request| raw_digest(&request.request.bytes).as_str().to_owned())
+            (retired
+                || (extra.5 == request.map(|request| request.fact.version)
+                    && extra.6
+                        == request.map(|request| raw_digest(&request.request.bytes).as_str().to_owned())))
                 && native::native_bytes(&outcome)? == extra.11,
         )?;
         let receipt = if matches!(value.query, QueryKey::Gateway(_)) {
@@ -946,6 +981,13 @@ fn finish_recovery(
             requests
                 .values()
                 .map(|request| (request.fact.version, request.fact.digest.clone())),
+        )
+        .chain(
+            groups
+                .get(12)
+                .into_iter()
+                .flatten()
+                .map(|fact| (fact.version, fact.digest.clone())),
         )
         .collect::<Vec<_>>();
     digest_material.sort_by_key(|(version, _)| *version);
