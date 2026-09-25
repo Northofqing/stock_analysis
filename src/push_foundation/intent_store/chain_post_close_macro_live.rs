@@ -505,6 +505,17 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let ready = if request.contract_profile()
             == crate::grpc_client::client::ContractProfile::ExternalV1
         {
+            // V1 Health rows remain readable with their historical outcome,
+            // but they never authorize a new data effect after the V2 build
+            // identity rule was introduced.
+            require(
+                current
+                    .readiness_episodes
+                    .first()
+                    .and_then(|episode| episode.controls.first())
+                    .and_then(|health| health.qualification_version)
+                    == Some(2),
+            )?;
             Some(
                 current
                     .readiness_episodes
@@ -605,6 +616,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         )?;
         let health_result = if ordinal == 2 {
             require(episode.controls[0].outcome == Some(old::MacroControlOutcome::Ready))?;
+            require(episode.controls[0].qualification_version == Some(2))?;
             Some(
                 episode.controls[0]
                     .result

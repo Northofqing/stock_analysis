@@ -135,13 +135,7 @@ pub(crate) fn test_external_observability() -> RuntimeObservability {
 }
 
 pub(crate) fn test_external_build_identity() -> BuildIdentity {
-    BuildIdentity {
-        service_version: "TEST_CODE_EXTERNAL_SERVICE_VERSION".to_owned(),
-        source_revision: "TEST_CODE_EXTERNAL_SOURCE_REVISION".to_owned(),
-        contract_sha256: "TEST_CODE_EXTERNAL_CONTRACT_SHA256".to_owned(),
-        binary_sha256: "TEST_CODE_EXTERNAL_BINARY_SHA256".to_owned(),
-        identity_error: String::new(),
-    }
+    crate::grpc_client::build_identity::test_public_build_identity()
 }
 
 #[derive(Default)]

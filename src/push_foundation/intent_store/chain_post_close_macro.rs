@@ -163,6 +163,7 @@ pub(crate) struct MacroControlRecovery {
     pub(super) result: Option<u64>,
     pub(super) outcome: Option<MacroControlOutcome>,
     pub(super) response: Option<Vec<u8>>,
+    pub(super) qualification_version: Option<u32>,
 }
 
 impl MacroControlRecovery {
@@ -1038,6 +1039,7 @@ pub(super) fn recover_readiness(
                 result: None,
                 outcome: None,
                 response: None,
+                qualification_version: None,
             };
             if let Some(begin) = control_begins.get(index) {
                 let decoded: ControlBegin = codec::decode(&begin.bytes)?;
@@ -1137,6 +1139,7 @@ pub(super) fn recover_readiness(
                     recovered.result = Some(result.version);
                     recovered.outcome = Some(outcome);
                     recovered.response = raw.response_bytes().map(ToOwned::to_owned);
+                    recovered.qualification_version = Some(raw.version());
                 }
             }
             controls.push(recovered);

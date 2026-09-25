@@ -1362,7 +1362,7 @@ pub(super) fn assert_response_raw(bytes: &[u8], response: &[u8]) {
     let actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     assert_eq!(actual.as_object().unwrap().len(), 7);
     assert_eq!(actual, serde_json::json!({
-        "version": 1, "connect_unavailable": false, "response": response,
+        "version": 2, "connect_unavailable": false, "response": response,
         "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
     }));
 }
@@ -1371,7 +1371,7 @@ pub(super) fn assert_connect_unavailable_raw(bytes: &[u8]) {
     let actual: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     assert_eq!(actual.as_object().unwrap().len(), 7);
     assert_eq!(actual, serde_json::json!({
-        "version": 1, "connect_unavailable": true, "response": null,
+        "version": 2, "connect_unavailable": true, "response": null,
         "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
     }));
 }
@@ -1434,7 +1434,7 @@ fn assert_raw(
     } else {
         (None, serde_json::json!("Absent"))
     };
-    assert_eq!(actual.get("version"), Some(&serde_json::json!(1)));
+    assert_eq!(actual.get("version"), Some(&serde_json::json!(2)));
     assert_eq!(
         actual.get("connect_unavailable"),
         Some(&serde_json::json!(case.is_connect_unavailable()))

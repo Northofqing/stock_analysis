@@ -765,6 +765,10 @@ pub(super) struct ControlRawResult {
 }
 
 impl ControlRawResult {
+    pub(super) fn version(&self) -> u32 {
+        self.version
+    }
+
     pub(super) fn capture_health(completion: &ExternalControlCompletion<HealthResponse>) -> Self {
         Self::capture(completion.result_material())
     }
@@ -778,7 +782,7 @@ impl ControlRawResult {
     fn capture<T>(material: ExternalControlResultMaterial<'_, T>) -> Self {
         match material {
             ExternalControlResultMaterial::ConnectUnavailable { error } => Self {
-                version: 1,
+                version: 2,
                 connect_unavailable: true,
                 response: None,
                 code: None,
@@ -787,7 +791,7 @@ impl ControlRawResult {
                 diagnostic: error.safe_diagnostic().map(str::to_owned),
             },
             ExternalControlResultMaterial::Response { bytes, .. } => Self {
-                version: 1,
+                version: 2,
                 connect_unavailable: false,
                 response: Some(bytes.to_vec()),
                 code: None,
@@ -801,7 +805,7 @@ impl ControlRawResult {
                 error_detail_trailer,
                 error,
             } => Self {
-                version: 1,
+                version: 2,
                 connect_unavailable: false,
                 response: None,
                 code: Some(code),
@@ -820,7 +824,7 @@ impl ControlRawResult {
         &self,
         request: &ControlRequest,
     ) -> Result<std::result::Result<(), GatewayError>> {
-        require(self.version == 1)?;
+        require(matches!(self.version, 1 | 2))?;
         request.validate()?;
         match (
             self.connect_unavailable,
@@ -856,11 +860,22 @@ impl ControlRawResult {
                             ));
                         }
                         require(self.diagnostic.is_none())?;
-                        Ok(
-                            crate::data_gateway::grpc_source::require_external_health_ready(
-                                &response,
-                            ),
-                        )
+                        if self.version == 1 {
+                            // Preserve the meaning of historical control rows.
+                            // V1 recorded only live+ready; reinterpreting its
+                            // Ready outcome would corrupt append-only replay.
+                            Ok(
+                                crate::data_gateway::grpc_source::require_legacy_external_health_ready(
+                                    &response,
+                                ),
+                            )
+                        } else {
+                            Ok(
+                                crate::data_gateway::grpc_source::require_external_health_qualified(
+                                    &response,
+                                ),
+                            )
+                        }
                     }
                     ExternalControlKind::Capabilities => {
                         let response = CapabilitiesResponse::decode(bytes.as_slice())

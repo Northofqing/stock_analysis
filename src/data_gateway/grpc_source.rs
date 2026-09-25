@@ -931,14 +931,41 @@ fn external_query_method(operation: Operation) -> Result<ExternalMethod, Gateway
     }
 }
 
-pub(crate) fn external_health_ready(response: &ExternalHealthResponse) -> bool {
-    response.live && response.ready
-}
-
-pub(crate) fn require_external_health_ready(
+pub(crate) fn require_external_health_qualified(
     response: &ExternalHealthResponse,
 ) -> Result<(), GatewayError> {
-    if external_health_ready(response) {
+    use crate::grpc_client::build_identity::BuildIdentityError;
+    crate::grpc_client::build_identity::qualify_public_health(response).map_err(|error| {
+        let (outcome, reason_code, retryable) = match error {
+            BuildIdentityError::NotReady => ("unavailable", "external_health_not_ready", true),
+            BuildIdentityError::ExpectedIdentityUnavailable => {
+                ("invalid_request", "external_expected_identity_missing", false)
+            }
+            _ => ("invalid_evidence", "external_build_identity_unverified", false),
+        };
+        let message = if matches!(error, BuildIdentityError::NotReady) {
+            "ExternalV1 health 未达到 live+ready".to_owned()
+        } else {
+            format!("ExternalV1 health qualification failed: {error}")
+        };
+        GatewayError::classified(
+            "GrpcExternalV1",
+            None,
+            outcome,
+            reason_code,
+            retryable,
+            message,
+        )
+    })
+}
+
+/// Historical V1 control-row interpretation only. It preserves the outcome
+/// recorded before deployment identity became an admission condition; callers
+/// must never use it to authorize a new External query.
+pub(crate) fn require_legacy_external_health_ready(
+    response: &ExternalHealthResponse,
+) -> Result<(), GatewayError> {
+    if response.live && response.ready {
         Ok(())
     } else {
         Err(GatewayError::classified(
@@ -1817,16 +1844,7 @@ async fn current_external_opening_capabilities(
         .get_external_health()
         .await
         .map_err(map_external_connection_error)?;
-    if !external_health_ready(&health) {
-        return Err(GatewayError::classified(
-            "GrpcExternalV1",
-            None,
-            "unavailable",
-            "external_health_not_ready",
-            true,
-            "ExternalV1 current health 未达到 live+ready",
-        ));
-    }
+    require_external_health_qualified(&health)?;
     state
         .client
         .get_external_capabilities()
@@ -2693,7 +2711,6 @@ impl ConnectedBoardQueries {
 
 struct ExternalClientState {
     client: GrpcMarketClient,
-    ready_operations: HashSet<ExternalMethod>,
     prepared: crate::grpc_client::client::PreparedExternalEndpoint,
 }
 
@@ -3049,30 +3066,20 @@ impl GrpcSource {
             .lock()
             .await
             .as_ref()
-            .map(|state| (state.client.clone(), state.ready_operations.clone()));
-        if let Some((mut client, ready_operations)) = cached {
-            if ready_operations.contains(&method) {
-                return Ok(());
-            }
+            .map(|state| state.client.clone());
+        if let Some(mut client) = cached {
+            // Tonic may transparently reconnect a cached Channel. A previous
+            // capability result must not authorize a different service build.
+            let health = client
+                .get_external_health()
+                .await
+                .map_err(map_external_connection_error)?;
+            require_external_health_qualified(&health)?;
             let capabilities = client
                 .get_external_capabilities()
                 .await
                 .map_err(map_external_connection_error)?;
             require_external_capability(&capabilities, method)?;
-            self.external_client
-                .lock()
-                .await
-                .as_mut()
-                .ok_or_else(|| {
-                    GatewayError::unavailable(
-                        "GrpcExternalV1",
-                        None,
-                        false,
-                        "External cache disappeared during initialization",
-                    )
-                })?
-                .ready_operations
-                .insert(method);
             return Ok(());
         }
         let bundle = self.external_bundle.as_ref().ok_or_else(|| {
@@ -3106,7 +3113,7 @@ impl GrpcSource {
             .get_external_health()
             .await
             .map_err(map_external_connection_error)?;
-        require_external_health_ready(&health)?;
+        require_external_health_qualified(&health)?;
         let capabilities = client
             .get_external_capabilities()
             .await
@@ -3119,7 +3126,6 @@ impl GrpcSource {
         *self.external_client.lock().await = Some(ExternalClientState {
             client,
             prepared,
-            ready_operations: HashSet::from([method]),
         });
         Ok(())
     }

@@ -45,12 +45,10 @@ impl LegacyQualification {
                     "External initialization identity changed",
                 ));
             }
-            state.ready_operations.insert(external_global_news());
         } else {
             *cache = Some(ExternalClientState {
                 client,
                 prepared: self.prepared.clone(),
-                ready_operations: HashSet::from([external_global_news()]),
             });
         }
         Ok(())
@@ -95,23 +93,13 @@ impl GrpcSource {
                 )
             })?;
         let cached = self.external_client.lock().await.as_ref().map(|state| {
-            (
-                state.prepared.clone(),
-                state.client.clone(),
-                state.ready_operations.contains(&external_global_news()),
-            )
+            (state.prepared.clone(), state.client.clone())
         });
-        if let Some((prepared, client, true)) = &cached {
-            return Ok(LegacyExternalRoute {
-                prepared: prepared.clone(),
-                client: Some(client.clone()),
-                health_ready: true,
-                macro_ready: true,
-                qualification: None,
-            });
-        }
-        let (prepared, client, health_ready) = if let Some((prepared, client, false)) = cached {
-            (prepared, Some(client), true)
+        // A cached Channel may have reconnected to a different service build.
+        // Resume the control qualification even when an earlier operation was
+        // admitted; neither Health nor Capabilities is reusable by itself.
+        let (prepared, client) = if let Some((prepared, client)) = cached {
+            (prepared, Some(client))
         } else {
             let PreparedMacroQueries::External(prepared) = self.prepare_macro_queries()? else {
                 return Err(GatewayError::unavailable(
@@ -121,12 +109,12 @@ impl GrpcSource {
                     "Legacy Macro has no External route",
                 ));
             };
-            (prepared, None, false)
+            (prepared, None)
         };
         Ok(LegacyExternalRoute {
             prepared: prepared.clone(),
             client,
-            health_ready,
+            health_ready: false,
             macro_ready: false,
             qualification: Some(LegacyQualification {
                 source: self,
@@ -146,7 +134,7 @@ pub(crate) fn health_outcome(
         .processed()
         .map_err(map_external_connection_error_ref)?;
     match completion.result_material() {
-        crate::grpc_client::client::external_control_attempt::ExternalControlResultMaterial::Response { response,.. } => require_external_health_ready(response),
+        crate::grpc_client::client::external_control_attempt::ExternalControlResultMaterial::Response { response,.. } => require_external_health_qualified(response),
         _=>Err(GatewayError::unavailable("GrpcExternalV1",None,false,"External Health lacks a response")),
     }
 }

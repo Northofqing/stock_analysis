@@ -138,13 +138,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("bundle health unavailable: {error}"))?;
     println!("health live={} ready={}", health.live, health.ready);
     println!(
-        "health_fields observability_present={} build_identity_present={} authenticity=not_assessed",
+        "health_fields observability_present={} build_identity_present={}",
         health.observability.is_some(),
         health.build_identity.is_some()
     );
-    if !health.live || !health.ready {
-        anyhow::bail!("bundle health is not opening-ready");
-    }
+    stock_analysis::grpc_client::build_identity::qualify_public_health(&health)
+        .map_err(|error| anyhow::anyhow!("bundle health is not opening-qualified: {error}"))?;
+    println!("health_qualification deployment_build_identity=matched");
 
     let capabilities = client
         .get_external_capabilities()
