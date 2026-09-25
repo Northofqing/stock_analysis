@@ -4,6 +4,7 @@
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
+use diesel::sqlite::SqliteConnection;
 use stock_analysis::database::DatabaseManager;
 use stock_analysis::registry::StrategyRegistry;
 
@@ -41,21 +42,31 @@ pub async fn health_check() -> HealthStatus {
 }
 
 fn check_db() -> bool {
-    #[derive(diesel::QueryableByName)]
-    struct QueryRow {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        ok: i32,
-    }
-
     let Some(db) = DatabaseManager::try_get() else {
         return false;
     };
     let Ok(mut conn) = db.get_conn() else {
         return false;
     };
-    sql_query("SELECT 1 AS ok")
-        .get_result::<QueryRow>(&mut conn)
-        .is_ok_and(|row| row.ok == 1)
+    probe_main_db_write(&mut conn)
+}
+
+fn probe_main_db_write(conn: &mut SqliteConnection) -> bool {
+    // CREATE and INSERT prove writes to the main database are accepted. The
+    // transaction deliberately rolls back so health checks leave no rows or
+    // schema behind, including when a probe fails midway.
+    let mut wrote = false;
+    let result = conn.transaction::<(), diesel::result::Error, _>(|conn| {
+        sql_query(
+            "CREATE TABLE main.__stock_analysis_health_write_probe_20260925 (value INTEGER NOT NULL)",
+        )
+        .execute(conn)?;
+        sql_query("INSERT INTO main.__stock_analysis_health_write_probe_20260925 (value) VALUES (1)")
+            .execute(conn)?;
+        wrote = true;
+        Err(diesel::result::Error::RollbackTransaction)
+    });
+    wrote && matches!(result, Err(diesel::result::Error::RollbackTransaction))
 }
 
 fn check_perf_24h() -> bool {
@@ -94,6 +105,37 @@ fn snapshot_is_recent(created_at: &str, now: NaiveDateTime) -> bool {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn db_write_probe_rejects_readable_query_only_connection_and_leaves_no_table() {
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        sql_query("PRAGMA query_only = ON")
+            .execute(&mut conn)
+            .expect("read-only pragma");
+        let readable = sql_query("SELECT 1 AS count")
+            .get_result::<Count>(&mut conn)
+            .expect("read still works");
+        assert_eq!(readable.count, 1);
+        assert!(!probe_main_db_write(&mut conn));
+
+        sql_query("PRAGMA query_only = OFF")
+            .execute(&mut conn)
+            .expect("restore write access");
+        assert!(probe_main_db_write(&mut conn));
+        assert_eq!(
+            sql_query("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = '__stock_analysis_health_write_probe_20260925'")
+                .get_result::<Count>(&mut conn)
+                .expect("probe table was rolled back")
+                .count,
+            0
+        );
+    }
 
     #[test]
     fn every_component_is_blocking() {
