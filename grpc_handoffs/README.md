@@ -6,6 +6,8 @@
 
 新版接口：[client-bundle 2026-09-15.1 兼容审计](2026-09-16-client-bundle-interface-update.md)已完成，[双合同实施计划](2026-09-16-client-bundle-implementation-plan.md)正在执行。S0 Local冻结/External独立生成已验收，旧Local descriptor及生成代码逐字保持；S1a 的profile错误身份、双载体完整性、External attempts与在线/恢复解析已通过102项回归、全部目标编译检查及独立审查。实际External native数据/控制/事件、三个新RPC、健康身份及版本化恢复仍待完成，未部署，也未取得真实服务验收。
 
+后续合同核对：[R-08 FuturesDelivery 月份意图未进入 gRPC 请求](2026-09-25-r08-futures-delivery-request-scope.md)。这是 2026-09-25 的本地源码证据与上游待确认问题；不把它当作 9 月 22 日服务失败的已证实原因。
+
 ## 范围
 
 - 运行事实只覆盖 2026-09-16 00:47–00:49（Asia/Shanghai）的本机 `127.0.0.1:18082`：两次运行 GetHealth 检查命令都在 dial 阶段超时，没有 HealthResponse、Capabilities，也没有已发送业务 RPC 的证据。
