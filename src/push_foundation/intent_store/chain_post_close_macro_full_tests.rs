@@ -370,6 +370,153 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
     parent_server.finish().await;
 }
 
+#[tokio::test]
+async fn v14_resumes_v13_connected_request_plan_without_economic_attempt() {
+    let mut fixture = V2BusinessFixture::new();
+    let (parent_endpoint, parent_server) = spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
+    let server = MacroFullLoopbackServer::bind().await;
+    let parent_source = GrpcSource::from_board_loopback_test_client(
+        connect_parent_instance(&parent_endpoint).await,
+    );
+    let queries = parent_source.connected_board_queries().await.unwrap();
+    let (stocks, config, intent, v9_head) = populate_completed_v9_parent(
+        &mut fixture, &queries, "TEST_CODE_RUN_V13_RETIRED_RESUME",
+    ).await;
+    fixture.chain_post_close().migrate_schema_v9_to_v10().unwrap();
+    let mut local = fixture.store.as_mut().unwrap()
+        .single_user_local_chain_post_close(&config).unwrap();
+    let lease = local.resume_run(&intent, lease_request(
+        "TEST_CODE_RETIRED_RESUME_PARENT", 68_300_000_000, 90_000_000_000, Some(v9_head),
+    )).unwrap();
+    let parent_clock = DragonTigerClock {
+        now: UtcMicros::try_new(micros("2026-07-22T10:30:00+08:00")).unwrap(),
+        request_observed_at: DateTime::parse_from_rfc3339("2026-07-22T10:30:00+08:00").unwrap(),
+        request_calls: Cell::new(0), cache_calls: Cell::new(0),
+    };
+    let mut io = local.dragon_tiger_preparation_io_v10(
+        lease, &queries, &parent_clock, FixedClusterConfiguration::resolve(Some("2")),
+        &parent_source,
+    ).unwrap();
+    let stopped = prepare_chain_analysis_with_io(
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks.clone(), None, &mut io,
+    ).await.expect_err("TEST_CODE parent stops at Macro");
+    assert_partial_macro_stop(&stopped);
+    drop(io);
+    let parent_head = local.inspect_run(&intent).unwrap().head_version();
+    drop(local);
+    fixture.chain_post_close().migrate_schema_v10_to_v11().unwrap();
+    fixture.chain_post_close().migrate_schema_v11_to_v12().unwrap();
+    fixture.chain_post_close().migrate_schema_v12_to_v13().unwrap();
+
+    let macro_source = GrpcSource::from_macro_loopback_test_client(
+        server.connect().await, server.endpoint().to_owned(),
+    );
+    let connected = macro_source.connected_macro_queries().unwrap();
+    let started_at = micros("2026-09-14T15:30:00+08:00");
+    let clock = MacroClock {
+        now: Cell::new(UtcMicros::try_new(started_at).unwrap()),
+        observation: DateTime::parse_from_rfc3339("2026-09-14T15:30:00+08:00").unwrap(),
+        observation_calls: Cell::new(0),
+    };
+    let registered = [GeneralWebResearchProvider::SerpApi,
+        GeneralWebResearchProvider::Bocha, GeneralWebResearchProvider::Tavily];
+    let search_service = macro_search_service(&registered);
+    let web = search_service.macro_web_snapshot(&macro_source).unwrap();
+    let requests = (1..=5).map(|ordinal| {
+        let identity = if ordinal == 5 {
+            MacroQueryIdentity::EconomicCalendar
+        } else {
+            MacroQueryIdentity::GlobalNews {
+                provider: [GlobalNewsProvider::Eastmoney, GlobalNewsProvider::Cailianpress,
+                    GlobalNewsProvider::Jin10, GlobalNewsProvider::ThePaper][usize::from(ordinal - 1)],
+                limit: 20,
+            }
+        };
+        let authorized = connected.session(identity.clone()).unwrap().authorize_next().unwrap();
+        (QueryKey::Gateway(ordinal), macro_codec::Request::capture_for(&identity, &authorized).unwrap(),
+            connected.endpoint().to_owned())
+    }).collect::<Vec<_>>();
+    let database = fixture.database();
+    let mut local = fixture.store.as_mut().unwrap()
+        .single_user_local_chain_post_close(&config).unwrap();
+    let lease = local.resume_run(&intent, macro_lease(
+        "TEST_CODE_RETIRED_RESUME_MACRO", started_at, started_at + 60_000_000, parent_head,
+    )).unwrap();
+    let mut live = crate::push_foundation::intent_store::chain_post_close::macro_live::Live::open(
+        &mut local, lease, &clock, std::rc::Rc::new(Cell::new(false)),
+    ).unwrap();
+    live.initialize(clock.macro_request_observation(), connected.endpoint(), requests, None, &web).unwrap();
+    let planned_lease = live.into_lease();
+    drop(local);
+    let old_request_count: i64 = fixture.connection().query_row(
+        "SELECT count(*) FROM chain_post_close_macro_request_plans WHERE intent_id=?1 AND phase='Gateway' AND item_ordinal=5",
+        [intent.as_str()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(old_request_count, 1);
+    fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+
+    let mut local = fixture.store.as_mut().unwrap()
+        .single_user_local_chain_post_close(&config).unwrap();
+    let mut io = local.macro_preparation_io_v14(
+        planned_lease, &queries, &clock, FixedClusterConfiguration::resolve(Some("2")),
+        &parent_source, &macro_source, &search_service,
+    ).unwrap();
+    let mut reader = BusinessIntentStore::open(&database).unwrap();
+    let mut read_local = reader.single_user_local_chain_post_close(&config).unwrap();
+    let mut prepare = Box::pin(prepare_chain_analysis_with_io(
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks, None, &mut io,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut prepare => panic!("TEST_CODE resumed Macro returned before four news RPCs: {result:?}"),
+            _ = server.wait_for_gateway_count(4) => {}
+        }
+    }).await.unwrap();
+    let observed = read_local.inspect_macro(&intent).unwrap();
+    let retired = observed.query_terminal(QueryKey::Gateway(5)).unwrap();
+    assert!(!retired.was_called());
+    assert!(matches!(retired.native(), NativeOutcome::Economic(Err(error))
+        if error.reason_code() == "operation_retired" && !error.retryable()));
+    assert!(!observed.attempts().iter().any(|attempt| attempt.query_key() == QueryKey::Gateway(5)));
+    assert!(!server.snapshot().calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    let preserved_request_count: i64 = rusqlite::Connection::open(&database).unwrap().query_row(
+        "SELECT count(*) FROM chain_post_close_macro_request_plans WHERE intent_id=?1 AND phase='Gateway' AND item_ordinal=5",
+        [intent.as_str()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(preserved_request_count, 1);
+    server.release_all();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                result = &mut prepare => panic!("TEST_CODE resumed Macro returned before four news terminals: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if (1..=4).all(|ordinal| read_local.inspect_macro(&intent).unwrap()
+                .query_terminal(QueryKey::Gateway(ordinal)).is_some()) {
+                break;
+            }
+        }
+    }).await.unwrap();
+    drop(prepare);
+    drop(io);
+    drop(read_local);
+    reader.connection.close().unwrap();
+    drop(local);
+    drop(connected);
+    drop(queries);
+    drop(parent_source);
+    drop(macro_source);
+    fixture.reopen();
+    let reopened = fixture.store.as_mut().unwrap()
+        .single_user_local_chain_post_close(&config).unwrap()
+        .inspect_macro(&intent).unwrap();
+    assert_eq!(reopened.query_terminal(QueryKey::Gateway(5)).unwrap().native_bytes(),
+        retired.native_bytes());
+    assert!(!server.snapshot().calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    server.finish().await.unwrap();
+    parent_server.finish().await;
+}
+
 #[derive(Clone, Copy)]
 enum FullMacroScenario {
     FullSuccess,

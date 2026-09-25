@@ -13,7 +13,8 @@
 
 - 新 v14 Local 计划的无旧 RPC、`operation_retired`/`NotCalled`、四个其他新闻调用及重开恢复测试通过。
 - 真实旧 v12 五 Gateway 终态经 v13 升到 v14，运行头、旧终态、StageFinal、审计与审计链逐行保持；外键检查及重开恢复通过。
-- 还需覆盖旧 dimension 外键引用行、旧连接计划有 request plan 无 attempt 的续跑、v14 Models 后续写入。未覆盖前不宣称所有 v13 存量运行已完成安全切换。
+- v13 旧连接计划有 Gateway(5) request plan、无 attempt 的 v14 续跑通过：保留请求事实、补退役终态、四个新闻源继续执行、旧 RPC 零调用。
+- 还需覆盖旧 dimension 外键引用行和 v14 Models 后续写入。未覆盖前不宣称所有 v13 存量运行已完成安全切换。
 
 ## 实施阶段
 

@@ -13,7 +13,7 @@
 - v12/v13 的 `chain_post_close_macro_query_terminals.cause_kind` 有固定 `CHECK`，其他终态表以 `(intent_id,run_version)` 外键引用它。v14 因此新增独立退役终态表，保留旧表与旧行，不关闭外键；SQL guard、审计及 Rust 恢复共同校验退役事实。
 - 定向验证：`cargo test --lib retired_economic_calendar_does_not_initialize_transport` 通过（2026-09-25）；它证明 `GrpcSource` 的旧入口返回退役错误时没有初始化 Local 连接，不覆盖持久执行器的重放路径。
 - 普通客户端与映射分别经 `cargo test --lib retired_economic_calendar_query_is_rejected_before_wire_io`、`cargo test --lib map_query_error_preserves_retired_economic_calendar_reason` 通过（2026-09-25）；前者在无服务通道上立即返回，后者保留退役分类。
-- v14 三条定向测试通过（2026-09-25）：catalog 封印、空库迁移、真实 Local loopback 无旧 RPC 与重开恢复。真实 v12 五 Gateway 终态经 v13→v14 迁移后，旧终态、StageFinal、审计链逐行保持，外键检查为零；未来版本拒绝测试也通过。尚未覆盖已有 dimension 外键引用行、旧连接计划只有 request plan 的续跑、v14 Models 后续写入。v12 完整成功用例在本机触及固定 15 秒预算，不能作为通过证据；v12 五 Gateway 已确认后的预算到期用例通过。
+- v14 三条定向测试通过（2026-09-25）：catalog 封印、空库迁移、真实 Local loopback 无旧 RPC 与重开恢复。真实 v12 五 Gateway 终态经 v13→v14 迁移后，旧终态、StageFinal、审计链逐行保持，外键检查为零；未来版本拒绝测试也通过。2026-09-26 的 v13 已连接旧计划只有 Gateway(5) request plan、无 attempt 的 v14 续跑也通过，旧请求事实保留且旧 RPC 零调用。尚未覆盖已有 dimension 外键引用行及 v14 Models 后续写入。v12 完整成功用例在本机触及固定 15 秒预算，不能作为通过证据；v12 五 Gateway 已确认后的预算到期用例通过。
 
 ## 后续产品接线边界
 

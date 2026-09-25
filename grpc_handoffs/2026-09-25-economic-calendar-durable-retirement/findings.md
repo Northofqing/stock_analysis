@@ -21,4 +21,5 @@
 - `v14_connected_local_retires_economic_without_rpc_and_reopens_terminal` 已通过：loopback 服务端只收到另外四个 Gateway 调用，退役终态及审计在重开数据库后可读。
 - 排查中发现持久执行器将 LocalBridgeV1 新闻结果强制绑定到 ExternalV1 线身份；已按 profile 分支修正。原 v12 五 Gateway 确认后预算到期用例通过。原 v12 完整成功场景在当前机器上运行到 Web 研究阶段后耗尽固定 15 秒预算，不能作为本次迁移通过的证据。
 - 含真实 v12 旧终态的 v12→v13→v14 迁移测试已通过：五条旧终态、运行头、StageFinal、五条审计及其审计链逐行保持，`foreign_key_check` 为零，重开后仍恢复原 EconomicCalendar 结果。v14 catalog 三条定向测试和未来版本拒绝测试也已通过。
-- 已有 dimension 行引用旧终态的迁移样本、v13 旧连接计划只有 request plan 的恢复、以及 v14 Models 后续写入尚未单独验证。完整 v12 成功场景在当前机器上触及固定 15 秒预算，不能用它声称这些缺口已关闭。
+- 2026-09-26：v13 已连接计划只有 Gateway(5) request plan、没有 attempt 的续跑用例通过。旧请求行保留，v14 补 `OperationRetired` / `NotCalled`，四个新闻源继续执行，旧 RPC 零调用，重开后终态可读。
+- 已有 dimension 行引用旧终态的迁移样本，以及 v14 Models 后续写入尚未单独验证。完整 v12 成功场景在当前机器上触及固定 15 秒预算，不能用它声称这些缺口已关闭。
