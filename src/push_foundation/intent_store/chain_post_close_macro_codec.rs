@@ -31,8 +31,8 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     QueryResponse as ExternalQueryResponse,
 };
 use crate::grpc_client::external_query_transport::{
-    admit_external_payload, wire_error, ExternalQueryMethod, ExternalWireEvidenceV1,
-    ExternalWireMaterialV1, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+    admit_external_payload, compiled_descriptor_sha256, wire_error, ExternalQueryMethod,
+    ExternalWireEvidenceV1, ExternalWireMaterialV1, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
 };
 use crate::grpc_client::pb::magic::market::v1::{Operation, QueryRequest, QueryResponse};
 use crate::grpc_client::provider_attempts::{ExternalProviderCatalog, ProviderAttempts};
@@ -602,12 +602,16 @@ pub(super) struct ControlRequest {
     profile: String,
     endpoint: String,
     authority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<ExternalControlKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_descriptor_sha256: Option<String>,
 }
 
 impl ControlRequest {
     pub(super) fn capture(material: ExternalControlRequestMaterial) -> Result<Self> {
         let value = Self {
-            version: 1,
+            version: 2,
             kind: match material.kind {
                 ExternalControlKind::Health => "Health",
                 ExternalControlKind::Capabilities => "Capabilities",
@@ -622,6 +626,8 @@ impl ControlRequest {
             .to_owned(),
             endpoint: material.endpoint_uri,
             authority: material.acquisition_authority,
+            method: Some(material.kind),
+            client_descriptor_sha256: Some(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.to_owned()),
         };
         value.validate()?;
         Ok(value)
@@ -629,7 +635,7 @@ impl ControlRequest {
 
     pub(super) fn validate(&self) -> Result<()> {
         require(
-            self.version == 1
+            matches!(self.version, 1 | 2)
                 && self.profile == "ExternalV1"
                 && self.endpoint.starts_with("https://")
                 && self.endpoint.parse::<tonic::codegen::http::Uri>().is_ok()
@@ -638,6 +644,16 @@ impl ControlRequest {
                 && !self.id.is_empty()
                 && self.id.len() <= 512,
         )?;
+        if self.version == 2 {
+            require(
+                self.method == Some(self.kind())
+                    && self.client_descriptor_sha256.as_deref()
+                        == Some(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
+                    && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+            )?;
+        } else {
+            require(self.method.is_none() && self.client_descriptor_sha256.is_none())?;
+        }
         let context = match self.kind.as_str() {
             "Health" => {
                 let request = HealthRequest::decode(self.bytes.as_slice())
@@ -666,6 +682,22 @@ impl ControlRequest {
             endpoint_uri: self.endpoint.clone(),
             acquisition_authority: self.authority.clone(),
         }
+    }
+
+    pub(super) fn matches_material(&self, material: &ExternalControlRequestMaterial) -> Result<()> {
+        self.validate()?;
+        require(
+            material.profile == ContractProfile::ExternalV1
+                && material.kind == self.kind()
+                && material.request_bytes == self.bytes
+                && material.request_id == self.id
+                && material.endpoint_uri == self.endpoint
+                && material.acquisition_authority == self.authority,
+        )
+    }
+
+    pub(super) fn has_wire_identity(&self) -> bool {
+        self.version == 2
     }
 
     pub(crate) fn kind(&self) -> ExternalControlKind {
@@ -1009,7 +1041,8 @@ impl RawWireIdentity {
                 && method == MethodIdentity::External(external_global_news())
                 && self.method == ExternalQueryMethod::GlobalNews
                 && self.request_id == request.id
-                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+                && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         )
     }
 }
@@ -1458,7 +1491,90 @@ mod tests {
     use super::*;
     use crate::grpc_client::external_query_transport::ExternalFrameFailureV1;
     use crate::push_foundation::intent_store::chain_post_close::macro_native::DataResult;
+    use crate::push_foundation::intent_store::chain_post_close::macro_stage::{
+        MacroControlOutcome, MacroControlRecovery,
+    };
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn new_external_control_requests_bind_typed_method_and_descriptor_without_rewriting_v1() {
+        for kind in [ExternalControlKind::Health, ExternalControlKind::Capabilities] {
+            let request_id = "TEST_CODE_CONTROL_ID".to_owned();
+            let context = crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                protocol_version: 1,
+                request_id: request_id.clone(),
+            };
+            let request_bytes = match kind {
+                ExternalControlKind::Health => HealthRequest {
+                    context: Some(context),
+                }
+                .encode_to_vec(),
+                ExternalControlKind::Capabilities => CapabilitiesRequest {
+                    context: Some(context),
+                }
+                .encode_to_vec(),
+            };
+            let material = ExternalControlRequestMaterial {
+                kind,
+                request_bytes,
+                request_id,
+                profile: ContractProfile::ExternalV1,
+                endpoint_uri: "https://example.com".to_owned(),
+                acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
+            };
+            let stored = ControlRequest::capture(material.clone()).unwrap();
+            assert_eq!(stored.version, 2);
+            stored.matches_material(&material).unwrap();
+            let mut wrong_material = material.clone();
+            wrong_material.profile = ContractProfile::LocalBridgeV1;
+            assert!(stored.matches_material(&wrong_material).is_err());
+            wrong_material = material.clone();
+            wrong_material.request_id.push('X');
+            assert!(stored.matches_material(&wrong_material).is_err());
+            assert!(MacroControlRecovery {
+                request: stored.clone(),
+                begin: Some(1),
+                result: Some(2),
+                outcome: Some(MacroControlOutcome::Ready),
+                response: None,
+                qualification_version: Some(2),
+            }
+            .authorizes_new_external_effect());
+            let original = serde_json::to_value(&stored).unwrap();
+            for (field, replacement) in [
+                ("method", serde_json::json!(if kind == ExternalControlKind::Health {
+                    "Capabilities"
+                } else {
+                    "Health"
+                })),
+                ("client_descriptor_sha256", serde_json::json!("0".repeat(64))),
+            ] {
+                let mut changed = original.clone();
+                changed[field] = replacement;
+                let restored: ControlRequest = serde_json::from_value(changed).unwrap();
+                assert!(restored.matches_material(&material).is_err(), "{field}");
+            }
+            let mut legacy = original;
+            legacy["version"] = serde_json::json!(1);
+            legacy.as_object_mut().unwrap().remove("method");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("client_descriptor_sha256");
+            let legacy: ControlRequest = serde_json::from_value(legacy).unwrap();
+            legacy.matches_material(&material).unwrap();
+            assert_eq!(legacy.version, 1);
+            assert!(!MacroControlRecovery {
+                request: legacy,
+                begin: Some(1),
+                result: Some(2),
+                outcome: Some(MacroControlOutcome::Ready),
+                response: None,
+                qualification_version: Some(2),
+            }
+            .authorizes_new_external_effect());
+        }
+    }
 
     fn external_v2_material(
         source11: &[u8],

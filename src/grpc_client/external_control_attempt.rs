@@ -1,6 +1,7 @@
 //! Closed native attempts for External system-service controls.
 
 use prost::Message as _;
+use serde::{Deserialize, Serialize};
 
 use super::unary_attempt::{capture_status_material, UnaryTrailerMaterial};
 use super::{ContractProfile, ExternalSystemCall, GrpcMarketClient, PreparedExternalEndpoint};
@@ -10,7 +11,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
 };
 use crate::grpc_client::provider_attempts::ExternalProviderCatalog;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) enum ExternalControlKind {
     Health,
     Capabilities,

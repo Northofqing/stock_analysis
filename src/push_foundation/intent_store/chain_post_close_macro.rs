@@ -186,7 +186,9 @@ impl MacroControlRecovery {
         self.outcome
     }
     pub(crate) fn authorizes_new_external_effect(&self) -> bool {
-        self.outcome == Some(MacroControlOutcome::Ready) && self.qualification_version == Some(2)
+        self.outcome == Some(MacroControlOutcome::Ready)
+            && self.qualification_version == Some(2)
+            && self.request.has_wire_identity()
     }
     pub(crate) fn response_bytes(&self) -> Option<&[u8]> {
         self.response.as_deref()
@@ -1499,11 +1501,8 @@ impl LocalChainPostClose<'_> {
             .controls
             .get(index)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(
-            control.begin.is_none()
-                && codec::encode(&codec::ControlRequest::capture(material.clone())?)?
-                    == codec::encode(&control.request)?,
-        )?;
+        require(control.begin.is_none())?;
+        control.request.matches_material(&material)?;
         let health_result = if control_ordinal == 2 {
             let health = &episode.controls[0];
             require(health.authorizes_new_external_effect())?;

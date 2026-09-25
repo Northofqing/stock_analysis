@@ -505,17 +505,14 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let ready = if request.contract_profile()
             == crate::grpc_client::client::ContractProfile::ExternalV1
         {
-            // V1 Health rows remain readable with their historical outcome,
-            // but they never authorize a new data effect after the V2 build
-            // identity rule was introduced.
-            require(
-                current
-                    .readiness_episodes
-                    .first()
-                    .and_then(|episode| episode.controls.first())
-                    .and_then(|health| health.qualification_version)
-                    == Some(2),
-            )?;
+            // Historical V1 Health results and control requests remain
+            // readable, but lack the identities required for a new data effect.
+            require(current.readiness_episodes.first().is_some_and(|episode| {
+                episode.controls.first().is_some_and(|health| {
+                    health.qualification_version == Some(2)
+                        && health.request.has_wire_identity()
+                })
+            }))?;
             Some(
                 current
                     .readiness_episodes
@@ -609,14 +606,12 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             .controls
             .get(ordinal as usize - 1)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(
-            control.begin.is_none()
-                && codec::encode(&codec::ControlRequest::capture(material)?)?
-                    == codec::encode(&control.request)?,
-        )?;
+        require(control.begin.is_none())?;
+        control.request.matches_material(&material)?;
         let health_result = if ordinal == 2 {
             require(episode.controls[0].outcome == Some(old::MacroControlOutcome::Ready))?;
-            require(episode.controls[0].qualification_version == Some(2))?;
+            require(episode.controls[0].qualification_version == Some(2)
+                && episode.controls[0].request.has_wire_identity())?;
             Some(
                 episode.controls[0]
                     .result

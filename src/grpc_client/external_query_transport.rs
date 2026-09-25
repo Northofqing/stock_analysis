@@ -526,7 +526,7 @@ pub(crate) fn wire_error(code: &str) -> GrpcError {
     }
 }
 
-fn compiled_descriptor_sha256() -> String {
+pub(crate) fn compiled_descriptor_sha256() -> String {
     hex::encode(Sha256::digest(
         crate::grpc_client::external_pb::FILE_DESCRIPTOR_SET,
     ))
