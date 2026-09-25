@@ -145,6 +145,41 @@ BEGIN
     SELECT RAISE(ABORT, 'BR-172 NewsAI recovery snapshot is immutable');
 END;
 
+-- Scheduling progress is separate from delivery completion. A claim rotates
+-- pending work; it never authorizes a physical send or closes an assessment.
+CREATE TABLE IF NOT EXISTS news_ai_recovery_claim (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id TEXT NOT NULL REFERENCES news_ai_assessment(assessment_id),
+    category TEXT NOT NULL CHECK (category IN ('ready', 'manual')),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK ((category = 'ready' AND reason = '') OR
+           (category = 'manual' AND length(trim(reason)) > 0))
+);
+CREATE INDEX IF NOT EXISTS idx_news_ai_recovery_claim_assessment
+    ON news_ai_recovery_claim(assessment_id, id);
+CREATE TABLE IF NOT EXISTS news_ai_recovery_review_notified (
+    claim_id INTEGER PRIMARY KEY REFERENCES news_ai_recovery_claim(id),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_recovery_claim_no_update
+BEFORE UPDATE ON news_ai_recovery_claim
+BEGIN SELECT RAISE(ABORT, 'BR-172 recovery claims are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_recovery_claim_no_delete
+BEFORE DELETE ON news_ai_recovery_claim
+BEGIN SELECT RAISE(ABORT, 'BR-172 recovery claims are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_recovery_notified_no_update
+BEFORE UPDATE ON news_ai_recovery_review_notified
+BEGIN SELECT RAISE(ABORT, 'BR-172 review confirmations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_recovery_notified_no_delete
+BEFORE DELETE ON news_ai_recovery_review_notified
+BEGIN SELECT RAISE(ABORT, 'BR-172 review confirmations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_news_ai_recovery_notified_manual_only
+BEFORE INSERT ON news_ai_recovery_review_notified
+WHEN NOT EXISTS (SELECT 1 FROM news_ai_recovery_claim
+                 WHERE id = NEW.claim_id AND category = 'manual')
+BEGIN SELECT RAISE(ABORT, 'BR-172 only manual claims can be notified'); END;
+
 CREATE TABLE IF NOT EXISTS news_ai_delivery_event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
@@ -388,7 +423,22 @@ pub enum NewsAiPendingRecovery {
     ManualReview {
         assessment_id: String,
         reason: String,
+        /// Durable scan claim, not a delivery permission. Confirm only after
+        /// the manual-review audit publication has actually succeeded.
+        claim_id: i64,
     },
+}
+
+#[derive(QueryableByName)]
+struct RecoveryClaimRow {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = Text)]
+    assessment_id: String,
+    #[diesel(sql_type = Text)]
+    category: String,
+    #[diesel(sql_type = Text)]
+    reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2150,10 +2200,37 @@ pub(crate) fn load_pending_news_ai_recoveries_on_conn(
     limit: usize,
 ) -> NewsAiAssessmentAuditResult<Vec<NewsAiPendingRecovery>> {
     if limit == 0 || limit > 100 {
-        return Err(invalid("pending NewsAI recovery limit must be within 1..=100"));
+        return Err(invalid(
+            "pending NewsAI recovery limit must be within 1..=100",
+        ));
     }
+    conn.immediate_transaction(|conn| claim_pending_news_ai_recoveries(conn, limit))
+}
+
+fn claim_pending_news_ai_recoveries(
+    conn: &mut SqliteConnection,
+    limit: usize,
+) -> NewsAiAssessmentAuditResult<Vec<NewsAiPendingRecovery>> {
     validate_news_ai_assessment_chain(conn)?;
     validate_news_ai_delivery_audit(conn)?;
+    let claims = diesel::sql_query(
+        "SELECT id, assessment_id, category, reason FROM news_ai_recovery_claim ORDER BY id",
+    )
+    .load::<RecoveryClaimRow>(conn)?;
+    let mut manual_next = claims.last().is_some_and(|claim| claim.category == "ready");
+    let last_visits: BTreeMap<_, _> = claims
+        .iter()
+        .map(|claim| (claim.assessment_id.clone(), claim.id))
+        .collect();
+    let notified: std::collections::BTreeSet<_> = diesel::sql_query(
+        "SELECT c.id, c.assessment_id, c.category, c.reason
+           FROM news_ai_recovery_review_notified n
+           JOIN news_ai_recovery_claim c ON c.id = n.claim_id",
+    )
+    .load::<RecoveryClaimRow>(conn)?
+    .into_iter()
+    .map(|claim| (claim.assessment_id, claim.reason))
+    .collect();
 
     let mut ready = Vec::new();
     let mut manual = Vec::new();
@@ -2165,18 +2242,36 @@ pub(crate) fn load_pending_news_ai_recoveries_on_conn(
         if !news_ai_assessment_is_pending(latest.as_ref())? {
             continue;
         }
+        let last_visit = last_visits.get(&row.assessment_id).copied().unwrap_or(0);
+        let order = (last_visit, row.id);
         let Some(fact) = load_frozen_recovery_fact(conn, &row.assessment_id)? else {
-            manual.push(NewsAiPendingRecovery::ManualReview {
-                assessment_id: row.assessment_id.clone(),
-                reason: "legacy assessment has no immutable recovery snapshot".to_owned(),
-            });
+            let reason = "legacy assessment has no immutable recovery snapshot".to_owned();
+            if notified.contains(&(row.assessment_id.clone(), reason.clone())) {
+                continue;
+            }
+            manual.push((
+                order,
+                NewsAiPendingRecovery::ManualReview {
+                    assessment_id: row.assessment_id.clone(),
+                    reason,
+                    claim_id: 0,
+                },
+            ));
             continue;
         };
         let Some(card) = load_frozen_delivery_card(conn, &row.assessment_id)? else {
-            manual.push(NewsAiPendingRecovery::ManualReview {
-                assessment_id: row.assessment_id.clone(),
-                reason: "legacy assessment has no immutable delivery card".to_owned(),
-            });
+            let reason = "legacy assessment has no immutable delivery card".to_owned();
+            if notified.contains(&(row.assessment_id.clone(), reason.clone())) {
+                continue;
+            }
+            manual.push((
+                order,
+                NewsAiPendingRecovery::ManualReview {
+                    assessment_id: row.assessment_id.clone(),
+                    reason,
+                    claim_id: 0,
+                },
+            ));
             continue;
         };
         let identity = source_identity_from_fact(&fact, &row.analysis_version)?;
@@ -2208,11 +2303,59 @@ pub(crate) fn load_pending_news_ai_recoveries_on_conn(
                     row.assessment_id
                 ))
             })?;
-        ready.push(NewsAiPendingRecovery::Ready(audited));
+        ready.push((order, NewsAiPendingRecovery::Ready(audited)));
     }
-    ready.extend(manual);
-    ready.truncate(limit);
-    Ok(ready)
+    ready.sort_by_key(|(order, _)| *order);
+    manual.sort_by_key(|(order, _)| *order);
+    let mut ready = ready.into_iter();
+    let mut manual = manual.into_iter();
+    let mut selected = Vec::new();
+    while selected.len() < limit {
+        let next = if manual_next {
+            manual.next().or_else(|| ready.next())
+        } else {
+            ready.next().or_else(|| manual.next())
+        };
+        let Some((_, mut work)) = next else { break };
+        let (assessment_id, category, reason) = match &work {
+            NewsAiPendingRecovery::Ready(audited) => {
+                (audited.delivery().assessment().assessment_id(), "ready", "")
+            }
+            NewsAiPendingRecovery::ManualReview {
+                assessment_id,
+                reason,
+                ..
+            } => (assessment_id.as_str(), "manual", reason.as_str()),
+        };
+        let claim = diesel::sql_query(
+            "INSERT INTO news_ai_recovery_claim (assessment_id, category, reason)
+             VALUES (?, ?, ?) RETURNING id, assessment_id, category, reason",
+        )
+        .bind::<Text, _>(assessment_id)
+        .bind::<Text, _>(category)
+        .bind::<Text, _>(reason)
+        .get_result::<RecoveryClaimRow>(conn)?;
+        manual_next = category == "ready";
+        if let NewsAiPendingRecovery::ManualReview { claim_id, .. } = &mut work {
+            *claim_id = claim.id;
+        }
+        selected.push(work);
+    }
+    Ok(selected)
+}
+
+fn confirm_news_ai_recovery_review_on_conn(
+    conn: &mut SqliteConnection,
+    claim_id: i64,
+) -> NewsAiAssessmentAuditResult<()> {
+    // The FK and manual-only trigger reject nonexistent/ready claims. An
+    // already-confirmed exact claim is idempotent; it never closes delivery.
+    diesel::sql_query(
+        "INSERT OR IGNORE INTO news_ai_recovery_review_notified (claim_id) VALUES (?)",
+    )
+    .bind::<BigInt, _>(claim_id)
+    .execute(conn)?;
+    Ok(())
 }
 
 impl DatabaseManager {
@@ -2265,7 +2408,8 @@ impl DatabaseManager {
     }
 
     /// Recover bounded, nonterminal NewsAI work from immutable persisted
-    /// evidence. This does not depend on the current aggregator tick.
+    /// evidence, atomically appending scheduling claims. Claims rotate ready
+    /// and manual work but never mark delivery or manual notification complete.
     pub fn load_pending_news_ai_recoveries(
         &self,
         limit: usize,
@@ -2274,6 +2418,18 @@ impl DatabaseManager {
             .get_conn()
             .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
         load_pending_news_ai_recoveries_on_conn(&mut conn, limit)
+    }
+
+    /// Call only after the manual-review audit publication succeeds. A crash
+    /// before this append leaves the item retryable (at-least-once notice).
+    pub fn confirm_news_ai_recovery_review(
+        &self,
+        claim_id: i64,
+    ) -> NewsAiAssessmentAuditResult<()> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
+        confirm_news_ai_recovery_review_on_conn(&mut conn, claim_id)
     }
 
     pub fn is_news_ai_terminal_denial_for_fact(
@@ -2730,15 +2886,222 @@ mod tests {
     }
 
     #[test]
+    fn br172_recovery_queue_is_fair_under_a_ready_backlog() {
+        let mut conn = connection();
+        for index in 0..12 {
+            let (request, assessment) =
+                core_assessment_for(&format!("TEST_CODE_READY_{index}"), "TEST_CODE_600519");
+            append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+        }
+        for index in 0..3 {
+            let (request, assessment) =
+                core_assessment_for(&format!("TEST_CODE_MANUAL_{index}"), "TEST_CODE_600519");
+            let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment).unwrap();
+            append_news_ai_assessment_on_conn(&mut conn, &input).unwrap();
+        }
+        let mut ready = std::collections::BTreeSet::new();
+        let mut manual = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let pending = load_pending_news_ai_recoveries_on_conn(&mut conn, 2).unwrap();
+            assert_eq!(
+                pending.len(),
+                2,
+                "the limit applies to both categories together"
+            );
+            for work in pending {
+                match work {
+                    NewsAiPendingRecovery::Ready(audited) => {
+                        ready.insert(audited.delivery().assessment().assessment_id().to_owned());
+                    }
+                    NewsAiPendingRecovery::ManualReview { assessment_id, .. } => {
+                        manual.insert(assessment_id);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            manual.len(),
+            3,
+            "every manual item gets a turn despite ready backlog"
+        );
+        assert_eq!(
+            ready.len(),
+            3,
+            "ready progress rotates instead of retrying its prefix"
+        );
+    }
+
+    #[test]
+    fn br172_manual_confirmation_and_rotation_survive_reopen_and_failed_ack() {
+        std::fs::create_dir_all("data/test").unwrap();
+        let namespace = tempfile::Builder::new()
+            .prefix("TEST_CODE_BR172_REVIEW_")
+            .tempdir_in("data/test")
+            .unwrap();
+        let path = namespace.path().join("news_ai.sqlite3");
+        let open = || {
+            let mut conn = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+            conn.batch_execute("PRAGMA foreign_keys = ON;").unwrap();
+            create_schema(&mut conn).unwrap();
+            conn
+        };
+        let mut conn = open();
+        let (request, assessment) = core_assessment_for("TEST_CODE_READY", "TEST_CODE_600519");
+        append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+        let (request, assessment) = core_assessment_for("TEST_CODE_MANUAL", "TEST_CODE_600519");
+        let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment).unwrap();
+        let expected = append_news_ai_assessment_on_conn(&mut conn, &input)
+            .unwrap()
+            .assessment_id;
+        assert!(matches!(
+            load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+                .unwrap()
+                .as_slice(),
+            [NewsAiPendingRecovery::Ready(_)]
+        ));
+        drop(conn);
+
+        let mut conn = open();
+        let NewsAiPendingRecovery::ManualReview {
+            assessment_id,
+            claim_id,
+            ..
+        } = load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("a persisted ready claim must give the next turn to manual")
+        };
+        assert_eq!(assessment_id, expected);
+        let first_claim = claim_id;
+        // Crash before publication/ack: claiming alone must not close the item.
+        drop(conn);
+
+        let mut conn = open();
+        assert!(matches!(
+            load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+                .unwrap()
+                .as_slice(),
+            [NewsAiPendingRecovery::Ready(_)]
+        ));
+        let NewsAiPendingRecovery::ManualReview {
+            assessment_id,
+            claim_id,
+            ..
+        } = load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("unconfirmed manual work must return after reopen")
+        };
+        assert_eq!(assessment_id, expected);
+        assert!(claim_id > first_claim);
+        conn.batch_execute(
+            "CREATE TRIGGER TEST_CODE_fail_review_ack BEFORE INSERT ON news_ai_recovery_review_notified
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE simulated ack failure'); END;",
+        ).unwrap();
+        assert!(confirm_news_ai_recovery_review_on_conn(&mut conn, claim_id).is_err());
+        conn.batch_execute("DROP TRIGGER TEST_CODE_fail_review_ack;")
+            .unwrap();
+        drop(conn);
+
+        let mut conn = open();
+        let pending = load_pending_news_ai_recoveries_on_conn(&mut conn, 2).unwrap();
+        assert_eq!(pending.len(), 2);
+        let retry_claim = pending
+            .into_iter()
+            .find_map(|work| match work {
+                NewsAiPendingRecovery::ManualReview {
+                    assessment_id,
+                    claim_id,
+                    ..
+                } => {
+                    assert_eq!(assessment_id, expected);
+                    Some(claim_id)
+                }
+                _ => None,
+            })
+            .expect("failed acknowledgement must retain retry eligibility");
+        // Publication has succeeded before this ack; repeated ack is idempotent.
+        confirm_news_ai_recovery_review_on_conn(&mut conn, retry_claim).unwrap();
+        confirm_news_ai_recovery_review_on_conn(&mut conn, retry_claim).unwrap();
+        drop(conn);
+
+        let mut conn = open();
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    load_pending_news_ai_recoveries_on_conn(&mut conn, 2)
+                        .unwrap()
+                        .as_slice(),
+                    [NewsAiPendingRecovery::Ready(_)]
+                ),
+                "confirmed manual notice must not repeat"
+            );
+        }
+        assert_eq!(count(&mut conn, "news_ai_assessment"), 2);
+        assert_eq!(count(&mut conn, "news_ai_recovery_review_notified"), 1);
+        assert_eq!(
+            count(&mut conn, "news_ai_delivery_event"),
+            0,
+            "manual confirmation is not a delivery terminal state"
+        );
+    }
+
+    #[test]
+    fn br172_failed_scan_rolls_back_every_claim_and_keeps_global_limit() {
+        let mut conn = connection();
+        let (request, assessment) = core_assessment_for("TEST_CODE_READY", "TEST_CODE_600519");
+        append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+        let (request, assessment) = core_assessment_for("TEST_CODE_MANUAL", "TEST_CODE_600519");
+        let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment).unwrap();
+        append_news_ai_assessment_on_conn(&mut conn, &input).unwrap();
+        conn.batch_execute(
+            "CREATE TRIGGER TEST_CODE_fail_manual_claim BEFORE INSERT ON news_ai_recovery_claim
+             WHEN NEW.category = 'manual'
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE simulated claim failure'); END;",
+        )
+        .unwrap();
+        assert!(load_pending_news_ai_recoveries_on_conn(&mut conn, 2).is_err());
+        assert_eq!(
+            count(&mut conn, "news_ai_recovery_claim"),
+            0,
+            "a failed second claim must roll back the first claim too"
+        );
+        conn.batch_execute("DROP TRIGGER TEST_CODE_fail_manual_claim;")
+            .unwrap();
+        for limit in [0, 101] {
+            assert!(load_pending_news_ai_recoveries_on_conn(&mut conn, limit).is_err());
+        }
+        assert_eq!(count(&mut conn, "news_ai_recovery_claim"), 0);
+        assert!(matches!(
+            load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+                .unwrap()
+                .as_slice(),
+            [NewsAiPendingRecovery::Ready(_)]
+        ));
+        assert!(matches!(
+            load_pending_news_ai_recoveries_on_conn(&mut conn, 1)
+                .unwrap()
+                .as_slice(),
+            [NewsAiPendingRecovery::ManualReview { .. }]
+        ));
+        assert!(
+            confirm_news_ai_recovery_review_on_conn(&mut conn, 1).is_err(),
+            "a ready scheduling claim is not a manual acknowledgement capability"
+        );
+        assert!(confirm_news_ai_recovery_review_on_conn(&mut conn, 999).is_err());
+    }
+
+    #[test]
     fn br172_pending_scanner_reconstructs_audited_delivery_without_live_batch() {
         let mut conn = connection();
         let (request, assessment) = core_assessment();
-        let initial = append_audited_news_ai_assessment_on_conn(
-            &mut conn,
-            request.clone(),
-            assessment,
-        )
-        .expect("persist audited assessment and recovery evidence");
+        let initial =
+            append_audited_news_ai_assessment_on_conn(&mut conn, request.clone(), assessment)
+                .expect("persist audited assessment and recovery evidence");
 
         let pending = load_pending_news_ai_recoveries_on_conn(&mut conn, 5)
             .expect("scan durable pending NewsAI work");
@@ -2766,8 +3129,8 @@ mod tests {
             .expect("isolated NewsAI namespace");
         let path = namespace.path().join("news_ai.sqlite3");
         let expected_id = {
-            let mut writer = SqliteConnection::establish(path.to_str().unwrap())
-                .expect("open NewsAI writer");
+            let mut writer =
+                SqliteConnection::establish(path.to_str().unwrap()).expect("open NewsAI writer");
             writer
                 .batch_execute("PRAGMA foreign_keys = ON;")
                 .expect("writer foreign keys");
@@ -2781,8 +3144,8 @@ mod tests {
                 .to_owned()
         };
 
-        let mut reader = SqliteConnection::establish(path.to_str().unwrap())
-            .expect("reopen NewsAI database");
+        let mut reader =
+            SqliteConnection::establish(path.to_str().unwrap()).expect("reopen NewsAI database");
         reader
             .batch_execute("PRAGMA foreign_keys = ON;")
             .expect("reader foreign keys");
@@ -2848,6 +3211,7 @@ mod tests {
         let NewsAiPendingRecovery::ManualReview {
             assessment_id,
             reason,
+            ..
         } = &pending[0]
         else {
             panic!("legacy assessment must not be reconstructed from current news");

@@ -1,13 +1,13 @@
 //! BR-172 NewsAI governed producer（默认启用，2026-08-11 起取消 env 开关）。
 //!
-//! This adapter consumes only source-bound batches from the same aggregator
-//! tick, acquires audited market evidence, performs one receipt-bearing model
-//! call, appends the immutable assessment audit and enters the exact-identity
-//! governed delivery state machine. It has no trading capability.
+//! New analysis consumes only same-tick admitted batches. Independent durable
+//! recovery consumes existing immutable assessments without acquisition or
+//! model calls. One bounded worker owns both and has no trading capability.
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use stock_analysis::calendar::{self, MarketSession};
@@ -23,7 +23,7 @@ use stock_analysis::monitor::news_ai::{
     NewsMarketSnapshot, NEWS_AI_ANALYSIS_VERSION,
 };
 use stock_analysis::news::aggregator::AdmittedGlobalNewsBatch;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 const MAX_ASSESSMENTS_PER_TICK: usize = 5;
 const MAX_CANDIDATE_INSPECTIONS_PER_TICK: usize = 40;
@@ -33,6 +33,48 @@ static NEWS_AI_BATCH_PERMIT: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaph
 // NEWS_AI_BATCH_PERMIT keeps the worker single-flight, so its cursor can be
 // advanced after each bounded scan without concurrent writers.
 static NEXT_NEWS_AI_CANDIDATE: AtomicUsize = AtomicUsize::new(0);
+
+/// One scheduling seam owns both kinds of work and their shared single-flight
+/// permit. Futures are supplied at the database/provider boundary.
+fn schedule_news_ai_tick<R, RF, A, AF>(
+    permits: &Arc<Semaphore>,
+    selection_enabled: bool,
+    session: MarketSession,
+    batches: Option<Vec<AdmittedGlobalNewsBatch>>,
+    recover: R,
+    analyze: A,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    R: FnOnce(usize) -> RF + Send + 'static,
+    RF: Future<Output = usize> + Send,
+    A: FnOnce(Vec<AdmittedGlobalNewsBatch>, usize) -> AF + Send + 'static,
+    AF: Future<Output = ()> + Send,
+{
+    let batches = batches.filter(|batches| {
+        selection_enabled && (session.is_trading() || session.is_auction()) && !batches.is_empty()
+    });
+    let permit = permits.clone().try_acquire_owned().ok()?;
+    Some(tokio::spawn(async move {
+        let _permit = permit;
+        // One worker gives both owners a bounded share. A full recovery queue
+        // cannot consume the live allowance, and live ingress cannot skip recovery.
+        let recovery_limit = if batches.is_some() {
+            2
+        } else {
+            MAX_ASSESSMENTS_PER_TICK
+        };
+        let used = recover(recovery_limit).await;
+        if used > recovery_limit {
+            log::error!(
+                "[NewsAI][BR-172] recovery exceeded its hard work limit; live work stopped"
+            );
+            return;
+        }
+        if let Some(batches) = batches {
+            analyze(batches, used).await;
+        }
+    }))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NewAnalysisCapability {
@@ -92,7 +134,6 @@ impl std::fmt::Display for GovernedDeliveryRecoveryCapability {
 enum ProducerSchedulingCapability {
     Enabled,
     DisabledTestProcessIsolation,
-    DisabledNoExecutableCapability,
 }
 
 impl std::fmt::Display for ProducerSchedulingCapability {
@@ -102,16 +143,12 @@ impl std::fmt::Display for ProducerSchedulingCapability {
             Self::DisabledTestProcessIsolation => {
                 formatter.write_str("disabled:test_process_isolation")
             }
-            Self::DisabledNoExecutableCapability => {
-                formatter.write_str("disabled:no_executable_capability")
-            }
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateExecution {
-    DeliverAuditedAssessment,
     DeferAuditedAssessment,
     CreateAssessmentAndDeliver,
     CreateAssessmentOnly,
@@ -135,11 +172,9 @@ impl NewsAiRuntimeStatus {
                 NewAnalysisCapability::DisabledTestProcessIsolation,
                 GovernedDeliveryRecoveryCapability::DisabledTestProcessIsolation,
             ) => ProducerSchedulingCapability::DisabledTestProcessIsolation,
-            (NewAnalysisCapability::Enabled, _)
-            | (_, GovernedDeliveryRecoveryCapability::Enabled) => {
-                ProducerSchedulingCapability::Enabled
-            }
-            _ => ProducerSchedulingCapability::DisabledNoExecutableCapability,
+            // Manual recovery audit work remains executable even without a
+            // model or a physical delivery capability.
+            _ => ProducerSchedulingCapability::Enabled,
         };
         Self {
             new_analysis,
@@ -150,12 +185,9 @@ impl NewsAiRuntimeStatus {
 
     fn candidate_execution(&self, existing: bool) -> CandidateExecution {
         if existing {
-            return match self.governed_delivery_recovery {
-                GovernedDeliveryRecoveryCapability::Enabled => {
-                    CandidateExecution::DeliverAuditedAssessment
-                }
-                _ => CandidateExecution::DeferAuditedAssessment,
-            };
+            // The independent durable queue is the sole owner of existing
+            // assessments, including ones also present in this live batch.
+            return CandidateExecution::DeferAuditedAssessment;
         }
 
         match (&self.new_analysis, &self.governed_delivery_recovery) {
@@ -237,97 +269,128 @@ impl NewsAiProducer {
         }
     }
 
-    /// Schedule one bounded worker only when at least one executable capability
-    /// exists. A model-less tick may still retry an already audited assessment;
-    /// a delivery-less tick may still append a new receipt-bearing assessment.
-    pub(super) fn schedule_from_same_tick(&self, batches: &[AdmittedGlobalNewsBatch]) {
+    /// Recovery is independent of live ingress, selection activation, session,
+    /// and model capability. Only the optional *new analysis* branch uses them.
+    pub(super) fn schedule_tick(
+        &self,
+        selection_enabled: bool,
+        session: MarketSession,
+        batches: Option<&[AdmittedGlobalNewsBatch]>,
+    ) {
+        if self.test_process_isolation {
+            return;
+        }
         let status = self.runtime_status();
-        match status.scheduling {
-            ProducerSchedulingCapability::Enabled => {}
-            disabled => {
-                log::warn!(
-                    "[NewsAI][BR-172] producer not scheduled producer_scheduling={disabled} new_analysis={} governed_delivery_recovery={}",
-                    status.new_analysis,
-                    status.governed_delivery_recovery
-                );
-                return;
+        let batches = batches
+            .filter(|_| status.new_analysis == NewAnalysisCapability::Enabled)
+            .map(<[AdmittedGlobalNewsBatch]>::to_vec);
+        let analyzer = self.analyzer.clone();
+        let recovery_status = status.clone();
+        if schedule_news_ai_tick(
+            &NEWS_AI_BATCH_PERMIT,
+            selection_enabled,
+            session,
+            batches,
+            move |limit| run_durable_recovery(recovery_status, limit),
+            move |batches, used| run_same_tick_batches(batches, analyzer, status, used),
+        )
+        .is_none()
+        {
+            log::info!("[NewsAI][BR-172] skipped busy=true; no completion state written");
+        }
+    }
+}
+
+/// No analyzer, acquisition, or assessment-creation capability is passed here.
+async fn run_durable_recovery(status: NewsAiRuntimeStatus, limit: usize) -> usize {
+    let mut stats = NewsAiRunStats::default();
+    let mut recovered_work = 0_usize;
+    let pending = tokio::task::spawn_blocking(move || {
+        stock_analysis::database::get_db().load_pending_news_ai_recoveries(limit)
+    })
+    .await;
+    match pending {
+        Ok(Ok(pending)) => {
+            recovered_work = pending.len();
+            for recovery in pending {
+                match recovery {
+                    NewsAiPendingRecovery::Ready(audited) => {
+                        if status.governed_delivery_recovery
+                            != GovernedDeliveryRecoveryCapability::Enabled
+                        {
+                            stats.deferred += 1;
+                            continue;
+                        }
+                        let key = audited.delivery().assessment().assessment_id().to_owned();
+                        let outcome =
+                            deliver_governed_news_ai(&audited, &ProductionNewsAiDeliveryPort).await;
+                        stats.record_governed(&key, true, outcome);
+                    }
+                    NewsAiPendingRecovery::ManualReview {
+                        assessment_id,
+                        reason,
+                        claim_id,
+                    } => {
+                        stats.deferred += 1;
+                        let result = tokio::task::spawn_blocking(move || {
+                            publish_manual_review(
+                                || {
+                                    let identity = format!("news-ai-recovery:{assessment_id}:{claim_id}");
+                                    stock_analysis::event::publish_delivery(
+                                        "NewsAiRecoveryManualReview", Some(&identity),
+                                        "manual_review_required", "internal_audit", reason.len(), 0,
+                                    )?;
+                                    log::warn!("[NewsAI][BR-172] pending assessment requires manual review assessment_id={assessment_id} claim={claim_id} reason={reason}");
+                                    Ok(())
+                                },
+                                || stock_analysis::database::get_db()
+                                    .confirm_news_ai_recovery_review(claim_id)
+                                    .map_err(|error| error.to_string()),
+                            )
+                        }).await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            stats.failed += 1;
+                            log::error!("[NewsAI][BR-172] manual-review notice unconfirmed; retry retained: {result:?}");
+                        }
+                    }
+                }
             }
         }
-        let permit = match NEWS_AI_BATCH_PERMIT.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                log::info!("[NewsAI][BR-172] skipped busy=true; no completion state written");
-                return;
-            }
-        };
-        let batches = batches.to_vec();
-        let analyzer = self.analyzer.clone();
-        tokio::spawn(async move {
-            run_same_tick_batches(batches, analyzer, status, permit).await;
-        });
+        Ok(Err(error)) => {
+            stats.failed += 1;
+            log::warn!("[NewsAI][BR-172] durable pending scan failed: {error}");
+        }
+        Err(error) => {
+            stats.failed += 1;
+            log::warn!("[NewsAI][BR-172] durable pending scan task failed: {error}");
+        }
     }
+    log::info!(
+        "[NewsAI][BR-172] recovery visited={} pushed={} deferred={} failed={}",
+        recovered_work,
+        stats.pushed,
+        stats.deferred,
+        stats.failed
+    );
+    recovered_work
+}
+
+fn publish_manual_review<P, C>(publish: P, confirm: C) -> Result<(), String>
+where
+    P: FnOnce() -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
+    publish()?;
+    confirm()
 }
 
 async fn run_same_tick_batches(
     batches: Vec<AdmittedGlobalNewsBatch>,
     analyzer: Option<NewsAIAnalyzer>,
     status: NewsAiRuntimeStatus,
-    _permit: OwnedSemaphorePermit,
+    recovered_work: usize,
 ) {
     let mut stats = NewsAiRunStats::default();
-    let mut recovered_work = 0_usize;
-    if status.governed_delivery_recovery == GovernedDeliveryRecoveryCapability::Enabled {
-        let pending = tokio::task::spawn_blocking(|| {
-            stock_analysis::database::get_db()
-                .load_pending_news_ai_recoveries(MAX_ASSESSMENTS_PER_TICK)
-        })
-        .await;
-        match pending {
-            Ok(Ok(pending)) => {
-                for recovery in pending {
-                    match recovery {
-                        NewsAiPendingRecovery::Ready(audited) => {
-                            let key = audited
-                                .delivery()
-                                .assessment()
-                                .assessment_id()
-                                .to_owned();
-                            let outcome = deliver_governed_news_ai(
-                                &audited,
-                                &ProductionNewsAiDeliveryPort,
-                            )
-                            .await;
-                            recovered_work += usize::from(stats.record_governed(
-                                &key,
-                                true,
-                                outcome,
-                            ));
-                        }
-                        NewsAiPendingRecovery::ManualReview {
-                            assessment_id,
-                            reason,
-                        } => {
-                            stats.deferred += 1;
-                            log::warn!(
-                                "[NewsAI][BR-172] pending assessment requires manual review assessment_id={} reason={}",
-                                assessment_id,
-                                reason
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                stats.failed += 1;
-                log::warn!("[NewsAI][BR-172] durable pending scan failed: {error}");
-            }
-            Err(error) => {
-                stats.failed += 1;
-                log::warn!("[NewsAI][BR-172] durable pending scan task failed: {error}");
-            }
-        }
-    }
-
     let candidates = exact_candidates(&batches);
     if candidates.is_empty() {
         log::debug!("[NewsAI][BR-172] no exact source-bound equity target");
@@ -643,14 +706,6 @@ async fn assess_candidate(
     .map_err(|error| error.to_string())?;
     let execution = status.candidate_execution(existing.is_some());
     match execution {
-        CandidateExecution::DeliverAuditedAssessment => {
-            let audited = existing.expect("typed execution requires an audited assessment");
-            let delivery = deliver_governed_news_ai(&audited, &ProductionNewsAiDeliveryPort).await;
-            return Ok(CandidateOutcome::Governed {
-                existing: true,
-                delivery,
-            });
-        }
         CandidateExecution::DeferAuditedAssessment => {
             return Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing: true });
         }
@@ -721,8 +776,7 @@ async fn assess_candidate(
         CandidateExecution::CreateAssessmentOnly => {
             Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing: false })
         }
-        CandidateExecution::DeliverAuditedAssessment
-        | CandidateExecution::DeferAuditedAssessment
+        CandidateExecution::DeferAuditedAssessment
         | CandidateExecution::RejectNewAnalysisUnavailable => {
             unreachable!("typed execution already returned before model acquisition")
         }
@@ -946,6 +1000,165 @@ mod tests {
     use stock_analysis::data_gateway::{BatchEvidence, GlobalNewsRecord};
     use stock_analysis::market_domain::{ProviderId, SourceEvidence};
 
+    fn scheduling_batch() -> AdmittedGlobalNewsBatch {
+        AdmittedGlobalNewsBatch::from_parts(
+            Vec::new(),
+            BatchEvidence {
+                provider: ProviderId::Cailianpress,
+                source: "TEST_CODE_SCHEDULER".to_owned(),
+                source_at: None,
+                observed_at: "TEST_CODE_OBSERVATION".to_owned(),
+                batch_id: "TEST_CODE_SCHEDULER_BATCH".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn br172_manual_notice_is_confirmed_only_after_publication() {
+        let events = std::cell::RefCell::new(Vec::new());
+        publish_manual_review(
+            || {
+                events.borrow_mut().push("publish");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("confirm");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), vec!["publish", "confirm"]);
+
+        assert!(publish_manual_review(
+            || Err("TEST_CODE_AUDIT_UNAVAILABLE".to_owned()),
+            || panic!("failed publication must not be acknowledged"),
+        )
+        .is_err());
+        let publications = std::cell::Cell::new(0);
+        assert!(publish_manual_review(
+            || {
+                publications.set(publications.get() + 1);
+                Ok(())
+            },
+            || Err("TEST_CODE_ACK_WRITE_FAILED".to_owned()),
+        )
+        .is_err());
+        publish_manual_review(
+            || {
+                publications.set(publications.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            publications.get(),
+            2,
+            "effect/ack crash window is explicitly at-least-once"
+        );
+    }
+
+    #[tokio::test]
+    async fn br172_scheduler_recovers_without_live_ingress() {
+        for (selection, session, batches) in [
+            (true, MarketSession::Morning, None),
+            (true, MarketSession::Morning, Some(Vec::new())),
+            (
+                false,
+                MarketSession::Morning,
+                Some(vec![scheduling_batch()]),
+            ),
+            (true, MarketSession::Closed, Some(vec![scheduling_batch()])),
+        ] {
+            let recovered = Arc::new(AtomicUsize::new(0));
+            let analysis = Arc::new(AtomicUsize::new(0));
+            let observed_recovered = recovered.clone();
+            let observed_analysis = analysis.clone();
+            let task = schedule_news_ai_tick(
+                &Arc::new(Semaphore::new(1)),
+                selection,
+                session,
+                batches,
+                move |limit| async move {
+                    assert_eq!(limit, 5);
+                    observed_recovered.fetch_add(1, Ordering::SeqCst);
+                    1
+                },
+                move |_, _| async move {
+                    observed_analysis.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .expect("persisted recovery must be scheduled without live input");
+            task.await.unwrap();
+            assert_eq!(recovered.load(Ordering::SeqCst), 1);
+            assert_eq!(analysis.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn br172_scheduler_shares_one_worker_without_starving_live_or_recovery() {
+        let permits = Arc::new(Semaphore::new(1));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let began = Arc::new(tokio::sync::Notify::new());
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let analyses = Arc::new(AtomicUsize::new(0));
+        let (wait, started, recovery_count, analysis_count) = (
+            release.clone(),
+            began.clone(),
+            recoveries.clone(),
+            analyses.clone(),
+        );
+        let first = schedule_news_ai_tick(
+            &permits,
+            true,
+            MarketSession::Morning,
+            Some(vec![scheduling_batch()]),
+            move |limit| async move {
+                assert_eq!(limit, 2, "live work retains a bounded share");
+                recovery_count.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                wait.notified().await;
+                2
+            },
+            move |batches, used| async move {
+                assert_eq!(batches.len(), 1);
+                let mut budget = CandidateVisitBudget::with_worked(20, 0, used);
+                let mut worked = 0;
+                while budget.next_index().is_some() {
+                    worked += 1;
+                    budget.record_work(true);
+                }
+                assert_eq!(worked, 3, "total recovery plus live work is capped at five");
+                analysis_count.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        began.notified().await;
+        assert!(schedule_news_ai_tick(
+            &permits,
+            false,
+            MarketSession::Closed,
+            None,
+            |_| async { panic!("concurrent recovery must not execute") },
+            |_, _| async { panic!("concurrent analysis must not execute") },
+        )
+        .is_none());
+        release.notify_one();
+        first.await.unwrap();
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(analyses.load(Ordering::SeqCst), 1);
+        let next = schedule_news_ai_tick(
+            &permits,
+            false,
+            MarketSession::Closed,
+            None,
+            |_| async { 0 },
+            |_, _| async { panic!("no live admission") },
+        )
+        .expect("the worker releases its permit after both branches");
+        next.await.unwrap();
+    }
+
     #[test]
     fn br172_sixth_admitted_news_item_remains_eligible_after_five_seen_items() {
         let observed = chrono::Utc::now();
@@ -1151,7 +1364,8 @@ mod tests {
         assert!(!main.contains("governed delivery remains disabled"));
         assert!(!main.contains("immutable assessment shadow enabled"));
         assert!(main.contains("news_ai_producer.log_startup_banner()"));
-        assert!(main.contains("news_ai_producer.schedule_from_same_tick(&admitted)"));
+        // Scheduling behavior is exercised by br172_scheduler_* through the
+        // production scheduling seam, not by matching the spelling of a call.
         assert!(!main.contains("news_ai_shadow::spawn_from_same_tick(&admitted)"));
     }
 
@@ -1165,35 +1379,12 @@ mod tests {
         assert_eq!(status.scheduling, ProducerSchedulingCapability::Enabled);
         assert_eq!(
             status.candidate_execution(true),
-            CandidateExecution::DeliverAuditedAssessment
+            CandidateExecution::DeferAuditedAssessment
         );
         assert_eq!(
             status.candidate_execution(false),
             CandidateExecution::RejectNewAnalysisUnavailable
         );
-    }
-
-    #[test]
-    fn br172_empty_live_batch_does_not_bypass_persisted_pending_scan() {
-        let source = include_str!("news_ai_shadow.rs");
-        let runner = source
-            .split("async fn run_same_tick_batches(")
-            .nth(1)
-            .expect("same-tick runner")
-            .split("struct NewsAiCandidate")
-            .next()
-            .expect("same-tick runner boundary");
-        let durable_scan = runner
-            .find("load_pending_news_ai_recoveries")
-            .expect("independent durable pending scan");
-        let live_candidates = runner
-            .find("exact_candidates(&batches)")
-            .expect("live-batch candidates");
-
-        assert!(durable_scan < live_candidates);
-        assert!(!runner.contains(
-            "if candidates.is_empty() {\n        log::debug!(\"[NewsAI][BR-172] no exact source-bound equity target\");\n        return;"
-        ));
     }
 
     #[test]
@@ -1243,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn br172_producer_does_not_schedule_when_no_executable_capability_exists() {
+    fn br172_manual_recovery_still_schedules_without_model_or_delivery_capability() {
         let status = NewsAiRuntimeStatus::from_capabilities(
             NewAnalysisCapability::DisabledModelProviderUnavailable,
             GovernedDeliveryRecoveryCapability::DisabledAuditHealth {
@@ -1251,10 +1442,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            status.scheduling,
-            ProducerSchedulingCapability::DisabledNoExecutableCapability
-        );
+        assert_eq!(status.scheduling, ProducerSchedulingCapability::Enabled);
         assert_eq!(
             status.candidate_execution(true),
             CandidateExecution::DeferAuditedAssessment

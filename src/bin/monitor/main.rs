@@ -7907,6 +7907,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
     news_ai_producer.log_startup_banner();
+    news_ai_producer.schedule_tick(
+        selection_v2_enabled,
+        stock_analysis::calendar::current_session(),
+        None,
+    );
 
     let mut sm = SignalStateMachine::default();
 
@@ -7962,11 +7967,17 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     loop {
         if !NewsMonitor::should_run() {
+            news_ai_producer.schedule_tick(
+                selection_v2_enabled,
+                stock_analysis::calendar::current_session(),
+                None,
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
 
         let mut outer_tick = NewsOuterTickCoordinator::new(AnnouncementWatchReadiness::Pending);
+        let mut news_ai_batches = None;
 
         if announcement_watch_load.is_none() {
             announcement_watch_load = Some(tokio::task::spawn_blocking(
@@ -8112,27 +8123,25 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             // before BR-172 selection ingress, NewsAI and candidate/LLM work.
             if let Some(batch) = raw_batch {
                 let session = stock_analysis::calendar::current_session();
+                let admitted: Vec<
+                    stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
+                > = batch
+                    .attempts()
+                    .iter()
+                    .filter_map(|attempt| {
+                        let terminal = attempt.terminal();
+                        let records = terminal.records()?;
+                        let evidence = terminal.evidence()?;
+                        Some(
+                            stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
+                                records.to_vec(),
+                                evidence.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                news_ai_batches = Some(admitted);
                 if selection_v2_enabled && (session.is_trading() || session.is_auction()) {
-                    let admitted: Vec<
-                        stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
-                    > = batch
-                        .attempts()
-                        .iter()
-                        .filter_map(|attempt| {
-                            let terminal = attempt.terminal();
-                            let records = terminal.records()?;
-                            let evidence = terminal.evidence()?;
-                            Some(
-                                stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
-                                    records.to_vec(),
-                                    evidence.clone(),
-                                ),
-                            )
-                        })
-                        .collect();
-                    if !admitted.is_empty() {
-                        news_ai_producer.schedule_from_same_tick(&admitted);
-                    }
                     let titles: Vec<String> = batch
                         .attempts()
                         .iter()
@@ -8162,6 +8171,14 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 }
             }
         }
+
+        // One owner always recovers durable work, with optional same-tick live
+        // analysis. Missing batches/activation/market windows never hide recovery.
+        news_ai_producer.schedule_tick(
+            selection_v2_enabled,
+            stock_analysis::calendar::current_session(),
+            news_ai_batches.as_deref(),
+        );
 
         // BR-138: policy and critical flash have completed before watch
         // readiness is inspected. An unfinished task is retained for the next
