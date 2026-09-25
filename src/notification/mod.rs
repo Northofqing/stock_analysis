@@ -26,7 +26,7 @@ pub mod service;
 pub mod wechat;
 
 #[cfg(test)]
-mod send_report_tests;
+pub(crate) mod send_report_tests;
 
 pub use config::{NotificationChannel, NotificationConfig, SmtpConfig};
 pub use send_report::{NotificationAttempt, NotificationCompletion, NotificationSendReport};

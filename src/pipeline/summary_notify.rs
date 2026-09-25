@@ -1,6 +1,5 @@
 //! 汇总通知：生成图表 / 日报 Markdown / 保存 + 推送。
 
-use anyhow::Result;
 use log::{error, info};
 use std::path::Path;
 
@@ -8,7 +7,7 @@ use crate::chart_generator::ChartGenerator;
 use crate::notification::NotificationService;
 use crate::strategy::core::BacktestSummary;
 
-use super::{reporting, AnalysisResult};
+use super::{reporting, AnalysisNotification, AnalysisResult, SummaryCompletion};
 
 struct SummaryArtifacts {
     report: String,
@@ -49,7 +48,7 @@ pub(super) async fn send_summary_notification(
     backtest_summary: Option<&BacktestSummary>,
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
-) -> Result<()> {
+) -> SummaryCompletion {
     send_summary_notification_to(
         notifier,
         results,
@@ -68,7 +67,11 @@ pub(super) async fn send_summary_notification_to(
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
     output_dir: &Path,
-) -> Result<()> {
+) -> SummaryCompletion {
+    let mut outcome = SummaryCompletion {
+        notification: AnalysisNotification::NotAttempted,
+        ..Default::default()
+    };
     info!("生成分析汇总报告...");
 
     let date_str = chrono::Local::now().format("%Y%m%d").to_string();
@@ -97,37 +100,54 @@ pub(super) async fn send_summary_notification_to(
     );
 
     if let Some((backtest_report, backtest_filename)) = artifacts.backtest {
-        notifier.save_report_to_dir(&backtest_report, &backtest_filename, output_dir)?;
+        if let Err(error) =
+            notifier.save_report_to_dir(&backtest_report, &backtest_filename, output_dir)
+        {
+            outcome.failure = Some(error.to_string());
+            return outcome;
+        }
+        outcome
+            .saved_paths
+            .push(output_dir.join(&backtest_filename));
         info!(
             "✓ 多因子回测报告已保存到本地: reports/{}",
             backtest_filename
         );
     }
 
-    notifier.save_report_to_dir(&artifacts.report, &artifacts.filename, output_dir)?;
+    if let Err(error) =
+        notifier.save_report_to_dir(&artifacts.report, &artifacts.filename, output_dir)
+    {
+        outcome.failure = Some(error.to_string());
+        return outcome;
+    }
+    outcome
+        .saved_paths
+        .push(output_dir.join(&artifacts.filename));
 
     let delivery = notifier.send_report(&artifacts.report).await;
     match delivery.completion() {
         crate::notification::NotificationCompletion::AllAccepted => {
             info!("✓ 股票分析报告全部渠道弱接受")
         }
-        crate::notification::NotificationCompletion::Partial => info!(
-            "股票分析报告部分渠道弱接受: accepted={} unknown={}",
+        crate::notification::NotificationCompletion::Partial => error!(
+            "股票分析报告本轮不完整，部分渠道弱接受: accepted={} unknown={}",
             delivery.accepted_count(),
             delivery.unknown_count()
         ),
         crate::notification::NotificationCompletion::AllFailed => {
-            anyhow::bail!(
+            error!(
                 "股票分析报告所有 {} 个渠道均未确认成功",
                 delivery.attempts().len()
             );
         }
         crate::notification::NotificationCompletion::NoTargets => {
-            anyhow::bail!("股票分析报告没有可用通知渠道");
+            error!("股票分析报告没有可用通知渠道");
         }
     }
 
-    Ok(())
+    outcome.notification = AnalysisNotification::Attempted(delivery);
+    outcome
 }
 
 fn compose_summary_report(stock_report: String, chain_analysis_section: Option<&str>) -> String {
@@ -238,7 +258,7 @@ mod tests {
         let value = result();
         let summary = backtest();
 
-        let error = send_summary_notification_to(
+        let outcome = send_summary_notification_to(
             &notifier,
             &[value],
             Some(&summary),
@@ -246,9 +266,13 @@ mod tests {
             Some("TEST_CODE_产业链"),
             &output_dir,
         )
-        .await
-        .expect_err("disabled notifier must not masquerade as completed delivery");
-        assert!(error.to_string().contains("没有可用通知渠道"));
+        .await;
+        assert_eq!(
+            outcome.notification.completion(),
+            Some(crate::notification::NotificationCompletion::NoTargets)
+        );
+        assert!(outcome.notification.ensure_cli_success().is_err());
+        assert_eq!(outcome.saved_paths.len(), 2);
 
         let names = std::fs::read_dir(&output_dir)
             .expect("summary output directory")

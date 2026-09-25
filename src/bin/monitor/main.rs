@@ -9804,7 +9804,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                  checklist skipped before T+1 projection"
             );
 
-            prediction::verify_predictions().await;
+            let prediction_verification = prediction::verify_predictions().await;
+            if let Err(error) = prediction_verification {
+                log::warn!("[预测] 本轮未完成，继续盘前调度: {error}");
+            }
 
             match prediction::recent_hit_rate(7) {
                 Ok(hit_rate) => log::info!("[预测] 近7天命中率: {:.0}%", hit_rate * 100.0),

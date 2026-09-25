@@ -4104,9 +4104,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         hit: bool,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
-        if !actual_change.is_finite() || actual_change.abs() > 20.0 {
+        if !actual_change.is_finite() || actual_change < -100.0 {
             return Err(invalid_input(format!(
-                "actual_change 必须有限且绝对值不超过 20%: {actual_change}"
+                "actual_change 必须有限且不低于 -100%: {actual_change}"
             ))
             .into());
         }
@@ -4157,9 +4157,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             ))
             .into());
         }
-        if !actual_change.is_finite() || actual_change.abs() > 20.0 {
+        if !actual_change.is_finite() || actual_change < -100.0 {
             return Err(invalid_input(format!(
-                "actual_change 必须有限且绝对值不超过 20%: {actual_change}"
+                "actual_change 必须有限且不低于 -100%: {actual_change}"
             ))
             .into());
         }
@@ -4216,6 +4216,42 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         .bind::<diesel::sql_types::Text, _>(pred_date)
         .load::<PredictionRow>(&mut *conn)?;
         Ok(rows)
+    }
+
+    /// Freeze the scan's upper ID so concurrent inserts are deferred to the next run.
+    pub fn prediction_verification_high_water_id(
+        &self,
+    ) -> Result<i32, Box<dyn std::error::Error>> {
+        #[derive(QueryableByName)]
+        struct Id {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
+        }
+        let mut conn = self.get_conn()?;
+        Ok(diesel::sql_query("SELECT COALESCE(MAX(id),0) AS id FROM prediction_tracker")
+            .get_result::<Id>(&mut conn)?
+            .id)
+    }
+
+    /// Stable keyset over all due rows, not a lookback over prediction creation dates.
+    pub fn get_due_predictions_page(
+        &self,
+        as_of: &str,
+        after_id: i32,
+        high_water_id: i32,
+        limit: i64,
+    ) -> Result<Vec<PredictionRow>, Box<dyn std::error::Error>> {
+        validate_date_text("as_of", as_of).map_err(invalid_input)?;
+        if after_id < 0 || high_water_id < 0 || !(1..=1000).contains(&limit) {
+            return Err(invalid_input("invalid prediction page cursor/limit".into()).into());
+        }
+        let mut conn = self.get_conn()?;
+        Ok(diesel::sql_query("SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE target_date <= ?1 AND hit IS NULL AND id > ?2 AND id <= ?3 ORDER BY id ASC LIMIT ?4")
+            .bind::<diesel::sql_types::Text, _>(as_of)
+            .bind::<diesel::sql_types::Integer, _>(after_id)
+            .bind::<diesel::sql_types::Integer, _>(high_water_id)
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .load::<PredictionRow>(&mut conn)?)
     }
 
     /// BR-232: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
@@ -5712,7 +5748,7 @@ mod tests {
             )
             .is_err());
         assert!(db
-            .update_prediction_result(&today, Some(&code), 20.01, true)
+            .update_prediction_result(&today, Some(&code), f64::INFINITY, true)
             .is_err());
         assert!(db.get_pending_predictions("x' OR 1=1 --").is_err());
         assert!(db.count_recent_pushes(&code, 0).is_err());

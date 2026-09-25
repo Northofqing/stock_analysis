@@ -1098,20 +1098,25 @@ impl AnalysisPipeline {
         &self,
         code: String,
         macro_context: Arc<str>,
-    ) -> Option<AnalysisResult> {
+    ) -> super::StockAnalysisOutcome {
         let start = std::time::Instant::now();
         info!("========== [{}] 开始处理 ==========", code);
 
         // 整体超时保护：单只股票最多处理 120 秒，避免任何环节卡死拖垮全局
+        let mut outcome = super::StockAnalysisOutcome::new(
+            code.clone(),
+            self.config.single_notify && self.config.send_notification && !self.config.dry_run,
+        );
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            self.process_stock_inner(code.clone(), macro_context),
+            self.process_stock_inner(code.clone(), macro_context, &mut outcome),
         )
         .await
         {
             Ok(r) => r,
             Err(_) => {
                 error!("[{}] 处理超时（120s），跳过", code);
+                outcome.failure = Some("处理超时；保留已观察到的保存/通知状态".into());
                 None
             }
         };
@@ -1119,7 +1124,7 @@ impl AnalysisPipeline {
         let elapsed = start.elapsed();
         match &result {
             Some(r) => info!(
-                "[{}] ✓ 处理完成 ({:.1}s)：{} 评分 {}",
+                "[{}] 分析已保存 ({:.1}s)：{} 评分 {}；通知状态见独立报告",
                 code,
                 elapsed.as_secs_f32(),
                 r.operation_advice,
@@ -1131,13 +1136,17 @@ impl AnalysisPipeline {
                 elapsed.as_secs_f32()
             ),
         }
-        result
+        if result.is_none() && outcome.failure.is_none() && !self.config.dry_run {
+            outcome.failure = Some("获取、分析或持仓跟踪未完成；见本股错误日志".into());
+        }
+        outcome
     }
 
     async fn process_stock_inner(
         &self,
         code: String,
         macro_context: Arc<str>,
+        outcome: &mut super::StockAnalysisOutcome,
     ) -> Option<AnalysisResult> {
         // 1. 获取数据
         #[cfg(test)]
@@ -1151,12 +1160,14 @@ impl AnalysisPipeline {
             Ok(d) => d,
             Err(e) => {
                 error!("[{}] 获取数据失败: {}", code, e);
+                outcome.failure = Some(format!("获取数据失败: {e}"));
                 return None;
             }
         };
 
         if data.is_empty() {
             warn!("[{}] 数据为空，跳过分析", code);
+            outcome.failure = Some("数据为空，未完成请求".into());
             return None;
         }
 
@@ -1179,6 +1190,7 @@ impl AnalysisPipeline {
             Ok(r) => r,
             Err(e) => {
                 error!("[{}] 分析失败: {}", code, e);
+                outcome.failure = Some(format!("分析失败: {e}"));
                 return None;
             }
         };
@@ -1243,28 +1255,33 @@ impl AnalysisPipeline {
         }
 
         // 5. 保存分析结果到数据库
+        outcome.analysis = Some(result.clone());
         if let Err(error) = position_tracker::save_analysis_result(&code, &data, &result) {
             error!("[{}] BR-124 分析结果保存失败: {}", code, error);
+            outcome.saved = super::AnalysisSaveStatus::Failed(error.to_string());
             return None;
         }
+        outcome.saved = super::AnalysisSaveStatus::Saved;
 
         // 6. 单股推送（如果启用）
         if self.config.single_notify && self.config.send_notification {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
+            outcome.notification =
+                super::AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
             let delivery = self.notifier.send_report(&report).await;
             match delivery.completion() {
                 crate::notification::NotificationCompletion::AllAccepted => {
                     info!("[{}] 单股推送全部渠道弱接受", code_clone)
                 }
                 crate::notification::NotificationCompletion::Partial => error!(
-                    "[{}] 单股推送部分成功: accepted={} unknown={}",
+                    "[{}] 单股推送本轮不完整，部分渠道弱接受: accepted={} unknown={}",
                     code_clone,
                     delivery.accepted_count(),
                     delivery.unknown_count()
                 ),
                 crate::notification::NotificationCompletion::AllFailed => error!(
-                    "[{}] 单股推送全部失败: targets={}",
+                    "[{}] 单股推送未获任何渠道弱接受（结果未知）: targets={}",
                     code_clone,
                     delivery.attempts().len()
                 ),
@@ -1272,6 +1289,7 @@ impl AnalysisPipeline {
                     error!("[{}] 单股推送失败: 未配置可用渠道", code_clone)
                 }
             }
+            outcome.notification = super::AnalysisNotification::Attempted(delivery);
         }
 
         Some(result)
@@ -2061,6 +2079,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task2_single_stock_save_failure_does_not_attempt_notification() {
+        crate::database::DatabaseManager::init(None).unwrap();
+        let db = crate::database::DatabaseManager::get();
+        diesel::sql_query("CREATE TRIGGER task2_reject_analysis BEFORE INSERT ON analysis_result WHEN NEW.code = 'TEST_CODE_TASK2_SAVE_FAIL' BEGIN SELECT RAISE(ABORT, 'injected analysis persistence failure'); END")
+            .execute(&mut db.get_conn().unwrap()).unwrap();
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.config.single_notify = true;
+        pipeline.config.send_notification = true;
+        let outcome = pipeline
+            .process_stock("TEST_CODE_TASK2_SAVE_FAIL".into(), Arc::from(""))
+            .await;
+        diesel::sql_query("DROP TRIGGER task2_reject_analysis")
+            .execute(&mut db.get_conn().unwrap())
+            .unwrap();
+        assert!(matches!(
+            outcome.saved,
+            crate::pipeline::AnalysisSaveStatus::Failed(_)
+        ));
+        assert!(matches!(
+            outcome.notification,
+            crate::pipeline::AnalysisNotification::NotAttempted
+        ));
+        assert!(outcome.analysis.is_some());
+        assert!(outcome.ensure_cli_success().is_err());
+    }
+
+    #[tokio::test]
+    async fn task2_single_stock_channel_observations_reach_cli_policy() {
+        use crate::notification::send_report_tests::{
+            spawn_webhook_fixture, test_service, ScriptedResponse,
+        };
+        use crate::notification::{
+            NotificationChannel, NotificationCompletion, NotificationConfig,
+        };
+        crate::database::DatabaseManager::init(None).unwrap();
+        for (responses, expected, cli_ok) in [
+            (vec![false], NotificationCompletion::AllFailed, false),
+            (vec![true, false], NotificationCompletion::Partial, true),
+            (vec![true, true], NotificationCompletion::AllAccepted, true),
+        ] {
+            let fixtures: Vec<_> = responses
+                .iter()
+                .map(|accepted| {
+                    spawn_webhook_fixture(vec![ScriptedResponse::Http(if *accepted {
+                        r#"{"ok":true}"#
+                    } else {
+                        r#"{"ok":false}"#
+                    })])
+                })
+                .collect();
+            let context = resolved_context(
+                Ok(super::extra_context::ExtraContext {
+                    section: None,
+                    money_flow: None,
+                }),
+                Ok(None),
+            );
+            let mut pipeline = test_pipeline(context, false);
+            pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+            pipeline.config.single_notify = true;
+            pipeline.config.send_notification = true;
+            pipeline.notifier = Arc::new(test_service(
+                NotificationConfig {
+                    custom_webhook_urls: fixtures.iter().map(|f| f.url()).collect(),
+                    ..Default::default()
+                },
+                vec![NotificationChannel::Custom],
+            ));
+            let outcome = pipeline
+                .process_stock(format!("TEST_CODE_TASK2_{expected:?}"), Arc::from(""))
+                .await;
+            assert_eq!(outcome.saved, crate::pipeline::AnalysisSaveStatus::Saved);
+            assert!(outcome.analysis.is_some());
+            assert_eq!(outcome.notification.completion(), Some(expected));
+            assert_eq!(outcome.ensure_cli_success().is_ok(), cli_ok);
+            let run = crate::pipeline::AnalysisRunReport {
+                results: vec![outcome.analysis.clone().unwrap()],
+                stocks: vec![outcome],
+                ..Default::default()
+            };
+            assert_eq!(run.ensure_cli_success().is_ok(), cli_ok);
+            assert_eq!(
+                run.is_complete(),
+                expected == NotificationCompletion::AllAccepted
+            );
+            for fixture in fixtures {
+                assert_eq!(fixture.finish().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task2_single_stock_no_targets_and_opt_out_are_distinct() {
+        crate::database::DatabaseManager::init(None).expect("private test DB");
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.config.single_notify = true;
+        pipeline.config.send_notification = true;
+        let outcome = pipeline
+            .process_stock("TEST_CODE_TASK2_NOTIFICATION".into(), Arc::from(""))
+            .await;
+        assert_eq!(outcome.saved, crate::pipeline::AnalysisSaveStatus::Saved);
+        assert_eq!(
+            outcome.notification.completion(),
+            Some(crate::notification::NotificationCompletion::NoTargets)
+        );
+        assert!(outcome.ensure_cli_success().is_err());
+        assert!(outcome.analysis.is_some());
+        pipeline.config.send_notification = false;
+        let outcome = pipeline
+            .process_stock("TEST_CODE_TASK2_NOTIFICATION".into(), Arc::from(""))
+            .await;
+        assert!(matches!(
+            outcome.notification,
+            crate::pipeline::AnalysisNotification::NotRequested
+        ));
+        assert!(outcome.ensure_cli_success().is_ok());
+    }
+
+    #[tokio::test]
     async fn process_stock_uses_isolated_fetched_batch_and_covers_failure_gates() {
         crate::database::DatabaseManager::init(None).expect("BR-124 test database init");
         let context = resolved_context(
@@ -2077,29 +2230,33 @@ mod tests {
         let result = pipeline
             .process_stock("TEST_CODE_000001".to_string(), Arc::from(""))
             .await
+            .analysis
             .expect("isolated process result");
         assert_eq!(result.code, "TEST_CODE_000001");
 
         let mut fetch_failure = test_pipeline(context.clone(), false);
         fetch_failure.test_fetched_data = Some(Err("TEST_CODE_日线源失败".to_string()));
         assert!(fetch_failure
-            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
             .await
+            .analysis
             .is_none());
 
         let mut empty = test_pipeline(context.clone(), false);
         empty.test_fetched_data = Some(Ok(Vec::new()));
         assert!(empty
-            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
             .await
+            .analysis
             .is_none());
 
         let mut dry_run = test_pipeline(context.clone(), false);
         dry_run.test_fetched_data = Some(Ok(analysis_bars()));
         dry_run.config.dry_run = true;
         assert!(dry_run
-            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
             .await
+            .analysis
             .is_none());
 
         let mut analysis_failure = test_pipeline(
@@ -2110,6 +2267,7 @@ mod tests {
         assert!(analysis_failure
             .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
             .await
+            .analysis
             .is_none());
     }
 
@@ -2180,6 +2338,13 @@ mod tests {
             )
             .await
             .expect("resolved full pipeline run");
+        assert!(!results.is_complete());
+        assert!(results.ensure_cli_success().is_err());
+        assert_eq!(
+            results.summary.notification.completion(),
+            Some(crate::notification::NotificationCompletion::NoTargets)
+        );
+        let results = results.results;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].code, code);
         assert_eq!(

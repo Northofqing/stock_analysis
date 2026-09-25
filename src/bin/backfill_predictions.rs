@@ -1,90 +1,23 @@
-//! 一次性回填历史 prediction 的 actual_change 和 hit
-//!
-//! 用法:
-//!   cargo run --bin backfill_predictions -- 14
-//!   cargo run --bin backfill_predictions -- 30
-//!
-//! 实现: 循环过去 N 天的每个日期, 把 prediction_tracker 中 hit IS NULL 的行,
-//!       按每条记录已冻结的 target_date 重跑 verify 逻辑。
-//!       核心 verify 计算复用 `monitor::prediction::verify_one`, 与生产盘后回填保持一致。
-//!
-//! 配合 `tools/one_shot/backfill_predictions.sh` 使用。
+//! Backfill all due, pending prediction rows using their frozen target dates.
+//! `STOCK_DB` selects the database. The former positional lookback is deprecated.
+use stock_analysis::{database::DatabaseManager, monitor::prediction};
 
-use chrono::{Duration, Local};
-use std::env;
-use stock_analysis::database::DatabaseManager;
-use stock_analysis::monitor::prediction;
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let days: i64 = env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
-
-    let db_path = env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
-    let _ = DatabaseManager::init(db_path);
-
-    let db = DatabaseManager::get();
-    let today = Local::now().date_naive();
-
-    let mut total = 0usize;
-    let mut hit_count = 0usize;
-
-    for offset in 1..=days {
-        let pred_date = today - Duration::days(offset);
-        let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
-
-        let pending = db.get_pending_predictions(&pred_date_s)?;
-        if pending.is_empty() {
-            continue;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(days) = std::env::args().nth(1) {
+        if days.parse::<u32>().ok().filter(|days| *days > 0).is_none() {
+            return Err("旧 days 参数必须是正整数；新语义始终扫描所有到期 pending 行".into());
         }
-
-        println!(
-            "[backfill] {}: {} 条 pending（逐行使用冻结 target_date）",
-            pred_date_s,
-            pending.len()
-        );
-
-        for pred in pending {
-            let Some(code) = pred.stock_code.as_deref() else {
-                continue;
-            };
-            if code.is_empty() {
-                continue;
-            }
-
-            // 复用共享 verify 逻辑 (与生产盘后回填 verify_predictions 完全一致)
-            let Some(outcome) = prediction::verify_one(
-                db,
-                code,
-                &pred_date_s,
-                &pred.target_date,
-                &pred.pred_direction,
-            )
-            .await
-            else {
-                continue;
-            };
-
-            db.update_prediction_result_by_id(pred.id, outcome.actual_change, outcome.hit)?;
-            total += 1;
-            if outcome.hit {
-                hit_count += 1;
-            }
-        }
+        eprintln!("[backfill] days={days} 已弃用：本次扫描所有 target_date <= today 的 pending 行，不受 7/14 日窗口限制");
     }
-
-    println!(
-        "[backfill] 完成: {} 条已 verify, 命中 {} 条 ({:.0}%)",
-        total,
-        hit_count,
-        if total > 0 {
-            hit_count as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        }
-    );
-
+    let path = std::env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
+    DatabaseManager::init(path)?;
+    let report = prediction::verify_due_predictions(
+        DatabaseManager::get(),
+        chrono::Local::now().date_naive(),
+    )?;
+    println!("[backfill] 到期验证: {report:?}");
+    if !report.errors.is_empty() {
+        return Err("部分预测验证失败；已完成行不回滚，错误行保持 pending".into());
+    }
     Ok(())
 }

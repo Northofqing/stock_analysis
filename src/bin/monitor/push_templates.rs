@@ -10446,24 +10446,13 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
             Ok(target_date) => {
                 let prediction_date = date.to_owned();
                 let target_date = target_date.format("%Y-%m-%d").to_string();
-                let _ = tokio::task::spawn_blocking(move || {
-                    use stock_analysis::database::DatabaseManager;
-                    let db = DatabaseManager::get();
-                    for (code, score) in strong_samples {
-                        let _ = db.save_prediction(
-                            &prediction_date,
-                            &target_date,
-                            None,
-                            Some(&code),
-                            "up",
-                            score,
-                            Some("candidate-strong"),
-                            None,
-                            None,
-                        );
-                    }
-                })
+                let persistence = stock_analysis::monitor::prediction::persist_candidate_samples(
+                    prediction_date,
+                    target_date,
+                    strong_samples,
+                )
                 .await;
+                persistence.log();
             }
             Err(error) => log::warn!(
                 "[BR-232] 候选样本未保存：预测日或权威交易日历不可用 date={} error={}",
@@ -11847,52 +11836,6 @@ async fn dispatch_r12_backtest_after_capability(
     crate::review_batch::ReviewTaskOutcome::from_push_outcome(outcome, 1)
 }
 
-/// BR-232: 候选/预测样本 5 日收益回填 (SignalTracker 闭环)。
-/// 对近 days 天的 pending prediction 用日线收盘价验证 (复用 backfill_predictions 逻辑)。
-async fn backfill_pending_predictions(days: i64) -> (usize, usize) {
-    use chrono::Duration;
-    let today = chrono::Local::now().date_naive();
-    let mut total = 0usize;
-    let mut hit_count = 0usize;
-    for offset in 1..=days {
-        let pred_date = today - Duration::days(offset);
-        let pred_date_s = pred_date.format("%Y-%m-%d").to_string();
-        let db = stock_analysis::database::DatabaseManager::get();
-        let Ok(pending) = db.get_pending_predictions(&pred_date_s) else {
-            continue;
-        };
-        for pred in pending {
-            let Some(code) = pred.stock_code.as_deref() else {
-                continue;
-            };
-            if code.is_empty() {
-                continue;
-            }
-            let Some(outcome) = stock_analysis::monitor::prediction::verify_one(
-                db,
-                code,
-                &pred_date_s,
-                &pred.target_date,
-                &pred.pred_direction,
-            )
-            .await
-            else {
-                continue;
-            };
-            if db
-                .update_prediction_result_by_id(pred.id, outcome.actual_change, outcome.hit)
-                .is_ok()
-            {
-                total += 1;
-                if outcome.hit {
-                    hit_count += 1;
-                }
-            }
-        }
-    }
-    (total, hit_count)
-}
-
 /// R-13 counted durable delivery — task binding + InternalDurable 证据。
 ///
 /// 决策身份由 (business_date, task_identity, 稳定投影, 渲染哈希) 推导:
@@ -12346,9 +12289,9 @@ pub async fn dispatch_post_session_review(
         );
     } else {
         // BR-232: SignalTracker 样本回填 (5 日收益验证, 每日复盘时执行)
-        let (backfilled_total, backfilled_hits) = backfill_pending_predictions(14).await;
-        if backfilled_total > 0 {
-            log::info!("[BR-232] 预测样本回填 verified={backfilled_total} hits={backfilled_hits}");
+        match stock_analysis::monitor::prediction::verify_predictions().await {
+            Ok(report) => log::info!("[BR-232] 预测样本回填: {:?}", report),
+            Err(error) => log::error!("[BR-232] 预测样本回填失败: {error}"),
         }
 
         // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)

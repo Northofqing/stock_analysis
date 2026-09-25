@@ -257,7 +257,12 @@ fn reload_env() {
 async fn execute_analysis(stock_codes: &[String], config: &PipelineConfig) {
     match AnalysisPipeline::new(config.clone()) {
         Ok(pipeline) => match pipeline.run(stock_codes, None).await {
-            Ok(results) => {
+            Ok(outcome) => {
+                outcome.log_completion();
+                if let Err(error) = outcome.ensure_cli_success() {
+                    error!("本轮分析未完成，保留调度继续下一轮: {}", error);
+                }
+                let results = outcome.results;
                 info!("分析完成，成功 {} 只股票", results.len());
                 if !results.is_empty() {
                     let mut sorted = results.clone();

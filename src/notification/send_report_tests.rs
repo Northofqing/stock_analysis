@@ -12,7 +12,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-enum ScriptedResponse {
+pub(crate) enum ScriptedResponse {
     Http(&'static str),
     Disconnect,
 }
@@ -20,7 +20,7 @@ enum ScriptedResponse {
 const FIXTURE_LIFETIME: Duration = Duration::from_secs(8);
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-struct WebhookFixture {
+pub(crate) struct WebhookFixture {
     url: String,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
@@ -28,7 +28,7 @@ struct WebhookFixture {
 }
 
 impl WebhookFixture {
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         self.url.clone()
     }
 
@@ -36,7 +36,7 @@ impl WebhookFixture {
         self.requests.lock().expect("fixture requests").clone()
     }
 
-    fn finish(mut self) -> Vec<Vec<u8>> {
+    pub(crate) fn finish(mut self) -> Vec<Vec<u8>> {
         let result = self
             .handle
             .take()
@@ -59,7 +59,7 @@ impl Drop for WebhookFixture {
     }
 }
 
-fn spawn_webhook_fixture(responses: Vec<ScriptedResponse>) -> WebhookFixture {
+pub(crate) fn spawn_webhook_fixture(responses: Vec<ScriptedResponse>) -> WebhookFixture {
     spawn_webhook_fixture_with_lifetime(responses, FIXTURE_LIFETIME)
 }
 
@@ -202,7 +202,7 @@ fn parse_content_length(headers: &[u8]) -> Result<usize, String> {
     Ok(0)
 }
 
-fn test_service(
+pub(crate) fn test_service(
     config: NotificationConfig,
     available_channels: Vec<NotificationChannel>,
 ) -> NotificationService {

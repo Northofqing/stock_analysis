@@ -6,6 +6,11 @@
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 子模块改 pub(super) 让 analyze.rs 等兄弟文件能 super::xxx 访问
 mod backtest_runner;
+mod completion;
+pub use completion::{
+    AnalysisNotification, AnalysisRunReport, AnalysisSaveStatus, StockAnalysisOutcome,
+    SummaryCompletion,
+};
 pub mod chain_analysis;
 pub(super) mod extra_context;
 mod macro_news;
@@ -506,10 +511,10 @@ impl AnalysisPipeline {
         &self,
         stock_codes: &[String],
         prefetched_macro: Option<String>,
-    ) -> Result<Vec<AnalysisResult>> {
+    ) -> Result<AnalysisRunReport> {
         if stock_codes.is_empty() {
             warn!("股票列表为空");
-            return Ok(Vec::new());
+            return Ok(AnalysisRunReport::default());
         }
 
         info!("===== 开始分析 {} 只股票 =====", stock_codes.len());
@@ -539,12 +544,16 @@ impl AnalysisPipeline {
             stock_codes.len(),
             stock_codes
         );
-        let mut results: Vec<AnalysisResult> = stream::iter(stock_codes.iter())
+        let stocks: Vec<StockAnalysisOutcome> = stream::iter(stock_codes.iter())
             .map(|code| self.process_stock(code.clone(), macro_context.clone()))
             .buffer_unordered(self.config.max_workers)
-            .filter_map(|result| async { result })
             .collect()
             .await;
+        let mut results: Vec<AnalysisResult> = stocks
+            .iter()
+            .filter(|s| s.saved == AnalysisSaveStatus::Saved)
+            .filter_map(|s| s.analysis.clone())
+            .collect();
 
         let elapsed = start.elapsed();
         let success = results.len();
@@ -632,6 +641,7 @@ impl AnalysisPipeline {
             }
         }
 
+        let mut summary = SummaryCompletion::default();
         // 发送汇总通知
         if !results.is_empty()
             && self.config.send_notification
@@ -640,7 +650,7 @@ impl AnalysisPipeline {
         {
             #[cfg(test)]
             if let Some(context) = self.test_summary_context.as_ref() {
-                summary_notify::send_summary_notification_to(
+                summary = summary_notify::send_summary_notification_to(
                     &self.notifier,
                     &results,
                     backtest_summary.as_ref(),
@@ -648,24 +658,42 @@ impl AnalysisPipeline {
                     context.chain_section.as_deref(),
                     &context.output_dir,
                 )
-                .await?;
+                .await;
             } else {
-                self.send_live_summary(&mut results, backtest_summary.as_ref())
-                    .await?;
+                summary = self
+                    .send_live_summary(&mut results, backtest_summary.as_ref())
+                    .await
+                    .unwrap_or_else(|error| SummaryCompletion {
+                        notification: AnalysisNotification::NotAttempted,
+                        failure: Some(error.to_string()),
+                        ..Default::default()
+                    });
             }
             #[cfg(not(test))]
-            self.send_live_summary(&mut results, backtest_summary.as_ref())
-                .await?;
+            {
+                summary = self
+                    .send_live_summary(&mut results, backtest_summary.as_ref())
+                    .await
+                    .unwrap_or_else(|error| SummaryCompletion {
+                        notification: AnalysisNotification::NotAttempted,
+                        failure: Some(error.to_string()),
+                        ..Default::default()
+                    });
+            }
         }
 
-        Ok(results)
+        Ok(AnalysisRunReport {
+            results,
+            stocks,
+            summary,
+        })
     }
 
     async fn send_live_summary(
         &self,
         results: &mut [AnalysisResult],
         backtest_summary: Option<&crate::strategy::core::BacktestSummary>,
-    ) -> Result<()> {
+    ) -> Result<SummaryCompletion> {
         // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
         // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
         let chain_section = {
@@ -720,15 +748,14 @@ impl AnalysisPipeline {
         let regime_section = market_regime::apply(results)
             .await
             .map_err(anyhow::Error::msg)?;
-        summary_notify::send_summary_notification(
+        Ok(summary_notify::send_summary_notification(
             &self.notifier,
             results,
             backtest_summary,
             regime_section.as_deref(),
             chain_section.as_deref(),
         )
-        .await?;
-        Ok(())
+        .await)
     }
 
     /// 生成单股报告
@@ -870,6 +897,7 @@ mod tests {
             .run(&[], Some("TEST_CODE_宏观证据".to_string()))
             .await
             .expect("empty run")
+            .results
             .is_empty());
 
         pipeline.test_fetched_data = Some(Ok(vec![kline()]));
@@ -880,7 +908,7 @@ mod tests {
             )
             .await
             .expect("dry run");
-        assert!(results.is_empty());
+        assert!(results.results.is_empty());
 
         let report = pipeline.generate_single_report(&result());
         assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));

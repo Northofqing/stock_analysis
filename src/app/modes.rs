@@ -56,7 +56,10 @@ pub async fn run_analysis(
     } else {
         Some(macro_context.to_string())
     };
-    let results = pipeline.run(stock_codes, mc).await?;
+    let outcome = pipeline.run(stock_codes, mc).await?;
+    outcome.log_completion();
+    let completion = outcome.ensure_cli_success();
+    let results = outcome.results;
 
     if !results.is_empty() {
         info!(
@@ -77,7 +80,7 @@ pub async fn run_analysis(
         }
     }
 
-    Ok(())
+    completion
 }
 
 pub async fn run_market_review_only() -> Result<()> {
@@ -328,7 +331,10 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
         dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
     let pipeline = AnalysisPipeline::new(config)?;
-    let results = pipeline.run(&stock_codes, None).await?;
+    let outcome = pipeline.run(&stock_codes, None).await?;
+    outcome.log_completion();
+    let completion = outcome.ensure_cli_success();
+    let results = outcome.results;
 
     info!("\n===== 龙虎榜选股分析结果 =====");
     if !results.is_empty() {
@@ -362,5 +368,5 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
         }
     }
     info!("\n龙虎榜选股分析完成");
-    Ok(())
+    completion
 }
