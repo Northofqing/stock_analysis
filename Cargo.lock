@@ -4815,6 +4815,7 @@ dependencies = [
  "futures",
  "hex",
  "http-body 1.0.1",
+ "hyper-util",
  "lazy_static",
  "lettre",
  "log",

@@ -947,8 +947,14 @@ fn external_query_method(operation: Operation) -> Result<ExternalMethod, Gateway
 pub(crate) fn require_external_health_qualified(
     response: &ExternalHealthResponse,
 ) -> Result<(), GatewayError> {
+    crate::grpc_client::build_identity::qualify_public_health(response)
+        .map_err(map_external_build_identity_error)
+}
+
+pub(crate) fn map_external_build_identity_error(
+    error: crate::grpc_client::build_identity::BuildIdentityError,
+) -> GatewayError {
     use crate::grpc_client::build_identity::BuildIdentityError;
-    crate::grpc_client::build_identity::qualify_public_health(response).map_err(|error| {
         let (outcome, reason_code, retryable) = match error {
             BuildIdentityError::NotReady => ("unavailable", "external_health_not_ready", true),
             BuildIdentityError::ExpectedIdentityUnavailable => {
@@ -969,7 +975,6 @@ pub(crate) fn require_external_health_qualified(
             retryable,
             message,
         )
-    })
 }
 
 /// Historical V1 control-row interpretation only. It preserves the outcome

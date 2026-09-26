@@ -179,9 +179,9 @@ enum ExternalControlTarget {
 }
 
 impl ExternalControlTarget {
-    async fn connect(self) -> Result<GrpcMarketClient, GrpcError> {
+    async fn connect(self, generation: crate::grpc_client::connection_qualification::ConnectionGeneration) -> Result<GrpcMarketClient, GrpcError> {
         match self {
-            Self::Prepared(prepared) => prepared.connect_once().await,
+            Self::Prepared(prepared) => prepared.connect_generation(generation).await,
             Self::Connected(client) => Ok(client),
         }
     }
@@ -190,6 +190,7 @@ impl ExternalControlTarget {
 pub(crate) struct AuthorizedHealthAttempt {
     core: ExternalControlRequestCore<HealthRequest>,
     target: ExternalControlTarget,
+    generation: crate::grpc_client::connection_qualification::ConnectionGeneration,
 }
 
 pub(crate) struct AuthorizedCapabilitiesAttempt {
@@ -201,6 +202,7 @@ pub(crate) struct ExternalControlCompletion<T> {
     material: OwnedExternalControlMaterial<T>,
     processed: Result<(), GrpcError>,
     connected: Option<GrpcMarketClient>,
+    connection_identity: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
 }
 
 enum OwnedExternalControlMaterial<T> {
@@ -237,6 +239,7 @@ impl AuthorizedHealthAttempt {
         let core = ExternalControlRequestCore::new(&prepared)?;
         Ok(Self {
             core,
+            generation: prepared.plan_connection_generation(),
             target: ExternalControlTarget::Prepared(prepared),
         })
     }
@@ -248,6 +251,7 @@ impl AuthorizedHealthAttempt {
         let core = ExternalControlRequestCore::resume(&prepared, material)?;
         Ok(Self {
             core,
+            generation: prepared.plan_connection_generation(),
             target: ExternalControlTarget::Prepared(prepared),
         })
     }
@@ -265,28 +269,36 @@ impl AuthorizedHealthAttempt {
     }
 
     pub(crate) async fn execute(self) -> ExternalControlCompletion<HealthResponse> {
-        let mut client = match self.target.connect().await {
+        let identity = self.generation.identity();
+        let mut client = match self.target.connect(self.generation).await {
             Ok(client) => client,
             Err(error) => {
-                return ExternalControlCompletion::connect_unavailable(error);
+                return ExternalControlCompletion::connect_unavailable(error).bind_identity(identity);
             }
         };
         let (request_id, request) = self.core.into_request();
-        match client.execute_external_health(request).await {
+        let completion = match client.execute_external_health(request).await {
             ExternalSystemCall::Response(response) => {
                 let bytes = response.encode_to_vec();
-                let processed = validate_health_response_id(&request_id, &response);
+                let processed = validate_health_response_id(&request_id, &response)
+                    .and_then(|()| client.observe_external_health(&request_id, &response));
                 let connected = processed.is_ok().then_some(client);
                 ExternalControlCompletion {
                     material: OwnedExternalControlMaterial::Response { bytes, response },
                     processed,
                     connected,
+                    connection_identity: None,
                 }
             }
             ExternalSystemCall::UnaryStatus(status) => {
                 ExternalControlCompletion::status(status, &request_id)
             }
-        }
+        };
+        completion.bind_identity(identity)
+    }
+
+    pub(crate) fn connection_identity(&self) -> crate::grpc_client::connection_qualification::ConnectionIdentity {
+        self.generation.identity()
     }
 }
 
@@ -331,42 +343,53 @@ impl AuthorizedCapabilitiesAttempt {
         {
             return Err(request_mismatch());
         }
+        client.require_external_qualification()?;
         self.target = ExternalControlTarget::Connected(client);
         Ok(self)
     }
 
-    pub(crate) async fn execute(self) -> ExternalControlCompletion<CapabilitiesResponse> {
-        let mut client = match self.target.connect().await {
-            Ok(client) => client,
-            Err(error) => {
-                return ExternalControlCompletion::connect_unavailable(error);
-            }
+    pub(crate) async fn execute(self) -> Result<ExternalControlCompletion<CapabilitiesResponse>, GrpcError> {
+        let mut client = match self.target {
+            ExternalControlTarget::Connected(client) => client,
+            ExternalControlTarget::Prepared(_) => return Err(crate::grpc_client::connection_qualification::unqualified()),
         };
+        client.require_external_qualification()?;
+        let identity = client.external_connection_identity()?;
         let (request_id, request) = self.core.into_request();
         match client.execute_external_capabilities(request).await {
             ExternalSystemCall::Response(response) => {
                 let bytes = response.encode_to_vec();
                 let processed = client.accept_external_capabilities(&request_id, &response);
                 let connected = processed.is_ok().then_some(client);
-                ExternalControlCompletion {
+                Ok(ExternalControlCompletion {
                     material: OwnedExternalControlMaterial::Response { bytes, response },
                     processed,
                     connected,
-                }
+                    connection_identity: Some(identity),
+                })
             }
             ExternalSystemCall::UnaryStatus(status) => {
-                ExternalControlCompletion::status(status, &request_id)
+                Ok(ExternalControlCompletion::status(status, &request_id).bind_identity(identity))
             }
         }
     }
 }
 
 impl<T> ExternalControlCompletion<T> {
+    fn bind_identity(mut self, identity: crate::grpc_client::connection_qualification::ConnectionIdentity) -> Self {
+        self.connection_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn connection_identity(&self) -> Option<&crate::grpc_client::connection_qualification::ConnectionIdentity> {
+        self.connection_identity.as_ref()
+    }
     fn connect_unavailable(error: GrpcError) -> Self {
         Self {
             material: OwnedExternalControlMaterial::ConnectUnavailable,
             processed: Err(error),
             connected: None,
+            connection_identity: None,
         }
     }
 
@@ -383,6 +406,7 @@ impl<T> ExternalControlCompletion<T> {
                 StatusErrorContext::control(ContractProfile::ExternalV1, request_id),
             )),
             connected: None,
+            connection_identity: None,
         }
     }
 

@@ -401,6 +401,8 @@ pub(super) struct ConfirmedExternalBaseline {
     pub(super) intent: crate::monitor::push_job::IntentId,
 }
 
+/// Frozen layout11 history generator only. Production recovery must use the
+/// layout15 journaled owner, never this test-only legacy append path.
 pub(super) async fn establish_confirmed_external_first_source(
     business: &mut V2BusinessFixture,
     parent_server: &mut Option<BoardLoopbackServer>,
@@ -888,34 +890,30 @@ pub(super) async fn establish_confirmed_external_first_source(
         )
         .unwrap();
     let resume_head = local.inspect_run(&intent).unwrap().head_version();
-    let changed_search_service =
-        crate::search_service::SearchService::from_untyped_general_web_provider_for_test(
-            GeneralWebResearchProvider::Bocha,
-        );
-    let mut io = local
-        .macro_preparation_io_v11(
-            lease,
-            &reopened_queries,
-            &reopened_clock,
-            FixedClusterConfiguration::resolve(Some("2")),
-            &reopened_parent_source,
-            &reopened_macro_source,
-            &changed_search_service,
-        )
-        .unwrap();
-    let mut prepared = Box::pin(prepare_chain_analysis_with_io(
-        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
-        stocks,
-        None,
-        &mut io,
-    ));
+    // A genuine new transport still requires its own explicit Health. Only
+    // the historical fixture append omits a v15 receipt; no production driver
+    // can enter this function or use old Ready as transport authority.
+    let transport = crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(
+        external.bundle_path(),
+    ).unwrap();
+    external.release_health();
+    let client = transport.prepare_health_attempt().unwrap().execute().await
+        .into_connected_client().expect("TEST_CODE historical fixture qualification");
+    let recovered = local.inspect_macro(&intent).unwrap();
+    let authorized = transport.resume_macro_query(
+        macro_codec::first_identity(),
+        recovered.plan().first_source_request().restored_external(recovered.plan().endpoint(), 1),
+    ).unwrap();
+    let (lease, call) = local.begin_prepared_macro_attempt(
+        lease, &authorized, reopened_clock.now.get(),
+    ).unwrap();
+    let qualified_attempt = authorized.bind_connected(client).unwrap();
+    let mut prepared = Box::pin(qualified_attempt.execute());
     let data_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::select! {
             biased;
-            result = &mut prepared => panic!(
-                "TEST_CODE External reopened prepare returned before data receipt: {result:?}"
-            ),
+            _ = &mut prepared => panic!("TEST_CODE historical data returned before receipt"),
             _ = tokio::task::yield_now() => {}
         }
         if external.snapshot().data_calls > 0 {
@@ -975,7 +973,8 @@ pub(super) async fn establish_confirmed_external_first_source(
         .is_none());
     let data_receipt = external.snapshot();
     assert_eq!(data_receipt.tcp_accepts, 2);
-    assert_eq!(data_receipt.health_requests.len(), 1);
+    assert_eq!(data_receipt.health_requests.len(), 2);
+    assert_ne!(data_receipt.health_requests[0], data_receipt.health_requests[1]);
     assert_eq!(data_receipt.capabilities_calls, 1);
     assert_eq!(data_receipt.data_calls, 1);
     assert_eq!(data_receipt.data_methods, vec!["global_news"]);
@@ -984,14 +983,14 @@ pub(super) async fn establish_confirmed_external_first_source(
     assert!(data_receipt.data_responses.is_empty());
 
     external.release_data();
-    let stopped = match tokio::time::timeout(Duration::from_secs(5), &mut prepared).await {
-        Ok(Err(error)) => error,
-        Ok(Ok(_)) => panic!("TEST_CODE External unexpectedly completed all Macro sources"),
-        Err(_) => panic!("TEST_CODE External data completion watchdog elapsed"),
-    };
-    assert_partial_macro_stop(&stopped);
+    let completion = tokio::time::timeout(Duration::from_secs(5), &mut prepared).await
+        .expect("TEST_CODE External data completion watchdog elapsed");
     drop(prepared);
-    drop(io);
+    local.record_external_macro_result(
+        lease, call,
+        &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion::Unary(completion),
+        reopened_clock.now.get(),
+    ).unwrap();
     let recovered = local.inspect_macro(&intent).unwrap();
     assert!(!recovered.is_complete());
     assert!(!recovered.has_unconfirmed_effect());
@@ -1094,7 +1093,7 @@ pub(super) async fn establish_confirmed_external_first_source(
 
     let final_wire = external.snapshot();
     assert_eq!(final_wire.tcp_accepts, 2);
-    assert_eq!(final_wire.health_requests.len(), 1);
+    assert_eq!(final_wire.health_requests.len(), 2);
     assert_eq!(final_wire.capabilities_calls, 1);
     assert_eq!(final_wire.data_calls, 1);
     assert_eq!(final_wire.data_requests, vec![data_bytes]);

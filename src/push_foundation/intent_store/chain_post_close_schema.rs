@@ -48,9 +48,11 @@ mod v12;
 mod v13;
 #[path = "chain_post_close_schema_v14.rs"]
 mod v14;
+#[path = "chain_post_close_schema_v15.rs"]
+mod v15;
 
 /// Newest sealed layout this build can attest and write.
-pub(super) const CURRENT_LAYOUT: i64 = 14;
+pub(super) const CURRENT_LAYOUT: i64 = 15;
 
 // Include foreign-named objects attached to our tables, not just our own name prefix.
 const CATALOG_SQL: &str = "SELECT name,type,tbl_name,CAST(sql AS BLOB) FROM main.sqlite_schema \
@@ -185,6 +187,7 @@ pub(super) fn verify_current(
         Some(12) => v12::run(connection, false),
         Some(13) => v13::run(connection, false),
         Some(14) => v14::run(connection, false),
+        Some(15) => v15::run(connection, false),
         Some(version) if version > 10 => Err(ChainPostCloseError::UnsupportedVersion),
         _ => run_v2(connection, V2Operation::Verify),
     }
@@ -269,6 +272,12 @@ pub(super) fn migrate_v14(
     v14::run(connection, true)
 }
 
+pub(super) fn migrate_v15(
+    connection: &mut Connection,
+) -> Result<ChainPostCloseSchemaReceipt, ChainPostCloseError> {
+    v15::run(connection, true)
+}
+
 /// Internal historical-fact readers accept the current sealed layout (v12 or
 /// v13) only after exact verification on their own current transaction. This
 /// is not a versioned legacy facade.
@@ -279,6 +288,7 @@ pub(super) fn verify_parent_layout_v12(
         Some(12) => v12::verify_installed(transaction).map(|_| ()),
         Some(13) => v13::verify_installed(transaction).map(|_| ()),
         Some(14) => v14::verify_installed(transaction).map(|_| ()),
+        Some(15) => v15::verify_installed(transaction).map(|_| ()),
         _ => Err(ChainPostCloseError::UnsupportedVersion),
     }
 }
@@ -329,7 +339,7 @@ pub(super) fn transaction_layout<'transaction, 'connection>(
     transaction: &'transaction rusqlite::Transaction<'connection>,
 ) -> Result<(i64, Option<V12CatalogProof<'transaction, 'connection>>), ChainPostCloseError> {
     let layout = runtime_layout_version(transaction)?;
-    let proof = if matches!(layout, 12 | 13 | 14) {
+    let proof = if matches!(layout, 12 | 13 | 14 | 15) {
         let proof = V12CatalogProof {
             transaction,
             schema_cookie: pragma(transaction, "PRAGMA main.schema_version")?,
@@ -3515,6 +3525,7 @@ pub(super) fn verify_runtime_layout(connection: &Connection) -> Result<(), Chain
         Some(12) => v12::verify_installed(connection).map(|_| ()),
         Some(13) => v13::verify_installed(connection).map(|_| ()),
         Some(14) => v14::verify_installed(connection).map(|_| ()),
+        Some(15) => v15::verify_installed(connection).map(|_| ()),
         Some(version) if version > 11 => Err(ChainPostCloseError::UnsupportedVersion),
         _ => Err(ChainPostCloseError::SchemaRejected),
     }

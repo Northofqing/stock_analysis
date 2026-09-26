@@ -113,21 +113,9 @@ impl SystemService for ExternalQueryWireService {
             .and_then(|value| value.to_str().ok())
             == Some(TEST_AUTHORIZATION);
         let request = request.into_inner();
-        let behavior = {
+        {
             let mut state = self.state.lock().expect("TEST_CODE auction Health state");
             state.observation.health_calls += 1;
-            state.capabilities_behavior
-        };
-        if !matches!(
-            behavior,
-            ExternalCapabilitiesBehavior::Auction
-                | ExternalCapabilitiesBehavior::ReleaseObservations
-                | ExternalCapabilitiesBehavior::ReleaseSchedule
-                | ExternalCapabilitiesBehavior::CatalogLifecycle
-        ) {
-            return Err(Status::unimplemented(
-                "TEST_CODE External query wire Health is out of scope",
-            ));
         }
         if !authorized {
             return Err(Status::unauthenticated("TEST_CODE auction Health bearer required"));

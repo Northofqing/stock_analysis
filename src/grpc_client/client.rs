@@ -89,6 +89,7 @@ pub(crate) struct PreparedExternalEndpoint {
     endpoint_uri: String,
     authorization: ClientAuthorization,
     acquisition_authority: String,
+    qualification_trust: super::build_identity::BuildIdentityTrust,
 }
 
 #[derive(Clone)]
@@ -167,9 +168,16 @@ pub struct GrpcMarketClient {
     acquisition_authority: Option<String>,
     endpoint_uri: Option<String>,
     external_provider_catalog: Option<ExternalProviderCatalog>,
+    connection_generation: Option<super::connection_qualification::ConnectionGeneration>,
 }
 
 impl GrpcMarketClient {
+    pub(crate) fn external_connection_identity(&self) -> Result<super::connection_qualification::ConnectionIdentity, GrpcError> {
+        self.require_external_qualification()?;
+        self.connection_generation.as_ref()
+            .map(|generation| generation.identity())
+            .ok_or_else(super::connection_qualification::unqualified)
+    }
     pub(crate) fn macro_query(
         &self,
         identity: macro_attempt::MacroQueryIdentity,
@@ -348,6 +356,8 @@ impl GrpcMarketClient {
             endpoint_uri,
             authorization: ClientAuthorization::InstanceBearer(bearer_token),
             acquisition_authority,
+            qualification_trust: super::build_identity::BuildIdentityTrust::bundled()
+                .map_err(|_| super::connection_qualification::unqualified())?,
         })
     }
 
@@ -391,7 +401,29 @@ impl GrpcMarketClient {
             acquisition_authority,
             endpoint_uri: None,
             external_provider_catalog: None,
+            connection_generation: None,
         }
+    }
+
+    pub(super) fn require_external_qualification(&self) -> Result<(), GrpcError> {
+        if self.profile == ContractProfile::ExternalV1 {
+            self.connection_generation
+                .as_ref()
+                .ok_or_else(super::connection_qualification::unqualified)?
+                .require_qualified()?;
+        }
+        Ok(())
+    }
+
+    fn observe_external_health(
+        &self,
+        request_id: &str,
+        response: &ExternalHealthResponse,
+    ) -> Result<(), GrpcError> {
+        self.connection_generation
+            .as_ref()
+            .ok_or_else(super::connection_qualification::unqualified)?
+            .observe_health(request_id, response)
     }
 
     pub(super) fn accept_external_capabilities(
@@ -502,7 +534,10 @@ impl GrpcMarketClient {
         });
         self.attach_request_auth(&mut request)?;
         match self.execute_external_health(request).await {
-            ExternalSystemCall::Response(response) => Ok(response),
+            ExternalSystemCall::Response(response) => {
+                self.observe_external_health(&request_id, &response)?;
+                Ok(response)
+            }
             ExternalSystemCall::UnaryStatus(status) => Err(GrpcError::from_status(
                 status,
                 StatusErrorContext::control(ContractProfile::ExternalV1, &request_id),
@@ -517,6 +552,7 @@ impl GrpcMarketClient {
         if !matches!(&self.system, SystemTransport::External(_)) {
             return Err(system_profile_mismatch());
         }
+        self.require_external_qualification()?;
         let request_id = crate::grpc_client::envelope::new_request_id();
         let mut request = tonic::Request::new(ExternalCapabilitiesRequest {
             context: Some(ExternalRequestContext {
@@ -651,6 +687,7 @@ impl GrpcMarketClient {
         })?;
         let mut attempt = 1;
         loop {
+            self.require_external_qualification()?;
             let mut authorized = tonic::Request::new(request.clone());
             self.attach_request_auth(&mut authorized)?;
             let outcome = match &mut self.data {
@@ -766,6 +803,9 @@ impl GrpcMarketClient {
         op: Operation,
         req: ProfileAuthorizedRequest,
     ) -> DataCallAuthorized {
+        if let Err(error) = self.require_external_qualification() {
+            return DataCallAuthorized::Rejected(error);
+        }
         let (data, req) = match (&mut self.data, req) {
             (DataTransport::Local(data), ProfileAuthorizedRequest::Local(req)) => (data, req),
             (DataTransport::External(data), ProfileAuthorizedRequest::External(req)) => {
@@ -877,6 +917,7 @@ impl GrpcMarketClient {
         if !matches!(&self.events, EventTransport::External(_)) {
             return Err(event_profile_mismatch());
         }
+        self.require_external_qualification()?;
         let request_id = crate::grpc_client::envelope::new_request_id();
         let mut req = tonic::Request::new(ExternalSubscribeRequest {
             context: Some(ExternalRequestContext {
@@ -935,6 +976,7 @@ impl GrpcMarketClient {
         if !matches!(&self.events, EventTransport::External(_)) {
             return Err(event_profile_mismatch());
         }
+        self.require_external_qualification()?;
         let request_id = crate::grpc_client::envelope::new_request_id();
         let mut req = tonic::Request::new(ExternalListenerStatusRequest {
             context: Some(ExternalRequestContext {
@@ -994,6 +1036,7 @@ impl GrpcMarketClient {
         if !matches!(&self.events, EventTransport::External(_)) {
             return Err(event_profile_mismatch());
         }
+        self.require_external_qualification()?;
         let request_id = crate::grpc_client::envelope::new_request_id();
         let mut req = tonic::Request::new(ExternalSetWatchlistRequest {
             context: Some(ExternalRequestContext {
@@ -1018,6 +1061,12 @@ impl GrpcMarketClient {
 
 impl PreparedExternalEndpoint {
     #[cfg(test)]
+    pub(crate) fn with_test_build_trust(mut self, trust: super::build_identity::BuildIdentityTrust) -> Self {
+        self.qualification_trust = trust;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_plaintext_for_test(
         endpoint: tonic::transport::Endpoint,
         endpoint_uri: String,
@@ -1029,6 +1078,7 @@ impl PreparedExternalEndpoint {
             endpoint_uri,
             authorization: ClientAuthorization::InstanceBearer(bearer_token),
             acquisition_authority,
+            qualification_trust: super::build_identity::BuildIdentityTrust::bundled().unwrap(),
         }
     }
 
@@ -1078,10 +1128,18 @@ impl PreparedExternalEndpoint {
     }
 
     pub(crate) async fn connect_once(&self) -> Result<GrpcMarketClient, GrpcError> {
+        self.connect_generation(self.plan_connection_generation()).await
+    }
+
+    pub(super) fn plan_connection_generation(&self) -> super::connection_qualification::ConnectionGeneration {
+        super::connection_qualification::ConnectionGeneration::new(self.qualification_trust.clone())
+    }
+
+    pub(super) async fn connect_generation(&self, generation: super::connection_qualification::ConnectionGeneration) -> Result<GrpcMarketClient, GrpcError> {
         let channel =
             self.endpoint
                 .clone()
-                .connect()
+                .connect_with_connector(generation.connector())
                 .await
                 .map_err(|_| GrpcError::Unavailable {
                     details: Box::default(),
@@ -1093,6 +1151,7 @@ impl PreparedExternalEndpoint {
             Some(self.acquisition_authority.clone()),
         );
         client.endpoint_uri = Some(self.endpoint_uri.clone());
+        client.connection_generation = Some(generation);
         Ok(client)
     }
 

@@ -431,6 +431,7 @@ impl AuthorizedPreparedMacroRequest {
         if client.endpoint_uri.as_deref() != Some(self.prepared.endpoint_uri.as_str()) {
             return Err(session_mismatch());
         }
+        client.require_external_qualification()?;
         self.request.bind_connected(client)
     }
 

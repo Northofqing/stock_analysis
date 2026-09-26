@@ -173,11 +173,19 @@ impl ExternalWireEvidenceV1 {
     }
 
     pub(crate) fn validate(&self, method: ExternalQueryMethod) -> Result<(), GrpcError> {
+        self.validate_bound(method, self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+            && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
+    }
+
+    pub(crate) fn validate_historical(&self, method: ExternalQueryMethod) -> Result<(), GrpcError> {
+        self.validate_bound(method, crate::grpc_client::historical_external::accepts_descriptor(&self.client_descriptor_sha256))
+    }
+
+    fn validate_bound(&self, method: ExternalQueryMethod, descriptor_valid: bool) -> Result<(), GrpcError> {
         if self.material != EXTERNAL_WIRE_MATERIAL
             || self.profile != "ExternalV1"
             || self.method != method
-            || self.client_descriptor_sha256 != EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-            || compiled_descriptor_sha256() != EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+            || !descriptor_valid
         {
             return Err(wire_error("external_response_wire_invalid"));
         }

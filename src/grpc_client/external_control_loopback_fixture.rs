@@ -69,6 +69,7 @@ pub(crate) enum HealthReply {
     NotReady,
     Status(HealthStatusCase),
     MismatchedId,
+    TrustedBuildB,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl SystemService for ExternalControlService {
             .expect("TEST_CODE External control Health reply mode")
             .health_reply;
         match health_reply {
-            HealthReply::Success | HealthReply::NotReady | HealthReply::MismatchedId => {
+            HealthReply::Success | HealthReply::NotReady | HealthReply::MismatchedId | HealthReply::TrustedBuildB => {
                 let ready = health_reply != HealthReply::NotReady;
                 let response = HealthResponse {
                     request_id: if health_reply == HealthReply::MismatchedId {
@@ -220,7 +221,12 @@ impl SystemService for ExternalControlService {
                     }
                     .to_owned(),
                     observability: Some(test_external_observability()),
-                    build_identity: Some(test_external_build_identity()),
+                    build_identity: Some(if health_reply == HealthReply::TrustedBuildB {
+                        let mut build = test_external_build_identity();
+                        build.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
+                        build.binary_sha256 = "b".repeat(64);
+                        build
+                    } else { test_external_build_identity() }),
                 };
                 self.state
                     .lock()
@@ -1298,6 +1304,69 @@ pub(crate) fn write_test_code_bundle(
     Ok(root)
 }
 
+/// A byte-only TCP front door: TLS still terminates in independent mTLS servers.
+/// Switching waits for every old relay to close before returning.
+pub(crate) struct ExternalMtlsSwitch {
+    bundle_path: PathBuf,
+    _temp_dir: tempfile::TempDir,
+    route: tokio::sync::watch::Sender<String>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalMtlsSwitch {
+    pub(crate) async fn bind(endpoint: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = format!("https://{}", listener.local_addr().unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bundle_path = write_test_code_bundle(temp_dir.path(), "switch", &front, "macro.test.invalid").unwrap();
+        let (route, receiver) = tokio::sync::watch::channel(endpoint.trim_start_matches("https://").to_owned());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_active = active.clone();
+        let task = tokio::spawn(async move {
+            let mut relays = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut downstream, _)) = accepted else { break };
+                        let mut generation = receiver.clone();
+                        let address = generation.borrow_and_update().clone();
+                        let active = task_active.clone();
+                        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        relays.spawn(async move {
+                            if let Ok(mut upstream) = tokio::net::TcpStream::connect(address).await {
+                                tokio::select! {
+                                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {},
+                                    _ = generation.changed() => {},
+                                }
+                            }
+                            drop(downstream);
+                            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                    _ = relays.join_next(), if !relays.is_empty() => {}
+                }
+            }
+        });
+        Self { bundle_path, _temp_dir: temp_dir, route, active, task }
+    }
+
+    pub(crate) fn bundle_path(&self) -> &Path { &self.bundle_path }
+
+    pub(crate) async fn switch_to(&self, endpoint: &str) {
+        self.route.send_replace(endpoint.trim_start_matches("https://").to_owned());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("TEST_CODE old relay closed");
+    }
+}
+
+impl Drop for ExternalMtlsSwitch {
+    fn drop(&mut self) { self.task.abort(); }
+}
+
 pub(crate) struct ExternalMtlsMacroFixture {
     bundle_path: PathBuf,
     wrong_name_bundle_path: PathBuf,
@@ -1354,6 +1423,12 @@ impl ExternalMtlsMacroFixture {
             .expect("TEST_CODE zero-length External response mode")
             .append_zero_length_source = true;
         Ok(fixture)
+    }
+
+    pub(crate) fn append_zero_length_source_for_test(&self) {
+        self.server.as_ref().expect("TEST_CODE zero-length server").state
+            .lock().expect("TEST_CODE zero-length response mode")
+            .append_zero_length_source = true;
     }
 
     pub(crate) async fn bind_health_not_ready_for_test() -> Result<Self, String> {

@@ -148,6 +148,26 @@ fn v14_retired_terminal_sidecar_migrates_sealed_v13_catalog() {
     );
 }
 
+#[test]
+fn task6_layout15_requires_explicit_migration_and_preserves_legacy_seals() {
+    let mut fixture = V2BusinessFixture::new();
+    install_v12(&mut fixture);
+    fixture.chain_post_close().migrate_schema_v12_to_v13().unwrap();
+    fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+    let old = catalog_snapshot(fixture.connection());
+    fixture.reopen();
+    assert_eq!(catalog_snapshot(fixture.connection()), old, "ordinary reopen cannot install qualification schema");
+    let receipt = schema::migrate_v15(&mut fixture.store.as_mut().unwrap().connection).unwrap();
+    assert_eq!(receipt.schema_version(), 15);
+    let upgraded = catalog_snapshot(fixture.connection());
+    assert_eq!(&upgraded.layouts[..old.layouts.len()], &old.layouts);
+    fixture.reopen();
+    assert_eq!(catalog_snapshot(fixture.connection()), upgraded);
+    assert_eq!(schema::runtime_layout_version(fixture.connection()).unwrap(), 15);
+    fixture.execute("CREATE TABLE chain_post_close_macro_shadow_qualification(secret TEXT)");
+    assert!(schema::runtime_layout_version(fixture.connection()).is_err());
+}
+
 fn catalog_snapshot(connection: &Connection) -> CatalogSnapshot {
     CatalogSnapshot {
         schema_cookie: connection

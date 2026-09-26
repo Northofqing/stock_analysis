@@ -1,11 +1,13 @@
 //! Macro facts on the BusinessIntentStore's owned connection; no network here.
-use chrono::{DateTime, FixedOffset, TimeZone as _, Utc};
+use chrono::{TimeZone as _, Utc};
+#[cfg(test)]
+use chrono::{DateTime, FixedOffset};
 use rusqlite::{params, Transaction, TransactionBehavior};
 
 use super::macro_codec::{self as codec, require, NewsResult, Plan, RawResult, Result};
 use super::{
     check_lease, dragon_tiger, inspect_run_and_macro_on, inspect_run_and_macro_scoped,
-    inspect_run_on, schema, storage, ChainPostCloseError, LocalChainPostClose, RunLease,
+    schema, storage, ChainPostCloseError, LocalChainPostClose, RunLease,
     RunRecovery,
 };
 use crate::data_gateway::review::map_gateway_audit_record;
@@ -14,20 +16,30 @@ use crate::database::data_acquisition_audit::{
     append_acquisition_in_transaction, verify_acquisition_receipt_in_transaction,
     DataAcquisitionAuditReceipt,
 };
+#[cfg(test)]
+use super::inspect_run_on;
+#[cfg(test)]
 use crate::grpc_client::client::external_control_attempt::{
     AuthorizedCapabilitiesAttempt, AuthorizedHealthAttempt, ExternalControlCompletion,
+};
+use crate::grpc_client::client::external_control_attempt::{
     ExternalControlKind, ExternalControlRequestMaterial,
 };
+#[cfg(test)]
 use crate::grpc_client::client::macro_attempt::{
     AuthorizedMacroAttempt, AuthorizedPreparedMacroRequest, ExternalMacroAttemptCompletion,
-    MacroAttemptCompletion, MacroContinuation, MacroQueryIdentity,
+    MacroAttemptCompletion,
 };
+use crate::grpc_client::client::macro_attempt::{MacroContinuation, MacroQueryIdentity};
+#[cfg(test)]
 use crate::grpc_client::external_pb::magic::market::v1::{
-    CapabilitiesResponse, HealthResponse, Operation as ExternalOperation,
+    CapabilitiesResponse, HealthResponse,
 };
+use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
 use crate::grpc_client::provider_attempts::{ExternalProviderCatalog, ProviderAttempts};
 use crate::grpc_client::retry::RetryDecision;
 use crate::monitor::push_job::{raw_digest, IntentId, Sha256Digest, UtcMicros};
+#[cfg(test)]
 use crate::search_service::service::MacroWebSnapshot;
 
 pub(super) const TABLES: [&str; 8] = [
@@ -185,6 +197,7 @@ impl MacroControlRecovery {
     pub(crate) fn outcome(&self) -> Option<MacroControlOutcome> {
         self.outcome
     }
+    #[cfg(test)]
     pub(crate) fn authorizes_new_external_effect(&self) -> bool {
         self.outcome == Some(MacroControlOutcome::Ready)
             && self.qualification_version == Some(3)
@@ -208,6 +221,7 @@ pub(crate) struct MacroReadinessEpisodeRecovery {
 }
 
 impl MacroReadinessEpisodeRecovery {
+    #[cfg(test)]
     pub(crate) fn authorizes_new_data_effect(&self) -> bool {
         self.ready_result.is_some()
             && self.controls.len() == 2
@@ -363,6 +377,7 @@ impl MacroNewsRecovery {
 }
 
 pub(crate) struct MacroRecovery {
+    pub(super) qualification_pending: Vec<u64>,
     pub(super) full: Option<super::macro_recovery::FullRecovery>,
     pub(super) plan: Plan,
     pub(super) plan_bytes: Vec<u8>,
@@ -373,11 +388,41 @@ pub(crate) struct MacroRecovery {
     pub(super) source: Option<MacroNewsRecovery>,
 }
 impl MacroRecovery {
+    pub(super) fn legacy_snapshot(&self) -> Result<crate::search_service::macro_news::runner::Snapshot> {
+        use crate::search_service::macro_news::runner::{BudgetMode, QueryKey, QueryOutcome, QueryState, RouteState, Snapshot};
+        require(self.full.is_none() && self.plan.format_version() == 2
+            && self.plan.profile() == crate::grpc_client::client::ContractProfile::ExternalV1
+            && self.request_plan_version > self.plan_version)?;
+        let controls = &self.readiness_episodes.first().ok_or(ChainPostCloseError::SchemaRejected)?.controls;
+        require(controls.len() == 2)?;
+        let external = if controls.iter().any(|control| control.outcome == Some(MacroControlOutcome::Rejected)) {
+            RouteState::Rejected
+        } else if controls[0].outcome != Some(MacroControlOutcome::Ready) {
+            RouteState::NeedsHealth
+        } else if controls[1].outcome != Some(MacroControlOutcome::Ready) {
+            RouteState::NeedsCapabilities
+        } else { RouteState::Ready };
+        let previous = self.attempts.last();
+        let state = QueryState {
+            next_attempt: previous.map_or(1, |attempt| attempt.ordinal + 1),
+            retry_due: previous.and_then(|attempt| attempt.retry_not_before),
+            terminal: self.source.as_ref().map(|source| QueryOutcome::Native(crate::search_service::macro_news::NativeOutcome::News(source.result.clone()))),
+            // Single-source completion has no full-Macro pacing anchor.
+            terminal_version: None, terminal_at: None,
+        };
+        Ok(Snapshot {
+            budget: BudgetMode::DurableAbsolute { started_at: self.plan.started, deadline_at: self.plan.deadline },
+            definition: super::macro_plan_v3::definition(&self.plan)?,
+            local: RouteState::Unprepared, external,
+            queries: [(QueryKey::Gateway(1), state)].into_iter().collect(),
+            dimensions: Default::default(), final_output: None,
+        })
+    }
     pub(crate) fn is_complete(&self) -> bool {
         self.full.as_ref().is_some_and(|full| full.final_.is_some())
     }
     pub(crate) fn has_unconfirmed_effect(&self) -> bool {
-        self.attempts.iter().any(|a| a.result.is_none())
+        !self.qualification_pending.is_empty() || self.attempts.iter().any(|a| a.result.is_none())
             || self
                 .full
                 .as_ref()
@@ -533,7 +578,8 @@ pub(super) fn facts(
     require(
         TABLES.contains(&table)
             || super::macro_recovery::TABLES.contains(&table)
-            || table == super::macro_recovery::RETIRED_TABLE,
+            || table == super::macro_recovery::RETIRED_TABLE
+            || table == super::macro_connection::TABLE,
     )?;
     let mut statement=transaction.prepare(&format!("SELECT run_id,run_context_sha256,input_sha256,lease_owner,lease_generation,prior_head_version,run_version,recorded_at,bytes,byte_length,sha256 FROM {table} WHERE intent_id=?1 ORDER BY run_version"))
         .map_err(|_|storage("macro facts"))?;
@@ -833,6 +879,9 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
         &control_results,
         false,
     )?;
+    let connection_history = if schema::runtime_layout_version(transaction)? >= 15 {
+        super::macro_connection::load(transaction, intent, run, &plan, fact.version, &fact.digest)?
+    } else { super::macro_connection::Recovery::default() };
 
     let mut attempts = Vec::<MacroAttemptRecovery>::new();
     let readiness_result = readiness_episodes
@@ -882,8 +931,8 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
                         && a.retry_not_before.is_some_and(|due| due <= begin.time)
                 }),
         )?;
-        let provider_catalog =
-            historical_provider_catalog(&readiness_episodes, extra.6);
+        let provider_catalog = connection_history.data_catalogs.get(&begin.version)
+            .or_else(|| historical_provider_catalog(&readiness_episodes, extra.6));
         let mut attempt = MacroAttemptRecovery {
             query: crate::search_service::macro_news::runner::QueryKey::Gateway(1),
             request: plan.request.bytes.clone(),
@@ -1034,6 +1083,7 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
         None
     };
     Ok(Some(MacroRecovery {
+        qualification_pending: connection_history.pending,
         full: None,
         plan,
         plan_bytes: fact.bytes.clone(),
@@ -1372,7 +1422,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("macro inspect"))?;
         require(matches!(
             schema::runtime_layout_version(&transaction)?,
-            11 | 12 | 13 | 14
+            11 | 12 | 13 | 14 | 15
         ))?;
         let (_, recovery) = inspect_run_and_macro_on(&transaction, intent)?;
         let recovery = recovery.ok_or(ChainPostCloseError::MacroNotStarted)?;
@@ -1382,6 +1432,7 @@ impl LocalChainPostClose<'_> {
         Ok(recovery)
     }
 
+    #[cfg(test)]
     pub(super) fn load_macro(
         &mut self,
         lease: &RunLease,
@@ -1411,7 +1462,7 @@ impl LocalChainPostClose<'_> {
             .map_err(|_| storage("macro parent"))?;
         require(matches!(
             schema::runtime_layout_version(&transaction)?,
-            11 | 12 | 13 | 14
+            11 | 12 | 13 | 14 | 15
         ))?;
         let (_, _, parent) =
             inspect_run_and_macro_scoped(&transaction, &lease.intent_id, |run, _, validated| {
@@ -1431,6 +1482,7 @@ impl LocalChainPostClose<'_> {
             .projection)
     }
 
+    #[cfg(test)]
     pub(super) fn plan_macro(
         &mut self,
         lease: RunLease,
@@ -1453,6 +1505,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn plan_macro_request(
         &mut self,
         mut lease: RunLease,
@@ -1530,6 +1583,7 @@ impl LocalChainPostClose<'_> {
         Ok(lease)
     }
 
+    #[cfg(test)]
     pub(super) fn begin_macro_attempt(
         &mut self,
         lease: RunLease,
@@ -1544,6 +1598,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn begin_health_control(
         &mut self,
         lease: RunLease,
@@ -1553,6 +1608,7 @@ impl LocalChainPostClose<'_> {
         self.begin_macro_control(lease, attempt.request_material(), now)
     }
 
+    #[cfg(test)]
     pub(super) fn begin_capabilities_control(
         &mut self,
         lease: RunLease,
@@ -1562,6 +1618,7 @@ impl LocalChainPostClose<'_> {
         self.begin_macro_control(lease, attempt.request_material(), now)
     }
 
+    #[cfg(test)]
     fn begin_macro_control(
         &mut self,
         mut lease: RunLease,
@@ -1647,6 +1704,7 @@ impl LocalChainPostClose<'_> {
         Ok((lease, call))
     }
 
+    #[cfg(test)]
     pub(super) fn record_health_control_result(
         &mut self,
         lease: RunLease,
@@ -1663,6 +1721,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn record_capabilities_control_result(
         &mut self,
         lease: RunLease,
@@ -1679,6 +1738,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     fn record_macro_control_result(
         &mut self,
         mut lease: RunLease,
@@ -1765,6 +1825,7 @@ impl LocalChainPostClose<'_> {
         Ok((lease, outcome))
     }
 
+    #[cfg(test)]
     pub(super) fn begin_prepared_macro_attempt(
         &mut self,
         lease: RunLease,
@@ -1779,6 +1840,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     fn begin_macro_request(
         &mut self,
         mut lease: RunLease,
@@ -1855,6 +1917,7 @@ impl LocalChainPostClose<'_> {
         Ok((lease, call))
     }
 
+    #[cfg(test)]
     pub(super) fn record_macro_result(
         &mut self,
         lease: RunLease,
@@ -1877,6 +1940,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn record_external_macro_result(
         &mut self,
         lease: RunLease,
@@ -1907,6 +1971,7 @@ impl LocalChainPostClose<'_> {
         )
     }
 
+    #[cfg(test)]
     fn record_macro_raw_result(
         &mut self,
         mut lease: RunLease,
@@ -1990,7 +2055,7 @@ impl LocalChainPostClose<'_> {
         Ok(lease)
     }
 
-    fn insert_macro_source_final(
+    pub(super) fn insert_macro_source_final(
         transaction: &Transaction<'_>,
         lease: &mut RunLease,
         run: &RunRecovery,
@@ -1998,7 +2063,7 @@ impl LocalChainPostClose<'_> {
         cause_version: u64,
         gateway: &NewsResult,
         now: UtcMicros,
-    ) -> Result<()> {
+    ) -> Result<(String, DataAcquisitionAuditReceipt)> {
         let native = codec::native_bytes(gateway)?;
         let audit = map_gateway_audit_record(
             CAPABILITY,
@@ -2030,6 +2095,6 @@ impl LocalChainPostClose<'_> {
         transaction.execute("INSERT INTO chain_post_close_macro_source_finals(intent_id,run_id,run_context_sha256,input_sha256,lease_owner,lease_generation,prior_head_version,run_version,recorded_at,bytes,byte_length,sha256,phase,item_ordinal,cause_kind,cause_version,native_bytes,native_length,native_sha256,audit_id,audit_record_hash,previous_outcome,current_outcome) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'Gateway',1,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![lease.intent_id.as_str(),lease.run_id.as_str(),run.context.canonical_sha256().as_str(),raw_digest(&run.input.encode()?).as_str(),lease.owner.as_str(),lease.generation,prior,lease.head,now.get(),bytes,bytes.len(),raw_digest(&bytes).as_str(),cause_kind,cause_version,native,native.len(),raw_digest(&native).as_str(),receipt.audit_id,receipt.record_hash,receipt.previous_outcome,receipt.current_outcome])
             .map_err(|_|storage("macro source final insert"))?;
-        Ok(())
+        Ok((raw_digest(&bytes).as_str().to_owned(), receipt))
     }
 }

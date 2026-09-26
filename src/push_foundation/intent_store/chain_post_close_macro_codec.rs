@@ -1,6 +1,8 @@
 use chrono::{DateTime, FixedOffset};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
+use crate::grpc_client::build_identity::BuildIdentityTrust;
+use crate::grpc_client::historical_external;
 
 use super::{dragon_tiger::MacroParent, ChainPostCloseError};
 use crate::data_gateway::grpc_source::LocalSemanticSearchConnectionState;
@@ -23,15 +25,19 @@ use crate::grpc_client::client::macro_attempt::{
 };
 use crate::grpc_client::client::ContractProfile;
 use crate::grpc_client::errors::{
-    restore_persisted_status_error, GrpcError, PersistedErrorDetailTrailer, StatusErrorContext,
+    restore_historical_external_status_error as restore_persisted_status_error,
+    GrpcError, PersistedErrorDetailTrailer, StatusErrorContext,
 };
 use crate::grpc_client::external_pb::magic::market::v1::{
-    BuildIdentity, CapabilitiesRequest, CapabilitiesResponse, HealthRequest, HealthResponse,
-    Operation as ExternalOperation, QueryRequest as ExternalQueryRequest,
-    QueryResponse as ExternalQueryResponse,
+    BuildIdentity, CapabilitiesResponse, HealthResponse,
+    Operation as ExternalOperation,
+};
+#[cfg(test)]
+use crate::grpc_client::external_pb::magic::market::v1::{
+    CapabilitiesRequest, HealthRequest, QueryResponse as ExternalQueryResponse,
 };
 use crate::grpc_client::external_query_transport::{
-    admit_external_payload, compiled_descriptor_sha256, wire_error, ExternalQueryMethod,
+    admit_external_payload, wire_error, ExternalQueryMethod,
     ExternalWireEvidenceV1, ExternalWireMaterialV1, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
 };
 use crate::grpc_client::pb::magic::market::v1::{Operation, QueryRequest, QueryResponse};
@@ -194,20 +200,11 @@ impl Request {
             MacroQueryIdentity::SemanticSearch { provider, query, limit } => serde_json::json!({"provider":provider.wire_name(),"query":query,"limit":limit}),
         };
         if external {
-            let request = ExternalQueryRequest::decode(self.bytes.as_slice())
-                .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-            require(request.encode_to_vec() == self.bytes)?;
-            let mut expected = crate::grpc_client::external_v1::build_external_query_request(
-                identity.operation(),
-                params,
-            )
-            .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-            expected
-                .context
-                .as_mut()
-                .ok_or(ChainPostCloseError::SchemaRejected)?
-                .request_id = self.id.clone();
-            require(request == expected)
+            let MacroQueryIdentity::GlobalNews { provider, limit } = identity else {
+                return Err(ChainPostCloseError::SchemaRejected);
+            };
+            historical_external::global_news_request(&self.bytes, &self.id, provider.wire_name(), *limit)
+                .map_err(|_| ChainPostCloseError::SchemaRejected)
         } else {
             let request = QueryRequest::decode(self.bytes.as_slice())
                 .map_err(|_| ChainPostCloseError::SchemaRejected)?;
@@ -634,6 +631,10 @@ impl ControlRequest {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        self.validate_with_trust(&BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?)
+    }
+
+    fn validate_with_trust(&self, trust: &BuildIdentityTrust) -> Result<()> {
         require(
             matches!(self.version, 1 | 2)
                 && self.profile == "ExternalV1"
@@ -647,30 +648,15 @@ impl ControlRequest {
         if self.version == 2 {
             require(
                 self.method == Some(self.kind())
-                    && self.client_descriptor_sha256.as_deref()
-                        == Some(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
-                    && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                    && self.client_descriptor_sha256.as_deref().is_some_and(|descriptor| trust.historical_descriptor(descriptor)),
             )?;
         } else {
             require(self.method.is_none() && self.client_descriptor_sha256.is_none())?;
         }
-        let context = match self.kind.as_str() {
-            "Health" => {
-                let request = HealthRequest::decode(self.bytes.as_slice())
-                    .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                require(request.encode_to_vec() == self.bytes)?;
-                request.context
-            }
-            "Capabilities" => {
-                let request = CapabilitiesRequest::decode(self.bytes.as_slice())
-                    .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                require(request.encode_to_vec() == self.bytes)?;
-                request.context
-            }
-            _ => return Err(ChainPostCloseError::SchemaRejected),
-        }
-        .ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(context.protocol_version == 1 && context.request_id == self.id)
+        require(matches!(self.kind.as_str(), "Health" | "Capabilities"))?;
+        let (protocol_version, request_id) = historical_external::request_context(self.kind == "Health", &self.bytes)
+            .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        require(protocol_version == 1 && request_id == self.id)
     }
 
     pub(super) fn material(&self) -> ExternalControlRequestMaterial {
@@ -785,7 +771,7 @@ impl ReadinessEpisodePlan {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ControlRawResult {
     version: u32,
@@ -799,6 +785,8 @@ pub(super) struct ControlRawResult {
     wire_identity: Option<ControlWireIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verified_build_identity: Option<VerifiedBuildIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_identity: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -822,14 +810,13 @@ impl ControlWireIdentity {
         })
     }
 
-    fn validate(&self, request: &ControlRequest) -> Result<()> {
+    fn validate_with_trust(&self, request: &ControlRequest, trust: &BuildIdentityTrust) -> Result<()> {
         require(
             request.has_wire_identity()
                 && self.profile == "ExternalV1"
                 && self.method == request.kind()
                 && self.request_id == request.request_id()
-                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-                && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                && trust.historical_descriptor(&self.client_descriptor_sha256),
         )
     }
 }
@@ -845,6 +832,20 @@ struct VerifiedBuildIdentity {
 }
 
 impl VerifiedBuildIdentity {
+    fn from_recorded_health(response: &HealthResponse, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity, trust: &BuildIdentityTrust) -> Option<Self> {
+        trust.recorded_health(&identity.policy_sha256, &identity.descriptor_sha256, response).ok()?;
+        let build = response.build_identity.as_ref()?;
+        Some(Self { service_version: build.service_version.clone(), source_revision: build.source_revision.clone(),
+            contract_sha256: build.contract_sha256.clone(), binary_sha256: build.binary_sha256.clone(), identity_error: build.identity_error.clone() })
+    }
+
+    fn as_health(&self) -> HealthResponse {
+        HealthResponse { live: true, ready: true, build_identity: Some(BuildIdentity {
+            service_version: self.service_version.clone(), source_revision: self.source_revision.clone(),
+            contract_sha256: self.contract_sha256.clone(), binary_sha256: self.binary_sha256.clone(), identity_error: self.identity_error.clone(),
+        }), ..Default::default() }
+    }
+
     fn from_qualified_health(response: &HealthResponse) -> Option<Self> {
         crate::grpc_client::build_identity::qualify_public_health(response).ok()?;
         let identity = response.build_identity.as_ref()?;
@@ -857,7 +858,7 @@ impl VerifiedBuildIdentity {
         })
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, trust: &BuildIdentityTrust) -> Result<()> {
         let identity = BuildIdentity {
             service_version: self.service_version.clone(),
             source_revision: self.source_revision.clone(),
@@ -865,7 +866,19 @@ impl VerifiedBuildIdentity {
             binary_sha256: self.binary_sha256.clone(),
             identity_error: self.identity_error.clone(),
         };
-        require(crate::grpc_client::build_identity::qualify_public_build_identity(&identity).is_ok())
+        require(trust.historical_identity(&identity).is_ok())
+    }
+
+    fn from_historical_health(response: &HealthResponse, trust: &BuildIdentityTrust) -> Option<Self> {
+        trust.historical_health(response).ok()?;
+        let identity = response.build_identity.as_ref()?;
+        Some(Self {
+            service_version: identity.service_version.clone(),
+            source_revision: identity.source_revision.clone(),
+            contract_sha256: identity.contract_sha256.clone(),
+            binary_sha256: identity.binary_sha256.clone(),
+            identity_error: identity.identity_error.clone(),
+        })
     }
 }
 
@@ -896,6 +909,7 @@ impl ControlRawResult {
                 diagnostic: error.safe_diagnostic().map(str::to_owned),
                 wire_identity: None,
                 verified_build_identity: None,
+                connection_identity: None,
             },
             ExternalControlResultMaterial::Response { bytes, .. } => Self {
                 version: 2,
@@ -907,6 +921,7 @@ impl ControlRawResult {
                 diagnostic: None,
                 wire_identity: None,
                 verified_build_identity: None,
+                connection_identity: None,
             },
             ExternalControlResultMaterial::Status {
                 code,
@@ -927,6 +942,7 @@ impl ControlRawResult {
                 diagnostic: error.safe_diagnostic().map(str::to_owned),
                 wire_identity: None,
                 verified_build_identity: None,
+                connection_identity: None,
             },
         }
     }
@@ -940,6 +956,8 @@ impl ControlRawResult {
             self.version == 2
                 && self.wire_identity.is_none()
                 && self.verified_build_identity.is_none(),
+        )?;
+        require(self.connection_identity.is_none()
         )?;
         let identity = ControlWireIdentity::capture(request)?;
         let build = match request.kind() {
@@ -982,19 +1000,87 @@ impl ControlRawResult {
         Ok(())
     }
 
+    pub(super) fn bind_connection_identity(
+        &mut self, request: &ControlRequest,
+        identity: &crate::grpc_client::connection_qualification::ConnectionIdentity,
+        health: Option<(&ControlRequest, &[u8])>,
+    ) -> Result<()> {
+        require(self.version == 2 && self.wire_identity.is_none()
+            && self.verified_build_identity.is_none() && self.connection_identity.is_none()
+            && identity.validate_recorded())?;
+        let wire = ControlWireIdentity::capture(request)?;
+        require(wire.client_descriptor_sha256 == identity.descriptor_sha256)?;
+        let trust = BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        let build = match request.kind() {
+            ExternalControlKind::Health => {
+                require(health.is_none())?;
+                self.response.as_deref().and_then(|bytes| historical_external::health(bytes).ok())
+                    .filter(|response| response.request_id == request.request_id())
+                    .and_then(|response| VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust))
+            }
+            ExternalControlKind::Capabilities => {
+                let (health_request, bytes) = health.ok_or(ChainPostCloseError::SchemaRejected)?;
+                health_request.validate()?;
+                require(health_request.kind() == ExternalControlKind::Health
+                    && health_request.endpoint == request.endpoint && health_request.authority == request.authority
+                    && health_request.id != request.id)?;
+                let response = historical_external::health(bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                require(response.request_id == health_request.request_id())?;
+                Some(VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust)
+                    .ok_or(ChainPostCloseError::SchemaRejected)?)
+            }
+        };
+        self.version = 4;
+        self.wire_identity = Some(wire);
+        self.verified_build_identity = build;
+        self.connection_identity = Some(identity.clone());
+        Ok(())
+    }
+
+    pub(super) fn validate_connection_binding(
+        &self, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity,
+        health: Option<&[u8]>,
+    ) -> Result<()> {
+        require(self.version == 4 && self.connection_identity.as_ref() == Some(identity))?;
+        if let Some(bytes) = health {
+            let response = historical_external::health(bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+            let trust = BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?;
+            let expected = VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(self.verified_build_identity.as_ref() == Some(&expected))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn project(
         &self,
         request: &ControlRequest,
     ) -> Result<std::result::Result<(), GatewayError>> {
-        require(matches!(self.version, 1 | 2 | 3))?;
-        request.validate()?;
-        if self.version == 3 {
+        self.project_with_trust(request, &BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?)
+    }
+
+    fn project_with_trust(
+        &self,
+        request: &ControlRequest,
+        trust: &BuildIdentityTrust,
+    ) -> Result<std::result::Result<(), GatewayError>> {
+        require(matches!(self.version, 1 | 2 | 3 | 4))?;
+        request.validate_with_trust(trust)?;
+        if self.version == 4 {
+            let identity = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(identity.version == 1 && !identity.epoch.is_empty() && identity.epoch.len() <= 512
+                && trust.accepts_recorded_policy(&identity.policy_sha256, &identity.descriptor_sha256)
+                && self.wire_identity.as_ref().is_some_and(|wire| wire.client_descriptor_sha256 == identity.descriptor_sha256))?;
+        } else { require(self.connection_identity.is_none())?; }
+        if self.version >= 3 {
             self.wire_identity
                 .as_ref()
                 .ok_or(ChainPostCloseError::SchemaRejected)?
-                .validate(request)?;
+                .validate_with_trust(request, trust)?;
             if let Some(build) = &self.verified_build_identity {
-                build.validate()?;
+                if let Some(identity) = &self.connection_identity {
+                    require(trust.recorded_health(&identity.policy_sha256, &identity.descriptor_sha256, &build.as_health()).is_ok())?;
+                } else { build.validate(trust)?; }
             }
             require(if request.kind() == ExternalControlKind::Capabilities {
                 self.verified_build_identity.is_some()
@@ -1026,13 +1112,12 @@ impl ControlRawResult {
                 require(matches!(self.trailer, Trailer::Absent))?;
                 match request.kind() {
                     ExternalControlKind::Health => {
-                        let response = HealthResponse::decode(bytes.as_slice())
+                        let response = historical_external::health(bytes)
                             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                        require(response.encode_to_vec() == *bytes)?;
                         if let Err(error) =
                             validate_health_response_id(request.request_id(), &response)
                         {
-                            if self.version == 3 {
+                            if self.version >= 3 {
                                 require(self.verified_build_identity.is_none())?;
                             }
                             require(self.diagnostic.as_deref() == error.safe_diagnostic())?;
@@ -1043,10 +1128,13 @@ impl ControlRawResult {
                             ));
                         }
                         require(self.diagnostic.is_none())?;
-                        if self.version == 3 {
+                        if self.version == 4 {
+                            require(self.verified_build_identity == VerifiedBuildIdentity::from_recorded_health(&response,
+                                self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?, trust))?;
+                        } else if self.version == 3 {
                             require(
                                 self.verified_build_identity
-                                    == VerifiedBuildIdentity::from_qualified_health(&response),
+                                    == VerifiedBuildIdentity::from_historical_health(&response, trust),
                             )?;
                         }
                         if self.version == 1 {
@@ -1058,18 +1146,18 @@ impl ControlRawResult {
                                     &response,
                                 ),
                             )
+                        } else if let Some(identity) = &self.connection_identity {
+                            Ok(trust.recorded_health(&identity.policy_sha256, &identity.descriptor_sha256, &response)
+                                .map_err(crate::data_gateway::grpc_source::map_external_build_identity_error))
                         } else {
                             Ok(
-                                crate::data_gateway::grpc_source::require_external_health_qualified(
-                                    &response,
-                                ),
+                                trust.historical_health(&response).map_err(crate::data_gateway::grpc_source::map_external_build_identity_error),
                             )
                         }
                     }
                     ExternalControlKind::Capabilities => {
-                        let response = CapabilitiesResponse::decode(bytes.as_slice())
+                        let response = historical_external::capabilities(bytes)
                             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                        require(response.encode_to_vec() == *bytes)?;
                         if let Err(error) =
                             validate_capabilities_response_id(request.request_id(), &response)
                         {
@@ -1129,9 +1217,8 @@ impl ControlRawResult {
             .response
             .as_deref()
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        let response = CapabilitiesResponse::decode(bytes)
+        let response = historical_external::capabilities(bytes)
             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-        require(response.encode_to_vec().as_slice() == bytes)?;
         validated_external_provider_catalog(request.request_id(), &response)
             .map_err(|_| ChainPostCloseError::SchemaRejected)
     }
@@ -1198,8 +1285,7 @@ impl RawWireIdentity {
                 && method == MethodIdentity::External(external_global_news())
                 && self.method == ExternalQueryMethod::GlobalNews
                 && self.request_id == request.id
-                && self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-                && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                && historical_external::accepts_descriptor(&self.client_descriptor_sha256),
         )
     }
 }
@@ -1474,7 +1560,7 @@ impl RawResult {
             .as_ref()
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         evidence
-            .validate(ExternalQueryMethod::GlobalNews)
+            .validate_historical(ExternalQueryMethod::GlobalNews)
             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
         Ok(evidence)
     }
@@ -1526,8 +1612,7 @@ impl RawResult {
         bytes: &[u8],
     ) -> std::result::Result<crate::grpc_client::envelope::QueryResult, GrpcError> {
         admit_external_payload(bytes)?;
-        let response = ExternalQueryResponse::decode(bytes)
-            .map_err(|_| wire_error("external_response_wire_invalid"))?;
+        let response = historical_external::query(bytes)?;
         crate::grpc_client::envelope::parse_external_query_response(
             &request.id,
             Operation::GlobalNews,
@@ -1743,6 +1828,112 @@ mod tests {
     }
 
     #[test]
+    fn task6_current_control_v4_uses_recorded_b_policy_not_legacy_a() {
+        let id = "TEST_CODE_CURRENT_B_HEALTH";
+        let request = ControlRequest::capture(ExternalControlRequestMaterial {
+            kind: ExternalControlKind::Health,
+            request_bytes: HealthRequest { context: Some(crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                protocol_version: 1, request_id: id.into(),
+            }) }.encode_to_vec(),
+            request_id: id.into(), profile: ContractProfile::ExternalV1,
+            endpoint_uri: "https://TEST_CODE.invalid:443".into(),
+            acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
+        }).unwrap();
+        let trust = BuildIdentityTrust::test_client_b();
+        let mut build = crate::grpc_client::build_identity::test_public_build_identity();
+        build.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
+        build.binary_sha256 = "b".repeat(64);
+        let health = HealthResponse { request_id: id.into(), live: true, ready: true,
+            build_identity: Some(build.clone()), ..Default::default() };
+        assert!(trust.current_health(&health).is_ok());
+        let value = serde_json::json!({
+            "version":4,"connect_unavailable":false,"response":health.encode_to_vec(),
+            "code":null,"details":null,"trailer":"Absent","diagnostic":null,
+            "wire_identity":{"profile":"ExternalV1","method":"Health","request_id":id,
+                "client_descriptor_sha256":EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256},
+            "verified_build_identity":{"service_version":build.service_version,"source_revision":build.source_revision,
+                "contract_sha256":build.contract_sha256,"binary_sha256":build.binary_sha256,"identity_error":""},
+            "connection_identity":{"version":1,"epoch":"TEST_CODE_CURRENT_B_EPOCH",
+                "policy_sha256":trust.current_policy_sha256(),"descriptor_sha256":trust.current_descriptor()}
+        });
+        let raw: ControlRawResult = serde_json::from_value(value.clone()).expect("versioned current connection receipt must decode");
+        assert!(raw.project_with_trust(&request, &trust).unwrap().is_ok());
+        let bytes = encode(&raw).unwrap();
+        let reopened: ControlRawResult = decode(&bytes).unwrap();
+        assert!(reopened.project_with_trust(&request, &trust).unwrap().is_ok());
+        assert_eq!(encode(&reopened).unwrap(), bytes);
+        for field in ["policy_sha256", "descriptor_sha256"] {
+            let mut changed = value.clone();
+            changed["connection_identity"][field] = serde_json::json!("0".repeat(64));
+            let changed: ControlRawResult = serde_json::from_value(changed).unwrap();
+            assert!(changed.project_with_trust(&request, &trust).is_err(), "{field}");
+        }
+        let mut downgraded = value;
+        downgraded["version"] = serde_json::json!(3);
+        let downgraded: ControlRawResult = serde_json::from_value(downgraded).unwrap();
+        assert!(downgraded.project_with_trust(&request, &trust).is_err());
+    }
+
+    #[test]
+    fn task6_historical_build_a_v3_reopens_under_client_b_without_changing_bytes() {
+        let request_id = "TEST_CODE_FROZEN_A_HEALTH";
+        let request = ControlRequest::capture(ExternalControlRequestMaterial {
+            kind: ExternalControlKind::Health,
+            request_bytes: HealthRequest {
+                context: Some(crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                    protocol_version: 1, request_id: request_id.into(),
+                }),
+            }.encode_to_vec(),
+            request_id: request_id.into(), profile: ContractProfile::ExternalV1,
+            endpoint_uri: "https://TEST_CODE.invalid:443".into(),
+            acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
+        }).unwrap();
+        // Explicit release A fixture; never regenerated from B's current pin.
+        let build = serde_json::json!({
+            "service_version":"0.2.0",
+            "source_revision":"098021444d7b3c0dea4732c1b5a03e8773047cfb",
+            "contract_sha256":"0c4485545dbfd0979a7d5ea206c840f39fd504ed62fb7eef92f1940bdc9c2f41",
+            "binary_sha256":"22a9726aab44473694141ef78b884c56a99549b23d3c3f9381fead66f6510727",
+            "identity_error":""
+        });
+        let health = HealthResponse {
+            request_id: request_id.into(), live: true, ready: true,
+            build_identity: Some(BuildIdentity {
+                service_version: build["service_version"].as_str().unwrap().into(),
+                source_revision: build["source_revision"].as_str().unwrap().into(),
+                contract_sha256: build["contract_sha256"].as_str().unwrap().into(),
+                binary_sha256: build["binary_sha256"].as_str().unwrap().into(),
+                identity_error: String::new(),
+            }),
+            ..Default::default()
+        };
+        let raw: ControlRawResult = serde_json::from_value(serde_json::json!({
+            "version":3,"connect_unavailable":false,"response":health.encode_to_vec(),
+            "code":null,"details":null,"trailer":"Absent","diagnostic":null,
+            "wire_identity":{"profile":"ExternalV1","method":"Health","request_id":request_id,
+                "client_descriptor_sha256":"5ba0fa3b2fa450e74bdcc8cb5f163348a6ca90df3f3626d1d8f2ec27137f5edb"},
+            "verified_build_identity":build
+        })).unwrap();
+        let original = serde_json::to_vec(&raw).unwrap();
+        assert!(raw.project(&request).unwrap().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("TEST_CODE_historical_codec.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE frozen_fixture(bytes BLOB NOT NULL)").unwrap();
+        db.execute("INSERT INTO frozen_fixture(bytes) VALUES(?1)", [&original]).unwrap();
+        drop(db);
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        let frozen: Vec<u8> = reopened.query_row("SELECT bytes FROM frozen_fixture", [], |row| row.get(0)).unwrap();
+        let restored: ControlRawResult = serde_json::from_slice(&frozen).unwrap();
+        let client_b = BuildIdentityTrust::test_client_b();
+        assert!(client_b.current_health(&health).is_err(), "A cannot qualify a new B connection");
+        assert!(restored.project_with_trust(&request, &client_b).unwrap().is_ok(), "B must verify A using frozen historical release policy");
+        let descriptor_b = BuildIdentityTrust::test_client_b_with_descriptor();
+        assert!(restored.project_with_trust(&request, &descriptor_b).unwrap().is_ok(), "historical A descriptor must be independent of current B descriptor");
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), original);
+    }
+
+    #[test]
     fn new_external_control_results_bind_request_and_verified_health_build() {
         let control_request = |kind, id: &str| {
             let context = crate::grpc_client::external_pb::magic::market::v1::RequestContext {
@@ -1919,12 +2110,12 @@ mod tests {
             raw
         };
         let matched = status(detail.encode_to_vec())
-            .project(&request)
+            .project_with_trust(&request, &BuildIdentityTrust::test_client_b_with_descriptor())
             .unwrap()
             .unwrap_err();
         assert_eq!(matched.provider(), Some(crate::market_domain::ProviderId::Eastmoney));
         let conflicting = status(conflict.encode_to_vec())
-            .project(&request)
+            .project_with_trust(&request, &BuildIdentityTrust::test_client_b_with_descriptor())
             .unwrap()
             .unwrap_err();
         assert_eq!(conflicting.provider(), None);

@@ -76,6 +76,16 @@ pub(super) async fn reach_confirmed_health_checkpoint(
     external: &ExternalMtlsMacroFixture,
     owner: &str,
 ) -> ConfirmedHealthCheckpoint {
+    reach_confirmed_health_checkpoint_at_bundle(business, baseline, external, owner, external.bundle_path()).await
+}
+
+pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
+    business: &mut V2BusinessFixture,
+    baseline: &control_tests::ExternalParentBaseline,
+    external: &ExternalMtlsMacroFixture,
+    owner: &str,
+    bundle_path: &std::path::Path,
+) -> ConfirmedHealthCheckpoint {
     let parent_source = &baseline.source;
     let queries = &baseline.queries;
     let stocks = &baseline.stocks;
@@ -89,7 +99,7 @@ pub(super) async fn reach_confirmed_health_checkpoint(
     let baseline_audit = &baseline.audit;
     let database = business.database();
     let macro_source = GrpcSource::from_external_macro_bundle_for_test(
-        external.bundle_path().to_path_buf(),
+        bundle_path.to_path_buf(),
     );
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
@@ -207,7 +217,7 @@ pub(super) async fn reach_confirmed_health_checkpoint(
         let plan = health_pending.plan();
         assert_eq!(plan.profile(), ContractProfile::ExternalV1);
         assert_eq!(plan.acquisition_authority(), Some(AUTHORITY));
-        assert_eq!(plan.endpoint(), external.endpoint());
+        assert_eq!(plan.endpoint(), crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(bundle_path).unwrap().endpoint_uri());
         assert_eq!(plan.started_at().get(), started_at);
         assert_eq!(plan.deadline_at().get(), started_at + 15_000_000);
         assert_eq!(plan.observed_local(), STARTED_LOCAL);
@@ -480,6 +490,10 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                 "TEST_CODE_EXTERNAL_HEALTH_READY_OWNER_A",
             )
             .await;
+            business.chain_post_close().migrate_schema_v11_to_v12().unwrap();
+            business.chain_post_close().migrate_schema_v12_to_v13().unwrap();
+            business.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+            business.chain_post_close().migrate_schema_v14_to_v15().unwrap();
             let parent_endpoint = baseline.endpoint;
             let parent_source = baseline.source;
             let queries = baseline.queries;
@@ -582,7 +596,7 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
             let resume_head = local.inspect_run(&intent).unwrap().head_version();
             assert!(resume_head > health_result_version);
             let mut io = local
-                .macro_preparation_io_v11(
+                .macro_preparation_io_v15(
                     lease,
                     &reopened_queries,
                     &reopened_clock,
@@ -592,6 +606,7 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                     &search_service,
                 )
                 .unwrap();
+            external.release_health();
             let mut prepared = Box::pin(prepare_chain_analysis_with_io(
                 NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
                 stocks,
@@ -609,10 +624,12 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                     ),
                 }
                 let wire = external.snapshot();
-                assert_eq!(wire.health_requests, vec![health_bytes.clone()]);
-                assert_eq!(wire.health_responses, vec![health_response_bytes.clone()]);
+                assert_eq!(wire.health_requests.first(), Some(&health_bytes));
+                assert_eq!(wire.health_responses.first(), Some(&health_response_bytes));
                 assert_eq!(wire.data_calls, 0);
                 if wire.capabilities_calls == 1 {
+                    assert_eq!(wire.health_requests.len(), 2);
+                    assert_ne!(wire.health_requests[0], wire.health_requests[1]);
                     let (recovery, (run_head, run_generation, run_context)) = inspect();
                     assert_eq!(wire.tcp_accepts, 2);
                     assert_eq!(wire.capabilities_requests, vec![capabilities_bytes.clone()]);
@@ -707,6 +724,12 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
             }
             .encode_to_vec();
             external.release_capabilities();
+            while external.snapshot().data_calls == 0 {
+                tokio::select! {
+                    result = &mut prepared => panic!("new owner stopped before original data: {result:?}"),
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
             let capabilities_checkpoint_deadline =
                 std::time::Instant::now() + Duration::from_secs(5);
             let capabilities_result_version = loop {
@@ -726,7 +749,7 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                     assert!(health_result_version < resume_head);
                     assert!(resume_head < capabilities_begin_version);
                     assert!(capabilities_begin_version < capabilities_result_version);
-                    assert_eq!(run_head, capabilities_result_version);
+                    assert_eq!(run_head, recovery.attempts()[0].begin_version());
                     assert_eq!(run_generation, 4);
                     assert_eq!(run_context, parent_context);
                     assert_eq!(episode.ready_result_version(), Some(capabilities_result_version));
@@ -742,8 +765,9 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                         controls[1].response_bytes(),
                         Some(expected_capabilities_bytes.as_slice())
                     );
-                    assert!(!recovery.has_unconfirmed_effect());
-                    assert!(recovery.attempts().is_empty());
+                    assert!(recovery.has_unconfirmed_effect());
+                    assert_eq!(recovery.attempts().len(), 1);
+                    assert_eq!(recovery.attempts()[0].request_bytes(), data_bytes);
                     assert!(recovery
                         .global_news(GlobalNewsProvider::Eastmoney)
                         .is_none());
@@ -763,9 +787,10 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                     );
                     let wire = external.snapshot();
                     assert_eq!(wire.tcp_accepts, 2);
-                    assert_eq!(wire.health_requests, vec![health_bytes.clone()]);
-                    assert_eq!(wire.health_authorized, vec![true]);
-                    assert_eq!(wire.health_responses, vec![health_response_bytes.clone()]);
+                    assert_eq!(wire.health_requests.len(), 2);
+                    assert_eq!(wire.health_requests[0], health_bytes);
+                    assert_eq!(wire.health_authorized, vec![true, true]);
+                    assert_eq!(wire.health_responses[0], health_response_bytes);
                     assert!(wire.health_statuses.is_empty());
                     assert_eq!(wire.capabilities_calls, 1);
                     assert_eq!(wire.capabilities_requests, vec![capabilities_bytes.clone()]);
@@ -775,8 +800,8 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
                         vec![expected_capabilities_bytes.clone()]
                     );
                     assert!(wire.capabilities_statuses.is_empty());
-                    assert_eq!(wire.data_calls, 0);
-                    assert!(wire.data_requests.is_empty());
+                    assert_eq!(wire.data_calls, 1);
+                    assert_eq!(wire.data_requests, vec![data_bytes.clone()]);
                     assert!(wire.data_responses.is_empty());
                     assert!(wire.data_statuses.is_empty());
                     break capabilities_result_version;
@@ -791,8 +816,8 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
             drop(prepared);
             drop(io);
             let stable = local.inspect_macro(&intent).unwrap();
-            assert!(!stable.has_unconfirmed_effect());
-            assert!(stable.attempts().is_empty());
+            assert!(stable.has_unconfirmed_effect());
+            assert_eq!(stable.attempts().len(), 1);
             assert!(stable
                 .global_news(GlobalNewsProvider::Eastmoney)
                 .is_none());
@@ -803,7 +828,7 @@ async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_
             );
             assert_eq!(
                 local.inspect_run(&intent).unwrap().head_version(),
-                capabilities_result_version
+                stable.attempts()[0].begin_version()
             );
             assert_eq!(reopened_clock.observation_calls.get(), 0);
             drop(local);

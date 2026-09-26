@@ -912,7 +912,7 @@ pub(super) fn macro_parent(
     run: &RunRecovery,
 ) -> Result<MacroParent> {
     let layout = schema::runtime_layout_version(transaction)?;
-    require(matches!(layout, 11 | 12 | 13 | 14))?;
+    require(matches!(layout, 11 | 12 | 13 | 14 | 15))?;
     let validated = validate_facts_and_capture_final_at_layout(transaction, intent, run, layout)?;
     macro_parent_from_validated(transaction, intent, run, &validated)
 }

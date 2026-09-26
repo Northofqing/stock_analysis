@@ -508,6 +508,16 @@ pub(crate) async fn run<I: MacroStepIo>(io: &mut I) -> anyhow::Result<String> {
     }
 }
 
+/// Continue exactly the legacy persisted GlobalNews request. This shares the
+/// same readiness, attempt and backoff schedule but never renders a full run.
+pub(crate) async fn continue_legacy_source<I: MacroStepIo>(io: &mut I) -> anyhow::Result<()> {
+    let mut snapshot = io.open()?;
+    if snapshot.queries.len() != 1 || !snapshot.queries.contains_key(&QueryKey::Gateway(1)) {
+        anyhow::bail!("legacy Macro scope is not the original single source");
+    }
+    collect(io, &mut snapshot, &[QueryKey::Gateway(1)]).await
+}
+
 async fn run_inner<I: MacroStepIo>(io: &mut I) -> anyhow::Result<String> {
     let mut snapshot = io.open()?;
     if let Some(output) = &snapshot.final_output {

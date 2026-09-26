@@ -255,7 +255,8 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
     run: &'run RunRecovery,
     validated: Option<&dragon_tiger::ValidatedDragonTiger<'transaction, 'connection, 'run>>,
 ) -> Result<Option<MacroRecovery>> {
-    let retired_layout = schema::runtime_layout_version(transaction)? >= 14;
+    let layout = schema::runtime_layout_version(transaction)?;
+    let retired_layout = layout >= 14;
     let mut groups = old::TABLES
         .iter()
         .chain(TABLES.iter())
@@ -264,6 +265,9 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
         .collect::<Result<Vec<_>>>()?;
     if groups[0].is_empty() {
         require(groups.iter().all(Vec::is_empty))?;
+        if layout >= 15 {
+            require(old::facts(transaction, intent, super::macro_connection::TABLE)?.is_empty())?;
+        }
         return Ok(None);
     }
     require(groups[0].len() == 1 && groups[10].len() <= 1 && groups[11].len() <= 1)?;
@@ -286,6 +290,7 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
             require(groups[7].is_empty())?;
             (
                 MacroRecovery {
+                    qualification_pending: Vec::new(),
                     full: None,
                     plan: plan.core,
                     plan_bytes: fact.bytes.clone(),
@@ -300,6 +305,13 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
         } else {
             let legacy = old::load_legacy_subset(transaction, intent, run, validated)?
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
+            // One frozen request with no full-stage facts is the old single
+            // source contract, even when it recorded a Local observation.
+            // A layout migration must not broaden its execution scope.
+            if layout >= 15 && groups[1].len() == 1 && groups[8..].iter().all(Vec::is_empty)
+                && groups[5].len() == legacy.attempts.len() {
+                return Ok(Some(legacy));
+            }
             let local = match plan3::legacy_local_route(&legacy.plan) {
                 Ok(local) => local,
                 Err(
@@ -335,6 +347,10 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
             && fact.prior >= parent.version,
     )?;
     bound(&fact, plan)?;
+    let connection_history = if layout >= 15 {
+        super::macro_connection::load(transaction, intent, run, plan, fact.version, &fact.digest)?
+    } else { super::macro_connection::Recovery::default() };
+    recovery.qualification_pending = connection_history.pending.clone();
     let mut requests = BTreeMap::new();
     for request_fact in std::mem::take(&mut groups[1]) {
         bound(&request_fact, plan)?;
@@ -491,8 +507,8 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
         } else {
             require(extra.6.is_none())?;
         }
-        let provider_catalog =
-            old::historical_provider_catalog(&recovery.readiness_episodes, extra.6);
+        let provider_catalog = connection_history.data_catalogs.get(&begin.version)
+            .or_else(|| old::historical_provider_catalog(&recovery.readiness_episodes, extra.6));
         let mut attempt = MacroAttemptRecovery {
             query: decoded.query,
             request: request.request.bytes.clone(),
@@ -553,6 +569,7 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
     }
     require(result_by_begin.is_empty())?;
     validate_effect_width(&recovery)?;
+    let connection_facts = connection_history.facts;
     finish_recovery(
         transaction,
         intent,
@@ -564,6 +581,7 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
         rejected,
         groups,
         fact,
+        connection_facts,
     )
 }
 
@@ -609,6 +627,7 @@ fn finish_recovery(
     rejected: Option<(u64, crate::data_gateway::GatewayError)>,
     mut groups: Vec<Vec<Fact>>,
     plan_fact: Fact,
+    connection_facts: Vec<Fact>,
 ) -> Result<Option<MacroRecovery>> {
     let plan = &recovery.plan;
     let definition = plan3::definition(plan)?;
@@ -990,6 +1009,7 @@ fn finish_recovery(
                 .map(|fact| (fact.version, fact.digest.clone())),
         )
         .collect::<Vec<_>>();
+    digest_material.extend(connection_facts.into_iter().map(|fact| (fact.version, fact.digest)));
     digest_material.sort_by_key(|(version, _)| *version);
     require(digest_material.windows(2).all(|pair| pair[0].0 < pair[1].0))?;
     let facts_sha256 = raw_digest(&codec::encode(&digest_material)?)

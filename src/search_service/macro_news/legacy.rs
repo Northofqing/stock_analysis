@@ -313,7 +313,14 @@ impl<'providers> MacroStepIo for Legacy<'providers> {
                     });
                 match attempt {
                     Ok(attempt) => {
-                        async move { Ok(Material::Capabilities(attempt.execute().await)) }.boxed()
+                        async move {
+                            Ok(match attempt.execute().await {
+                                Ok(completion) => Material::Capabilities(completion),
+                                Err(error) => Material::External(Err(
+                                    grpc_source::map_external_connection_error(error),
+                                )),
+                            })
+                        }.boxed()
                     }
                     Err(error) => {
                         let error = grpc_source::map_external_connection_error(error);

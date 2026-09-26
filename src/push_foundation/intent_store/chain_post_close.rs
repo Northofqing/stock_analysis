@@ -59,9 +59,12 @@ mod dragon_tiger_codec;
 mod dragon_tiger_driver;
 #[path = "chain_post_close_macro_codec.rs"]
 mod macro_codec;
+#[path = "chain_post_close_macro_connection.rs"]
+mod macro_connection;
 #[path = "chain_post_close_macro_driver.rs"]
 mod macro_driver;
 #[path = "chain_post_close_macro_driver_v11.rs"]
+#[cfg(test)]
 mod macro_driver_v11;
 #[path = "chain_post_close_macro_live.rs"]
 mod macro_live;
@@ -1279,6 +1282,7 @@ impl<'store> LocalChainPostClose<'store> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn macro_preparation_io_v11<'local, 'provider, C>(
         &'local mut self,
         lease: RunLease,
@@ -1354,6 +1358,19 @@ impl<'store> LocalChainPostClose<'store> {
         )
     }
 
+    /// Requires an explicitly migrated/qualified layout15. Never migrates on open.
+    pub(crate) fn macro_preparation_io_v15<'local, 'provider, C>(
+        &'local mut self, lease: RunLease, queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C, configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource, source: &'provider GrpcSource,
+        search_service: &'provider SearchService,
+    ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
+    where C: MacroObservationClock,
+    {
+        self.macro_preparation_io_at_layout(lease, queries, clock, configuration,
+            parent_source, source, search_service, MacroLayout::V15)
+    }
+
     fn macro_preparation_io_at_layout<'local, 'provider, C>(
         &'local mut self,
         lease: RunLease,
@@ -1371,9 +1388,11 @@ impl<'store> LocalChainPostClose<'store> {
         schema::verify_runtime_layout_version(
             &self.store.connection,
             match layout {
+                #[cfg(test)]
                 MacroLayout::V11 => 11,
                 MacroLayout::V12 => 12,
                 MacroLayout::V14 => 14,
+                MacroLayout::V15 => 15,
             },
         )?;
         self.recover_macro_parent(&lease, clock.now())?;
@@ -1445,6 +1464,19 @@ impl<'store> LocalChainPostClose<'store> {
             lease, queries, clock, configuration, parent_source, source,
             search_service, analyzer, 14, MacroLayout::V14,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn models_preparation_io_v15<'local, 'provider, C>(
+        &'local mut self, lease: RunLease, queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C, configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource, source: &'provider GrpcSource,
+        search_service: &'provider SearchService, analyzer: &'provider crate::analyzer::GeminiAnalyzer,
+    ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
+    where C: ModelsObservationClock,
+    {
+        self.models_preparation_io_at_layout(lease, queries, clock, configuration, parent_source,
+            source, search_service, analyzer, 15, MacroLayout::V15)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1677,10 +1709,10 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
         schema::verify_v12_read_pass(connection, proof)?;
     }
     let recovery = inspect_run_on_with_catalog(connection, intent_id, layout_version, proof)?;
-    if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+    if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
         concept_rpc::validate_concept_rpc_facts(connection, intent_id)?;
     }
-    let validated_positions = if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+    let validated_positions = if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
         let concepts = inspect_concept_batch_from_recovery_on(connection, intent_id, &recovery)?;
         let parent = cluster::validate_existing_cluster_facts_scoped(
             connection,
@@ -1729,7 +1761,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
     } else {
         None
     };
-    if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14) {
+    if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14 | 15) {
         if let Some(proof) = proof {
             position_concept_rpc::validate_facts_after_position_validation(
                 connection,
@@ -1750,7 +1782,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
             )?;
         }
     }
-    let dragon_tiger = if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
+    let dragon_tiger = if matches!(layout_version, 10 | 11 | 12 | 13 | 14 | 15) {
         Some(
             dragon_tiger::validate_facts_and_capture_final_after_position_validation_scoped(
                 connection,
@@ -1764,7 +1796,7 @@ fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
     } else {
         None
     };
-    let (macro_recovery, consumed) = if matches!(layout_version, 11 | 12 | 13 | 14) {
+    let (macro_recovery, consumed) = if matches!(layout_version, 11 | 12 | 13 | 14 | 15) {
         let dragon_tiger = dragon_tiger.ok_or(ChainPostCloseError::SchemaRejected)?;
         let macro_recovery = macro_stage::load_on_after_dragon_validation_scoped(
             connection,
@@ -1973,7 +2005,7 @@ fn validate_run_fact_versions_body(
     head: u64,
     layout_version: i64,
 ) -> Result<(), ChainPostCloseError> {
-    if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
+    if matches!(layout_version, 10 | 11 | 12 | 13 | 14 | 15) {
         let tables = [
             "chain_post_close_stage_begins",
             "chain_post_close_stage_results",
@@ -2011,7 +2043,7 @@ fn validate_run_fact_versions_body(
             "chain_post_close_dragon_tiger_finals",
         ];
         let mut unique = HashSet::new();
-        let macro_tables = if matches!(layout_version, 11 | 12 | 13 | 14) {
+        let macro_tables = if matches!(layout_version, 11 | 12 | 13 | 14 | 15) {
             macro_stage::TABLES.as_slice()
         } else {
             &[]
@@ -2031,12 +2063,18 @@ fn validate_run_fact_versions_body(
         } else {
             &[]
         };
+        let connection_tables = if layout_version >= 15 {
+            &["chain_post_close_macro_connection_facts"][..]
+        } else {
+            &[]
+        };
         for table in tables
             .into_iter()
             .chain(macro_tables.iter().copied())
             .chain(full_tables.iter().copied())
             .chain(models_tables.iter().copied())
             .chain(retired_tables.iter().copied())
+            .chain(connection_tables.iter().copied())
         {
             let sql = format!(
                 "SELECT run_version FROM {table} WHERE intent_id=?1 AND run_version IS NOT NULL"
@@ -2231,7 +2269,7 @@ pub(super) fn validate_all_runs_at_layout(
     if layout_version >= 12 {
         schema::verify_parent_layout_v12(transaction)?;
     }
-    if !matches!(layout_version, 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+    if !matches!(layout_version, 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
         return Err(ChainPostCloseError::UnsupportedVersion);
     }
     validate_owned_foreign_keys(transaction)?;
@@ -2269,10 +2307,10 @@ pub(super) fn validate_all_runs_at_layout(
             parent.as_ref(),
             layout_version,
         )?;
-        if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+        if matches!(layout_version, 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
             concept_rpc::validate_concept_rpc_fact_rows(transaction, &intent)?;
         }
-        if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+        if matches!(layout_version, 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15) {
             positions::validate_existing_position_facts_at_layout(
                 transaction,
                 &intent,
@@ -2281,10 +2319,10 @@ pub(super) fn validate_all_runs_at_layout(
                 layout_version,
             )?;
         }
-        if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14) {
+        if matches!(layout_version, 9 | 10 | 11 | 12 | 13 | 14 | 15) {
             position_concept_rpc::validate_facts(transaction, &intent, &recovery, layout_version)?;
         }
-        if matches!(layout_version, 10 | 11 | 12 | 13 | 14) {
+        if matches!(layout_version, 10 | 11 | 12 | 13 | 14 | 15) {
             dragon_tiger::validate_facts_at_layout(
                 transaction,
                 &intent,
@@ -2292,7 +2330,7 @@ pub(super) fn validate_all_runs_at_layout(
                 layout_version,
             )?;
         }
-        if matches!(layout_version, 11 | 12 | 13 | 14) {
+        if matches!(layout_version, 11 | 12 | 13 | 14 | 15) {
             macro_stage::validate_facts(transaction, &intent, &recovery)?;
         }
         if layout_version >= 13 {
@@ -3047,9 +3085,11 @@ enum BoardSource<'provider> {
 
 #[derive(Clone, Copy)]
 enum MacroLayout {
+    #[cfg(test)]
     V11,
     V12,
     V14,
+    V15,
 }
 
 struct MacroInput<'provider> {
@@ -3930,6 +3970,7 @@ where
                 })
             })?;
             match input.layout {
+                #[cfg(test)]
                 MacroLayout::V11 => {
                     let lease = macro_driver_v11::drive(
                         self.local,
@@ -3946,7 +3987,7 @@ where
                     }
                     .into());
                 }
-                MacroLayout::V12 | MacroLayout::V14 => {
+                MacroLayout::V12 | MacroLayout::V14 | MacroLayout::V15 => {
                     let (lease, output) = macro_driver::drive(
                         self.local,
                         lease,
@@ -3957,7 +3998,12 @@ where
                     )
                     .await?;
                     self.lease = Some(lease);
-                    return Ok(output);
+                    return match output {
+                        macro_driver::Outcome::Full(output) => Ok(output),
+                        macro_driver::Outcome::LegacySourceConfirmed => Err(PreparationStop::StageNotMigrated {
+                            next: UnmigratedStage::Macro,
+                        }.into()),
+                    };
                 }
             }
         }
@@ -4456,6 +4502,13 @@ impl ChainPostClose<'_> {
         &mut self,
     ) -> Result<ChainPostCloseSchemaReceipt, ChainPostCloseError> {
         schema::migrate_v14(&mut self.store.connection)
+    }
+
+    /// Explicit maintenance operation; ordinary store open never calls this.
+    pub(crate) fn migrate_schema_v14_to_v15(
+        &mut self,
+    ) -> Result<ChainPostCloseSchemaReceipt, ChainPostCloseError> {
+        schema::migrate_v15(&mut self.store.connection)
     }
 
     pub(crate) fn migrate_schema_v7_to_v8(

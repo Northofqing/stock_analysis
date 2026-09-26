@@ -23,12 +23,6 @@ const TEST_CODE_HEALTH_STATE: &str = "TEST_CODE_NATIVE_HEALTH_RUNNING";
 const TEST_CODE_GLOBAL_NEWS_PROVIDER: &str = "TEST_CODE_NATIVE_GLOBAL_NEWS_PROVIDER";
 const TEST_CODE_AUCTION_PROVIDER: &str = "TEST_CODE_NATIVE_AUCTION_PROVIDER";
 const TEST_CODE_AUCTION_SCOPE: &str = "TEST_CODE_CURRENT_AUCTION_OBSERVATIONS_SCOPE";
-const TEST_CODE_SERVICE_VERSION: &str = "TEST_CODE_SERVICE_VERSION_2026_09_16";
-const TEST_CODE_SOURCE_REVISION: &str = "TEST_CODE_SOURCE_REVISION_NATIVE_CONTROL";
-const TEST_CODE_CONTRACT_SHA256: &str =
-    "TEST_CODE_CONTRACT_SHA256_0123456789abcdef0123456789abcdef0123456789abcdef";
-const TEST_CODE_BINARY_SHA256: &str =
-    "TEST_CODE_BINARY_SHA256_fedcba9876543210fedcba9876543210fedcba9876543210";
 const TEST_CODE_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(35);
 const TEST_CODE_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -53,13 +47,7 @@ fn test_code_observability() -> RuntimeObservability {
 }
 
 fn test_code_build_identity() -> BuildIdentity {
-    BuildIdentity {
-        service_version: TEST_CODE_SERVICE_VERSION.to_owned(),
-        source_revision: TEST_CODE_SOURCE_REVISION.to_owned(),
-        contract_sha256: TEST_CODE_CONTRACT_SHA256.to_owned(),
-        binary_sha256: TEST_CODE_BINARY_SHA256.to_owned(),
-        identity_error: String::new(),
-    }
+    crate::grpc_client::build_identity::test_public_build_identity()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -426,7 +414,8 @@ async fn grpc_dual_contract_external_native_controls_preserve_health_identity_an
             let capabilities_completion =
                 tokio::time::timeout(TEST_CODE_RECEIPT_TIMEOUT, &mut capabilities_execution)
                     .await
-                    .expect("TEST_CODE native Capabilities completion deadline");
+                    .expect("TEST_CODE native Capabilities completion deadline")
+                    .expect("TEST_CODE qualified Capabilities admission");
             capabilities_completion
                 .processed()
                 .expect("TEST_CODE native Capabilities processed response");

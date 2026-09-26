@@ -347,6 +347,7 @@ async fn drive_external(
             if returned_at.get() >= deadline || tokio::time::Instant::now() >= limit {
                 return Err(unconfirmed(intent));
             }
+            let completion = completion.map_err(|_| unconfirmed(intent))?;
             let (next_lease, outcome) = local
                 .record_capabilities_control_result(lease, call, &completion, returned_at)
                 .map_err(|error| result_unconfirmed(error, intent.to_owned()))?;

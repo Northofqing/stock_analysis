@@ -788,7 +788,8 @@ async fn external_control_restore_reauthorizes_then_reuses_health_connection_for
             let capabilities_completion =
                 tokio::time::timeout(Duration::from_secs(5), &mut capabilities_execution)
                     .await
-                    .expect("TEST_CODE Capabilities completion deadline");
+                    .expect("TEST_CODE Capabilities completion deadline")
+                    .expect("TEST_CODE qualified Capabilities admission");
             capabilities_completion
                 .processed()
                 .expect("TEST_CODE Capabilities processed response");
@@ -1056,6 +1057,8 @@ async fn execute_loopback_capabilities(
 ) {
     let request_id = capabilities.request_id().to_owned();
     let request_bytes = capabilities.request_bytes();
+    let (_, _, health) = execute_loopback_health(server).await;
+    let capabilities = capabilities.bind_connected(health.into_connected_client().expect("explicit Health qualified this connection")).unwrap();
     let execution = capabilities.execute();
     tokio::pin!(execution);
     let receipt_deadline = Instant::now() + Duration::from_secs(5);
@@ -1077,8 +1080,8 @@ async fn execute_loopback_capabilities(
     }
     let received = server.snapshot();
     assert_eq!(received.tcp_accepts, 1);
-    assert!(received.health_requests.is_empty());
-    assert!(received.health_authorized.is_empty());
+    assert_eq!(received.health_requests.len(), 1);
+    assert_eq!(received.health_authorized, vec![true]);
     assert_eq!(received.capabilities_requests, vec![request_bytes.clone()]);
     assert_eq!(received.capabilities_authorized, vec![true]);
     assert_eq!(received.capabilities_calls, 1);
@@ -1087,12 +1090,13 @@ async fn execute_loopback_capabilities(
     server.release_capabilities();
     let completion = tokio::time::timeout(Duration::from_secs(5), &mut execution)
         .await
-        .expect("TEST_CODE External Capabilities completion deadline");
+        .expect("TEST_CODE External Capabilities completion deadline")
+        .expect("TEST_CODE qualified Capabilities admission");
     (request_id, request_bytes, completion)
 }
 
 #[tokio::test]
-async fn external_capabilities_restored_pending_cold_execute_sends_capabilities_without_health() {
+async fn external_capabilities_restored_pending_requires_explicit_health_and_preserves_request() {
     use super::external_control_attempt::{ExternalControlKind, ExternalControlResultMaterial};
 
     const OLD_BEARER: &str = "TEST_CODE_EXTERNAL_CONTROL_OLD_TOKEN";
@@ -1152,6 +1156,11 @@ async fn external_capabilities_restored_pending_cold_execute_sends_capabilities_
             tokio::task::yield_now().await;
             assert_no_external_control_effects(server);
 
+            let material = capabilities.request_material();
+            assert!(capabilities.execute().await.is_err(), "cold Capabilities must not connect or send");
+            assert_no_external_control_effects(server);
+            let capabilities = current.resume_capabilities_attempt(material).unwrap();
+
             let (request_id, request_bytes, completion) =
                 execute_loopback_capabilities(server, capabilities).await;
             assert_eq!(request_id, original_id);
@@ -1169,7 +1178,7 @@ async fn external_capabilities_restored_pending_cold_execute_sends_capabilities_
             }
             let observed = server.snapshot();
             assert_eq!(observed.tcp_accepts, 1);
-            assert!(observed.health_requests.is_empty());
+            assert_eq!(observed.health_requests.len(), 1);
             assert_eq!(observed.capabilities_requests, vec![original_bytes]);
             assert_eq!(
                 observed.capabilities_responses,
@@ -1586,7 +1595,7 @@ async fn external_capabilities_status_preserves_code_details_and_trailer_without
                 assert_eq!(actual_status.code, tonic::Code::Unavailable as i32);
                 assert_eq!(actual_status.details, expected_details);
                 assert_eq!(actual_status.trailer, expected_trailer);
-                assert!(observed.health_requests.is_empty());
+                assert_eq!(observed.health_requests.len(), 1);
                 assert_eq!(observed.data_calls, 0);
 
                 let processed = completion
@@ -1693,7 +1702,7 @@ async fn external_capabilities_mismatched_request_id_preserves_response_without_
                 vec![expected.encode_to_vec()]
             );
             assert!(observed.capabilities_statuses.is_empty());
-            assert!(observed.health_requests.is_empty());
+            assert_eq!(observed.health_requests.len(), 1);
             assert_eq!(observed.data_calls, 0);
             match completion.result_material() {
                 ExternalControlResultMaterial::Response { bytes, response } => {
@@ -1734,8 +1743,8 @@ async fn external_capabilities_mismatched_request_id_preserves_response_without_
 }
 
 #[tokio::test]
-async fn external_capabilities_connect_failure_is_local_unavailable_without_status_or_client() {
-    use crate::grpc_client::errors::{ErrorDetail as ClientErrorDetail, GrpcError};
+async fn external_capabilities_without_qualification_rejects_before_connect() {
+    use crate::grpc_client::errors::GrpcError;
     use tokio::net::TcpSocket;
 
     let mut socket = None;
@@ -1770,23 +1779,12 @@ async fn external_capabilities_connect_failure_is_local_unavailable_without_stat
             let capabilities = prepared
                 .prepare_capabilities_attempt()
                 .expect("TEST_CODE closed socket Capabilities");
-            let completion = tokio::time::timeout(Duration::from_secs(5), capabilities.execute())
+            let result = tokio::time::timeout(Duration::from_secs(5), capabilities.execute())
                 .await
-                .expect("TEST_CODE Capabilities connect failure deadline");
-            let processed = completion
-                .processed()
-                .expect_err("TEST_CODE Capabilities connect must fail");
-            match completion.result_material() {
-                ExternalControlResultMaterial::ConnectUnavailable { error } => {
-                    assert!(matches!(error, GrpcError::Unavailable { .. }));
-                    assert_eq!(error.details(), &ClientErrorDetail::default());
-                    assert!(std::ptr::eq(error, processed));
-                }
-                _ => panic!("TEST_CODE expected Capabilities ConnectUnavailable"),
-            }
-            assert!(matches!(processed, GrpcError::Unavailable { .. }));
-            assert_eq!(processed.details(), &ClientErrorDetail::default());
-            assert!(completion.into_connected_client().is_none());
+                .expect("TEST_CODE bounded local rejection");
+            let Err(error) = result else { panic!("cold Capabilities cannot mint a transport result") };
+            assert!(matches!(error, GrpcError::FailedPrecondition { .. }));
+            assert_eq!(error.details().code, "external_connection_unqualified");
             drop(prepared);
         }))
         .catch_unwind()
@@ -1799,7 +1797,7 @@ async fn external_capabilities_connect_failure_is_local_unavailable_without_stat
 }
 
 #[tokio::test]
-async fn external_macro_restored_pending_cold_execute_sends_only_original_data() {
+async fn external_macro_restored_pending_after_explicit_health_sends_original_data() {
     use super::macro_attempt::{
         ExternalMacroAttemptCompletion, MacroContinuation, MacroTrailerMaterial,
         RestoredExternalMacroRequest, RestoredMacroRequest,
@@ -1932,7 +1930,9 @@ async fn external_macro_restored_pending_cold_execute_sends_only_original_data()
             assert_eq!(before_execute.data_calls, 0);
             assert!(before_execute.data_requests.is_empty());
 
-            let execution = resumed.execute();
+            let (_, _, health) = execute_loopback_health(server).await;
+            let connected = resumed.bind_connected(health.into_connected_client().unwrap()).unwrap();
+            let execution = async { Ok::<_, crate::grpc_client::errors::GrpcError>(ExternalMacroAttemptCompletion::Unary(connected.execute().await)) };
             tokio::pin!(execution);
             let receipt_deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -1953,8 +1953,8 @@ async fn external_macro_restored_pending_cold_execute_sends_only_original_data()
             }
             let received = server.snapshot();
             assert_eq!(received.tcp_accepts, 1);
-            assert!(received.health_requests.is_empty());
-            assert!(received.health_responses.is_empty());
+            assert_eq!(received.health_requests.len(), 1);
+            assert_eq!(received.health_responses.len(), 1);
             assert_eq!(received.capabilities_calls, 0);
             assert!(received.capabilities_requests.is_empty());
             assert!(received.capabilities_responses.is_empty());
@@ -2023,7 +2023,7 @@ async fn external_macro_restored_pending_cold_execute_sends_only_original_data()
             let observed = server.snapshot();
             assert_eq!(observed.data_responses, vec![expected_response_bytes]);
             assert_eq!(observed.tcp_accepts, 1);
-            assert!(observed.health_requests.is_empty());
+            assert_eq!(observed.health_requests.len(), 1);
             assert_eq!(observed.capabilities_calls, 0);
             assert!(observed.capabilities_requests.is_empty());
             assert_eq!(observed.data_calls, 1);
@@ -2631,7 +2631,9 @@ async fn external_macro_unary_status_remains_distinct_from_connect_unavailable()
                 .expect("TEST_CODE External Macro Status request");
             let request_id = request.request_id().to_owned();
             let request_bytes = request.request_bytes();
-            let execution = request.execute();
+            let (_, _, health) = execute_loopback_health(server).await;
+            let connected = request.bind_connected(health.into_connected_client().unwrap()).unwrap();
+            let execution = async { Ok::<_, crate::grpc_client::errors::GrpcError>(ExternalMacroAttemptCompletion::Unary(connected.execute().await)) };
             tokio::pin!(execution);
             let receipt_deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -2652,7 +2654,7 @@ async fn external_macro_unary_status_remains_distinct_from_connect_unavailable()
             }
             let received = server.snapshot();
             assert_eq!(received.tcp_accepts, 1);
-            assert!(received.health_requests.is_empty());
+            assert_eq!(received.health_requests.len(), 1);
             assert_eq!(received.capabilities_calls, 0);
             assert_eq!(received.data_calls, 1);
             assert_eq!(received.data_methods, vec!["global_news"]);
@@ -2736,7 +2738,7 @@ async fn external_macro_unary_status_remains_distinct_from_connect_unavailable()
                 expected_detail
             );
             assert_eq!(observed.tcp_accepts, 1);
-            assert!(observed.health_requests.is_empty());
+            assert_eq!(observed.health_requests.len(), 1);
             assert_eq!(observed.capabilities_calls, 0);
             assert_eq!(observed.data_calls, 1);
             assert_eq!(observed.data_requests, vec![request_bytes]);

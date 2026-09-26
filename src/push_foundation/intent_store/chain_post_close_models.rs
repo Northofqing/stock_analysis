@@ -466,7 +466,7 @@ impl LocalChainPostClose<'_> {
         now: UtcMicros,
     ) -> Result<(RunRecovery, MacroParent)> {
         let layout = schema::runtime_layout_version(transaction)?;
-        require(matches!(layout, 13 | 14))?;
+        require(matches!(layout, 13 | 14 | 15))?;
         let recovery = inspect_run_on_at_layout(transaction, &lease.intent_id, layout)?;
         check_lease(transaction, lease, now)?;
         validate_identity(&recovery, lease)?;

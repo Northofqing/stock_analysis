@@ -41,6 +41,13 @@ pub(super) struct Ticket {
     guard: EffectGuard,
 }
 
+enum DataAppendAuthority {
+    Connection(Option<crate::grpc_client::connection_qualification::ConnectionIdentity>),
+    /// Offline legacy fixture construction; never compiled into an owner binary.
+    #[cfg(test)]
+    HistoricalV12Fixture,
+}
+
 pub(super) struct Live<'local, 'store, 'clock> {
     local: &'local mut LocalChainPostClose<'store>,
     lease: RunLease,
@@ -159,11 +166,13 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                 lease.intent_id.as_str(),
             ));
         }
+        let layout = catalog.layout();
         transaction.commit()
             .map_err(|_| storage("full Macro open commit"))?;
         if let Some(recovery) = &current {
             if recovery.full.is_none() {
-                plan3::legacy_local_route(&recovery.plan)?;
+                require(layout == 15)?;
+                recovery.legacy_snapshot()?;
             }
         }
         let started = current
@@ -232,13 +241,11 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         self.current.as_ref()
     }
     pub(super) fn snapshot(&self) -> anyhow::Result<Snapshot> {
-        Ok(self
-            .current
-            .as_ref()
-            .and_then(|recovery| recovery.full.as_ref())
-            .ok_or(ChainPostCloseError::MacroNotStarted)?
-            .snapshot
-            .clone())
+        let current = self.current.as_ref().ok_or(ChainPostCloseError::MacroNotStarted)?;
+        Ok(match &current.full {
+            Some(full) => full.snapshot.clone(),
+            None => current.legacy_snapshot()?,
+        })
     }
     pub(super) fn now(&self) -> i64 {
         self.clock.now().get()
@@ -431,6 +438,34 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         request: codec::Request,
         endpoint: &str,
     ) -> anyhow::Result<Ticket> {
+        self.begin_data_connection(query, attempt, request, endpoint, None)
+    }
+
+    pub(super) fn begin_data_connection(
+        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+        connection: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
+    ) -> anyhow::Result<Ticket> {
+        self.begin_data_with_authority(query, attempt, request, endpoint, DataAppendAuthority::Connection(connection))
+    }
+
+    /// Only builds frozen v12 bytes offline. The returned ticket is a journal
+    /// fact, not a client/session or permission to issue an RPC.
+    #[cfg(test)]
+    pub(super) fn begin_historical_v12_data_fixture(
+        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+    ) -> anyhow::Result<Ticket> {
+        self.begin_data_with_authority(query, attempt, request, endpoint, DataAppendAuthority::HistoricalV12Fixture)
+    }
+
+    fn begin_data_with_authority(
+        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+        authority: DataAppendAuthority,
+    ) -> anyhow::Result<Ticket> {
+        let (connection, historical_fixture) = match authority {
+            DataAppendAuthority::Connection(connection) => (connection, false),
+            #[cfg(test)]
+            DataAppendAuthority::HistoricalV12Fixture => (None, true),
+        };
         if self.cancelled.get() {
             return Err(PreparationStop::ResultUnconfirmed {
                 intent_id: self.lease.intent_id.as_str().to_owned(),
@@ -447,6 +482,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             .map_err(|_| storage("full Macro data begin"))?;
         let checkpoint_now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
+        if historical_fixture {
+            require(catalog.layout() == 12
+                && request.contract_profile() == crate::grpc_client::client::ContractProfile::ExternalV1)?;
+        }
         let (run, current) = admitted(
             &transaction,
             &catalog,
@@ -473,14 +512,11 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             .current
             .as_ref()
             .ok_or(ChainPostCloseError::MacroNotStarted)?;
-        let full = current
-            .full
-            .as_ref()
-            .ok_or(ChainPostCloseError::SchemaRejected)?;
-        let identity = full.snapshot.definition.identity(query)?;
+        let full = current.full.as_ref();
+        let snapshot = match full { Some(full) => full.snapshot.clone(), None => current.legacy_snapshot()? };
+        let identity = snapshot.definition.identity(query)?;
         request.validate_for(&identity)?;
-        let state = full
-            .snapshot
+        let state = snapshot
             .queries
             .get(&query)
             .cloned()
@@ -493,13 +529,19 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
-        let request_version = if let Some(original) = full.requests.get(&query) {
+        let request_version = if full.is_none() {
+            require(catalog.layout() == 15 && query == QueryKey::Gateway(1)
+                && endpoint == current.plan.endpoint()
+                && codec::encode(&request)? == codec::encode(&current.plan.request)?)?;
+            current.request_plan_version
+        } else if let Some(original) = full.and_then(|full| full.requests.get(&query)) {
             require(
                 original.endpoint == endpoint
                     && codec::encode(&original.request)? == codec::encode(&request)?,
             )?;
             original.fact.version
         } else {
+            let full = full.ok_or(ChainPostCloseError::SchemaRejected)?;
             let value = plan3::RequestPlan {
                 version: 2,
                 query,
@@ -520,12 +562,17 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let ready = if request.contract_profile()
             == crate::grpc_client::client::ContractProfile::ExternalV1
         {
-            // Historical V1 Health results and control requests remain
-            // readable, but lack the identities required for a new data effect.
+            // This checks the frozen episode's shape only. It grants no send
+            // authority: the layout15/current-generation receipt gate below
+            // is required for every new external data effect.
             require(current
                 .readiness_episodes
                 .first()
-                .is_some_and(old::MacroReadinessEpisodeRecovery::authorizes_new_data_effect))?;
+                .is_some_and(|episode| episode.controls.len() == 2
+                    && episode.controls.iter().all(|control|
+                        control.outcome == Some(old::MacroControlOutcome::Ready)
+                            && matches!(control.qualification_version, Some(3 | 4))
+                            && control.request.has_wire_identity())))?;
             Some(
                 current
                     .readiness_episodes
@@ -550,7 +597,37 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                 .find(|previous| previous.query == query)
                 .and_then(|previous| previous.result),
         };
-        let begin = writer.append(Body::DataBegin(&value))?;
+        if request.contract_profile() == crate::grpc_client::client::ContractProfile::ExternalV1 && !historical_fixture {
+            require(catalog.layout() == 15)?;
+            let identity = connection.ok_or(ChainPostCloseError::SchemaRejected)?;
+            let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
+            let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+                &current.plan, current.plan_version, &plan_sha256)?;
+            let (qualification, _) = history.qualified(&identity)?;
+            let capabilities = history.capabilities.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            let link = super::macro_connection::EffectLink {
+                version: 1, identity, plan_version: current.plan_version, plan_sha256,
+                qualification_version: qualification.version, qualification_sha256: qualification.digest.clone(),
+                effect_begin_version: writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?,
+                request: capabilities.request.clone(),
+                data: Some(super::macro_connection::DataEffect {
+                    query, attempt, request_plan_version: request_version, request: request.clone(),
+                    capabilities_begin_version: capabilities.begin_version,
+                    capabilities_result_version: capabilities.result_version,
+                    capabilities_result_sha256: capabilities.result_sha256.clone(),
+                }),
+            };
+            writer.append(Body::ConnectionEffectLink(&link))?;
+        }
+        let begin = if full.is_some() { writer.append(Body::DataBegin(&value))? } else {
+            writer.append(Body::LegacyDataBegin {
+                value: &old::Begin {
+                    version: 1, ordinal: attempt,
+                    plan_sha256: raw_digest(&current.plan_bytes).as_str().to_owned(),
+                    request_sha256: value.request_sha256.clone(), previous_result: value.previous_result_version,
+                }, links: &value,
+            })?
+        };
         let receipt = writer.receipt(initial_head)?;
         drop(writer);
         let mut expected = self.active.clone();
@@ -589,9 +666,127 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         Ok(ticket)
     }
 
-    pub(super) fn begin_control(
+    /// A fresh physical generation is an independent effect, never a rewrite
+    /// of the original plan's Health. Its unresolved ticket survives reopen.
+    pub(super) fn begin_qualification_control(
         &mut self,
         material: ExternalControlRequestMaterial,
+        identity: crate::grpc_client::connection_qualification::ConnectionIdentity,
+    ) -> anyhow::Result<Ticket> {
+        self.checkpoint()?;
+        require(self.active.is_empty())?;
+        let gate = self.gate();
+        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage("Macro qualification begin"))?;
+        let now = gate.sample(false)?;
+        let catalog = schema::verify_v12_transaction(&transaction)?;
+        require(catalog.layout() == 15)?;
+        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
+        let request = codec::ControlRequest::capture(material)?;
+        let health = request.kind() == ExternalControlKind::Health;
+        let step = if health { Step::Health } else { Step::Capabilities };
+        require(current.readiness_episodes.first().and_then(|episode| episode.controls.get(if health { 0 } else { 1 }))
+            .is_some_and(|control| control.outcome == Some(old::MacroControlOutcome::Ready)
+                && control.request.request_id() != request.request_id()))?;
+        let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
+        let initial = self.lease.head;
+        let mut candidate = transaction_lease_candidate(&self.lease);
+        let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
+        let begin = if health {
+            let value = super::macro_connection::HealthBegin {
+                version: 1, identity, plan_version: current.plan_version, plan_sha256,
+                request, control_begin_version: None,
+            };
+            value.validate()?;
+            writer.append(Body::ConnectionHealthBegin(&value))?
+        } else {
+            let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+                &current.plan, current.plan_version, &plan_sha256)?;
+            let (fact, _) = history.qualified(&identity)?;
+            require(!history.capability_begins.contains_key(&identity.epoch) && !history.capabilities.contains_key(&identity.epoch))?;
+            writer.append(Body::ConnectionCapabilitiesBegin(&super::macro_connection::CapabilitiesBegin {
+                version: 1, identity, plan_version: current.plan_version, plan_sha256, request,
+                qualification_version: fact.version, qualification_sha256: fact.digest.clone(),
+            }))?
+        };
+        let receipt = writer.receipt(initial)?;
+        drop(writer);
+        let mut expected = self.active.clone();
+        require(expected.insert(step, begin).is_none())?;
+        let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
+        gate.sample(false)?;
+        transaction.commit().map_err(|_| storage("Macro qualification begin commit"))?;
+        self.lease.head = candidate.head;
+        self.active = expected;
+        self.current = current;
+        let ticket = Ticket { step, begin, guard: EffectGuard::new(Rc::clone(&self.cancelled)) };
+        gate.after_commit(receipt, false)?;
+        Ok(ticket)
+    }
+
+    pub(super) fn record_qualification_control(
+        &mut self,
+        mut ticket: Ticket,
+        mut raw: codec::ControlRawResult,
+        identity: crate::grpc_client::connection_qualification::ConnectionIdentity,
+    ) -> anyhow::Result<bool> {
+        require(matches!(ticket.step, Step::Health | Step::Capabilities) && self.active.get(&ticket.step) == Some(&ticket.begin))?;
+        let gate = self.gate();
+        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage("Macro qualification result"))?;
+        let now = gate.sample(false)?;
+        let catalog = schema::verify_v12_transaction(&transaction)?;
+        require(catalog.layout() == 15)?;
+        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
+        let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
+        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+            &current.plan, current.plan_version, &plan_sha256)?;
+        let (begin_fact, request) = if ticket.step == Step::Health {
+            let (fact, begin) = history.begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(begin.identity == identity && begin.control_begin_version.is_none() && !history.results.contains_key(&identity.epoch))?;
+            raw.bind_connection_identity(&begin.request, &identity, None)?;
+            (fact, &begin.request)
+        } else {
+            let (fact, begin) = history.capability_begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(begin.identity == identity && !history.capabilities.contains_key(&identity.epoch))?;
+            let (_, health_begin) = history.begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            let response = history.health_responses.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            raw.bind_connection_identity(&begin.request, &identity, Some((&health_begin.request, response)))?;
+            (fact, &begin.request)
+        };
+        require(begin_fact.version == ticket.begin)?;
+        let qualified = raw.project(request)?.is_ok();
+        let value = super::macro_connection::HealthResult {
+            version: 1, identity, plan_version: current.plan_version, plan_sha256,
+            begin_version: begin_fact.version, begin_sha256: begin_fact.digest.clone(),
+            control_result_version: None, control_result_sha256: raw_digest(&codec::encode(&raw)?).as_str().to_owned(),
+            raw: Some(raw), qualified,
+        };
+        let initial = self.lease.head;
+        let mut candidate = transaction_lease_candidate(&self.lease);
+        let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
+        writer.append(if ticket.step == Step::Health { Body::ConnectionHealthResult(&value) } else { Body::ConnectionCapabilitiesResult(&value) })?;
+        let receipt = writer.receipt(initial)?;
+        drop(writer);
+        let mut expected = self.active.clone();
+        require(expected.remove(&ticket.step) == Some(ticket.begin))?;
+        let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
+        gate.sample(false)?;
+        transaction.commit().map_err(|_| PreparationStop::ResultUnconfirmed { intent_id: gate.intent.clone() })?;
+        self.lease.head = candidate.head;
+        self.active = expected;
+        self.current = current;
+        ticket.guard.disarm();
+        gate.after_commit(receipt, false)?;
+        Ok(qualified)
+    }
+
+    pub(super) fn begin_control_connection(
+        &mut self,
+        material: ExternalControlRequestMaterial,
+        connection: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
     ) -> anyhow::Result<Ticket> {
         self.checkpoint()?;
         let (step, ordinal, kind) = match material.kind {
@@ -623,7 +818,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         control.request.matches_material(&material)?;
         let health_result = if ordinal == 2 {
             require(episode.controls[0].outcome == Some(old::MacroControlOutcome::Ready))?;
-            require(episode.controls[0].qualification_version == Some(3)
+            require(matches!(episode.controls[0].qualification_version, Some(3 | 4))
                 && episode.controls[0].request.has_wire_identity())?;
             Some(
                 episode.controls[0]
@@ -649,6 +844,31 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
+        if let Some(identity) = connection {
+            require(catalog.layout() == 15)?;
+            let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
+            if ordinal == 1 {
+                let qualification = super::macro_connection::HealthBegin {
+                    version: 1, identity, plan_version: current.plan_version, plan_sha256,
+                    request: control.request.clone(),
+                    control_begin_version: Some(writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?),
+                };
+                qualification.validate()?;
+                writer.append(Body::ConnectionHealthBegin(&qualification))?;
+            } else {
+                let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+                    &current.plan, current.plan_version, &plan_sha256)?;
+                let (fact, _) = history.qualified(&identity)?;
+                let link = super::macro_connection::EffectLink {
+                    version: 1, identity, plan_version: current.plan_version, plan_sha256,
+                    qualification_version: fact.version, qualification_sha256: fact.digest.clone(),
+                    effect_begin_version: writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?,
+                    request: control.request.clone(),
+                    data: None,
+                };
+                writer.append(Body::ConnectionEffectLink(&link))?;
+            }
+        }
         let begin = writer.append(Body::ControlBegin {
             value: &value,
             episode_version: episode.plan_version,
@@ -679,6 +899,9 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         mut ticket: Ticket,
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
     ) -> anyhow::Result<Snapshot> {
+        if self.current.as_ref().is_some_and(|current| current.full.is_none()) {
+            return self.record_legacy_data(ticket, completion);
+        }
         let Step::Data { query, attempt } = ticket.step else {
             return Err(ChainPostCloseError::SchemaRejected.into());
         };
@@ -715,10 +938,16 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                     && original.result.is_none()
             })
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        let provider_catalog = old::historical_provider_catalog(
+        let connection_history = if catalog.layout() == 15 {
+            Some(super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+                &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?)
+        } else { None };
+        let provider_catalog = connection_history.as_ref()
+            .and_then(|history| history.data_catalogs.get(&original.begin))
+            .or_else(|| old::historical_provider_catalog(
             &current.readiness_episodes,
             original.readiness_result_version(),
-        );
+        ));
         let identity = full.snapshot.definition.identity(query)?;
         let data =
             native::DataResult::capture_external(
@@ -789,10 +1018,63 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         self.snapshot()
     }
 
-    pub(super) fn record_control(
+    fn record_legacy_data(
+        &mut self,
+        mut ticket: Ticket,
+        completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
+    ) -> anyhow::Result<Snapshot> {
+        let Step::Data { query: QueryKey::Gateway(1), attempt } = ticket.step else { return Err(ChainPostCloseError::SchemaRejected.into()); };
+        require(self.active.get(&ticket.step) == Some(&ticket.begin))?;
+        let gate = self.gate();
+        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| storage("legacy continuation result"))?;
+        let now = gate.sample(false)?;
+        let catalog = schema::verify_v12_transaction(&transaction)?;
+        require(catalog.layout() == 15)?;
+        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
+        current.legacy_snapshot()?;
+        require(current.attempts.last().is_some_and(|last| last.begin == ticket.begin && last.ordinal == attempt && last.result.is_none()))?;
+        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+            &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?;
+        let provider_catalog = history.data_catalogs.get(&ticket.begin).ok_or(ChainPostCloseError::SchemaRejected)?;
+        let request = &current.plan.request;
+        let raw = codec::RawResult::capture_external_bound(completion, &codec::first_identity(), request)?;
+        let (gateway, _, _) = raw.project(request, attempt, Some(provider_catalog))?;
+        let retry_due = match raw.continuation() {
+            MacroContinuation::Terminal => None,
+            MacroContinuation::Retry { backoff_ms } => Some(now.get().checked_add(
+                i64::try_from(backoff_ms).ok().and_then(|ms| ms.checked_mul(1000)).ok_or(ChainPostCloseError::SchemaRejected)?
+            ).ok_or(ChainPostCloseError::SchemaRejected)?),
+        };
+        let initial = self.lease.head;
+        let mut candidate = transaction_lease_candidate(&self.lease);
+        let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
+        let result = writer.append(Body::LegacyDataResult {
+            value: &raw, attempt, begin: ticket.begin,
+            request_sha: raw_digest(&request.bytes).as_str(), retry_due,
+        })?;
+        if retry_due.is_none() { writer.legacy_terminal("DataResult", result, &gateway)?; }
+        let receipt = writer.receipt(initial)?;
+        drop(writer);
+        let mut expected = self.active.clone();
+        require(expected.remove(&ticket.step) == Some(ticket.begin))?;
+        let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
+        gate.sample(false)?;
+        transaction.commit().map_err(|_| PreparationStop::ResultUnconfirmed { intent_id: gate.intent.clone() })?;
+        self.lease.head = candidate.head;
+        self.active = expected;
+        self.current = current;
+        ticket.guard.disarm();
+        gate.after_commit(receipt, false)?;
+        self.snapshot()
+    }
+
+    pub(super) fn record_control_connection(
         &mut self,
         mut ticket: Ticket,
         mut raw: codec::ControlRawResult,
+        connection: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
     ) -> anyhow::Result<Snapshot> {
         let (ordinal, kind) = match ticket.step {
             Step::Health => (1, "Health"),
@@ -813,35 +1095,33 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let (run, current) =
             admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
-        let full = current
-            .full
-            .as_ref()
-            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        let full = current.full.as_ref();
+        if full.is_none() { require(catalog.layout() == 15)?; current.legacy_snapshot()?; }
         let control = current
             .readiness_episodes
             .first()
             .and_then(|episode| episode.controls.get(ordinal as usize - 1))
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         require(control.begin == Some(ticket.begin) && control.result.is_none())?;
-        if control.request.has_wire_identity() {
-            let health = if ordinal == 2 {
-                let health = current
-                    .readiness_episodes
-                    .first()
-                    .and_then(|episode| episode.controls.first())
-                    .ok_or(ChainPostCloseError::SchemaRejected)?;
-                Some((
-                    &health.request,
-                    health
-                        .response
-                        .as_deref()
-                        .ok_or(ChainPostCloseError::SchemaRejected)?,
-                ))
-            } else {
-                None
-            };
-            raw.bind_external_identity(&control.request, health)?;
-        }
+        require(catalog.layout() == 15)?;
+        let identity = connection.ok_or(ChainPostCloseError::SchemaRejected)?;
+        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
+            &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?;
+        let (health_fact, health_begin) = history.begins.get(&identity.epoch)
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(health_begin.identity == identity)?;
+        let qualification_begin = if ordinal == 1 {
+            require(health_begin.control_begin_version == Some(ticket.begin)
+                && !history.results.contains_key(&identity.epoch))?;
+            raw.bind_connection_identity(&control.request, &identity, None)?;
+            Some((health_fact.clone(), health_begin.clone()))
+        } else {
+            history.qualified(&identity)?;
+            let response = history.health_responses.get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            raw.bind_connection_identity(&control.request, &identity, Some((&health_begin.request, response)))?;
+            None
+        };
         let projected = raw.project(&control.request)?;
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
@@ -854,7 +1134,25 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             request_sha: raw_digest(control.request.request_bytes()).as_str(),
             ready: projected.is_ok(),
         })?;
-        if let Err(error) = projected {
+        if full.is_none() {
+            if let Err(error) = &projected {
+                writer.legacy_terminal("ExternalControlResult", result, &Err(error.clone()))?;
+            }
+        }
+        if let Some((begin_fact, begin)) = qualification_begin {
+            let qualification = super::macro_connection::HealthResult {
+                version: 1, identity: begin.identity,
+                plan_version: current.plan_version,
+                plan_sha256: raw_digest(&current.plan_bytes).as_str().to_owned(),
+                begin_version: begin_fact.version, begin_sha256: begin_fact.digest,
+                control_result_version: Some(result),
+                control_result_sha256: raw_digest(&codec::encode(&raw)?).as_str().to_owned(),
+                raw: None,
+                qualified: projected.is_ok(),
+            };
+            writer.append(Body::ConnectionHealthResult(&qualification))?;
+        }
+        if let (Some(full), Err(error)) = (full, projected) {
             for ordinal in 1..=4 {
                 let query = QueryKey::Gateway(ordinal);
                 require(
@@ -1383,6 +1681,7 @@ fn unmatched(current: &Option<old::MacroRecovery>) -> BTreeSet<u64> {
                 .iter()
                 .filter(|attempt| attempt.result.is_none())
                 .map(|attempt| attempt.begin)
+                .chain(recovery.qualification_pending.iter().copied())
                 .chain(recovery.readiness_episodes.iter().flat_map(|episode| {
                     episode
                         .controls
@@ -1433,6 +1732,13 @@ fn validate_admitted(
 }
 
 enum Body<'a> {
+    LegacyDataBegin { value: &'a old::Begin, links: &'a native::DataBegin },
+    LegacyDataResult { value: &'a codec::RawResult, attempt: u32, begin: u64, request_sha: &'a str, retry_due: Option<i64> },
+    ConnectionHealthBegin(&'a super::macro_connection::HealthBegin),
+    ConnectionHealthResult(&'a super::macro_connection::HealthResult),
+    ConnectionEffectLink(&'a super::macro_connection::EffectLink),
+    ConnectionCapabilitiesBegin(&'a super::macro_connection::CapabilitiesBegin),
+    ConnectionCapabilitiesResult(&'a super::macro_connection::HealthResult),
     Plan {
         bytes: &'a [u8],
         plan: &'a plan3::PlanV3,
@@ -1495,6 +1801,14 @@ struct Writer<'transaction, 'connection, 'state> {
 }
 
 impl<'transaction, 'connection, 'state> Writer<'transaction, 'connection, 'state> {
+    fn legacy_terminal(&mut self, cause: &str, version: u64, gateway: &codec::NewsResult) -> Result<()> {
+        let (digest, receipt) = LocalChainPostClose::insert_macro_source_final(
+            self.transaction, self.lease, self.run, cause, version, gateway, self.now,
+        )?;
+        self.last_sha = digest;
+        self.audits.push(receipt);
+        Ok(())
+    }
     fn new(
         transaction: &'transaction Transaction<'connection>,
         lease: &'state mut RunLease,
@@ -1555,6 +1869,20 @@ impl<'transaction, 'connection, 'state> Writer<'transaction, 'connection, 'state
     // SQL fragment, parameter list, callback or connection through this seam.
     fn append(&mut self, body: Body<'_>) -> Result<u64> {
         let (table,columns,bytes,extra):(&str,&str,Vec<u8>,Vec<Value>) = match body {
+            Body::LegacyDataBegin { value, links } => (old::TABLES[5],"phase,item_ordinal,candidate_ordinal,attempt_ordinal,request_plan_version,request_sha256,readiness_result_version,previous_result_version",codec::encode(value)?,
+                vec![text("Gateway"),Value::Integer(1),Value::Integer(1),Value::Integer(value.ordinal.into()),number(links.request_plan_version)?,text(&links.request_sha256),optional_number(links.readiness_result_version)?,optional_number(links.previous_result_version)?]),
+            Body::LegacyDataResult { value, attempt, begin, request_sha, retry_due } => (old::TABLES[6],"phase,item_ordinal,candidate_ordinal,attempt_ordinal,begin_version,request_sha256,continuation,retry_not_before",codec::encode(value)?,
+                vec![text("Gateway"),Value::Integer(1),Value::Integer(1),Value::Integer(attempt.into()),number(begin)?,text(request_sha),text(if retry_due.is_some() { "Retry" } else { "Terminal" }),retry_due.map(Value::Integer).unwrap_or(Value::Null)]),
+            Body::ConnectionHealthBegin(value) => (super::macro_connection::TABLE,"kind,connection_epoch,plan_version,plan_sha256,predecessor_version,predecessor_sha256,effect_version,outcome",codec::encode(value)?,
+                vec![text("HealthBegin"),text(&value.identity.epoch),number(value.plan_version)?,text(&value.plan_sha256),Value::Null,Value::Null,Value::Null,Value::Null]),
+            Body::ConnectionHealthResult(value) => (super::macro_connection::TABLE,"kind,connection_epoch,plan_version,plan_sha256,predecessor_version,predecessor_sha256,effect_version,outcome",codec::encode(value)?,
+                vec![text("HealthResult"),text(&value.identity.epoch),number(value.plan_version)?,text(&value.plan_sha256),number(value.begin_version)?,text(&value.begin_sha256),Value::Null,text(if value.qualified { "Qualified" } else { "Rejected" })]),
+            Body::ConnectionEffectLink(value) => (super::macro_connection::TABLE,"kind,connection_epoch,plan_version,plan_sha256,predecessor_version,predecessor_sha256,effect_version,outcome",codec::encode(value)?,
+                vec![text("EffectLink"),text(&value.identity.epoch),number(value.plan_version)?,text(&value.plan_sha256),number(value.qualification_version)?,text(&value.qualification_sha256),number(value.effect_begin_version)?,Value::Null]),
+            Body::ConnectionCapabilitiesBegin(value) => (super::macro_connection::TABLE,"kind,connection_epoch,plan_version,plan_sha256,predecessor_version,predecessor_sha256,effect_version,outcome",codec::encode(value)?,
+                vec![text("CapabilitiesBegin"),text(&value.identity.epoch),number(value.plan_version)?,text(&value.plan_sha256),number(value.qualification_version)?,text(&value.qualification_sha256),Value::Null,Value::Null]),
+            Body::ConnectionCapabilitiesResult(value) => (super::macro_connection::TABLE,"kind,connection_epoch,plan_version,plan_sha256,predecessor_version,predecessor_sha256,effect_version,outcome",codec::encode(value)?,
+                vec![text("CapabilitiesResult"),text(&value.identity.epoch),number(value.plan_version)?,text(&value.plan_sha256),number(value.begin_version)?,text(&value.begin_sha256),Value::Null,text(if value.qualified { "Qualified" } else { "Rejected" })]),
             Body::Plan { bytes,plan } => (old::TABLES[0],"parent_version,parent_sha256,started_at,deadline_at,request_sha256",bytes.to_vec(),
                 vec![number(plan.core.parent_version)?,text(&plan.core.parent_digest),Value::Integer(plan.core.started),Value::Integer(plan.core.deadline),text(raw_digest(&plan.core.request.bytes).as_str())]),
             Body::Request { value,plan_version,endpoint } => {

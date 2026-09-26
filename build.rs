@@ -46,6 +46,19 @@ fn main() {
         .expect("compile unmodified ExternalV1 contract");
 
     println!("cargo:rerun-if-changed={local_source}");
+    // Historical V1-V3 decode uses its own immutable public release contract.
+    // Message-only output cannot acquire a network transport or effect authority.
+    let history_source = "contracts/external_v1_history/market.proto";
+    let history_dir = out_dir.join("external_history_20260917");
+    std::fs::create_dir_all(&history_dir).expect("create historical External output");
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .out_dir(&history_dir)
+        .file_descriptor_set_path(history_dir.join("descriptor.bin"))
+        .compile_protos(&[Path::new(history_source)], &[Path::new("contracts/external_v1_history")])
+        .expect("compile frozen historical External contract");
+    println!("cargo:rerun-if-changed={history_source}");
     println!("cargo:rerun-if-changed={external_source}");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PROTOC");

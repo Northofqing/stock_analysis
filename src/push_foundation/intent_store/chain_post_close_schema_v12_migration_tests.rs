@@ -1122,12 +1122,15 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
                 provider: GlobalNewsProvider::Cailianpress,
                 limit: 20,
             };
-            // This successor is a real generated call with a terminal evidence refusal, not a second-source success.
+            // Offline mixed-format fixture only: new effects are forbidden on
+            // layout12. Rebind a frozen response to the fixture request below,
+            // preserving the original exact-provider evidence refusal.
             let authorized = prepared.prepare_macro_query(identity.clone()).unwrap();
             let request =
                 macro_codec::Request::capture_prepared_for(&identity, &authorized).unwrap();
             let request_bytes = request.bytes.clone();
             let request_sha = raw_digest(&request_bytes).as_str().to_owned();
+            let fixture_request_id = request.id.clone();
             let endpoint = prepared.endpoint_uri().to_owned();
             let resumed_at = started_at + 10_000_001;
             let clock = MacroClock {
@@ -1189,8 +1192,10 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
                 .ready_result_version()
                 .unwrap();
             drop(migrated_recovery);
+            assert!(live.begin_data(QueryKey::Gateway(2), 1, request.clone(), &endpoint).is_err(),
+                "the production entry cannot authorize a new external effect on v12");
             let ticket = live
-                .begin_data(QueryKey::Gateway(2), 1, request, &endpoint)
+                .begin_historical_v12_data_fixture(QueryKey::Gateway(2), 1, request, &endpoint)
                 .unwrap();
             assert_eq!(external_server.as_ref().unwrap().snapshot(), external_before_migration);
             assert_eq!(
@@ -1202,11 +1207,33 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
                 memberships_before_migration
             );
 
-            external_server.as_ref().unwrap().release_data();
-            let completion = tokio::time::timeout(Duration::from_secs(3), authorized.execute())
-                .await
-                .expect("TEST_CODE mixed-history External unary deadline")
-                .expect("TEST_CODE mixed-history External connection");
+            use crate::grpc_client::client::macro_attempt::{project_macro_response, MacroAttemptCompletion, MacroTrailerMaterial};
+            use crate::grpc_client::external_query_transport::{ExternalQueryMethod, ExternalWireEvidenceV1, ExternalWireMaterialV1, EXTERNAL_QUERY_DECODE_LIMIT_BYTES, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256};
+            let mut fixture_response = crate::grpc_client::pb::magic::market::v1::QueryResponse::decode(old_attempt.3.as_slice()).unwrap();
+            fixture_response.request_id = fixture_request_id;
+            let fixture_response_bytes = fixture_response.encode_to_vec();
+            let processed = project_macro_response(
+                &identity, crate::grpc_client::client::ContractProfile::ExternalV1,
+                Some("grpc-mtls:macro.test.invalid"), &fixture_response.request_id,
+                fixture_response.clone(),
+            );
+            let completion = ExternalMacroAttemptCompletion::Unary(MacroAttemptCompletion {
+                response_bytes: Some(fixture_response_bytes.clone()),
+                status_code: None, status_details: None,
+                status_error_detail_trailer: MacroTrailerMaterial::Absent,
+                processed, retry_decision: crate::grpc_client::retry::RetryDecision::NoRetry,
+                continuation: MacroContinuation::Terminal,
+                external_wire: Some(ExternalWireEvidenceV1 {
+                    material: "external-unary-response-evidence-v1".into(), profile: "ExternalV1".into(),
+                    method: ExternalQueryMethod::GlobalNews,
+                    client_descriptor_sha256: EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.into(),
+                    evidence: ExternalWireMaterialV1::Payload {
+                        protobuf_payload: fixture_response_bytes.clone(),
+                        payload_sha256: raw_digest(&fixture_response_bytes).as_str().into(),
+                        decode_limit_bytes: EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
+                    },
+                }),
+            });
             let ExternalMacroAttemptCompletion::Unary(unary) = &completion else {
                 panic!("TEST_CODE mixed history requires a generated unary response");
             };
@@ -1335,7 +1362,7 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
             assert_eq!(native_result_json["raw"]["wire_identity"]["profile"], "ExternalV1");
             assert!(native_result_json.get("native").is_some());
             assert!(native_result_json.get("native_sha256").is_some());
-            assert_eq!(native_response, external_server.as_ref().unwrap().snapshot().data_responses[1]);
+            assert_eq!(native_response, fixture_response_bytes);
 
             assert_eq!(business.count("data_acquisition_audit"), audit_before + 1);
             let transaction = business.connection().unchecked_transaction().unwrap();
@@ -1360,14 +1387,8 @@ async fn v11_external_raw_v2_migrates_then_appends_v12_native_data_and_reopens_w
             assert_eq!(old_source_after, old_source);
 
             let external_after_data = external_server.as_ref().unwrap().snapshot();
-            assert_eq!(external_after_data.tcp_accepts, external_before_migration.tcp_accepts + 1);
-            assert_eq!(external_after_data.health_requests, external_before_migration.health_requests);
-            assert_eq!(external_after_data.capabilities_calls, external_before_migration.capabilities_calls);
-            assert_eq!(external_after_data.data_calls, external_before_migration.data_calls + 1);
-            assert_eq!(external_after_data.data_methods.last().map(String::as_str), Some("global_news"));
-            assert_eq!(external_after_data.data_authorized.last(), Some(&true));
-            assert_eq!(external_after_data.data_responses.len(), external_before_migration.data_responses.len() + 1);
-            assert!(external_after_data.data_statuses.is_empty());
+            assert_eq!(external_after_data, external_before_migration,
+                "offline historical fixture must create no new physical connection or RPC");
             assert_eq!(parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(), parent_before_migration);
             assert_eq!(parent_server.as_ref().unwrap().membership_snapshot(), memberships_before_migration);
             let durable_before_reopen =

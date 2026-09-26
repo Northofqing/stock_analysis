@@ -5,6 +5,8 @@ use std::time::Duration;
 
 const FUTURE_14_SHA256: &str =
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const FUTURE_15_SHA256: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+const FUTURE_16_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FUTURE_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const QUERY_TERMINALS: &str = "chain_post_close_macro_query_terminals";
 
@@ -302,7 +304,7 @@ fn assert_future_layout_delta(
             );
         }
     }
-    let forged = [Value::Integer(13), Value::Integer(14)];
+    let forged = [Value::Integer(13), Value::Integer(14), Value::Integer(15), Value::Integer(16)];
     let old_headers = damaged.tables["chain_post_close_layouts"]
         .iter()
         .filter(|row| !forged.contains(&row[0]))
@@ -311,23 +313,23 @@ fn assert_future_layout_delta(
     assert_eq!(old_headers, clean.tables["chain_post_close_layouts"]);
     assert_eq!(
         damaged.tables["chain_post_close_layouts"].len(),
-        clean.tables["chain_post_close_layouts"].len() + 2
+        clean.tables["chain_post_close_layouts"].len() + 4
     );
     let header = damaged.tables["chain_post_close_layouts"]
         .iter()
-        .find(|row| row[0] == Value::Integer(14))
+        .find(|row| row[0] == Value::Integer(16))
         .unwrap();
     assert_eq!(
         header,
         &vec![
-            Value::Integer(14),
-            Value::Integer(13),
-            Value::Text(FUTURE_SHA256.to_owned()),
+            Value::Integer(16),
+            Value::Integer(15),
+            Value::Text(FUTURE_15_SHA256.to_owned()),
             Value::Integer(1),
             Value::Integer(1),
             Value::Integer(1),
-            Value::Text("TEST_CODE_chain-post-close-layout-v14".to_owned()),
-            Value::Text(FUTURE_14_SHA256.to_owned()),
+            Value::Text("TEST_CODE_chain-post-close-layout-v16".to_owned()),
+            Value::Text(FUTURE_16_SHA256.to_owned()),
         ]
     );
 
@@ -344,7 +346,7 @@ fn assert_future_layout_delta(
         .iter()
         .filter(|row| forged.contains(&row[0]))
         .collect::<Vec<_>>();
-    assert_eq!(future_registry.len(), 482);
+    assert_eq!(future_registry.len(), 964);
     for future in future_registry {
         let source = clean.tables["chain_post_close_layout_objects"]
             .iter()
@@ -455,8 +457,8 @@ fn install_future_layout(business: &V2BusinessFixture) {
             .unwrap(),
         1
     );
-    // Layout 14 is the first version this build does not know; 13 only exists
-    // so the predecessor chain is well-formed.
+    // Fake predecessor metadata only. The first unsupported successor is now
+    // 16; frozen 12/13/14/15 schemas themselves are not changed by this probe.
     assert_eq!(
         transaction
             .execute(
@@ -480,6 +482,19 @@ fn install_future_layout(business: &V2BusinessFixture) {
             .unwrap(),
         1
     );
+    for (version, predecessor_hash, hash) in [
+        (15, FUTURE_14_SHA256, FUTURE_15_SHA256),
+        (16, FUTURE_15_SHA256, FUTURE_16_SHA256),
+    ] {
+        assert_eq!(transaction.execute(
+            "INSERT INTO chain_post_close_layout_objects(layout_version,name,object_type,definition) SELECT ?1,name,object_type,definition FROM chain_post_close_layout_objects WHERE layout_version=12",
+            [version],
+        ).unwrap(), 241);
+        assert_eq!(transaction.execute(
+            "INSERT INTO chain_post_close_layouts(layout_version,predecessor_layout_version,predecessor_bundle_sha256,artifact_codec_version,input_codec_version,stage_codec_version,description,bundle_sha256) VALUES(?1,?2,?3,1,1,1,?4,?5)",
+            params![version, version - 1, predecessor_hash, format!("TEST_CODE_chain-post-close-layout-v{version}"), hash],
+        ).unwrap(), 1);
+    }
     transaction.commit().unwrap();
 }
 
