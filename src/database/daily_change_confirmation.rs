@@ -159,7 +159,8 @@ END;
 "#;
 
 /// Objective evidence that must match exactly before a large daily move is admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DailyChangeConfirmationQuery {
     pub code: String,
     pub previous_date: NaiveDate,
@@ -1138,38 +1139,71 @@ pub(crate) fn append_daily_change_confirmation_on_conn(
     input: &DailyChangeConfirmationInput,
 ) -> DailyChangeConfirmationResult<DailyChangeConfirmationReceipt> {
     conn.immediate_transaction::<_, DailyChangeConfirmationError, _>(|conn| {
-        let canonical = canonical_confirmation(input)?;
-        validate_daily_change_confirmation_chain(conn)?;
-        let previous_v2_hash = validate_daily_change_confirmation_chain_v2(conn)?;
-        let stable_fact = canonical_stable_fact_v2(&canonical.query);
-        let stable_hash = stable_fact_identity_hash_v2(&stable_fact)?;
-        if let Some(existing) = load_v2_by_fact_hash(conn, &stable_hash)? {
-            let persisted = validate_v2_row(conn, &existing)?;
-            if persisted != stable_fact {
-                return Err(audit(format!(
-                    "SHA-256 stable fact identity collision at v2 row {}",
-                    existing.id
-                )));
-            }
-            let retained_v1 = load_v1_by_id(conn, existing.v1_confirmation_row_id)?;
-            let retained_decision = validate_persisted_row(&retained_v1)?;
-            if retained_decision.operator_identity != canonical.operator_identity
-                || retained_decision.reason != canonical.reason
-            {
-                return Err(DailyChangeConfirmationError::Conflict {
-                    query_identity_hash: stable_hash,
-                });
-            }
-            return receipt_for_v2_alias(conn, &existing);
-        }
-
-        let receipt = insert_confirmation_in_transaction(conn, input)?;
-        let v1_query_hash = query_identity_hash(&canonical.query)?;
-        let v1 = load_by_query_hash(conn, &v1_query_hash)?
-            .ok_or_else(|| audit("v1 confirmation disappeared before v2 alias append"))?;
-        insert_v2_alias(conn, &previous_v2_hash, &stable_hash, &v1)?;
-        Ok(receipt)
+        append_daily_change_confirmation_in_transaction(conn, input)
     })
+}
+
+/// The review owner calls this only inside its existing IMMEDIATE transaction.
+pub(crate) fn append_daily_change_confirmation_in_transaction(
+    conn: &mut SqliteConnection,
+    input: &DailyChangeConfirmationInput,
+) -> DailyChangeConfirmationResult<DailyChangeConfirmationReceipt> {
+    let canonical = canonical_confirmation(input)?;
+    validate_daily_change_confirmation_chain(conn)?;
+    let previous_v2_hash = validate_daily_change_confirmation_chain_v2(conn)?;
+    let stable_fact = canonical_stable_fact_v2(&canonical.query);
+    let stable_hash = stable_fact_identity_hash_v2(&stable_fact)?;
+    if let Some(existing) = load_v2_by_fact_hash(conn, &stable_hash)? {
+        let persisted = validate_v2_row(conn, &existing)?;
+        if persisted != stable_fact {
+            return Err(audit(format!(
+                "SHA-256 stable fact identity collision at v2 row {}",
+                existing.id
+            )));
+        }
+        let retained_v1 = load_v1_by_id(conn, existing.v1_confirmation_row_id)?;
+        let retained_decision = validate_persisted_row(&retained_v1)?;
+        if retained_decision.operator_identity != canonical.operator_identity
+            || retained_decision.reason != canonical.reason
+        {
+            return Err(DailyChangeConfirmationError::Conflict {
+                query_identity_hash: stable_hash,
+            });
+        }
+        return receipt_for_v2_alias(conn, &existing);
+    }
+
+    let receipt = insert_confirmation_in_transaction(conn, input)?;
+    let v1_query_hash = query_identity_hash(&canonical.query)?;
+    let v1 = load_by_query_hash(conn, &v1_query_hash)?
+        .ok_or_else(|| audit("v1 confirmation disappeared before v2 alias append"))?;
+    insert_v2_alias(conn, &previous_v2_hash, &stable_hash, &v1)?;
+    Ok(receipt)
+}
+
+/// Read-only exact alias recovery; never rewrites the first operator's facts.
+pub(crate) fn exact_daily_change_confirmation_receipt_on_conn(
+    conn: &mut SqliteConnection,
+    query: &DailyChangeConfirmationQuery,
+) -> DailyChangeConfirmationResult<Option<DailyChangeConfirmationReceipt>> {
+    if !has_exact_daily_change_confirmation_on_conn(conn, query)? {
+        return Ok(None);
+    }
+    let canonical = canonical_query(query)?;
+    let stable = stable_fact_identity_hash_v2(&canonical_stable_fact_v2(&canonical))?;
+    if let Some(alias) = load_v2_by_fact_hash(conn, &stable)? {
+        return receipt_for_v2_alias(conn, &alias).map(Some);
+    }
+    let query_hash = query_identity_hash(&canonical)?;
+    let row = load_by_query_hash(conn, &query_hash)?
+        .ok_or_else(|| audit("exact confirmation disappeared"))?;
+    let link = load_chain_for_row(conn, row.id)?;
+    Ok(Some(DailyChangeConfirmationReceipt {
+        confirmation_id: row.confirmation_id,
+        query_identity_hash: query_hash,
+        record_hash: link.record_hash,
+        inserted: false,
+    }))
 }
 
 pub(crate) fn has_exact_daily_change_confirmation_on_conn(

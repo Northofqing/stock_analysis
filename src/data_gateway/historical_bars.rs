@@ -33,6 +33,63 @@ use super::security_lifecycle::{
 
 const CAPABILITY: &str = "HistoricalDailyBars";
 
+/// Only a qualified Gateway Adapter may construct discovery authority. Neither
+/// CLI JSON nor an error string can deserialize or construct this capability.
+pub(crate) struct QualifiedDailyChangeDiscovery {
+    snapshot: crate::database::daily_change_review::ReviewSnapshot,
+}
+
+impl QualifiedDailyChangeDiscovery {
+    pub(crate) fn snapshot(&self) -> &crate::database::daily_change_review::ReviewSnapshot {
+        &self.snapshot
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_mutation(
+        mut self,
+        mutate: impl FnOnce(&mut crate::database::daily_change_review::ReviewSnapshot),
+    ) -> Self {
+        mutate(&mut self.snapshot);
+        self
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn qualified_review_fixture() -> QualifiedDailyChangeDiscovery {
+    use crate::market_domain::{AssetClass, Exchange, InstrumentId};
+    let previous_date = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+    let current_date = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+    QualifiedDailyChangeDiscovery {
+        snapshot: crate::database::daily_change_review::ReviewSnapshot {
+            schema_version: 1,
+            discovery_contract: "outcome-provider-sequence-v1".into(),
+            rule_version: "br171-close-change-v1".into(),
+            instrument: InstrumentId::new(
+                Exchange::Shenzhen,
+                "TEST_CODE_300005",
+                AssetClass::Equity,
+            )
+            .unwrap(),
+            query: DailyChangeConfirmationQuery {
+                code: "TEST_CODE_300005".into(),
+                previous_date,
+                current_date,
+                previous_close: "18.59".into(),
+                current_close: "14.87".into(),
+                calculated_pct: canonical_decimal((14.87 / 18.59 - 1.0) * 100.0).unwrap(),
+                daily_provider: "magic_tdx".into(),
+                daily_source: "TEST_CODE_tdx".into(),
+                daily_batch_id: "TEST_CODE_batch1".into(),
+                lifecycle_provider: "magic_tdx".into(),
+                lifecycle_batch_id: "TEST_CODE_lifecycle1".into(),
+                listing_date: Some(NaiveDate::from_ymd_opt(2010, 1, 1).unwrap()),
+                corporate_action_identity: None,
+            },
+            fact_payload: serde_json::json!({"fixture":"TEST_CODE_synthetic_ohlcv"}),
+            raw_evidence: serde_json::json!({"fixture":"TEST_CODE_synthetic_raw_not_production"}),
+        },
+    }
+}
+
 /// BR-216: record Kline liveness at the gateway admission point.
 ///
 /// Sinking the marker here (instead of at each business call site) is what
@@ -223,7 +280,12 @@ impl HistoricalBarsGateway {
         // P4 M2 钩子: remote gRPC → gRPC 通道 (fail-closed, audit 对等)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(bridge) => {
-                let result = bridge.daily_bars(code, days);
+                let result = bridge.daily_bars(code, days).and_then(|batch| {
+                    super::grpc_source::block_on_gateway(finalize_ordinary_batch_async(
+                        code.to_owned(),
+                        batch,
+                    ))
+                });
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
             }
@@ -251,7 +313,10 @@ impl HistoricalBarsGateway {
         // P4 M2 钩子: remote gRPC → gRPC 通道 (async 路径, 不 block_on)。
         match super::grpc_source::bridge_for("HistoricalBars") {
             Ok(bridge) => {
-                let result = bridge.daily_bars_async(&code, days).await;
+                let result = match bridge.daily_bars_async(&code, days).await {
+                    Ok(batch) => finalize_ordinary_batch_async(code.clone(), batch).await,
+                    Err(error) => Err(error),
+                };
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
                 return AdmittedDailyBars::from_audited_batch(code, audited);
             }
@@ -301,10 +366,10 @@ impl HistoricalBarsGateway {
         let code = code.to_owned();
         Err(GatewayError::classified(
             CAPABILITY,
-            Some(ProviderId::Tdx),
+            None,
             "unavailable",
-            "provider_transport",
-            true,
+            "daily_change_discovery_unavailable_v1",
+            false,
             &format!(
                 "daily-change confirmation discovery is unavailable over the remote transport \
                  (code={code}, days={days})"
@@ -548,81 +613,195 @@ fn admit_outcome_lifecycle(
     })
 }
 
-fn confirm_outcome_changes(
+pub(super) fn review_batch_facts(
     batch: &GatewayBatch<KlineData>,
-    changes: &[AdjacentDailyChange],
+) -> Result<serde_json::Value, GatewayError> {
+    let records = batch
+        .records()
+        .iter()
+        .map(review_bar_fact)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| final_admission_error(batch.evidence().provider, e))?;
+    Ok(serde_json::json!({"records":records,"evidence":review_evidence(batch.evidence())}))
+}
+
+fn review_bar_fact(r: &KlineData) -> Result<serde_json::Value, String> {
+    if r.close <= 0.0
+        || r.open <= 0.0
+        || r.low <= 0.0
+        || r.high < r.low
+        || r.volume <= 0.0
+        || r.amount <= 0.0
+        || r.close < r.low
+        || r.close > r.high
+        || r.open < r.low
+        || r.open > r.high
+    {
+        return Err("review bar has invalid OHLCV/amount".into());
+    }
+    Ok(
+        serde_json::json!({"date":r.date,"open":canonical_decimal(r.open)?,"high":canonical_decimal(r.high)?,"low":canonical_decimal(r.low)?,"close":canonical_decimal(r.close)?,"volume":canonical_decimal(r.volume)?,"amount":canonical_decimal(r.amount)?,"adjustment":format!("{:?}",r.adjust),"settled":r.settled}),
+    )
+}
+fn review_evidence(e: &BatchEvidence) -> serde_json::Value {
+    serde_json::json!({"provider":e.provider,"source":e.source,"source_at":e.source_at,"observed_at":e.observed_at,"batch_id":e.batch_id})
+}
+fn review_lifecycle(lc: &SecurityLifecycleContext) -> serde_json::Value {
+    let listing = match &lc.listing {
+        ListingDateState::Available(r) => {
+            serde_json::json!({"state":"Available","listed_on":r.listed_on,"evidence":review_evidence(&r.evidence)})
+        }
+        ListingDateState::Unavailable { evidence, error } => {
+            serde_json::json!({"state":"Unavailable","evidence":evidence.as_ref().map(review_evidence),"error":super::review::store_gateway_error(error)})
+        }
+    };
+    let actions = match &lc.corporate_actions {
+        CorporateActionState::Available { records, evidence } => {
+            serde_json::json!({"state":"Available","evidence":review_evidence(evidence),"records":records.iter().map(|r|serde_json::json!({"code":r.code,"category":r.category,"effective_on":r.effective_on,"record_on":r.record_on,"ex_on":r.ex_on,"payable_on":r.payable_on,"terms":r.terms})).collect::<Vec<_>>()})
+        }
+        CorporateActionState::VerifiedEmpty(e) => {
+            serde_json::json!({"state":"VerifiedEmpty","evidence":review_evidence(e)})
+        }
+        CorporateActionState::Unavailable(e) => {
+            serde_json::json!({"state":"Unavailable","error":super::review::store_gateway_error(e)})
+        }
+    };
+    serde_json::json!({"instrument":lc.instrument,"window_start":lc.window_start,"window_end":lc.window_end,"listing":listing,"actions":actions})
+}
+
+fn finalize_changes_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    code: &str,
+    batch: &GatewayBatch<KlineData>,
     lifecycle: &SecurityLifecycleContext,
+    raw: Option<&super::outcome_daily_bars::OutcomeReviewEvidence>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), GatewayError> {
-    let daily_evidence = batch.evidence();
-    let provider = daily_evidence.provider;
-    let database = DatabaseManager::try_get().ok_or_else(|| {
-        final_admission_error(
-            provider,
-            "BR-171 manual_confirmation_lookup_failed: confirmation database is not initialized"
-                .to_string(),
-        )
-    })?;
-    for change in changes {
-        let lifecycle_evidence = lifecycle
-            .confirmation_evidence_for(change.previous_date, change.current_date)
-            .map_err(|error| {
-                final_admission_error(
-                    provider,
-                    format!(
-                        "BR-171 manual_confirmation_lookup_failed {}→{}: {error}",
-                        change.previous_date, change.current_date
-                    ),
-                )
-            })?;
-        let query = build_confirmation_query(change, daily_evidence, &lifecycle_evidence).map_err(
-            |error| {
-                final_admission_error(
-                    provider,
-                    format!(
-                        "BR-171 manual_confirmation_lookup_failed {}→{}: {error}",
-                        change.previous_date, change.current_date
-                    ),
-                )
-            },
-        )?;
-        let confirmed = database
-            .has_exact_daily_change_confirmation(&query)
-            .map_err(|error| {
-                final_admission_error(
-                    provider,
-                    format!(
-                        "BR-171 manual_confirmation_lookup_failed {}→{}: {error}",
-                        change.previous_date, change.current_date
-                    ),
-                )
-            })?;
-        if !confirmed {
-            log::warn!(
-                "[BR-171] manual_confirmation_required code={} dates={}→{} \
-                 closes={:.6}→{:.6} change={:.4}%",
-                change.code,
-                change.previous_date,
-                change.current_date,
-                change.previous_close,
-                change.current_close,
-                change.change_pct
-            );
-            return Err(final_admission_error(
-                provider,
-                format!(
-                    "[{}] BR-171 manual_confirmation_required {}→{} \
-                     closes={:.6}→{:.6} change={:.4}%",
-                    change.code,
-                    change.previous_date,
-                    change.current_date,
-                    change.previous_close,
-                    change.current_close,
-                    change.change_pct
-                ),
-            ));
+    use crate::database::daily_change_review::{self as review, ReviewError, ReviewSnapshot};
+    let provider = batch.evidence().provider;
+    let fail = |e: String| {
+        final_admission_error(provider, format!("manual_confirmation_lookup_failed: {e}"))
+    };
+    admit_outcome_lifecycle(code, batch, lifecycle)?;
+    let raw_payload = raw
+        .map(|raw| {
+            if raw.instrument() != &lifecycle.instrument {
+                return Err(fail("raw/lifecycle instrument mismatch".into()));
+            }
+            raw.for_batch(batch).cloned()
+        })
+        .transpose()?;
+    let changes = outcome_pending_changes(code, batch)?;
+    let mut unconfirmed = Vec::new();
+    for change in &changes {
+        let lifecycle_fact =
+            lifecycle.confirmation_evidence_for(change.previous_date, change.current_date)?;
+        let query =
+            build_confirmation_query(change, batch.evidence(), &lifecycle_fact).map_err(&fail)?;
+        let pair = batch
+            .records()
+            .iter()
+            .filter(|r| r.date == change.previous_date || r.date == change.current_date)
+            .map(review_bar_fact)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(&fail)?;
+        let snapshot = ReviewSnapshot {
+            schema_version: 1,
+            discovery_contract: "outcome-provider-sequence-v1".into(),
+            rule_version: "br171-close-change-v1".into(),
+            instrument: lifecycle.instrument.clone(),
+            query,
+            fact_payload: serde_json::json!({"adjacent_bars":pair}),
+            raw_evidence: serde_json::json!({"daily":raw_payload,"lifecycle":review_lifecycle(lifecycle)}),
+        };
+        let mut candidate_id = None;
+        if raw.is_some() {
+            match review::discover_on_conn(
+                conn,
+                &QualifiedDailyChangeDiscovery {
+                    snapshot: snapshot.clone(),
+                },
+                now,
+            ) {
+                Ok(candidate) => candidate_id = Some(candidate.candidate_id),
+                Err(ReviewError::AlreadyConfirmed) => {}
+                // A valid old database without this extension can still read
+                // exact legacy confirmations; it can never invent a candidate.
+                Err(ReviewError::Unavailable)
+                    if review::admit_on_conn(conn, &snapshot)
+                        .map_err(|e| fail(e.to_string()))? => {}
+                Err(e) => return Err(fail(e.to_string())),
+            }
+        }
+        if !review::admit_on_conn(conn, &snapshot).map_err(|e| fail(e.to_string()))? {
+            unconfirmed.push(candidate_id.unwrap_or_else(|| {
+                format!("{}:{}:{}", code, change.previous_date, change.current_date)
+            }));
         }
     }
-    Ok(())
+    if unconfirmed.is_empty() {
+        return Ok(());
+    }
+    Err(GatewayError::classified(
+        CAPABILITY,
+        Some(provider),
+        "unavailable",
+        if raw.is_some() {
+            "manual_confirmation_required"
+        } else {
+            "daily_change_discovery_unavailable_v1"
+        },
+        false,
+        format!(
+            "BR-171 pending/expired/rejected facts require exact persisted review; candidates={}",
+            unconfirmed.join(",")
+        ),
+    ))
+}
+
+fn confirm_changes_with_database(
+    code: &str,
+    batch: &GatewayBatch<KlineData>,
+    lifecycle: &SecurityLifecycleContext,
+    raw: Option<&super::outcome_daily_bars::OutcomeReviewEvidence>,
+) -> Result<(), GatewayError> {
+    let fail = |e: String| {
+        final_admission_error(
+            batch.evidence().provider,
+            format!("manual_confirmation_lookup_failed: {e}"),
+        )
+    };
+    let database = DatabaseManager::try_get()
+        .ok_or_else(|| fail("confirmation database is not initialized".into()))?;
+    let mut conn = database.get_conn().map_err(|e| fail(e.to_string()))?;
+    finalize_changes_on_conn(&mut conn, code, batch, lifecycle, raw, chrono::Utc::now())
+}
+
+async fn finalize_ordinary_batch_async(
+    code: String,
+    batch: GatewayBatch<KlineData>,
+) -> Result<GatewayBatch<KlineData>, GatewayError> {
+    let mut records = batch.records().to_vec();
+    records.sort_by_key(|r| r.date);
+    let ordered = GatewayBatch::Available {
+        records,
+        evidence: batch.evidence().clone(),
+    };
+    if outcome_pending_changes(&code, &ordered)?.is_empty() {
+        return Ok(batch);
+    }
+    let (start, end) = batch_window(&ordered)?;
+    let lifecycle = SecurityLifecycleGateway::new()
+        .acquire(&code, start, end)
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        confirm_changes_with_database(&code, &ordered, &lifecycle, None)?;
+        Ok(batch)
+    })
+    .await
+    .map_err(|e| {
+        GatewayError::unavailable(CAPABILITY, None, true, format!("daily review worker: {e}"))
+    })?
 }
 
 /// Final BR-171/lifecycle admission for an immutable schema-v2 outcome
@@ -631,6 +810,7 @@ fn confirm_outcome_changes(
 pub(super) async fn finalize_outcome_sequence_async(
     code: String,
     batch: GatewayBatch<KlineData>,
+    raw: super::outcome_daily_bars::OutcomeReviewEvidence,
 ) -> Result<(GatewayBatch<KlineData>, OutcomeLifecycleAdmission), GatewayError> {
     let pending = outcome_pending_changes(&code, &batch)?;
     let (window_start, window_end) = batch_window(&batch)?;
@@ -642,7 +822,7 @@ pub(super) async fn finalize_outcome_sequence_async(
         return Ok((batch, admission));
     }
     tokio::task::spawn_blocking(move || {
-        confirm_outcome_changes(&batch, &pending, &lifecycle)?;
+        confirm_changes_with_database(&code, &batch, &lifecycle, Some(&raw))?;
         Ok((batch, admission))
     })
     .await
@@ -698,3 +878,7 @@ mod tests {
         assert_eq!(row.provider, "Custom");
     }
 }
+
+#[cfg(test)]
+#[path = "historical_bars_review_tests.rs"]
+mod review_tests;

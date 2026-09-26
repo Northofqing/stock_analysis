@@ -2521,6 +2521,13 @@ where
     block_on_with_timeout(fut, GRPC_BRIDGE_SYNC_TIMEOUT)
 }
 
+/// Reuse the bounded bridge runtime for synchronous Gateway finalizers that
+/// need async lifecycle evidence. This does not create another transport owner.
+pub(super) fn block_on_gateway<F, T>(future: F) -> Result<T, GatewayError>
+where F: std::future::Future<Output=Result<T,GatewayError>> + Send, T: Send {
+    block_on(future)
+}
+
 /// gRPC 客户端桥: 每 op 一个查询方法, 内部 client.query (§10 重试语义) + convert。
 /// 连接是惰性 async (`ensure_connected`, 在方法层做) — 同步方法在 blocking 线程
 /// 经 block_on 调用, async 方法在 runtime worker 调用; 首连放在方法层避免

@@ -2612,6 +2612,8 @@ pub mod benchmark_segments;
 pub mod chain_intelligence;
 pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod daily_change_confirmation;
+pub mod daily_change_review;
+pub(crate) mod daily_change_review_schema_v1;
 pub mod data_acquisition_audit;
 pub mod execution_tracking;
 pub(crate) mod global_schema_catalog_v1;

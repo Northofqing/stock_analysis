@@ -157,6 +157,7 @@ pub(crate) const TRANSITIONAL_SELECTION_PAYLOAD_SCHEMAS: [&str; 4] = [
 const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
 const PAPER_LEDGER_CATALOG_GENERATION: i64 = super::paper_ledger_schema_v1::CATALOG_GENERATION;
+const REVIEW_CATALOG_GENERATION: i64 = super::daily_change_review_schema_v1::CATALOG_GENERATION;
 const SQLITE_MINIMUM_LIBVERSION_NUMBER: i32 = 3_035_000;
 const SQLITE_NEXT_MAJOR_LIBVERSION_NUMBER: i32 = 4_000_000;
 
@@ -1114,11 +1115,19 @@ pub(crate) struct SameRuntimeCatalogReferences {
     transitional: CatalogReferenceState,
     amended: CatalogReferenceState,
     paper_v2: PaperLedgerCatalogV2References,
+    review_v3: DailyChangeReviewCatalogV3References,
 }
 
 /// Explicit extension generation; the three frozen v1 references stay intact.
 #[derive(Debug)]
 struct PaperLedgerCatalogV2References {
+    legacy: CatalogReferenceState,
+    transitional: CatalogReferenceState,
+    amended: CatalogReferenceState,
+}
+
+#[derive(Debug)]
+struct DailyChangeReviewCatalogV3References {
     legacy: CatalogReferenceState,
     transitional: CatalogReferenceState,
     amended: CatalogReferenceState,
@@ -1219,11 +1228,11 @@ pub(crate) fn classify_database_half(
             .collect(),
     )?;
     if actual.identity.application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && actual.identity.user_version > PAPER_LEDGER_CATALOG_GENERATION
+        && actual.identity.user_version > REVIEW_CATALOG_GENERATION
     {
         return Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
             actual: actual.identity.user_version,
-            supported: PAPER_LEDGER_CATALOG_GENERATION,
+            supported: REVIEW_CATALOG_GENERATION,
         });
     }
     validate_catalog_safety(
@@ -1273,7 +1282,10 @@ pub(crate) fn classify_database_half(
     }
 
     let paper_v2 = actual.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION;
-    let (legacy_reference, transitional_reference, amended_reference) = if paper_v2 {
+    let review_v3 = actual.identity.user_version == REVIEW_CATALOG_GENERATION;
+    let (legacy_reference, transitional_reference, amended_reference) = if review_v3 {
+        (&references.review_v3.legacy, &references.review_v3.transitional, &references.review_v3.amended)
+    } else if paper_v2 {
         (
             &references.paper_v2.legacy,
             &references.paper_v2.transitional,
@@ -1339,10 +1351,10 @@ pub(crate) fn classify_database_half(
             ),
         });
     };
-    if paper_v2 {
+    if paper_v2 || review_v3 {
         expected_identity = DatabaseSchemaIdentity {
             application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-            user_version: PAPER_LEDGER_CATALOG_GENERATION,
+            user_version: if review_v3 { REVIEW_CATALOG_GENERATION } else { PAPER_LEDGER_CATALOG_GENERATION },
         };
     }
     require_exact_ancillary_catalog(actual, expected_reference)?;
@@ -1382,7 +1394,14 @@ pub(crate) fn classify_database_half(
         mode: actual.mode,
         identity: actual.identity,
         runtime: actual.runtime.clone(),
-        whole_application_catalog_sha256: if paper_v2 {
+        whole_application_catalog_sha256: if review_v3 {
+            WholeApplicationSchemaCatalogSha256(catalog_digest(
+                b"stock_analysis.global_schema_catalog.v3.daily_change_review.v1",
+                actual.mode,
+                &actual.runtime,
+                &actual.objects,
+            ))
+        } else if paper_v2 {
             WholeApplicationSchemaCatalogSha256(catalog_digest(
                 b"stock_analysis.global_schema_catalog.v2.paper_ledger.v1",
                 actual.mode,
@@ -1637,6 +1656,15 @@ fn build_same_runtime_catalog_state_with_paper(
     phase: Option<SelectionCatalogDdlPhase>,
     paper_v2: bool,
 ) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
+    build_same_runtime_catalog_state_with_extensions(mode, phase, paper_v2, false)
+}
+
+fn build_same_runtime_catalog_state_with_extensions(
+    mode: GlobalSchemaCatalogMode,
+    phase: Option<SelectionCatalogDdlPhase>,
+    paper_v2: bool,
+    review_v3: bool,
+) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
     let label = phase.map_or("legacy", SelectionCatalogDdlPhase::label);
     let connection = Connection::open_in_memory()
         .map_err(|error| sqlite_reference_build_error("open-in-memory", None, error))?;
@@ -1680,6 +1708,25 @@ fn build_same_runtime_catalog_state_with_paper(
             }
         }
         expected_registry.extend(paper_registry);
+    }
+    if review_v3 {
+        for (i, (kind, name, table, sql)) in super::daily_change_review_schema_v1::STATEMENTS.iter().enumerate() {
+            let entry = FrozenCatalogRegistryEntry {
+                identity: CatalogObjectIdentity {
+                    kind: parse_catalog_object_kind("daily-change-review-v1", kind)?,
+                    name: (*name).into(),
+                    table_name: (*table).into(),
+                },
+                ddl_id: format!("daily-change-review-v1:{name}"),
+                source_line: i + 1,
+            };
+            connection.execute_batch(sql).map_err(|error| sqlite_reference_build_error("execute-daily-change-review-v1", Some(&entry.ddl_id), error))?;
+            capture_exact_catalog_object(&connection, &entry.identity, &entry.ddl_id, "daily-change-review-v1")?;
+            if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
+                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch { catalog: "daily-change-review-v1", detail: "duplicate DDL identity".into() });
+            }
+            expected_registry.push(entry);
+        }
     }
     let built = OwnerBuiltCatalogState {
         reference: capture_catalog_reference_state(&connection, mode)?,
@@ -2113,6 +2160,9 @@ fn capture_managed_index_geometry(
                 .filter(|(kind, _, _, _)| *kind == "table")
                 .map(|(_, name, _, _)| (*name).to_owned()),
         )
+        .chain(super::daily_change_review_schema_v1::STATEMENTS.iter()
+            .filter(|(kind, _, _, _)| *kind == "table")
+            .map(|(_, name, _, _)| (*name).to_owned()))
         .filter(|table| existing_tables.contains(table.as_str()))
         .collect::<Vec<_>>();
     let mut geometry = Vec::new();
@@ -2260,6 +2310,12 @@ fn issue_same_runtime_catalog_references(
     {
         return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
     }
+    let (review_runtime, review_legacy) = build_same_runtime_catalog_state_with_extensions(built.mode, None, true, true)?;
+    let (review_transitional_runtime, review_transitional) = build_same_runtime_catalog_state_with_extensions(built.mode, Some(SelectionCatalogDdlPhase::Transitional), true, true)?;
+    let (review_amended_runtime, review_amended) = build_same_runtime_catalog_state_with_extensions(built.mode, Some(SelectionCatalogDdlPhase::Final), true, true)?;
+    if [review_runtime, review_transitional_runtime, review_amended_runtime].iter().any(|runtime| runtime != &built.runtime) {
+        return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
+    }
     Ok(SameRuntimeCatalogReferences {
         mode: built.mode,
         runtime: built.runtime,
@@ -2270,6 +2326,11 @@ fn issue_same_runtime_catalog_references(
             legacy: legacy.reference,
             transitional: transitional.reference,
             amended: amended.reference,
+        },
+        review_v3: DailyChangeReviewCatalogV3References {
+            legacy: review_legacy.reference,
+            transitional: review_transitional.reference,
+            amended: review_amended.reference,
         },
     })
 }
@@ -2463,6 +2524,7 @@ fn validate_catalog_safety(
     });
     let paper_tables = super::paper_ledger_schema_v1::STATEMENTS
         .iter()
+        .chain(super::daily_change_review_schema_v1::STATEMENTS.iter())
         .filter(|(kind, _, _, _)| *kind == "table")
         .map(|(_, name, _, _)| *name)
         .collect::<BTreeSet<_>>();
@@ -3315,12 +3377,12 @@ mod tests {
     fn future_generation_and_incomplete_final_payload_fail_closed() {
         let references = same_runtime_references(GlobalSchemaCatalogMode::Test);
         let mut actual = snapshot_for_state(&references, DatabaseHalfState::Amended);
-        actual.identity.user_version = 3;
+        actual.identity.user_version = 4;
         assert!(matches!(
             classify_database_half(&actual, &references),
             Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
-                actual: 3,
-                supported: 2,
+                actual: 4,
+                supported: 3,
             })
         ));
 
@@ -3601,6 +3663,34 @@ mod tests {
                 &refs
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn task8_catalog_v3_exact_extension_preserves_v1_v2_and_rejects_partial_unknown() {
+        let mode=GlobalSchemaCatalogMode::Test;
+        let refs=same_runtime_references(mode);
+        let authority=SelectionCatalogCaptureAuthority::for_test_code();
+        for phase in [None,Some(SelectionCatalogDdlPhase::Transitional),Some(SelectionCatalogDdlPhase::Final)] {
+            let conn=Connection::open_in_memory().unwrap(); let mut ids=BTreeSet::new();
+            execute_legacy_catalog_ddl(&conn,&legacy_catalog_registry_entries_v1().unwrap(),&legacy_catalog_ddl_entries_v1().unwrap(),"TEST_CODE_review",&mut ids).unwrap();
+            if let Some(phase)=phase{execute_selection_catalog_ddl(&conn,mode,phase,&mut ids).unwrap();}
+            for (_,_,_,sql) in super::super::paper_ledger_schema_v1::STATEMENTS{conn.execute_batch(sql).unwrap();}
+            conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=2").unwrap();
+            let v2=capture_catalog_snapshot(&authority,&conn,mode).unwrap();
+            classify_database_half(&v2,&refs).unwrap();
+            for (_,_,_,sql) in super::super::daily_change_review_schema_v1::STATEMENTS{conn.execute_batch(sql).unwrap();}
+            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err(),"old generation cannot authorize extension");
+            conn.execute_batch("PRAGMA user_version=3").unwrap();
+            let v3=capture_catalog_snapshot(&authority,&conn,mode).unwrap();
+            classify_database_half(&v3,&refs).expect("complete explicit CatalogV3 review extension");
+            assert_ne!(v2.objects,v3.objects);
+            conn.execute_batch("CREATE TABLE daily_change_review_shadow(value TEXT)").unwrap();
+            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
+            conn.execute_batch("DROP TABLE daily_change_review_shadow; DROP TRIGGER daily_change_review_no_delete").unwrap();
+            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
+            conn.execute_batch("CREATE TRIGGER daily_change_review_no_delete BEFORE DELETE ON daily_change_review_event BEGIN SELECT 1; END").unwrap();
+            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
         }
     }
 

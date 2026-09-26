@@ -415,6 +415,91 @@ struct StructurallyAdmittedBatch {
     transport_attempts: Vec<OutcomeTransportAttemptPreimage>,
 }
 
+/// Raw discovery authority exists only after this Adapter's structural and
+/// transport qualification. It cannot be built from CLI JSON or GatewayError.
+pub(super) struct OutcomeReviewEvidence {
+    instrument: InstrumentId,
+    batch_facts: serde_json::Value,
+    raw: serde_json::Value,
+}
+
+impl OutcomeReviewEvidence {
+    fn from_qualified_projection(
+        plan: &OutcomeAcquisitionPlan,
+        projected: &StructurallyAdmittedBatch,
+        batch: &GatewayBatch<KlineData>,
+    ) -> Result<Self, GatewayError> {
+        Ok(Self {
+            instrument: plan.instrument.clone(),
+            batch_facts: super::historical_bars::review_batch_facts(batch)?,
+            raw: serde_json::json!({
+                "schema":"outcome-provider-review-evidence-v1",
+                "request":plan.provider_request_json,"request_hash":plan.provider_request_hash,
+                "semantic_request": { "request_evidence_json":plan.request_evidence.request_evidence_json,"request_hash":plan.request_evidence.request_hash,"request_evidence_hash":plan.request_evidence.request_evidence_hash },"due_binding_hash":plan.verified_due_binding_hash,
+                "provider_capability_hash":plan.provider_capability_hash,
+                "calendar_hash":plan.calendar_hash,"trading_date_vector":plan.trading_date_vector,
+                "available_evidence":projected.available_evidence,
+                "provider_ordered_content":projected.provider_ordered_content_json,
+                "provider_ordered_content_hash":projected.provider_ordered_content_hash,
+                "provider_response":projected.provider_response_json,"provider_response_hash":projected.provider_response_hash,
+                "window_preimages":projected.window_preimages,"transport_attempts":projected.transport_attempts,
+            }),
+        })
+    }
+    pub(super) fn for_batch(
+        &self,
+        batch: &GatewayBatch<KlineData>,
+    ) -> Result<&serde_json::Value, GatewayError> {
+        if super::historical_bars::review_batch_facts(batch)? != self.batch_facts {
+            return Err(invalid_evidence(
+                "review raw authority does not bind selected batch",
+            ));
+        }
+        Ok(&self.raw)
+    }
+    pub(super) fn instrument(&self) -> &InstrumentId {
+        &self.instrument
+    }
+}
+
+#[cfg(test)]
+pub(super) fn task8_review_fixture() -> (GatewayBatch<KlineData>, OutcomeReviewEvidence) {
+    let instrument = InstrumentId::new(
+        crate::market_domain::Exchange::Shenzhen,
+        "TEST_CODE_300005",
+        crate::market_domain::AssetClass::Equity,
+    )
+    .unwrap();
+    let bars = [(16, 18.59), (17, 14.87), (20, 11.90)]
+        .into_iter()
+        .map(|(day, close)| OutcomeDailyBar {
+            market_date: NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 10000.0,
+            amount: 200000.0,
+        })
+        .collect::<Vec<_>>();
+    let batch = GatewayBatch::Available {
+        records: project_kline_records(&bars),
+        evidence: BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE_tdx".into(),
+            source_at: Some("2026-07-20T15:00:00+08:00".into()),
+            observed_at: "2026-07-20T16:00:00+08:00".into(),
+            batch_id: "TEST_CODE_outcome_batch1".into(),
+        },
+    };
+    let raw = OutcomeReviewEvidence {
+        instrument,
+        batch_facts: super::historical_bars::review_batch_facts(&batch).unwrap(),
+        raw: serde_json::json!({"fixture":"TEST_CODE_synthetic_qualified_outcome_preimages"}),
+    };
+    (batch, raw)
+}
+
 #[derive(Debug)]
 struct OutcomeProjectionFailure {
     error: GatewayError,
@@ -653,10 +738,8 @@ impl OutcomeDailyBarsGateway {
             records: projected.validation_records.clone(),
             evidence: projected.evidence.clone(),
         };
-        let (_, lifecycle_admission) =
-            finalize_outcome_sequence_async(plan.canonical_stock_code.clone(), quality_batch)
-                .await
-                .map_err(map_final_admission_error)
+        let review_evidence =
+            OutcomeReviewEvidence::from_qualified_projection(&plan, &projected, &quality_batch)
                 .map_err(|error| {
                     OutcomeAcquisitionFailure::after_provider(
                         &plan,
@@ -665,6 +748,21 @@ impl OutcomeDailyBarsGateway {
                         projected.transport_attempts.clone(),
                     )
                 })?;
+        let (_, lifecycle_admission) = finalize_outcome_sequence_async(
+            plan.canonical_stock_code.clone(),
+            quality_batch,
+            review_evidence,
+        )
+        .await
+        .map_err(map_final_admission_error)
+        .map_err(|error| {
+            OutcomeAcquisitionFailure::after_provider(
+                &plan,
+                error,
+                Some(projected.available_evidence.clone()),
+                projected.transport_attempts.clone(),
+            )
+        })?;
         let (
             lifecycle_evidence_json,
             lifecycle_evidence_hash,
