@@ -112,6 +112,7 @@ pub(super) struct Recovery {
     pub(super) capability_begins: BTreeMap<String, (old::Fact, CapabilitiesBegin)>,
     pub(super) health_responses: BTreeMap<String, Vec<u8>>,
     pub(super) data_catalogs: BTreeMap<u64, ExternalProviderCatalog>,
+    pub(super) data_connections: BTreeMap<u64, ConnectionIdentity>,
     pub(super) pending: Vec<u64>,
 }
 
@@ -259,7 +260,7 @@ pub(super) fn load(
                 let qualified = raw.project(&begin.request)?.is_ok();
                 let policy_qualified = raw
                     .response_bytes()
-                    .and_then(|bytes| crate::grpc_client::historical_external::health(bytes).ok())
+                    .and_then(|bytes| crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(&value.identity.descriptor_sha256).and_then(|decoder| decoder.health(bytes)).ok())
                     .is_some_and(|response| {
                         crate::grpc_client::build_identity::BuildIdentityTrust::bundled().is_ok_and(
                             |trust| {
@@ -470,6 +471,7 @@ pub(super) fn load(
                         params![intent.as_str(),value.effect_begin_version,data.request_plan_version,raw_digest(&data.request.bytes).as_str(),phase,item,candidate,data.attempt,fact.owner,fact.generation,fact.time],
                         |row| row.get(0),
                     ).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                    require(recovered.data_connections.insert(value.effect_begin_version, value.identity.clone()).is_none())?;
                     require(
                         paired == 1
                             && recovered

@@ -278,8 +278,7 @@ impl AuthorizedHealthAttempt {
         };
         let (request_id, request) = self.core.into_request();
         let completion = match client.execute_external_health(request).await {
-            ExternalSystemCall::Response(response) => {
-                let bytes = response.encode_to_vec();
+            ExternalSystemCall::Response(response, bytes) => {
                 let processed = validate_health_response_id(&request_id, &response)
                     .and_then(|()| client.observe_external_health(&request_id, &response));
                 let connected = processed.is_ok().then_some(client);
@@ -291,7 +290,7 @@ impl AuthorizedHealthAttempt {
                 }
             }
             ExternalSystemCall::UnaryStatus(status) => {
-                ExternalControlCompletion::status(status, &request_id)
+                ExternalControlCompletion::status(status, &request_id, &identity)
             }
         };
         completion.bind_identity(identity)
@@ -357,8 +356,7 @@ impl AuthorizedCapabilitiesAttempt {
         let identity = client.external_connection_identity()?;
         let (request_id, request) = self.core.into_request();
         match client.execute_external_capabilities(request).await {
-            ExternalSystemCall::Response(response) => {
-                let bytes = response.encode_to_vec();
+            ExternalSystemCall::Response(response, bytes) => {
                 let processed = client.accept_external_capabilities(&request_id, &response);
                 let connected = processed.is_ok().then_some(client);
                 Ok(ExternalControlCompletion {
@@ -369,7 +367,7 @@ impl AuthorizedCapabilitiesAttempt {
                 })
             }
             ExternalSystemCall::UnaryStatus(status) => {
-                Ok(ExternalControlCompletion::status(status, &request_id).bind_identity(identity))
+                Ok(ExternalControlCompletion::status(status, &request_id, &identity).bind_identity(identity))
             }
         }
     }
@@ -393,18 +391,19 @@ impl<T> ExternalControlCompletion<T> {
         }
     }
 
-    fn status(status: tonic::Status, request_id: &str) -> Self {
+    fn status(status: tonic::Status, request_id: &str, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity) -> Self {
         let (code, details, error_detail_trailer) = capture_status_material(&status);
+        let error = match crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(&identity.descriptor_sha256) {
+            Ok(decoder) => GrpcError::from_status_with_decoder(status, StatusErrorContext::control(ContractProfile::ExternalV1, request_id), decoder),
+            Err(error) => error,
+        };
         Self {
             material: OwnedExternalControlMaterial::Status {
                 code,
                 details,
                 error_detail_trailer,
             },
-            processed: Err(GrpcError::from_status(
-                status,
-                StatusErrorContext::control(ContractProfile::ExternalV1, request_id),
-            )),
+            processed: Err(error),
             connected: None,
             connection_identity: None,
         }

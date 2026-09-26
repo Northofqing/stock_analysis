@@ -60,6 +60,7 @@ impl BuildIdentityTrust {
     }
 
     fn recorded_identity(&self, digest: &str, descriptor: &str) -> Option<ExpectedBuildIdentity> {
+        super::external_decoder::ExternalDecoder::for_descriptor(descriptor).ok()?;
         if descriptor == self.current_descriptor && digest == self.current_policy_sha256() {
             return Some(self.current.clone());
         } else if super::historical_external::accepts_descriptor(descriptor)
@@ -70,9 +71,10 @@ impl BuildIdentityTrust {
         // only verifies a recorded receipt; it does not change live A's pin.
         #[cfg(test)]
         {
-            let b = Self::test_client_b();
-            if descriptor == b.current_descriptor && digest == b.current_policy_sha256() {
-                return Some(b.current);
+            for b in [Self::test_client_b(), Self::test_client_b_with_descriptor()] {
+                if descriptor == b.current_descriptor && digest == b.current_policy_sha256() {
+                    return Some(b.current);
+                }
             }
         }
         None
@@ -111,7 +113,8 @@ impl BuildIdentityTrust {
     #[cfg(test)]
     pub(crate) fn test_client_b_with_descriptor() -> Self {
         let mut value = Self::test_client_b();
-        value.current_descriptor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        value.current_descriptor = super::external_decoder::test_b::descriptor();
+        value.current.contract_sha256 = value.current_descriptor.to_owned();
         value
     }
 

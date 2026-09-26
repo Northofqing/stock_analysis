@@ -285,6 +285,7 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
         server_b = Some(ExternalMtlsMacroFixture::bind_health_reply_for_test(if mode == 6 { HealthReply::Success } else { HealthReply::TrustedBuildB }).await.unwrap());
         let b = server_b.as_ref().unwrap();
         if mode == 6 { b.append_zero_length_source_for_test(); }
+        else { b.use_descriptor_b_for_test(); }
         front.switch_to(b.endpoint()).await;
         let source = GrpcSource::from_external_macro_bundle_for_test(front.bundle_path().to_path_buf());
         let resumed_at = started + if retry_case { 3_500_000 } else { 3_000_000 };
@@ -292,7 +293,7 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
             observation: DateTime::parse_from_rfc3339(STARTED_LOCAL).unwrap(), observation_calls: Cell::new(0) };
         let prepare = || {
             let prepared = GrpcMarketClient::prepare_client_bundle(front.bundle_path()).unwrap();
-            if mode == 1 || mode == 6 { prepared } else { prepared.with_test_build_trust(BuildIdentityTrust::test_client_b()) }
+            if mode == 1 || mode == 6 { prepared } else { prepared.with_test_build_trust(BuildIdentityTrust::test_client_b_with_descriptor()) }
         };
         let mut local = business.store.as_mut().unwrap().single_user_local_chain_post_close(&baseline.config).unwrap();
         let lease = local.resume_run(&baseline.intent, macro_lease("TEST_CODE_B_OWNER", resumed_at, started + 14_000_000, checkpoint.head_version)).unwrap();
@@ -358,6 +359,17 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
                 }
                 assert_eq!(b.snapshot().data_requests, vec![checkpoint.data.bytes.clone()]);
                 assert_eq!(b.snapshot().data_methods, vec!["global_news"]);
+                if mode != 6 {
+                    use crate::grpc_client::external_decoder::test_b;
+                    let observed = b.snapshot();
+                    assert_ne!(test_b::descriptor(), crate::grpc_client::historical_external::DESCRIPTOR_SHA256);
+                    for bytes in &observed.health_responses {
+                        assert_eq!(test_b::HealthResponse::decode(bytes.as_slice()).unwrap().test_release_b_note, "B");
+                        assert!(crate::grpc_client::historical_external::health(bytes).is_err());
+                    }
+                    assert_eq!(test_b::CapabilitiesResponse::decode(observed.capabilities_responses[0].as_slice()).unwrap().test_release_b_note, "B");
+                    assert_eq!(test_b::QueryResponse::decode(observed.data_responses[0].as_slice()).unwrap().test_release_b_note, "B");
+                }
             } else {
                 assert!(result.is_err());
                 assert_eq!(b.snapshot().capabilities_calls, 0);
@@ -376,11 +388,35 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
         if let Some(raw) = frozen_retry {
             assert_eq!(attempt_result_bytes(business.connection(), &baseline.intent, 1), raw);
         }
+        if retry_case {
+            let mut tables = table_names(business.connection());
+            tables.push("data_acquisition_audit".into());
+            let frozen = old_fact_rows(business.connection(), &tables);
+            let observed = b.snapshot();
+            business.reopen();
+            let mut local = business.store.as_mut().unwrap().single_user_local_chain_post_close(&baseline.config).unwrap();
+            let head = local.inspect_run(&baseline.intent).unwrap().head_version();
+            clock.now.set(UtcMicros::try_new(started + 14_000_000).unwrap());
+            let lease = local.resume_run(&baseline.intent, macro_lease("TEST_CODE_TERMINAL_REOPEN", started + 14_000_000, started + 16_000_000, head)).unwrap();
+            macro_driver::drive_test_prepared(&mut local, lease, &source, &clock, Rc::new(Cell::new(false)), &search, prepare()).await.unwrap();
+            drop(local);
+            assert_eq!(old_fact_rows(business.connection(), &tables), frozen, "terminal reopen cannot append or rewrite facts, bytes, hashes or audits");
+            let after = b.snapshot();
+            assert_eq!(after.health_requests, observed.health_requests);
+            assert_eq!(after.capabilities_requests, observed.capabilities_requests);
+            assert_eq!(after.data_requests, observed.data_requests);
+            assert_eq!(after.tcp_accepts, observed.tcp_accepts);
+        }
         if mode == 0 {
             let current: Vec<u8> = business.connection().query_row("SELECT bytes FROM chain_post_close_macro_control_attempt_results WHERE intent_id=?1 AND kind='Capabilities'", [baseline.intent.as_str()], |row| row.get(0)).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&current).unwrap();
             assert_eq!(value["version"], 4);
             assert_eq!(value["verified_build_identity"]["source_revision"], "TEST_CODE_TRUSTED_RELEASE_B");
+            assert_eq!(value["connection_identity"]["descriptor_sha256"], crate::grpc_client::external_decoder::test_b::descriptor());
+            let data: serde_json::Value = serde_json::from_slice(&attempt_result_bytes(business.connection(), &baseline.intent, 1)).unwrap();
+            assert_eq!(data["version"], 4);
+            assert_eq!(data["wire_identity"]["client_descriptor_sha256"], crate::grpc_client::external_decoder::test_b::descriptor());
+            assert_eq!(data["response"], serde_json::json!(b.snapshot().data_responses[0]));
             business.reopen();
             let mut local = business.store.as_mut().unwrap().single_user_local_chain_post_close(&baseline.config).unwrap();
             assert!(local.inspect_macro(&baseline.intent).unwrap().global_news(GlobalNewsProvider::Eastmoney).is_some());

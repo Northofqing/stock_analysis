@@ -2,7 +2,40 @@
 
 基线：`dd0f9e644cdc714c4d6018da928028c655218496`；开始时源码工作树干净。依据 Task6 plan、预检、authoritative audit D11/D12 和当前源码；不使用旧预检行号替代当前证据。不连接外部服务、不读取生产数据库、不部署或自动迁移。
 
-## 最终状态
+## Fix round 1 — review I01 / M01（基线 2438ca76）
+
+本轮只处理 `task-6-review.md` 的 I01 和 M01，不混 Task7，不访问生产、外部服务或执行部署。下文原始实现阶段的测试记录保留，本节为本轮修复证据。
+
+结果：I01/M01 修复完成并交复审；核心36/36、最后接口回归43/43、非测试库检查通过。尚未部署；不把本轮源码验证等同于 Task10 生产验收。
+
+### I01 最小修复与兼容边界
+
+- 新增 `grpc_client::external_decoder::ExternalDecoder` 的代码所有、封闭 descriptor→decoder 目录。未知 descriptor 拒绝；已知 descriptor 仅表示可解码，当前/历史 build policy 和 connection receipt 仍独立校验，不从响应或环境学习可信版本。
+- V1–V3 control/data/status 固定使用归档 A decoder。V4 依据严格绑定的 connection policy/descriptor 选择当前 decoder；当前 request 与旧 request 分别检查各自 canonical 合同。旧 A GlobalNews plan/request/id/ordinal/backoff/deadline 不改写；A→B continuation 只支持明确兼容、字节相同的请求形状，并在发业务前用 B decoder 验证，不承诺任意不兼容的未来升级。
+- 控制传输先保存实际 protobuf bytes，再映射到领域类型；避免先用 A 类型重编码而抹去 B 合法字段。Capabilities catalog、Health build qualification、wire/status/data replay 使用相同版本选择。data V4 增加可选 connection identity（旧版本省略，旧 bytes 不变），写入及恢复绑定原 effect-link 的 epoch/policy/descriptor；错误 epoch、缺失身份和把 B data 降级成 A/V3 拒绝。
+- 测试 B 不是假摘要：build.rs 从冻结 A 明确生成独立的 additive B proto，HealthResponse / CapabilitiesResponse / QueryResponse / ErrorDetail 各声明 tag127；独立编译真实 descriptor，SHA256=`95aef6923dba1f688a911bca9a1b81c3c2c3c6e423965fd96026e37032d85fff`。真实 localhost tonic+mTLS 服务实际发送这些字段，B policy 的 contract digest 也不同。生成的 B 消息/信任条目仅 `cfg(test)` 可用；生产支持新发布仍需显式代码/可信目录发布与 Task10 运维资格。
+- 原 A metadata/proto、client-bundle、v11/v12/v14/v15 DDL/seal 本轮均无修改。无需新 schema/migration；旧 control/schema/canonical/raw golden 持续验证，不通过改旧事实“修复”历史。
+
+### M01 终态重开
+
+共享 retry 场景在 A→A 和 A→B 成功终态后关闭数据库、真正重开、恢复 lease 并再次 drive。比较所有 `chain_post_close_*` 不可变事实与 `data_acquisition_audit` 行（包含 bytes/hash；允许正常 lease/run 元数据变化），以及 Health/Capabilities/data 请求、TCP 接收数量，要求完全不变。此项是缺失回归的补充：原生产 early-return 已正确，未伪造行为 RED，也未改终态逻辑。
+
+### 本轮验证记录
+
+1. 真正 RED，session40727：`cargo test --lib task6_current_control_v4_uses_recorded_b_policy_not_legacy_a -- --nocapture`。编译3m16s；0/1，B 真实 descriptor + 合法新字段的 V4 project 返回 `SchemaRejected`，复现 I01。
+2. GREEN 接线初试，session74086：同一单目标；6个编译错误（http 路径、Sync 约束、两处旧测试 initializer 缺 optional identity），非行为 RED。修复后 session64049 的3目标命令仍报 fixture 缺 `Message` trait 导入3处；修复导入，不更改业务断言。
+3. 首次 GREEN，session41054：`cargo test --lib -- task6_current_control_v4_uses_recorded_b_policy_not_legacy_a task6_historical_build_a_v3_reopens_under_client_b_without_changing_bytes task6_durable_b_legacy_qualified --nocapture --test-threads=1`。3/3，编译3m16s、测试16.70s。证明 A 历史、B V4、真实 B 新资格/Capabilities/data 写入与重开。
+4. 核心限定回归：`cargo test --lib -- macro_codec::tests task6_durable_b_ task6_connection_ single_user_external_macro_confirmed_data_retry --nocapture --test-threads=1`。session81699 中21条 codec通过，但15条网络用例在 localhost bind 时被沙箱拒绝，未进入业务，不能计为业务 RED/GREEN；按权限规则原命令提权重跑 session9282，36/36 GREEN，编译3m16s、测试185.70s。覆盖 B descriptor 升级/拒绝/Unknown、物理代次、持久 journal/effect-link、旧 A bytes、V4 status/carrier、原 retry 与两种终态重开。
+5. 最后接口回归 session28354：`cargo test --lib -- new_external_data_result_binds_request_and_descriptor_identity external_control_attempt_tests external_native_control_tests external_query_transport_tests grpc_client::errors::tests --nocapture --test-threads=1`。43/43 GREEN，编译3m14s、测试5.29s；包含最后加强的 V4 inner success 与反降级/epoch 断言，以及实际 control/native/status/provider/carrier 回归。过滤项中没有独立 `external_query_transport_tests` 命名测试；不按过滤词冒称额外测试数，原始数据 wire/source11 已由前一组 codec 和实际 transport 场景验证。
+6. 最终非测试 `cargo check --lib`（session12466）通过，1m14s，既有 warning 非零但无编译错误。`git diff --check` 已通过；`git diff --quiet HEAD -- contracts/external_v1_history client-bundle src/push_foundation/intent_store/chain_post_close.v11.sql src/push_foundation/intent_store/chain_post_close.v12.sql src/push_foundation/intent_store/chain_post_close.v14.sql src/push_foundation/intent_store/chain_post_close.v15.sql` 返回0，证实冻结资产未变。停止验证，不追加无关全量/check/build/clippy。
+
+### 改动面 / 自审
+
+`build.rs` 仅生成独立测试 B 合同；`grpc_client/{external_decoder,build_identity,client,errors,external_control_attempt,external_query_transport,historical_external,unary_attempt,mod}` 负责闭合 current/frozen decoder 和原始字节传输；`chain_post_close_macro{,_codec,_connection,_live,_native,_recovery}` 负责 V4 data 与已存在 effect-link 绑定。两组 fixture/codec 测试覆盖新增合同和终态恢复。未改变业务源、重试策略、旧报告、生产参数或数据库对象；没有新发布授权旁路。
+
+未覆盖：真实上游未来 B 发布及部署、生产迁移重资格、已排队并发 RPC 的完整断网混沌矩阵。当前证据证明 one-dial 与既有双 mTLS 同 URI 切换行为，不夸大为所有网络时序。保留 Task10 运维验收边界。
+
+## 原实现阶段最终状态
 
 Task6 源码实现完成，交独立review；未上线。最终专项18/18、旧布局兼容/重试13/13、最终v15 seal/迁移2/2通过；非测试`cargo check --lib`通过；暂存`git diff --cached --check`通过。先前单项失败均已修复并在相关后续目标复验，不把有失败的合并命令描述成全绿；完整RED/GREEN及时间见下文。保留真实SQLite commit contention/Unknown、旧raw bytes/hash、原request/backoff/deadline断言。没有跑无关全量，也没有执行release/生产迁移/上线。
 

@@ -24,8 +24,8 @@ use crate::grpc_client::client::macro_attempt::{
     MacroTrailerMaterial, RestoredExternalMacroRequest, RestoredMacroRequest,
 };
 use crate::grpc_client::client::ContractProfile;
+use crate::grpc_client::external_decoder::ExternalDecoder;
 use crate::grpc_client::errors::{
-    restore_historical_external_status_error as restore_persisted_status_error,
     GrpcError, PersistedErrorDetailTrailer, StatusErrorContext,
 };
 use crate::grpc_client::external_pb::magic::market::v1::{
@@ -606,6 +606,13 @@ pub(super) struct ControlRequest {
 }
 
 impl ControlRequest {
+    pub(super) fn capture_current(material: ExternalControlRequestMaterial, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity) -> Result<Self> {
+        require(identity.validate_recorded())?;
+        let mut value = Self::capture(material)?;
+        value.client_descriptor_sha256 = Some(identity.descriptor_sha256.clone());
+        value.validate()?;
+        Ok(value)
+    }
     pub(super) fn capture(material: ExternalControlRequestMaterial) -> Result<Self> {
         let value = Self {
             version: 2,
@@ -634,7 +641,7 @@ impl ControlRequest {
         self.validate_with_trust(&BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?)
     }
 
-    fn validate_with_trust(&self, trust: &BuildIdentityTrust) -> Result<()> {
+    fn validate_with_trust(&self, _trust: &BuildIdentityTrust) -> Result<()> {
         require(
             matches!(self.version, 1 | 2)
                 && self.profile == "ExternalV1"
@@ -648,13 +655,15 @@ impl ControlRequest {
         if self.version == 2 {
             require(
                 self.method == Some(self.kind())
-                    && self.client_descriptor_sha256.as_deref().is_some_and(|descriptor| trust.historical_descriptor(descriptor)),
+                    && self.client_descriptor_sha256.as_deref().is_some_and(|descriptor| ExternalDecoder::for_descriptor(descriptor).is_ok()),
             )?;
         } else {
             require(self.method.is_none() && self.client_descriptor_sha256.is_none())?;
         }
         require(matches!(self.kind.as_str(), "Health" | "Capabilities"))?;
-        let (protocol_version, request_id) = historical_external::request_context(self.kind == "Health", &self.bytes)
+        let decoder = ExternalDecoder::for_descriptor(self.client_descriptor_sha256.as_deref().unwrap_or(historical_external::DESCRIPTOR_SHA256))
+            .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        let (protocol_version, request_id) = decoder.request_context(self.kind == "Health", &self.bytes)
             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
         require(protocol_version == 1 && request_id == self.id)
     }
@@ -1008,13 +1017,18 @@ impl ControlRawResult {
         require(self.version == 2 && self.wire_identity.is_none()
             && self.verified_build_identity.is_none() && self.connection_identity.is_none()
             && identity.validate_recorded())?;
-        let wire = ControlWireIdentity::capture(request)?;
-        require(wire.client_descriptor_sha256 == identity.descriptor_sha256)?;
+        let mut wire = ControlWireIdentity::capture(request)?;
+        // An old request may continue unchanged only under the explicitly
+        // supported current decoder's canonical request compatibility.
+        let decoder = ExternalDecoder::for_descriptor(&identity.descriptor_sha256).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        let (_, id) = decoder.request_context(request.kind() == ExternalControlKind::Health, &request.bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        require(id == request.id)?;
+        wire.client_descriptor_sha256 = identity.descriptor_sha256.clone();
         let trust = BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?;
         let build = match request.kind() {
             ExternalControlKind::Health => {
                 require(health.is_none())?;
-                self.response.as_deref().and_then(|bytes| historical_external::health(bytes).ok())
+                self.response.as_deref().and_then(|bytes| decoder.health(bytes).ok())
                     .filter(|response| response.request_id == request.request_id())
                     .and_then(|response| VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust))
             }
@@ -1024,7 +1038,7 @@ impl ControlRawResult {
                 require(health_request.kind() == ExternalControlKind::Health
                     && health_request.endpoint == request.endpoint && health_request.authority == request.authority
                     && health_request.id != request.id)?;
-                let response = historical_external::health(bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                let response = decoder.health(bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
                 require(response.request_id == health_request.request_id())?;
                 Some(VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust)
                     .ok_or(ChainPostCloseError::SchemaRejected)?)
@@ -1043,7 +1057,7 @@ impl ControlRawResult {
     ) -> Result<()> {
         require(self.version == 4 && self.connection_identity.as_ref() == Some(identity))?;
         if let Some(bytes) = health {
-            let response = historical_external::health(bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+            let response = ExternalDecoder::for_descriptor(&identity.descriptor_sha256).and_then(|decoder| decoder.health(bytes)).map_err(|_| ChainPostCloseError::SchemaRejected)?;
             let trust = BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?;
             let expected = VerifiedBuildIdentity::from_recorded_health(&response, identity, &trust)
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
@@ -1066,6 +1080,9 @@ impl ControlRawResult {
     ) -> Result<std::result::Result<(), GatewayError>> {
         require(matches!(self.version, 1 | 2 | 3 | 4))?;
         request.validate_with_trust(trust)?;
+        if self.version < 4 {
+            require(request.client_descriptor_sha256.as_deref().is_none_or(|descriptor| trust.historical_descriptor(descriptor)))?;
+        }
         if self.version == 4 {
             let identity = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
             require(identity.version == 1 && !identity.epoch.is_empty() && identity.epoch.len() <= 512
@@ -1073,10 +1090,12 @@ impl ControlRawResult {
                 && self.wire_identity.as_ref().is_some_and(|wire| wire.client_descriptor_sha256 == identity.descriptor_sha256))?;
         } else { require(self.connection_identity.is_none())?; }
         if self.version >= 3 {
-            self.wire_identity
-                .as_ref()
-                .ok_or(ChainPostCloseError::SchemaRejected)?
-                .validate_with_trust(request, trust)?;
+            let wire = self.wire_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            if self.version == 4 {
+                require(wire.profile == "ExternalV1" && wire.method == request.kind() && wire.request_id == request.id)?;
+                let (_, id) = self.decoder()?.request_context(request.kind() == ExternalControlKind::Health, &request.bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+                require(id == request.id)?;
+            } else { wire.validate_with_trust(request, trust)?; }
             if let Some(build) = &self.verified_build_identity {
                 if let Some(identity) = &self.connection_identity {
                     require(trust.recorded_health(&identity.policy_sha256, &identity.descriptor_sha256, &build.as_health()).is_ok())?;
@@ -1112,7 +1131,7 @@ impl ControlRawResult {
                 require(matches!(self.trailer, Trailer::Absent))?;
                 match request.kind() {
                     ExternalControlKind::Health => {
-                        let response = historical_external::health(bytes)
+                        let response = self.decoder()?.health(bytes)
                             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
                         if let Err(error) =
                             validate_health_response_id(request.request_id(), &response)
@@ -1156,7 +1175,7 @@ impl ControlRawResult {
                         }
                     }
                     ExternalControlKind::Capabilities => {
-                        let response = historical_external::capabilities(bytes)
+                        let response = self.decoder()?.capabilities(bytes)
                             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
                         if let Err(error) =
                             validate_capabilities_response_id(request.request_id(), &response)
@@ -1184,7 +1203,7 @@ impl ControlRawResult {
                     Trailer::Bytes(bytes) => PersistedErrorDetailTrailer::Bytes(bytes),
                     Trailer::Malformed => PersistedErrorDetailTrailer::Malformed,
                 };
-                let error = restore_persisted_status_error(
+                let error = crate::grpc_client::errors::restore_status_at_contract(
                     code,
                     details,
                     trailer,
@@ -1193,6 +1212,7 @@ impl ControlRawResult {
                         ContractProfile::ExternalV1,
                         request.request_id(),
                     ),
+                    self.decoder()?,
                 )
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
                 require(self.diagnostic.as_deref() == error.safe_diagnostic())?;
@@ -1217,7 +1237,7 @@ impl ControlRawResult {
             .response
             .as_deref()
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        let response = historical_external::capabilities(bytes)
+        let response = self.decoder()?.capabilities(bytes)
             .map_err(|_| ChainPostCloseError::SchemaRejected)?;
         validated_external_provider_catalog(request.request_id(), &response)
             .map_err(|_| ChainPostCloseError::SchemaRejected)
@@ -1225,6 +1245,13 @@ impl ControlRawResult {
 
     pub(super) fn response_bytes(&self) -> Option<&[u8]> {
         self.response.as_deref()
+    }
+
+    fn decoder(&self) -> Result<ExternalDecoder> {
+        if self.version < 4 { return Ok(ExternalDecoder::ArchivedA); }
+        let identity = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(identity.validate_recorded())?;
+        ExternalDecoder::for_descriptor(&identity.descriptor_sha256).map_err(|_| ChainPostCloseError::SchemaRejected)
     }
 }
 
@@ -1306,6 +1333,8 @@ pub(super) struct RawResult {
     external_wire: Option<ExternalWireEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wire_identity: Option<RawWireIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_identity: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
 }
 
 impl RawResult {
@@ -1334,6 +1363,7 @@ impl RawResult {
             },
             external_wire: completion.external_wire.clone(),
             wire_identity: None,
+            connection_identity: None,
         }
     }
 
@@ -1365,6 +1395,7 @@ impl RawResult {
                 },
                 external_wire: None,
                 wire_identity: None,
+                connection_identity: None,
             },
         }
     }
@@ -1397,6 +1428,30 @@ impl RawResult {
         }
     }
 
+    pub(super) fn bind_current_connection(&mut self, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity) -> Result<()> {
+        require(self.version == 3 && self.connection_identity.is_none() && identity.validate_recorded())?;
+        let wire = self.wire_identity.as_mut().ok_or(ChainPostCloseError::SchemaRejected)?;
+        wire.client_descriptor_sha256 = identity.descriptor_sha256.clone();
+        if let Some(evidence) = &self.external_wire {
+            require(evidence.client_descriptor_sha256 == identity.descriptor_sha256)?;
+        }
+        self.connection_identity = Some(identity.clone());
+        self.version = 4;
+        Ok(())
+    }
+
+    pub(super) fn validate_current_connection(&self, identity: Option<&crate::grpc_client::connection_qualification::ConnectionIdentity>) -> Result<()> {
+        if self.version == 4 { require(self.connection_identity.as_ref() == identity && identity.is_some()) }
+        else { require(self.connection_identity.is_none()) }
+    }
+
+    fn decoder(&self) -> Result<ExternalDecoder> {
+        if self.version < 4 { return Ok(ExternalDecoder::ArchivedA); }
+        let identity = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(identity.validate_recorded())?;
+        ExternalDecoder::for_descriptor(&identity.descriptor_sha256).map_err(|_| ChainPostCloseError::SchemaRejected)
+    }
+
     pub(super) fn project(
         &self,
         request: &Request,
@@ -1423,13 +1478,21 @@ impl RawResult {
         RetryDecision,
         Option<ProviderAttempts>,
     )> {
-        require(matches!(self.version, 1 | 2 | 3) && ordinal > 0 && ordinal <= request.policy.0)?;
+        require(matches!(self.version, 1 | 2 | 3 | 4) && ordinal > 0 && ordinal <= request.policy.0)?;
+        if self.version < 4 { require(self.connection_identity.is_none())?; }
         request.validate_for(identity)?;
         let profile = request.checked_contract_profile()?;
         let method = identity
             .method(profile)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        if self.version == 3 {
+        if self.version == 4 {
+            self.decoder()?.query_request(&request.bytes).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+            let connection = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            let wire = self.wire_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(profile == ContractProfile::ExternalV1 && method == MethodIdentity::External(external_global_news())
+                && wire.profile == "ExternalV1" && wire.method == ExternalQueryMethod::GlobalNews && wire.request_id == request.id
+                && wire.client_descriptor_sha256 == connection.descriptor_sha256)?;
+        } else if self.version == 3 {
             self.wire_identity
                 .as_ref()
                 .ok_or(ChainPostCloseError::SchemaRejected)?
@@ -1437,7 +1500,7 @@ impl RawResult {
         } else {
             require(self.wire_identity.is_none())?;
         }
-        if matches!(self.version, 2 | 3) && !self.connect_unavailable {
+        if matches!(self.version, 2 | 3 | 4) && !self.connect_unavailable {
             if self.code.is_none() {
                 let (processed, decision) = self.project_external_v2(identity, request, ordinal)?;
                 return Ok((processed, decision, None));
@@ -1449,7 +1512,7 @@ impl RawResult {
             require(
                 !self.connect_unavailable && self.response.is_none() && self.details.is_some(),
             )?;
-        } else if self.version == 3 {
+        } else if matches!(self.version, 3 | 4) {
             require(self.connect_unavailable && self.external_wire.is_none())?;
         } else {
             require(self.external_wire.is_none())?;
@@ -1468,7 +1531,7 @@ impl RawResult {
                 )?;
                 let processed = if profile == ContractProfile::ExternalV1 {
                     require(method == MethodIdentity::External(external_global_news()))?;
-                    Self::project_external_payload(request, bytes)
+                    self.project_external_payload(request, bytes)
                 } else {
                     let response = QueryResponse::decode(bytes.as_slice())
                         .map_err(|_| ChainPostCloseError::SchemaRejected)?;
@@ -1489,7 +1552,7 @@ impl RawResult {
                     Trailer::Bytes(bytes) => PersistedErrorDetailTrailer::Bytes(bytes),
                     Trailer::Malformed => PersistedErrorDetailTrailer::Malformed,
                 };
-                let error = restore_persisted_status_error(
+                let error = crate::grpc_client::errors::restore_status_at_contract(
                     code,
                     details,
                     trailer,
@@ -1506,6 +1569,7 @@ impl RawResult {
                         ),
                         (_, method, _) => StatusErrorContext::data(method, &request.id),
                     },
+                    self.decoder()?,
                 )
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
                 let decision = retry_decision(&error);
@@ -1559,9 +1623,13 @@ impl RawResult {
             .external_wire
             .as_ref()
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        evidence
-            .validate_historical(ExternalQueryMethod::GlobalNews)
-            .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        if self.version == 4 {
+            let identity = self.connection_identity.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            evidence.validate_descriptor(ExternalQueryMethod::GlobalNews, &identity.descriptor_sha256)
+                .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        } else {
+            evidence.validate_historical(ExternalQueryMethod::GlobalNews).map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        }
         Ok(evidence)
     }
 
@@ -1588,7 +1656,7 @@ impl RawResult {
                 protobuf_payload, ..
             } => {
                 require(self.response.as_deref() == Some(protobuf_payload.as_slice()))?;
-                Self::project_external_payload(request, protobuf_payload)
+                self.project_external_payload(request, protobuf_payload)
             }
             ExternalWireMaterialV1::Missing { .. }
             | ExternalWireMaterialV1::Overflow { .. }
@@ -1608,11 +1676,12 @@ impl RawResult {
     }
 
     fn project_external_payload(
+        &self,
         request: &Request,
         bytes: &[u8],
     ) -> std::result::Result<crate::grpc_client::envelope::QueryResult, GrpcError> {
         admit_external_payload(bytes)?;
-        let response = historical_external::query(bytes)?;
+        let response = self.decoder().map_err(|_| wire_error("unsupported_external_descriptor"))?.query(bytes)?;
         crate::grpc_client::envelope::parse_external_query_response(
             &request.id,
             Operation::GlobalNews,
@@ -1645,7 +1714,7 @@ impl RawResult {
             },
             (true, None, None, None) => RecoveredWire::ConnectUnavailable,
             (false, None, None, None)
-                if matches!(self.version, 2 | 3) && self.external_wire.is_some() => {
+                if matches!(self.version, 2 | 3 | 4) && self.external_wire.is_some() => {
                 RecoveredWire::LocalWireFailure
             }
             _ => return Err(ChainPostCloseError::SchemaRejected),
@@ -1839,18 +1908,23 @@ mod tests {
             endpoint_uri: "https://TEST_CODE.invalid:443".into(),
             acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
         }).unwrap();
-        let trust = BuildIdentityTrust::test_client_b();
+        let trust = BuildIdentityTrust::test_client_b_with_descriptor();
+        assert_ne!(trust.current_descriptor(), EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256);
         let mut build = crate::grpc_client::build_identity::test_public_build_identity();
         build.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
         build.binary_sha256 = "b".repeat(64);
+        build.contract_sha256 = trust.current_descriptor().to_owned();
         let health = HealthResponse { request_id: id.into(), live: true, ready: true,
             build_identity: Some(build.clone()), ..Default::default() };
         assert!(trust.current_health(&health).is_ok());
+        let mut b_health = crate::grpc_client::external_decoder::test_b::HealthResponse::decode(health.encode_to_vec().as_slice()).unwrap();
+        b_health.test_release_b_note = "TEST_CODE_SUPPORTED_B_FIELD".into();
+        assert!(historical_external::health(&b_health.encode_to_vec()).is_err());
         let value = serde_json::json!({
-            "version":4,"connect_unavailable":false,"response":health.encode_to_vec(),
+            "version":4,"connect_unavailable":false,"response":b_health.encode_to_vec(),
             "code":null,"details":null,"trailer":"Absent","diagnostic":null,
             "wire_identity":{"profile":"ExternalV1","method":"Health","request_id":id,
-                "client_descriptor_sha256":EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256},
+                "client_descriptor_sha256":trust.current_descriptor()},
             "verified_build_identity":{"service_version":build.service_version,"source_revision":build.source_revision,
                 "contract_sha256":build.contract_sha256,"binary_sha256":build.binary_sha256,"identity_error":""},
             "connection_identity":{"version":1,"epoch":"TEST_CODE_CURRENT_B_EPOCH",
@@ -1931,6 +2005,15 @@ mod tests {
         let descriptor_b = BuildIdentityTrust::test_client_b_with_descriptor();
         assert!(restored.project_with_trust(&request, &descriptor_b).unwrap().is_ok(), "historical A descriptor must be independent of current B descriptor");
         assert_eq!(serde_json::to_vec(&restored).unwrap(), original);
+        let mut b_wire = crate::grpc_client::external_decoder::test_b::HealthResponse::decode(health.encode_to_vec().as_slice()).unwrap();
+        b_wire.test_release_b_note = "TEST_CODE_B_ONLY_FIELD".into();
+        let b_bytes = b_wire.encode_to_vec();
+        assert!(ExternalDecoder::for_descriptor(descriptor_b.current_descriptor()).unwrap().health(&b_bytes).is_ok());
+        let mut changed = serde_json::to_value(&restored).unwrap();
+        changed["response"] = serde_json::json!(b_bytes);
+        let changed: ControlRawResult = serde_json::from_value(changed).unwrap();
+        assert!(changed.project_with_trust(&request, &descriptor_b).is_err(), "current B decoder must never reinterpret an A V3 record");
+        assert!(ExternalDecoder::for_descriptor(&"f".repeat(64)).is_err());
     }
 
     #[test]
@@ -2119,6 +2202,28 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(conflicting.provider(), None);
+
+        // V4 status uses B's explicit decoder while carrier reconciliation and
+        // historical A's forward-compatible status semantics stay unchanged.
+        let trust = BuildIdentityTrust::test_client_b_with_descriptor();
+        let connection = crate::grpc_client::connection_qualification::ConnectionIdentity {
+            version: 1, epoch: "TEST_CODE_B_STATUS_EPOCH".into(),
+            policy_sha256: trust.current_policy_sha256(), descriptor_sha256: trust.current_descriptor().into(),
+        };
+        let mut b_detail = crate::grpc_client::external_decoder::test_b::ErrorDetail::decode(detail.encode_to_vec().as_slice()).unwrap();
+        b_detail.test_release_b_note = "TEST_CODE_B_STATUS_FIELD".into();
+        let bytes = b_detail.encode_to_vec();
+        let mut raw: ControlRawResult = serde_json::from_value(serde_json::json!({
+            "version": 2, "connect_unavailable": false, "response": null,
+            "code": 14, "details": bytes, "trailer": {"Bytes": bytes}, "diagnostic": null,
+        })).unwrap();
+        raw.bind_connection_identity(&request, &connection, None).unwrap();
+        assert_eq!(raw.project(&request).unwrap().unwrap_err().provider(), Some(crate::market_domain::ProviderId::Eastmoney));
+        let frozen = encode(&raw).unwrap();
+        let reopened: ControlRawResult = decode(&frozen).unwrap();
+        assert_eq!(reopened.details.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(encode(&reopened).unwrap(), frozen);
+        assert_eq!(reopened.project(&request).unwrap().unwrap_err().provider(), Some(crate::market_domain::ProviderId::Eastmoney));
     }
 
     fn external_v2_material(
@@ -2226,10 +2331,31 @@ mod tests {
             1,
             &completion,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(stored.raw.version, 3);
         stored.project(&identity, &request, None).unwrap();
+
+        let trust_b = BuildIdentityTrust::test_client_b_with_descriptor();
+        let connection_b = crate::grpc_client::connection_qualification::ConnectionIdentity {
+            version: 1, epoch: "TEST_CODE_B_DATA_EPOCH".into(), policy_sha256: trust_b.current_policy_sha256(),
+            descriptor_sha256: trust_b.current_descriptor().into(),
+        };
+        let mut current = stored.raw.clone();
+        current.external_wire.as_mut().unwrap().client_descriptor_sha256 = connection_b.descriptor_sha256.clone();
+        current.bind_current_connection(&connection_b).unwrap();
+        current.project_for(&identity, &request, 1, None).unwrap().0.unwrap();
+        current.validate_current_connection(Some(&connection_b)).unwrap();
+        let mut other_connection = connection_b.clone();
+        other_connection.epoch.push_str("_OTHER");
+        assert!(current.validate_current_connection(Some(&other_connection)).is_err());
+        assert!(current.validate_current_connection(None).is_err());
+        let mut downgraded = serde_json::to_value(&current).unwrap();
+        downgraded["version"] = serde_json::json!(3);
+        downgraded.as_object_mut().unwrap().remove("connection_identity");
+        let downgraded: RawResult = serde_json::from_value(downgraded).unwrap();
+        assert!(downgraded.project_for(&identity, &request, 1, None).is_err(), "B data must not masquerade as frozen A V3");
 
         let captured = serde_json::to_value(&stored).unwrap();
         for (field, replacement) in [
@@ -2919,6 +3045,7 @@ mod tests {
             backoff_ms: None,
             external_wire: None,
             wire_identity: None,
+            connection_identity: None,
         };
 
         assert!(matches!(
@@ -2947,6 +3074,7 @@ mod tests {
             backoff_ms: None,
             external_wire: None,
             wire_identity: None,
+            connection_identity: None,
         };
         let (processed, decision, provider_attempts) =
             raw.project_for(&identity, &request, 1, None).unwrap();

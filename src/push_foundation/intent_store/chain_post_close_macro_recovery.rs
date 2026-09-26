@@ -527,6 +527,7 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
                 params![intent.as_str(),result.version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))
                 .map_err(|_| storage("full macro result"))?;
             let data: native::DataResult = codec::decode(&result.bytes)?;
+            data.raw.validate_current_connection(connection_history.data_connections.get(&begin.version))?;
             require(
                 key(&extra.0, extra.1, extra.2)? == decoded.query
                     && data.query == decoded.query

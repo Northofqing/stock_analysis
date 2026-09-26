@@ -181,6 +181,11 @@ impl ExternalWireEvidenceV1 {
         self.validate_bound(method, crate::grpc_client::historical_external::accepts_descriptor(&self.client_descriptor_sha256))
     }
 
+    pub(crate) fn validate_descriptor(&self, method: ExternalQueryMethod, descriptor: &str) -> Result<(), GrpcError> {
+        self.validate_bound(method, self.client_descriptor_sha256 == descriptor
+            && super::external_decoder::ExternalDecoder::for_descriptor(descriptor).is_ok())
+    }
+
     fn validate_bound(&self, method: ExternalQueryMethod, descriptor_valid: bool) -> Result<(), GrpcError> {
         if self.material != EXTERNAL_WIRE_MATERIAL
             || self.profile != "ExternalV1"
@@ -268,11 +273,15 @@ impl ExternalQueryTransport {
         Self { client }
     }
 
-    pub(crate) async fn call(
-        &mut self,
-        method: ExternalQueryMethod,
-        mut request: tonic::Request<QueryRequest>,
+    pub(crate) async fn call_with_descriptor(
+        &mut self, method: ExternalQueryMethod, mut request: tonic::Request<QueryRequest>, descriptor: &str,
     ) -> ExternalQueryCall {
+        if let Err(error) = super::external_decoder::ExternalDecoder::for_descriptor(descriptor)
+            .and_then(|decoder| decoder.query_request(&prost::Message::encode_to_vec(request.get_ref()))) {
+            let mut evidence = ExternalWireEvidenceV1::new(method, ExternalWireMaterialV1::Missing { framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES });
+            evidence.client_descriptor_sha256 = descriptor.to_owned();
+            return ExternalQueryCall::LocalWireFailure { error, evidence };
+        }
         let capture = CaptureHandle::new(method);
         request.extensions_mut().insert(capture.clone());
         let response = match method {
@@ -289,18 +298,24 @@ impl ExternalQueryTransport {
                 self.client.economic_release_schedule(request).await
             }
         };
+        let bind = |mut evidence: ExternalWireEvidenceV1| { evidence.client_descriptor_sha256 = descriptor.to_owned(); evidence };
         match response {
             Err(status) => ExternalQueryCall::UnaryStatus {
                 status,
-                evidence: capture.observed(),
+                evidence: bind(capture.observed()),
             },
             Ok(response) => match capture.evidence() {
-                Ok(evidence) => ExternalQueryCall::Response {
-                    message: response.into_inner(),
-                    evidence,
-                },
+                Ok(evidence) => {
+                    let evidence = bind(evidence);
+                    let _ = response;
+                    match super::external_decoder::ExternalDecoder::for_descriptor(descriptor)
+                        .and_then(|decoder| decoder.query(evidence.payload().ok_or_else(|| wire_error("external_response_wire_invalid"))?)) {
+                        Ok(message) => ExternalQueryCall::Response { message, evidence },
+                        Err(error) => ExternalQueryCall::LocalWireFailure { error, evidence },
+                    }
+                }
                 Err((error, evidence)) => {
-                    ExternalQueryCall::LocalWireFailure { error, evidence }
+                    ExternalQueryCall::LocalWireFailure { error, evidence: bind(evidence) }
                 }
             },
         }

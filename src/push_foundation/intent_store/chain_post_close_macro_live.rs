@@ -683,7 +683,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(catalog.layout() == 15)?;
         let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
-        let request = codec::ControlRequest::capture(material)?;
+        let request = codec::ControlRequest::capture_current(material, &identity)?;
         let health = request.kind() == ExternalControlKind::Health;
         let step = if health { Step::Health } else { Step::Capabilities };
         require(current.readiness_episodes.first().and_then(|episode| episode.controls.get(if health { 0 } else { 1 }))
@@ -957,6 +957,7 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                 attempt,
                 completion,
                 provider_catalog,
+                connection_history.as_ref().and_then(|history| history.data_connections.get(&original.begin)),
             )?;
         let (outcome, material) = data.project(&identity, request, provider_catalog)?;
         let retry_due = match material.continuation {
@@ -1039,7 +1040,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?;
         let provider_catalog = history.data_catalogs.get(&ticket.begin).ok_or(ChainPostCloseError::SchemaRejected)?;
         let request = &current.plan.request;
-        let raw = codec::RawResult::capture_external_bound(completion, &codec::first_identity(), request)?;
+        let mut raw = codec::RawResult::capture_external_bound(completion, &codec::first_identity(), request)?;
+        raw.bind_current_connection(history.data_connections.get(&ticket.begin).ok_or(ChainPostCloseError::SchemaRejected)?)?;
         let (gateway, _, _) = raw.project(request, attempt, Some(provider_catalog))?;
         let retry_due = match raw.continuation() {
             MacroContinuation::Terminal => None,

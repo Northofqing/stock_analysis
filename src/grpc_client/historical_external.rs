@@ -42,6 +42,11 @@ pub(crate) fn request_context(health: bool, bytes: &[u8]) -> Result<(u32, String
     Ok((context.protocol_version, context.request_id))
 }
 
+pub(crate) fn query_request(bytes: &[u8]) -> Result<(), GrpcError> {
+    canonical::<frozen::QueryRequest>(bytes)?;
+    Ok(())
+}
+
 pub(crate) fn global_news_request(
     bytes: &[u8],
     id: &str,

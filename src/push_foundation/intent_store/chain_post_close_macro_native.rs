@@ -176,12 +176,14 @@ impl DataResult {
         attempt: u32,
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
         provider_catalog: Option<&ExternalProviderCatalog>,
+        connection: Option<&crate::grpc_client::connection_qualification::ConnectionIdentity>,
     ) -> Result<Self> {
-        let raw = if request.checked_contract_profile()? == ContractProfile::ExternalV1 {
+        let mut raw = if request.checked_contract_profile()? == ContractProfile::ExternalV1 {
             RawResult::capture_external_bound(completion, identity, request)?
         } else {
             RawResult::capture_external(completion)
         };
+        if let Some(connection) = connection { raw.bind_current_connection(connection)?; }
         let (processed, _, _) = raw.project_for(identity, request, attempt, provider_catalog)?;
         let native = native_bytes(&NativeOutcome::project(
             identity,

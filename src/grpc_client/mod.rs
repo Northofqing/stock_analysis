@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod errors;
 pub mod external_pb;
 pub(crate) mod external_query_transport;
+pub(crate) mod external_decoder;
 pub mod external_v1;
 pub(crate) mod historical_external;
 pub mod pb;

@@ -59,6 +59,22 @@ fn main() {
         .compile_protos(&[Path::new(history_source)], &[Path::new("contracts/external_v1_history")])
         .expect("compile frozen historical External contract");
     println!("cargo:rerun-if-changed={history_source}");
+    // An explicit additive TEST_CODE release, compiled independently from A.
+    // Only cfg(test) modules include these messages; never a runtime registry.
+    let upgrade_dir = out_dir.join("external_test_upgrade_b");
+    std::fs::create_dir_all(&upgrade_dir).expect("create test B output");
+    let mut upgrade = std::fs::read_to_string(history_source).expect("read frozen A fixture");
+    for message in ["HealthResponse", "CapabilitiesResponse", "QueryResponse", "ErrorDetail"] {
+        let header = format!("message {message} {{");
+        assert_eq!(upgrade.matches(&header).count(), 1);
+        upgrade = upgrade.replace(&header, &format!("{header}\n  string test_release_b_note = 127;"));
+    }
+    let upgrade_input = upgrade_dir.join("market.proto");
+    std::fs::write(&upgrade_input, upgrade).expect("write test-only generated B input");
+    tonic_prost_build::configure().build_server(false).build_client(false)
+        .out_dir(&upgrade_dir).file_descriptor_set_path(upgrade_dir.join("descriptor.bin"))
+        .compile_protos(&[upgrade_input.as_path()], &[upgrade_dir.as_path()])
+        .expect("compile explicit test B contract");
     println!("cargo:rerun-if-changed={external_source}");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PROTOC");

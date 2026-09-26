@@ -70,6 +70,17 @@ impl GrpcError {
             diagnostic_message,
         )
     }
+
+    pub(crate) fn from_status_with_decoder(status: tonic::Status, context: StatusErrorContext<'_>, decoder: crate::grpc_client::external_decoder::ExternalDecoder) -> Self {
+        let diagnostic = safe_status_message(status.message());
+        let standard = if status.details().is_empty() { Ok(None) } else { Ok(Some(status.details().to_vec())) };
+        let trailer = match status.metadata().get_bin(ERROR_DETAIL_TRAILER) {
+            None => Ok(None), Some(value) => value.to_bytes().map(|bytes| Some(bytes.to_vec())).map_err(|_| ()),
+        };
+        let wire = reconcile_raw_error_detail(standard, trailer)
+            .and_then(|bytes| decode_error_detail_bytes_at_contract(&bytes, context, decoder));
+        grpc_error_from_parts(status.code(), wire, diagnostic)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -504,13 +515,13 @@ fn decode_error_detail_bytes(
     bytes: &[u8],
     context: StatusErrorContext<'_>,
 ) -> Option<DecodedWireErrorDetail> {
-    decode_error_detail_bytes_at_contract(bytes, context, false)
+    decode_error_detail_bytes_at_contract(bytes, context, crate::grpc_client::external_decoder::ExternalDecoder::Current)
 }
 
 fn decode_error_detail_bytes_at_contract(
     bytes: &[u8],
     context: StatusErrorContext<'_>,
-    historical_external: bool,
+    decoder: crate::grpc_client::external_decoder::ExternalDecoder,
 ) -> Option<DecodedWireErrorDetail> {
     let wire = match context.profile {
         ContractProfile::LocalBridgeV1 => {
@@ -532,12 +543,7 @@ fn decode_error_detail_bytes_at_contract(
             }
         }
         ContractProfile::ExternalV1 => {
-            let detail = if historical_external {
-                crate::grpc_client::historical_external::error_detail(bytes)?
-            } else {
-                crate::grpc_client::external_pb::magic::market::v1::ErrorDetail::decode(bytes)
-                    .ok()?
-            };
+            let detail = decoder.error_detail(bytes)?;
             let provider_attempts = ProviderAttempts::from_external_wire(
                 detail.provider_attempts,
                 context.external_provider_catalog(),
@@ -651,28 +657,17 @@ pub(crate) fn restore_persisted_status_error(
     diagnostic: Option<&str>,
     context: StatusErrorContext<'_>,
 ) -> Option<GrpcError> {
-    restore_status_at_contract(code, standard, trailer, diagnostic, context, false)
+    restore_status_at_contract(code, standard, trailer, diagnostic, context, crate::grpc_client::external_decoder::ExternalDecoder::Current)
 }
 
-/// Read-only public release A decoder. Callers first validate the frozen
-/// request/descriptor; this function grants no current connection authority.
-pub(crate) fn restore_historical_external_status_error(
+/// Decoder is selected from the validated record/connection, never carriers.
+pub(crate) fn restore_status_at_contract(
     code: i32,
     standard: &[u8],
     trailer: PersistedErrorDetailTrailer<'_>,
     diagnostic: Option<&str>,
     context: StatusErrorContext<'_>,
-) -> Option<GrpcError> {
-    restore_status_at_contract(code, standard, trailer, diagnostic, context, true)
-}
-
-fn restore_status_at_contract(
-    code: i32,
-    standard: &[u8],
-    trailer: PersistedErrorDetailTrailer<'_>,
-    diagnostic: Option<&str>,
-    context: StatusErrorContext<'_>,
-    historical_external: bool,
+    decoder: crate::grpc_client::external_decoder::ExternalDecoder,
 ) -> Option<GrpcError> {
     if !is_canonical_safe_diagnostic(diagnostic) {
         return None;
@@ -707,7 +702,7 @@ fn restore_status_at_contract(
         PersistedErrorDetailTrailer::Malformed => Err(()),
     };
     let wire = reconcile_raw_error_detail(standard, trailer)
-        .and_then(|bytes| decode_error_detail_bytes_at_contract(&bytes, context, historical_external));
+        .and_then(|bytes| decode_error_detail_bytes_at_contract(&bytes, context, decoder));
     let diagnostic_message = diagnostic.map(|value| Box::new(DiagnosticMessage::new(value)));
     Some(grpc_error_from_parts(code, wire, diagnostic_message))
 }

@@ -11,7 +11,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     SubscribeRequest,
 };
 use prost::bytes::BufMut as _;
-use prost::Message as _;
+use prost::Message;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -148,6 +148,7 @@ struct ExternalControlState {
     watchlist_reply: WatchlistReply,
     reject_new_connections: bool,
     append_zero_length_source: bool,
+    descriptor_b: bool,
 }
 
 #[derive(Clone)]
@@ -225,6 +226,9 @@ impl SystemService for ExternalControlService {
                         let mut build = test_external_build_identity();
                         build.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
                         build.binary_sha256 = "b".repeat(64);
+                        if self.state.lock().unwrap().descriptor_b {
+                            build.contract_sha256 = crate::grpc_client::external_decoder::test_b::descriptor().into();
+                        }
                         build
                     } else { test_external_build_identity() }),
                 };
@@ -1003,6 +1007,7 @@ impl Encoder for ExternalControlDataEncoder {
         if state.append_zero_length_source {
             payload.extend_from_slice(&[0x5a, 0x00]);
         }
+        if state.descriptor_b { append_b_field(&mut payload); }
         destination.put_slice(&payload);
         state.observation.data_responses.push(payload);
         Ok(())
@@ -1074,6 +1079,69 @@ where
 impl NamedService for ExternalControlDataServer {
     const NAME: &'static str = "magic.market.v1.MarketDataService";
 }
+
+fn append_b_field(payload: &mut Vec<u8>) {
+    // Tag 127 is declared by the independently compiled B test contract.
+    payload.extend_from_slice(&[0xfa, 0x07, 1, b'B']);
+}
+
+#[derive(Clone)]
+struct ExternalControlSystemServer { generated: SystemServiceServer<ExternalControlService>, inner: Arc<ExternalControlService> }
+impl ExternalControlSystemServer {
+    fn new(service: ExternalControlService) -> Self {
+        let inner = Arc::new(service);
+        Self { generated: SystemServiceServer::from_arc(Arc::clone(&inner)), inner }
+    }
+}
+struct BControlCodec<Q, R> { state: Arc<Mutex<ExternalControlState>>, health: bool, marker: std::marker::PhantomData<(Q, R)> }
+struct BControlEncoder<R> { state: Arc<Mutex<ExternalControlState>>, health: bool, marker: std::marker::PhantomData<R> }
+impl<Q: Message + Default + Send + 'static, R: Message + Send + 'static> Codec for BControlCodec<Q, R> {
+    type Encode = R; type Decode = Q;
+    type Encoder = BControlEncoder<R>; type Decoder = tonic_prost::ProstDecoder<Q>;
+    fn encoder(&mut self) -> Self::Encoder { BControlEncoder { state: self.state.clone(), health: self.health, marker: std::marker::PhantomData } }
+    fn decoder(&mut self) -> Self::Decoder { tonic_prost::ProstDecoder::new(BufferSettings::default()) }
+}
+impl<R: Message> Encoder for BControlEncoder<R> {
+    type Item = R; type Error = Status;
+    fn encode(&mut self, item: R, destination: &mut EncodeBuf<'_>) -> Result<(), Status> {
+        let mut bytes = item.encode_to_vec();
+        append_b_field(&mut bytes);
+        let mut state = self.state.lock().unwrap();
+        let captured = if self.health { &mut state.observation.health_responses } else { &mut state.observation.capabilities_responses };
+        *captured.last_mut().unwrap() = bytes.clone();
+        destination.put_slice(&bytes);
+        Ok(())
+    }
+}
+impl<B> Service<http::Request<B>> for ExternalControlSystemServer
+where B: Body + Send + 'static, B::Error: Into<StdError> + Send + 'static {
+    type Response = http::Response<tonic::body::Body>; type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if !self.inner.state.lock().unwrap().descriptor_b { return self.generated.call(request); }
+        macro_rules! serve {
+            ($q:ty, $r:ty, $method:ident, $health:expr) => {{
+                struct Method(Arc<ExternalControlService>);
+                impl UnaryService<$q> for Method {
+                    type Response = $r; type Future = BoxFuture<Response<$r>, Status>;
+                    fn call(&mut self, request: Request<$q>) -> Self::Future {
+                        let inner = self.0.clone(); Box::pin(async move { <ExternalControlService as SystemService>::$method(&inner, request).await })
+                    }
+                }
+                let codec = BControlCodec::<$q, $r> { state: self.inner.state.clone(), health: $health, marker: std::marker::PhantomData };
+                let method = Method(self.inner.clone());
+                Box::pin(async move { Ok(Grpc::new(codec).unary(method, request).await) })
+            }}
+        }
+        match request.uri().path() {
+            "/magic.market.v1.SystemService/GetHealth" => serve!(HealthRequest, HealthResponse, get_health, true),
+            "/magic.market.v1.SystemService/GetCapabilities" => serve!(CapabilitiesRequest, CapabilitiesResponse, get_capabilities, false),
+            _ => self.generated.call(request),
+        }
+    }
+}
+impl NamedService for ExternalControlSystemServer { const NAME: &'static str = "magic.market.v1.SystemService"; }
 
 pub(crate) struct ExternalControlLoopbackServer {
     endpoint: String,
@@ -1170,7 +1238,7 @@ impl ExternalControlLoopbackServer {
         let (shutdown, receive) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(SystemServiceServer::new(service.clone()))
+                .add_service(ExternalControlSystemServer::new(service.clone()))
                 .add_service(ExternalControlDataServer::new(service))
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = receive.await;
@@ -1375,6 +1443,7 @@ pub(crate) struct ExternalMtlsMacroFixture {
 }
 
 impl ExternalMtlsMacroFixture {
+    pub(crate) fn use_descriptor_b_for_test(&self) { self.server.as_ref().unwrap().state.lock().unwrap().descriptor_b = true; }
     pub(crate) async fn bind_data_success_for_test() -> Result<Self, String> {
         Self::bind_with_modes_for_test(
             HealthReply::Success,
@@ -1535,7 +1604,7 @@ impl ExternalMtlsMacroFixture {
         let (shutdown, receive) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             builder
-                .add_service(SystemServiceServer::new(service.clone()))
+                .add_service(ExternalControlSystemServer::new(service.clone()))
                 .add_service(MarketEventServiceServer::new(service.clone()))
                 .add_service(ExternalControlDataServer::new(service))
                 .serve_with_incoming_shutdown(incoming, async move {

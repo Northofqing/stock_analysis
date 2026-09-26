@@ -963,6 +963,7 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
                     && result.generation == begin.generation,
             )?;
             let raw: RawResult = codec::decode(&result.bytes)?;
+            raw.validate_current_connection(connection_history.data_connections.get(&begin.version))?;
             let (gateway, retry_decision, provider_attempts) =
                 raw.project(&plan.request, ordinal, provider_catalog)?;
             match raw.continuation() {
