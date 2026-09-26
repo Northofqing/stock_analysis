@@ -2,7 +2,7 @@
 
 基线 `19c95e2d`，2026-09-27。唯一 writer；使用 executing-plans、TDD、codebase-design、karpathy-guidelines 和 verification-before-completion：既有计划约束行为，小 Interface 收口身份/审计/事务，逐片真实 RED/GREEN。未访问生产 DB 或外部服务；不部署。
 
-状态：Task8 本地源码实现与限定验证完成，待独立review；不等同于生产启用或整个项目完成。
+状态：Task8 本地源码实现完成；首轮独立 review 的 I01/I02 已按 RED→GREEN 修复，待修复 diff 复审；不等同于生产启用或整个项目完成。
 
 ## 开工复核与裁定
 
@@ -83,3 +83,15 @@
 - 普通HistoricalBars raw-discovery合同仍未交付：固定返回版本化unavailable，不能声称普通CLI在线发现已可用。outcome只在真实due运行且取得合格raw evidence时发现；本任务没有伪造due来主动发现。
 - 测试走真实隔离SQLite、共享CLI runner及Gateway收口；outcome注入资格fixture的附加amount/source字段明确为synthetic，不声称已验收真实服务或完整生产wire。Lifecycle snapshot是现有已准入context（保留Available/Unavailable/VerifiedEmpty及证据），非新增raw lifecycle RPC合同；Task9继续处理生命周期资格。
 - 全链验证/完整snapshot留存尚未做规模压力测试；未跑无关全量、release、网络或生产测试。无后台monitor变更。
+
+## 首轮独立 review 修复（2026-09-27）
+
+首轮报告 `.superpowers/sdd/task_plan/task-8-review.md` 为 REQUEST_CHANGES，确认两个 Important：合法 CatalogV3 被 paper 经济消费者的 `generation == 2` 硬门拒绝；listing metadata unavailable 仍可发现并 Confirm 新候选。
+
+- I01 RED：`cargo test --lib task8_catalog_v3_preserves_paper_projection_and_adjudication -- --nocapture --test-threads=1`，1/1 失败，V3 返回 `IntegrityFailure("...unknown catalog generation")`。修复后同命令 1/1 GREEN。PaperLedger 只接受 generation 2，或 generation 3 + 精确 PaperLedgerV1 + 精确 DailyChangeReviewV1；未知 generation、缺失 review namespace、缺 trigger 仍拒绝。新增 V2 seed/fill → V3 投影一致 → V3 quarantine 裁定行为测试，以及 V3 缺失/篡改 review namespace 的拒绝测试。
+- I02 RED：`cargo test --lib task8_gateway_unavailable_listing_metadata_cannot_create_candidate -- --nocapture --test-threads=1`，旧行为返回 `manual_confirmation_required` 并产生候选。修复后相同测试 GREEN：BR-171 的 lifecycle confirmation evidence 必须有 admitted listing date；Unavailable 保留为 typed `listing_date_context_unavailable`，在 discover 前终止且事件表零候选。旧 nullable legacy 字节未改写。
+- 修复后 `cargo test --lib task8_ -- --nocapture --test-threads=1`：17/17 GREEN。
+- 修复后原限定回归加新增用例：`cargo test --lib -- task8_ database::daily_change_confirmation::tests database::global_schema_catalog_v1::tests paper_ledger_catalog_v2_old_receipt data_gateway::historical_bars::tests monitor::data_quality::tests::br092_ --nocapture --test-threads=1`：49/49 GREEN。
+- `cargo test --bin confirm_daily_change -- --nocapture`：3/3 GREEN。`git diff --check` 通过。
+
+覆盖边界保持诚实：当前 raw authority 行为测试由 `cfg(test)` synthetic fixture 穿过共享 finalizer/SQLite，并未穿过真实 `OutcomeDailyBarsGateway::acquire` 的远端 transport。生产代码的构造闭包静态位于 `project_magic_tdx_batch` 成功后，但真实服务、production CatalogV3 迁移/重新资格与 end-to-end 采集证据属于 Task10；在此之前不声称 raw Adapter 已经生产验收。

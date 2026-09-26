@@ -589,8 +589,12 @@ fn admit_outcome_lifecycle(
             lifecycle
                 .confirmation_evidence_for(pair[0].date, pair[1].date)
                 .map_err(|error| {
-                    final_admission_error(
-                        provider,
+                    GatewayError::classified(
+                        CAPABILITY,
+                        Some(provider),
+                        error.audit_outcome(),
+                        error.reason_code(),
+                        error.retryable(),
                         format!(
                             "outcome lifecycle adjacency {}→{} rejected: {error}",
                             pair[0].date, pair[1].date

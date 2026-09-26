@@ -1350,6 +1350,96 @@ fn declare_test_catalog_v2(db: &DatabaseManager) {
         .batch_execute("PRAGMA application_id=1398035265; PRAGMA user_version=2")
         .unwrap();
 }
+
+#[test]
+fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_catalog_v3.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    let fill = ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "buy",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+    }
+
+    let after_migration = ledger
+        .verified_effective_fills(&request)
+        .expect("CatalogV3 is a strict extension of the qualified paper catalog");
+    assert_eq!(after_migration.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after_migration.lineage(), before.lineage());
+
+    ledger
+        .adjudicate(ruling_for(
+            &ledger,
+            &binding,
+            fill.paper_trade_id.unwrap(),
+            "catalog-v3-quarantine",
+        ))
+        .expect("paper adjudication remains available after the V2 to V3 migration");
+    assert!(ledger
+        .verified_effective_fills(&request)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn task8_catalog_v3_requires_the_exact_review_namespace_for_paper_economics() {
+    for tamper in [None, Some("DROP TRIGGER daily_change_review_no_delete")] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            dir.path().join("TEST_CODE_catalog_v3_incomplete.db"),
+        )
+        .unwrap();
+        declare_test_catalog_v2(&db);
+        let ledger = PaperLedger::open(&db, &instant);
+        let seed = manifest();
+        let binding = seed.binding().unwrap();
+        ledger.apply(PaperCommand::Seed(seed)).unwrap();
+
+        {
+            let mut conn = db.get_conn().unwrap();
+            if let Some(tamper) = tamper {
+                crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+                conn.batch_execute(tamper).unwrap();
+            }
+            conn.batch_execute("PRAGMA user_version=3").unwrap();
+        }
+
+        let result = ledger.verified_effective_fills(&EffectiveFillRequest {
+            scope: EffectiveFillScope::Epoch(binding),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: day(instant()),
+        });
+        assert!(
+            matches!(result, Err(LedgerError::IntegrityFailure(_))),
+            "CatalogV3 paper economics accepted an absent/tampered review namespace: {result:?}"
+        );
+    }
+}
 fn legacy_buy(db: &DatabaseManager) -> i64 {
     let mut conn = db.get_conn().unwrap();
     diesel::sql_query("INSERT INTO paper_trades(plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES ('TEST_CODE_legacy','TEST_CODE_000001','fixture','buy',10,100,'Filled',10,'TEST_CODE_legacy','Normal','Full','2026-07-10 10:00:00','2026-07-10 10:00:00')").execute(&mut conn).unwrap();

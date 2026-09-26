@@ -134,10 +134,18 @@ impl SecurityLifecycleContext {
                 Some(listing.listed_on),
                 Some(listing.evidence.batch_id.as_str()),
             ),
-            ListingDateState::Unavailable { evidence, .. } => (
-                None,
-                evidence.as_ref().map(|evidence| evidence.batch_id.as_str()),
-            ),
+            ListingDateState::Unavailable { error, .. } => {
+                return Err(GatewayError::classified(
+                    LIFECYCLE_CAPABILITY,
+                    Some(ProviderId::Tdx),
+                    error.audit_outcome(),
+                    "listing_date_context_unavailable",
+                    error.retryable(),
+                    format!(
+                        "BR-171 cannot prepare manual confirmation without an admitted listing date: {error}"
+                    ),
+                ));
+            }
         };
         let (actions, actions_evidence) = match &self.corporate_actions {
             CorporateActionState::Available { records, evidence } => (records.as_slice(), evidence),

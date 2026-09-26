@@ -426,7 +426,13 @@ pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String
             })
             .collect::<Vec<_>>();
         expected.sort();
-        if generation != 2 || application != 1398035265 || objects != expected {
+        let supported_generation = match generation {
+            2 => true,
+            3 => crate::database::daily_change_review_schema_v1::is_present(conn)
+                .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?,
+            _ => false,
+        };
+        if !supported_generation || application != 1398035265 || objects != expected {
             return Err(LedgerError::IntegrityFailure(
                 "paper namespace missing/tampered/extra object or unknown catalog generation"
                     .into(),

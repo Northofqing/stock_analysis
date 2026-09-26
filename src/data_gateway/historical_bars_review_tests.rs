@@ -151,3 +151,35 @@ async fn task8_gateway_missing_discovery_contract_and_lifecycle_create_zero_cand
     );
     assert!(candidates(&mut conn).is_empty());
 }
+
+#[test]
+fn task8_gateway_unavailable_listing_metadata_cannot_create_candidate() {
+    let (_dir, _path, mut conn) = setup();
+    let (batch, raw) = super::super::outcome_daily_bars::task8_review_fixture();
+    let mut lc = lifecycle(&batch);
+    lc.listing = ListingDateState::Unavailable {
+        evidence: Some(batch.evidence().clone()),
+        error: GatewayError::unavailable(
+            "SecurityLifecycleListing",
+            Some(crate::market_domain::ProviderId::Tdx),
+            false,
+            "TEST_CODE_listing_metadata_unavailable",
+        ),
+    };
+
+    let unavailable = finalize_changes_on_conn(
+        &mut conn,
+        "TEST_CODE_300005",
+        &batch,
+        &lc,
+        Some(&raw),
+        "2026-07-20T08:00:00Z".parse().unwrap(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        unavailable.reason_code(),
+        "listing_date_context_unavailable"
+    );
+    assert!(candidates(&mut conn).is_empty());
+}
