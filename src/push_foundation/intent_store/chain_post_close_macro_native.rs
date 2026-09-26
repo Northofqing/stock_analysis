@@ -168,6 +168,31 @@ pub(super) struct DataResult {
     pub(super) native_sha256: String,
 }
 
+// The full journal also freezes the success-envelope projection, not just the
+// original single-source codec. Do not route these historical native bytes
+// through ordinary acquisition's current attribution policy. Existing wire
+// errors and Economic/Web codecs are unchanged by this success-only revision.
+fn project_frozen_native(
+    identity: &MacroQueryIdentity,
+    profile: ContractProfile,
+    processed: &std::result::Result<
+        crate::grpc_client::envelope::QueryResult,
+        crate::grpc_client::errors::GrpcError,
+    >,
+) -> NativeOutcome {
+    match (identity, processed) {
+        (MacroQueryIdentity::GlobalNews { provider, limit }, Ok(query)) => NativeOutcome::News(
+            crate::data_gateway::grpc_source::GrpcSource::legacy_durable_global_news_query_result(
+                *provider,
+                *limit,
+                profile == ContractProfile::ExternalV1,
+                query,
+            ),
+        ),
+        _ => NativeOutcome::project(identity, profile, processed),
+    }
+}
+
 impl DataResult {
     pub(super) fn capture_external(
         query: QueryKey,
@@ -185,7 +210,7 @@ impl DataResult {
         };
         if let Some(connection) = connection { raw.bind_current_connection(connection)?; }
         let (processed, _, _) = raw.project_for(identity, request, attempt, provider_catalog)?;
-        let native = native_bytes(&NativeOutcome::project(
+        let native = native_bytes(&project_frozen_native(
             identity,
             request.contract_profile(),
             &processed,
@@ -216,7 +241,7 @@ impl DataResult {
         let (processed, decision, provider_attempts) =
             self.raw
                 .project_for(identity, request, self.attempt, provider_catalog)?;
-        let outcome = NativeOutcome::project(identity, request.contract_profile(), &processed);
+        let outcome = project_frozen_native(identity, request.contract_profile(), &processed);
         require(native_bytes(&outcome)? == self.native)?;
         Ok((
             outcome,

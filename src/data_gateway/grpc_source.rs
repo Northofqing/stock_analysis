@@ -3568,10 +3568,34 @@ impl GrpcSource {
         } else {
             self.query_op(Operation::GlobalNews, params).await?
         };
-        Self::global_news_query_result(provider, limit, external, &q)
+        Self::current_global_news_query_result(provider, limit, external, &q)
     }
 
-    pub(crate) fn global_news_query_result(
+    /// Ordinary routed acquisition: preserve admission and error fields, but
+    /// attribute a rejected success envelope to its actual selected provider.
+    pub(crate) fn current_global_news_query_result(
+        provider: GlobalNewsProvider,
+        limit: u32,
+        external: bool,
+        q: &QueryResult,
+    ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+        Self::legacy_durable_global_news_query_result(provider, limit, external, q).map_err(
+            |error| {
+                GatewayError::classified(
+                    error.capability(),
+                    convert::parse_provider(&q.selected_provider).ok(),
+                    error.audit_outcome(),
+                    error.reason_code(),
+                    error.retryable(),
+                    error.message(),
+                )
+            },
+        )
+    }
+
+    /// Frozen durable native projection. Its requested-provider rejection is
+    /// part of historical bytes; ordinary Gateway / settle must use current.
+    pub(crate) fn legacy_durable_global_news_query_result(
         provider: GlobalNewsProvider,
         limit: u32,
         external: bool,

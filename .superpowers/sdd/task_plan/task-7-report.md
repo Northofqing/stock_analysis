@@ -80,3 +80,38 @@ session43038：上述相同组合命令 **58/58 GREEN**，编译3m13s，测试1.
 既有三个固定产品的 qualified mTLS localhost fixture、Benchmark ownership/Unknown/服务端回执、BR-159 append-failure、原TopN约束和旧mapper用例均GREEN。测试输出68条既有warning，无新增未处理的编译错误。测试后只有一行 TopN 注释由“保留”改成准确的“尝试”，无行为变化。
 
 最终 `git diff --check` 通过；五组 closure 均已运行并记录 allowlist；额外 mapper 全库检索确认旧泛名 `map_query_error(` 已无调用，普通 query_op/Dragon terminal/macro收口走 current，明确持久专用边界走 frozen。没有在相关测试通过后追加同目标 check/build/clippy。
+
+## Fix round 1 — I01 GlobalNews 错源成功 envelope
+
+基线 `19fa6002`，依据 `task-7-review.md` 的 Important I01。前文“全覆盖”结论被此 review 限定：统一审计 helper 不能纠正转换器提前写错的 provider；本轮补齐真实 Ok(query) 路径，不涉及 Task8。
+
+### 真实 RED 与夹具纠正
+
+1. `cargo test --lib d15_attribution_global_news_wrong_source_success_envelopes -- --nocapture --test-threads=1`，session19570：编译3m12s、测试0.17s，失败在测试错误地把 `audit_outcome` 写为 `invalid_evidence`；现有合同是 `partial`，原因码才是 `invalid_evidence`。仅修正测试预期，不算行为 RED。
+2. 同命令 session84443：编译3m15s、测试0.19s，失败在同源 External 成功夹具的 Eastmoney `source_at` 带秒；该 provider 合同是分钟。改为 `2026-09-25 15:59`，并将同源成功独立为测试，未修改生产验证器。不算行为 RED。
+3. `cargo test --lib -- d15_attribution_global_news_ d15_attribution_frozen_global_news_wrong_source --nocapture --test-threads=1`，session36004：编译3m17s、测试0.20s，**2 GREEN / 1 真实 RED**。Local/External × public Gateway/macro settle 四路，实际 Cailianpress 均返回 `Some(Eastmoney)` 且真实 SQLite acquisition audit 为 Eastmoney。未知/空 provider→None/Custom、同源 Available/VerifiedEmpty 及旧 durable 两格式 reopen golden 通过。
+
+测试输入先以 Local/External protobuf encode/decode、各自真实 envelope parser 解析，再只在 RPC 边界注入；普通转换、公共 Gateway 或 `news_outcome`→macro audit、数据库 append 不 mock。错误仍须拒绝，保留原 capability/partial outcome/invalid_evidence reason/nonretryable/message/request hash，旧审计行/hash 前缀不变。
+
+### 最小实现与兼容闭包
+
+- `GrpcSource::current_global_news_query_result` 复用原准入/转换，只在错误结果将 provider 改为实际 `selected_provider` 的闭集解析值；缺失或未知为 None，审计收口为 Custom。没有放宽固定产品合同，也没有改变成功数据。
+- 原函数体只重命名为 `legacy_durable_global_news_query_result`，`convert::external_global_news` 原实现原样保留。普通 `global_news_async` 与 `grpc_source_macro::news_outcome` 显式使用 current。
+- `chain_post_close_macro_codec::gateway_for` 显式使用 frozen。额外调用闭包发现 full journal 的 `DataResult` 也通过 `NativeOutcome::project` 复用普通成功投影，因此其 capture/reopen 均经 `project_frozen_native` 隔离 GlobalNews **成功 envelope** 分支；现有 wire Err、Economic/Web 投影没有变化。
+- 新 golden 从旧 raw response 构造 canonical DataResult 后 encode/decode 重开，分别走 original single-source `RawResult::project` 和 full-journal `DataResult::project`；断言两种 profile 的旧 requested-provider 错误 JSON、native/hash、整个 canonical result bytes 原样。该测试是持久 codec 重开，不声称进行了生产 DB 重开。
+- `rg -n 'current_global_news_query_result|legacy_durable_global_news_query_result|global_news_query_result|external_global_news\(' src` 确认普通两个入口走 current；frozen 只由 current 的兼容转换基底、两类 durable owner 使用。另两个直接 external converter 调用是 `grpc_bundle_probe` 运维诊断和 mTLS测试，不是 routed acquisition audit。`NativeOutcome::project` 在普通 macro runner 保持 current；full journal 的成功新闻不再借用它。
+
+改动仅五个源码文件：`d15_attribution_tests.rs`、`grpc_source.rs`、`grpc_source_macro.rs`、`chain_post_close_macro_codec.rs`、`chain_post_close_macro_native.rs`，以及本报告。无 converter body、旧 fixture、schema、DDL、decoder、历史数据更改；未访问生产库、外部服务或部署。
+
+### Fix round 1 GREEN / 自审
+
+```sh
+cargo test --lib -- d15_attribution_ data_gateway::global_news::tests:: data_gateway::grpc_source::convert::tests::br238_external_global_news macro_codec::tests:: --nocapture --test-threads=1
+git diff --check
+```
+
+session46831：**40/40 GREEN**，编译3m18s、测试1.23s。其中16个 D15 用例（含新增三项）、3个 External GlobalNews converter 用例和其余21个 frozen macro codec 回归；`data_gateway::global_news::tests::` 本身没有匹配用例，不将空过滤器算验证。原有68条warning，无新编译错误。编译期间后续改动仅为两处新增代码的换行格式及文档，不改变语义；最终 diff-check 通过。
+
+关键证据：`grpc_source.rs:3576` current 归因、`:3598` frozen 旧函数；`grpc_source_macro.rs:178` ordinary macro；`chain_post_close_macro_codec.rs:1764` original durable；`chain_post_close_macro_native.rs:175/213/244` full journal capture/read 成功投影隔离。新增行为测试在 `d15_attribution_tests.rs:591/676`、`chain_post_close_macro_codec.rs:2598`。
+
+自审：错误分类、reason、retryability、文本和请求 hash 不变；仅 current error provider 变化。所有真实 routed 路径仍拒绝错源，没有“错误先审计成成功”；未知/缺失不猜请求源。旧 durable 仍沿用其既有专用投影，包括旧 requested-provider 拒绝归因；升级它的新写语义需另立版本合同，本轮不伪称已改。未重写历史行、未更换旧 golden。没有跑全量、release、activation、monitor 或真实服务探测；Task10 实际上线验收仍未执行。

@@ -510,3 +510,205 @@ fn d15_attribution_macro_wire_settle_uses_current_not_frozen_projection() {
     assert_eq!(frozen.provider(), None);
     review::restore_gateway_error(&review::store_gateway_error(&frozen)).unwrap();
 }
+
+// Decode actual profile-specific wire envelopes before injecting only the RPC
+// boundary. Conversion, public Gateway / macro settle and SQLite audit are real.
+fn global_news_wire(external: bool, selected: &str, available: bool) -> QueryResult {
+    use crate::grpc_client::{envelope, pb::magic::market::v1 as local};
+    let item = serde_json::json!({
+        "item_id":"TEST_CODE_D15_ITEM", "title":"TEST_CODE news", "summary":null,
+        "content":null, "publisher":"TEST_CODE publisher",
+        "url":"https://example.com/TEST_CODE_D15_ITEM", "published_at":"2026-09-25T15:59:00+08:00",
+        "instruments":[], "topics":[], "language":"zh-CN"
+    });
+    let response = local::QueryResponse {
+        request_id: "TEST_CODE_D15_NEWS".into(),
+        operation: local::Operation::GlobalNews as i32,
+        admission: local::AdmissionState::Admitted as i32,
+        selected_provider: selected.into(),
+        batch_id: "TEST_CODE_D15_NEWS_BATCH".into(),
+        complete: true,
+        observed_at: "2026-09-25T16:00:00+08:00".into(),
+        source_at: "2026-09-25 15:59".into(),
+        records: vec![local::CanonicalPayload {
+            schema: "TEST_CODE_local_news_array".into(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".into(),
+            data: serde_json::to_vec(&if available {
+                serde_json::json!([item.clone()])
+            } else {
+                serde_json::json!([])
+            })
+            .unwrap(),
+        }],
+        source: "eastmoney-web".into(),
+        diagnostic_blocker: String::new(),
+    };
+    if external {
+        use crate::grpc_client::external_pb::magic::market::v1 as wire;
+        let mut item = item;
+        item["evidence"] = serde_json::json!({"provider": selected, "source_at":response.source_at,
+            "observed_at":response.observed_at, "batch_id":response.batch_id});
+        let response = wire::QueryResponse {
+            request_id: response.request_id,
+            operation: wire::Operation::GlobalNews as i32,
+            admission: wire::AdmissionState::Admitted as i32,
+            selected_provider: response.selected_provider,
+            batch_id: response.batch_id,
+            complete: true,
+            observed_at: response.observed_at,
+            source_at: response.source_at,
+            records: if available {
+                vec![wire::CanonicalPayload {
+                    schema: "magic.market.news_item".into(),
+                    schema_version: 2,
+                    content_type: "application/json; charset=utf-8".into(),
+                    data: serde_json::to_vec(&item).unwrap(),
+                }]
+            } else {
+                vec![]
+            },
+            diagnostic_blocker: String::new(),
+        };
+        envelope::parse_external_query_response(
+            "TEST_CODE_D15_NEWS",
+            local::Operation::GlobalNews,
+            "grpc-mtls:TEST_CODE_d15.invalid",
+            wire::QueryResponse::decode(response.encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
+    } else {
+        envelope::parse_query_response(
+            "TEST_CODE_D15_NEWS",
+            local::Operation::GlobalNews,
+            local::QueryResponse::decode(response.encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn d15_attribution_global_news_wrong_source_success_envelopes() {
+    use crate::grpc_contract::methods::ContractProfile;
+    let _env = init();
+    let mut failures = Vec::new();
+    for external in [false, true] {
+        if external {
+            std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", "TEST_CODE_injected_rpc_only");
+        } else {
+            std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        }
+        grpc_source::reset_bridge();
+        for selected in ["Cailianpress", "FutureUnknownProvider", ""] {
+            for settle in [false, true] {
+                let before = all_audits();
+                let q = global_news_wire(external, selected, false);
+                let error = if settle {
+                    let projected = grpc_source::macro_queries::news_outcome(
+                        GlobalNewsProvider::Eastmoney,
+                        20,
+                        if external {
+                            ContractProfile::ExternalV1
+                        } else {
+                            ContractProfile::LocalBridgeV1
+                        },
+                        &Ok(q),
+                    );
+                    global_news::audit_macro_query(GlobalNewsProvider::Eastmoney, 20, projected)
+                        .unwrap_err()
+                } else {
+                    grpc_source::set_test_query_responses(vec![Ok(q)]);
+                    GlobalNewsGateway::new()
+                        .global_news(GlobalNewsProvider::Eastmoney, 20)
+                        .await
+                        .unwrap_err()
+                };
+                let expected = if selected == "Cailianpress" {
+                    Some(ProviderId::Cailianpress)
+                } else {
+                    None
+                };
+                let after = all_audits();
+                assert_eq!(
+                    &after[..before.len()],
+                    before.as_slice(),
+                    "old audit bytes/hash"
+                );
+                assert_eq!(after.len(), before.len() + 1);
+                let audit = after.last().unwrap();
+                if error.provider() != expected
+                    || audit.provider
+                        != if expected.is_some() {
+                            "Cailianpress"
+                        } else {
+                            "Custom"
+                        }
+                {
+                    failures.push(format!("external={external} settle={settle} selected={selected:?}: error={:?} audit={}", error.provider(), audit.provider));
+                }
+                assert_eq!(error.capability(), "GlobalNews");
+                assert_eq!(error.audit_outcome(), "partial");
+                assert_eq!(error.reason_code(), "invalid_evidence");
+                assert!(!error.retryable());
+                assert_eq!(audit.outcome, "partial");
+                assert_eq!(audit.reason_code, "invalid_evidence");
+                assert_eq!(
+                    audit.request_hash,
+                    global_news::macro_request_hash(GlobalNewsProvider::Eastmoney, 20)
+                );
+                if selected == "Cailianpress" {
+                    assert_eq!(
+                        error.message(),
+                        if external {
+                            "ExternalV1 GlobalNews selected provider differs from exact request"
+                        } else {
+                            "global-news response evidence does not match request provider=Eastmoney source=eastmoney-web"
+                        }
+                    );
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn d15_attribution_global_news_same_source_success_unchanged() {
+    let _env = init();
+    for external in [false, true] {
+        if external {
+            std::env::set_var("GRPC_MARKET_CLIENT_BUNDLE", "TEST_CODE_injected_rpc_only");
+        } else {
+            std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        }
+        grpc_source::reset_bridge();
+        for available in [false, true] {
+            grpc_source::set_test_query_responses(vec![Ok(global_news_wire(
+                external,
+                "Eastmoney",
+                available,
+            ))]);
+            let batch = GlobalNewsGateway::new()
+                .global_news(GlobalNewsProvider::Eastmoney, 20)
+                .await
+                .unwrap();
+            assert_eq!(batch.is_verified_empty(), !available);
+            assert_eq!(batch.evidence().provider, ProviderId::Eastmoney);
+            assert_eq!(batch.evidence().source, "eastmoney-web");
+            assert_eq!(batch.evidence().batch_id, "TEST_CODE_D15_NEWS_BATCH");
+            if available {
+                assert_eq!(batch.records().len(), 1);
+                assert_eq!(batch.records()[0].item_id, "TEST_CODE_D15_ITEM");
+                assert_eq!(batch.records()[0].title, "TEST_CODE news");
+            }
+            assert_eq!(
+                all_audits().last().unwrap().outcome,
+                if available {
+                    "available"
+                } else {
+                    "verified_empty"
+                }
+            );
+        }
+    }
+}

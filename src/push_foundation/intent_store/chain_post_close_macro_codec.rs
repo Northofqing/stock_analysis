@@ -1761,7 +1761,7 @@ pub(super) fn gateway_for(
     processed: &std::result::Result<crate::grpc_client::envelope::QueryResult, GrpcError>,
 ) -> NewsResult {
     match processed {
-        Ok(query) => GrpcSource::global_news_query_result(
+        Ok(query) => GrpcSource::legacy_durable_global_news_query_result(
             GlobalNewsProvider::Eastmoney,
             20,
             profile == ContractProfile::ExternalV1,
@@ -2592,6 +2592,66 @@ mod tests {
             external_wire: None,
         };
         (identity, request, RawResult::capture(&completion))
+    }
+
+    #[test]
+    fn d15_attribution_frozen_global_news_wrong_source_reopens_exact_native_bytes() {
+        let (local_identity, local_request, mut local) = local_v1_material();
+        let mut response = QueryResponse::decode(local.response.as_deref().unwrap()).unwrap();
+        response.selected_provider = "Cailianpress".into();
+        response.records = vec![crate::grpc_client::pb::magic::market::v1::CanonicalPayload {
+            schema: "TEST_CODE_local_news_array".into(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".into(),
+            data: b"[]".to_vec(),
+        }];
+        local.response = Some(response.encode_to_vec());
+
+        let (external_identity, external_request, completion) = external_v2_material(&[]);
+        let mut external = RawResult::capture_external(&completion);
+        let mut response =
+            ExternalQueryResponse::decode(external.response.as_deref().unwrap()).unwrap();
+        response.selected_provider = "Cailianpress".into();
+        let payload = response.encode_to_vec();
+        external.response = Some(payload.clone());
+        let ExternalWireMaterialV1::Payload {
+            protobuf_payload, payload_sha256, ..
+        } = &mut external.external_wire.as_mut().unwrap().evidence else {
+            panic!("TEST_CODE payload fixture")
+        };
+        *payload_sha256 = hex::encode(Sha256::digest(&payload));
+        *protobuf_payload = payload;
+
+        for (identity, request, raw, golden) in [
+            (local_identity, local_request, local,
+             r#"{"error":{"audit_outcome":"partial","capability":"GlobalNews","message":"global-news response evidence does not match request provider=Eastmoney source=eastmoney-web","provider":"Eastmoney","reason_code":"invalid_evidence","retryable":false},"kind":"Error","version":1}"#),
+            (external_identity, external_request, external,
+             r#"{"error":{"audit_outcome":"partial","capability":"GlobalNews","message":"ExternalV1 GlobalNews selected provider differs from exact request","provider":"Eastmoney","reason_code":"invalid_evidence","retryable":false},"kind":"Error","version":1}"#),
+        ] {
+            // Freeze the old raw response AND old native material, then reopen
+            // through both durable reader generations (not current settlement).
+            let stored = DataResult {
+                version: 2,
+                query: crate::search_service::macro_news::runner::QueryKey::Gateway(1),
+                attempt: 1,
+                raw,
+                native: golden.as_bytes().to_vec(),
+                native_sha256: hex::encode(Sha256::digest(golden.as_bytes())),
+            };
+            let bytes = encode(&stored).unwrap();
+            let reopened: DataResult = decode(&bytes).unwrap();
+            let (outcome, _) = reopened.project(&identity, &request, None).unwrap();
+            assert_eq!(
+                super::super::macro_native::native_bytes(&outcome).unwrap(),
+                golden.as_bytes()
+            );
+            let (old_owner, _, _) = reopened.raw.project(&request, 1, None).unwrap();
+            assert_eq!(native_bytes(&old_owner).unwrap(), golden.as_bytes());
+            assert_eq!(
+                encode(&reopened).unwrap(), bytes,
+                "raw/native/hash unchanged after reopen"
+            );
+        }
     }
 
     fn assert_v1_response_schema_rejected_without_id_drift(

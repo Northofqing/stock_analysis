@@ -175,7 +175,7 @@ pub(crate) fn news_outcome(
     processed: &Result<QueryResult, GrpcError>,
 ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
     match processed {
-        Ok(query) => GrpcSource::global_news_query_result(
+        Ok(query) => GrpcSource::current_global_news_query_result(
             provider,
             limit,
             profile == ContractProfile::ExternalV1,
