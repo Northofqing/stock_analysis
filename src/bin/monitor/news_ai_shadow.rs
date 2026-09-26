@@ -17,10 +17,10 @@ use stock_analysis::database::news_ai::NewsAiPendingRecovery;
 use stock_analysis::llm::LlmRegistry;
 use stock_analysis::monitor::news_ai::{
     deliver_governed_news_ai, AdmittedNewsFact, GovernedNewsAiDelivery, NewsAIAnalyzer,
-    NewsAiChainContext, NewsAiDeliveryAuditReceipt, NewsAiDeliveryReservation,
-    NewsAiGovernedDeliveryOutcome, NewsAiGovernedDeliveryPort, NewsAiPhysicalPushOutcome,
-    NewsAiPredictionLinkReceipt, NewsAiRequest, NewsAiReserveOutcome, NewsMarketContext,
-    NewsMarketSnapshot, NEWS_AI_ANALYSIS_VERSION,
+    NewsAiAnalysisProfile, NewsAiChainContext, NewsAiDeliveryAuditReceipt,
+    NewsAiDeliveryReservation, NewsAiGovernedDeliveryOutcome, NewsAiGovernedDeliveryPort,
+    NewsAiIdentityV3, NewsAiPhysicalPushOutcome, NewsAiPredictionLinkReceipt, NewsAiRequest,
+    NewsAiReserveOutcome, NewsMarketContext, NewsMarketSnapshot,
 };
 use stock_analysis::news::aggregator::AdmittedGlobalNewsBatch;
 use tokio::sync::Semaphore;
@@ -391,7 +391,14 @@ async fn run_same_tick_batches(
     recovered_work: usize,
 ) {
     let mut stats = NewsAiRunStats::default();
-    let candidates = exact_candidates(&batches);
+    let Some(profile) = analyzer
+        .as_ref()
+        .and_then(|analyzer| analyzer.identity_profile().ok())
+    else {
+        log::warn!("[NewsAI] no qualified pre-call model profile; live analysis skipped");
+        return;
+    };
+    let candidates = exact_candidates(&batches, &profile);
     if candidates.is_empty() {
         log::debug!("[NewsAI][BR-172] no exact source-bound equity target");
     }
@@ -498,6 +505,7 @@ struct NewsAiCandidate {
     batch: AdmittedGlobalNewsBatch,
     record_index: usize,
     target_code: String,
+    identity: NewsAiIdentityV3,
 }
 
 /// Inspect a bounded portion of the admitted batch and spend the per-tick
@@ -550,7 +558,10 @@ impl CandidateVisitBudget {
     }
 }
 
-fn exact_candidates(batches: &[AdmittedGlobalNewsBatch]) -> Vec<NewsAiCandidate> {
+fn exact_candidates(
+    batches: &[AdmittedGlobalNewsBatch],
+    profile: &NewsAiAnalysisProfile,
+) -> Vec<NewsAiCandidate> {
     let mut unique = BTreeMap::new();
     for batch in batches {
         for (record_index, record) in batch.records().iter().enumerate() {
@@ -570,14 +581,17 @@ fn exact_candidates(batches: &[AdmittedGlobalNewsBatch]) -> Vec<NewsAiCandidate>
                     }
                 };
                 let target_code = identity.storage_code().to_owned();
-                let key = format!(
-                    "{:?}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
-                    batch.evidence().provider,
-                    batch.evidence().batch_id,
-                    record.item_id,
-                    target_code,
-                    NEWS_AI_ANALYSIS_VERSION
-                );
+                let identity =
+                    match AdmittedNewsFact::from_admitted_global(batch, record_index, &target_code)
+                        .and_then(|fact| NewsAiIdentityV3::from_fact(&fact, profile))
+                    {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            log::warn!("[NewsAI] candidate identity rejected: {error}");
+                            continue;
+                        }
+                    };
+                let key = identity.digest();
                 unique
                     .entry(key.clone())
                     .or_insert_with(|| NewsAiCandidate {
@@ -585,6 +599,7 @@ fn exact_candidates(batches: &[AdmittedGlobalNewsBatch]) -> Vec<NewsAiCandidate>
                         batch: batch.clone(),
                         record_index,
                         target_code,
+                        identity,
                     });
             }
         }
@@ -669,7 +684,18 @@ async fn assess_candidate(
     status: &NewsAiRuntimeStatus,
     candidate: &NewsAiCandidate,
 ) -> Result<CandidateOutcome, String> {
-    let mut fact = AdmittedNewsFact::from_admitted_global(
+    // Durable recovery is owned by the independent scanner. A disabled live
+    // capability must not acquire even a database/market/model attempt.
+    let execution = status.candidate_execution(false);
+    if execution == CandidateExecution::RejectNewAnalysisUnavailable {
+        return Err(
+            "receipt-bearing news_ai model provider unavailable; assessment not written".to_owned(),
+        );
+    }
+    let analyzer = analyzer.ok_or_else(|| {
+        "receipt-bearing news_ai model provider unavailable; assessment not written".to_owned()
+    })?;
+    let fact = AdmittedNewsFact::from_admitted_global(
         &candidate.batch,
         candidate.record_index,
         &candidate.target_code,
@@ -678,10 +704,10 @@ async fn assess_candidate(
     // This indexed read is a scheduling hint for a counted decision that can
     // never be reopened under the frozen identity. Every nonterminal state
     // still takes the fully validated BR-172 audit path below.
-    let terminal_fact = fact.clone();
+    let terminal_identity = candidate.identity.clone();
     let terminal_denial = tokio::task::spawn_blocking(move || {
         stock_analysis::database::get_db()
-            .is_news_ai_terminal_denial_for_fact(&terminal_fact, NEWS_AI_ANALYSIS_VERSION)
+            .is_news_ai_terminal_denial_for_identity(&terminal_identity)
     })
     .await
     .map_err(|error| format!("terminal NewsAI decision lookup task failed: {error}"))?
@@ -689,76 +715,27 @@ async fn assess_candidate(
     if terminal_denial {
         return Ok(CandidateOutcome::TerminalDenied);
     }
-    // BR-250: 注入证券名称供卡片渲染; 解析失败保持 None, 不阻塞评估。
-    let name_code = candidate.target_code.clone();
-    let name = resolve_target_name(&name_code).await;
-    if let Some(name) = name {
-        fact = fact.with_target_name(name);
-    }
-
-    let identity_fact = fact.clone();
-    let existing = tokio::task::spawn_blocking(move || {
-        stock_analysis::database::get_db()
-            .load_audited_news_ai_assessment_for_fact(&identity_fact, NEWS_AI_ANALYSIS_VERSION)
-    })
-    .await
-    .map_err(|error| format!("assessment identity lookup task failed: {error}"))?
-    .map_err(|error| error.to_string())?;
-    let execution = status.candidate_execution(existing.is_some());
-    match execution {
-        CandidateExecution::DeferAuditedAssessment => {
-            return Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing: true });
-        }
-        CandidateExecution::RejectNewAnalysisUnavailable => {
-            return Err(
-                "receipt-bearing news_ai model provider unavailable; assessment not written"
-                    .to_owned(),
-            );
-        }
-        CandidateExecution::CreateAssessmentAndDeliver
-        | CandidateExecution::CreateAssessmentOnly => {}
-    }
-
-    let analyzer = analyzer.ok_or_else(|| {
-        "receipt-bearing news_ai model provider unavailable; assessment not written".to_owned()
-    })?;
-
-    let context = news_market_context(calendar::current_session());
-    let daily = HistoricalBarsGateway::new()
-        .required_daily_bars_async(&candidate.target_code, DAILY_HISTORY_DAYS)
-        .await
-        .map_err(|error| error.to_string())?;
-    let quote = if context == NewsMarketContext::Intraday {
-        let code = candidate.target_code.clone();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                MarketDataGateway::new().required_realtime_quote(&code)
-            })
-            .await
-            .map_err(|error| format!("realtime quote task failed: {error}"))?
-            .map_err(|error| error.to_string())?,
+    let result = analyzer
+        .assess_if_absent(
+            candidate.identity.clone(),
+            |identity| async move {
+                tokio::task::spawn_blocking(move || {
+                    stock_analysis::database::get_db()
+                        .load_audited_news_ai_assessment_for_identity(&identity)
+                })
+                .await
+                .map_err(|e| format!("assessment identity lookup task failed: {e}"))?
+                .map(|existing| existing.is_some())
+                .map_err(|e| e.to_string())
+            },
+            |identity| async move {
+                prepare_candidate_request(fact, &candidate.target_code, identity).await
+            },
         )
-    } else {
-        None
+        .await?;
+    let Some((request, assessment)) = result else {
+        return Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing: true });
     };
-    // as_of 必须在市场证据就绪之后取:日K/quote 批次的 observed_at 是获取
-    // 完成时刻,若 as_of 早于它们会被 NewsMarketSnapshot 误判 "in the future"。
-    let as_of = chrono::Utc::now();
-    let market =
-        NewsMarketSnapshot::try_from_admitted(&candidate.target_code, context, as_of, daily, quote)
-            .map_err(|error| error.to_string())?;
-    // BR-249: 产业链上下文（chain_daily 最新涨停主线簇 + BR-170 板块归属）。
-    // 读取失败降级为空上下文，不阻塞逐条评估。
-    let chain_code = candidate.target_code.clone();
-    let chain = tokio::task::spawn_blocking(move || load_chain_context(&chain_code))
-        .await
-        .map_err(|error| format!("chain context task failed: {error}"))?;
-    let request = NewsAiRequest::try_new(fact, market, Vec::new(), NEWS_AI_ANALYSIS_VERSION, chain)
-        .map_err(|error| error.to_string())?;
-    let assessment = analyzer
-        .assess(&request)
-        .await
-        .map_err(|error| error.to_string())?;
     let audited = tokio::task::spawn_blocking(move || {
         stock_analysis::database::get_db().append_audited_news_ai_assessment(request, assessment)
     })
@@ -776,11 +753,49 @@ async fn assess_candidate(
         CandidateExecution::CreateAssessmentOnly => {
             Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing: false })
         }
-        CandidateExecution::DeferAuditedAssessment
-        | CandidateExecution::RejectNewAnalysisUnavailable => {
-            unreachable!("typed execution already returned before model acquisition")
-        }
+        _ => unreachable!("typed execution rejected before model acquisition"),
     }
+}
+
+async fn prepare_candidate_request(
+    mut fact: AdmittedNewsFact,
+    target_code: &str,
+    identity: NewsAiIdentityV3,
+) -> Result<NewsAiRequest, String> {
+    if let Some(name) = resolve_target_name(target_code).await {
+        fact = fact.with_target_name(name);
+    }
+    let context = news_market_context(calendar::current_session());
+    let daily = HistoricalBarsGateway::new()
+        .required_daily_bars_async(target_code, DAILY_HISTORY_DAYS)
+        .await
+        .map_err(|error| error.to_string())?;
+    let quote = if context == NewsMarketContext::Intraday {
+        let code = target_code.to_owned();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                MarketDataGateway::new().required_realtime_quote(&code)
+            })
+            .await
+            .map_err(|error| format!("realtime quote task failed: {error}"))?
+            .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    // as_of 必须在市场证据就绪之后取:日K/quote 批次的 observed_at 是获取
+    // 完成时刻,若 as_of 早于它们会被 NewsMarketSnapshot 误判 "in the future"。
+    let as_of = chrono::Utc::now();
+    let market = NewsMarketSnapshot::try_from_admitted(target_code, context, as_of, daily, quote)
+        .map_err(|error| error.to_string())?;
+    // BR-249: 产业链上下文（chain_daily 最新涨停主线簇 + BR-170 板块归属）。
+    // 读取失败降级为空上下文，不阻塞逐条评估。
+    let chain_code = target_code.to_owned();
+    let chain = tokio::task::spawn_blocking(move || load_chain_context(&chain_code))
+        .await
+        .map_err(|error| format!("chain context task failed: {error}"))?;
+    NewsAiRequest::try_new_v3(fact, market, Vec::new(), identity, chain)
+        .map_err(|error| error.to_string())
 }
 
 struct ProductionNewsAiDeliveryPort;
@@ -1176,29 +1191,110 @@ mod tests {
                 topics: vec![],
                 language: "zh".to_owned(),
                 evidence: SourceEvidence::new(
-                    ProviderId::Eastmoney,
+                    ProviderId::Cailianpress,
                     observed.to_rfc3339(),
                     "batch-six",
                 )
-                .expect("source evidence"),
+                .expect("source evidence")
+                .with_source_at(observed.to_rfc3339())
+                .unwrap(),
             })
             .collect();
         let batch = AdmittedGlobalNewsBatch::from_parts(
             records,
             BatchEvidence {
-                provider: ProviderId::Eastmoney,
-                source: "test source".to_owned(),
-                source_at: None,
+                provider: ProviderId::Cailianpress,
+                source: "cls-v1".to_owned(),
+                source_at: Some(observed.to_rfc3339()),
                 observed_at: observed.to_rfc3339(),
                 batch_id: "batch-six".to_owned(),
             },
         );
 
-        let candidates = exact_candidates(&[batch]);
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        let candidates = exact_candidates(&[batch], &profile);
         assert_eq!(candidates.len(), 6);
         assert!(candidates
             .iter()
-            .any(|candidate| candidate.key.contains("item-5")));
+            .any(
+                |candidate| candidate.batch.records()[candidate.record_index].item_id == "item-5"
+            ));
+    }
+
+    fn v3_revision_batch() -> AdmittedGlobalNewsBatch {
+        let observed = chrono::Utc::now();
+        let records = ["TEST_CODE original content", "TEST_CODE revised content"]
+            .into_iter()
+            .map(|content| GlobalNewsRecord {
+                item_id: "TEST_CODE_same_item".to_owned(),
+                title: "TEST_CODE news".to_owned(),
+                summary: None,
+                content: Some(content.to_owned()),
+                publisher: "TEST_CODE source".to_owned(),
+                canonical_url: "https://example.invalid/item".to_owned(),
+                published_at: observed,
+                observed_at: observed,
+                instruments: vec!["600519".to_owned()],
+                topics: vec![],
+                language: "zh".to_owned(),
+                evidence: SourceEvidence::new(
+                    ProviderId::Cailianpress,
+                    observed.to_rfc3339(),
+                    "TEST_CODE_batch",
+                )
+                .unwrap()
+                .with_source_at(observed.to_rfc3339())
+                .unwrap(),
+            })
+            .collect();
+        AdmittedGlobalNewsBatch::from_parts(
+            records,
+            BatchEvidence {
+                provider: ProviderId::Cailianpress,
+                source: "cls-v1".to_owned(),
+                source_at: Some(observed.to_rfc3339()),
+                observed_at: observed.to_rfc3339(),
+                batch_id: "TEST_CODE_batch".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn v3_same_tick_keeps_distinct_text_revisions() {
+        let batch = v3_revision_batch();
+        let observed = batch.records()[0].observed_at;
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        assert_eq!(exact_candidates(&[batch.clone()], &profile).len(), 2);
+        let mut repeated = batch.records()[0].clone();
+        let next_observed = observed + chrono::Duration::seconds(1);
+        repeated.observed_at = next_observed;
+        repeated.evidence = SourceEvidence::new(
+            ProviderId::Cailianpress,
+            next_observed.to_rfc3339(),
+            "TEST_CODE_batch_next",
+        )
+        .unwrap()
+        .with_source_at(observed.to_rfc3339())
+        .unwrap();
+        let next_batch = AdmittedGlobalNewsBatch::from_parts(
+            vec![repeated],
+            BatchEvidence {
+                provider: ProviderId::Cailianpress,
+                source: "cls-v1".to_owned(),
+                source_at: Some(observed.to_rfc3339()),
+                observed_at: next_observed.to_rfc3339(),
+                batch_id: "TEST_CODE_batch_next".to_owned(),
+            },
+        );
+        assert_eq!(
+            exact_candidates(&[batch, next_batch], &profile).len(),
+            2,
+            "same revision in a new batch is not a third candidate"
+        );
     }
 
     #[test]
@@ -1387,32 +1483,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn br172_model_is_never_called_when_new_analysis_capability_is_disabled() {
+    #[tokio::test]
+    async fn br172_model_is_never_called_when_new_analysis_capability_is_disabled() {
         let status = NewsAiRuntimeStatus::from_capabilities(
             NewAnalysisCapability::DisabledModelProviderUnavailable,
             GovernedDeliveryRecoveryCapability::Enabled,
         );
-        let source = include_str!("news_ai_shadow.rs");
-        let runner = source
-            .split("async fn assess_candidate(")
-            .nth(1)
-            .expect("NewsAI candidate runner")
-            .split("struct ProductionNewsAiDeliveryPort")
-            .next()
-            .expect("candidate runner boundary");
-        let execution = runner
-            .find("candidate_execution(existing.is_some())")
-            .expect("typed candidate execution decision");
-        let model_call = runner
-            .find(".assess(&request)")
-            .expect("receipt-bearing model call");
-
-        assert_eq!(
-            status.candidate_execution(false),
-            CandidateExecution::RejectNewAnalysisUnavailable
-        );
-        assert!(execution < model_call);
+        use stock_analysis::llm::{LlmError, LlmProvider, ReceiptBearingJson};
+        struct CountingProvider(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LlmProvider for CountingProvider {
+            fn name(&self) -> &'static str {
+                "TEST_CODE_disabled_provider"
+            }
+            fn model(&self) -> &str {
+                "TEST_CODE_disabled_model"
+            }
+            async fn chat_json(&self, _: &str, _: &str) -> Result<serde_json::Value, LlmError> {
+                panic!("disabled model")
+            }
+            async fn chat_json_with_receipt(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<ReceiptBearingJson, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("disabled receipt model")
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let analyzer = NewsAIAnalyzer::new(Arc::new(CountingProvider(calls.clone())));
+        let profile = analyzer.identity_profile().unwrap();
+        let candidates = exact_candidates(&[v3_revision_batch()], &profile);
+        assert_eq!(candidates.len(), 2);
+        let outcome = assess_candidate(Some(&analyzer), &status, &candidates[0]).await;
+        assert!(outcome
+            .err()
+            .unwrap()
+            .contains("model provider unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

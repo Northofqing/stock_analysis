@@ -267,11 +267,12 @@ impl AdmittedNewsFact {
                 "NewsAI recovery snapshot size is invalid".to_owned(),
             ));
         }
-        let snapshot: NewsFactRecoverySnapshot = serde_json::from_slice(bytes).map_err(|error| {
-            NewsAiError::AnalysisAuditFailed(format!(
-                "NewsAI recovery snapshot parse failed: {error}"
-            ))
-        })?;
+        let snapshot: NewsFactRecoverySnapshot =
+            serde_json::from_slice(bytes).map_err(|error| {
+                NewsAiError::AnalysisAuditFailed(format!(
+                    "NewsAI recovery snapshot parse failed: {error}"
+                ))
+            })?;
         if snapshot.schema_version != NEWS_FACT_RECOVERY_SNAPSHOT_VERSION
             || serde_json::to_vec(&snapshot).map_err(|error| {
                 NewsAiError::AnalysisAuditFailed(format!(
@@ -806,6 +807,192 @@ pub struct NewsAiChainContext {
     pub board_name: Option<String>,
 }
 
+/// Calling configuration, qualified before acquisition/model work. Actual
+/// upstream model names belong to ModelCallReceipt, never this profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsAiAnalysisProfile {
+    analysis_version: String,
+    prompt_contract: String,
+    system_sha256: String,
+    model_provider: String,
+    configured_model: String,
+    model_profile_revision: String,
+    data_contract_version: String,
+}
+
+impl NewsAiAnalysisProfile {
+    pub fn for_configured_model(provider: &str, model: &str) -> Result<Self, NewsAiError> {
+        let profile = Self {
+            analysis_version: NEWS_AI_ANALYSIS_VERSION.to_owned(),
+            prompt_contract: "news_ai_normalized_prompt_v2_strict_output_v1".to_owned(),
+            system_sha256: sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()),
+            model_provider: provider.to_owned(),
+            configured_model: model.to_owned(),
+            model_profile_revision: "receipt_bearing_json_v1".to_owned(),
+            data_contract_version: "br172_admitted_news_market_v1".to_owned(),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn validate(&self) -> Result<(), NewsAiError> {
+        for value in [
+            &self.analysis_version,
+            &self.prompt_contract,
+            &self.model_provider,
+            &self.configured_model,
+            &self.model_profile_revision,
+            &self.data_contract_version,
+        ] {
+            if value.is_empty() || value.trim() != value || value.contains('\0') {
+                return Err(NewsAiError::AnalysisAuditFailed(
+                    "invalid qualified analysis profile".to_owned(),
+                ));
+            }
+        }
+        if self.system_sha256 != sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()) {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "unsupported prompt system contract".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One canonical business-identity seam shared by candidate selection, lookup,
+/// request, persistence and recovery. No live evidence or response is an input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsAiIdentityV3 {
+    identity_version: u8,
+    codec: String,
+    provider: String,
+    item_id: String,
+    content_revision: String,
+    target: String,
+    profile: NewsAiAnalysisProfile,
+}
+
+pub(crate) const NEWS_AI_V3_STORAGE_PREFIX: &str = "news_ai_identity_v3/";
+
+impl NewsAiIdentityV3 {
+    pub fn from_fact(
+        fact: &AdmittedNewsFact,
+        profile: &NewsAiAnalysisProfile,
+    ) -> Result<Self, NewsAiError> {
+        profile.validate()?;
+        validate_code(fact.target_code())?;
+        // Option markers and exact bytes are significant. In particular a
+        // present empty summary is not an absent summary. Sina supplies a
+        // nonoptional summary string; preserve it rather than trimming it.
+        let (title, summary, content) = match &fact.record {
+            AdmittedNewsSourceRecord::Global(record) => (
+                record.title.as_str(),
+                record.summary.as_deref(),
+                record.content.as_deref(),
+            ),
+            AdmittedNewsSourceRecord::Sina(record) => {
+                let item = record.persistence_item();
+                (item.title.as_str(), Some(item.summary.as_str()), None)
+            }
+        };
+        let mut revision = Sha256::new();
+        revision.update(b"BR172_NEWS_TEXT_REVISION_V1\0");
+        for value in [Some(title), summary, content] {
+            revision.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                hash_field(&mut revision, value);
+            }
+        }
+        Ok(Self {
+            identity_version: 3,
+            codec: "br172_news_ai_business_identity".to_owned(),
+            provider: provider_tag(fact.provider()).to_owned(),
+            item_id: fact.item_id().to_owned(),
+            content_revision: hex::encode(revision.finalize()),
+            target: normalized_code(fact.target_code()).to_owned(),
+            profile: profile.clone(),
+        })
+    }
+
+    pub fn digest(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"BR172_NEWS_AI_IDENTITY_V3\0");
+        hash.update(self.canonical_bytes());
+        hex::encode(hash.finalize())
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("fixed identity DTO is infallibly serializable")
+    }
+
+    pub(crate) fn storage_analysis_version(&self) -> String {
+        format!(
+            "{NEWS_AI_V3_STORAGE_PREFIX}{}",
+            self.profile.analysis_version
+        )
+    }
+
+    pub(crate) fn analysis_version(&self) -> &str {
+        &self.profile.analysis_version
+    }
+
+    pub(crate) fn validate_fact(&self, fact: &AdmittedNewsFact) -> Result<(), NewsAiError> {
+        if &Self::from_fact(fact, &self.profile)? != self {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "v3 identity is unknown or detached from original fact".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode_recovery(&self, fact: &AdmittedNewsFact) -> Result<Vec<u8>, NewsAiError> {
+        self.validate_fact(fact)?;
+        let envelope = NewsAiRecoveryEnvelopeV3 {
+            identity_version: 3,
+            codec: "br172_news_ai_recovery_v3".to_owned(),
+            identity: self.clone(),
+            // Preserve the legacy fact codec as an opaque exact UTF-8 string.
+            fact_snapshot: String::from_utf8(fact.recovery_snapshot_canonical()?)
+                .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?,
+        };
+        serde_json::to_vec(&envelope).map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))
+    }
+
+    pub(crate) fn decode_recovery(bytes: &[u8]) -> Result<(Self, AdmittedNewsFact), NewsAiError> {
+        if bytes.len() > 2 * 512 * 1024 {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "v3 recovery envelope too large".to_owned(),
+            ));
+        }
+        let envelope: NewsAiRecoveryEnvelopeV3 = serde_json::from_slice(bytes)
+            .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?;
+        if envelope.identity_version != 3
+            || envelope.codec != "br172_news_ai_recovery_v3"
+            || serde_json::to_vec(&envelope)
+                .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?
+                != bytes
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "noncanonical or unsupported v3 recovery envelope".to_owned(),
+            ));
+        }
+        let fact = AdmittedNewsFact::from_recovery_snapshot(envelope.fact_snapshot.as_bytes())?;
+        envelope.identity.validate_fact(&fact)?;
+        Ok((envelope.identity, fact))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsAiRecoveryEnvelopeV3 {
+    identity_version: u8,
+    codec: String,
+    identity: NewsAiIdentityV3,
+    fact_snapshot: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewsAiRequest {
     fact: AdmittedNewsFact,
@@ -815,6 +1002,7 @@ pub struct NewsAiRequest {
     chain: NewsAiChainContext,
     evidence_hash: String,
     normalized_prompt: String,
+    business_identity: Option<NewsAiIdentityV3>,
 }
 
 impl NewsAiRequest {
@@ -848,7 +1036,31 @@ impl NewsAiRequest {
             chain,
             evidence_hash,
             normalized_prompt,
+            business_identity: None,
         })
+    }
+
+    pub fn try_new_v3(
+        fact: AdmittedNewsFact,
+        market: NewsMarketSnapshot,
+        optional_metrics: Vec<OptionalNewsMetric>,
+        identity: NewsAiIdentityV3,
+        chain: NewsAiChainContext,
+    ) -> Result<Self, NewsAiError> {
+        identity.validate_fact(&fact)?;
+        let mut request = Self::try_new(
+            fact,
+            market,
+            optional_metrics,
+            identity.analysis_version(),
+            chain,
+        )?;
+        request.business_identity = Some(identity);
+        Ok(request)
+    }
+
+    pub(crate) fn business_identity(&self) -> Option<&NewsAiIdentityV3> {
+        self.business_identity.as_ref()
     }
 
     pub fn fact(&self) -> &AdmittedNewsFact {
@@ -1311,7 +1523,8 @@ impl AuditedNewsAiAssessment {
         }
         let fact = request.fact().clone();
         let analysis_version = request.analysis_version().to_owned();
-        let identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        let mut identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        identity.sha256 = expected_assessment_id;
         let chain = Some(request.chain().clone());
         Ok(Self {
             delivery: GovernedNewsAiDelivery {
@@ -1332,6 +1545,22 @@ impl AuditedNewsAiAssessment {
         assessment: PersistedNewsAiAssessment,
         assessment_audit_record_sha256: &str,
     ) -> Result<Self, NewsAiError> {
+        Self::try_from_persisted_identity_audit(
+            fact,
+            analysis_version,
+            None,
+            assessment,
+            assessment_audit_record_sha256,
+        )
+    }
+
+    pub(crate) fn try_from_persisted_identity_audit(
+        fact: AdmittedNewsFact,
+        analysis_version: &str,
+        business_identity: Option<&NewsAiIdentityV3>,
+        assessment: PersistedNewsAiAssessment,
+        assessment_audit_record_sha256: &str,
+    ) -> Result<Self, NewsAiError> {
         if analysis_version.trim().is_empty() {
             return Err(NewsAiError::AnalysisAuditFailed(
                 "persisted assessment analysis version is empty".to_owned(),
@@ -1339,13 +1568,24 @@ impl AuditedNewsAiAssessment {
         }
         validate_sha256("assessment audit record", assessment_audit_record_sha256)?;
         let assessment = NewsAiAssessment::try_from_persisted(assessment)?;
-        let expected_assessment_id = assessment_identity_for_fact(&fact, analysis_version);
+        let expected_assessment_id = if let Some(identity) = business_identity {
+            identity.validate_fact(&fact)?;
+            if identity.analysis_version() != analysis_version {
+                return Err(NewsAiError::AnalysisAuditFailed(
+                    "persisted v3 analysis version mismatch".to_owned(),
+                ));
+            }
+            identity.digest()
+        } else {
+            assessment_identity_for_fact(&fact, analysis_version)
+        };
         if assessment.assessment_id() != expected_assessment_id {
             return Err(NewsAiError::AnalysisAuditFailed(
                 "persisted assessment identity differs from admitted source fact".to_owned(),
             ));
         }
-        let identity = NewsAiDeliveryIdentity::from_fact(&fact, analysis_version);
+        let mut identity = NewsAiDeliveryIdentity::from_fact(&fact, analysis_version);
+        identity.sha256 = expected_assessment_id;
         Ok(Self {
             delivery: GovernedNewsAiDelivery {
                 fact,
@@ -1370,8 +1610,7 @@ impl AuditedNewsAiAssessment {
             || !card.contains(&self.delivery.assessment_audit_record_sha256)
         {
             return Err(NewsAiError::AnalysisAuditFailed(
-                "persisted delivery card is empty or detached from its audited identity"
-                    .to_owned(),
+                "persisted delivery card is empty or detached from its audited identity".to_owned(),
             ));
         }
         self.delivery.rendered_card = Some(card);
@@ -1415,8 +1654,8 @@ impl GovernedNewsAiDelivery {
     }
 
     pub fn business_date(&self) -> chrono::NaiveDate {
-        let market_timezone = chrono::FixedOffset::east_opt(8 * 3600)
-            .expect("Asia/Shanghai UTC offset is valid");
+        let market_timezone =
+            chrono::FixedOffset::east_opt(8 * 3600).expect("Asia/Shanghai UTC offset is valid");
         self.assessment
             .receipt()
             .completed_at()
@@ -1952,7 +2191,47 @@ impl NewsAIAnalyzer {
         Self { provider }
     }
 
+    pub fn identity_profile(&self) -> Result<NewsAiAnalysisProfile, NewsAiError> {
+        NewsAiAnalysisProfile::for_configured_model(self.provider.name(), self.provider.model())
+    }
+
+    /// Pre-call barrier: retained identity skips both market acquisition and
+    /// the model. The repository callback must validate the retained audit;
+    /// lookup failure is not a cache miss. All phases receive the same identity.
+    pub async fn assess_if_absent<L, LF, P, PF>(
+        &self,
+        identity: NewsAiIdentityV3,
+        lookup: L,
+        prepare: P,
+    ) -> Result<Option<(NewsAiRequest, NewsAiAssessment)>, String>
+    where
+        L: FnOnce(NewsAiIdentityV3) -> LF,
+        LF: std::future::Future<Output = Result<bool, String>>,
+        P: FnOnce(NewsAiIdentityV3) -> PF,
+        PF: std::future::Future<Output = Result<NewsAiRequest, String>>,
+    {
+        if identity.profile != self.identity_profile().map_err(|e| e.to_string())? {
+            return Err("candidate profile differs from configured provider".to_owned());
+        }
+        if lookup(identity.clone()).await? {
+            return Ok(None);
+        }
+        let request = prepare(identity.clone()).await?;
+        if request.business_identity() != Some(&identity) {
+            return Err("prepared request changed the pre-call identity".to_owned());
+        }
+        let assessment = self.assess(&request).await.map_err(|e| e.to_string())?;
+        Ok(Some((request, assessment)))
+    }
+
     pub async fn assess(&self, request: &NewsAiRequest) -> Result<NewsAiAssessment, NewsAiError> {
+        if let Some(identity) = request.business_identity() {
+            if identity.profile != self.identity_profile()? {
+                return Err(NewsAiError::ModelUnavailable(
+                    "request profile differs from qualified configured provider".to_owned(),
+                ));
+            }
+        }
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(MODEL_CALL_TIMEOUT_SECONDS),
             self.provider
@@ -2555,7 +2834,10 @@ fn hash_request_evidence(
 }
 
 fn assessment_identity(request: &NewsAiRequest) -> String {
-    assessment_identity_for_fact(request.fact(), request.analysis_version())
+    request
+        .business_identity()
+        .map(NewsAiIdentityV3::digest)
+        .unwrap_or_else(|| assessment_identity_for_fact(request.fact(), request.analysis_version()))
 }
 
 fn assessment_identity_for_fact(fact: &AdmittedNewsFact, analysis_version: &str) -> String {
@@ -3076,6 +3358,123 @@ mod tests {
     }
 
     #[test]
+    fn v3_business_identity_is_independent_of_batch_evidence() {
+        let first = request();
+        let mut next = first.clone();
+        next.fact.batch.batch_id = "TEST_CODE_NEW_BATCH".to_owned();
+        next.fact = next
+            .fact
+            .with_target_name("TEST_CODE display only".to_owned());
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        assert_eq!(
+            NewsAiIdentityV3::from_fact(first.fact(), &profile)
+                .unwrap()
+                .digest(),
+            NewsAiIdentityV3::from_fact(next.fact(), &profile)
+                .unwrap()
+                .digest()
+        );
+    }
+
+    #[test]
+    fn v3_identity_distinguishes_raw_text_and_each_contract_version() {
+        let original = request();
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        let base = NewsAiIdentityV3::from_fact(original.fact(), &profile).unwrap();
+        for field in ["title", "summary", "content"] {
+            let mut fact = original.fact().clone();
+            let AdmittedNewsSourceRecord::Global(record) = &mut fact.record else {
+                unreachable!()
+            };
+            match field {
+                "title" => record.title.push(' '),
+                "summary" => record.summary = Some("TEST_CODE revised summary".to_owned()),
+                _ => record.content = Some(String::new()), // absent != present empty
+            }
+            assert_ne!(
+                base.digest(),
+                NewsAiIdentityV3::from_fact(&fact, &profile)
+                    .unwrap()
+                    .digest(),
+                "{field}"
+            );
+        }
+        for field in ["analysis", "prompt", "model", "profile", "data"] {
+            let mut changed = profile.clone();
+            match field {
+                "analysis" => changed.analysis_version.push_str("_next"),
+                "prompt" => changed.prompt_contract.push_str("_next"),
+                "model" => changed.configured_model.push_str("_next"),
+                "profile" => changed.model_profile_revision.push_str("_next"),
+                _ => changed.data_contract_version.push_str("_next"),
+            }
+            assert_ne!(
+                base.digest(),
+                NewsAiIdentityV3::from_fact(original.fact(), &changed)
+                    .unwrap()
+                    .digest(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_recovery_codec_is_canonical_versioned_and_source_bound() {
+        let original = request();
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        let identity = NewsAiIdentityV3::from_fact(original.fact(), &profile).unwrap();
+        let encoded = identity.encode_recovery(original.fact()).unwrap();
+        let (decoded, fact) = NewsAiIdentityV3::decode_recovery(&encoded).unwrap();
+        assert_eq!(decoded, identity);
+        assert_eq!(
+            fact.recovery_snapshot_canonical().unwrap(),
+            original.fact().recovery_snapshot_canonical().unwrap()
+        );
+        let mut envelope: NewsAiRecoveryEnvelopeV3 = serde_json::from_slice(&encoded).unwrap();
+        envelope.identity_version = 4;
+        assert!(
+            NewsAiIdentityV3::decode_recovery(&serde_json::to_vec(&envelope).unwrap()).is_err()
+        );
+        envelope.identity_version = 3;
+        envelope.identity.item_id.push_str("_other");
+        assert!(
+            NewsAiIdentityV3::decode_recovery(&serde_json::to_vec(&envelope).unwrap()).is_err()
+        );
+        assert!(NewsAiIdentityV3::decode_recovery(&[encoded, b" ".to_vec()].concat()).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_configured_profile_is_not_replaced_by_actual_response_model() {
+        let analyzer = NewsAIAnalyzer::new(Arc::new(ReceiptProvider {
+            raw_response: r#"{"impact":"positive","confidence":82,"uncertainty":"TEST_CODE uncertainty","core_logic":"TEST_CODE evidence"}"#.to_owned(),
+        }));
+        let old = request();
+        let identity =
+            NewsAiIdentityV3::from_fact(old.fact(), &analyzer.identity_profile().unwrap()).unwrap();
+        let request = NewsAiRequest::try_new_v3(
+            old.fact().clone(),
+            old.market().clone(),
+            vec![],
+            identity.clone(),
+            NewsAiChainContext::default(),
+        )
+        .unwrap();
+        let assessment = analyzer.assess(&request).await.unwrap();
+        assert_eq!(assessment.assessment_id(), identity.digest());
+        assert_eq!(
+            identity.profile.configured_model,
+            "TEST_CODE_configured_model"
+        );
+        assert_eq!(assessment.receipt().model(), "TEST_CODE_upstream_model");
+    }
+
+    #[test]
     fn br172_global_fact_binds_record_batch_and_explicit_instrument() {
         let observed_at = instant("2026-07-27T01:00:03Z");
         let fact = AdmittedNewsFact::from_global(
@@ -3205,8 +3604,8 @@ mod tests {
             instant("2026-07-27T01:00:05Z"),
         )
         .unwrap();
-        let assessment = NewsAiAssessment::from_model_response(&bare_request, response, Some(receipt))
-            .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&bare_request, response, Some(receipt)).unwrap();
         let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
             bare_request,
             assessment,
@@ -3824,9 +4223,12 @@ mod tests {
         .unwrap();
         let assessment =
             NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
-        let audited =
-            AuditedNewsAiAssessment::try_from_assessment_audit(request, assessment, &"a".repeat(64))
-                .unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            &"a".repeat(64),
+        )
+        .unwrap();
         let port = AdmissionDeniedPort::new(NewsAiPhysicalPushOutcome::Denied(
             "daily_budget_full".to_owned(),
         ));
@@ -3861,7 +4263,10 @@ mod tests {
             NewsAiGovernedDeliveryOutcome::SinkError { ref reason, .. }
                 if reason == "presentation_token_unavailable"
         ));
-        assert_eq!(*port.actions.lock().unwrap(), vec!["reserve", "push", "rollback"]);
+        assert_eq!(
+            *port.actions.lock().unwrap(),
+            vec!["reserve", "push", "rollback"]
+        );
         assert_eq!(
             port.rollback_reason.lock().unwrap().as_deref(),
             Some("presentation_token_unavailable")

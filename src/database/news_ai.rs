@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use super::DatabaseManager;
+use crate::monitor::news_ai::{AdmittedNewsFact, NewsAiIdentityV3, NEWS_AI_V3_STORAGE_PREFIX};
 
 const SCHEMA_VERSION: i32 = 1;
 const CHAIN_GENESIS: &str = "BR172_NEWS_AI_ASSESSMENT_GENESIS_V1";
@@ -315,6 +316,8 @@ impl From<crate::monitor::news_ai::NewsImpact> for NewsAiAuditImpact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewsAiAssessmentAuditInput {
+    business_identity: Option<NewsAiIdentityV3>,
+    recovery_envelope: Option<String>,
     assessment_id: String,
     impact: NewsAiAuditImpact,
     confidence: u8,
@@ -363,6 +366,22 @@ impl NewsAiAssessmentAuditInput {
         let utc = FixedOffset::east_opt(0)
             .ok_or_else(|| audit("UTC fixed offset is unavailable for model receipt"))?;
         Ok(Self {
+            business_identity: request.business_identity().cloned(),
+            recovery_envelope: request
+                .business_identity()
+                .map(|identity| {
+                    identity
+                        .encode_recovery(request.fact())
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes).map_err(|error| {
+                                crate::monitor::news_ai::NewsAiError::AnalysisAuditFailed(
+                                    error.to_string(),
+                                )
+                            })
+                        })
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?,
             assessment_id: assessment.assessment_id().to_owned(),
             impact: assessment.impact().into(),
             confidence: assessment.confidence(),
@@ -373,7 +392,10 @@ impl NewsAiAssessmentAuditInput {
             source_provider,
             source_batch_id: request.fact().source_batch_id().to_owned(),
             source_item_id: request.fact().item_id().to_owned(),
-            analysis_version: request.analysis_version().to_owned(),
+            analysis_version: request
+                .business_identity()
+                .map(NewsAiIdentityV3::storage_analysis_version)
+                .unwrap_or_else(|| request.analysis_version().to_owned()),
             target_code: request.fact().target_code().to_owned(),
             model_provider: assessment.receipt().provider().to_owned(),
             model: assessment.receipt().model().to_owned(),
@@ -771,7 +793,35 @@ fn canonical_assessment(
         target_code: input.target_code.clone(),
         analysis_version: input.analysis_version.clone(),
     };
-    let expected_assessment_id = core_assessment_id(&source_identity);
+    let expected_assessment_id = if is_v3_format(&input.analysis_version)? {
+        let identity = input
+            .business_identity
+            .as_ref()
+            .ok_or_else(|| invalid("v3 identity is missing"))?;
+        let envelope = input
+            .recovery_envelope
+            .as_ref()
+            .ok_or_else(|| invalid("v3 recovery envelope is missing"))?;
+        let (decoded, fact) = NewsAiIdentityV3::decode_recovery(envelope.as_bytes())
+            .map_err(|e| invalid(e.to_string()))?;
+        if identity != &decoded
+            || identity.storage_analysis_version() != input.analysis_version
+            || source_provider_tag(fact.provider())? != input.source_provider
+            || fact.source_batch_id() != input.source_batch_id
+            || fact.item_id() != input.source_item_id
+            || fact.target_code() != input.target_code
+        {
+            return Err(invalid(
+                "v3 envelope is detached from assessment source evidence",
+            ));
+        }
+        identity.digest()
+    } else {
+        if input.business_identity.is_some() || input.recovery_envelope.is_some() {
+            return Err(invalid("legacy row cannot carry v3 material"));
+        }
+        core_assessment_id(&source_identity)
+    };
     if input.assessment_id != expected_assessment_id {
         return Err(invalid(format!(
             "assessment_id differs from exact BR-172 source identity: expected {expected_assessment_id}"
@@ -822,8 +872,36 @@ fn source_identity_hash(source: &CanonicalSourceIdentity) -> NewsAiAssessmentAud
 
 fn assessment_content_hash(
     assessment: &CanonicalAssessment,
+    envelope: Option<&str>,
 ) -> NewsAiAssessmentAuditResult<String> {
-    hash_serializable(CONTENT_HASH_DOMAIN, assessment)
+    if is_v3_format(&assessment.source_identity.analysis_version)? {
+        let envelope = envelope.ok_or_else(|| audit("v3 content hash requires frozen envelope"))?;
+        // Identity hash excludes live evidence, while content/chain retains
+        // every byte of the first frozen fact, including its observation.
+        let canonical = serde_json::to_vec(assessment).map_err(|e| audit(e.to_string()))?;
+        let mut hash = Sha256::new();
+        hash.update(b"BR172_NEWS_AI_ASSESSMENT_CONTENT_V3\0");
+        for bytes in [canonical.as_slice(), envelope.as_bytes()] {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        Ok(hex::encode(hash.finalize()))
+    } else {
+        hash_serializable(CONTENT_HASH_DOMAIN, assessment)
+    }
+}
+
+/// The immutable audited row, not snapshot presence, chooses the codec.
+/// Reserve the entire family so unknown versions cannot masquerade as legacy.
+fn is_v3_format(version: &str) -> NewsAiAssessmentAuditResult<bool> {
+    if let Some(analysis) = version.strip_prefix(NEWS_AI_V3_STORAGE_PREFIX) {
+        validate_exact_text("v3 analysis version", analysis)?;
+        return Ok(true);
+    }
+    if version.starts_with("news_ai_identity_") {
+        return Err(audit("unsupported NewsAI identity format"));
+    }
+    Ok(false)
 }
 
 fn core_assessment_id(source: &CanonicalSourceIdentity) -> String {
@@ -925,8 +1003,25 @@ fn load_chain_for_row(
 }
 
 fn canonical_from_row(
+    conn: &mut SqliteConnection,
     row: &PersistedAssessmentRow,
-) -> NewsAiAssessmentAuditResult<CanonicalAssessment> {
+) -> NewsAiAssessmentAuditResult<(CanonicalAssessment, Option<NewsAiIdentityV3>)> {
+    let recovery_envelope = if is_v3_format(&row.analysis_version)? {
+        Some(
+            load_recovery_bytes(conn, &row.assessment_id)?
+                .ok_or_else(|| audit("v3 recovery envelope is missing"))?,
+        )
+    } else {
+        None
+    };
+    let identity = recovery_envelope
+        .as_ref()
+        .map(|bytes| {
+            NewsAiIdentityV3::decode_recovery(bytes.as_bytes())
+                .map(|(identity, _)| identity)
+                .map_err(|e| audit(e.to_string()))
+        })
+        .transpose()?;
     let confidence = u8::try_from(row.confidence).map_err(|error| {
         audit(format!(
             "persisted confidence is invalid at row {}: {error}",
@@ -946,6 +1041,8 @@ fn canonical_from_row(
         ))
     })?;
     let canonical = canonical_assessment(&NewsAiAssessmentAuditInput {
+        business_identity: identity.clone(),
+        recovery_envelope,
         assessment_id: row.assessment_id.clone(),
         impact: NewsAiAuditImpact::parse(&row.impact)?,
         confidence,
@@ -983,10 +1080,11 @@ fn canonical_from_row(
             row.id
         )));
     }
-    Ok(canonical)
+    Ok((canonical, identity))
 }
 
 fn validate_persisted_row(
+    conn: &mut SqliteConnection,
     row: &PersistedAssessmentRow,
 ) -> NewsAiAssessmentAuditResult<CanonicalAssessment> {
     if row.schema_version != SCHEMA_VERSION {
@@ -995,9 +1093,16 @@ fn validate_persisted_row(
             row.schema_version, row.id
         )));
     }
-    let canonical = canonical_from_row(row)?;
-    let expected_source_hash = source_identity_hash(&canonical.source_identity)?;
-    let expected_content_hash = assessment_content_hash(&canonical)?;
+    let (canonical, identity) = canonical_from_row(conn, row)?;
+    let expected_source_hash = identity
+        .map(|identity| Ok(identity.digest()))
+        .unwrap_or_else(|| source_identity_hash(&canonical.source_identity))?;
+    let envelope = if is_v3_format(&row.analysis_version)? {
+        load_recovery_bytes(conn, &row.assessment_id)?
+    } else {
+        None
+    };
+    let expected_content_hash = assessment_content_hash(&canonical, envelope.as_deref())?;
     if row.source_identity_sha256 != expected_source_hash
         || row.content_hash != expected_content_hash
     {
@@ -1038,7 +1143,12 @@ pub(crate) fn validate_news_ai_assessment_chain(
 
     let mut previous_hash = CHAIN_GENESIS.to_owned();
     for (row, link) in rows.iter().zip(chain.iter()) {
-        validate_persisted_row(row)?;
+        validate_persisted_row(conn, row)?;
+        if is_v3_format(&row.analysis_version)?
+            && load_frozen_delivery_card(conn, &row.assessment_id)?.is_none()
+        {
+            return Err(audit("v3 frozen delivery card is missing"));
+        }
         if link.assessment_row_id != row.id || link.previous_hash != previous_hash {
             return Err(audit(format!(
                 "assessment hash-chain linkage mismatch at row {}",
@@ -1824,8 +1934,13 @@ fn insert_assessment_in_transaction(
     input: &NewsAiAssessmentAuditInput,
 ) -> NewsAiAssessmentAuditResult<NewsAiAssessmentAuditReceipt> {
     let canonical = canonical_assessment(input)?;
-    let expected_source_hash = source_identity_hash(&canonical.source_identity)?;
-    let expected_content_hash = assessment_content_hash(&canonical)?;
+    let expected_source_hash = input
+        .business_identity
+        .as_ref()
+        .map(|identity| Ok(identity.digest()))
+        .unwrap_or_else(|| source_identity_hash(&canonical.source_identity))?;
+    let expected_content_hash =
+        assessment_content_hash(&canonical, input.recovery_envelope.as_deref())?;
     let previous_hash = validate_news_ai_assessment_chain(conn)?;
 
     if let Some(existing) = load_by_assessment_id(conn, &canonical.assessment_id)? {
@@ -1836,7 +1951,7 @@ fn insert_assessment_in_transaction(
                 assessment_id: canonical.assessment_id,
             });
         }
-        validate_persisted_row(&existing)?;
+        validate_persisted_row(conn, &existing)?;
         let link = load_chain_for_row(conn, existing.id)?;
         return Ok(NewsAiAssessmentAuditReceipt {
             assessment_id: existing.assessment_id,
@@ -1903,7 +2018,10 @@ fn insert_assessment_in_transaction(
           WHERE id = last_insert_rowid()",
     )
     .get_result::<PersistedAssessmentRow>(conn)?;
-    validate_persisted_row(&row)?;
+    if let Some(envelope) = &input.recovery_envelope {
+        freeze_recovery_bytes(conn, &row.assessment_id, envelope)?;
+    }
+    validate_persisted_row(conn, &row)?;
     let record_hash = calculate_chain_hash(&previous_hash, &row)?;
     let chain_inserted = diesel::sql_query(
         "INSERT INTO news_ai_assessment_chain (
@@ -1932,6 +2050,9 @@ pub(crate) fn append_news_ai_assessment_on_conn(
     conn: &mut SqliteConnection,
     input: &NewsAiAssessmentAuditInput,
 ) -> NewsAiAssessmentAuditResult<NewsAiAssessmentAuditReceipt> {
+    if input.business_identity.is_some() || is_v3_format(&input.analysis_version)? {
+        return Err(invalid("v3 requires the complete audited append owner"));
+    }
     conn.immediate_transaction::<_, NewsAiAssessmentAuditError, _>(|conn| {
         insert_assessment_in_transaction(conn, input)
     })
@@ -1984,10 +2105,10 @@ fn freeze_delivery_card(
     Ok(rendered_text.to_owned())
 }
 
-fn load_frozen_recovery_fact(
+fn load_recovery_bytes(
     conn: &mut SqliteConnection,
     assessment_id: &str,
-) -> NewsAiAssessmentAuditResult<Option<crate::monitor::news_ai::AdmittedNewsFact>> {
+) -> NewsAiAssessmentAuditResult<Option<String>> {
     let row = diesel::sql_query(
         "SELECT schema_version, fact_snapshot, fact_snapshot_sha256
            FROM news_ai_delivery_recovery_snapshot
@@ -2008,16 +2129,55 @@ fn load_frozen_recovery_fact(
                 "NewsAI recovery snapshot hash is invalid for assessment {assessment_id}"
             )));
         }
-        crate::monitor::news_ai::AdmittedNewsFact::from_recovery_snapshot(
-            row.fact_snapshot.as_bytes(),
-        )
-        .map_err(|error| {
-            audit(format!(
-                "NewsAI recovery snapshot is invalid for assessment {assessment_id}: {error}"
-            ))
-        })
+        Ok(row.fact_snapshot)
     })
     .transpose()
+}
+
+fn load_recovery_identity(
+    conn: &mut SqliteConnection,
+    row: &PersistedAssessmentRow,
+) -> NewsAiAssessmentAuditResult<Option<NewsAiIdentityV3>> {
+    if !is_v3_format(&row.analysis_version)? {
+        return Ok(None);
+    }
+    let bytes = load_recovery_bytes(conn, &row.assessment_id)?
+        .ok_or_else(|| audit("v3 recovery envelope is missing"))?;
+    let (identity, _) =
+        NewsAiIdentityV3::decode_recovery(bytes.as_bytes()).map_err(|e| audit(e.to_string()))?;
+    if identity.digest() != row.assessment_id
+        || identity.digest() != row.source_identity_sha256
+        || identity.storage_analysis_version() != row.analysis_version
+    {
+        return Err(audit("v3 recovery identity differs from audited row"));
+    }
+    Ok(Some(identity))
+}
+
+fn load_frozen_recovery_fact(
+    conn: &mut SqliteConnection,
+    assessment_id: &str,
+) -> NewsAiAssessmentAuditResult<Option<AdmittedNewsFact>> {
+    let row = load_by_assessment_id(conn, assessment_id)?
+        .ok_or_else(|| audit("recovery assessment is missing"))?;
+    let v3 = is_v3_format(&row.analysis_version)?;
+    let Some(bytes) = load_recovery_bytes(conn, assessment_id)? else {
+        return if v3 {
+            Err(audit("v3 recovery envelope is missing"))
+        } else {
+            Ok(None)
+        };
+    };
+    if v3 {
+        load_recovery_identity(conn, &row)?;
+        NewsAiIdentityV3::decode_recovery(bytes.as_bytes())
+            .map(|(_, fact)| Some(fact))
+            .map_err(|e| audit(e.to_string()))
+    } else {
+        AdmittedNewsFact::from_recovery_snapshot(bytes.as_bytes())
+            .map(Some)
+            .map_err(|e| audit(e.to_string()))
+    }
 }
 
 fn freeze_recovery_fact(
@@ -2033,6 +2193,14 @@ fn freeze_recovery_fact(
         .map_err(|error| audit(format!("cannot freeze NewsAI recovery fact: {error}")))?;
     let snapshot = String::from_utf8(snapshot)
         .map_err(|error| audit(format!("NewsAI recovery fact is not UTF-8: {error}")))?;
+    freeze_recovery_bytes(conn, assessment_id, &snapshot)
+}
+
+fn freeze_recovery_bytes(
+    conn: &mut SqliteConnection,
+    assessment_id: &str,
+    snapshot: &str,
+) -> NewsAiAssessmentAuditResult<()> {
     let snapshot_sha256 = hex::encode(Sha256::digest(snapshot.as_bytes()));
     let inserted = diesel::sql_query(
         "INSERT INTO news_ai_delivery_recovery_snapshot (
@@ -2041,7 +2209,7 @@ fn freeze_recovery_fact(
     )
     .bind::<Text, _>(assessment_id)
     .bind::<Integer, _>(RECOVERY_SNAPSHOT_SCHEMA_VERSION)
-    .bind::<Text, _>(&snapshot)
+    .bind::<Text, _>(snapshot)
     .bind::<Text, _>(&snapshot_sha256)
     .execute(conn)?;
     if inserted != 1 {
@@ -2094,9 +2262,10 @@ pub(crate) fn has_news_ai_assessment_for_fact_on_conn(
 }
 
 fn persisted_delivery_assessment(
+    conn: &mut SqliteConnection,
     row: &PersistedAssessmentRow,
 ) -> NewsAiAssessmentAuditResult<crate::monitor::news_ai::PersistedNewsAiAssessment> {
-    validate_persisted_row(row)?;
+    validate_persisted_row(conn, row)?;
     let confidence = u8::try_from(row.confidence).map_err(|error| {
         audit(format!(
             "persisted delivery confidence is invalid at row {}: {error}",
@@ -2143,7 +2312,7 @@ pub(crate) fn load_audited_news_ai_assessment_for_fact_on_conn(
         return Ok(None);
     };
     let link = load_chain_for_row(conn, row.id)?;
-    let persisted = persisted_delivery_assessment(&row)?;
+    let persisted = persisted_delivery_assessment(conn, &row)?;
     let audited =
         crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_assessment_audit(
             fact.clone(),
@@ -2173,6 +2342,35 @@ pub(crate) fn load_audited_news_ai_assessment_for_fact_on_conn(
         .with_frozen_card(card)
         .map(Some)
         .map_err(|error| audit(format!("persisted delivery card binding failed: {error}")))
+}
+
+fn load_audited_news_ai_assessment_for_identity_on_conn(
+    conn: &mut SqliteConnection,
+    identity: &NewsAiIdentityV3,
+) -> NewsAiAssessmentAuditResult<Option<crate::monitor::news_ai::AuditedNewsAiAssessment>> {
+    validate_news_ai_assessment_chain(conn)?;
+    let Some(row) = load_by_assessment_id(conn, &identity.digest())? else {
+        return Ok(None);
+    };
+    if load_recovery_identity(conn, &row)?.as_ref() != Some(identity) {
+        return Err(audit("retained v3 identity differs from qualified lookup"));
+    }
+    let fact = load_frozen_recovery_fact(conn, &row.assessment_id)?
+        .ok_or_else(|| audit("v3 original fact missing"))?;
+    let link = load_chain_for_row(conn, row.id)?;
+    let persisted = persisted_delivery_assessment(conn, &row)?;
+    let card = load_frozen_delivery_card(conn, &row.assessment_id)?
+        .ok_or_else(|| audit("v3 original card missing"))?;
+    crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_identity_audit(
+        fact,
+        identity.analysis_version(),
+        Some(identity),
+        persisted,
+        &link.record_hash,
+    )
+    .and_then(|audited| audited.with_frozen_card(card))
+    .map(Some)
+    .map_err(|e| audit(e.to_string()))
 }
 
 fn news_ai_assessment_is_pending(
@@ -2274,19 +2472,28 @@ fn claim_pending_news_ai_recoveries(
             ));
             continue;
         };
-        let identity = source_identity_from_fact(&fact, &row.analysis_version)?;
-        if core_assessment_id(&identity) != row.assessment_id {
+        let business_identity = load_recovery_identity(conn, &row)?;
+        let expected_id = if let Some(identity) = &business_identity {
+            identity.digest()
+        } else {
+            core_assessment_id(&source_identity_from_fact(&fact, &row.analysis_version)?)
+        };
+        if expected_id != row.assessment_id {
             return Err(audit(format!(
                 "NewsAI recovery snapshot identity mismatch for assessment {}",
                 row.assessment_id
             )));
         }
         let link = load_chain_for_row(conn, row.id)?;
-        let persisted = persisted_delivery_assessment(&row)?;
+        let persisted = persisted_delivery_assessment(conn, &row)?;
         let audited =
-            crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_assessment_audit(
+            crate::monitor::news_ai::AuditedNewsAiAssessment::try_from_persisted_identity_audit(
                 fact,
-                &row.analysis_version,
+                business_identity
+                    .as_ref()
+                    .map(NewsAiIdentityV3::analysis_version)
+                    .unwrap_or(&row.analysis_version),
+                business_identity.as_ref(),
                 persisted,
                 &link.record_hash,
             )
@@ -2359,6 +2566,35 @@ fn confirm_news_ai_recovery_review_on_conn(
 }
 
 impl DatabaseManager {
+    pub fn load_audited_news_ai_assessment_for_identity(
+        &self,
+        identity: &NewsAiIdentityV3,
+    ) -> NewsAiAssessmentAuditResult<Option<crate::monitor::news_ai::AuditedNewsAiAssessment>> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
+        load_audited_news_ai_assessment_for_identity_on_conn(&mut conn, identity)
+    }
+
+    pub fn is_news_ai_terminal_denial_for_identity(
+        &self,
+        identity: &NewsAiIdentityV3,
+    ) -> NewsAiAssessmentAuditResult<bool> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| NewsAiAssessmentAuditError::Connection(error.to_string()))?;
+        validate_news_ai_assessment_chain(&mut conn)?;
+        let latest = latest_delivery_event(&mut conn, &identity.digest())?;
+        Ok(latest.is_some_and(|event| {
+            event.assessment_id == identity.digest()
+                && event.state == DeliveryEventState::RolledBack.as_str()
+                && event
+                    .reason
+                    .as_deref()
+                    .is_some_and(is_counted_terminal_denial_reason)
+        }))
+    }
+
     /// Check the durable exact BR-172 identity before making another model
     /// call. The complete chain is validated first; a corrupt audit can never
     /// masquerade as a successful deduplication hit.
@@ -2577,6 +2813,8 @@ mod tests {
     fn input() -> NewsAiAssessmentAuditInput {
         let timezone = FixedOffset::east_opt(8 * 3600).expect("UTC+08:00");
         NewsAiAssessmentAuditInput {
+            business_identity: None,
+            recovery_envelope: None,
             assessment_id: "ed656daca371c716f27357956a9c9778e57bc2d2c7150ac5c51fb661aae8ec73"
                 .to_owned(),
             impact: NewsAiAuditImpact::Positive,
@@ -2757,6 +2995,440 @@ mod tests {
         );
         assert_eq!(receipt.record_hash.len(), 64);
         validate_news_ai_assessment_chain(&mut conn).expect("valid assessment chain");
+    }
+
+    fn legacy_golden_dump(conn: &mut SqliteConnection) -> String {
+        #[derive(QueryableByName)]
+        struct Name {
+            #[diesel(sql_type = Text)]
+            name: String,
+        }
+        #[derive(QueryableByName)]
+        struct Statement {
+            #[diesel(sql_type = Text)]
+            statement: String,
+        }
+        let mut sql = String::new();
+        for table in [
+            "news_ai_assessment",
+            "news_ai_assessment_chain",
+            "news_ai_delivery_recovery_snapshot",
+            "news_ai_delivery_card",
+            "news_ai_delivery_event",
+            "news_ai_delivery_event_chain",
+        ] {
+            let names = diesel::sql_query(format!("PRAGMA table_info({table})"))
+                .load::<Name>(conn)
+                .unwrap();
+            let columns = names
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let values = names
+                .iter()
+                .map(|n| format!("quote({})", n.name))
+                .collect::<Vec<_>>()
+                .join(" || ',' || ");
+            let query = format!("SELECT 'INSERT INTO {table} ({columns}) VALUES (' || {values} || ');' AS statement FROM {table} WHERE rowid <= 2 ORDER BY rowid");
+            for row in diesel::sql_query(query).load::<Statement>(conn).unwrap() {
+                sql.push_str(&row.statement);
+                sql.push('\n');
+            }
+        }
+        sql
+    }
+
+    #[test]
+    fn v3_legacy_golden_reopen_and_mixed_recovery_keep_original_bytes_and_fairness() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/news_ai_legacy_v1_v2.json")).unwrap();
+        let sql = fixture["sql"].as_str().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let mut conn = SqliteConnection::establish(path).unwrap();
+        create_schema(&mut conn).unwrap();
+        conn.batch_execute(sql).unwrap();
+        create_schema(&mut conn).unwrap();
+        assert_eq!(legacy_golden_dump(&mut conn), sql);
+        for (index, version) in ["news_ai_v1", "news_ai_v2"].into_iter().enumerate() {
+            let (old, _) = core_assessment();
+            let request = crate::monitor::news_ai::NewsAiRequest::try_new(
+                old.fact().clone(),
+                old.market().clone(),
+                vec![],
+                version,
+                NewsAiChainContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                request.normalized_prompt(),
+                fixture["prompts"][index].as_str().unwrap()
+            );
+        }
+        let (request, assessment) = v3_core_assessment();
+        let new_id = assessment.assessment_id().to_owned();
+        append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+        append_news_ai_assessment_on_conn(&mut conn, &input()).unwrap(); // legacy manual, no invented fact
+        drop(conn);
+        let mut conn = SqliteConnection::establish(path).unwrap();
+        create_schema(&mut conn).unwrap();
+        assert_eq!(legacy_golden_dump(&mut conn), sql);
+        let mut ready = std::collections::BTreeSet::new();
+        let mut manual = 0;
+        for _ in 0..8 {
+            let work = load_pending_news_ai_recoveries_on_conn(&mut conn, 1).unwrap();
+            assert_eq!(work.len(), 1);
+            match &work[0] {
+                NewsAiPendingRecovery::Ready(audited) => {
+                    ready.insert(audited.delivery().identity().sha256().to_owned());
+                }
+                NewsAiPendingRecovery::ManualReview { .. } => manual += 1,
+            }
+        }
+        assert_eq!(ready.len(), 3);
+        assert!(ready.contains(&new_id));
+        assert!(manual > 0);
+        assert_eq!(legacy_golden_dump(&mut conn), sql);
+    }
+
+    fn v3_core_assessment() -> (
+        crate::monitor::news_ai::NewsAiRequest,
+        crate::monitor::news_ai::NewsAiAssessment,
+    ) {
+        use crate::monitor::news_ai::{
+            ModelCallReceipt, NewsAiAnalysisProfile, NewsAiAssessment, NewsAiIdentityV3,
+            NewsAiRequest,
+        };
+        let (old, _) = core_assessment();
+        let profile = NewsAiAnalysisProfile::for_configured_model(
+            "TEST_CODE_MODEL_PROVIDER",
+            "TEST_CODE_configured_model",
+        )
+        .unwrap();
+        let identity = NewsAiIdentityV3::from_fact(old.fact(), &profile).unwrap();
+        let request = NewsAiRequest::try_new_v3(
+            old.fact().clone(),
+            old.market().clone(),
+            vec![],
+            identity,
+            NewsAiChainContext::default(),
+        )
+        .unwrap();
+        let response = r#"{"impact":"positive","confidence":82,"uncertainty":"TEST_CODE execution may vary","core_logic":"TEST_CODE evidence-bound positive impact"}"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_MODEL_PROVIDER",
+            "TEST_CODE_actual_model",
+            Some("TEST_CODE_REQUEST_CORE"),
+            request.normalized_prompt(),
+            response,
+            Utc.with_ymd_and_hms(2026, 7, 27, 1, 0, 3).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 27, 1, 0, 4).unwrap(),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        (request, assessment)
+    }
+
+    #[test]
+    fn v3_append_freezes_audited_identity_and_recovers_original_materials() {
+        let mut conn = connection();
+        let (request, assessment) = v3_core_assessment();
+        let id = assessment.assessment_id().to_owned();
+        let audited =
+            append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+        assert_eq!(audited.delivery().identity().sha256(), id);
+        assert_eq!(
+            audited.delivery().assessment().receipt().model(),
+            "TEST_CODE_actual_model"
+        );
+        let pending = load_pending_news_ai_recoveries_on_conn(&mut conn, 1).unwrap();
+        let NewsAiPendingRecovery::Ready(recovered) = &pending[0] else {
+            panic!("v3 must recover ready")
+        };
+        assert_eq!(
+            recovered.delivery().render_card(),
+            audited.delivery().render_card()
+        );
+        assert_eq!(count(&mut conn, "news_ai_assessment"), 1);
+    }
+
+    #[test]
+    fn v3_every_append_stage_rolls_back_and_raw_append_cannot_create_partial_material() {
+        for table in [
+            "news_ai_assessment",
+            "news_ai_delivery_recovery_snapshot",
+            "news_ai_assessment_chain",
+            "news_ai_delivery_card",
+        ] {
+            let mut conn = connection();
+            conn.batch_execute(&format!("CREATE TRIGGER TEST_CODE_abort BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'TEST_CODE fault'); END;")).unwrap();
+            let (request, assessment) = v3_core_assessment();
+            assert!(
+                append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).is_err(),
+                "{table}"
+            );
+            for retained in [
+                "news_ai_assessment",
+                "news_ai_delivery_recovery_snapshot",
+                "news_ai_assessment_chain",
+                "news_ai_delivery_card",
+            ] {
+                assert_eq!(
+                    count(&mut conn, retained),
+                    0,
+                    "failure at {table} retained {retained}"
+                );
+            }
+        }
+        let mut conn = connection();
+        let (request, assessment) = v3_core_assessment();
+        let input = NewsAiAssessmentAuditInput::from_core(&request, &assessment).unwrap();
+        assert!(append_news_ai_assessment_on_conn(&mut conn, &input).is_err());
+        assert_eq!(count(&mut conn, "news_ai_assessment"), 0);
+    }
+
+    #[test]
+    fn v3_missing_tampered_moved_unknown_material_fails_closed_before_claims() {
+        for scenario in [
+            "missing",
+            "revision",
+            "observation",
+            "unknown",
+            "move",
+            "card",
+            "format",
+        ] {
+            let mut conn = connection();
+            let (request, assessment) = v3_core_assessment();
+            let id = assessment.assessment_id().to_owned();
+            append_audited_news_ai_assessment_on_conn(&mut conn, request, assessment).unwrap();
+            // First prove normal UPDATE/DELETE are denied by existing immutable guards.
+            assert!(diesel::sql_query(
+                "DELETE FROM news_ai_delivery_recovery_snapshot WHERE assessment_id=?"
+            )
+            .bind::<Text, _>(&id)
+            .execute(&mut conn)
+            .is_err());
+            assert!(diesel::sql_query("UPDATE news_ai_delivery_recovery_snapshot SET fact_snapshot='{}' WHERE assessment_id=?").bind::<Text,_>(&id).execute(&mut conn).is_err());
+            #[derive(QueryableByName)]
+            struct TriggerName {
+                #[diesel(sql_type=Text)]
+                name: String,
+            }
+            // Privileged corruption fixture: bypass guards, then require audit
+            // validation to reject even when the untrusted snapshot SHA is repaired.
+            let triggers = diesel::sql_query("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('news_ai_delivery_recovery_snapshot','news_ai_delivery_card','news_ai_assessment')").load::<TriggerName>(&mut conn).unwrap();
+            for trigger in triggers {
+                conn.batch_execute(&format!("DROP TRIGGER {}", trigger.name))
+                    .unwrap();
+            }
+            match scenario {
+                "missing" => {
+                    conn.batch_execute("DELETE FROM news_ai_delivery_recovery_snapshot")
+                        .unwrap();
+                }
+                "move" => {
+                    append_news_ai_assessment_on_conn(&mut conn, &input()).unwrap();
+                    diesel::sql_query(
+                        "UPDATE news_ai_delivery_recovery_snapshot SET assessment_id=?",
+                    )
+                    .bind::<Text, _>(input().assessment_id)
+                    .execute(&mut conn)
+                    .unwrap();
+                }
+                "card" => {
+                    conn.batch_execute("DELETE FROM news_ai_delivery_card")
+                        .unwrap();
+                }
+                "format" => {
+                    conn.batch_execute("UPDATE news_ai_assessment SET analysis_version='news_ai_identity_v4/news_ai_v2'").unwrap();
+                }
+                _ => {
+                    let original = load_recovery_bytes(&mut conn, &id).unwrap().unwrap();
+                    let modified = match scenario {
+                        "revision" => original.replace(
+                            "TEST_CODE exact source-bound contract",
+                            "TEST_CODE tampered text",
+                        ),
+                        "observation" => original
+                            .replace("1785114003.000000000", "1785114004.000000000")
+                            .replace("2026-07-27T01:00:03Z", "2026-07-27T01:00:04Z"),
+                        _ => original.replace("\"identity_version\":3", "\"identity_version\":4"),
+                    };
+                    assert_ne!(
+                        original, modified,
+                        "tamper fixture must change bytes: {scenario}"
+                    );
+                    let repaired_sha = hex::encode(Sha256::digest(modified.as_bytes()));
+                    diesel::sql_query("UPDATE news_ai_delivery_recovery_snapshot SET fact_snapshot=?,fact_snapshot_sha256=? WHERE assessment_id=?")
+                        .bind::<Text,_>(modified).bind::<Text,_>(repaired_sha).bind::<Text,_>(&id).execute(&mut conn).unwrap();
+                }
+            }
+            assert!(
+                load_pending_news_ai_recoveries_on_conn(&mut conn, 1).is_err(),
+                "{scenario}"
+            );
+            assert_eq!(count(&mut conn, "news_ai_recovery_claim"), 0, "{scenario}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_same_content_across_batches_skips_second_model_and_market_call_after_reopen() {
+        use crate::llm::{LlmError, LlmProvider, ReceiptBearingJson};
+        use crate::monitor::news_ai::{NewsAIAnalyzer, NewsAiRequest};
+        use std::{
+            cell::RefCell,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+        struct CountingProvider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LlmProvider for CountingProvider {
+            fn name(&self) -> &'static str {
+                "TEST_CODE_MODEL_PROVIDER"
+            }
+            fn model(&self) -> &str {
+                "TEST_CODE_configured_model"
+            }
+            async fn chat_json(&self, _: &str, _: &str) -> Result<serde_json::Value, LlmError> {
+                unreachable!("receipt-only")
+            }
+            async fn chat_json_with_receipt(
+                &self,
+                system: &str,
+                user: &str,
+            ) -> Result<ReceiptBearingJson, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ReceiptBearingJson::test_fixture(
+                    self.name(),
+                    "TEST_CODE_actual_model",
+                    Some("TEST_CODE_request"),
+                    "TEST_CODE_response",
+                    system,
+                    user,
+                    r#"{"impact":"positive","confidence":82,"uncertainty":"TEST_CODE uncertainty","core_logic":"TEST_CODE evidence"}"#,
+                    Utc.with_ymd_and_hms(2026, 7, 27, 1, 0, 4).unwrap(),
+                    Utc.with_ymd_and_hms(2026, 7, 27, 1, 0, 5).unwrap(),
+                ))
+            }
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let mut conn = SqliteConnection::establish(path).unwrap();
+        create_schema(&mut conn).unwrap();
+        let conn = RefCell::new(conn);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let acquired = AtomicUsize::new(0);
+        let analyzer = NewsAIAnalyzer::new(Arc::new(CountingProvider(calls.clone())));
+        let (old, _) = core_assessment();
+        let profile = analyzer.identity_profile().unwrap();
+        let identity = NewsAiIdentityV3::from_fact(old.fact(), &profile).unwrap();
+        let first = analyzer
+            .assess_if_absent(
+                identity.clone(),
+                |identity| {
+                    std::future::ready(
+                        load_audited_news_ai_assessment_for_identity_on_conn(
+                            &mut conn.borrow_mut(),
+                            &identity,
+                        )
+                        .map(|v| v.is_some())
+                        .map_err(|e| e.to_string()),
+                    )
+                },
+                |identity| async {
+                    acquired.fetch_add(1, Ordering::SeqCst);
+                    NewsAiRequest::try_new_v3(
+                        old.fact().clone(),
+                        old.market().clone(),
+                        vec![],
+                        identity,
+                        NewsAiChainContext::default(),
+                    )
+                    .map_err(|e| e.to_string())
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let audited =
+            append_audited_news_ai_assessment_on_conn(&mut conn.borrow_mut(), first.0, first.1)
+                .unwrap();
+        let frozen = load_recovery_bytes(&mut conn.borrow_mut(), &identity.digest())
+            .unwrap()
+            .unwrap();
+        let original_card = audited.delivery().render_card();
+        let original_fact =
+            String::from_utf8(old.fact().recovery_snapshot_canonical().unwrap()).unwrap();
+        let other_batch = original_fact
+            .replace("TEST_CODE_NEWS_BATCH_CORE", "TEST_CODE_NEWS_BATCH_NEXT")
+            .replace("1785114003.000000000", "1785114004.000000000")
+            .replace("2026-07-27T01:00:03Z", "2026-07-27T01:00:04Z");
+        let next_fact = AdmittedNewsFact::from_recovery_snapshot(other_batch.as_bytes())
+            .unwrap()
+            .with_target_name("TEST_CODE changed display".to_owned());
+        let next_identity = NewsAiIdentityV3::from_fact(&next_fact, &profile).unwrap();
+        assert_eq!(next_identity, identity);
+        drop(conn.into_inner());
+        let mut conn = SqliteConnection::establish(path).unwrap();
+        create_schema(&mut conn).unwrap();
+        let conn = RefCell::new(conn);
+        let second = analyzer
+            .assess_if_absent(
+                next_identity,
+                |identity| {
+                    std::future::ready(
+                        load_audited_news_ai_assessment_for_identity_on_conn(
+                            &mut conn.borrow_mut(),
+                            &identity,
+                        )
+                        .map(|v| v.is_some())
+                        .map_err(|e| e.to_string()),
+                    )
+                },
+                |_| async { panic!("retained identity must not acquire new market evidence") },
+            )
+            .await
+            .unwrap();
+        assert!(second.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&mut conn.borrow_mut(), "news_ai_assessment"), 1);
+        assert_eq!(
+            load_recovery_bytes(&mut conn.borrow_mut(), &identity.digest())
+                .unwrap()
+                .unwrap(),
+            frozen
+        );
+        let restored =
+            load_audited_news_ai_assessment_for_identity_on_conn(&mut conn.borrow_mut(), &identity)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored.delivery().render_card(), original_card);
+        assert_eq!(
+            restored.delivery().fact().source_batch_id(),
+            "TEST_CODE_NEWS_BATCH_CORE"
+        );
+        let recovered = load_pending_news_ai_recoveries_on_conn(&mut conn.borrow_mut(), 1).unwrap();
+        assert!(matches!(recovered[0], NewsAiPendingRecovery::Ready(_)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery cannot invoke model"
+        );
+        let error = analyzer
+            .assess_if_absent(
+                identity,
+                |_| async { Err("TEST_CODE corrupt audit".to_owned()) },
+                |_| async { panic!("lookup failure is not cache miss") },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("corrupt audit"));
     }
 
     #[test]
