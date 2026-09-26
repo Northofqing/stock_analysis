@@ -1,9 +1,11 @@
 //! BR-066/BR-164/BR-172 evidence-preserving Sina instrument-news gateway.
 
-use crate::market_domain::{ProviderId, SourceEvidence};
+use crate::market_domain::SourceEvidence;
 use chrono::{DateTime, Utc};
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+use super::review::{
+    acquisition_request_hash, audit_routed_gateway_result, GatewayBatch, GatewayError,
+};
 
 use crate::data_provider::news_item::NewsItem;
 
@@ -69,19 +71,10 @@ impl SinaInstrumentNewsGateway {
                 let result = bridge
                     .instrument_news_async(std::slice::from_ref(&code), from_days)
                     .await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Sina);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Sina,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。

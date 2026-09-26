@@ -36,6 +36,9 @@ pub mod security_lifecycle;
 pub mod sina_instrument_news;
 pub mod t0_evidence;
 
+#[cfg(test)]
+mod d15_attribution_tests;
+
 pub use benchmark::{
     admit_benchmark_batch, probe_benchmark_request, AdmittedBenchmarkBatch,
     BenchmarkAdmissionCoverage, BenchmarkBar, BenchmarkBarTime, BenchmarkCapture, BenchmarkError,

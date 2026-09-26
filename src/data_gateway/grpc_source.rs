@@ -690,12 +690,15 @@ fn instrument_news_request_params(
     })
 }
 
-/// D2: gRPC 错误 → GatewayError 分类保真映射 (query_op 共用)。
+/// Frozen v1 projection for Board/Constituent/Dragon durable codec and replay.
+/// Keep byte-for-byte historical error text and provider omission. Dedicated
+/// OutcomeDailyBars transport also retains this policy; ordinary acquisitions
+/// must use map_current_routed_query_error instead.
 /// 服务端 Fetch 失败 (handlers.rs) 携带 ErrorDetail (provider/reason_code/retryable),
 /// 客户端据此重建分类 — 不再折叠为默认 unavailable+provider=None (BR-170 pre-fix 形态)。
 /// 明确错误码 (invalid_argument/unimplemented/…): 重试不会变好 → invalid_request 不重试；
 /// 已退役 EconomicCalendar 保留独立的 operation_retired 分类。
-fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
+fn map_legacy_durable_query_error(op: Operation, e: &GrpcError) -> GatewayError {
     if op == Operation::EconomicCalendar
         && e.details().reason_code.as_deref() == Some("operation_retired")
     {
@@ -736,6 +739,28 @@ fn map_query_error(op: Operation, e: &GrpcError) -> GatewayError {
             )
         }
     }
+}
+
+/// Current ordinary acquisition policy: retain wire attribution without
+/// changing the frozen classification, retryability or historical decoder.
+fn map_current_routed_query_error(op: Operation, error: &GrpcError) -> GatewayError {
+    let legacy = map_legacy_durable_query_error(op, error);
+    // Dedicated outcome transport/receipt is not an ordinary routed product.
+    if op == Operation::OutcomeDailyBars {
+        return legacy;
+    }
+    GatewayError::classified(
+        legacy.capability(),
+        error
+            .details()
+            .provider
+            .as_deref()
+            .and_then(|name| convert::parse_provider(name).ok()),
+        legacy.audit_outcome(),
+        legacy.reason_code(),
+        legacy.retryable(),
+        legacy.message(),
+    )
 }
 
 pub(crate) fn map_external_connection_error(error: GrpcError) -> GatewayError {
@@ -1223,6 +1248,27 @@ pub fn reset_bridge() {
 #[cfg(test)]
 static TEST_GRPC_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+// Test-only external Query boundary. Validators, public Gateway methods and
+// audit append remain real; no fixture can be enabled in a production build.
+#[cfg(test)]
+static TEST_QUERY_RESPONSES: Mutex<
+    Option<std::collections::VecDeque<Result<QueryResult, GrpcError>>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn set_test_query_responses(responses: Vec<Result<QueryResult, GrpcError>>) {
+    *TEST_QUERY_RESPONSES.lock().unwrap() = Some(responses.into());
+}
+
+#[cfg(test)]
+fn take_test_query_response() -> Option<Result<QueryResult, GrpcError>> {
+    TEST_QUERY_RESPONSES.lock().unwrap().as_mut().map(|queue| {
+        queue
+            .pop_front()
+            .expect("TEST_CODE unexpected extra physical query")
+    })
+}
+
 #[cfg(test)]
 pub(crate) struct TestGrpcEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -1249,6 +1295,7 @@ pub(crate) fn test_grpc_env_guard() -> TestGrpcEnvGuard {
 #[cfg(test)]
 impl Drop for TestGrpcEnvGuard {
     fn drop(&mut self) {
+        *TEST_QUERY_RESPONSES.lock().unwrap() = None;
         reset_bridge();
         for (key, value) in &self.snapshot {
             match value {
@@ -2583,7 +2630,7 @@ impl ConnectedBoardQueries {
             .board_directory_query(
                 serde_json::json!({ "kind": format!("{kind:?}"), "limit": limit }),
             )
-            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardDirectory, &error))
     }
 
     pub(crate) fn resume_directory_session(
@@ -2602,7 +2649,7 @@ impl ConnectedBoardQueries {
                 retry_policy,
                 next_attempt,
             )
-            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardDirectory, &error))
     }
 
     pub(crate) fn memberships_session(
@@ -2612,7 +2659,7 @@ impl ConnectedBoardQueries {
         let request = MembershipRequest::try_new(code)?;
         self.client
             .board_memberships_query(request.code().to_owned())
-            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))
     }
 
     pub(crate) fn resume_memberships_session(
@@ -2630,7 +2677,7 @@ impl ConnectedBoardQueries {
                 restored.retry_policy,
                 restored.next_attempt,
             )
-            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))
     }
 
     pub(crate) fn directory_completion(
@@ -2638,7 +2685,7 @@ impl ConnectedBoardQueries {
     ) -> Result<GatewayBatch<BoardDirectoryFact>, GatewayError> {
         let query = completion
             .processed
-            .map_err(|error| map_query_error(Operation::BoardDirectory, &error))?;
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardDirectory, &error))?;
         convert::board_directory(&query)
     }
 
@@ -2654,7 +2701,7 @@ impl ConnectedBoardQueries {
             request_id,
             response,
         )
-        .map_err(|error| map_query_error(Operation::BoardDirectory, &error))?;
+        .map_err(|error| map_legacy_durable_query_error(Operation::BoardDirectory, &error))?;
         convert::board_directory(&query)
     }
 
@@ -2678,7 +2725,7 @@ impl ConnectedBoardQueries {
             diagnostic,
             crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
         )
-        .map(|error| map_query_error(Operation::BoardDirectory, &error))
+        .map(|error| map_legacy_durable_query_error(Operation::BoardDirectory, &error))
     }
 
     pub(crate) fn memberships_completion(
@@ -2686,7 +2733,7 @@ impl ConnectedBoardQueries {
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
         let query = completion
             .processed
-            .map_err(|error| map_query_error(Operation::BoardConstituents, &error))?;
+            .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))?;
         convert::board_constituents(&query)
     }
 
@@ -2702,7 +2749,7 @@ impl ConnectedBoardQueries {
             request_id,
             response,
         )
-        .map_err(|error| map_query_error(Operation::BoardConstituents, &error))?;
+        .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))?;
         convert::board_constituents(&query)
     }
 
@@ -2726,7 +2773,7 @@ impl ConnectedBoardQueries {
             diagnostic,
             crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
         )
-        .map(|error| map_query_error(Operation::BoardConstituents, &error))
+        .map(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))
     }
 }
 
@@ -2815,6 +2862,10 @@ impl GrpcSource {
     }
 
     async fn query_op(&self, op: Operation, params: Value) -> Result<QueryResult, GatewayError> {
+        #[cfg(test)]
+        if let Some(result) = take_test_query_response() {
+            return result.map_err(|error| map_current_routed_query_error(op, &error));
+        }
         self.ensure_connected().await?;
         // BR-243: 锁只保护惰性连接初始化, 查询必须并发。全局锁覆盖整个
         // query await 会让一个慢 op (如 tdx-smart failover 20s+) 阻塞所有
@@ -2829,7 +2880,7 @@ impl GrpcSource {
         client
             .query(op, params)
             .await
-            .map_err(|e| map_query_error(op, &e))
+            .map_err(|e| map_current_routed_query_error(op, &e))
     }
 
     pub(crate) async fn board_directory_query_session(
@@ -2881,7 +2932,7 @@ impl GrpcSource {
                 disclosure_limit,
                 stock_limit,
             )
-            .map_err(|error| map_query_error(Operation::DragonTiger, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::DragonTiger, &error))
     }
 
     pub(crate) async fn resume_dragon_tiger_query_session(
@@ -2920,7 +2971,7 @@ impl GrpcSource {
                 retry_policy,
                 next_attempt,
             )
-            .map_err(|error| map_query_error(Operation::DragonTiger, &error))
+            .map_err(|error| map_legacy_durable_query_error(Operation::DragonTiger, &error))
     }
 
     pub(crate) fn dragon_tiger_completion(
@@ -2928,7 +2979,7 @@ impl GrpcSource {
     ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
         let query = completion
             .processed
-            .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+            .map_err(|error| map_legacy_durable_query_error(Operation::DragonTiger, &error))?;
         convert::dragon_tiger(&query)
     }
 
@@ -2944,7 +2995,7 @@ impl GrpcSource {
             request_id,
             response,
         )
-        .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+        .map_err(|error| map_legacy_durable_query_error(Operation::DragonTiger, &error))?;
         convert::dragon_tiger(&query)
     }
 
@@ -2968,7 +3019,7 @@ impl GrpcSource {
             diagnostic,
             crate::grpc_client::errors::StatusErrorContext::data(method, request_id),
         )
-        .map(|error| map_query_error(Operation::DragonTiger, &error))
+        .map(|error| map_legacy_durable_query_error(Operation::DragonTiger, &error))
     }
 
     pub(crate) fn board_directory_completion(
@@ -3162,6 +3213,10 @@ impl GrpcSource {
         operation: Operation,
         params: Value,
     ) -> Result<QueryResult, GatewayError> {
+        #[cfg(test)]
+        if let Some(result) = take_test_query_response() {
+            return result.map_err(|error| map_external_query_error(operation, &error));
+        }
         let method = external_query_method(operation)?;
         crate::grpc_client::external_v1::build_external_query_request(operation, params.clone())
             .map_err(|_| {
@@ -3194,6 +3249,12 @@ impl GrpcSource {
         operation: ExternalOperation,
         params: Value,
     ) -> Result<QueryResult, GatewayError> {
+        #[cfg(test)]
+        if let Some(result) = take_test_query_response() {
+            return result.map_err(|error| {
+                map_external_query_error_named(&format!("{operation:?}"), &error)
+            });
+        }
         crate::grpc_client::external_v1::build_external_native_query_request(
             operation,
             params.clone(),
@@ -3575,20 +3636,33 @@ impl GrpcSource {
         disclosure_limit: u32,
         stock_limit: usize,
     ) -> Result<GatewayBatch<DragonTigerStockReview>, GatewayError> {
+        #[cfg(test)]
+        if let Some(result) = take_test_query_response() {
+            return result
+                .map_err(|error| map_current_routed_query_error(Operation::DragonTiger, &error))
+                .and_then(|query| convert::dragon_tiger(&query));
+        }
         let mut session = self
             .dragon_tiger_query_session(trading_date, disclosure_limit, stock_limit)
             .await?;
         loop {
             let authorized = session
                 .authorize_next()
-                .map_err(|error| map_query_error(Operation::DragonTiger, &error))?;
+                .map_err(|error| map_current_routed_query_error(Operation::DragonTiger, &error))?;
             let completion = authorized.execute().await;
             match completion.continuation {
                 BoardContinuation::Retry { backoff_ms } => {
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
                 BoardContinuation::Terminal => {
-                    return Self::dragon_tiger_completion(completion);
+                    // Ordinary acquisition has current routed attribution. Durable
+                    // drivers call the frozen dragon_tiger_completion separately.
+                    return completion
+                        .processed
+                        .map_err(|error| {
+                            map_current_routed_query_error(Operation::DragonTiger, &error)
+                        })
+                        .and_then(|query| convert::dragon_tiger(&query));
                 }
             }
         }
@@ -4516,7 +4590,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let g = map_query_error(Operation::BoardConstituents, &err);
+        let g = map_legacy_durable_query_error(Operation::BoardConstituents, &err);
         assert_eq!(g.capability(), "GrpcBridge");
         assert_eq!(g.provider(), Some(ProviderId::Tdx));
         assert_eq!(g.reason_code(), "no_verified_batch");
@@ -4535,7 +4609,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let gateway = map_query_error(Operation::EconomicCalendar, &error);
+        let gateway = map_legacy_durable_query_error(Operation::EconomicCalendar, &error);
         assert_eq!(gateway.reason_code(), "operation_retired");
         assert_eq!(gateway.provider(), Some(ProviderId::Jin10));
         assert!(!gateway.retryable());
@@ -4554,7 +4628,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let g = map_query_error(Operation::RealtimeQuotes, &err);
+        let g = map_legacy_durable_query_error(Operation::RealtimeQuotes, &err);
         assert_eq!(g.provider(), None);
         assert_eq!(g.reason_code(), "database_failure");
         assert!(!g.retryable());
@@ -4583,10 +4657,31 @@ mod tests {
                 details: Box::default(),
             },
         ] {
-            let g = map_query_error(Operation::RealtimeQuotes, &code);
+            let g = map_legacy_durable_query_error(Operation::RealtimeQuotes, &code);
             assert_eq!(g.audit_outcome(), "invalid_request", "{code:?}");
             assert!(!g.retryable(), "{code:?}");
         }
+    }
+
+    #[test]
+    fn d15_attribution_frozen_durable_invalid_request_bytes_still_restore() {
+        let wire = pb::ErrorDetail {
+            request_id: "TEST_CODE_legacy_request".into(),
+            operation: Operation::Consensus as i32,
+            provider: "Sina".into(),
+            reason_code: "provider_transport".into(),
+            retryable: true,
+            ..Default::default()
+        };
+        let status = tonic::Status::with_details(tonic::Code::InvalidArgument, "TEST_CODE error", wire.encode_to_vec().into());
+        let error = map_legacy_durable_query_error(Operation::Consensus, &GrpcError::from(status));
+        assert_eq!(error.provider(), None, "frozen durable v1 projection must keep its original bytes");
+        let stored = crate::data_gateway::review::store_gateway_error(&error);
+        let bytes = serde_json::to_vec(&stored).unwrap();
+        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), r#"{"capability":"GrpcBridge","provider":null,"audit_outcome":"invalid_request","reason_code":"invalid_request","retryable":false,"message":"gRPC Consensus 查询失败: 请求参数错误 (不重试)"}"#);
+        let restored = crate::data_gateway::review::restore_gateway_error(&stored).unwrap();
+        assert_eq!(serde_json::to_vec(&crate::data_gateway::review::store_gateway_error(&restored)).unwrap(), bytes);
+        assert_eq!(restored.message(), "gRPC Consensus 查询失败: 请求参数错误 (不重试)");
     }
 
     /// D2: Unavailable 无 ErrorDetail (服务端不可达, connect 失败) →
@@ -4596,7 +4691,7 @@ mod tests {
         let err = GrpcError::Unavailable {
             details: Box::default(),
         };
-        let g = map_query_error(Operation::HistoricalBars, &err);
+        let g = map_legacy_durable_query_error(Operation::HistoricalBars, &err);
         assert_eq!(g.reason_code(), "no_verified_batch");
         assert!(g.retryable());
     }
@@ -5904,7 +5999,7 @@ mod tests {
             "取数失败",
             pb_detail.encode_to_vec().into(),
         );
-        let g = map_query_error(Operation::OutcomeDailyBars, &GrpcError::from(status));
+        let g = map_legacy_durable_query_error(Operation::OutcomeDailyBars, &GrpcError::from(status));
         assert_eq!(g.provider(), Some(ProviderId::Tdx));
         assert_eq!(g.reason_code(), "no_verified_batch");
         assert!(g.retryable());

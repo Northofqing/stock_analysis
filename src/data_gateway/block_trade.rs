@@ -3,10 +3,9 @@
 //! 数据由远端 `BlockTrades` gRPC operation 获取。聚合批次证据 = 首个成功
 //! 真实批次的 provenance（逐代码真实证据保留在记录内，不合成 batch_id）。
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::{GatewayBatch, GatewayError};
-use crate::market_domain::ProviderId;
 
 use chrono::NaiveDate;
 
@@ -45,19 +44,10 @@ impl BlockTradesGateway {
         match super::grpc_source::bridge_for("BlockTrades") {
             Ok(bridge) => {
                 let result = bridge.block_trades_async(codes, trading_date).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
     }

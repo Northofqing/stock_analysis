@@ -1,9 +1,8 @@
 //! BR-165/BR-199 evidence-preserving CFFEX futures-delivery acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::{GatewayBatch, GatewayError};
-use crate::market_domain::ProviderId;
 
 use chrono::NaiveDate;
 
@@ -47,19 +46,10 @@ impl FuturesDeliveryGateway {
         match super::grpc_source::bridge_for("FuturesDelivery") {
             Ok(bridge) => {
                 let result = bridge.futures_delivery_async().await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Cffex);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Cffex,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。

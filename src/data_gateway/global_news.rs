@@ -1,6 +1,6 @@
 //! BR-066/BR-133/BR-137/BR-166/BR-172/BR-238 evidence-preserving global financial-news acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 use super::{BatchEvidence, GatewayBatch, GatewayError};
 
 use crate::market_domain::{ProviderId, SourceEvidence};
@@ -117,7 +117,7 @@ pub(crate) fn validate_global_news_batch_evidence(
     if evidence.provider != provider_id || evidence.source != provider.source() {
         return Err(GatewayError::invalid_evidence(
             capability,
-            Some(provider_id),
+            Some(evidence.provider),
             "global-news batch provider/source contract mismatch",
         ));
     }
@@ -182,7 +182,10 @@ impl GlobalNewsGateway {
 }
 
 pub(crate) fn macro_request_hash(provider: GlobalNewsProvider, limit: u32) -> String {
-    acquisition_request_hash(provider.capability(), format!("{}:{limit}", provider.source()))
+    acquisition_request_hash(
+        provider.capability(),
+        format!("{}:{limit}", provider.source()),
+    )
 }
 
 pub(crate) fn audit_macro_query(
@@ -190,10 +193,11 @@ pub(crate) fn audit_macro_query(
     limit: u32,
     result: Result<GatewayBatch<GlobalNewsRecord>, GatewayError>,
 ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
-    let audit_provider = result.as_ref().map(|batch| batch.evidence().provider)
-        .unwrap_or(provider.provider_id());
-    audit_gateway_result(provider.capability(), audit_provider,
-        &macro_request_hash(provider, limit), result)
+    audit_routed_gateway_result(
+        provider.capability(),
+        &macro_request_hash(provider, limit),
+        result,
+    )
 }
 
 fn parse_provider_time(

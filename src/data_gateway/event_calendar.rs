@@ -1,6 +1,6 @@
 //! BR-161 evidence-preserving R-08 event-calendar acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::GatewayBatch;
 use super::GatewayError;
@@ -41,19 +41,10 @@ impl EventCalendarGateway {
         match super::grpc_source::bridge_for("MarketAnnouncements") {
             Ok(bridge) => {
                 let result = bridge.market_announcements_async(trading_date, limit).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Cninfo);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Cninfo,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。

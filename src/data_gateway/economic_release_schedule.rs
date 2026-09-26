@@ -84,7 +84,9 @@ pub(crate) fn convert_response(
         || !response.source().starts_with("grpc-mtls:")
         || response.batch_id.trim().is_empty()
     {
-        return Err(invalid(
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            super::grpc_source::convert::parse_provider(&response.selected_provider).ok(),
             "FRED schedule envelope is not admitted and complete",
         ));
     }
@@ -193,7 +195,7 @@ impl EconomicReleaseScheduleGateway {
             Ok(bridge) => bridge.economic_release_schedule_async(request).await,
             Err(error) => Err(error),
         };
-        super::review::audit_gateway_result(CAPABILITY, ProviderId::Fred, &request_hash, result)
+        super::review::audit_routed_gateway_result(CAPABILITY, &request_hash, result)
     }
 }
 

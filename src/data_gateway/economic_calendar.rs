@@ -1,6 +1,6 @@
 //! BR-133/BR-167 evidence-preserving macroeconomic release acquisition.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::{GatewayBatch, GatewayError};
 
@@ -59,7 +59,10 @@ impl EconomicCalendarGateway {
 }
 
 pub(crate) fn macro_request_hash(limit: u32, country: Option<&str>) -> String {
-    acquisition_request_hash(CAPABILITY, format!("limit={limit}:country={}", country.unwrap_or("*")))
+    acquisition_request_hash(
+        CAPABILITY,
+        format!("limit={limit}:country={}", country.unwrap_or("*")),
+    )
 }
 
 pub(crate) fn audit_macro_query(
@@ -67,7 +70,5 @@ pub(crate) fn audit_macro_query(
     country: Option<&str>,
     result: Result<GatewayBatch<EconomicReleaseFact>, GatewayError>,
 ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
-    let provider = result.as_ref().map(|batch| batch.evidence().provider)
-        .unwrap_or(ProviderId::Jin10);
-    audit_gateway_result(CAPABILITY, provider, &macro_request_hash(limit, country), result)
+    audit_routed_gateway_result(CAPABILITY, &macro_request_hash(limit, country), result)
 }

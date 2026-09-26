@@ -17,7 +17,9 @@ use crate::market_domain::{
 };
 use chrono::NaiveDate;
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+use super::review::{
+    acquisition_request_hash, audit_routed_gateway_result, GatewayBatch, GatewayError,
+};
 
 const FUND_FLOW_CAPABILITY: &str = "CapitalInstrumentFundFlow";
 const PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY: &str = "CapitalProviderTopNVolumeRatio";
@@ -144,21 +146,11 @@ impl CapitalDataGateway {
                 let result = bridge
                     .fund_flow_series_async(&storage_code, interval, limit)
                     .await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(
-                    FUND_FLOW_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(FUND_FLOW_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     FUND_FLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
                     &request_hash,
                     Err(error),
                 );
@@ -192,91 +184,50 @@ impl CapitalDataGateway {
             trading_date,
             PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
         )?;
-        // 仅 library transport 路径需要独立的 hash 变量 (桥路径直接读
-        // evidence.request_hash), no-feature 构建不产生未使用变量。
-
-        // P4 M4b: gRPC 桥 (remote gRPC 时替换 transport; 双路 audit 留
-        // 客户端, request evidence 是本地构造的 (桥只换 transport 数据)。
-        match super::grpc_source::bridge_for("ProviderTopNRankings") {
-            Ok(bridge) => {
-                return match bridge.provider_top_n_pair_async(trading_date).await {
-                    Ok((volume, inflow)) => {
-                        let volume_audited = audit_gateway_result(
+        let result = match super::grpc_source::bridge_for("ProviderTopNRankings") {
+            Ok(bridge) => bridge.provider_top_n_pair_async(trading_date).await,
+            Err(error) => Err(error),
+        };
+        // Admission is an atomic product contract, not an audit-provider guess.
+        // If either side fails, neither side may leave an accepted audit.
+        let (volume, inflow) = match result {
+            Ok((volume, inflow)) => {
+                match validate_provider_top_n_pair(&volume, &inflow, trading_date) {
+                    Ok(()) => (Ok(volume), Ok(inflow)),
+                    Err(error) => (
+                        Err(GatewayError::invalid_evidence(
                             PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-                            ProviderId::Eastmoney,
-                            &volume_request_evidence.request_hash,
-                            Ok(volume),
-                        );
-                        let inflow_audited = audit_gateway_result(
+                            Some(volume.evidence().provider),
+                            error.message(),
+                        )),
+                        Err(GatewayError::invalid_evidence(
                             PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
-                            ProviderId::Eastmoney,
-                            &inflow_request_evidence.request_hash,
-                            Ok(inflow),
-                        );
-                        match (volume_audited, inflow_audited) {
-                            (Ok(volume), Ok(inflow)) => {
-                                validate_provider_top_n_pair(&volume, &inflow, trading_date)?;
-                                Ok(ProviderTopNPair {
-                                    volume_ratio_request: volume_request_evidence,
-                                    volume_ratio: volume,
-                                    main_net_inflow_request: inflow_request_evidence,
-                                    main_net_inflow: inflow,
-                                })
-                            }
-                            (Err(error), _) | (_, Err(error)) => Err(error),
-                        }
-                    }
-                    Err(error) => {
-                        let volume_audited = audit_gateway_result::<ProviderTopNFact>(
-                            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-                            ProviderId::Eastmoney,
-                            &volume_request_evidence.request_hash,
-                            Err(error.clone()),
-                        );
-                        let inflow_audited = audit_gateway_result::<ProviderTopNFact>(
-                            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
-                            ProviderId::Eastmoney,
-                            &inflow_request_evidence.request_hash,
-                            Err(error),
-                        );
-                        match (volume_audited, inflow_audited) {
-                            (Err(error), _) | (_, Err(error)) => Err(error),
-                            (Ok(_), Ok(_)) => Err(GatewayError::unavailable(
-                                PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-                                Some(ProviderId::Eastmoney),
-                                true,
-                                "头部排行 gRPC 桥失败且双路 audit 落库 (原始错误见上一条 audit 行)",
-                            )),
-                        }
-                    }
-                };
+                            Some(inflow.evidence().provider),
+                            error.message(),
+                        )),
+                    ),
+                }
             }
-            Err(error) => {
-                let volume_audited = audit_gateway_result::<ProviderTopNFact>(
-                    PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &volume_request_evidence.request_hash,
-                    Err(error.clone()),
-                );
-                let inflow_audited = audit_gateway_result::<ProviderTopNFact>(
-                    PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &inflow_request_evidence.request_hash,
-                    Err(error),
-                );
-                return match (volume_audited, inflow_audited) {
-                    (Err(error), _) | (_, Err(error)) => Err(error),
-                    (Ok(_), Ok(_)) => Err(GatewayError::unavailable(
-                        PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
-                        Some(ProviderId::Eastmoney),
-                        true,
-                        "头部排行 gRPC 桥不可用且双路 audit 落库 (原始错误见上一条 audit 行)",
-                    )),
-                };
-            }
-        }
-        // P4 M5: no-feature 构建不携带 library transport, 无桥时显式失败
-        // (fail-closed), 绝不静默回退。
+            Err(error) => (Err(error.clone()), Err(error)),
+        };
+        // Both metric audits are attempted even when one append fails.
+        // These are two audit identities, not two physical provider attempts.
+        let volume = audit_routed_gateway_result::<ProviderTopNFact>(
+            PROVIDER_TOP_N_VOLUME_RATIO_CAPABILITY,
+            &volume_request_evidence.request_hash,
+            volume,
+        );
+        let inflow = audit_routed_gateway_result::<ProviderTopNFact>(
+            PROVIDER_TOP_N_MAIN_NET_INFLOW_CAPABILITY,
+            &inflow_request_evidence.request_hash,
+            inflow,
+        );
+        Ok(ProviderTopNPair {
+            volume_ratio_request: volume_request_evidence,
+            volume_ratio: volume?,
+            main_net_inflow_request: inflow_request_evidence,
+            main_net_inflow: inflow?,
+        })
     }
 
     /// Fetches one official HKEX northbound channel/day statistic.
@@ -291,21 +242,11 @@ impl CapitalDataGateway {
         match super::grpc_source::bridge_for("NorthboundDaily") {
             Ok(bridge) => {
                 let result = bridge.northbound_daily_async(trading_date, channel).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Hkex);
-                return audit_gateway_result(
-                    NORTHBOUND_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(NORTHBOUND_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     NORTHBOUND_CAPABILITY,
-                    ProviderId::Hkex,
                     &request_hash,
                     Err(error),
                 );

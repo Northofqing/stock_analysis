@@ -1,9 +1,8 @@
 //! BR-119/BR-164 evidence-preserving research-report acquisition Gateway.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::{GatewayBatch, GatewayError};
-use crate::market_domain::ProviderId;
 
 const CAPABILITY: &str = "research-reports";
 
@@ -43,19 +42,10 @@ impl ResearchDataGateway {
         match super::grpc_source::bridge_for("ResearchReports") {
             Ok(bridge) => {
                 let result = bridge.research_reports_async(&code, page_size).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。

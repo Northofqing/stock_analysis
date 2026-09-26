@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use super::instrument_identity::{resolve_production_equity, EquitySegment};
 
 use super::review::{
-    acquisition_request_hash, audit_gateway_result, BatchEvidence, GatewayBatch, GatewayError,
+    acquisition_request_hash, audit_routed_gateway_result, BatchEvidence, GatewayBatch,
+    GatewayError,
 };
 use super::MarketSecurityMetadata;
 
@@ -259,7 +260,7 @@ impl SecurityLifecycleGateway {
         // P4 M4b 批次 1B: grpc 模式走桥 (服务端 SecurityLifecycleGateway 直连)。
         // 本地验证先行复制 (fail-fast, 与 acquire_blocking 语义一致):
         // window 顺序 + build_instrument (含 Beijing 拒绝)。审计留客户端
-        // (audit_gateway_result), 与服务端审计双写 — ProviderTopNRankings 先例。
+        // (audit_routed_gateway_result), 与服务端审计双写 — ProviderTopNRankings 先例。
         match super::grpc_source::bridge_for("CorporateActions") {
             Ok(bridge) => {
                 if window_start > window_end {
@@ -272,22 +273,16 @@ impl SecurityLifecycleGateway {
                 let metadata = bridge
                     .security_metadata_async(std::slice::from_ref(&code))
                     .await
+                    .and_then(|batch| admit_lifecycle_tdx(LISTING_CAPABILITY, batch))
                     .map(bridge_listing_projection);
-                let metadata = audit_gateway_result(
-                    LISTING_CAPABILITY,
-                    ProviderId::Tdx,
-                    &listing_hash,
-                    metadata,
-                );
+                let metadata =
+                    audit_routed_gateway_result(LISTING_CAPABILITY, &listing_hash, metadata);
                 let actions = bridge
                     .corporate_actions_async(&code, window_start, window_end)
-                    .await;
-                let actions = audit_gateway_result(
-                    ACTIONS_CAPABILITY,
-                    ProviderId::Tdx,
-                    &actions_hash,
-                    actions,
-                );
+                    .await
+                    .and_then(|batch| admit_lifecycle_tdx(ACTIONS_CAPABILITY, batch));
+                let actions =
+                    audit_routed_gateway_result(ACTIONS_CAPABILITY, &actions_hash, actions);
                 return Ok(SecurityLifecycleContext {
                     instrument,
                     window_start,
@@ -296,19 +291,27 @@ impl SecurityLifecycleGateway {
                     corporate_actions: action_state(actions),
                 });
             }
-            Err(error) => {
-                return Err(GatewayError::unavailable(
-                    LIFECYCLE_CAPABILITY,
-                    Some(ProviderId::Tdx),
-                    true,
-                    format!("CorporateActions 桥初始化失败: {error}"),
-                ));
-            }
+            Err(error) => return Err(error),
         }
 
         // no-feature (monitor 零 magic 构建): library transport 编译期不存在。
         // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
     }
+}
+
+/// Preserve the pinned product contract independently of audit attribution.
+fn admit_lifecycle_tdx<T>(
+    capability: &'static str,
+    batch: GatewayBatch<T>,
+) -> Result<GatewayBatch<T>, GatewayError> {
+    if batch.evidence().provider != ProviderId::Tdx {
+        return Err(GatewayError::invalid_evidence(
+            capability,
+            Some(batch.evidence().provider),
+            "security lifecycle requires the pinned TDX provider contract",
+        ));
+    }
+    Ok(batch)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

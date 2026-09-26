@@ -300,6 +300,8 @@ where
 fn security_identity_audit_provider(
     result: &Result<GatewayBatch<MarketSecurityIdentity>, GatewayError>,
 ) -> ProviderId {
+    // D15 receipt-owner allowlist: identical evidence/error/Custom routing,
+    // retaining its immutable observation receipt and original request hash.
     match result {
         Ok(batch) => batch.evidence().provider,
         Err(error) => error.provider().unwrap_or(ProviderId::Custom),

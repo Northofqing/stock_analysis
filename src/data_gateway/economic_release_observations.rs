@@ -97,7 +97,9 @@ pub(crate) fn convert_response(
         || !response.source().starts_with("grpc-mtls:")
         || response.batch_id.trim().is_empty()
     {
-        return Err(invalid(
+        return Err(GatewayError::invalid_evidence(
+            CAPABILITY,
+            super::grpc_source::convert::parse_provider(&response.selected_provider).ok(),
             "Jin10 release response envelope is not admitted and complete",
         ));
     }
@@ -252,7 +254,7 @@ impl EconomicReleaseObservationsGateway {
             Ok(bridge) => bridge.economic_release_observations_async(request).await,
             Err(error) => Err(error),
         };
-        super::review::audit_gateway_result(CAPABILITY, ProviderId::Jin10, &request_hash, result)
+        super::review::audit_routed_gateway_result(CAPABILITY, &request_hash, result)
     }
 }
 

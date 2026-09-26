@@ -10,7 +10,9 @@ pub use crate::market_domain::{
     FinancialLine, FinancialStatement, MarketStatistics, StatementKind,
 };
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+use super::review::{
+    acquisition_request_hash, audit_routed_gateway_result, GatewayBatch, GatewayError,
+};
 
 const FINANCIAL_CAPABILITY: &str = "CompanyFinancialStatements";
 const STATISTICS_CAPABILITY: &str = "CompanyMarketStatistics";
@@ -50,21 +52,11 @@ impl CompanyDataGateway {
                 let result = bridge
                     .financial_statements_async(&storage_codes, kind)
                     .await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Sina);
-                return audit_gateway_result(
-                    FINANCIAL_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(FINANCIAL_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     FINANCIAL_CAPABILITY,
-                    ProviderId::Sina,
                     &request_hash,
                     Err(error),
                 );
@@ -113,21 +105,11 @@ impl CompanyDataGateway {
         match super::grpc_source::bridge_for("MarketStatistics") {
             Ok(bridge) => {
                 let result = bridge.market_statistics_async(&storage_codes).await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tencent);
-                return audit_gateway_result(
-                    STATISTICS_CAPABILITY,
-                    audit_provider,
-                    &request_hash,
-                    result,
-                );
+                return audit_routed_gateway_result(STATISTICS_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
+                return audit_routed_gateway_result(
                     STATISTICS_CAPABILITY,
-                    ProviderId::Tencent,
                     &request_hash,
                     Err(error),
                 );

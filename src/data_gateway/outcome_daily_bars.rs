@@ -684,6 +684,8 @@ impl OutcomeDailyBarsGateway {
             let evidence = projected.evidence.clone();
             let records = std::mem::take(&mut projected.bars);
             move || {
+                // D15 allowlist: only the admitted TDX success reaches this
+                // dedicated outcome receipt; general routed errors do not.
                 audit_gateway_result(
                     CAPABILITY,
                     ProviderId::Tdx,

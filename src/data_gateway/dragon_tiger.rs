@@ -1,10 +1,10 @@
 //! BR-162 evidence-preserving R-04 whole-market dragon-tiger Gateway.
 
-use super::review::{acquisition_request_hash, audit_gateway_result};
+use super::review::{acquisition_request_hash, audit_routed_gateway_result};
 
 use super::{GatewayBatch, GatewayError};
 
-use crate::market_domain::{DragonTigerSide, Exchange, ProviderId};
+use crate::market_domain::{DragonTigerSide, Exchange};
 use chrono::NaiveDate;
 
 const CAPABILITY: &str = "R-04";
@@ -104,19 +104,10 @@ impl DragonTigerGateway {
                 let result = bridge
                     .dragon_tiger_async(trading_date, disclosure_limit, stock_limit)
                     .await;
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Eastmoney);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Eastmoney,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。

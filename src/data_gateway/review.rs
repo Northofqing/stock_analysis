@@ -1558,6 +1558,11 @@ pub(super) fn audit_gateway_result_with_receipt_in<T>(
         .map_err(GatewayAuditFailure::into_error)
 }
 
+// D15 explicit-provider allowlist: Benchmark provider/library receipts are TDX
+// contracts; its transport/admission receipts deliberately identify Custom.
+// OutcomeDailyBars calls this only AFTER TDX final admission, with Ok(batch).
+// SecurityIdentity's receipt owner already selects evidence/error/Custom.
+// Routed product acquisitions must use audit_routed_gateway_result below.
 pub(super) fn audit_gateway_result<T>(
     capability: &'static str,
     provider: ProviderId,
@@ -1618,6 +1623,8 @@ fn audit_routed_gateway_result_with_receipt_in<T>(
     audit_gateway_result_with_receipt_in(database, capability, provider, request_hash, result)
 }
 
+// Non-routed fixed-provider worker ownership only; currently no callers.
+// A routed worker cannot infer an attempted provider from its requested route.
 pub(super) async fn audit_blocking_join_failure<T: Send + 'static>(
     capability: &'static str,
     provider: ProviderId,

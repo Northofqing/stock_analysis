@@ -9,7 +9,9 @@
 use crate::market_domain::ProviderId;
 use chrono::{DateTime, Utc};
 
-use super::review::{acquisition_request_hash, audit_gateway_result, GatewayBatch, GatewayError};
+use super::review::{
+    acquisition_request_hash, audit_routed_gateway_result, GatewayBatch, GatewayError,
+};
 
 const CAPABILITY: &str = "RealtimeIndexQuotes";
 
@@ -57,19 +59,10 @@ impl IndexDataGateway {
                     ));
                 }
                 let result = bridge.index_quotes(storage_codes);
-                let audit_provider = result
-                    .as_ref()
-                    .map(|b| b.evidence().provider)
-                    .unwrap_or(ProviderId::Tencent);
-                return audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result);
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, result);
             }
             Err(error) => {
-                return audit_gateway_result(
-                    CAPABILITY,
-                    ProviderId::Tencent,
-                    &request_hash,
-                    Err(error),
-                );
+                return audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error));
             }
         }
     }

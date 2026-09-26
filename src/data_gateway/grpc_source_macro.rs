@@ -152,7 +152,9 @@ impl PreparedMacroQueries {
 }
 
 pub(crate) fn map_macro_error(error: &GrpcError) -> GatewayError {
-    map_query_error(Operation::GlobalNews, error)
+    // Frozen durable LocalBridge macro codec only (gateway_for); do not use
+    // this projection for current ordinary macro settlement.
+    map_legacy_durable_query_error(Operation::GlobalNews, error)
 }
 
 pub(crate) fn map_macro_query_error(
@@ -161,7 +163,7 @@ pub(crate) fn map_macro_query_error(
     error: &GrpcError,
 ) -> GatewayError {
     match profile {
-        ContractProfile::LocalBridgeV1 => map_query_error(operation, error),
+        ContractProfile::LocalBridgeV1 => map_current_routed_query_error(operation, error),
         ContractProfile::ExternalV1 => map_external_query_error(operation, error),
     }
 }
@@ -188,7 +190,7 @@ pub(crate) fn economic_outcome(
 ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
     match processed {
         Ok(query) => convert::economic_calendar(query),
-        Err(error) => Err(map_query_error(Operation::EconomicCalendar, error)),
+        Err(error) => Err(map_current_routed_query_error(Operation::EconomicCalendar, error)),
     }
 }
 
@@ -205,7 +207,7 @@ pub(crate) fn web_outcome(
     let query = validate_request(provider, query, limit)?;
     match processed {
         Ok(result) => convert::semantic_search(result, query, provider, limit),
-        Err(error) => Err(map_query_error(Operation::SemanticSearch, error)),
+        Err(error) => Err(map_current_routed_query_error(Operation::SemanticSearch, error)),
     }
     .map_err(|error| transport_error(provider, error))
 }
