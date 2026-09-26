@@ -151,7 +151,7 @@ enum SecondQuote {
 }
 
 struct SaleReadIo {
-    store: crate::trading::paper_trade::runtime_tests::MemoryPaperTradeStore,
+    store: LedgerFixture,
     second: SecondQuote,
     quotes: Mutex<Vec<String>>,
 }
@@ -159,27 +159,100 @@ struct SaleReadIo {
 impl SaleReadIo {
     fn new(second: SecondQuote) -> Self {
         Self {
-            store: crate::trading::paper_trade::runtime_tests::MemoryPaperTradeStore::new(),
+            store: LedgerFixture::new(),
             second,
             quotes: Mutex::new(Vec::new()),
         }
     }
 }
 
+struct LedgerFixture {
+    db: crate::database::DatabaseManager,
+    binding: crate::trading::paper_ledger::AccountBinding,
+    _directory: tempfile::TempDir,
+}
+impl LedgerFixture {
+    fn new() -> Self {
+        use crate::trading::paper_ledger::*;
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::database::DatabaseManager::open_isolated_for_test(
+            directory.path().join("TEST_CODE_runtime_sales.db"),
+        )
+        .unwrap();
+        let cutover = chrono::Utc::now() - chrono::Duration::days(2);
+        let sellable = chrono::Local::now().date_naive();
+        let seed = SeedManifest {
+            account_id: "TEST_CODE_SALE_ACCOUNT".into(),
+            epoch_id: "TEST_CODE_SALE_EPOCH".into(),
+            command_id: "seed".into(),
+            cutover_at: cutover,
+            account_effective_at: cutover,
+            positions_effective_at: cutover,
+            source_reference: "TEST_CODE_explicit_seed".into(),
+            source_hash: "c".repeat(64),
+            approved_by: "TEST_CODE_operator".into(),
+            cash: Money::from_cny(50_000.0).unwrap(),
+            original_total: Money::from_cny(53_000.0).unwrap(),
+            excluded_residual: None,
+            lots: ["A", "B", "C"]
+                .into_iter()
+                .map(|suffix| SeedLot {
+                    code: format!("TEST_CODE_PAPER_RUNTIME_{suffix}"),
+                    name: suffix.into(),
+                    quantity: 100,
+                    reported_cost: None,
+                    sellable_from: Some(sellable),
+                    sellability_evidence: Some("TEST_CODE_confirmed_sellable".into()),
+                })
+                .collect(),
+            marks: ["A", "B", "C"]
+                .into_iter()
+                .map(|suffix| Mark {
+                    code: format!("TEST_CODE_PAPER_RUNTIME_{suffix}"),
+                    price: Money::from_cny(10.0).unwrap(),
+                    observed_at: cutover,
+                    source: "TEST_CODE_cutover".into(),
+                })
+                .collect(),
+            policy: RiskPolicyV1::default(),
+        };
+        let binding = seed.binding().unwrap();
+        PaperLedger::open(&db, &chrono::Utc::now)
+            .apply(PaperCommand::Seed(seed))
+            .unwrap();
+        Self {
+            db,
+            binding,
+            _directory: directory,
+        }
+    }
+    fn already_sold(&self, code: &str, today: &str) -> Result<bool, String> {
+        crate::trading::paper_ledger_runtime::already_sold_on(&self.db, &self.binding, code, today)
+    }
+    fn sold_codes(&self) -> Vec<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type=diesel::sql_types::Text)]
+            code: String,
+        }
+        diesel::sql_query(
+            "SELECT code FROM paper_trades WHERE direction='sell' AND status='Filled' ORDER BY id",
+        )
+        .load::<Row>(&mut self.db.get_conn().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.code)
+        .collect()
+    }
+}
+
 impl PaperSellReadIo for SaleReadIo {
     fn positions(&self, today: chrono::NaiveDate) -> Result<Vec<PaperPosition>, String> {
-        Ok(["A", "B", "C"]
-            .into_iter()
-            .map(|suffix| PaperPosition {
-                code: format!("TEST_CODE_PAPER_RUNTIME_{suffix}"),
-                name: suffix.to_owned(),
-                quantity: 100,
-                avg_buy_price: 10.0,
-                buy_fee_cost: 5.0,
-                first_buy_date: today.pred_opt().unwrap(),
-                inventory_audit_evidence: "BR134_FIFO_V1;TEST_CODE_IN_MEMORY".to_owned(),
-            })
-            .collect())
+        crate::trading::paper_ledger_runtime::sellable_positions_on(
+            &self.store.db,
+            &self.store.binding,
+            today,
+        )
     }
 
     fn execution_quote(&self, code: &str) -> Result<crate::broker::ExecutionQuote, String> {
@@ -242,18 +315,29 @@ impl PaperSellReadIo for SaleReadIo {
         self.store.already_sold(code, today)
     }
 
-    fn portfolio_state(
+    fn execute(
         &self,
-        code: &str,
-        _price: f64,
-        _cancelled: &AtomicBool,
-    ) -> Result<(f64, f64, f64), String> {
-        assert!(code.starts_with("TEST_CODE_"));
-        Ok((50_000.0, 100_000.0, 1.0))
-    }
-
-    fn trade_store(&self) -> Option<&dyn crate::trading::paper_trade::PaperTradeStore> {
-        Some(&self.store)
+        signal: &PaperSignal,
+        quote: &crate::broker::ExecutionQuote,
+        cancelled: &AtomicBool,
+    ) -> Result<crate::trading::paper_trade::PaperOutcome, String> {
+        // Fixture valuation is distinct from the deliberately slow/failing scan
+        // quote. The actual transaction, risk, FIFO and compatible writes run.
+        crate::trading::paper_ledger_runtime::execute_on(
+            &self.store.db,
+            &self.store.binding,
+            signal,
+            quote,
+            &chrono::Utc::now,
+            &|code| {
+                assert!(code.starts_with("TEST_CODE_"));
+                Ok(crate::broker::ExecutionQuote {
+                    observed_at: chrono::Utc::now(),
+                    ..quote.clone()
+                })
+            },
+            cancelled,
+        )
     }
 }
 

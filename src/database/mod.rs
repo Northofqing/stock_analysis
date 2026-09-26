@@ -2621,6 +2621,7 @@ mod lhb;
 pub mod news_ai;
 pub mod order_audit;
 pub(crate) mod paper_inventory_failure_audit;
+pub(crate) mod paper_ledger_schema_v1;
 pub mod position_chain;
 mod positions;
 // BR-215: projection reconciliation is a tool-facing entry point.
@@ -3865,6 +3866,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // order attempt, so they use an independent immutable hash chain.
         // Startup refuses a missing, partial or tampered chain.
         paper_inventory_failure_audit::create_schema(&mut *conn)?;
+        // PaperLedgerV1 is an explicit CatalogV2 migration, not an automatic
+        // extension authorized by an old generation-1 startup receipt.
+        // Private test processes install the extension on owned fixture DBs.
+        if crate::risk::env_guard::runtime_is_test_process() {
+            paper_ledger_schema_v1::create_schema(conn)?;
+        }
 
         // execution_tracking (PR3-3.5)
         diesel::sql_query(

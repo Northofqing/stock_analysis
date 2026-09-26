@@ -1020,7 +1020,7 @@ fn account_status_note_with_source(source: &impl BannerExternalNoteSource) -> St
     )
 }
 
-use stock_analysis::trading::paper_trade::{self, Direction, PaperSignal};
+use stock_analysis::trading::paper_trade;
 
 fn valid_source_stock_code(code: &str) -> bool {
     #[cfg(test)]
@@ -5038,9 +5038,8 @@ use std::time::{Duration, Instant};
 pub static D01_LAST_PUSH: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-async fn submit_virtual_buy_from_d01(
+pub(crate) async fn enqueue_candidate_from_d01(
     snapshot: &NewsToIdeaSnapshot,
-    banner: &BannerCtx,
 ) -> Result<(), String> {
     let code = snapshot.code.clone();
     let quote = tokio::task::spawn_blocking(move || stock_analysis::broker::execution_quote(&code))
@@ -5050,7 +5049,7 @@ async fn submit_virtual_buy_from_d01(
 
     let quote = quote.ok_or_else(|| {
         format!(
-            "D-01 virtual buy quote unavailable for {}({})",
+            "D-01 candidate quote unavailable for {}({})",
             snapshot.name, snapshot.code
         )
     })?;
@@ -5061,63 +5060,8 @@ async fn submit_virtual_buy_from_d01(
         ));
     }
 
-    let now = chrono::Local::now();
-    let signal = PaperSignal {
-        plan_id: format!(
-            "d01-news-buydip-{}-{}",
-            snapshot.code,
-            now.format("%Y%m%d%H%M%S%3f")
-        ),
-        code: snapshot.code.clone(),
-        name: snapshot.name.clone(),
-        direction: Direction::Buy,
-        price: quote.price,
-        quantity: 100,
-        // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
-        // v16.3 Commit 2: 改 free-text → VirtualReason::NewsCatalyst.as_str() (符合 v10 §10.3)
-        virtual_reason: stock_analysis::opportunity::virtual_reason::VirtualReason::NewsCatalyst
-            .as_str()
-            .to_string(),
-        is_limit_up: quote.price >= quote.limit_up_price,
-        is_limit_down: false,
-        is_suspended: false,
-        limit_up_price: Some(quote.limit_up_price),
-        limit_down_price: Some(quote.limit_down_price),
-        secondary_confirmed: false,
-        quote_observed_at: quote.observed_at,
-        risk_context: paper_risk_context_from_banner(banner)?,
-    };
-
-    // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
-    let (cash, total, pos_pct) = match paper_portfolio_state(&snapshot.code, quote.price) {
-        Ok(state) => state,
-        Err(error) => {
-            log::warn!(
-                "[虚拟盘] 跳过 D-01 虚拟买入: {}({}) 账户快照不可用: {}",
-                snapshot.name,
-                snapshot.code,
-                error
-            );
-            return Err(format!("D-01 account snapshot unavailable: {error}"));
-        }
-    };
-    match paper_trade::simulate(&signal, quote.price, cash, total, pos_pct) {
-        Ok(outcome) => log::info!(
-            "[虚拟盘] D-01 买入 {}({}) status={} inserted={} price={:.2} qty={}",
-            signal.name,
-            signal.code,
-            outcome.result.status.as_str(),
-            outcome.inserted,
-            signal.price,
-            signal.quantity
-        ),
-        Err(e) => {
-            return Err(format!(
-                "D-01 paper trade failed {}({}): {e}",
-                signal.name, signal.code
-            ));
-        }
-    }
+    // D01 only enqueues. The persisted row ID belongs to the shared tick/evening
+    // PaperLedger owner; a timestamp/headline must never create another fill.
 
     // v16.3 Commit 2: 推入 pushed_stocks 票池 (R3 业务核心)
     let metric_json = truncate_metric_json(
@@ -5248,13 +5192,13 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
         }
     }
 
-    let should_virtual_buy = matches!(snapshot.action.as_ref(), Some(NewsAction::BuyDip));
+    let should_enqueue_candidate = matches!(snapshot.action.as_ref(), Some(NewsAction::BuyDip));
     let params = build_news_to_idea_from_snapshot(&snapshot);
     let snap_size = snapshot.reasons.len();
     let result = push_news_to_idea("", banner, params).await;
     if result {
-        if should_virtual_buy {
-            if let Err(error) = submit_virtual_buy_from_d01(&snapshot, banner).await {
+        if should_enqueue_candidate {
+            if let Err(error) = enqueue_candidate_from_d01(&snapshot).await {
                 log::error!("[D-01][BR-086] {error}");
                 log_dispatcher_attempt("D-01", false, snap_size, &error);
                 return false;

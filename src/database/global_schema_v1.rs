@@ -37,6 +37,7 @@ use crate::selection::audit::{
 
 pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
+const PAPER_LEDGER_CATALOG_GENERATION: i64 = super::paper_ledger_schema_v1::CATALOG_GENERATION;
 
 const PRODUCTION_DATABASE_RELATIVE_PATH: &str = "data/stock_analysis.db";
 const PRODUCTION_LOCK_DIRECTORY_RELATIVE_PATH: &str = "data/locks";
@@ -228,7 +229,7 @@ pub(crate) enum GlobalSchemaV1Error {
     UnsupportedFutureGeneration { actual: i64, supported: i64 },
 
     #[error(
-        "unsupported global schema identity application_id={application_id},user_version={user_version}; expected application_id=1398035265,user_version=1"
+        "unsupported global schema identity application_id={application_id},user_version={user_version}; expected application_id=1398035265,user_version=1 or explicitly qualified 2"
     )]
     UnsupportedIdentity {
         application_id: i64,
@@ -436,6 +437,9 @@ fn render_selection_v2_migration_diagnostic(
             "amended_receipt_verification_pending"
         }
         SelectionSchemaAuthorityDiagnostic::Amended => "amended",
+        SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired => {
+            "catalog_v2_requalification_required"
+        }
     };
     let nonempty = outcome
         .selection_row_counts()
@@ -1106,6 +1110,9 @@ pub(crate) enum SelectionSchemaAuthorityDiagnostic {
     TransitionalIncomplete,
     AmendedReceiptVerificationPending,
     Amended,
+    /// Existing selection receipts only prove generation 1. Task10 must add an
+    /// explicit whole-catalog maintenance receipt before issuing V2 authority.
+    CatalogV2RequalificationRequired,
 }
 
 #[allow(dead_code)]
@@ -1603,6 +1610,15 @@ fn classify_selection_authority_state(
     audit_present: bool,
     audit: &ValidatedAuditChainSnapshot,
 ) -> Result<SelectionSchemaAuthorityDiagnostic, GlobalSchemaV1Error> {
+    let evidence = match database_half {
+        DatabaseHalfDiagnostic::AbsentDatabaseHalf(e)
+        | DatabaseHalfDiagnostic::PreAmendment(e)
+        | DatabaseHalfDiagnostic::Transitional(e)
+        | DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => e,
+    };
+    if evidence.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION {
+        return Ok(SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired);
+    }
     if !audit_present {
         if audit.validation().record_count != 0 || !audit.records().is_empty() {
             return Err(GlobalSchemaV1Error::SelectionAuthorityContradiction {
@@ -1674,7 +1690,8 @@ fn selection_audit_phase_is_v2(phase: SelectionAuditPhase) -> bool {
     )
 }
 
-/// Opaque proof that the mode-bound database was read as exact `STSA/1` while
+/// Header-only proof that the mode-bound database was read as `STSA/1` or
+/// `STSA/2` (not CatalogV2 qualification) while
 /// a shared process/OS maintenance lease and pinned database descriptor remain
 /// alive.
 #[must_use = "the verified schema capability must retain its maintenance lease"]
@@ -2204,7 +2221,10 @@ fn classify_identity(
     user_version: i64,
 ) -> Result<GlobalSchemaIdentity, GlobalSchemaV1Error> {
     if application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && user_version == STOCK_ANALYSIS_DB_SCHEMA_GENERATION
+        && matches!(
+            user_version,
+            STOCK_ANALYSIS_DB_SCHEMA_GENERATION | PAPER_LEDGER_CATALOG_GENERATION
+        )
     {
         return Ok(GlobalSchemaIdentity {
             application_id,
@@ -2212,11 +2232,11 @@ fn classify_identity(
         });
     }
     if application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && user_version > STOCK_ANALYSIS_DB_SCHEMA_GENERATION
+        && user_version > PAPER_LEDGER_CATALOG_GENERATION
     {
         return Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
             actual: user_version,
-            supported: STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
+            supported: PAPER_LEDGER_CATALOG_GENERATION,
         });
     }
     if application_id == 0 && user_version == 0 {
@@ -3675,10 +3695,10 @@ mod tests {
             );
         }
         assert!(matches!(
-            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 2),
+            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 3),
             Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
-                actual: 2,
-                supported: 1
+                actual: 3,
+                supported: 2
             })
         ));
     }
@@ -3711,6 +3731,67 @@ mod tests {
             error,
             GlobalSchemaV1Error::SelectionReceiptReconciliation { .. }
         ));
+    }
+
+    #[test]
+    fn paper_ledger_catalog_v2_old_receipt_cannot_issue_extended_authority() {
+        let fixture = TestFixture::new(
+            "paper-catalog-old-receipt",
+            STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+            1,
+        );
+        fixture.install_final_selection_catalog();
+        let writer = fixture.pinned_audit_writer();
+        writer
+            .append(SelectionAuditRecord::new(
+                SelectionAuditPhase::V2GateDCanaryVerified,
+                "TEST_CODE_OLD_RECEIPT",
+                "c".repeat(64),
+                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:02:00+08:00").unwrap(),
+            ))
+            .unwrap();
+        let old = GlobalSchemaVersionOwner::for_test_code()
+            .inspect_selection_with_audit_for_test(&fixture.root, &writer)
+            .unwrap();
+        assert!(matches!(old, SelectionSchemaInspectionOutcome::Amended(_)));
+        drop(old);
+        let conn = Connection::open(fixture.database()).unwrap();
+        for (_, _, _, sql) in super::super::paper_ledger_schema_v1::STATEMENTS {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", PAPER_LEDGER_CATALOG_GENERATION)
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(conn);
+        // Only the just-created, closed private fixture sidecars are cleaned.
+        // The production inspector must continue rejecting unknown sidecars.
+        for suffix in ["-wal", "-shm"] {
+            let path = sidecar_path(&fixture.database(), suffix);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("closed TEST_CODE fixture sidecar: {error}"),
+            }
+        }
+        let before = fs::read(fixture.database()).unwrap();
+        let outcome = GlobalSchemaVersionOwner::for_test_code()
+            .inspect_selection_with_audit_for_test(&fixture.root, &writer)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SelectionSchemaInspectionOutcome::Diagnostic(_)
+        ));
+        assert_eq!(
+            outcome.authority_state(),
+            SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired
+        );
+        drop(outcome);
+        assert_eq!(
+            fs::read(fixture.database()).unwrap(),
+            before,
+            "classification must not auto migrate/qualify"
+        );
     }
 
     #[test]
@@ -4325,7 +4406,7 @@ mod tests {
             (
                 "future",
                 STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-                2,
+                3,
                 "global_schema_unsupported_future_generation",
             ),
         ] {

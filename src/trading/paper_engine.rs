@@ -337,7 +337,7 @@ fn emit_sell_signal(decision: &SellDecision, risk_context: PaperRiskContext) -> 
     let order_id = crate::bus::new_order_id();
     let exec_id = crate::bus::new_execution_id();
     let decision_id = crate::bus::new_decision_id();
-    match paper_trade::simulate(&signal, effective_price, cash, total, pos_pct) {
+    match paper_trade::simulate_legacy_fixture(&signal, effective_price, cash, total, pos_pct) {
         Ok(outcome) => {
             log::info!(
                 "[paper_engine] 4 铁律卖出 {}({}) status={} reason={}",

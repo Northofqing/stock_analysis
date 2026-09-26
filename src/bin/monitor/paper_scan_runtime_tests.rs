@@ -48,6 +48,147 @@ fn run_child(test: &str, case: &str) {
     }
 }
 
+fn seed_child_paper(codes: &[&str]) -> stock_analysis::trading::paper_ledger::AccountBinding {
+    use stock_analysis::trading::paper_ledger::*;
+    let cutover = chrono::Utc::now() - chrono::Duration::days(2);
+    let sellable = chrono::Local::now().date_naive();
+    let seed = SeedManifest {
+        account_id: "TEST_CODE_MONITOR_ACCOUNT".into(),
+        epoch_id: "TEST_CODE_MONITOR_EPOCH".into(),
+        command_id: "seed".into(),
+        cutover_at: cutover,
+        account_effective_at: cutover,
+        positions_effective_at: cutover,
+        source_reference: "TEST_CODE_explicit_seed".into(),
+        source_hash: "d".repeat(64),
+        approved_by: "TEST_CODE_operator".into(),
+        cash: Money::from_cny(100_000.0 - codes.len() as f64 * 1000.0).unwrap(),
+        original_total: Money::from_cny(100_000.0).unwrap(),
+        excluded_residual: None,
+        lots: codes
+            .iter()
+            .map(|code| SeedLot {
+                code: (*code).into(),
+                name: (*code).into(),
+                quantity: 100,
+                reported_cost: None,
+                sellable_from: Some(sellable),
+                sellability_evidence: Some("TEST_CODE_confirmed_sellable".into()),
+            })
+            .collect(),
+        marks: codes
+            .iter()
+            .map(|code| Mark {
+                code: (*code).into(),
+                price: Money::from_cny(10.0).unwrap(),
+                observed_at: cutover,
+                source: "TEST_CODE_cutover".into(),
+            })
+            .collect(),
+        policy: RiskPolicyV1::default(),
+    };
+    let binding = seed.binding().unwrap();
+    PaperLedger::open(
+        stock_analysis::database::DatabaseManager::get(),
+        &chrono::Utc::now,
+    )
+    .apply(PaperCommand::Seed(seed))
+    .unwrap();
+    std::env::set_var(
+        stock_analysis::trading::paper_ledger_runtime::BINDING_ENV,
+        serde_json::to_string(&binding).unwrap(),
+    );
+    binding
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn paper_ledger_d01_enqueues_without_direct_fill_and_owner_consumes_row_once() {
+    if std::env::var(CHILD_CASE).as_deref() != Ok("d01") {
+        run_child("paper_scan_runtime_tests::paper_ledger_d01_enqueues_without_direct_fill_and_owner_consumes_row_once","d01");
+        return;
+    }
+    use stock_analysis::database::DatabaseManager;
+    let root = std::path::PathBuf::from(std::env::var_os(CHILD_ROOT).unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(root.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("TEST_CODE_PAPER_RUNTIME_"));
+    assert!(DatabaseManager::try_get().is_none());
+    DatabaseManager::init(Some(root.join("stock.db"))).unwrap();
+    let binding = seed_child_paper(&[]);
+    struct Quote;
+    impl stock_analysis::broker::QuoteProvider for Quote {
+        fn get_execution_quote(
+            &self,
+            code: &str,
+        ) -> Result<stock_analysis::broker::ExecutionQuote, String> {
+            assert_eq!(code, "TEST_CODE_D01_SINGLE_OWNER");
+            Ok(stock_analysis::broker::ExecutionQuote {
+                price: 10.0,
+                limit_down_price: 9.0,
+                limit_up_price: 11.0,
+                observed_at: chrono::Utc::now(),
+            })
+        }
+    }
+    stock_analysis::broker::register_quote_provider(Box::new(Quote)).unwrap();
+    let snapshot = push_templates::NewsToIdeaSnapshot {
+        code: "TEST_CODE_D01_SINGLE_OWNER".into(),
+        name: "TEST_CODE".into(),
+        headline: "TEST_CODE catalyst".into(),
+        theme: "TEST_CODE".into(),
+        ..Default::default()
+    };
+    push_templates::enqueue_candidate_from_d01(&snapshot)
+        .await
+        .unwrap();
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type=diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = DatabaseManager::get().get_conn().unwrap();
+    let count = |conn: &mut diesel::SqliteConnection, table: &str| {
+        diesel::sql_query(format!("SELECT COUNT(*) AS n FROM {table}"))
+            .get_result::<Count>(conn)
+            .unwrap()
+            .n
+    };
+    assert_eq!(count(&mut conn, "pushed_stocks"), 1);
+    assert_eq!(count(&mut conn, "paper_trades"), 0, "D01 may only enqueue");
+    diesel::sql_query("UPDATE pushed_stocks SET push_time=?")
+        .bind::<diesel::sql_types::Text, _>(
+            (chrono::Local::now() - chrono::Duration::minutes(1))
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+        )
+        .execute(&mut conn)
+        .unwrap();
+    let risk = stock_analysis::trading::paper_trade::PaperRiskContext::new(
+        stock_analysis::risk::action_gate::AccountMode::Normal,
+        stock_analysis::monitor::data_mode::DataMode::Full,
+    );
+    let owner = stock_analysis::decision::intraday_monitor::IntradayMonitor;
+    assert_eq!(owner.tick(risk).unwrap(), 1);
+    diesel::sql_query("UPDATE pushed_stocks SET consumed_at=NULL,consumed_by=NULL,outcome=NULL")
+        .execute(&mut conn)
+        .unwrap();
+    assert_eq!(owner.tick(risk).unwrap(), 0);
+    assert_eq!(count(&mut conn, "paper_trades"), 1);
+    let view = stock_analysis::trading::paper_ledger::PaperLedger::open(
+        DatabaseManager::get(),
+        &chrono::Utc::now,
+    )
+    .read(&binding)
+    .unwrap();
+    assert_eq!(view.cash.cny(), 98_995.0);
+    assert_eq!(view.fees.cny(), 5.0);
+}
+
 struct FiniteQuote {
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     release: Arc<(Mutex<bool>, Condvar)>,
@@ -128,6 +269,7 @@ async fn child_case(missing_writer: bool) {
             .execute(&mut conn).unwrap();
     }
     drop(conn);
+    seed_child_paper(&["TEST_CODE_PAPER_MAIN_A", "TEST_CODE_PAPER_MAIN_B"]);
     let order = Arc::new(Mutex::new(Vec::new()));
     let codes = Arc::new(Mutex::new(Vec::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));

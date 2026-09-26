@@ -1,5 +1,7 @@
 //! Registered business rules: BR-084.
 //! v12 PR3-3.5: 虚拟盘成交模拟 (paper_trade).
+//! Production execution now belongs to `paper_ledger`; this module retains
+//! compatibility records, quote validation and real-account reference readers.
 //!
 //! 设计: 虚拟腿只写 paper_trades, **零写 stock_position** (BR-023 硬性隔离).
 //!        真实减仓走 position_adjustments (BR-024).
@@ -519,6 +521,7 @@ pub struct PaperSignal {
     pub risk_context: PaperRiskContext,
 }
 
+#[cfg(test)]
 fn audit_decision_basis(
     signal: &PaperSignal,
     audit_evidence: Option<&PaperAuditEvidence>,
@@ -999,6 +1002,7 @@ pub struct PaperTradePersistenceReceipt {
     pub terminal_at: String,
 }
 
+#[cfg(test)]
 fn persist_paper_trade_with_audit(
     conn: &mut diesel::sqlite::SqliteConnection,
     sql: &str,
@@ -1054,6 +1058,7 @@ fn persist_paper_trade_with_audit(
 ///
 /// v16.3 Commit 1 BREAKING: 签名加 4 参数 (quote_price, current_cash, total_value, current_position_pct)
 /// 调用方: push_templates:3073 (D-01), push_templates:6223 (盘后资金)
+#[cfg(test)]
 pub(crate) trait PaperTradeStore {
     fn reserve(&self, plan_id: &str) -> Result<bool, String>;
     fn record_audit(&self, record: &crate::database::order_audit::OrderAuditRecord<'_>) -> Result<(), String>;
@@ -1064,6 +1069,7 @@ pub(crate) trait PaperTradeStore {
     ) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String>;
 }
 
+#[cfg(test)]
 impl PaperTradeStore for DatabaseManager {
     fn reserve(&self, plan_id: &str) -> Result<bool, String> {
         self.reserve_business_order_id(plan_id)
@@ -1077,6 +1083,7 @@ impl PaperTradeStore for DatabaseManager {
     }
 }
 
+#[cfg(test)]
 fn persist_paper_trade_if_active(
     conn: &mut SqliteConnection, sql: &str, signal: &PaperSignal, result: &PaperResult,
     observed_at: &str, evidence: Option<&PaperAuditEvidence>, cancelled: &std::sync::atomic::AtomicBool,
@@ -1088,6 +1095,7 @@ fn persist_paper_trade_if_active(
         .map_err(|error| format!("BR-086 audited paper trade transaction: {error}"))
 }
 
+#[cfg(test)]
 fn simulate_with_scope(
     signal: &PaperSignal,
     quote_price: f64,
@@ -1101,6 +1109,7 @@ fn simulate_with_scope(
         current_position_pct, snapshot_scope, audit_evidence, None, &std::sync::atomic::AtomicBool::new(false))
 }
 
+#[cfg(test)]
 fn simulate_with_scope_and_store(
     signal: &PaperSignal,
     quote_price: f64,
@@ -1227,7 +1236,18 @@ fn simulate_with_scope_and_store(
     })
 }
 
+/// Legacy financial-authority interface is deliberately closed. Production
+/// owners must use PaperLedger; naked caller cash cannot authorize a fill.
 pub fn simulate(
+    _signal: &PaperSignal, _quote_price: f64, _current_cash: f64,
+    _total_value: f64, _current_position_pct: f64,
+) -> Result<PaperOutcome,String> {
+    Err("legacy paper simulate disabled: explicit PaperLedger account/epoch required".into())
+}
+
+/// Historical fixture coverage only; never compiled as a production writer.
+#[cfg(test)]
+pub(crate) fn simulate_legacy_fixture(
     signal: &PaperSignal,
     quote_price: f64,
     current_cash: f64,
@@ -1245,6 +1265,7 @@ pub fn simulate(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn simulate_with_audit_evidence_controlled(
     signal: &PaperSignal, quote_price: f64, cash: f64, total: f64, position_pct: f64,
     evidence: &PaperAuditEvidence, store: Option<&dyn PaperTradeStore>, cancelled: &std::sync::atomic::AtomicBool,
@@ -1825,10 +1846,10 @@ mod tests {
         );
         signal.quantity = 99;
 
-        let first = simulate(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
+        let first = simulate_legacy_fixture(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
             .expect_err("invalid lot must be rejected");
         assert!(first.contains("100"));
-        let second = simulate(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
+        let second = simulate_legacy_fixture(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
             .expect_err("same rejected business id must be deduplicated");
         assert!(second.contains("duplicate business order id within 60 seconds"));
     }

@@ -5,10 +5,10 @@
 //!   1. intraday_monitor.tick() 每 30s 跑一次
 //!      - 扫 pushed_stocks (consumed_at IS NULL, push_time < now, 1h 内)
 //!      - 4 步过滤: (a) metric_json 早盘量能 (b) 时间窗 (c) VirtualReason 命中 (d) 综合分 ≥ 6.0
-//!      - 命中 → 调 risk_adapter 4 项检查 → 调 paper_trade::simulate Buy → 标记 consumed
+//!      - 命中 → PaperLedger 锁内风控/成交 → 标记 consumed
 //!   2. evening_review() 15:30 跑一次 (R5)
 //!      - 整盘扫全天未消费推送 + Momentum 整合
-//!      - 命中 → 调 paper_trade::simulate Buy → 标记 consumed (outcome = "Momentum")
+//!      - 命中 → 同一 PaperLedger owner → 标记 consumed (outcome = "Momentum")
 //!
 //! 8 Source trait 推迟到 v16.4; Commit 3 直接用 v16.2 现有函数调
 //! (按 plan review 修复: signal_sources 改 None, 4 步过滤用 v16.2 6 函数直接调)
@@ -19,6 +19,8 @@ use crate::strategy::v16_4::{
     MomentumStrategy, NewsCatalystStrategy, SectorLeaderStrategy, Strategy, StrategyInput,
     StrategyOutput, VolumeSurgeStrategy,
 };
+use crate::trading::paper_ledger::AccountBinding;
+use crate::trading::paper_ledger_runtime;
 use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use diesel::prelude::*;
@@ -109,23 +111,31 @@ fn paper_limit_flags(quote: &crate::broker::ExecutionQuote) -> (bool, bool) {
 fn reconcile_persisted_candidate_buys(
     conn: &mut diesel::sqlite::SqliteConnection,
     now: &DateTime<Local>,
+    binding: &AccountBinding,
 ) -> Result<usize, String> {
+    let prefix = format!("paper:{}:{PUSHED_STOCK_BUY_PLAN_PREFIX}", binding.epoch_id);
     let recovered = diesel::sql_query(
         "UPDATE pushed_stocks
          SET consumed_at = ?, consumed_by = 'paper_trade_recovery',
              outcome = (SELECT paper_trades.virtual_reason FROM paper_trades
+                        JOIN paper_ledger_event e ON e.paper_trade_id = paper_trades.id
                         WHERE paper_trades.plan_id = ? || pushed_stocks.id
+                          AND e.account_id = ? AND e.is_terminal = 1
                           AND paper_trades.code = pushed_stocks.code
                           AND paper_trades.direction = 'buy' LIMIT 1)
          WHERE consumed_at IS NULL
            AND EXISTS (SELECT 1 FROM paper_trades
+                       JOIN paper_ledger_event e ON e.paper_trade_id = paper_trades.id
                        WHERE paper_trades.plan_id = ? || pushed_stocks.id
+                         AND e.account_id = ? AND e.is_terminal = 1
                          AND paper_trades.code = pushed_stocks.code
                          AND paper_trades.direction = 'buy')",
     )
     .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-    .bind::<diesel::sql_types::Text, _>(PUSHED_STOCK_BUY_PLAN_PREFIX)
-    .bind::<diesel::sql_types::Text, _>(PUSHED_STOCK_BUY_PLAN_PREFIX)
+    .bind::<diesel::sql_types::Text, _>(&prefix)
+    .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+    .bind::<diesel::sql_types::Text, _>(&prefix)
+    .bind::<diesel::sql_types::Text, _>(&binding.account_id)
     .execute(conn)
     .map_err(|error| format!("reconcile persisted candidate buys: {error}"))?;
     if recovered > 0 {
@@ -140,34 +150,38 @@ fn reconcile_persisted_candidate_buys(
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
     ///
-    /// BR-151 快照模式：生产账户证据 = 用户确认的真实账户快照
-    /// （portfolio_state_snapshot：user_account_summary + user_position_snapshot，
-    /// upsert 当日 ledger）。实时账户模式（portfolio_state，30s 券商门）在生产
-    /// 无盘中刷新者，恒拦虚拟盘成交（7/17 起零成交缺陷，2026-08-10 修复）。
+    /// 独立模拟账户：只接受已显式 seed/cutover 的 epoch，不刷新用户账户快照。
     pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
-        // 无条件刷新当日 ledger（BR-097 结构门 age≤30s）——候选到达前 ledger
-        // 即已新鲜。无候选 tick 也必须刷新：ledger 门要求 date==today 且
-        // created_at 新（7/17 起零成交根因之一：ledger 无生产写入者）。
-        paper_trade::refresh_account_ledger_from_snapshot()?;
-        self.tick_with_portfolio_state(risk_context, paper_trade::portfolio_state_snapshot)
+        let binding = paper_ledger_runtime::active_binding()?;
+        self.tick_with_executor(risk_context, &binding, |signal, quote| {
+            paper_ledger_runtime::execute(
+                &binding,
+                signal,
+                quote,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        })
     }
 
-    /// Keep the decision loop independently testable while the public production
-    /// entrypoint remains hard-wired to the freshness-gated account snapshot.
-    fn tick_with_portfolio_state<F>(
+    /// The seam replaces execution I/O, not the ledger's financial authority.
+    fn tick_with_executor<F>(
         &self,
         risk_context: PaperRiskContext,
-        mut portfolio_state: F,
+        binding: &AccountBinding,
+        mut execute: F,
     ) -> Result<usize, String>
     where
-        F: FnMut(&str, f64) -> Result<(f64, f64, f64), String>,
+        F: FnMut(
+            &PaperSignal,
+            &crate::broker::ExecutionQuote,
+        ) -> Result<paper_trade::PaperOutcome, String>,
     {
         let now = Local::now();
         let cutoff = now - Duration::hours(PUSH_AGE_MAX_HOURS);
         let mut conn = DatabaseManager::get()
             .get_conn()
             .map_err(|e| format!("DB 连接失败: {}", e))?;
-        reconcile_persisted_candidate_buys(&mut conn, &now)?;
+        reconcile_persisted_candidate_buys(&mut conn, &now, binding)?;
 
         // 1. 扫推送票池 (review fix Issue #4: 参数化绑定替代 format! 拼接)
         let candidates: Vec<Candidate> = diesel::sql_query(
@@ -243,26 +257,7 @@ impl IntradayMonitor {
                     quote_observed_at: execution_quote.observed_at,
                     risk_context,
                 };
-                let (cash, total, pos_pct) =
-                    match portfolio_state(&cand.code, execution_quote.price) {
-                        Ok(state) => state,
-                        Err(error) => {
-                            log::warn!(
-                                "[intraday_monitor] 跳过 {}({}): 账户快照不可用: {}",
-                                cand.name,
-                                cand.code,
-                                error
-                            );
-                            continue;
-                        }
-                    };
-                match paper_trade::simulate(
-                    &paper_signal,
-                    execution_quote.price,
-                    cash,
-                    total,
-                    pos_pct,
-                ) {
+                match execute(&paper_signal, &execution_quote) {
                     Ok(outcome) => {
                         // 4. 标记 consumed (review fix Issue #4: 参数化绑定)
                         let strategy_outcome = signal.source;
@@ -432,23 +427,30 @@ static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
     std::sync::Mutex::new(None);
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
-/// BR-151 快照模式：与 tick 同源（portfolio_state_snapshot），见 tick 注释。
+/// 与 tick 共用独立 paper epoch 和持久候选身份。
 pub fn evening_review(today: NaiveDate, risk_context: PaperRiskContext) -> Result<usize, String> {
-    paper_trade::refresh_account_ledger_from_snapshot()?;
-    evening_review_with_portfolio_state(today, risk_context, paper_trade::portfolio_state_snapshot)
+    let binding = paper_ledger_runtime::active_binding()?;
+    evening_review_with_executor(today, risk_context, &binding, |signal, quote| {
+        paper_ledger_runtime::execute(
+            &binding,
+            signal,
+            quote,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    })
 }
 
-/// Production calls this only through `evening_review`, which supplies the real
-/// freshness-gated account loader. The private seam lets TEST_CODE fixtures
-/// exercise decision consumption without inheriting unrelated database rows
-/// left by other unit tests.
-fn evening_review_with_portfolio_state<F>(
+fn evening_review_with_executor<F>(
     today: NaiveDate,
     risk_context: PaperRiskContext,
-    mut portfolio_state: F,
+    binding: &AccountBinding,
+    mut execute: F,
 ) -> Result<usize, String>
 where
-    F: FnMut(&str, f64) -> Result<(f64, f64, f64), String>,
+    F: FnMut(
+        &PaperSignal,
+        &crate::broker::ExecutionQuote,
+    ) -> Result<paper_trade::PaperOutcome, String>,
 {
     {
         let last = EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
@@ -477,7 +479,7 @@ where
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
-    reconcile_persisted_candidate_buys(&mut conn, &now)?;
+    reconcile_persisted_candidate_buys(&mut conn, &now, binding)?;
 
     // review fix Issue #4: 参数化绑定
     let candidates: Vec<Candidate> = diesel::sql_query(
@@ -547,19 +549,7 @@ where
             quote_observed_at: execution_quote.observed_at,
             risk_context,
         };
-        let (cash, total, pos_pct) = match portfolio_state(&cand.code, execution_quote.price) {
-            Ok(state) => state,
-            Err(error) => {
-                log::warn!(
-                    "[evening_review] 跳过 {}({}): 账户快照不可用: {}",
-                    cand.name,
-                    cand.code,
-                    error
-                );
-                continue;
-            }
-        };
-        match paper_trade::simulate(&paper_signal, execution_quote.price, cash, total, pos_pct) {
+        match execute(&paper_signal, &execution_quote) {
             Ok(outcome) => {
                 // review fix Issue #4: 参数化绑定
                 diesel::sql_query(
@@ -693,9 +683,8 @@ mod tests {
         .execute(&mut conn)
         .expect("prepare same-day test ledger");
 
-        // 生产入口 (tick/evening_review) 先 refresh_account_ledger_from_snapshot：
-        // 测试 DB 需券商账户汇总 + 用户确认持仓快照（同生产 8/7 快照语义）。
-        // 值与原 ledger 行一致（total=100000, cash=100000）→ 对注入路径零影响。
+        // Keep old real-account fixtures present to prove that the paper owner
+        // does not use them as financial authority or reset its running cash.
         diesel::sql_query(
             "INSERT INTO user_account_summary \
                 (effective_at, total_assets, securities_market_value, available_cash, \
@@ -739,21 +728,55 @@ mod tests {
         }
     }
 
-    fn admitted_test_portfolio_state(
-        code: &str,
-        quote_price: f64,
-    ) -> Result<(f64, f64, f64), String> {
-        if !code.starts_with("TEST_CODE_") {
-            return Err(format!(
-                "test portfolio fixture rejects non-test symbol {code}"
-            ));
-        }
-        if !quote_price.is_finite() || quote_price <= 0.0 {
-            return Err(format!(
-                "test portfolio fixture rejects price {quote_price}"
-            ));
-        }
-        Ok((100_000.0, 100_000.0, 0.0))
+    fn test_binding() -> AccountBinding {
+        use crate::trading::paper_ledger::*;
+        let cutover = chrono::DateTime::parse_from_rfc3339("2026-09-14T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let seed = SeedManifest {
+            account_id: "TEST_CODE_INTRADAY_ACCOUNT".into(),
+            epoch_id: "TEST_CODE_INTRADAY_EPOCH".into(),
+            command_id: "seed".into(),
+            cutover_at: cutover,
+            account_effective_at: cutover,
+            positions_effective_at: cutover,
+            source_reference: "TEST_CODE_explicit_seed".into(),
+            source_hash: "b".repeat(64),
+            approved_by: "TEST_CODE_operator".into(),
+            cash: Money::from_cny(100_000.0).unwrap(),
+            original_total: Money::from_cny(100_000.0).unwrap(),
+            excluded_residual: None,
+            lots: vec![],
+            marks: vec![],
+            policy: RiskPolicyV1::default(),
+        };
+        let binding = seed.binding().unwrap();
+        PaperLedger::open(DatabaseManager::get(), &chrono::Utc::now)
+            .apply(PaperCommand::Seed(seed))
+            .unwrap();
+        binding
+    }
+
+    fn admitted_test_executor(
+        signal: &PaperSignal,
+        quote: &crate::broker::ExecutionQuote,
+    ) -> Result<paper_trade::PaperOutcome, String> {
+        assert!(signal.code.starts_with("TEST_CODE_"));
+        paper_ledger_runtime::execute_on(
+            DatabaseManager::get(),
+            &test_binding(),
+            signal,
+            quote,
+            &chrono::Utc::now,
+            &|code| {
+                assert!(code.starts_with("TEST_CODE_"));
+                Ok(crate::broker::ExecutionQuote {
+                    observed_at: chrono::Utc::now(),
+                    ..quote.clone()
+                })
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        )
     }
 
     #[derive(QueryableByName)]
@@ -1043,7 +1066,7 @@ mod tests {
 
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("intraday tick"),
             1
         );
@@ -1057,7 +1080,7 @@ mod tests {
         assert!(bad.outcome.is_none());
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state,)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("idempotent follow-up tick"),
             0
         );
@@ -1106,7 +1129,7 @@ mod tests {
 
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("first buy"),
             1
         );
@@ -1129,7 +1152,7 @@ mod tests {
 
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("immediate replay after crash"),
             0
         );
@@ -1158,7 +1181,7 @@ mod tests {
         .expect("expire short reservation to test durable idempotency");
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("replay after reservation expiry"),
             0
         );
@@ -1177,7 +1200,7 @@ mod tests {
         .expect("restore stale candidate after trade commit");
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(test_risk_context(), admitted_test_portfolio_state)
+                .tick_with_executor(test_risk_context(), &test_binding(), admitted_test_executor)
                 .expect("replay after decision window"),
             0
         );
@@ -1224,7 +1247,7 @@ mod tests {
         );
         assert_eq!(
             IntradayMonitor
-                .tick_with_portfolio_state(context, admitted_test_portfolio_state)
+                .tick_with_executor(context, &test_binding(), admitted_test_executor)
                 .expect("account mode is informational for paper buy"),
             1
         );
@@ -1267,10 +1290,11 @@ mod tests {
             .expect("place candidate before evening cutoff");
 
         assert_eq!(
-            evening_review_with_portfolio_state(
+            evening_review_with_executor(
                 review_date,
                 test_risk_context(),
-                admitted_test_portfolio_state,
+                &test_binding(),
+                admitted_test_executor,
             )
             .expect("evening review"),
             1
@@ -1280,10 +1304,11 @@ mod tests {
         assert_eq!(row.consumed_by.as_deref(), Some("evening_review"));
         assert_eq!(row.outcome.as_deref(), Some("Momentum"));
         assert_eq!(
-            evening_review_with_portfolio_state(
+            evening_review_with_executor(
                 review_date,
                 test_risk_context(),
-                admitted_test_portfolio_state,
+                &test_binding(),
+                admitted_test_executor,
             )
             .expect("same-day reentry"),
             0
@@ -1326,7 +1351,9 @@ mod tests {
 
         assert_eq!(
             IntradayMonitor
-                .tick(test_risk_context())
+                .tick_with_executor(test_risk_context(), &test_binding(), |_, _| {
+                    panic!("below-threshold candidate must not execute")
+                })
                 .expect("low-score tick"),
             0
         );
@@ -1372,7 +1399,13 @@ mod tests {
         }
 
         assert_eq!(
-            evening_review(review_date, test_risk_context()).expect("skip-only review"),
+            evening_review_with_executor(
+                review_date,
+                test_risk_context(),
+                &test_binding(),
+                |_, _| { panic!("ineligible evening candidate must not execute") }
+            )
+            .expect("skip-only review"),
             0
         );
         assert!(guard
@@ -1388,8 +1421,13 @@ mod tests {
         let review_date = NaiveDate::from_ymd_opt(2198, 1, 4).unwrap();
         *EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(chrono::Utc::now());
-        let error = evening_review(review_date, test_risk_context())
-            .expect_err("recent failure must debounce");
+        let error = evening_review_with_executor(
+            review_date,
+            test_risk_context(),
+            &test_binding(),
+            |_, _| panic!("debounced review must not execute"),
+        )
+        .expect_err("recent failure must debounce");
         assert!(error.contains("debounce"));
         *EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }

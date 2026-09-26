@@ -156,6 +156,7 @@ pub(crate) const TRANSITIONAL_SELECTION_PAYLOAD_SCHEMAS: [&str; 4] = [
 ];
 const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
+const PAPER_LEDGER_CATALOG_GENERATION: i64 = super::paper_ledger_schema_v1::CATALOG_GENERATION;
 const SQLITE_MINIMUM_LIBVERSION_NUMBER: i32 = 3_035_000;
 const SQLITE_NEXT_MAJOR_LIBVERSION_NUMBER: i32 = 4_000_000;
 
@@ -1112,6 +1113,15 @@ pub(crate) struct SameRuntimeCatalogReferences {
     legacy: CatalogReferenceState,
     transitional: CatalogReferenceState,
     amended: CatalogReferenceState,
+    paper_v2: PaperLedgerCatalogV2References,
+}
+
+/// Explicit extension generation; the three frozen v1 references stay intact.
+#[derive(Debug)]
+struct PaperLedgerCatalogV2References {
+    legacy: CatalogReferenceState,
+    transitional: CatalogReferenceState,
+    amended: CatalogReferenceState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1209,11 +1219,11 @@ pub(crate) fn classify_database_half(
             .collect(),
     )?;
     if actual.identity.application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && actual.identity.user_version > STOCK_ANALYSIS_DB_SCHEMA_GENERATION
+        && actual.identity.user_version > PAPER_LEDGER_CATALOG_GENERATION
     {
         return Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
             actual: actual.identity.user_version,
-            supported: STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
+            supported: PAPER_LEDGER_CATALOG_GENERATION,
         });
     }
     validate_catalog_safety(
@@ -1262,11 +1272,25 @@ pub(crate) fn classify_database_half(
         ));
     }
 
-    let legacy = canonical_catalog(&references.legacy.objects);
-    let transitional = canonical_catalog(&references.transitional.objects);
-    let final_catalog = canonical_catalog(&references.amended.objects);
+    let paper_v2 = actual.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION;
+    let (legacy_reference, transitional_reference, amended_reference) = if paper_v2 {
+        (
+            &references.paper_v2.legacy,
+            &references.paper_v2.transitional,
+            &references.paper_v2.amended,
+        )
+    } else {
+        (
+            &references.legacy,
+            &references.transitional,
+            &references.amended,
+        )
+    };
+    let legacy = canonical_catalog(&legacy_reference.objects);
+    let transitional = canonical_catalog(&transitional_reference.objects);
+    let final_catalog = canonical_catalog(&amended_reference.objects);
     let actual_catalog = canonical_catalog(&actual.objects);
-    let (expected_identity, expected_payloads, state, expected_reference) = if actual_catalog
+    let (mut expected_identity, expected_payloads, state, expected_reference) = if actual_catalog
         == legacy
     {
         (
@@ -1276,7 +1300,7 @@ pub(crate) fn classify_database_half(
             },
             Vec::new(),
             DatabaseHalfState::PreAmendment,
-            &references.legacy,
+            legacy_reference,
         )
     } else if actual_catalog == transitional {
         (
@@ -1289,7 +1313,7 @@ pub(crate) fn classify_database_half(
                 .map(|value| (*value).to_owned())
                 .collect(),
             DatabaseHalfState::Transitional,
-            &references.transitional,
+            transitional_reference,
         )
     } else if actual_catalog == final_catalog {
         (
@@ -1302,7 +1326,7 @@ pub(crate) fn classify_database_half(
                 .map(|value| (*value).to_owned())
                 .collect(),
             DatabaseHalfState::Amended,
-            &references.amended,
+            amended_reference,
         )
     } else {
         return Err(GlobalSchemaCatalogError::CatalogMismatch {
@@ -1315,6 +1339,12 @@ pub(crate) fn classify_database_half(
             ),
         });
     };
+    if paper_v2 {
+        expected_identity = DatabaseSchemaIdentity {
+            application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+            user_version: PAPER_LEDGER_CATALOG_GENERATION,
+        };
+    }
     require_exact_ancillary_catalog(actual, expected_reference)?;
     if actual.identity != expected_identity {
         return Err(GlobalSchemaCatalogError::UnsupportedSchemaIdentity {
@@ -1352,11 +1382,16 @@ pub(crate) fn classify_database_half(
         mode: actual.mode,
         identity: actual.identity,
         runtime: actual.runtime.clone(),
-        whole_application_catalog_sha256: whole_application_catalog_sha256(
-            actual.mode,
-            &actual.runtime,
-            &actual.objects,
-        ),
+        whole_application_catalog_sha256: if paper_v2 {
+            WholeApplicationSchemaCatalogSha256(catalog_digest(
+                b"stock_analysis.global_schema_catalog.v2.paper_ledger.v1",
+                actual.mode,
+                &actual.runtime,
+                &actual.objects,
+            ))
+        } else {
+            whole_application_catalog_sha256(actual.mode, &actual.runtime, &actual.objects)
+        },
         selection_managed_catalog_sha256,
         legacy_row_counts: actual.legacy_row_counts.clone(),
         selection_payload_schemas: actual.selection_payload_schemas.clone(),
@@ -1594,6 +1629,14 @@ fn build_same_runtime_catalog_state(
     mode: GlobalSchemaCatalogMode,
     phase: Option<SelectionCatalogDdlPhase>,
 ) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
+    build_same_runtime_catalog_state_with_paper(mode, phase, false)
+}
+
+fn build_same_runtime_catalog_state_with_paper(
+    mode: GlobalSchemaCatalogMode,
+    phase: Option<SelectionCatalogDdlPhase>,
+    paper_v2: bool,
+) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
     let label = phase.map_or("legacy", SelectionCatalogDdlPhase::label);
     let connection = Connection::open_in_memory()
         .map_err(|error| sqlite_reference_build_error("open-in-memory", None, error))?;
@@ -1610,16 +1653,59 @@ fn build_same_runtime_catalog_state(
         execute_selection_catalog_ddl(&connection, mode, phase, &mut executed_ddl_ids)?;
     }
 
-    let expected_registry = match phase {
+    let mut expected_registry = match phase {
         Some(phase) => whole_application_registry(mode, phase)?,
         None => registry,
     };
+    if paper_v2 {
+        let paper_registry = paper_ledger_catalog_registry()?;
+        for (entry, (_, _, _, sql)) in paper_registry
+            .iter()
+            .zip(super::paper_ledger_schema_v1::STATEMENTS)
+        {
+            connection.execute_batch(sql).map_err(|error| {
+                sqlite_reference_build_error("execute-paper-ledger-v1", Some(&entry.ddl_id), error)
+            })?;
+            capture_exact_catalog_object(
+                &connection,
+                &entry.identity,
+                &entry.ddl_id,
+                "paper-ledger-v1",
+            )?;
+            if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
+                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch {
+                    catalog: "paper-ledger-v1",
+                    detail: "duplicate DDL identity".into(),
+                });
+            }
+        }
+        expected_registry.extend(paper_registry);
+    }
     let built = OwnerBuiltCatalogState {
         reference: capture_catalog_reference_state(&connection, mode)?,
         executed_ddl_ids,
     };
     validate_reference_state(label, mode, &built, &expected_registry)?;
     Ok((runtime, built))
+}
+
+fn paper_ledger_catalog_registry(
+) -> Result<Vec<FrozenCatalogRegistryEntry>, GlobalSchemaCatalogError> {
+    super::paper_ledger_schema_v1::STATEMENTS
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, name, table, _))| {
+            Ok(FrozenCatalogRegistryEntry {
+                identity: CatalogObjectIdentity {
+                    kind: parse_catalog_object_kind("paper-ledger-v1", kind)?,
+                    name: (*name).into(),
+                    table_name: (*table).into(),
+                },
+                ddl_id: format!("paper-ledger-v1:{name}"),
+                source_line: i + 1,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2021,6 +2107,12 @@ fn capture_managed_index_geometry(
         .into_iter()
         .filter(|identity| identity.kind == CatalogObjectKind::Table)
         .map(|identity| identity.name)
+        .chain(
+            super::paper_ledger_schema_v1::STATEMENTS
+                .iter()
+                .filter(|(kind, _, _, _)| *kind == "table")
+                .map(|(_, name, _, _)| (*name).to_owned()),
+        )
         .filter(|table| existing_tables.contains(table.as_str()))
         .collect::<Vec<_>>();
     let mut geometry = Vec::new();
@@ -2151,12 +2243,34 @@ fn issue_same_runtime_catalog_references(
         &transitional_registry,
     )?;
     validate_reference_state("amended", built.mode, &built.amended, &amended_registry)?;
+    let (runtime, legacy) = build_same_runtime_catalog_state_with_paper(built.mode, None, true)?;
+    let (transitional_runtime, transitional) = build_same_runtime_catalog_state_with_paper(
+        built.mode,
+        Some(SelectionCatalogDdlPhase::Transitional),
+        true,
+    )?;
+    let (amended_runtime, amended) = build_same_runtime_catalog_state_with_paper(
+        built.mode,
+        Some(SelectionCatalogDdlPhase::Final),
+        true,
+    )?;
+    if runtime != built.runtime
+        || transitional_runtime != built.runtime
+        || amended_runtime != built.runtime
+    {
+        return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
+    }
     Ok(SameRuntimeCatalogReferences {
         mode: built.mode,
         runtime: built.runtime,
         legacy: built.legacy.reference,
         transitional: built.transitional.reference,
         amended: built.amended.reference,
+        paper_v2: PaperLedgerCatalogV2References {
+            legacy: legacy.reference,
+            transitional: transitional.reference,
+            amended: amended.reference,
+        },
     })
 }
 
@@ -2347,7 +2461,22 @@ fn validate_catalog_safety(
     let contains_managed_catalog = objects.iter().any(|object| {
         object.identity.kind == CatalogObjectKind::Table && managed.contains(&object.identity.name)
     });
-    validate_index_geometry(label, index_geometry, &managed, contains_managed_catalog)?;
+    let paper_tables = super::paper_ledger_schema_v1::STATEMENTS
+        .iter()
+        .filter(|(kind, _, _, _)| *kind == "table")
+        .map(|(_, name, _, _)| *name)
+        .collect::<BTreeSet<_>>();
+    let selection_geometry = index_geometry
+        .iter()
+        .filter(|index| !paper_tables.contains(index.table_name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_index_geometry(
+        label,
+        &selection_geometry,
+        &managed,
+        contains_managed_catalog,
+    )?;
     validate_sqlite_owned_objects(label, sqlite_owned_objects)?;
     for foreign_key in foreign_keys {
         if managed.contains(&foreign_key.target_table)
@@ -3186,12 +3315,12 @@ mod tests {
     fn future_generation_and_incomplete_final_payload_fail_closed() {
         let references = same_runtime_references(GlobalSchemaCatalogMode::Test);
         let mut actual = snapshot_for_state(&references, DatabaseHalfState::Amended);
-        actual.identity.user_version = 2;
+        actual.identity.user_version = 3;
         assert!(matches!(
             classify_database_half(&actual, &references),
             Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
-                actual: 2,
-                supported: 1,
+                actual: 3,
+                supported: 2,
             })
         ));
 
@@ -3383,6 +3512,96 @@ mod tests {
     fn same_runtime_references(mode: GlobalSchemaCatalogMode) -> SameRuntimeCatalogReferences {
         build_same_runtime_catalog_references(mode)
             .expect("private owner issues real exact same-runtime references")
+    }
+
+    #[test]
+    fn paper_ledger_catalog_v2_accepts_only_complete_extension_of_each_frozen_base() {
+        let mode = GlobalSchemaCatalogMode::Test;
+        let refs = same_runtime_references(mode);
+        let authority = SelectionCatalogCaptureAuthority::for_test_code();
+        for phase in [
+            None,
+            Some(SelectionCatalogDdlPhase::Transitional),
+            Some(SelectionCatalogDdlPhase::Final),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("TEST_CODE_catalog_v2.db");
+            let conn = Connection::open(&path).unwrap();
+            let mut ddl_ids = BTreeSet::new();
+            execute_legacy_catalog_ddl(
+                &conn,
+                &legacy_catalog_registry_entries_v1().unwrap(),
+                &legacy_catalog_ddl_entries_v1().unwrap(),
+                "TEST_CODE",
+                &mut ddl_ids,
+            )
+            .unwrap();
+            if let Some(phase) = phase {
+                execute_selection_catalog_ddl(&conn, mode, phase, &mut ddl_ids).unwrap();
+            }
+            if matches!(phase, Some(SelectionCatalogDdlPhase::Final)) {
+                conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=1")
+                    .unwrap();
+            }
+            let before = capture_catalog_snapshot(&authority, &conn, mode).unwrap();
+            let old = classify_database_half(&before, &refs).unwrap();
+            let old_hash = match old {
+                DatabaseHalfDiagnostic::PreAmendment(e)
+                | DatabaseHalfDiagnostic::Transitional(e)
+                | DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => {
+                    e.whole_application_catalog_sha256
+                }
+                _ => panic!("expected legacy base"),
+            };
+            for (_, _, _, sql) in super::super::paper_ledger_schema_v1::STATEMENTS {
+                conn.execute_batch(sql).unwrap();
+            }
+            // New objects never inherit a v1 identity/receipt.
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
+            conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=2")
+                .unwrap();
+            let actual = capture_catalog_snapshot(&authority, &conn, mode).unwrap();
+            let diagnostic = classify_database_half(&actual, &refs)
+                .expect("complete explicit CatalogV2/PaperLedgerV1 extension");
+            let new_hash = match diagnostic {
+                DatabaseHalfDiagnostic::PreAmendment(e)
+                | DatabaseHalfDiagnostic::Transitional(e)
+                | DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => {
+                    e.whole_application_catalog_sha256
+                }
+                _ => panic!("expected extended base"),
+            };
+            assert_ne!(
+                new_hash, old_hash,
+                "old receipt hash cannot authorize the new generation"
+            );
+            conn.execute_batch("CREATE TABLE TEST_CODE_shadow(value TEXT)")
+                .unwrap();
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
+            conn.execute_batch(
+                "DROP TABLE TEST_CODE_shadow; DROP TRIGGER paper_ledger_event_no_delete",
+            )
+            .unwrap();
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
+            conn.execute_batch("CREATE TRIGGER paper_ledger_event_no_delete BEFORE DELETE ON paper_ledger_event BEGIN SELECT 1; END").unwrap();
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
+        }
     }
 
     fn snapshot_for_state(
