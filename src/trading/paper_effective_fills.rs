@@ -66,10 +66,28 @@ pub struct VerifiedEffectiveFillSet {
     pub(super) receipt: EffectiveProjectionReceipt,
     pub(super) rows: Vec<EconomicFillRow>,
     pub(super) lineage: Vec<FillLineage>,
+    // Original OR corrected facts at/before as_of, including exclusions. The
+    // complete lineage/receipt above still verifies every source and CAS head.
+    period_lineage: Vec<FillLineage>,
     pub(super) unavailable: Option<String>,
     pub(super) seed_lots: Vec<Lot>,
 }
 impl VerifiedEffectiveFillSet {
+    pub(super) fn snapshot_input_hash(&self) -> Result<String, LedgerError> {
+        Ok(digest(&encode(&(
+            "PaperSnapshotPeriodInputV1",
+            &self.receipt.request.scope,
+            self.receipt.request.as_of,
+            self.receipt.cutover_at,
+            self.receipt.cutover_raw_high_water,
+            &self.receipt.rule_version,
+            self.receipt.catalog_generation,
+            &self.receipt.catalog_objects_hash,
+            self.rows()?,
+            &self.period_lineage,
+            &self.seed_lots,
+        ))?))
+    }
     pub fn receipt(&self) -> &EffectiveProjectionReceipt {
         &self.receipt
     }
@@ -226,6 +244,7 @@ pub(super) fn verified_on(
     }
     let mut rows = Vec::new();
     let mut lineage = Vec::new();
+    let mut period_lineage = Vec::new();
     let mut raw_manifest = Vec::new();
     let mut high_water = 0;
     for event in &events {
@@ -272,6 +291,17 @@ pub(super) fn verified_on(
                 }
             }
         }
+        if day(source.fact_at) <= request.as_of
+            || crate::trading::paper_lot_ledger::parse_paper_fill_timestamp(
+                row.id,
+                &row.occurred_at,
+            )
+            .map_err(LedgerError::IntegrityFailure)?
+            .date()
+                <= request.as_of
+        {
+            period_lineage.push(proof.clone());
+        }
         if !proof.quarantined {
             rows.push(row);
         }
@@ -304,6 +334,7 @@ pub(super) fn verified_on(
         receipt,
         rows,
         lineage,
+        period_lineage,
         unavailable,
         seed_lots,
     })
@@ -675,6 +706,27 @@ fn legacy_verified_on(
     let (mut rows, lineage, unavailable) =
         historical_rows(conn, &source, &event_rows, None, cutover)?;
     filter_date(&mut rows, request.as_of)?;
+    let mut period_ids = rows
+        .iter()
+        .map(|row| row.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for source_fill in source.fills() {
+        let row = source_fill.fill();
+        let original_date =
+            crate::trading::paper_lot_ledger::parse_paper_fill_timestamp(row.id, &row.occurred_at)
+                .map_err(LedgerError::IntegrityFailure)?
+                .checked_add_signed(chrono::Duration::hours(8))
+                .ok_or(LedgerError::Overflow)?
+                .date();
+        if original_date <= request.as_of {
+            period_ids.insert(row.id);
+        }
+    }
+    let period_lineage = lineage
+        .iter()
+        .filter(|proof| period_ids.contains(&proof.fill_id))
+        .cloned()
+        .collect();
     let adjudication_head =
         event_rows
             .iter()
@@ -703,6 +755,7 @@ fn legacy_verified_on(
         receipt,
         rows,
         lineage,
+        period_lineage,
         unavailable,
         seed_lots: Vec::new(),
     })

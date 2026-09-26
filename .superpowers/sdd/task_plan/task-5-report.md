@@ -182,3 +182,28 @@ RED：`cargo test --lib effective_fill_ -- --nocapture`，session 24430。
 | 不属于在线消费者 | paper_engine cfg(test) 加载器、paper_trade 测试写入、各种测试 fixture | production run_once 保持 fail-closed；本任务不改变真实 stock_position 或另一条真实交易 OrderStatus::Filled 路径 |
 
 Task10 明确保留：生产扩展显式迁移/全局 catalog 重资格、一次性 seed/cutover 与旧 worker drain、归因 epoch 与 paper 边界对齐资格、历史 manifest preview 后的用户授权 apply/重算、真实部署与运行验收。本任务没有读取生产记录、裁定历史 ID、部署或发送消息。
+
+## Fix round 1 — I01 历史裁定预览 / M01 目标日快照身份
+
+固定基线 `afb43a40157ba7611846719fea35452d5f73f7f2`，依据 `task-5-review.md` 的 I01 与 M01；只修改这两个可复现行为，不涉及生产操作。
+
+- I01：使用真实隔离库的 cutover 前 buy→sell，分别预览 quarantine 和改价；要求显式区分 current account 与 LegacyBeforeCutover 历史范围，历史依赖不可用与 apply/reopen 一致，preview 重复/重开零写，seed/cash 不变。
+- M01：snapshot 的目标日内容身份与完整 source/CAS receipt 分层；完整源与链仍先验证，只让目标日以后无关成交退出派生缓存键，晚到且作用于目标日的裁定仍使旧结果失效。不得更改原 snapshot bytes 或削弱 execution head CAS。
+- TDD 首条命令 `cargo test --lib effective_fill_legacy_preview -- --nocapture`，session 87493：测试编译发现 `LedgerError` 没有 PartialEq。仅将断言改为匹配 typed error/reason；此条不是业务 RED，后续需真实执行用例。
+- 同命令 session 11919 仍未到行为：匹配 guard 不能移动 String；改成 `as_str/as_deref` 借用比较。保留两次测试作者错误，不把编译失败充当业务回归证据。session 89091 再执行同一用例。
+- I01 真正 RED：session 89091，3m47s 编译、0.24s 测试，0 passed / 1 failed。历史 quarantine preview 实际仅返回 `cash=100000000000, fees=0, unavailable=null` 和当前账户 hash，没有历史影响。最小实现保留原 `AdjudicatedFact` bytes/schema，preview 明确返回 `current_account` 与 `historical_scope`（scope、LegacyEconomicV1 before/after hash、同 apply 的依赖失败原因）；CLI 输出显式复用这份结果。
+- I01 GREEN：`cargo test --lib -- effective_fill_legacy_preview effective_fill_ruling_failure_after_writes --nocapture`，session 9534，2/2；编译 3m47s、测试 0.77s。历史 quarantine/改价、零写/重复/重开/apply 一致，以及原 epoch preview/事务失败均通过。
+- M01 真正 RED：`cargo test --lib effective_fill_snapshot_period -- --nocapture`，session 39493，0 passed / 1 failed，测试 0.26s；次日普通买入使昨日 `current_snapshot` 无法返回原 revision。新用例同时要求无关未来改价不影响昨日、相关晚到改价失效并追加、旧 AsKnown bytes 可恢复、重开幂等，以及未来原始行被篡改时昨日查询仍失败封闭。
+- M01 最小实现：完整 `projection_hash`/raw high-water/head/inventory/lineage/CAS 合同保持不变；仅 snapshot command 使用版本化 `PaperSnapshotPeriodInputV1`，绑定显式 scope/as-of/cutover/rules/catalog、目标日前经济行、原始或更正后事实日期在目标日前的 lineage（含隔离）与 seed lots。先完成全链取证，后按日计算结果身份；晚到的相关裁定仍进入该身份。
+- 兼容性：原 `DerivedSnapshotV1` codec、result hash 验证和既有 bytes 不变；command 前缀版本为 `derived-snapshot:period-v1`。pre-fix 旧键结果保留可审计，新 owner 首次 settle 追加新缓存合同的 revision，不自动覆盖或部署补算。
+- 最终 lib GREEN：`cargo test --lib paper_ledger -- --nocapture`，session 36228，45/45；编译 3m44s，测试 8.67s。覆盖 I01/M01 新行为、旧 DerivedSnapshot 尾事件稳定、源篡改/未知 schema/链截断失败封闭、并发/原子性/陈旧 CAS、opening 与已迁移经济消费者。没有重复无关全量测试。
+- 最终 bin GREEN：`cargo test --bin monitor --bin paper_adjudication_preview -- health:: tests::output_preserves tests::explicit_paths --nocapture`，session 21837，monitor health 3/3 + preview CLI 2/2；编译 2m38s，测试均 <0.01s。CLI 不仅检查参数，也断言真实输出映射保留历史 scope/hash/依赖诊断、当前现金可用与 preview_only/applied=false。
+- 最终 `git diff --check` 通过。lib GREEN 后仅对新增测试做空白/换行整理，没有再次修改行为，也不因此重复编译。
+
+### Fix round 1 自审与交付边界
+
+- I01 当前账户输出位于 `src/trading/paper_ledger_adjudication.rs:105`；历史 hash 直接使用与 apply 相同的 `historical_projection`，不从当前现金伪造。新公开类型仅用于 preview，持久化 `AdjudicatedFact` codec 未变；CLI 映射在 `src/bin/paper_adjudication_preview.rs:55`。
+- M01 目标日身份位于 `src/trading/paper_effective_fills.rs:76`，原始/更正后日期选择在 `:293` 与 `:709`，消费在 `src/trading/paper_ledger_snapshot.rs:103`。所有 `verified_on/load` 完整验证仍在查缓存之前；没有修改 execute/sell CAS。
+- 回归位于 `src/trading/paper_ledger_tests.rs:804`（跨日、相关/无关晚到改价、旧 bytes、重开、未来原始行篡改）及 `:1402`（历史 quarantine/改价 preview/apply/reopen、seed/cash 不变）。旧 epoch preview 同时继续通过。
+- 本轮只改上述六个 Rust 文件（含公开 re-export 的 `paper_ledger.rs`）及本报告；progress 仅追加状态，不纳入实现提交。未修改 schema/catalog/部署配置或生产数据。
+- 未执行 production legacy adjudication、旧键 snapshot 补算/新 owner 激活、长期规模测试、真实 monitor 运行验收；这些仍留 Task10。原报告记录的混合 activation busy 测试 flake 本轮没有扩大重测，也不声称已消除。

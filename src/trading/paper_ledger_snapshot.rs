@@ -27,7 +27,7 @@ impl PaperLedger<'_> {
         conn.immediate_transaction(|conn| {
             let effective = effective::verified_on(conn, request)?;
             effective.rows()?;
-            let command = command(&effective);
+            let command = command(&effective)?;
             if let Some(original) = find(conn, binding, &command)? {
                 return Ok(original);
             }
@@ -84,7 +84,7 @@ impl PaperLedger<'_> {
         conn.transaction(|conn| {
             let effective = effective::verified_on(conn, request)?;
             effective.rows()?;
-            find(conn, binding, &command(&effective))
+            find(conn, binding, &command(&effective)?)
         })
     }
 }
@@ -98,12 +98,14 @@ fn binding(request: &EffectiveFillRequest) -> Result<&AccountBinding, LedgerErro
         EffectiveFillScope::LegacyRaw => Err(LedgerError::NotSeeded),
     }
 }
-fn command(effective: &VerifiedEffectiveFillSet) -> String {
-    format!(
-        "derived-snapshot:{ALGORITHM}:{}:{}",
+fn command(effective: &VerifiedEffectiveFillSet) -> Result<String, LedgerError> {
+    // Version the derived cache key independently from the frozen metrics
+    // codec. Full source/CAS evidence remains in the immutable revision.
+    Ok(format!(
+        "derived-snapshot:period-v1:{ALGORITHM}:{}:{}",
         effective.receipt().request.as_of,
-        effective.receipt().projection_hash
-    )
+        effective.snapshot_input_hash()?
+    ))
 }
 fn find(
     conn: &mut SqliteConnection,

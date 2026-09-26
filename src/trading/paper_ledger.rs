@@ -18,7 +18,10 @@ use execution::{apply_fact, OrderFact};
 pub use execution::{ExecuteIntent, PriceIntent, ValuationBatch};
 #[path = "paper_ledger_adjudication.rs"]
 mod adjudication;
-pub use adjudication::{Adjudication, AdjudicationAction, AdjudicationPreview, FillFingerprint};
+pub use adjudication::{
+    AccountProjectionImpact, Adjudication, AdjudicationAction, AdjudicationPreview, FillFingerprint,
+    HistoricalProjectionImpact,
+};
 #[path = "paper_effective_fills.rs"]
 mod effective;
 pub use effective::{

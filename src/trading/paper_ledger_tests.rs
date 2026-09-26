@@ -800,6 +800,99 @@ fn effective_fill_snapshot_is_append_only_stable_after_its_own_result_and_reopen
     );
 }
 
+#[test]
+fn effective_fill_snapshot_period_ignores_future_orders_but_invalidates_relevant_late_rulings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("TEST_CODE_snapshot_period.db");
+    let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let binding = manifest().binding().unwrap();
+    ledger.apply(PaperCommand::Seed(manifest())).unwrap();
+    let first_fill = ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger, &binding, "day-one", Direction::Buy, 10.0, instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let first = ledger.settle_snapshot(&request).unwrap();
+    let old_bytes = encode(&first).unwrap();
+    let tomorrow = || instant() + chrono::Duration::days(1);
+    let next = PaperLedger::open(&db, &tomorrow);
+    let future_fill = next
+        .apply(PaperCommand::Execute(order(
+            &next, &binding, "day-two", Direction::Buy, 10.0, tomorrow(),
+        )))
+        .unwrap();
+    assert_eq!(
+        next.current_snapshot(&request).unwrap().map(|r| encode(&r).unwrap()),
+        Some(old_bytes.clone()),
+        "next-day order must not make yesterday's snapshot unhealthy"
+    );
+    let version = next.read(&binding).unwrap().version;
+    assert_eq!(
+        encode(&next.settle_snapshot(&request).unwrap()).unwrap(),
+        old_bytes
+    );
+    assert_eq!(next.read(&binding).unwrap().version, version);
+    // Even a late ruling is irrelevant when both the original and its corrected fact are after D.
+    let mut future_ruling = ruling_for(
+        &next, &binding, future_fill.paper_trade_id.unwrap(), "future-price",
+    );
+    future_ruling.decision_at = tomorrow();
+    future_ruling.action = AdjudicationAction::CorrectionDeclared {
+        price: Money::from_cny(11.0).unwrap(),
+        quantity: 100,
+        fact_at: tomorrow(),
+    };
+    next.adjudicate(future_ruling).unwrap();
+    assert_eq!(
+        encode(&next.current_snapshot(&request).unwrap().unwrap()).unwrap(),
+        old_bytes
+    );
+    let mut relevant = ruling_for(
+        &next, &binding, first_fill.paper_trade_id.unwrap(), "yesterday-price",
+    );
+    relevant.decision_at = tomorrow();
+    relevant.action = AdjudicationAction::CorrectionDeclared {
+        price: Money::from_cny(9.0).unwrap(),
+        quantity: 100,
+        fact_at: instant(),
+    };
+    next.adjudicate(relevant).unwrap();
+    assert!(next.current_snapshot(&request).unwrap().is_none());
+    let revised = next.settle_snapshot(&request).unwrap();
+    assert_ne!(revised.result_hash, first.result_hash);
+    assert_eq!(
+        encode(&next.current_snapshot(&EffectiveFillRequest {
+            history: EffectiveHistory::AsKnown {
+                ledger_version: Some(first.projection.ledger_head.unwrap().0),
+            },
+            ..request.clone()
+        }).unwrap().unwrap()).unwrap(),
+        old_bytes,
+        "old revision remains frozen and verifiable"
+    );
+    let reopened = DatabaseManager::open_isolated_for_test(path).unwrap();
+    let reopened_ledger = PaperLedger::open(&reopened, &tomorrow);
+    assert_eq!(
+        encode(&reopened_ledger.settle_snapshot(&request).unwrap()).unwrap(),
+        encode(&revised).unwrap()
+    );
+    // Scope-specific cache identity must not bypass full-source integrity validation.
+    diesel::sql_query("UPDATE paper_trades SET fill_price=99 WHERE id=?")
+        .bind::<BigInt, _>(future_fill.paper_trade_id.unwrap())
+        .execute(&mut reopened.get_conn().unwrap()).unwrap();
+    assert!(matches!(
+        reopened_ledger.current_snapshot(&request),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+}
+
 fn manifest() -> SeedManifest {
     SeedManifest {
         account_id: "TEST_CODE_ACCOUNT".into(),
@@ -942,7 +1035,9 @@ fn effective_fill_ruling_failure_after_writes_rolls_back_and_request_payload_con
     );
     let before = ledger.read(&binding).unwrap();
     let preview = ledger.preview_adjudication(&request).unwrap();
-    assert_eq!(preview.cash, Money::from_cny(100000.0).unwrap());
+    assert_eq!(preview.current_account.cash, Money::from_cny(100000.0).unwrap());
+    assert!(preview.current_account.changed);
+    assert!(preview.historical_scope.is_none());
     assert_eq!(ledger.read(&binding).unwrap(), before);
     ledger.before_commit_fault = Some(&|| true);
     assert!(
@@ -1301,6 +1396,82 @@ fn effective_fill_legacy_raw_is_explicit_as_known_and_cannot_authorize_adjudicat
         ledger.verified_effective_fills(&request).is_err(),
         "once seeded, callers must choose a bound scope"
     );
+}
+
+#[test]
+fn effective_fill_legacy_preview_separates_history_from_current_account_and_never_writes() {
+    for quarantine in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("TEST_CODE_legacy_preview.db");
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        declare_test_catalog_v2(&db);
+        let id = legacy_buy(&db);
+        diesel::sql_query("INSERT INTO paper_trades(plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES ('TEST_CODE_legacy_sell','TEST_CODE_000001','fixture','sell',11,100,'Filled',11,'TEST_CODE_legacy','Normal','Full','2026-07-13 02:00:00','2026-07-13 02:00:00')")
+            .execute(&mut db.get_conn().unwrap()).unwrap();
+        let ledger = PaperLedger::open(&db, &instant);
+        let binding = manifest().binding().unwrap();
+        ledger.apply(PaperCommand::Seed(manifest())).unwrap();
+        let before = ledger.read(&binding).unwrap();
+        let mut request = ruling_for(&ledger, &binding, id, "historical-preview");
+        if !quarantine {
+            request.action = AdjudicationAction::CorrectionDeclared {
+                price: Money::from_cny(9.0).unwrap(),
+                quantity: 100,
+                fact_at: request.original.fact_at,
+            };
+        }
+        let preview = ledger.preview_adjudication(&request).unwrap();
+        let value = serde_json::to_value(&preview).unwrap();
+        assert!(
+            value["historical_scope"].is_object(),
+            "historical preview must not report only current cash: {value}"
+        );
+        let historical = &value["historical_scope"];
+        assert_eq!(
+            historical["scope"],
+            serde_json::to_value(EffectiveFillScope::LegacyBeforeCutover(binding.clone())).unwrap()
+        );
+        assert_ne!(historical["before_hash"], historical["after_hash"]);
+        assert_eq!(historical["unavailable"].is_string(), quarantine);
+        assert_eq!(value["current_account"]["changed"], false);
+        assert_eq!(value["current_account"]["cash"], 100_000_000_000_i64);
+        assert!(value["current_account"]["unavailable"].is_null());
+        assert_eq!(ledger.preview_adjudication(&request).unwrap(), preview);
+        assert_eq!(
+            ledger.read(&binding).unwrap(), before, "preview is zero-write"
+        );
+        let reopened = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let reopened_ledger = PaperLedger::open(&reopened, &instant);
+        assert_eq!(
+            reopened_ledger.preview_adjudication(&request).unwrap(), preview
+        );
+        let receipt = reopened_ledger.adjudicate(request.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&receipt.reason).unwrap(), historical["unavailable"]
+        );
+        assert_eq!(
+            reopened_ledger.read(&binding).unwrap().projection, before.projection
+        );
+        let history_request = EffectiveFillRequest {
+            scope: EffectiveFillScope::LegacyBeforeCutover(binding.clone()),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: day(instant()),
+        };
+        let effective = reopened_ledger.verified_effective_fills(&history_request).unwrap();
+        if quarantine {
+            assert!(matches!(effective.rows(), Err(LedgerError::EvidenceUnavailable(reason)) if Some(reason.as_str()) == receipt.reason.as_deref()));
+        } else {
+            assert_eq!(effective.rows().unwrap()[0].fill_price, Some(9.0));
+        }
+        let reopened_again = DatabaseManager::open_isolated_for_test(path).unwrap();
+        let ledger_again = PaperLedger::open(&reopened_again, &instant);
+        assert_eq!(
+            ledger_again.verified_effective_fills(&history_request).unwrap(), effective
+        );
+        assert_eq!(
+            ledger_again.adjudicate(request).unwrap().reason, receipt.reason
+        );
+    }
 }
 
 #[test]

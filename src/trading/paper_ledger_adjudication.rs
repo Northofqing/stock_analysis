@@ -102,11 +102,30 @@ impl PaperLedger<'_> {
             effective::verify_catalog(conn)?;
             let view = load(conn, &request.binding)?;
             let fact = prepare(conn, request, &view, (self.clock)())?;
+            let historical_scope =
+                if let Some((after_hash, unavailable)) = &fact.historical_projection {
+                    let rows = events(conn, &request.binding.account_id)?;
+                    let (before_hash, _) =
+                        effective::legacy_result(conn, &request.binding, &rows, None)?;
+                    Some(HistoricalProjectionImpact {
+                        scope: EffectiveFillScope::LegacyBeforeCutover(request.binding.clone()),
+                        identity_version: "LegacyEconomicV1".into(),
+                        before_hash,
+                        after_hash: after_hash.clone(),
+                        unavailable: unavailable.clone(),
+                    })
+                } else {
+                    None
+                };
             Ok(AdjudicationPreview {
-                projection_hash: digest(&encode(&fact.projection)?),
-                unavailable: fact.projection.economic_unavailable.clone(),
-                cash: fact.projection.cash,
-                fees: fact.projection.fees,
+                current_account: AccountProjectionImpact {
+                    changed: fact.projection != view.projection,
+                    projection_hash: digest(&encode(&fact.projection)?),
+                    unavailable: fact.projection.economic_unavailable.clone(),
+                    cash: fact.projection.cash,
+                    fees: fact.projection.fees,
+                },
+                historical_scope,
             })
         })
     }
@@ -114,10 +133,28 @@ impl PaperLedger<'_> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdjudicationPreview {
+    pub current_account: AccountProjectionImpact,
+    pub historical_scope: Option<HistoricalProjectionImpact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountProjectionImpact {
+    pub changed: bool,
     pub projection_hash: String,
     pub unavailable: Option<String>,
     pub cash: Money,
     pub fees: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalProjectionImpact {
+    pub scope: EffectiveFillScope,
+    /// This historical economic hash is not a current-account/receipt hash.
+    pub identity_version: String,
+    pub before_hash: String,
+    pub after_hash: String,
+    /// The same FIFO/T+1/dependent-sell diagnostic frozen by apply.
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
