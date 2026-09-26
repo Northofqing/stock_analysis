@@ -16,6 +16,9 @@ use rusqlite::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[path = "attribution_effective.rs"]
+mod effective;
+pub use effective::{commit_effective_window, compute_effective_attribution, EffectiveAttributionRunner, EffectiveAttributionReport, EffectiveCycleAttribution, PreparedEffectiveAttributionReport};
 
 use super::attribution::SignalFamily;
 use super::attribution_epoch::{
@@ -68,6 +71,7 @@ const MIN_COVERAGE_DAYS: i64 = 84;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AttributionUnavailable {
     SourceUnavailable,
+    PaperScopeRequired,
     TradeTimeUnavailable,
     StockCloseUnavailable,
     FeeEvidenceUnavailable,
@@ -79,6 +83,7 @@ impl AttributionUnavailable {
     pub const fn code(self) -> &'static str {
         match self {
             Self::SourceUnavailable => "replay_source_unavailable",
+            Self::PaperScopeRequired => "paper_scope_required",
             Self::TradeTimeUnavailable => "trade_time_unavailable",
             Self::StockCloseUnavailable => "stock_close_unavailable",
             Self::FeeEvidenceUnavailable => "fee_evidence_unavailable",
@@ -1359,6 +1364,32 @@ impl AttributionReplayLoader {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| source_read_error("begin one read transaction", error))
             .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        let generation:i64=transaction.query_row("PRAGMA user_version",[],|row|row.get(0))
+            .map_err(|error|source_read_error("check paper generation",error))
+            .map_err(|error|progress.failure(error,AttributionReplayLoadStage::Trade,None))?;
+        if !matches!(generation,0|1) {
+            return Err(progress.failure(AttributionReplayError::unavailable(
+                AttributionUnavailable::PaperScopeRequired,false,
+                "extended or unknown catalog requires explicit verified paper scope; no implicit legacy fallback",
+            ),AttributionReplayLoadStage::Trade,None));
+        }
+        let has_paper_account_table: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_ledger_account')",
+            [], |row| row.get(0),
+        ).map_err(|error| source_read_error("check paper scope", error))
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        if has_paper_account_table {
+            let bound: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM paper_ledger_account)", [], |row| row.get(0),
+            ).map_err(|error| source_read_error("check paper binding", error))
+                .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+            if bound {
+                return Err(progress.failure(AttributionReplayError::unavailable(
+                    AttributionUnavailable::PaperScopeRequired, false,
+                    "bound PaperLedger requires explicit paper scope/history; raw replay cannot authorize economic restatement",
+                ), AttributionReplayLoadStage::Trade, None));
+            }
+        }
         let all_paper_rows = load_paper_rows(&transaction)
             .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
         let audit_rows = load_order_audits(&transaction)
@@ -4365,6 +4396,8 @@ impl<'a> AttributionReplayRunner<'a> {
                 let snapshot = self
                     .database
                     .attribution_read_transaction(|connection| {
+                        crate::database::attribution_epochs::require_explicit_paper_scope_if_bound(connection)
+                            .map_err(EpochReplaySnapshotFailure::Epoch)?;
                         let resolved = load_selector_with_connection(connection, selector)
                             .map_err(EpochReplaySnapshotFailure::Epoch)?;
                         summary.record_resolved_epoch(&resolved);
@@ -4777,6 +4810,15 @@ fn load_runner_benchmarks(
     supplied: &[BenchmarkDayManifest],
     summary: &mut FailureEvidenceSummary,
 ) -> Result<(Vec<BenchmarkBar>, String, Vec<BenchmarkDayManifest>), ReplayError> {
+    let mut required = calendar.required_trading_dates().iter().copied().collect::<BTreeSet<_>>();
+    required.extend(evidence.fills().iter().filter_map(|fill|fill.terminal_time().map(|time|time.date_naive())));
+    load_runner_benchmarks_for_dates(database,instrument,&required,supplied,summary)
+}
+
+fn load_runner_benchmarks_for_dates(
+    database:&DatabaseManager,instrument:&str,required:&BTreeSet<NaiveDate>,
+    supplied:&[BenchmarkDayManifest],summary:&mut FailureEvidenceSummary,
+) -> Result<(Vec<BenchmarkBar>, String, Vec<BenchmarkDayManifest>), ReplayError> {
     if supplied
         .windows(2)
         .any(|pair| pair[0].trading_date >= pair[1].trading_date)
@@ -4788,17 +4830,6 @@ fn load_runner_benchmarks(
             false,
         ));
     }
-    let mut required = calendar
-        .required_trading_dates()
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    required.extend(
-        evidence
-            .fills()
-            .iter()
-            .filter_map(|fill| fill.terminal_time().map(|time| time.date_naive())),
-    );
     let supplied_dates = supplied
         .iter()
         .map(|binding| binding.trading_date)

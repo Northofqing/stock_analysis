@@ -1,8 +1,5 @@
-//! v16.4 #4: paper_performance_snapshot 独立表 + PerformanceEngine
-//!
-//! 设计 (v16.3 doc §6): paper_trades 是 immutable 写入 (即成事实, 不 UPDATE),
-//!                          PerformanceSnapshot 独立表 (Sharpe/Sortino/WinRate/IC/IR),
-//!                          每天 15:05 跑一次结算, 写 snapshot.
+//! PaperLedger 追加式每日绩效 revision；旧日期表仅作历史只读兼容。
+//! 同一有效成交 receipt 提供策略净指标和独立 opening-inventory exclusions。
 
 use crate::database::DatabaseManager;
 use chrono::{Local, NaiveDate};
@@ -37,71 +34,46 @@ pub struct PerformanceSnapshot {
     pub created_at: String,
 }
 
-pub fn ensure_table() -> Result<(), String> {
-    let mut conn = DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {}", e))?;
-    diesel::sql_query(
-        r#"
-        CREATE TABLE IF NOT EXISTS paper_performance_snapshot (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL UNIQUE,
-            total_trades INTEGER NOT NULL DEFAULT 0,
-            winning_trades INTEGER NOT NULL DEFAULT 0,
-            losing_trades INTEGER NOT NULL DEFAULT 0,
-            total_pnl REAL NOT NULL DEFAULT 0.0,
-            sharpe_ratio REAL NOT NULL DEFAULT 0.0,
-            sortino_ratio REAL NOT NULL DEFAULT 0.0,
-            win_rate REAL NOT NULL DEFAULT 0.0,
-            max_drawdown REAL NOT NULL DEFAULT 0.0,
-            info_ratio REAL NOT NULL DEFAULT 0.0,
-            sharpe_ratio_v2 REAL,
-            sortino_ratio_v2 REAL,
-            win_rate_v2 REAL,
-            max_drawdown_v2 REAL,
-            info_ratio_v2 REAL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        "#,
-    )
-    .execute(&mut conn)
-    .map_err(|e| format!("create paper_performance_snapshot: {}", e))?;
-    for column in [
-        "sharpe_ratio_v2 REAL",
-        "sortino_ratio_v2 REAL",
-        "win_rate_v2 REAL",
-        "max_drawdown_v2 REAL",
-        "info_ratio_v2 REAL",
-    ] {
-        let sql = format!("ALTER TABLE paper_performance_snapshot ADD COLUMN {column}");
-        if let Err(error) = diesel::sql_query(&sql).execute(&mut conn) {
-            if !error.to_string().contains("duplicate column") {
-                return Err(format!(
-                    "migrate paper_performance_snapshot {column}: {error}"
-                ));
-            }
-        }
-    }
-    Ok(())
+pub fn compute_snapshot(date: NaiveDate) -> Result<PerformanceSnapshot, String> {
+    use crate::trading::paper_ledger::{
+        EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, PaperLedger,
+    };
+    let binding = crate::trading::paper_ledger_runtime::active_binding()?;
+    let db = DatabaseManager::try_get().ok_or("paper snapshot DB unavailable")?;
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: date,
+    };
+    PaperLedger::open(db, &chrono::Utc::now)
+        .settle_snapshot(&request)
+        .map(|revision| revision.metrics)
+        .map_err(|e| e.to_string())
 }
 
-pub fn compute_snapshot(date: NaiveDate) -> Result<PerformanceSnapshot, String> {
-    let mut conn = DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| format!("DB: {}", e))?;
-    let date_str = date.format("%Y-%m-%d").to_string();
-    let fill_rows: Vec<PaperFillRow> = diesel::sql_query(
-        "SELECT id, code, direction, fill_price, quantity, \
-                datetime(ts, 'localtime') AS local_ts \
-         FROM paper_trades \
-         WHERE datetime(ts, 'localtime') < datetime(?, '+1 day') \
-           AND status = 'Filled' \
-         ORDER BY datetime(ts, 'localtime') ASC, id ASC",
-    )
-    .bind::<diesel::sql_types::Text, _>(&date_str)
-    .load::<PaperFillRow>(&mut conn)
-    .map_err(|e| format!("query paper_trades: {}", e))?;
-    let pnls = realized_pnls_for_date(&fill_rows, date)?;
+pub fn has_current_snapshot(date: NaiveDate) -> Result<bool, String> {
+    use crate::trading::paper_ledger::{
+        EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, PaperLedger,
+    };
+    let binding = crate::trading::paper_ledger_runtime::active_binding()?;
+    let db = DatabaseManager::try_get().ok_or("paper snapshot DB unavailable")?;
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: date,
+    };
+    PaperLedger::open(db, &chrono::Utc::now)
+        .current_snapshot(&request)
+        .map(|revision| revision.is_some())
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn metrics_from_pnls(
+    date: NaiveDate,
+    pnls: &[f64],
+    id: i32,
+    created_at: String,
+) -> Result<PerformanceSnapshot, String> {
     let total_trades = i32::try_from(pnls.len())
         .map_err(|_| format!("paper performance trade count overflow: {}", pnls.len()))?;
     let winning = i32::try_from(pnls.iter().filter(|pnl| **pnl > 0.0).count())
@@ -109,44 +81,28 @@ pub fn compute_snapshot(date: NaiveDate) -> Result<PerformanceSnapshot, String> 
     let losing = total_trades - winning;
     let total_pnl = pnls.iter().sum::<f64>();
     let win_rate = (total_trades > 0).then_some(winning as f64 / total_trades as f64);
-    let sharpe = compute_sharpe(&pnls);
-    let sortino = compute_sortino(&pnls);
-    let max_dd = compute_max_drawdown(&pnls);
+    let sharpe = compute_sharpe(pnls);
+    let sortino = compute_sortino(pnls);
+    let max_dd = compute_max_drawdown(pnls);
     let info_ratio: Option<f64> = None;
 
-    diesel::sql_query(
-        "INSERT OR REPLACE INTO paper_performance_snapshot \
-         (date, total_trades, winning_trades, losing_trades, total_pnl, \
-          sharpe_ratio_v2, sortino_ratio_v2, win_rate_v2, max_drawdown_v2, info_ratio_v2) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(&date_str)
-    .bind::<diesel::sql_types::Integer, _>(total_trades)
-    .bind::<diesel::sql_types::Integer, _>(winning)
-    .bind::<diesel::sql_types::Integer, _>(losing)
-    .bind::<diesel::sql_types::Double, _>(total_pnl)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(sharpe)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(sortino)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(win_rate)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(max_dd)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(info_ratio)
-    .execute(&mut conn)
-    .map_err(|e| format!("insert snapshot: {}", e))?;
-
-    let snap: PerformanceSnapshot = diesel::sql_query(
-        "SELECT id, date, total_trades, winning_trades, losing_trades, total_pnl, \
-         sharpe_ratio_v2 AS sharpe_ratio, sortino_ratio_v2 AS sortino_ratio, \
-         win_rate_v2 AS win_rate, max_drawdown_v2 AS max_drawdown, \
-         info_ratio_v2 AS info_ratio, created_at \
-         FROM paper_performance_snapshot WHERE date = ?",
-    )
-    .bind::<diesel::sql_types::Text, _>(&date_str)
-    .get_result(&mut conn)
-    .map_err(|e| format!("read snapshot: {}", e))?;
-
-    Ok(snap)
+    Ok(PerformanceSnapshot {
+        id,
+        date: date.to_string(),
+        total_trades,
+        winning_trades: winning,
+        losing_trades: losing,
+        total_pnl,
+        sharpe_ratio: sharpe,
+        sortino_ratio: sortino,
+        win_rate,
+        max_drawdown: max_dd,
+        info_ratio,
+        created_at,
+    })
 }
 
+#[cfg(test)]
 #[derive(diesel::QueryableByName, Debug)]
 struct PaperFillRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -163,12 +119,14 @@ struct PaperFillRow {
     local_ts: String,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct OpenLot {
     remaining: u32,
     price: f64,
 }
 
+#[cfg(test)]
 fn realized_pnls_for_date(
     rows: &[PaperFillRow],
     target_date: NaiveDate,
@@ -315,7 +273,6 @@ pub struct PerformanceEngine;
 
 impl PerformanceEngine {
     pub fn daily_settlement() -> Result<PerformanceSnapshot, String> {
-        ensure_table()?;
         let today = Local::now().date_naive();
         compute_snapshot(today)
     }

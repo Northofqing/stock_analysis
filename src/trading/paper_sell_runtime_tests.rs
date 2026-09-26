@@ -22,6 +22,7 @@ impl PaperSellReadIo for SlowQuoteReadIo {
                 buy_fee_cost: 5.0,
                 first_buy_date: today.pred_opt().expect("fixture previous date"),
                 inventory_audit_evidence: "TEST_CODE_UNUSED_NO_QUOTE".to_owned(),
+                checkpoint: None,
             })
             .collect())
     }
@@ -179,6 +180,12 @@ impl LedgerFixture {
             directory.path().join("TEST_CODE_runtime_sales.db"),
         )
         .unwrap();
+        diesel::sql_query("PRAGMA application_id=1398035265")
+            .execute(&mut db.get_conn().unwrap())
+            .unwrap();
+        diesel::sql_query("PRAGMA user_version=2")
+            .execute(&mut db.get_conn().unwrap())
+            .unwrap();
         let cutover = chrono::Utc::now() - chrono::Duration::days(2);
         let sellable = chrono::Local::now().date_naive();
         let seed = SeedManifest {
@@ -317,13 +324,14 @@ impl PaperSellReadIo for SaleReadIo {
 
     fn execute(
         &self,
+        position: &PaperPosition,
         signal: &PaperSignal,
         quote: &crate::broker::ExecutionQuote,
         cancelled: &AtomicBool,
     ) -> Result<crate::trading::paper_trade::PaperOutcome, String> {
         // Fixture valuation is distinct from the deliberately slow/failing scan
         // quote. The actual transaction, risk, FIFO and compatible writes run.
-        crate::trading::paper_ledger_runtime::execute_on(
+        crate::trading::paper_ledger_runtime::execute_checked_on(
             &self.store.db,
             &self.store.binding,
             signal,
@@ -337,6 +345,7 @@ impl PaperSellReadIo for SaleReadIo {
                 })
             },
             cancelled,
+            position.checkpoint.as_ref(),
         )
     }
 }

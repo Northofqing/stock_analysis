@@ -445,6 +445,10 @@ impl PaperTradeTerminalBindingV1 {
     pub fn quote_observed_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.quote_observed_at
     }
+
+    pub fn audit_record_hash(&self) -> &str {
+        &self.audit_record_hash
+    }
 }
 
 fn is_lower_sha256(value: &str) -> bool {

@@ -118,30 +118,11 @@ pub fn fetch_attribution_close_prices(
     // 当日成交代码并入覆盖: 未估值 lot 全部来自当日新开仓 (快照只覆盖持仓代码),
     // 不并入则当日新开仓浮盈无法估值 (2026-09-01 实测教训)。只读查询。
     {
-        use diesel::prelude::*;
-        #[derive(diesel::QueryableByName)]
-        struct CodeRow {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            code: String,
-        }
-        let mut conn = stock_analysis::database::DatabaseManager::get()
-            .get_conn()
-            .map_err(|error| format!("数据库连接失败: {error}"))?;
-        let window_start = format!("{} 00:00:00", today.format("%Y-%m-%d"));
-        let window_end = format!(
-            "{} 00:00:00",
-            today.succ_opt().expect("日期上溢").format("%Y-%m-%d")
-        );
-        let trade_codes: Vec<String> = diesel::sql_query(
-            "SELECT DISTINCT code FROM paper_trades WHERE status = 'Filled' AND ts >= ? AND ts < ?",
-        )
-        .bind::<diesel::sql_types::Text, _>(&window_start)
-        .bind::<diesel::sql_types::Text, _>(&window_end)
-        .load::<CodeRow>(&mut conn)
-        .map_err(|error| format!("当日成交代码查询失败: {error}"))?
-        .into_iter()
-        .map(|row| row.code)
-        .collect();
+        let effective=stock_analysis::performance::economic_position::query_effective_fills_through(today)?;
+        // Include the whole scoped inventory history, not only today's raw fills:
+        // a historical correction may change an open lot's economic contribution.
+        let trade_codes: Vec<String> = effective.rows().map_err(|error|error.to_string())?
+            .iter().map(|row|row.code.clone()).collect();
         codes.extend(trade_codes);
         codes.sort();
         codes.dedup();

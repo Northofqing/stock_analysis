@@ -51,8 +51,39 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(test)]
+#[test]
+fn effective_fill_cli_requires_explicit_scope_manifest_and_defaults_to_preview() {
+    let cli=Cli::try_parse_from(["strategy_attribution","effective-replay","--db","TEST_CODE.db","--from","2026-09-14","--to","2026-09-15","--paper-request","TEST_CODE_request.json","--epoch","legacy"]);
+    assert!(cli.is_ok(),"explicit effective projection replay is not reachable: {cli:?}");
+    assert!(matches!(cli.unwrap().command, Command::EffectiveReplay {commit:false,..}));
+    assert!(Cli::try_parse_from(["strategy_attribution","effective-replay","--db","TEST_CODE.db","--from","2026-09-14","--to","2026-09-15"]).is_err());
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 按显式 paper scope/history 重算；默认只读，commit 仅追加新版报告。
+    EffectiveReplay {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        from: NaiveDate,
+        #[arg(long)]
+        to: NaiveDate,
+        #[arg(long)]
+        at: Option<DateTime<FixedOffset>>,
+        /// EffectiveFillRequest JSON；必须明确 scope/history/as_of，不读取环境默认值。
+        #[arg(long)]
+        paper_request: PathBuf,
+        #[arg(long = "manifest")]
+        manifests: Vec<ManifestArg>,
+        #[arg(long, default_value = "active")]
+        epoch: EpochSelectorArg,
+        #[arg(long, default_value_t = false)]
+        commit: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
     /// 只读解析业务日期，不连接数据库。
     Resolve {
         /// 显式 +08:00 运行时刻；省略时使用当前上海时刻。
@@ -1333,6 +1364,7 @@ fn command_format(command: &Command) -> OutputFormat {
         | Command::ResetSample { format, .. }
         | Command::Scheduled { format, .. }
         | Command::Replay { format, .. }
+        | Command::EffectiveReplay { format, .. }
         | Command::Quarter { format, .. } => *format,
     }
 }
@@ -1373,6 +1405,29 @@ fn execute_replay(
 async fn execute(cli: &Cli) -> Result<String, AppError> {
     validate_command(cli)?;
     match &cli.command {
+        Command::EffectiveReplay {db,from,to,at,paper_request,manifests,epoch,commit,format} => {
+            use stock_analysis::performance::attribution_replay::EffectiveAttributionRunner;
+            use stock_analysis::trading::paper_ledger::EffectiveFillRequest;
+            let bytes=std::fs::read(paper_request).map_err(|_|AppError::usage("paper_request_unreadable"))?;
+            let paper:EffectiveFillRequest=serde_json::from_slice(&bytes).map_err(|_|AppError::usage("invalid_explicit_paper_request"))?;
+            let invoked_at=invocation_time(*at)?;
+            let access=if *commit {AttributionDatabaseAccess::AppendOnly} else {AttributionDatabaseAccess::ReadOnly};
+            let session=AttributionDatabaseSession::open(db,access).map_err(map_database_error)?;
+            let request=ReplayRequest{mode:ReplayMode::Range{from:*from,to:*to,invoked_at},epoch:epoch.0.clone(),benchmark_day_manifests:manifest_bindings(manifests)};
+            let runner=EffectiveAttributionRunner::new(session.database());
+            let (prepared,receipt)=if *commit {
+                let (prepared,receipt)=runner.commit(request,paper).map_err(map_replay_error)?;
+                (prepared,Some(receipt))
+            } else {(runner.preview(request,paper).map_err(map_replay_error)?,None)};
+            match format {
+                OutputFormat::Json => {
+                    let result:Value=serde_json::from_slice(&prepared.report().canonical_bytes().map_err(AppError::output_integrity)?).map_err(|e|AppError::output_integrity(e.to_string()))?;
+                    let receipt=receipt.as_ref().map(report_receipt_value).transpose()?;
+                    Ok(json!({"schema":"PaperEffectiveReplayCliV1","mode":if *commit {"append_report"}else{"preview"},"adjudication_applied":false,"result":result,"receipt":receipt}).to_string())
+                },
+                OutputFormat::Markdown => Ok(format!("模式：{}；不修改原始成交、不应用裁定、不重发卡片。\n\n{}\n追加报告凭据：{:?}",if *commit {"追加重算报告"}else{"只读预览"},prepared.report().render_markdown().map_err(AppError::output_integrity)?,receipt)),
+            }
+        },
         Command::Resolve { at, format } => {
             let invoked_at = invocation_time(*at)?;
             let calendar =
@@ -1528,6 +1583,21 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[tokio::test]
+    async fn effective_fill_cli_executes_read_only_legacy_preview_without_mutating_source() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("TEST_CODE_effective_cli.db");
+        create_source_schema(&path);
+        let request=dir.path().join("TEST_CODE_effective_request.json");
+        fs::write(&request,r#"{"scope":"LegacyRaw","history":{"AsKnown":{"ledger_version":null}},"as_of":"2026-08-21"}"#).unwrap();
+        let before=database_state(&path);
+        let cli=Cli::try_parse_from(["strategy_attribution","effective-replay","--db",path.to_str().unwrap(),"--from","2026-08-21","--to","2026-08-21","--at","2026-08-21T15:40:00+08:00","--paper-request",request.to_str().unwrap(),"--epoch","legacy","--format","json"]).unwrap();
+        let value:Value=serde_json::from_str(&execute(&cli).await.unwrap()).unwrap();
+        assert_eq!(value["mode"],"preview");assert_eq!(value["receipt"],Value::Null);
+        assert_eq!(value["result"]["projection"]["request"]["scope"],"LegacyRaw");
+        assert_eq!(value["result"]["fee_kind"],"Scenario");
+        assert_eq!(database_state(&path),before);
+    }
 
     fn manifest() -> String {
         format!("2026-08-21={}", "a".repeat(64))

@@ -7514,7 +7514,7 @@ fn parse_paper_trade_sqlite_time(
     field: &str,
     value: &str,
 ) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .map(|parsed| parsed.and_utc())
         .map_err(|error| format!("P-04 {field} 非法 {value:?}: {error}"))
 }
@@ -7544,12 +7544,6 @@ fn paper_trade_instrument_for_env(
     }
     InstrumentId::new(identity.exchange(), code, AssetClass::Equity)
         .map_err(|error| format!("P-04 无法构造测试股票身份 {code}: {error}"))
-}
-
-fn validate_paper_trade_dispatch_row(
-    row: PaperTradeDispatchRow,
-) -> Result<PaperTradeDispatchReport, String> {
-    validate_paper_trade_dispatch_row_for_env(row, stock_analysis::risk::env_guard::current_env())
 }
 
 fn validate_paper_trade_dispatch_row_for_env(
@@ -7756,17 +7750,23 @@ fn reject_ambiguous_paper_trade_reports(
 }
 
 fn load_today_paper_trade_reports() -> Result<Vec<PaperTradeDispatchReport>, String> {
-    use diesel::RunQueryDsl;
-
     let db = stock_analysis::database::DatabaseManager::try_get()
         .ok_or_else(|| "P-04 数据库未初始化".to_string())?;
     let mut conn = db
         .get_conn()
         .map_err(|error| format!("P-04 数据库连接失败: {error}"))?;
+    load_paper_trade_reports_on(&mut conn, chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap()).date_naive(),stock_analysis::risk::env_guard::current_env())
+}
+
+fn load_paper_trade_reports_on(conn:&mut diesel::sqlite::SqliteConnection,date:chrono::NaiveDate,env:stock_analysis::risk::env_guard::TradingEnv)->Result<Vec<PaperTradeDispatchReport>,String> {
+    use diesel::RunQueryDsl;
     let rows = diesel::sql_query(
         "SELECT p.id, p.plan_id, p.code, p.name, p.direction, p.price, p.quantity, \
                 p.status, p.fill_price, p.not_fill_reason, p.virtual_reason, \
-                p.account_mode, p.data_mode, p.ts AS paper_trade_created_at, \
+                p.account_mode, p.data_mode, \
+                CASE WHEN instr(oa.decision_basis, p.virtual_reason || ' | PaperLedgerV1 account=') = 1 \
+                     THEN strftime('%Y-%m-%d %H:%M:%f',p.ts,'-8 hours') \
+                     ELSE p.ts END AS paper_trade_created_at, \
                 oa.id AS order_audit_id, oac.previous_hash AS audit_previous_hash, \
                 oac.record_hash AS audit_record_hash, oa.quote_observed_at, \
                 oa.created_at AS terminal_at \
@@ -7774,7 +7774,8 @@ fn load_today_paper_trade_reports() -> Result<Vec<PaperTradeDispatchReport>, Str
          LEFT JOIN order_audit oa \
            ON oa.business_order_id = p.plan_id \
           AND oa.source = 'PaperTrade' \
-          AND oa.decision_basis = p.virtual_reason \
+          AND (oa.decision_basis = p.virtual_reason \
+               OR instr(oa.decision_basis, p.virtual_reason || ' | PaperLedgerV1 account=') = 1) \
           AND oa.side = p.direction \
           AND oa.code = p.code \
           AND oa.requested_price = p.price \
@@ -7788,15 +7789,17 @@ fn load_today_paper_trade_reports() -> Result<Vec<PaperTradeDispatchReport>, Str
                 AND oa.execution_price IS NULL \
                 AND oa.failure_reason = p.not_fill_reason)) \
          LEFT JOIN order_audit_chain oac ON oac.order_audit_id = oa.id \
-         WHERE date(p.ts, 'localtime') = date('now', 'localtime') \
+         WHERE (CASE WHEN instr(oa.decision_basis, p.virtual_reason || ' | PaperLedgerV1 account=') = 1 \
+                     THEN date(p.ts) ELSE date(p.ts,'+8 hours') END) = ? \
            AND p.status IN ('Filled', 'NotFilled', 'Invalidated') \
          ORDER BY p.id ASC, oa.id ASC",
     )
-    .load::<PaperTradeDispatchRow>(&mut conn)
+    .bind::<diesel::sql_types::Text,_>(date.to_string())
+    .load::<PaperTradeDispatchRow>(conn)
     .map_err(|error| format!("P-04 查询当日 paper_trades 失败: {error}"))?;
     let reports = rows
         .into_iter()
-        .map(validate_paper_trade_dispatch_row)
+        .map(|row|validate_paper_trade_dispatch_row_for_env(row,env))
         .collect::<Result<Vec<_>, _>>()?;
     reject_ambiguous_paper_trade_reports(&reports)?;
     Ok(reports)
@@ -7812,9 +7815,29 @@ struct PreparedPaperTrade {
 
 fn prepare_paper_trade_daily() -> Result<Vec<PreparedPaperTrade>, String> {
     let reports = load_today_paper_trade_reports()?;
+    let effective = if reports.iter().any(|report| report.status == PaperTradeStatus::Filled) {
+        Some(stock_analysis::performance::economic_position::query_effective_fills_through(
+            chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()).date_naive(),
+        )?)
+    } else { None };
     reports
         .into_iter()
+        .filter_map(|report| {
+            if report.status == PaperTradeStatus::Filled {
+                let set=effective.as_ref().expect("Filled batch has an effective capability");
+                match set.original_fill_card_allowed(report.id,report.terminal_binding.audit_record_hash()) {
+                    Ok(true)=>{},
+                    Ok(false)=>{
+                        log::warn!("[P-04] original Filled card suppressed by adjudication: fill={} projection={} lineage={:?}; no automatic resend",report.id,set.receipt().projection_hash,set.lineage().iter().find(|lineage|lineage.fill_id==report.id));
+                        return None;
+                    },
+                    Err(error)=>return Some(Err(format!("P-04 effective disposition unavailable: {error}"))),
+                }
+            }
+            Some(Ok(report))
+        })
         .map(|report| {
+            let report=report?;
             let hhmm = report
                 .terminal_binding
                 .quote_observed_at()
@@ -18729,6 +18752,7 @@ pub fn build_test_template_catalog(
         "R-12-backtest-review",
         stock_analysis::review::backtest::render_r12(
             &stock_analysis::review::backtest::R12BacktestResult {
+                effective_projection: None,
                 virtual_buy: vec![stock_analysis::review::backtest::SignalGroup {
                     reason: "TEST_CODE NewsCatalyst".to_string(),
                     window_bars: 4,
@@ -24982,6 +25006,39 @@ mod tests {
             stock_analysis::risk::env_guard::TradingEnv::Test
         )
         .is_err());
+    }
+
+    #[test]
+    fn effective_fill_p04_accepts_precise_native_terminal_time_without_changing_legacy_bytes() {
+        let legacy=validate_paper_trade_dispatch_row_for_env(valid_paper_trade_dispatch_row(),stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
+        let frozen=legacy.terminal_binding.canonical_bytes().unwrap();
+        let mut native=valid_paper_trade_dispatch_row();
+        native.paper_trade_created_at="2026-07-30 01:31:00.125".into();
+        native.terminal_at=Some("2026-07-30 01:31:00.125".into());
+        let report=validate_paper_trade_dispatch_row_for_env(native,stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
+        assert!(String::from_utf8(report.terminal_binding.canonical_bytes().unwrap()).unwrap().contains("01:31:00.125"));
+        assert_eq!(legacy.terminal_binding.canonical_bytes().unwrap(),frozen);
+    }
+
+    #[test]
+    fn effective_fill_p04_sqlite_join_keeps_native_and_legacy_fact_clock_exact() {
+        use diesel::{Connection,connection::SimpleConnection};
+        let file=tempfile::NamedTempFile::new().unwrap();
+        let mut conn=diesel::sqlite::SqliteConnection::establish(file.path().to_str().unwrap()).unwrap();
+        conn.batch_execute("CREATE TABLE paper_trades(id INTEGER,plan_id TEXT,code TEXT,name TEXT,direction TEXT,price REAL,quantity INTEGER,status TEXT,fill_price REAL,not_fill_reason TEXT,virtual_reason TEXT,account_mode TEXT,data_mode TEXT,ts TEXT);
+            CREATE TABLE order_audit(id INTEGER,business_order_id TEXT,source TEXT,decision_basis TEXT,side TEXT,code TEXT,requested_price REAL,quantity INTEGER,outcome TEXT,execution_price REAL,failure_reason TEXT,quote_observed_at TEXT,created_at TEXT);
+            CREATE TABLE order_audit_chain(order_audit_id INTEGER,previous_hash TEXT,record_hash TEXT);
+            INSERT INTO paper_trades VALUES(1,'TEST_CODE_legacy','TEST_CODE_600001','fixture','buy',10,100,'Filled',10,NULL,'NewsCatalyst','Normal','Full','2026-07-30 01:31:00'),
+            (2,'TEST_CODE_native','TEST_CODE_600001','fixture','buy',10,100,'Filled',10,NULL,'NewsCatalyst','Normal','Full','2026-07-30 09:31:00.125');
+            INSERT INTO order_audit VALUES(1,'TEST_CODE_legacy','PaperTrade','NewsCatalyst','buy','TEST_CODE_600001',10,100,'Filled',10,NULL,'2026-07-30T09:31:00+08:00','2026-07-30 01:31:00'),
+            (2,'TEST_CODE_native','PaperTrade','NewsCatalyst | PaperLedgerV1 account=TEST_CODE epoch=TEST_CODE head=fixture inventory=fixture fee_model=fixture','buy','TEST_CODE_600001',10,100,'Filled',10,NULL,'2026-07-30T09:31:00+08:00','2026-07-30 01:31:00');
+            INSERT INTO order_audit_chain VALUES(1,'BR086_ORDER_AUDIT_GENESIS_V1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),(2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');").unwrap();
+        let reports=load_paper_trade_reports_on(&mut conn,chrono::NaiveDate::from_ymd_opt(2026,7,30).unwrap(),stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
+        assert_eq!(reports.len(),2);
+        let native:serde_json::Value=serde_json::from_slice(&reports[1].terminal_binding.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(native["paper_trade_created_at"],"2026-07-30T01:31:00.125Z");
+        let legacy:serde_json::Value=serde_json::from_slice(&reports[0].terminal_binding.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(legacy["paper_trade_created_at"],"2026-07-30T01:31:00Z");
     }
 
     #[test]

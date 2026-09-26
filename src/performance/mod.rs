@@ -8,4 +8,4 @@ pub mod fee_evidence;
 pub mod report;
 pub mod snapshot;
 
-pub use snapshot::{compute_snapshot, ensure_table, PerformanceEngine, PerformanceSnapshot};
+pub use snapshot::{compute_snapshot, PerformanceEngine, PerformanceSnapshot};

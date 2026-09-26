@@ -10,6 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Task10 must explicitly seed and bind this manifest; absence is fail-closed.
 pub const BINDING_ENV: &str = "PAPER_LEDGER_ACCOUNT_BINDING";
+/// Frozen decision input; a new ruling invalidates a previously evaluated sell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryCheckpoint {
+    pub binding: AccountBinding,
+    pub version: i64,
+    pub event_hash: String,
+    pub inventory_fingerprint: String,
+}
 pub fn active_binding() -> Result<AccountBinding, String> {
     let raw = std::env::var(BINDING_ENV).map_err(|_| {
         "PaperLedger is not activated: explicit seed/cutover binding required".to_string()
@@ -51,6 +59,25 @@ pub fn execute(
     )
 }
 
+pub fn execute_candidate(
+    checkpoint: &InventoryCheckpoint,
+    signal: &PaperSignal,
+    quote: &ExecutionQuote,
+    cancelled: &AtomicBool,
+) -> Result<PaperOutcome, String> {
+    let db = DatabaseManager::try_get().ok_or("DB not initialized")?;
+    execute_checked_on(
+        db,
+        &checkpoint.binding,
+        signal,
+        quote,
+        &Utc::now,
+        &crate::broker::execution_quote,
+        cancelled,
+        Some(checkpoint),
+    )
+}
+
 /// The only injectable dependencies are storage, clock and outside-lock quotes;
 /// no caller-supplied financial balance can authorize a trade.
 pub(crate) fn execute_on(
@@ -61,6 +88,19 @@ pub(crate) fn execute_on(
     clock: &(dyn Fn() -> DateTime<Utc> + Sync),
     quotes: &dyn Fn(&str) -> Result<ExecutionQuote, String>,
     cancelled: &AtomicBool,
+) -> Result<PaperOutcome, String> {
+    execute_checked_on(db, binding, signal, quote, clock, quotes, cancelled, None)
+}
+
+pub(crate) fn execute_checked_on(
+    db: &DatabaseManager,
+    binding: &AccountBinding,
+    signal: &PaperSignal,
+    quote: &ExecutionQuote,
+    clock: &(dyn Fn() -> DateTime<Utc> + Sync),
+    quotes: &dyn Fn(&str) -> Result<ExecutionQuote, String>,
+    cancelled: &AtomicBool,
+    checkpoint: Option<&InventoryCheckpoint>,
 ) -> Result<PaperOutcome, String> {
     if cancelled.load(Ordering::SeqCst) {
         return Err(LedgerError::Cancelled.to_string());
@@ -78,6 +118,16 @@ pub(crate) fn execute_on(
         return outcome(signal.plan_id, receipt);
     }
     let view = ledger.read(binding).map_err(|error| error.to_string())?;
+    if let Some(checkpoint) = checkpoint {
+        if checkpoint.binding != *binding
+            || checkpoint.version != view.version
+            || checkpoint.event_hash != view.event_hash
+            || checkpoint.inventory_fingerprint
+                != view.inventory_fingerprint().map_err(|e| e.to_string())?
+        {
+            return Err(LedgerError::VersionChanged.to_string());
+        }
+    }
     let mut marks = Vec::new();
     let mut codes = view
         .lots
@@ -177,43 +227,33 @@ pub(crate) fn sellable_positions_on(
     binding: &AccountBinding,
     today: chrono::NaiveDate,
 ) -> Result<Vec<super::paper_sell::PaperPosition>, String> {
-    let view = PaperLedger::open(db, &Utc::now)
-        .read(binding)
+    let set = PaperLedger::open(db, &Utc::now)
+        .verified_effective_fills(&EffectiveFillRequest {
+            scope: EffectiveFillScope::Epoch(binding.clone()),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: today,
+        })
         .map_err(|error| error.to_string())?;
-    let mut grouped = std::collections::BTreeMap::<String, super::paper_sell::PaperPosition>::new();
-    let evidence = format!(
-        "PaperLedgerV1 account={} epoch={} head={} inventory={}",
-        binding.account_id,
-        binding.epoch_id,
-        view.version,
-        view.inventory_fingerprint()
-            .map_err(|error| error.to_string())?
-    );
-    for lot in view.lots.iter().filter(|lot| lot.sellable_from <= today) {
-        let position =
-            grouped
-                .entry(lot.code.clone())
-                .or_insert_with(|| super::paper_sell::PaperPosition {
-                    code: lot.code.clone(),
-                    name: lot.name.clone(),
-                    quantity: 0,
-                    avg_buy_price: 0.0,
-                    buy_fee_cost: 0.0,
-                    first_buy_date: lot.acquired_on,
-                    inventory_audit_evidence: evidence.clone(),
-                });
-        position.quantity = position
-            .quantity
-            .checked_add(i64::from(lot.quantity))
-            .ok_or("quantity overflow")?;
-        position.avg_buy_price += lot.basis_price.cny() * f64::from(lot.quantity);
-        position.buy_fee_cost += lot.buy_fee_remaining.cny();
-        position.first_buy_date = position.first_buy_date.min(lot.acquired_on);
+    let (version, event_hash) = set
+        .receipt()
+        .ledger_head
+        .clone()
+        .ok_or("effective inventory has no bound ledger head")?;
+    let checkpoint = InventoryCheckpoint {
+        binding: binding.clone(),
+        version,
+        event_hash,
+        inventory_fingerprint: set
+            .receipt()
+            .inventory_fingerprint
+            .clone()
+            .ok_or("effective inventory has no CAS fingerprint")?,
+    };
+    let mut positions = super::paper_sell::positions_from_effective(&set)?;
+    for position in &mut positions {
+        position.checkpoint = Some(checkpoint.clone());
     }
-    for position in grouped.values_mut() {
-        position.avg_buy_price /= position.quantity as f64;
-    }
-    Ok(grouped.into_values().collect())
+    Ok(positions)
 }
 
 pub fn already_sold_today(code: &str, today: &str) -> Result<bool, String> {

@@ -2,8 +2,9 @@
 
 use crate::database::DatabaseManager;
 use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(test)]
+use diesel::connection::SimpleConnection;
 use diesel::{
-    connection::SimpleConnection,
     prelude::*,
     sql_types::{BigInt, Text},
 };
@@ -15,6 +16,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod execution;
 use execution::{apply_fact, OrderFact};
 pub use execution::{ExecuteIntent, PriceIntent, ValuationBatch};
+#[path = "paper_ledger_adjudication.rs"]
+mod adjudication;
+pub use adjudication::{Adjudication, AdjudicationAction, AdjudicationPreview, FillFingerprint};
+#[path = "paper_effective_fills.rs"]
+mod effective;
+pub use effective::{
+    EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, EffectiveProjectionReceipt,
+    FillAuthority, FillLineage, VerifiedEffectiveFillSet,
+};
+#[path = "paper_ledger_snapshot.rs"]
+mod snapshot;
+pub use snapshot::SnapshotRevision;
+#[path = "paper_opening_inventory.rs"]
+mod opening_inventory;
+pub use opening_inventory::{
+    EffectiveExitPnl, EffectiveSellablePosition, OpeningInventoryExit, OpeningInventorySample,
+};
+
+/// Reuses a caller-owned read transaction; never opens a second connection or
+/// combines independently observed heads for attribution/report consumers.
+pub(crate) fn verified_effective_fills_on(
+    conn: &mut SqliteConnection,
+    request: &EffectiveFillRequest,
+) -> Result<VerifiedEffectiveFillSet, LedgerError> {
+    effective::verified_on(conn, request)
+}
 
 const GENESIS: &str = "PAPER_LEDGER_GENESIS_V1";
 pub const MONEY_MODEL: &str = "micro-cny-half-up-v1";
@@ -199,8 +226,17 @@ pub struct Projection {
     pub seed_equity: Money,
     pub as_of: DateTime<Utc>,
     pub closes: BTreeMap<NaiveDate, Money>,
+    /// Absent on frozen V1 bytes. A ruling may expose an unresolved dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    economic_unavailable: Option<String>,
 }
 impl Projection {
+    fn require_available(&self) -> Result<(), LedgerError> {
+        if let Some(reason) = &self.economic_unavailable {
+            return Err(LedgerError::EvidenceUnavailable(reason.clone()));
+        }
+        Ok(())
+    }
     pub fn equity(&self) -> Result<Money, LedgerError> {
         self.lots.iter().try_fold(self.cash, |equity, lot| {
             let mark = self.marks.get(&lot.code).ok_or_else(|| {
@@ -264,6 +300,8 @@ pub enum LedgerStatus {
     NotFilled,
     Invalidated,
     Rejected,
+    Adjudicated,
+    SnapshotRecorded,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditLink {
@@ -292,6 +330,7 @@ pub enum PaperCommand {
     Seed(SeedManifest),
     Execute(ExecuteIntent),
     Mark(ValuationBatch),
+    Adjudicate(Adjudication),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Fact {
@@ -302,6 +341,8 @@ enum Fact {
     },
     Order(OrderFact),
     Marked(ValuationBatch),
+    AdjudicatedV1(adjudication::AdjudicatedFact),
+    DerivedSnapshotV1(SnapshotRevision),
 }
 fn receipt(version: i64, hash: String, fact: &Fact, repeated: bool) -> PaperReceipt {
     let mut result = PaperReceipt {
@@ -319,6 +360,14 @@ fn receipt(version: i64, hash: String, fact: &Fact, repeated: bool) -> PaperRece
     match fact {
         Fact::Seeded { .. } => {}
         Fact::Marked(_) => result.status = LedgerStatus::Marked,
+        Fact::DerivedSnapshotV1(_) => result.status = LedgerStatus::SnapshotRecorded,
+        Fact::AdjudicatedV1(ruling) => {
+            result.status = LedgerStatus::Adjudicated;
+            result.reason = ruling.projection.economic_unavailable.clone();
+            if let Some((_, reason)) = &ruling.historical_projection {
+                result.reason = reason.clone();
+            }
+        }
         Fact::Order(order) => {
             result.status = order.status;
             result.reason = order.reason.clone();
@@ -341,6 +390,8 @@ pub struct PaperLedger<'a> {
     clock: &'a (dyn Fn() -> DateTime<Utc> + Sync),
     #[cfg(test)]
     after_commit_fault: Option<&'a (dyn Fn() -> bool + Sync)>,
+    #[cfg(test)]
+    before_commit_fault: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 impl<'a> PaperLedger<'a> {
     pub fn open(db: &'a DatabaseManager, clock: &'a (dyn Fn() -> DateTime<Utc> + Sync)) -> Self {
@@ -349,6 +400,8 @@ impl<'a> PaperLedger<'a> {
             clock,
             #[cfg(test)]
             after_commit_fault: None,
+            #[cfg(test)]
+            before_commit_fault: None,
         }
     }
     pub fn apply(&self, command: PaperCommand) -> Result<PaperReceipt, LedgerError> {
@@ -376,7 +429,14 @@ impl<'a> PaperLedger<'a> {
                 PaperCommand::Seed(seed) => self.seed(conn, seed),
                 PaperCommand::Execute(intent) => self.execute(conn, intent, at),
                 PaperCommand::Mark(batch) => self.mark(conn, batch, at),
+                PaperCommand::Adjudicate(request) => self.adjudicate_on(conn, request, at),
             }?;
+            #[cfg(test)]
+            if self.before_commit_fault.is_some_and(|fault| fault()) {
+                return Err(LedgerError::Database(
+                    "TEST_CODE injected post-write transaction failure".into(),
+                ));
+            }
             if cancelled.load(Ordering::SeqCst) {
                 return Err(LedgerError::Cancelled);
             }
@@ -397,7 +457,11 @@ impl<'a> PaperLedger<'a> {
             .db
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
-        conn.transaction(|conn| load(conn, binding))
+        conn.transaction(|conn| {
+            let view = load(conn, binding)?;
+            view.require_available()?;
+            Ok(view)
+        })
     }
     /// Recover a committed business terminal without obtaining new market
     /// evidence. This is read-only, validates the same chain and intent as
@@ -435,9 +499,12 @@ impl<'a> PaperLedger<'a> {
                 ));
             }
             if version == head.version {
+                head.require_available()?;
                 return Ok(head);
             }
-            replay_through(conn, binding, Some(version))
+            let view = replay_through(conn, binding, Some(version))?;
+            view.require_available()?;
+            Ok(view)
         })
     }
     pub fn effective_fills(
@@ -449,12 +516,13 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
-            load(conn, binding)?;
+            load(conn, binding)?.require_available()?;
+            let rulings = adjudication::latest_rulings(&events(conn, &binding.account_id)?)?;
             let mut fills = Vec::new();
             for event in events(conn, &binding.account_id)? {
                 if let Fact::Order(order) = decode(&event.payload)? {
                     if order.status == LedgerStatus::Filled {
-                        fills.push(EffectiveFill {
+                        let mut fill = EffectiveFill {
                             version: event.seq,
                             event_hash: event.event_hash,
                             paper_trade_id: order.paper_trade_id.ok_or_else(|| {
@@ -470,7 +538,24 @@ impl<'a> PaperLedger<'a> {
                             fee: order.commission.add(order.stamp)?,
                             occurred_at: order.occurred_at,
                             audit: order.audit,
-                        });
+                        };
+                        if let Some(action) = rulings.get(&fill.paper_trade_id) {
+                            match action {
+                                AdjudicationAction::Quarantine => continue,
+                                AdjudicationAction::CorrectionDeclared {
+                                    price,
+                                    quantity,
+                                    fact_at,
+                                } => {
+                                    fill.fill_price = *price;
+                                    fill.quantity = *quantity;
+                                    fill.occurred_at = *fact_at;
+                                    fill.fee =
+                                        adjudication::fee(*price, *quantity, &fill.direction)?;
+                                }
+                            }
+                        }
+                        fills.push(fill);
                     }
                 }
             }
@@ -631,6 +716,7 @@ fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
         seed_equity: Money::ZERO,
         as_of: seed.cutover_at,
         closes: BTreeMap::new(),
+        economic_unavailable: None,
     };
     projection.seed_equity = projection.equity()?;
     if projection.seed_equity <= Money::ZERO
@@ -768,6 +854,18 @@ fn replay_through(
             return Err(LedgerError::IntegrityFailure(
                 "event index/receipt metadata mismatch".into(),
             ));
+        }
+        if let Fact::AdjudicatedV1(ruling) = &fact {
+            adjudication::verify_ruling(
+                conn,
+                binding,
+                row.seq,
+                &row.previous_hash,
+                ruling,
+                state
+                    .as_ref()
+                    .ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
+            )?;
         }
         match fact {
             Fact::Seeded { manifest: seed, .. } if version == 1 && seed == manifest => {

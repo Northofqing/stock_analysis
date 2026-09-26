@@ -1,7 +1,6 @@
 //! Production health checks for storage, event delivery, strategies,
 //! performance snapshots, and realtime quote registration.
 
-use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sqlite::SqliteConnection;
@@ -70,41 +69,27 @@ fn probe_main_db_write(conn: &mut SqliteConnection) -> bool {
 }
 
 fn check_perf_24h() -> bool {
-    #[derive(diesel::QueryableByName)]
-    struct LatestSnapshot {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        created_at: Option<String>,
-    }
-
-    let Some(db) = DatabaseManager::try_get() else {
+    let Ok(target) = required_snapshot_date(chrono::Utc::now()) else {
         return false;
     };
-    let Ok(mut conn) = db.get_conn() else {
-        return false;
-    };
-    let Ok(row) = sql_query("SELECT MAX(created_at) AS created_at FROM paper_performance_snapshot")
-        .get_result::<LatestSnapshot>(&mut conn)
-    else {
-        return false;
-    };
-    row.created_at
-        .as_deref()
-        .is_some_and(|created_at| snapshot_is_recent(created_at, Utc::now().naive_utc()))
+    stock_analysis::performance::snapshot::has_current_snapshot(target).unwrap_or(false)
 }
 
-fn snapshot_is_recent(created_at: &str, now: NaiveDateTime) -> bool {
-    NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .is_some_and(|timestamp| {
-            let age = now.signed_duration_since(timestamp);
-            age.num_seconds() >= 0 && age.num_hours() <= 24
-        })
+fn required_snapshot_date(now: chrono::DateTime<chrono::Utc>) -> Result<chrono::NaiveDate, String> {
+    let now = now.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+    let today = now.date_naive();
+    if stock_analysis::calendar::verified_a_share_trading_day(today)?
+        && now.time() >= chrono::NaiveTime::from_hms_opt(15, 5, 0).unwrap()
+    {
+        Ok(today)
+    } else {
+        stock_analysis::calendar::verified_prev_a_share_trading_day(today)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
     #[test]
     fn db_write_probe_rejects_readable_query_only_connection_and_leaves_no_table() {
@@ -152,17 +137,16 @@ mod tests {
     }
 
     #[test]
-    fn performance_timestamp_must_be_within_24_hours() {
-        let now =
-            NaiveDateTime::parse_from_str("2026-07-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-        let recent = (now - Duration::hours(23))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        let stale = (now - Duration::hours(25))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        assert!(snapshot_is_recent(&recent, now));
-        assert!(!snapshot_is_recent(&stale, now));
-        assert!(!snapshot_is_recent("invalid", now));
+    fn effective_fill_health_requires_the_completed_shanghai_business_day() {
+        for (utc, expected) in [
+            ("2026-09-18T07:04:00Z", "2026-09-17"),
+            ("2026-09-18T07:05:00Z", "2026-09-18"),
+            ("2026-09-19T07:05:00Z", "2026-09-18"),
+        ] {
+            let at = chrono::DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            assert_eq!(required_snapshot_date(at).unwrap().to_string(), expected);
+        }
     }
 }

@@ -29,9 +29,6 @@ use crate::database::paper_inventory_failure_audit::{
 use crate::database::DatabaseManager;
 use crate::pipeline::position_tracker::{evaluate_sell_rules_with_net_return, SellEvaluation};
 use crate::strategy::detect_boll_macd_signal;
-use crate::trading::paper_lot_ledger::{
-    parse_paper_fill_timestamp, rebuild_paper_positions, PaperFill, PaperPositionInventory,
-};
 use crate::trading::paper_trade::{Direction, PaperRiskContext, PaperSignal, PaperTradeStatus};
 use crate::trend_analyzer::StockTrendAnalyzer;
 
@@ -50,6 +47,8 @@ pub struct PaperPosition {
     pub first_buy_date: chrono::NaiveDate,
     /// 绑定评估日、成交身份与剩余批次的规范化审计证据。
     pub inventory_audit_evidence: String,
+    /// Required for production execution; legacy diagnostic inventories cannot authorize orders.
+    pub checkpoint: Option<crate::trading::paper_ledger_runtime::InventoryCheckpoint>,
 }
 
 /// 一次卖出动作的结果（供 monitor 推送）。
@@ -147,6 +146,51 @@ pub fn aggregate_open_positions() -> Result<Vec<PaperPosition>, String> {
 fn aggregate_open_positions_at(
     as_of_date: chrono::NaiveDate,
 ) -> Result<Vec<PaperPosition>, String> {
+    match crate::performance::economic_position::query_effective_fills_through(as_of_date)
+        .and_then(|set| positions_from_effective(&set))
+    {
+        Ok(positions) => Ok(positions),
+        Err(error) => {
+            // Raw rows are used ONLY to persist failure evidence. They cannot
+            // recover/authorize an unavailable effective inventory.
+            match audit_raw_inventory_failure(as_of_date, &error) {
+                Ok(diagnostic) => Err(diagnostic),
+                Err(audit_error) => Err(format!("{error}; {audit_error}")),
+            }
+        }
+    }
+}
+
+pub fn positions_from_effective(
+    set: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
+) -> Result<Vec<PaperPosition>, String> {
+    let sample = set
+        .opening_inventory_sample()
+        .map_err(|error| error.to_string())?;
+    Ok(sample
+        .sellable_positions()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|position| PaperPosition {
+            code: position.code,
+            name: position.name,
+            quantity: i64::from(position.quantity),
+            avg_buy_price: position.basis.cny() / f64::from(position.quantity),
+            buy_fee_cost: position.buy_fee.cny(),
+            first_buy_date: position.first_buy_date,
+            inventory_audit_evidence: format!(
+                "OpeningInventorySampleV1;effective_projection={};seed={:?}",
+                sample.projection_hash, sample.seed_binding
+            ),
+            checkpoint: None,
+        })
+        .collect())
+}
+
+fn audit_raw_inventory_failure(
+    as_of_date: chrono::NaiveDate,
+    effective_error: &str,
+) -> Result<String, String> {
     let db = DatabaseManager::try_get()
         .ok_or_else(|| "DB 未初始化；BR-249 来源不可用，失败审计未形成".to_string())?;
     let mut conn = db
@@ -178,86 +222,13 @@ fn aggregate_open_positions_at(
         })
         .collect::<Vec<_>>();
 
-    let mut fills = Vec::with_capacity(rows.len());
-    for row in rows {
-        let occurred_at = match parse_paper_fill_timestamp(row.id, &row.occurred_at) {
-            Ok(occurred_at) => occurred_at,
-            Err(error) => {
-                return Err(audit_inventory_failure(
-                    &mut conn,
-                    as_of_date,
-                    PaperInventoryFailureStage::ParseRawFill,
-                    &error,
-                    &source_facts,
-                ));
-            }
-        };
-        fills.push(PaperFill {
-            id: row.id,
-            code: row.code,
-            name: row.name,
-            direction: row.direction,
-            fill_price: row.fill_price,
-            quantity: row.quantity,
-            occurred_at,
-        });
-    }
-
-    let inventories = match rebuild_paper_positions(&fills, as_of_date) {
-        Ok(inventories) => inventories,
-        Err(error) => {
-            return Err(audit_inventory_failure(
-                &mut conn,
-                as_of_date,
-                PaperInventoryFailureStage::RebuildFifo,
-                &error,
-                &source_facts,
-            ));
-        }
-    };
-    project_sellable_positions(inventories).map_err(|error| {
-        audit_inventory_failure(
-            &mut conn,
-            as_of_date,
-            PaperInventoryFailureStage::ProjectSellablePosition,
-            &error,
-            &source_facts,
-        )
-    })
-}
-
-fn project_sellable_positions(
-    inventories: Vec<PaperPositionInventory>,
-) -> Result<Vec<PaperPosition>, String> {
-    let mut positions = Vec::new();
-    for inventory in inventories {
-        if inventory.sellable_quantity == 0 {
-            continue;
-        }
-        let avg_buy_price = inventory.sellable_avg_price.ok_or_else(|| {
-            format!(
-                "paper position {} missing sellable average price",
-                inventory.code
-            )
-        })?;
-        let first_buy_date = inventory.earliest_sellable_date.ok_or_else(|| {
-            format!(
-                "paper position {} missing earliest sellable date",
-                inventory.code
-            )
-        })?;
-        let inventory_audit_evidence = inventory.audit_evidence();
-        positions.push(PaperPosition {
-            code: inventory.code,
-            name: inventory.name,
-            quantity: i64::from(inventory.sellable_quantity),
-            avg_buy_price,
-            buy_fee_cost: inventory.sellable_buy_fee,
-            first_buy_date,
-            inventory_audit_evidence,
-        });
-    }
-    Ok(positions)
+    Ok(audit_inventory_failure(
+        &mut conn,
+        as_of_date,
+        PaperInventoryFailureStage::RebuildFifo,
+        effective_error,
+        &source_facts,
+    ))
 }
 
 fn audit_inventory_failure(
@@ -529,12 +500,18 @@ trait PaperSellReadIo {
     }
     fn execute(
         &self,
+        position: &PaperPosition,
         signal: &PaperSignal,
         quote: &crate::broker::ExecutionQuote,
         cancelled: &AtomicBool,
     ) -> Result<crate::trading::paper_trade::PaperOutcome, String> {
-        let binding = crate::trading::paper_ledger_runtime::active_binding()?;
-        crate::trading::paper_ledger_runtime::execute(&binding, signal, quote, cancelled)
+        let checkpoint = position
+            .checkpoint
+            .as_ref()
+            .ok_or("paper sell candidate lacks ledger checkpoint")?;
+        crate::trading::paper_ledger_runtime::execute_candidate(
+            checkpoint, signal, quote, cancelled,
+        )
     }
 }
 
@@ -565,11 +542,23 @@ fn scan_and_sell_inner_with_io(
         return Ok(Vec::new());
     }
     let mut sold = Vec::new();
-    for pos in &positions {
+    for (index, original) in positions.iter().enumerate() {
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
-        match evaluate_and_sell(pos, risk_context, today, io, cancelled) {
+        // The preceding attempt may itself append a terminal and advance the
+        // account head. Re-read the entire next candidate (cost/qty/T+1/proof),
+        // then re-evaluate it; never attach a fresh head to an old decision.
+        // The initial code list is bounded, and disappeared inventory is skipped.
+        let candidate = if index > 0 && original.checkpoint.is_some() {
+            io.positions(today)?
+                .into_iter()
+                .find(|position| position.code == original.code)
+        } else {
+            Some(original.clone())
+        };
+        let Some(pos) = candidate else { continue };
+        match evaluate_and_sell(&pos, risk_context, today, io, cancelled) {
             Ok(Some(result)) => {
                 completed
                     .lock()
@@ -687,7 +676,7 @@ fn evaluate_and_sell(
     if cancelled.load(Ordering::SeqCst) {
         return Ok(None);
     }
-    let outcome = io.execute(&signal, &quote, cancelled)?;
+    let outcome = io.execute(pos, &signal, &quote, cancelled)?;
     if outcome.result.status != PaperTradeStatus::Filled || !outcome.inserted {
         warn!(
             "[paper_sell] {} 卖出未成交: {:?}",
@@ -724,13 +713,11 @@ mod tests {
     use super::*;
     use crate::database::DatabaseManager;
 
-    fn unique_code(label: &str) -> String {
+    fn unique_code(_label: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(850000);
         format!(
-            "TEST_CODE_PAPER_SELL_{label}_{}_{}",
-            std::process::id(),
-            chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .expect("test timestamp")
+            "TEST_CODE_{:06}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         )
     }
 
@@ -759,6 +746,13 @@ mod tests {
 
     fn init_test_db() {
         let _ = DatabaseManager::init(None);
+        let mut conn = DatabaseManager::get().get_conn().unwrap();
+        diesel::sql_query("PRAGMA application_id=1398035265")
+            .execute(&mut conn)
+            .unwrap();
+        diesel::sql_query("PRAGMA user_version=2")
+            .execute(&mut conn)
+            .unwrap();
     }
 
     fn date(year: i32, month: u32, day: u32) -> chrono::NaiveDate {
@@ -1004,7 +998,10 @@ mod tests {
         let replay_error =
             aggregate_open_positions_at(date(2026, 8, 5)).expect_err("同一坏事实重放仍必须失败");
 
-        assert!(first_error.contains("fill_price"), "{first_error}");
+        assert!(
+            first_error.contains("Filled") && first_error.contains("incomplete terminal facts"),
+            "{first_error}"
+        );
         assert!(
             first_error.contains("BR-249 audit_id=")
                 && first_error.contains("disposition=appended"),
@@ -1029,7 +1026,7 @@ mod tests {
             10.0,
             Some(10.0),
             100,
-            "2026-08-11 09:31:00",
+            "2026-08-05 01:31:00",
         );
         insert_fill(
             &code,
@@ -1038,7 +1035,7 @@ mod tests {
             10.2,
             Some(10.2),
             100,
-            "2026-08-11 14:31:00",
+            "2026-08-05 06:31:00",
         );
         let order_attempts_before = order_audit_count(&code);
 

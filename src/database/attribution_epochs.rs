@@ -2511,6 +2511,7 @@ pub fn reconstruct_epoch_daily(
         .attribution_checkout()
         .map_err(map_database_authority_error)?;
     checkout.transaction_with_authority(map_database_authority_error, |conn, _authority| {
+        require_explicit_paper_scope_if_bound(conn)?;
         let (fills, carry) = reconstructed_source_projection(conn, completed_session)?;
         let target_rows = fills
             .into_iter()
@@ -2946,11 +2947,45 @@ fn verified_epoch_retained_carry(
     Ok(carry)
 }
 
-#[allow(dead_code)] // Task 5 wires this deep verified source capability into replay.
+/// Economic callers without a PaperLedger scope must not silently read raw fills.
+/// Raw audit/prefix verification deliberately does not call this guard.
+pub(crate) fn require_explicit_paper_scope_if_bound(conn: &mut SqliteConnection) -> Result<(), AttributionEpochStoreError> {
+    let declared=diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_user_version WHERE user_version NOT IN (0,1)").get_result::<CountRow>(conn)?;
+    if declared.count>0 {
+        return Err(AttributionEpochStoreError::Unavailable{reason_code:"paper_scope_required",retryable:false,detail:"extended or unknown catalog requires explicit verified paper scope; no implicit legacy fallback".into()});
+    }
+    let exists=diesel::sql_query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='paper_ledger_account'").get_result::<CountRow>(conn)?;
+    if exists.count>0 && diesel::sql_query("SELECT COUNT(*) AS count FROM paper_ledger_account").get_result::<CountRow>(conn)?.count>0 {
+        return Err(AttributionEpochStoreError::Unavailable {reason_code:"paper_scope_required",retryable:false,detail:"bound PaperLedger requires explicit economic scope/history".into()});
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Shared raw authority, including historical frozen receipts.
 pub(crate) fn load_verified_epoch_fills_until(
     conn: &mut SqliteConnection,
     epoch: &ResolvedAttributionEpoch,
     to: NaiveDate,
+) -> Result<VerifiedEpochFillSet, AttributionEpochStoreError> {
+    load_verified_epoch_fills_with_limits(conn, epoch, to, None)
+}
+
+/// PaperLedger historical scope uses the seed's exact frozen raw/audit prefix.
+/// This reuses the existing raw authority checks, not the attribution carry overlay.
+pub(crate) fn load_verified_legacy_prefix(
+    conn: &mut SqliteConnection,
+    paper_high_water: i64,
+    audit_high_water: i64,
+) -> Result<VerifiedEpochFillSet, AttributionEpochStoreError> {
+    load_verified_epoch_fills_with_limits(conn, &ResolvedAttributionEpoch::Legacy, NaiveDate::MAX,
+        Some((paper_high_water, audit_high_water)))
+}
+
+fn load_verified_epoch_fills_with_limits(
+    conn: &mut SqliteConnection,
+    epoch: &ResolvedAttributionEpoch,
+    to: NaiveDate,
+    frozen_limits: Option<(i64, i64)>,
 ) -> Result<VerifiedEpochFillSet, AttributionEpochStoreError> {
     let (completed, paper_high_water, audit_high_water, effective, carry) = match epoch {
         ResolvedAttributionEpoch::Legacy => (to, 0, 0, None, Vec::new()),
@@ -2965,7 +3000,7 @@ pub(crate) fn load_verified_epoch_fills_until(
             )
         }
     };
-    let source = analyze_source_projection(conn, completed, None, false)?;
+    let source = analyze_source_projection(conn, completed, frozen_limits, false)?;
     let bindings = source
         .bindings
         .iter()
@@ -3668,6 +3703,7 @@ impl<'a> AttributionEpochStore<'a> {
             .attribution_checkout()
             .map_err(map_database_authority_error)?;
         checkout.transaction_with_authority(map_database_authority_error, |conn, authority| {
+            require_explicit_paper_scope_if_bound(conn)?;
             let resolved = load_selector_with_connection(conn, &AttributionEpochSelector::Active)?;
             let receipt = match &resolved {
                 ResolvedAttributionEpoch::Epoch(receipt) => receipt.clone(),

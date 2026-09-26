@@ -2551,36 +2551,9 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
     // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
     // 账本重建失败 → Err (不允许放行交易门).
     let as_of = observed_at.date_naive();
-    let cost_ledger = {
-        use stock_analysis::performance::economic_position::query_economic_fills_through;
-        use stock_analysis::performance::fee_evidence::{lot_rate_fill_cost_ledger, FillSide};
-        let rows = query_economic_fills_through(as_of)
-            .map_err(|error| format!("BR-103 paper ledger fills: {error}"))?;
-        let mut fills: Vec<(i64, FillSide, f64)> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            // 缺成交价的 Filled 行 → 明确 fail-closed, 不用静默跳过掩盖账本缺口.
-            let price = row.fill_price.ok_or_else(|| {
-                format!("BR-103 paper ledger fill id={} has no fill_price", row.id)
-            })?;
-            let side = match row.direction.as_str() {
-                "buy" => FillSide::Buy,
-                "sell" => FillSide::Sell,
-                other => {
-                    return Err(format!(
-                        "BR-103 paper ledger fill id={} direction invalid: {other}",
-                        row.id
-                    ));
-                }
-            };
-            fills.push((row.id, side, price * row.quantity as f64));
-        }
-        lot_rate_fill_cost_ledger(&fills)
-            .map_err(|error| format!("BR-103 paper ledger cost evidence: {error}"))?
-    };
     let report =
         stock_analysis::performance::economic_position::compute_economic_position_report(
             as_of,
-            Some(&cost_ledger),
         )
         .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
     let realized: Vec<(chrono::NaiveDateTime, String, f64)> = report
@@ -9313,6 +9286,21 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     .unwrap_or(false);
                 if !already_run {
                     match (|| -> Result<String, AttributionEpochRuntimeError> {
+                        let database = stock_analysis::database::DatabaseManager::get();
+                        if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() {
+                            let map_effective=|detail:String|AttributionEpochRuntimeError::Unavailable{reason_code:"effective_attribution_unavailable",retryable:false,detail};
+                            let binding=stock_analysis::trading::paper_ledger_runtime::active_binding().map_err(map_effective)?;
+                            let (prepared,_receipt)=stock_analysis::performance::attribution_replay::commit_effective_window(database,binding,today,30,chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap())).map_err(|error| {
+                                use stock_analysis::performance::attribution_replay::ReplayErrorClass;
+                                match error.class() {
+                                    ReplayErrorClass::FailedIntegrity=>AttributionEpochRuntimeError::FailedIntegrity{reason_code:error.code(),detail:error.to_string()},
+                                    ReplayErrorClass::Unavailable|ReplayErrorClass::Storage=>AttributionEpochRuntimeError::Unavailable{reason_code:error.code(),retryable:error.retryable(),detail:error.to_string()},
+                                }
+                            })?;
+                            let md=prepared.report().render_markdown().map_err(map_effective)?;
+                            stock_analysis::performance::report::persist_report_revision(std::path::Path::new("data/attribution"),today,md.as_bytes()).map_err(map_effective)?;
+                            return Ok(prepared.report().render_summary());
+                        }
                         // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
                         // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
                         // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
@@ -9325,21 +9313,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 detail,
                             },
                         )?;
-                        let database = stock_analysis::database::DatabaseManager::get();
                         let daily = compute_epoch_daily(database, today, &prices)?;
                         let window = compute_epoch_window(database, today, 30, &prices)?;
                         persist_epoch_daily(database, &daily)?;
                         let md = render_full_markdown(daily.daily(), window.window());
-                        std::fs::create_dir_all("data/attribution").map_err(|error| {
-                            AttributionEpochRuntimeError::Unavailable {
-                                reason_code: "attribution_report_storage_unavailable",
-                                retryable: true,
-                                detail: format!("create data/attribution: {error}"),
-                            }
-                        })?;
-                        std::fs::write(
-                            format!("data/attribution/{}.md", today.format("%Y-%m-%d")),
-                            md,
+                        stock_analysis::performance::report::persist_report_revision(
+                            std::path::Path::new("data/attribution"),today,md.as_bytes(),
                         )
                         .map_err(|error| {
                             AttributionEpochRuntimeError::Unavailable {

@@ -58,6 +58,13 @@ fn main() {
         .unwrap_or_else(|_| PathBuf::from("./data/stock_analysis.db"));
     eprintln!("[backfill] 阶段1: 初始化数据库 {database_path:?}");
     DatabaseManager::init(Some(database_path)).expect("数据库初始化失败");
+    if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() {
+        let binding=stock_analysis::trading::paper_ledger_runtime::active_binding().expect("显式 PaperLedger 绑定无效");
+        let (prepared,receipt)=stock_analysis::performance::attribution_replay::commit_effective_window(DatabaseManager::get(),binding,date,30,chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap())).expect("effective 日窗重算失败（边界不对齐需 Task10 资格，不回退 raw）");
+        write_report(date,&prepared.report().render_markdown().expect("effective report serialization"));
+        println!("{}\n[backfill] effective report revision={}；只重算，未重发消息或成交",prepared.report().render_summary(),receipt.report_revision_id);
+        return;
+    }
     eprintln!("[backfill] 阶段2: 数据库就绪, 查持仓快照");
 
     // 持仓代码: BR-226 用户快照 (24h 新鲜) 优先, 否则本地持仓 (与 monitor 同规则)。
@@ -83,30 +90,10 @@ fn main() {
     // 覆盖持仓代码, 覆盖不到当日新开仓), 补跑重建应覆盖当日全部成交代码才能
     // 完整估值浮盈 (2026-09-01 实测: 快照 7 只 → 67 lot 未估值)。只读查询。
     {
-        use diesel::prelude::*;
-        #[derive(diesel::QueryableByName)]
-        struct CodeRow {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            code: String,
-        }
-        let mut conn = DatabaseManager::get()
-            .get_conn()
-            .expect("数据库连接失败");
-        let window_start = format!("{} 00:00:00", date.format("%Y-%m-%d"));
-        let window_end = format!(
-            "{} 00:00:00",
-            date.succ_opt().expect("日期上溢").format("%Y-%m-%d")
-        );
-        let trade_codes: Vec<String> = diesel::sql_query(
-            "SELECT DISTINCT code FROM paper_trades WHERE status = 'Filled' AND ts >= ? AND ts < ?",
-        )
-        .bind::<diesel::sql_types::Text, _>(&window_start)
-        .bind::<diesel::sql_types::Text, _>(&window_end)
-        .load::<CodeRow>(&mut conn)
-        .expect("当日交易代码查询失败")
-        .into_iter()
-        .map(|row| row.code)
-        .collect();
+        let effective=stock_analysis::performance::economic_position::query_effective_fills_through(date)
+            .expect("显式 effective paper scope 不可用");
+        let trade_codes: Vec<String> = effective.rows().expect("有效成交经济约束不可用")
+            .iter().map(|row|row.code.clone()).collect();
         eprintln!(
             "[backfill] 目标日 {date} 成交代码 {} 只并入行情覆盖",
             trade_codes.len()
@@ -221,10 +208,8 @@ fn main() {
 }
 
 fn write_report(date: NaiveDate, md: &str) {
-    let report_path = format!("data/attribution/{}.md", date.format("%Y-%m-%d"));
-    std::fs::create_dir_all("data/attribution").expect("创建 data/attribution 失败");
-    std::fs::write(&report_path, md).expect("写归因报告失败");
-    println!("[backfill] 报告已落盘: {report_path}");
+    let report_path=stock_analysis::performance::report::persist_report_revision(std::path::Path::new("data/attribution"),date,md.as_bytes()).expect("追加报告 revision 失败");
+    println!("[backfill] 报告 revision 已落盘: {}",report_path.display());
 }
 
 fn fallback_positions() -> Vec<String> {

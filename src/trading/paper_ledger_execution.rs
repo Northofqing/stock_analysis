@@ -60,8 +60,8 @@ pub(super) struct OrderFact {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct LotChange {
-    before: Option<Lot>,
-    after: Option<Lot>,
+    pub(super) before: Option<Lot>,
+    pub(super) after: Option<Lot>,
 }
 
 fn fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), LedgerError> {
@@ -171,6 +171,7 @@ impl PaperLedger<'_> {
         )? {
             return Ok(previous);
         }
+        view.require_available()?;
         check_head(&view, batch.expected_version, &batch.inventory_fingerprint)?;
         if batch.as_of < view.as_of
             || batch.as_of > now
@@ -219,6 +220,7 @@ impl PaperLedger<'_> {
         )? {
             return Ok(previous);
         }
+        view.require_available()?;
         check_head(
             &view,
             intent.expected_version,
@@ -554,6 +556,8 @@ fn financial_check(
 
 pub(super) fn apply_fact(state: &mut Projection, fact: &Fact) -> Result<(), LedgerError> {
     match fact {
+        Fact::DerivedSnapshotV1(revision) => super::snapshot::validate(revision)?,
+        Fact::AdjudicatedV1(ruling) => *state = ruling.projection.clone(),
         Fact::Seeded { .. } => return Err(LedgerError::IntegrityFailure("second genesis".into())),
         Fact::Marked(batch) => {
             if state.inventory_fingerprint()? != batch.inventory_fingerprint {

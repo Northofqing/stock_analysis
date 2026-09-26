@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::{NaiveDate, NaiveDateTime};
-use diesel::RunQueryDsl;
 
 use super::attribution::{signal_family_of, SignalFamily};
 use super::attribution_replay::ValidatedReplayFeeLedger;
@@ -16,7 +15,7 @@ use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 const MIN_CLOSED_POSITIONS: usize = 200;
 const MIN_COVERAGE_DAYS: i64 = 84;
 
-#[derive(diesel::QueryableByName, Debug, Clone, PartialEq)]
+#[derive(diesel::QueryableByName, Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EconomicFillRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub id: i64,
@@ -168,6 +167,8 @@ pub enum ValidationStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EconomicPositionReport {
+    pub effective_projection: Option<crate::trading::paper_ledger::EffectiveProjectionReceipt>,
+    pub opening_inventory: Option<crate::trading::paper_ledger::OpeningInventorySample>,
     pub as_of_date: NaiveDate,
     pub source_fill_ids: Vec<i64>,
     pub cost_basis: Option<CostBasisAudit>,
@@ -921,6 +922,8 @@ fn rebuild_validated_economic_positions(
     let net_summary = summarize_net(&closed_positions, &ledger)?;
     let validation_status = validation_status(&net_summary, closed_positions.len(), coverage_days);
     Ok(EconomicPositionReport {
+        effective_projection: None,
+        opening_inventory: None,
         as_of_date,
         source_fill_ids,
         cost_basis,
@@ -931,10 +934,6 @@ fn rebuild_validated_economic_positions(
         validation_status,
     })
 }
-
-const ECONOMIC_FILLS_SQL: &str = "SELECT id, plan_id, code, name, direction, fill_price, \
-     quantity, CAST(ts AS TEXT) AS occurred_at, virtual_reason \
-     FROM paper_trades WHERE status = 'Filled' ORDER BY ts ASC, id ASC";
 
 /// 完整来源批次先严格验证，再由 Rust 截止到显式评估日。评估日后的坏行也不能
 /// 被日期过滤静默隐藏。
@@ -969,26 +968,36 @@ pub fn select_economic_rows_through(
         .collect())
 }
 
-/// 只读薄壳：读取原始时间，不调用 SQLite 日期解释函数。
-pub fn query_economic_fills_through(as_of_date: NaiveDate) -> Result<Vec<EconomicFillRow>, String> {
+/// Current runtime selection is explicit: an activated binding reads its epoch;
+/// without one, only an unbound LegacyRaw/as-known database is accepted.
+pub fn query_effective_fills_through(as_of_date: NaiveDate) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
+    use crate::trading::paper_ledger::{EffectiveFillRequest,EffectiveFillScope,EffectiveHistory,PaperLedger};
     let db = crate::database::DatabaseManager::try_get()
         .ok_or_else(|| "economic-position database is not initialized".to_owned())?;
-    let mut conn = db
-        .get_conn()
-        .map_err(|error| format!("economic-position database: {error}"))?;
-    let rows = diesel::sql_query(ECONOMIC_FILLS_SQL)
-        .load::<EconomicFillRow>(&mut conn)
-        .map_err(|error| format!("query economic-position fills: {error}"))?;
-    select_economic_rows_through(rows, as_of_date)
+    let (scope,history)=match std::env::var(crate::trading::paper_ledger_runtime::BINDING_ENV) {
+        Ok(raw)=>(EffectiveFillScope::Epoch(serde_json::from_str(&raw).map_err(|e|format!("invalid paper binding: {e}"))?),EffectiveHistory::RestatedLatest),
+        Err(std::env::VarError::NotPresent)=>(EffectiveFillScope::LegacyRaw,EffectiveHistory::AsKnown{ledger_version:None}),
+        Err(error)=>return Err(format!("invalid paper binding: {error}")),
+    };
+    PaperLedger::open(db,&chrono::Utc::now).verified_effective_fills(&EffectiveFillRequest{scope,history,as_of:as_of_date}).map_err(|e|e.to_string())
 }
 
-/// 当前仅供显式只读研究调用；没有费用证据时净指标保持 Unavailable。
+/// Financial rows and fees are obtained from one opaque frozen read capability.
+pub fn report_from_effective(
+    effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
+) -> Result<EconomicPositionReport, String> {
+    let sample=effective.opening_inventory_sample().map_err(|e|e.to_string())?;
+    let mut report=rebuild_economic_positions(&sample.strategy_rows,effective.receipt().request.as_of,Some(&sample.strategy_costs))?;
+    report.effective_projection=Some(effective.receipt().clone());
+    report.opening_inventory=Some(sample);
+    Ok(report)
+}
+
+/// Runtime wrapper: never re-reads rows after separately computing a fee ledger.
 pub fn compute_economic_position_report(
     as_of_date: NaiveDate,
-    cost_ledger: Option<&FillCostLedger>,
 ) -> Result<EconomicPositionReport, String> {
-    let rows = query_economic_fills_through(as_of_date)?;
-    rebuild_economic_positions(&rows, as_of_date, cost_ledger)
+    report_from_effective(&query_effective_fills_through(as_of_date)?)
 }
 
 #[cfg(test)]
