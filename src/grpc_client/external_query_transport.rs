@@ -24,6 +24,8 @@ pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ExternalQueryMethod {
+    #[serde(rename = "OPERATION_FUTURES_DELIVERY")]
+    FuturesDelivery,
     #[serde(rename = "OPERATION_SECURITY_METADATA")]
     SecurityMetadata,
     #[serde(rename = "OPERATION_GLOBAL_NEWS")]
@@ -43,6 +45,7 @@ impl ExternalQueryMethod {
 
     fn generated_method(self) -> &'static str {
         match self {
+            Self::FuturesDelivery => "FuturesDelivery",
             Self::SecurityMetadata => "SecurityMetadata",
             Self::GlobalNews => "GlobalNews",
             Self::InstrumentNews => "InstrumentNews",
@@ -54,6 +57,7 @@ impl ExternalQueryMethod {
 
     fn path(self) -> &'static str {
         match self {
+            Self::FuturesDelivery => "/magic.market.v1.MarketDataService/FuturesDelivery",
             Self::SecurityMetadata => "/magic.market.v1.MarketDataService/SecurityMetadata",
             Self::GlobalNews => "/magic.market.v1.MarketDataService/GlobalNews",
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
@@ -94,6 +98,7 @@ impl ExternalQueryMethod {
     ) -> Option<Self> {
         use crate::grpc_client::external_pb::magic::market::v1::Operation;
         match operation {
+            Operation::FuturesDelivery => Some(Self::FuturesDelivery),
             Operation::CurrentAuctionObservations => Some(Self::CurrentAuctionObservations),
             Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
             Operation::EconomicReleaseSchedule => Some(Self::EconomicReleaseSchedule),
@@ -307,6 +312,7 @@ impl ExternalQueryTransport {
         let capture = CaptureHandle::new(method);
         request.extensions_mut().insert(capture.clone());
         let response = match method {
+            ExternalQueryMethod::FuturesDelivery => self.client.futures_delivery(request).await,
             ExternalQueryMethod::SecurityMetadata => self.client.security_metadata(request).await,
             ExternalQueryMethod::GlobalNews => self.client.global_news(request).await,
             ExternalQueryMethod::InstrumentNews => self.client.instrument_news(request).await,

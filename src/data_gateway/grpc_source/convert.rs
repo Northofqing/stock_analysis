@@ -18,11 +18,11 @@ use crate::data_gateway::{
     board_ranking::BoardRankingFact, BatchEvidence, BlockTradeReview, BoardDirectoryFact,
     BoardDirectoryRecordEvidence, BoardFlowFact, BoardKind, BoardMembershipRecord,
     DragonTigerSeatReview, DragonTigerSourceDisclosure, DragonTigerStockReview,
-    EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch,
-    GatewayError, GeneralWebResearchBatch, GeneralWebResearchBatchEvidence,
-    GeneralWebResearchProvider, GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsProvider,
-    GlobalNewsRecord, ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact,
-    MarketBookLevel, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
+    EconomicReleaseFact, EventAnnouncement, ForeignExchangeFact, GatewayBatch, GatewayError,
+    GeneralWebResearchBatch, GeneralWebResearchBatchEvidence, GeneralWebResearchProvider,
+    GeneralWebResearchRecord, GlobalIndexFact, GlobalNewsProvider, GlobalNewsRecord,
+    ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact, MarketBookLevel,
+    MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
     NorthboundDailyFact, NorthboundQuotaFact, NorthboundTopTurnoverFact, ProviderTopNFact,
     RealtimeIndexQuote, RealtimeMarketQuote, ResearchReportFact, ResearchUseScope, SecurityBoard,
     SinaInstrumentNewsRecord, T0Batch, T0BookLevel, T0DailyBar, T0Evidence, T0FiveMinuteBar,
@@ -1727,36 +1727,6 @@ pub fn economic_calendar(
                 importance: as_u64(v, "importance", capability)? as u32,
                 impact: as_optional_str(v, "impact", capability)?,
                 evidence: record_evidence(&ev, q)?,
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(GatewayBatch::Available {
-        records,
-        evidence: ev,
-    })
-}
-
-/// 交割日历。视图: delegate.rs fetch_futures_delivery (:441-463)
-/// {"contract_code","product_code","last_trading_date","delivery_date","notice_url"}。
-/// last_trading_date 可空 (JSON null → None)。
-pub fn futures_delivery(
-    q: &QueryResult,
-) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
-    let capability = "FuturesDelivery";
-    let ev = evidence_of(q, capability)?;
-    let parsed = parse_records(q, capability)?;
-    if parsed.is_empty() {
-        return Ok(GatewayBatch::VerifiedEmpty(ev));
-    }
-    let records = parsed
-        .iter()
-        .map(|v| {
-            Ok(FuturesDeliveryFact {
-                contract_code: as_str(v, "contract_code", capability)?,
-                product_code: as_str(v, "product_code", capability)?,
-                last_trading_date: as_optional_date(v, "last_trading_date", capability)?,
-                delivery_date: as_date(v, "delivery_date", capability)?,
-                notice_url: as_str(v, "notice_url", capability)?,
             })
         })
         .collect::<Result<_, _>>()?;

@@ -3691,6 +3691,16 @@ impl GrpcSource {
         ))
     }
 
+    pub(super) async fn futures_delivery_2026_async(
+        &self,
+        request: crate::data_gateway::futures_delivery::FuturesDeliveryRequest,
+    ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
+        let response = self
+            .query_external_native_op(ExternalOperation::FuturesDelivery, request.params())
+            .await?;
+        crate::data_gateway::futures_delivery::convert_response(request, &response)
+    }
+
     // ---------- M3 批次 2: 龙虎榜/大宗/一致预期/板块/研报/北向/财务/技术/资金流/排行/指数/个股新闻/形态/涨停复盘/T0 ----------
 
     /// 龙虎榜: 参数与本地 DragonTigerGateway::market_review 对齐 (date +

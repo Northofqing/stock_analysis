@@ -8,6 +8,29 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
+#[test]
+fn r08_futures_delivery_uses_external_method_identity_and_exact_rpc_path() {
+    let method = ExternalQueryMethod::from_external_operation(
+        crate::grpc_client::external_pb::magic::market::v1::Operation::FuturesDelivery,
+    )
+    .expect("external FuturesDelivery is routed");
+    assert_eq!(method, ExternalQueryMethod::FuturesDelivery);
+    assert!(method.matches_binding(
+        "/magic.market.v1.MarketDataService/FuturesDelivery",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "FuturesDelivery",
+        )),
+    ));
+    assert!(!method.matches_binding(
+        "/magic.market.v1.MarketDataService/GlobalNews",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "GlobalNews",
+        )),
+    ));
+}
+
 struct TestBody {
     frames: VecDeque<Result<Frame<Bytes>, tonic::Status>>,
     done: bool,

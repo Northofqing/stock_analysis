@@ -127,6 +127,25 @@ pub fn build_external_native_query_request(
     params: Value,
 ) -> Result<QueryRequest, ExternalContractError> {
     let (schema, schema_version, preferred_provider, data) = match operation {
+        ExternalOperation::FuturesDelivery => {
+            ensure_only_keys(&params, &["year", "month"])?;
+            let year = params
+                .get("year")
+                .and_then(Value::as_u64)
+                .filter(|year| *year == 2026)
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            let month = params
+                .get("month")
+                .and_then(Value::as_u64)
+                .filter(|month| (1..=12).contains(month))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            (
+                "magic.market.futures_delivery.request",
+                1,
+                "Cffex".to_owned(),
+                serde_json::json!({"year": year, "month": month}),
+            )
+        }
         ExternalOperation::CurrentAuctionObservations => {
             ensure_only_keys(&params, &["instruments", "stage"])?;
             let instruments = required_instruments(&params)?;
@@ -288,6 +307,37 @@ mod tests {
         let payload = request.payload.expect("external request payload");
         let data = serde_json::from_slice(&payload.data).expect("external request JSON");
         (payload.schema, data, request.allow_unadmitted)
+    }
+
+    #[test]
+    fn futures_delivery_binds_2026_month_to_external_cffex_wire() {
+        let request = build_external_native_query_request(
+            ExternalOperation::FuturesDelivery,
+            json!({"year": 2026, "month": 9}),
+        )
+        .expect("2026 CFFEX monthly contract");
+        assert_eq!(request.preferred_provider, "Cffex");
+        let payload = request.payload.expect("versioned delivery payload");
+        assert_eq!(payload.schema, "magic.market.futures_delivery.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"year": 2026, "month": 9})
+        );
+        assert!(!request.allow_unadmitted);
+        for params in [
+            json!({}),
+            json!({"year": 2027, "month": 9}),
+            json!({"year": 2026, "month": 0}),
+            json!({"year": 2026, "month": 13}),
+            json!({"year": 2026, "month": 9, "limit": 4}),
+        ] {
+            assert_eq!(
+                build_external_native_query_request(ExternalOperation::FuturesDelivery, params)
+                    .unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
     }
 
     #[test]
