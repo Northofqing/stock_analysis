@@ -10,6 +10,7 @@ use super::{
 use crate::data_gateway::grpc_source::macro_queries::PreparedMacroQueries;
 use crate::data_gateway::grpc_source::GrpcSource;
 use crate::data_gateway::GlobalNewsProvider;
+use crate::grpc_client::build_identity::BuildIdentityTrust;
 use crate::grpc_client::client::macro_attempt::{
     ExternalMacroAttemptCompletion, MacroContinuation,
 };
@@ -97,6 +98,12 @@ pub(super) async fn drive(
             intent_id: intent.clone(),
         })
     })?;
+    let route = match route {
+        PreparedMacroQueries::External(prepared) => PreparedMacroQueries::External(
+            prepared.with_test_build_trust(BuildIdentityTrust::test_historical_a()),
+        ),
+        local => local,
+    };
     if let Some(recovery) = &recovery {
         if recovery.plan().endpoint() != route.endpoint()
             || recovery.plan().profile() != route.profile()
@@ -133,7 +140,7 @@ pub(super) async fn drive(
                     .map_err(|error| authority(error, &intent))?;
                 (
                     macro_codec::Request::capture_prepared(&data)?,
-                    Some(macro_codec::ReadinessEpisodePlan::new(
+                    Some(macro_codec::ReadinessEpisodePlan::new_frozen_a_for_test(
                         health.request_material(),
                         capabilities.request_material(),
                     )?),

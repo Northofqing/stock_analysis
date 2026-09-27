@@ -1,12 +1,12 @@
 use super::*;
+use crate::grpc_client::build_identity::{test_historical_build_identity, BuildIdentityTrust};
 use crate::grpc_client::client::board_loopback_fixture::{
     BoardLoopbackObservation, BoardLoopbackServer,
 };
 use crate::grpc_client::client::external_control_attempt::ExternalControlKind;
 use crate::grpc_client::client::external_control_loopback_fixture::{
-    test_external_build_identity, test_external_observability, CapabilitiesReply,
-    ExternalMtlsMacroFixture, HealthReply, HealthStatusCase, ObservedHealthStatus,
-    ObservedHealthTrailer,
+    test_external_observability, CapabilitiesReply, ExternalMtlsMacroFixture, HealthReply,
+    HealthStatusCase, ObservedHealthStatus, ObservedHealthTrailer,
 };
 use crate::grpc_client::client::ContractProfile;
 use crate::grpc_client::external_pb::magic::market::v1::{
@@ -681,7 +681,7 @@ pub(super) async fn establish_confirmed_external_first_source(
             ready: true,
             state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
             observability: Some(test_external_observability()),
-            build_identity: Some(test_external_build_identity()),
+            build_identity: Some(test_historical_build_identity()),
         };
         let expected_health_bytes = expected_health.encode_to_vec();
         let capabilities_pending = inspect();
@@ -891,7 +891,8 @@ pub(super) async fn establish_confirmed_external_first_source(
     // can enter this function or use old Ready as transport authority.
     let transport =
         crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(external.bundle_path())
-            .unwrap();
+            .unwrap()
+            .with_test_build_trust(BuildIdentityTrust::test_historical_a());
     external.release_health();
     let client = transport
         .prepare_health_attempt()
@@ -1694,7 +1695,10 @@ pub(super) fn assert_response_raw(bytes: &[u8], response: &[u8]) {
         ExternalControlKind::Health => {
             let decoded = HealthResponse::decode(response).unwrap();
             assert_eq!(decoded.encode_to_vec(), response);
-            assert!(crate::grpc_client::build_identity::qualify_public_health(&decoded).is_ok());
+            assert!(BuildIdentityTrust::bundled()
+                .unwrap()
+                .historical_health(&decoded)
+                .is_ok());
             decoded.request_id
         }
         ExternalControlKind::Capabilities => {
@@ -1729,12 +1733,12 @@ fn assert_bound_control_result(
             "method": kind,
             "request_id": request_id,
             "client_descriptor_sha256":
-                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                crate::grpc_client::historical_external::DESCRIPTOR_SHA256,
         })
     );
     let build = object.remove("verified_build_identity");
     if expected_build {
-        let identity = test_external_build_identity();
+        let identity = test_historical_build_identity();
         assert_eq!(
             build,
             Some(serde_json::json!({
@@ -2132,7 +2136,7 @@ pub(super) async fn run_control_rejection(case: RejectionCase) {
                 ready: true,
                 state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
                 observability: Some(test_external_observability()),
-                build_identity: Some(test_external_build_identity()),
+                build_identity: Some(test_historical_build_identity()),
             }
             .encode_to_vec();
             assert_eq!(controls[0].response_bytes(), Some(expected_health.as_slice()));
@@ -2160,7 +2164,7 @@ pub(super) async fn run_control_rejection(case: RejectionCase) {
                     ready: true,
                     state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
                     observability: Some(test_external_observability()),
-                    build_identity: Some(test_external_build_identity()),
+                    build_identity: Some(test_historical_build_identity()),
                 }
                 .encode_to_vec()]
             );
@@ -2219,13 +2223,13 @@ pub(super) async fn run_control_rejection(case: RejectionCase) {
                 request_id: health_id.clone(), live: true, ready: false,
                 state: "TEST_CODE_HEALTH_NOT_READY".to_owned(),
                 observability: Some(test_external_observability()),
-                build_identity: Some(test_external_build_identity()),
+                build_identity: Some(test_historical_build_identity()),
             }.encode_to_vec()),
             RejectionCase::HealthMismatchedId => Some(HealthResponse {
                 request_id: "TEST_CODE_WRONG_HEALTH_REQUEST_ID".to_owned(), live: true, ready: true,
                 state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
                 observability: Some(test_external_observability()),
-                build_identity: Some(test_external_build_identity()),
+                build_identity: Some(test_historical_build_identity()),
             }.encode_to_vec()),
             RejectionCase::CapabilitiesMismatchedId
             | RejectionCase::CapabilitiesMissingGlobalNews
@@ -2304,7 +2308,7 @@ pub(super) async fn run_control_rejection(case: RejectionCase) {
                     ready: true,
                     state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
                     observability: Some(test_external_observability()),
-                    build_identity: Some(test_external_build_identity()),
+                    build_identity: Some(test_historical_build_identity()),
                 }
                 .encode_to_vec()]
             );

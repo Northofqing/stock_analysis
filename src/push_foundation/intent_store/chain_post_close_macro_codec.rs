@@ -630,6 +630,14 @@ pub(super) struct ControlRequest {
 }
 
 impl ControlRequest {
+    #[cfg(test)]
+    fn capture_frozen_a_for_test(material: ExternalControlRequestMaterial) -> Result<Self> {
+        let mut value = Self::capture(material)?;
+        value.client_descriptor_sha256 = Some(historical_external::DESCRIPTOR_SHA256.to_owned());
+        value.validate()?;
+        Ok(value)
+    }
+
     pub(super) fn capture_current(
         material: ExternalControlRequestMaterial,
         identity: &crate::grpc_client::connection_qualification::ConnectionIdentity,
@@ -773,6 +781,25 @@ pub(super) struct ReadinessEpisodePlan {
 }
 
 impl ReadinessEpisodePlan {
+    #[cfg(test)]
+    pub(super) fn new_frozen_a_for_test(
+        health: ExternalControlRequestMaterial,
+        capabilities: ExternalControlRequestMaterial,
+    ) -> Result<Self> {
+        let value = Self {
+            version: 1,
+            episode_ordinal: 1,
+            phase: "Gateway".to_owned(),
+            item_ordinal: 1,
+            candidate_ordinal: 1,
+            required_operation: ExternalOperation::GlobalNews as i32,
+            health: ControlRequest::capture_frozen_a_for_test(health)?,
+            capabilities: ControlRequest::capture_frozen_a_for_test(capabilities)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub(super) fn new(
         health: ExternalControlRequestMaterial,
         capabilities: ExternalControlRequestMaterial,
@@ -1497,6 +1524,25 @@ pub(super) struct RawResult {
 }
 
 impl RawResult {
+    #[cfg(test)]
+    pub(super) fn bind_frozen_a_for_test(
+        &mut self,
+        identity: &MacroQueryIdentity,
+        request: &Request,
+    ) -> Result<()> {
+        self.bind_external_identity(identity, request)?;
+        self.wire_identity
+            .as_mut()
+            .ok_or(ChainPostCloseError::SchemaRejected)?
+            .client_descriptor_sha256 = historical_external::DESCRIPTOR_SHA256.to_owned();
+        if let Some(evidence) = self.external_wire.as_ref() {
+            evidence
+                .validate_historical(ExternalQueryMethod::GlobalNews)
+                .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn capture(completion: &MacroAttemptCompletion) -> Self {
         Self {
             version: 1,

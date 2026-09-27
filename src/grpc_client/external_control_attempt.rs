@@ -147,6 +147,15 @@ where
     ) -> Result<Self, GrpcError> {
         let mut request = tonic::Request::new(request);
         prepared.attach_request_auth(&mut request)?;
+        #[cfg(test)]
+        if prepared.qualification_trust.current_descriptor()
+            == crate::grpc_client::historical_external::DESCRIPTOR_SHA256
+        {
+            request.metadata_mut().insert(
+                "x-test-frozen-external-a",
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+        }
         Ok(Self {
             request,
             request_id,

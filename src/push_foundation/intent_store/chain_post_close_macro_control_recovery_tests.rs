@@ -1,7 +1,8 @@
 use super::*;
+use crate::grpc_client::build_identity::test_historical_build_identity;
 use crate::grpc_client::client::external_control_attempt::ExternalControlKind;
 use crate::grpc_client::client::external_control_loopback_fixture::{
-    test_external_build_identity, test_external_observability, ExternalMtlsMacroFixture,
+    test_external_observability, ExternalMtlsMacroFixture,
 };
 use crate::grpc_client::client::ContractProfile;
 use crate::grpc_client::external_pb::magic::market::v1::{
@@ -328,7 +329,7 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
             ready: true,
             state: "TEST_CODE_HEALTH_RUNNING".to_owned(),
             observability: Some(test_external_observability()),
-            build_identity: Some(test_external_build_identity()),
+            build_identity: Some(test_historical_build_identity()),
         }
         .encode_to_vec();
         external.release_health();

@@ -138,6 +138,14 @@ impl BuildIdentityTrust {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_historical_a() -> Self {
+        let mut value = Self::bundled().unwrap();
+        value.current = value.historical_v3.clone();
+        value.current_descriptor = super::historical_external::DESCRIPTOR_SHA256;
+        value
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_client_b() -> Self {
         let mut value = Self::bundled().unwrap();
         value.current.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
@@ -268,6 +276,19 @@ pub fn qualify_public_health(response: &HealthResponse) -> Result<(), BuildIdent
 #[cfg(test)]
 pub(crate) fn test_public_build_identity() -> BuildIdentity {
     let expected = expected_identity().expect("public deployment metadata is complete");
+    BuildIdentity {
+        service_version: expected.service_version,
+        source_revision: expected.source_revision,
+        contract_sha256: expected.contract_sha256,
+        binary_sha256: expected.binary_sha256,
+        identity_error: String::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_historical_build_identity() -> BuildIdentity {
+    let expected = parse_expected_identity(HISTORICAL_V3_METADATA)
+        .expect("frozen public deployment metadata is complete");
     BuildIdentity {
         service_version: expected.service_version,
         source_revision: expected.source_revision,

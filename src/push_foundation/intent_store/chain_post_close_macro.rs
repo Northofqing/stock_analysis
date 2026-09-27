@@ -279,7 +279,7 @@ mod control_identity_tests {
                 acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
             }
         };
-        let plan = codec::ReadinessEpisodePlan::new(
+        let plan = codec::ReadinessEpisodePlan::new_frozen_a_for_test(
             material(ExternalControlKind::Health, "TEST_CODE_HEALTH"),
             material(ExternalControlKind::Capabilities, "TEST_CODE_CAPABILITIES"),
         )
@@ -2040,7 +2040,7 @@ impl LocalChainPostClose<'_> {
                 && call.request_sha == raw_digest(&recovery.plan.request.bytes).as_str(),
         )?;
         if profile == crate::grpc_client::client::ContractProfile::ExternalV1 {
-            raw.bind_external_identity(&codec::first_identity(), &recovery.plan.request)?;
+            raw.bind_frozen_a_for_test(&codec::first_identity(), &recovery.plan.request)?;
         }
         let provider_catalog =
             historical_provider_catalog(&recovery.readiness_episodes, last.readiness_result);

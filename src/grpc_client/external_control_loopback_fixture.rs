@@ -165,6 +165,11 @@ impl SystemService for ExternalControlService {
         &self,
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        let frozen_a = request
+            .metadata()
+            .get("x-test-frozen-external-a")
+            .and_then(|value| value.to_str().ok())
+            == Some("1");
         let authorized = request
             .metadata()
             .get("authorization")
@@ -234,6 +239,8 @@ impl SystemService for ExternalControlService {
                                 crate::grpc_client::external_decoder::test_b::descriptor().into();
                         }
                         build
+                    } else if frozen_a {
+                        crate::grpc_client::build_identity::test_historical_build_identity()
                     } else {
                         test_external_build_identity()
                     }),
