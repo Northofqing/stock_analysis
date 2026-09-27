@@ -849,12 +849,16 @@ struct ControlWireIdentity {
 impl ControlWireIdentity {
     fn capture(request: &ControlRequest) -> Result<Self> {
         request.validate()?;
+        let descriptor = request
+            .client_descriptor_sha256
+            .as_deref()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
         require(request.has_wire_identity())?;
         Ok(Self {
             profile: "ExternalV1".to_owned(),
             method: request.kind(),
             request_id: request.request_id().to_owned(),
-            client_descriptor_sha256: EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.to_owned(),
+            client_descriptor_sha256: descriptor.to_owned(),
         })
     }
 
@@ -919,18 +923,6 @@ impl VerifiedBuildIdentity {
             }),
             ..Default::default()
         }
-    }
-
-    fn from_qualified_health(response: &HealthResponse) -> Option<Self> {
-        crate::grpc_client::build_identity::qualify_public_health(response).ok()?;
-        let identity = response.build_identity.as_ref()?;
-        Some(Self {
-            service_version: identity.service_version.clone(),
-            source_revision: identity.source_revision.clone(),
-            contract_sha256: identity.contract_sha256.clone(),
-            binary_sha256: identity.binary_sha256.clone(),
-            identity_error: identity.identity_error.clone(),
-        })
     }
 
     fn validate(&self, trust: &BuildIdentityTrust) -> Result<()> {
@@ -1037,6 +1029,11 @@ impl ControlRawResult {
         )?;
         require(self.connection_identity.is_none())?;
         let identity = ControlWireIdentity::capture(request)?;
+        require(historical_external::accepts_descriptor(
+            &identity.client_descriptor_sha256,
+        ))?;
+        let trust =
+            BuildIdentityTrust::bundled().map_err(|_| ChainPostCloseError::SchemaRejected)?;
         let build = match request.kind() {
             ExternalControlKind::Health => {
                 require(health.is_none())?;
@@ -1046,7 +1043,9 @@ impl ControlRawResult {
                         && response.request_id == request.request_id())
                     .then_some(response)
                     .as_ref()
-                    .and_then(VerifiedBuildIdentity::from_qualified_health)
+                    .and_then(|response| {
+                        VerifiedBuildIdentity::from_historical_health(response, &trust)
+                    })
                 })
             }
             ExternalControlKind::Capabilities => {
@@ -1054,6 +1053,8 @@ impl ControlRawResult {
                 health_request.validate()?;
                 require(
                     health_request.has_wire_identity()
+                        && health_request.client_descriptor_sha256
+                            == request.client_descriptor_sha256
                         && health_request.kind() == ExternalControlKind::Health
                         && health_request.endpoint == request.endpoint
                         && health_request.authority == request.authority
@@ -1066,7 +1067,7 @@ impl ControlRawResult {
                         && response.request_id == health_request.request_id(),
                 )?;
                 Some(
-                    VerifiedBuildIdentity::from_qualified_health(&response)
+                    VerifiedBuildIdentity::from_historical_health(&response, &trust)
                         .ok_or(ChainPostCloseError::SchemaRejected)?,
                 )
             }
@@ -2010,6 +2011,30 @@ mod tests {
     };
     use sha2::{Digest as _, Sha256};
 
+    fn frozen_a_control_request(material: ExternalControlRequestMaterial) -> ControlRequest {
+        let mut request = ControlRequest::capture(material).unwrap();
+        request.client_descriptor_sha256 = Some(historical_external::DESCRIPTOR_SHA256.to_owned());
+        request.validate().unwrap();
+        request
+    }
+
+    fn frozen_a_build_identity() -> BuildIdentity {
+        let build = BuildIdentity {
+            service_version: "0.2.0".into(),
+            source_revision: "098021444d7b3c0dea4732c1b5a03e8773047cfb".into(),
+            contract_sha256: "0c4485545dbfd0979a7d5ea206c840f39fd504ed62fb7eef92f1940bdc9c2f41"
+                .into(),
+            binary_sha256: "22a9726aab44473694141ef78b884c56a99549b23d3c3f9381fead66f6510727"
+                .into(),
+            identity_error: String::new(),
+        };
+        assert!(BuildIdentityTrust::bundled()
+            .unwrap()
+            .historical_identity(&build)
+            .is_ok());
+        build
+    }
+
     #[test]
     fn new_external_control_requests_bind_typed_method_and_descriptor_without_rewriting_v1() {
         for kind in [
@@ -2128,6 +2153,32 @@ mod tests {
             acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
         })
         .unwrap();
+        let current = BuildIdentityTrust::bundled().unwrap();
+        let current_connection = crate::grpc_client::connection_qualification::ConnectionIdentity {
+            version: 1,
+            epoch: "TEST_CODE_CURRENT_CONNECTION_EPOCH".into(),
+            policy_sha256: current.current_policy_sha256(),
+            descriptor_sha256: current.current_descriptor().into(),
+        };
+        let current_health = HealthResponse {
+            request_id: id.into(),
+            live: true,
+            ready: true,
+            build_identity: Some(crate::grpc_client::build_identity::test_public_build_identity()),
+            ..Default::default()
+        };
+        let mut current_raw: ControlRawResult = serde_json::from_value(serde_json::json!({
+            "version":2,"connect_unavailable":false,"response":current_health.encode_to_vec(),
+            "code":null,"details":null,"trailer":"Absent","diagnostic":null
+        }))
+        .unwrap();
+        current_raw
+            .bind_connection_identity(&request, &current_connection, None)
+            .unwrap();
+        assert!(current_raw
+            .project_with_trust(&request, &current)
+            .unwrap()
+            .is_ok());
         let trust = BuildIdentityTrust::test_client_b_with_descriptor();
         assert_ne!(
             trust.current_descriptor(),
@@ -2189,7 +2240,7 @@ mod tests {
     #[test]
     fn task6_historical_build_a_v3_reopens_under_client_b_without_changing_bytes() {
         let request_id = "TEST_CODE_FROZEN_A_HEALTH";
-        let request = ControlRequest::capture(ExternalControlRequestMaterial {
+        let mut request = ControlRequest::capture(ExternalControlRequestMaterial {
             kind: ExternalControlKind::Health,
             request_bytes: HealthRequest {
                 context: Some(
@@ -2206,6 +2257,7 @@ mod tests {
             acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
         })
         .unwrap();
+        request.client_descriptor_sha256 = Some(historical_external::DESCRIPTOR_SHA256.to_owned());
         // Explicit release A fixture; never regenerated from B's current pin.
         let build = serde_json::json!({
             "service_version":"0.2.0",
@@ -2293,13 +2345,13 @@ mod tests {
     }
 
     #[test]
-    fn new_external_control_results_bind_request_and_verified_health_build() {
+    fn frozen_a_external_control_results_bind_request_and_verified_health_build() {
         let control_request = |kind, id: &str| {
             let context = crate::grpc_client::external_pb::magic::market::v1::RequestContext {
                 protocol_version: 1,
                 request_id: id.to_owned(),
             };
-            ControlRequest::capture(ExternalControlRequestMaterial {
+            frozen_a_control_request(ExternalControlRequestMaterial {
                 kind,
                 request_bytes: match kind {
                     ExternalControlKind::Health => HealthRequest {
@@ -2316,14 +2368,13 @@ mod tests {
                 endpoint_uri: "https://example.com".to_owned(),
                 acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
             })
-            .unwrap()
         };
         let health_request = control_request(ExternalControlKind::Health, "TEST_CODE_HEALTH");
         let health_response = HealthResponse {
             request_id: health_request.request_id().to_owned(),
             live: true,
             ready: true,
-            build_identity: Some(crate::grpc_client::build_identity::test_public_build_identity()),
+            build_identity: Some(frozen_a_build_identity()),
             ..Default::default()
         };
         let health_bytes = health_response.encode_to_vec();
@@ -2441,7 +2492,7 @@ mod tests {
     #[test]
     fn external_v3_control_status_conflicting_carriers_drop_provider_evidence() {
         let id = "TEST_CODE_CONTROL_STATUS";
-        let request = ControlRequest::capture(ExternalControlRequestMaterial {
+        let request = frozen_a_control_request(ExternalControlRequestMaterial {
             kind: ExternalControlKind::Health,
             request_bytes: HealthRequest {
                 context: Some(
@@ -2456,8 +2507,7 @@ mod tests {
             profile: ContractProfile::ExternalV1,
             endpoint_uri: "https://example.com".to_owned(),
             acquisition_authority: "grpc-mtls:TEST_CODE".to_owned(),
-        })
-        .unwrap();
+        });
         let detail = crate::grpc_client::external_pb::magic::market::v1::ErrorDetail {
             request_id: id.to_owned(),
             provider: "Eastmoney".to_owned(),
@@ -2576,9 +2626,7 @@ mod tests {
             material: "external-unary-response-evidence-v1".to_owned(),
             profile: "ExternalV1".to_owned(),
             method: ExternalQueryMethod::GlobalNews,
-            client_descriptor_sha256:
-                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-                    .to_owned(),
+            client_descriptor_sha256: historical_external::DESCRIPTOR_SHA256.to_owned(),
             evidence: ExternalWireMaterialV1::Payload {
                 protobuf_payload: payload.clone(),
                 payload_sha256: hex::encode(Sha256::digest(&payload)),
@@ -2629,20 +2677,41 @@ mod tests {
     }
 
     #[test]
-    fn new_external_data_result_binds_request_and_descriptor_identity() {
+    fn frozen_a_external_data_result_binds_request_and_descriptor_identity() {
         let (identity, request, completion) = external_v2_material(&[0x5a, 0x00]);
-        let stored = DataResult::capture_external(
-            crate::search_service::macro_news::runner::QueryKey::Gateway(1),
-            &identity,
-            &request,
-            1,
-            &completion,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut raw = RawResult::capture_external_bound(&completion, &identity, &request).unwrap();
+        raw.wire_identity.as_mut().unwrap().client_descriptor_sha256 =
+            historical_external::DESCRIPTOR_SHA256.to_owned();
+        let (processed, _, _) = raw.project_for(&identity, &request, 1, None).unwrap();
+        let MacroQueryIdentity::GlobalNews { provider, limit } = identity else {
+            unreachable!("TEST_CODE frozen GlobalNews fixture")
+        };
+        let gateway =
+            crate::data_gateway::grpc_source::GrpcSource::legacy_durable_global_news_query_result(
+                provider,
+                limit,
+                true,
+                &processed.unwrap(),
+            );
+        let native = native_bytes(&gateway).unwrap();
+        let stored = DataResult {
+            version: 2,
+            query: crate::search_service::macro_news::runner::QueryKey::Gateway(1),
+            attempt: 1,
+            raw,
+            native_sha256: hex::encode(Sha256::digest(&native)),
+            native,
+        };
         assert_eq!(stored.raw.version, 3);
-        stored.project(&identity, &request, None).unwrap();
+        stored
+            .project(
+                &MacroQueryIdentity::GlobalNews { provider, limit },
+                &request,
+                None,
+            )
+            .unwrap();
+
+        let identity = MacroQueryIdentity::GlobalNews { provider, limit };
 
         let trust_b = BuildIdentityTrust::test_client_b_with_descriptor();
         let connection_b = crate::grpc_client::connection_qualification::ConnectionIdentity {
@@ -2717,7 +2786,9 @@ mod tests {
             retry_decision: RetryDecision::RetryBackoff,
             continuation: MacroContinuation::Terminal,
         };
-        let raw = RawResult::capture_external_bound(&completion, &identity, &request).unwrap();
+        let mut raw = RawResult::capture_external_bound(&completion, &identity, &request).unwrap();
+        raw.wire_identity.as_mut().unwrap().client_descriptor_sha256 =
+            historical_external::DESCRIPTOR_SHA256.to_owned();
         assert_eq!(raw.version, 3);
         assert!(raw.response.is_none() && raw.external_wire.is_none());
         let (processed, decision, attempts) =
@@ -2840,9 +2911,7 @@ mod tests {
             material: "external-unary-response-evidence-v1".to_owned(),
             profile: "ExternalV1".to_owned(),
             method: ExternalQueryMethod::GlobalNews,
-            client_descriptor_sha256:
-                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-                    .to_owned(),
+            client_descriptor_sha256: historical_external::DESCRIPTOR_SHA256.to_owned(),
             evidence: ExternalWireMaterialV1::Missing {
                 framed_body_limit_bytes: crate::grpc_client::external_query_transport::EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
             },
@@ -3112,9 +3181,7 @@ mod tests {
             material: "external-unary-response-evidence-v1".to_owned(),
             profile: "ExternalV1".to_owned(),
             method: ExternalQueryMethod::GlobalNews,
-            client_descriptor_sha256:
-                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-                    .to_owned(),
+            client_descriptor_sha256: historical_external::DESCRIPTOR_SHA256.to_owned(),
             evidence: material,
         };
         let completion = ExternalMacroAttemptCompletion::Unary(MacroAttemptCompletion {
