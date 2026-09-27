@@ -1,0 +1,128 @@
+{
+  "schema_version": 2,
+  "role": "current-source-status-delta",
+  "status": "PROVISIONAL",
+  "source_commit": "402a7da74870a81fc58975628203923da4dc35f8",
+  "historical_catalog_sha256": "0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3",
+  "current_v1_catalog_sha256": "b3c04218e3548f80c026db905e3d0ac2eed59d7ce24efeefa8e69a20b417de93",
+  "scope": "仅修订四个已核实 kind 的当前源码状态事实；不替代 65-kind v1 身份、不更改运行时 MachineCatalog、readiness 或 activation。source_commit 固定审计源码快照，未证明当前部署或外部接收。",
+  "kinds": [
+    {
+      "kind": "IndustryChain",
+      "base_status": "STARVED",
+      "observed_status": "ACTIVE",
+      "new_claim_path": "CONDITIONAL",
+      "facts": {
+        "scheduler_wired": true,
+        "account_metrics_complete_required": true,
+        "historical_decision_resume_independent": true
+      },
+      "note": "R-03 在 account phase 内只于 banner.account_metrics_complete 为真时调用真实 counted dispatcher；缺指标时保持 typed AccountMetricsIncomplete。既存 immutable decision 的启动恢复是独立路径。ACTIVE 只表示条件生产调用可达，不表示已部署、源批次成功或 sink 已接收。",
+      "evidence_ids": ["r03-account-phase", "r03-banner", "r03-counted"]
+    },
+    {
+      "kind": "PostFixedPriceOrder",
+      "base_status": "STARVED",
+      "observed_status": "STARVED",
+      "new_claim_path": "BLOCKED",
+      "facts": {
+        "scheduler_wired": true,
+        "source_registered": false
+      },
+      "note": "T-14 盘中 900 秒调度接线存在，TradeEventSource 未在生产源码注册；读取边界失败，无新 order 事件可投递。保留 v1 的调度/Unit 状态语义。",
+      "evidence_ids": ["trade-schedule", "trade-source-fetch", "trade-source-register"]
+    },
+    {
+      "kind": "PostFixedPriceFill",
+      "base_status": "STARVED",
+      "observed_status": "STARVED",
+      "new_claim_path": "BLOCKED",
+      "facts": {
+        "scheduler_wired": true,
+        "source_registered": false,
+        "after_hours_schedule_reachable": false
+      },
+      "note": "T-15 盘中 300 秒调度接线存在，TradeEventSource 未注册；15:00 后盘中分支退出，盘后成交语义窗口另受时段结构阻断。无新 fill 事件可投递。",
+      "evidence_ids": ["trade-schedule", "trade-source-fetch", "trade-source-register"]
+    },
+    {
+      "kind": "BlockTradePriceRange",
+      "base_status": "INACTIVE",
+      "observed_status": "INACTIVE",
+      "new_claim_path": "BLOCKED",
+      "facts": {
+        "side_route_wired": true,
+        "required_range_present": false
+      },
+      "note": "T-19 北交所生产侧路由固定传 None 价格区间，dispatcher 在渲染和 sink 前返回 false；review.price 作为均价不能代替区间。",
+      "evidence_ids": ["block-review-route", "block-range-guard"]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "r03-account-phase",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "dispatch_post_session_review",
+      "symbol_sha256": "8a369a27a849bcc52d68e129447e4348aa166eb432ca3b09db095bc403be86c3",
+      "required_fragments": [
+        "if account_metrics_ok && *task == ReviewTask::R03",
+        "dispatch_r03_industry_chain_outcome(&date).await",
+        "ReviewTaskOutcome::account_metrics_incomplete(observed_at)"
+      ]
+    },
+    {
+      "id": "r03-banner",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "build_banner",
+      "symbol_sha256": "147fc6881a61da7ad1d1b1763421eeed1ccee53bc8ea3d1d7a120fe4b083da7a",
+      "required_fragments": ["account_metrics_complete: batch.metrics.is_complete()"]
+    },
+    {
+      "id": "r03-counted",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "dispatch_r03_industry_chain_outcome",
+      "symbol_sha256": "65c8cdda384711bcf3f0f61b78a7b6ed9dd6324ec00be06ea60476c3e30b8da8",
+      "required_fragments": ["dispatch_review_task_counted(", "PushKind::IndustryChain"]
+    },
+    {
+      "id": "trade-schedule",
+      "path": "src/bin/monitor/main.rs",
+      "symbol": "monitor_loop",
+      "symbol_sha256": "aaec1b5851fcfc6455b1f39864617c7515de2dce8069531c13fa510cc935b148",
+      "required_fragments": [
+        "session == MarketSession::Morning || session == MarketSession::Afternoon",
+        "dispatch_trade_pipeline_orders_periodic(",
+        "dispatch_trade_pipeline_fills_periodic(",
+        "session == MarketSession::AfterHours"
+      ]
+    },
+    {
+      "id": "trade-source-fetch",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "fetch_pending_trade_events",
+      "symbol_sha256": "374ceabfbe0ee4bf67e66b605aa094a6fff0251bb5b7f6ab4bb04f9e3b1c556b",
+      "required_fragments": ["TRADE_EVENT_SOURCE", ".get()", ".fetch_pending_events()"]
+    },
+    {
+      "id": "trade-source-register",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "register_trade_event_source",
+      "symbol_sha256": "b8c90bfef5380351e27bb5948a6d95053c4d9460e016492a8d210b03d24b38e1",
+      "required_fragments": ["TRADE_EVENT_SOURCE", ".set(source)"]
+    },
+    {
+      "id": "block-review-route",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "dispatch_block_trade_review",
+      "symbol_sha256": "ca8ef312363fac83b2209403c9ddf0a9857fa8b3f71f7ae9a80b7155e23478ea",
+      "required_fragments": ["dispatch_block_trade_price_range(", "review.price,\n                None,"]
+    },
+    {
+      "id": "block-range-guard",
+      "path": "src/bin/monitor/push_templates.rs",
+      "symbol": "dispatch_block_trade_price_range",
+      "symbol_sha256": "453e74335e301177207e5e3f74932d88d1a1d4b808b7f568f9ad3ba0d3791375",
+      "required_fragments": ["block_price_range.is_none_or(|range| range.trim().is_empty())", "return false;"]
+    }
+  ]
+}

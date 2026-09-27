@@ -29,3 +29,7 @@ T-14/T-15 的 `STARVED` 与旧 §24 `INACTIVE` 主要是**状态词口径冲突*
 4. 验证门禁：静态差分必须只含获证实的状态/说明变化；运行 `ruby scripts/architecture-docs/check-catalog.rb --root . --check`、`ruby scripts/architecture-docs/render-catalog.rb --root . --current --check`、`ruby scripts/architecture-docs/check.rb --check --root .` 和相关 Ruby fixture；若更改 `MachineCatalog` 消费版本或 readiness，另运行 `cargo test --locked --offline --lib w06_` 及受影响的 readiness/activation 定向测试。R-03 晋级仍需有效完整指标、真实源批次、durable 决策与 sink 回执的运行证据；T-14/T-15 需真实 source 注册及盘后时窗验收；T-19 需有来源证明的价格区间，方可声称有新发送能力。
 
 本审计只做文档证据整理；没有修改冻结 catalog、运行时代码、激活状态或生产部署。
+
+## 后续落地
+
+已建立独立的 [current-source v2 状态增量](../push-system/push-current-capability-status.v2.json)及[生成视图](../push-system/push-current-capability-status.v2.md)。它只覆盖本审计核实的四个 kind，固定源提交 `402a7da7` 与两份 v1 原字节摘要；R-03 的源码状态记录为条件 `ACTIVE`，T-14/T-15/T-19 保留阻断事实。定向校验命令为 `ruby scripts/architecture-docs/render-current-status-v2.rb --root . --check`。旧的 current v1 全量 manifest 已与大量后续源码变化脱节，本增量不代表全量 current audit 门禁通过。
