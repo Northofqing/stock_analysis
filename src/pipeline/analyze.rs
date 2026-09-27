@@ -2124,7 +2124,7 @@ mod tests {
         crate::database::DatabaseManager::init(None).unwrap();
         for (responses, expected, cli_ok) in [
             (vec![false], NotificationCompletion::AllFailed, false),
-            (vec![true, false], NotificationCompletion::Partial, true),
+            (vec![true, false], NotificationCompletion::Partial, false),
             (vec![true, true], NotificationCompletion::AllAccepted, true),
         ] {
             let fixtures: Vec<_> = responses

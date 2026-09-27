@@ -36,8 +36,7 @@ impl AnalysisNotification {
                 match report.completion() {
                     NotificationCompletion::AllAccepted => Ok(()),
                     NotificationCompletion::Partial => {
-                        log::warn!("通知本轮不完整：部分渠道弱接受，其他渠道结果未知；不自动重发已接受渠道");
-                        Ok(())
+                        anyhow::bail!("通知本轮不完整：部分渠道弱接受，其他渠道结果未知；不自动重发已接受渠道")
                     }
                     state => anyhow::bail!("通知未完成: {state:?}（不代表权威送达）"),
                 }
