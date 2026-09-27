@@ -16,6 +16,10 @@
 
 该响应所有记录的 `notice_url` 都是 `https://www.cffex.com.cn/jystz/20251217/46425.html`。2026-09-27 本地 HTTP HEAD 对同一路径得到 302 → 404；[标注该原始链接的交易所通知转载](https://www.citicsf.com/e-futures/content/000509/819778)显示内容是《关于2026年部分节假日休市安排的通知》，并非交割公告。[中金所官方中证1000合约细则](https://www.cffex.com.cn/cn/ssxz/20220718/43093.html)规定到期月第三个星期五为最后交易日/交割日，法定假日或异常停市顺延；它能支持规则推导，却不能把休市通知冒充逐月交割公告。VM 已收到来源错误交接：核实官方原件、说明“细则+休市日历计算”还是“月度公告”合同、修正 URL/版本/异常停市语义并重做 fixture；证据修复前不部署 R-08。本地接线代码仍待最终合同校准，不发布生产能力。
 
+VM 已确认新合同定位为 `FuturesDelivery` v2 的 `Planned` 规则预排：请求和记录均升 v2，记录要有产品规则及假期依据 URL，旧 v1 显式拒绝。该预排只能供明确标注的只读日历查询，不能证明“今日已交割”或存在逐月公告；异常停市和之后的交易所调整必须由新事实及修订处理。当前 EventCalendar 生产模板仍要求公告 `source_at`、`notice_url` 且文案为“官方通知”，因此确认型发送保持 fail-closed，不把 v2 Planned 塞入旧 v1 持久绑定。
+
+部署顺序已交接：本地 ExternalV1 Health 将上游 `source_revision`、二进制和 descriptor 哈希精确钉在当前客户端。VM 先完成 v2 提交、构建、同源公开 bundle/fixture 并交付精确身份，待本地消费者编译和切换准备完成后再替换线上服务；不能先更换线上进程使现运行 monitor 的其他 gRPC 路由失去资格。
+
 虚拟机回复需包含：
 
 1. 完整请求形状、`preferred_provider` / profile、2026 年覆盖和 2027 年/非法月份/空请求的明确结果；规范请求及其真实响应，包含 `request_id`、批次、来源证据、`complete` 和记录 schema。
