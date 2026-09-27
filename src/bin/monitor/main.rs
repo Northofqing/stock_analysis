@@ -214,6 +214,7 @@ mod news_aggregator_init;
 mod news_ai_shadow;
 
 mod health;
+mod health_cmd;
 
 mod holding_plan;
 
@@ -1586,6 +1587,13 @@ async fn run_daily_pushes() -> Result<(), String> {
 pub static LATEST_BANNER: Lazy<std::sync::Mutex<Option<push_templates::BannerCtx>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
+// Bound only after the monitor owns its singleton lease. Unit tests never run
+// main and therefore cannot publish a production operational health snapshot.
+static HEALTH_SNAPSHOT_OWNER: Lazy<std::sync::Mutex<Option<(bool, String)>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+static HEALTH_SNAPSHOT_WRITE_LOCK: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
+
 /// Read the latest fully evaluated banner.
 ///
 /// Before both account and data health have been evaluated there is no truthful
@@ -1874,9 +1882,24 @@ mod tests_account_banner_values {
 }
 
 fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
+    let _write_guard = HEALTH_SNAPSHOT_WRITE_LOCK
+        .lock()
+        .map_err(|_| "health snapshot write lock poisoned".to_string())?;
     *LATEST_BANNER
         .lock()
-        .map_err(|_| "latest banner lock poisoned".to_string())? = Some(banner);
+        .map_err(|_| "latest banner lock poisoned".to_string())? = Some(banner.clone());
+    let owner = match HEALTH_SNAPSHOT_OWNER.lock() {
+        Ok(owner) => owner.clone(),
+        Err(_) => {
+            log::error!("[health] snapshot owner lock poisoned");
+            None
+        }
+    };
+    if let Some((test_mode, boot_id)) = owner {
+        if let Err(error) = health_cmd::write_banner_snapshot(test_mode, &boot_id, &banner) {
+            log::error!("[health] operational banner snapshot unavailable: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -3682,6 +3705,7 @@ impl std::fmt::Display for MonitorInstanceLeaseError {
 struct MonitorInstanceLease {
     _file: std::fs::File,
     production: bool,
+    boot_id: String,
 }
 
 fn monitor_instance_lease_path(test_mode: bool) -> std::path::PathBuf {
@@ -3716,7 +3740,7 @@ fn acquire_monitor_instance_lease_at(
         path: path.to_path_buf(),
         source,
     })?;
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -3740,9 +3764,24 @@ fn acquire_monitor_instance_lease_at(
             }
         }
     })?;
+    let boot_id = health_cmd::new_boot_id();
+    file.set_len(0)
+        .map_err(|source| MonitorInstanceLeaseError::Io {
+            action: "clear identity in",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(boot_id.as_bytes())
+        .and_then(|_| file.sync_data())
+        .map_err(|source| MonitorInstanceLeaseError::Io {
+            action: "publish identity in",
+            path: path.to_path_buf(),
+            source,
+        })?;
     Ok(MonitorInstanceLease {
         _file: file,
         production: false,
+        boot_id,
     })
 }
 
@@ -4734,6 +4773,14 @@ async fn main() {
         .init();
 
     let process_args = std::env::args().collect::<Vec<_>>();
+    match health_cmd::parse(&process_args) {
+        Ok(Some(command)) => std::process::exit(health_cmd::run(command)),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[health] {error}");
+            std::process::exit(2);
+        }
+    }
     match parse_br194_terminal_replay_command(&process_args) {
         Ok(Some(command)) => {
             match durable_delivery_runtime::run_production_audited_terminal_replay(
@@ -4825,6 +4872,12 @@ async fn main() {
             }
         }
     };
+    if let Some(lease) = &_monitor_instance_lease {
+        match HEALTH_SNAPSHOT_OWNER.lock() {
+            Ok(mut owner) => *owner = Some((test_mode, lease.boot_id.clone())),
+            Err(_) => log::error!("[health] snapshot owner lock poisoned"),
+        }
+    }
     // BR-241: reject an invalid P-01 compensation command after acquiring the
     // production singleton lease, but before audit/sink initialization or the
     // global durable startup barrier can resume an unrelated PushKind.
