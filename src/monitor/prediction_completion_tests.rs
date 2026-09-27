@@ -214,3 +214,39 @@ async fn task2_missing_target_close_never_uses_future_price() {
             .is_none()
     );
 }
+
+#[test]
+fn task2_suspended_target_close_keeps_prediction_pending() {
+    let (_dir, db) = private_db();
+    let code = "TEST_CODE_suspended";
+    db.save_prediction_legacy(
+        "2026-02-02",
+        "2026-02-25",
+        None,
+        Some(code),
+        "up",
+        80.,
+        None,
+    )
+    .unwrap();
+    close(&db, code, "2026-02-02", 100.);
+    close(&db, code, "2026-02-25", 125.);
+    diesel::sql_query("UPDATE stock_daily SET is_suspended = 1 WHERE code = ?1 AND date = ?2")
+        .bind::<diesel::sql_types::Text, _>(code)
+        .bind::<diesel::sql_types::Text, _>("2026-02-25")
+        .execute(&mut db.get_conn().unwrap())
+        .unwrap();
+
+    let report =
+        verify_due_predictions(&db, chrono::NaiveDate::from_ymd_opt(2026, 2, 26).unwrap()).unwrap();
+    assert_eq!(
+        (report.pending, report.verified, report.deferred),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        db.get_prediction_by_code_date(code, "2026-02-02")
+            .unwrap()
+            .hit,
+        None
+    );
+}

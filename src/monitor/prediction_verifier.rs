@@ -51,13 +51,14 @@ fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Opti
         close: Option<f64>,
     }
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let row =
-        diesel::sql_query("SELECT close FROM stock_daily WHERE code = ?1 AND date = ?2 LIMIT 1")
-            .bind::<diesel::sql_types::Text, _>(code)
-            .bind::<diesel::sql_types::Text, _>(date)
-            .get_result::<Close>(&mut conn)
-            .optional()
-            .map_err(|e| e.to_string())?;
+    let row = diesel::sql_query(
+        "SELECT close FROM stock_daily WHERE code = ?1 AND date = ?2 AND is_suspended = 0 LIMIT 1",
+    )
+    .bind::<diesel::sql_types::Text, _>(code)
+    .bind::<diesel::sql_types::Text, _>(date)
+    .get_result::<Close>(&mut conn)
+    .optional()
+    .map_err(|e| e.to_string())?;
     Ok(row.and_then(|r| r.close))
 }
 
