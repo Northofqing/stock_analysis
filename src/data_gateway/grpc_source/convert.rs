@@ -193,6 +193,22 @@ fn parse_records(q: &QueryResult, capability: &'static str) -> Result<Vec<Value>
         .map_err(|e| err(capability, format!("records 非 JSON 数组: {e}")))
 }
 
+fn parse_realtime_quote_records(q: &QueryResult) -> Result<Vec<Value>, GatewayError> {
+    const CAPABILITY: &str = "RealtimeMarketQuotes";
+    let parsed = parse_records(q, CAPABILITY)?;
+    let payload = &q.records[0];
+    if payload.schema != "market.realtime_quotes"
+        || payload.schema_version != 1
+        || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
+    {
+        return Err(err(
+            CAPABILITY,
+            "RealtimeQuotes payload schema/version/content_type is not the frozen v1 contract",
+        ));
+    }
+    Ok(parsed)
+}
+
 fn parse_benchmark_wire(
     q: &QueryResult,
 ) -> Result<crate::data_gateway::benchmark::BenchmarkGrpcResponseWire, GatewayError> {
@@ -585,7 +601,7 @@ fn validate_live_times(
 pub fn realtime_quotes(q: &QueryResult) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let capability = "RealtimeMarketQuotes";
     let ev = evidence_of(q, capability)?;
-    let parsed = parse_records(q, capability)?;
+    let parsed = parse_realtime_quote_records(q)?;
     if parsed.is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(ev));
     }
@@ -650,7 +666,7 @@ pub(crate) fn realtime_quote_candidates_at(
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let capability = "RealtimeMarketQuotes";
     let (evidence, source_at, observed_at) = live_evidence_times(q, capability, now)?;
-    let parsed = parse_records(q, capability)?;
+    let parsed = parse_realtime_quote_records(q)?;
     if parsed.is_empty() {
         return Ok(GatewayBatch::VerifiedEmpty(evidence));
     }
@@ -4246,6 +4262,12 @@ mod tests {
         }
     }
 
+    fn mk_quote_q(data: &str, provider: &str, source: &str) -> QueryResult {
+        let mut q = mk_q(data, provider, source);
+        q.records[0].schema = "market.realtime_quotes".to_owned();
+        q
+    }
+
     #[test]
     fn market_announcements_accepts_per_record_payloads_and_verified_empty() {
         let row = serde_json::json!({
@@ -5406,7 +5428,7 @@ mod tests {
     #[test]
     fn realtime_quotes_canned_roundtrip() {
         // 与 delegate.rs fetch_realtime_quotes 视图字段一致 (交叉引用)。
-        let q = mk_q(
+        let q = mk_quote_q(
             r#"[{"code":"600519","name":"贵州茅台","price":1500.0,"change_pct":2.34,"previous_close":1465.7}]"#,
             "Tdx",
             "tdx",
@@ -5422,6 +5444,44 @@ mod tests {
             batch.evidence().source_at.as_deref(),
             Some("2026-08-15T09:35:00+08:00")
         );
+    }
+
+    #[test]
+    fn realtime_quote_payload_requires_frozen_contract() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 1).unwrap();
+        let data = r#"[{"code":"TEST_CODE_QUOTE","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#;
+        for (case, schema, version, content_type) in [
+            (
+                "schema",
+                "market.order_books",
+                1,
+                CANONICAL_JSON_CONTENT_TYPE,
+            ),
+            (
+                "version",
+                "market.realtime_quotes",
+                2,
+                CANONICAL_JSON_CONTENT_TYPE,
+            ),
+            (
+                "content_type",
+                "market.realtime_quotes",
+                1,
+                "application/json",
+            ),
+        ] {
+            let mut q = mk_q(data, "Tdx", "TEST_CODE_tdx");
+            q.source_at = "2026-08-17T01:30:00Z".to_owned();
+            q.observed_at = "2026-08-17T01:30:00.250Z".to_owned();
+            q.records[0].schema = schema.to_owned();
+            q.records[0].schema_version = version;
+            q.records[0].content_type = content_type.to_owned();
+
+            let ordinary = realtime_quotes(&q).expect_err(case);
+            assert_eq!(ordinary.reason_code(), "invalid_evidence", "case={case}");
+            let live = realtime_quote_candidates_at(&q, now).expect_err(case);
+            assert_eq!(live.reason_code(), "invalid_evidence", "case={case}");
+        }
     }
 
     #[test]
@@ -5452,7 +5512,7 @@ mod tests {
 
     #[test]
     fn realtime_quotes_rejects_missing_change_pct() {
-        let q = mk_q(
+        let q = mk_quote_q(
             r#"[{"code":"600519","name":"贵州茅台","price":1500.0,"previous_close":1465.7}]"#,
             "Tdx",
             "tdx",
@@ -5464,7 +5524,7 @@ mod tests {
     fn br238_realtime_consumer_rejects_five_seconds_and_one_nanosecond_old() {
         let now =
             Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap() + chrono::Duration::nanoseconds(1);
-        let mut q = mk_q(
+        let mut q = mk_quote_q(
             r#"[{"code":"TEST_CODE_QUOTE_001","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
             "Tdx",
             "TEST_CODE_tdx",
@@ -5481,7 +5541,7 @@ mod tests {
     #[test]
     fn br238_realtime_consumer_accepts_exact_five_second_fractional_unix_evidence() {
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
-        let mut q = mk_q(
+        let mut q = mk_quote_q(
             r#"[{"code":"TEST_CODE_QUOTE_003","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
             "Tdx",
             "TEST_CODE_tdx",
@@ -5501,7 +5561,7 @@ mod tests {
     #[test]
     fn br238_realtime_consumer_rejects_one_nanosecond_future_source_time() {
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 0).unwrap();
-        let mut q = mk_q(
+        let mut q = mk_quote_q(
             r#"[{"code":"TEST_CODE_QUOTE_004","name":"TEST_CODE_name","price":10.0,"change_pct":0.0,"previous_close":9.9}]"#,
             "Tdx",
             "TEST_CODE_tdx",
@@ -5518,7 +5578,7 @@ mod tests {
     #[test]
     fn br238_realtime_consumer_rejects_non_positive_quote_prices() {
         let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 0).unwrap();
-        let mut q = mk_q(
+        let mut q = mk_quote_q(
             r#"[{"code":"TEST_CODE_QUOTE_002","name":"TEST_CODE_name","price":0.0,"change_pct":0.0,"previous_close":9.9}]"#,
             "Tdx",
             "TEST_CODE_tdx",
@@ -5534,7 +5594,7 @@ mod tests {
 
     #[test]
     fn empty_records_is_verified_empty() {
-        let q = mk_q("[]", "Tdx", "tdx");
+        let q = mk_quote_q("[]", "Tdx", "tdx");
         let batch = realtime_quotes(&q).unwrap();
         assert!(batch.is_verified_empty());
     }
