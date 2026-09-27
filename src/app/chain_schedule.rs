@@ -46,7 +46,8 @@ impl ChainPhase {
         observed_at.date() == date && observed_at.time() >= start && observed_at.time() < end
     }
 
-    fn is_overdue(self, date: NaiveDate, observed_at: NaiveDateTime) -> bool {
+    /// Read-only policy query for comparing the legacy missed-window decision.
+    pub fn is_overdue(self, date: NaiveDate, observed_at: NaiveDateTime) -> bool {
         observed_at.date() == date && observed_at.time() >= self.window().1
     }
 }
