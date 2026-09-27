@@ -8,7 +8,13 @@
 
 ## 已派发给虚拟机侧
 
-虚拟机项目任务 `01a0d3f4-eb49-7bb1-a09e-462245d3e715` 已收到开发与部署交接：核对真实 wire，发布唯一版本化合同与脱敏 fixture，必要时修复服务端问题，完成定向测试、构建、部署和真实 RPC 验证。不得覆盖或顺带提交现有未提交改动，也不得扩展未经证实的年份或制造 `VerifiedEmpty`。
+当前上游执行任务是远程 Codex `01a0e0cf-2276-7512-96ee-3a94bdfa8ca5`，在被忽略的 `.worktrees/r08-futures-delivery` 隔离树工作；原任务 `01a0d3f4-eb49-7bb1-a09e-462245d3e715` 因托管工作树审批挂起，已收到停止指令。当前任务负责核对真实 wire，发布唯一版本化合同与脱敏 fixture，必要时修复服务端问题，完成定向测试、构建、部署和真实 RPC 验证。不得覆盖或顺带提交主工作树新闻改动，也不得扩展未经证实的年份或制造 `VerifiedEmpty`。
+
+### 2026-09-27 阶段性 RPC 与来源异常
+
+部署前的真实 `FuturesDelivery` RPC 使用 ExternalV1 `{"year":2026,"month":9}`、`preferred_provider=Cffex`，返回 `ADMITTED`、`complete=true`、IF/IH/IC/IM 四条、`batch_id=cffex-equity-index-delivery-2026-v1:09`；单条 schema 为 `magic.market.futures_delivery_event` v1，`observed_at` 是 Unix 秒小数字符串，`source_at` 缺失。2027-09 真实请求返回 `UNIMPLEMENTED`，明确仅覆盖 2026 年。这些是**旧运行进程的部署前证据**，不能代替最终提交的 Health 身份和部署后 RPC。
+
+该响应所有记录的 `notice_url` 都是 `https://www.cffex.com.cn/jystz/20251217/46425.html`。2026-09-27 本地 HTTP HEAD 对同一路径得到 302 → 404；[标注该原始链接的交易所通知转载](https://www.citicsf.com/e-futures/content/000509/819778)显示内容是《关于2026年部分节假日休市安排的通知》，并非交割公告。[中金所官方中证1000合约细则](https://www.cffex.com.cn/cn/ssxz/20220718/43093.html)规定到期月第三个星期五为最后交易日/交割日，法定假日或异常停市顺延；它能支持规则推导，却不能把休市通知冒充逐月交割公告。VM 已收到来源错误交接：核实官方原件、说明“细则+休市日历计算”还是“月度公告”合同、修正 URL/版本/异常停市语义并重做 fixture；证据修复前不部署 R-08。本地接线代码仍待最终合同校准，不发布生产能力。
 
 虚拟机回复需包含：
 
@@ -19,4 +25,4 @@
 
 ## 本地接收门
 
-本地已准备 ExternalV1 的 `year/month` 请求、FuturesDelivery 方法路由和四合约响应校验，并移除会把旧数组空批次当作 `VerifiedEmpty` 的转换器；业务入口仍保持 `futures_delivery_contract_unavailable_v1`。取得上面合同与 fixture 后，将校准响应字段，接通 Gateway，并以真实请求核对 `request_id`、audit、schema 和源证据。未通过前 R-08 不投递未知交割结论。
+本地已准备 ExternalV1 的 `year/month` 请求、FuturesDelivery 方法路由和四合约响应校验，并移除会把旧数组空批次当作 `VerifiedEmpty` 的转换器；工作树正在实现 Gateway 接线与脱敏探针，但尚未提交或部署。取得已修正的同源合同、fixture 和部署身份后，将校准响应字段、notice 证据，核对真实 `request_id`、audit、schema 和来源，再决定生产放行。未通过前 R-08 不投递未知交割结论。
