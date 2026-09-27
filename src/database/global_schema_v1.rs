@@ -2231,7 +2231,9 @@ fn classify_identity(
     if application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
         && matches!(
             user_version,
-            STOCK_ANALYSIS_DB_SCHEMA_GENERATION | PAPER_LEDGER_CATALOG_GENERATION | REVIEW_CATALOG_GENERATION
+            STOCK_ANALYSIS_DB_SCHEMA_GENERATION
+                | PAPER_LEDGER_CATALOG_GENERATION
+                | REVIEW_CATALOG_GENERATION
         )
     {
         return Ok(GlobalSchemaIdentity {
@@ -3744,72 +3746,72 @@ mod tests {
     #[test]
     fn paper_ledger_catalog_v2_old_receipt_cannot_issue_extended_authority() {
         for generation in [PAPER_LEDGER_CATALOG_GENERATION, REVIEW_CATALOG_GENERATION] {
-        let fixture = TestFixture::new(
-            "paper-catalog-old-receipt",
-            STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-            1,
-        );
-        fixture.install_final_selection_catalog();
-        let writer = fixture.pinned_audit_writer();
-        writer
-            .append(SelectionAuditRecord::new(
-                SelectionAuditPhase::V2GateDCanaryVerified,
-                "TEST_CODE_OLD_RECEIPT",
-                "c".repeat(64),
-                chrono::DateTime::parse_from_rfc3339("2026-07-29T00:02:00+08:00").unwrap(),
-            ))
-            .unwrap();
-        let old = GlobalSchemaVersionOwner::for_test_code()
-            .inspect_selection_with_audit_for_test(&fixture.root, &writer)
-            .unwrap();
-        assert!(matches!(old, SelectionSchemaInspectionOutcome::Amended(_)));
-        drop(old);
-        let conn = Connection::open(fixture.database()).unwrap();
-        for (_, _, _, sql) in super::super::paper_ledger_schema_v1::STATEMENTS {
-            conn.execute_batch(sql).unwrap();
-        }
-        if generation == REVIEW_CATALOG_GENERATION {
-            for (_, _, _, sql) in super::super::daily_change_review_schema_v1::STATEMENTS {
+            let fixture = TestFixture::new(
+                "paper-catalog-old-receipt",
+                STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+                1,
+            );
+            fixture.install_final_selection_catalog();
+            let writer = fixture.pinned_audit_writer();
+            writer
+                .append(SelectionAuditRecord::new(
+                    SelectionAuditPhase::V2GateDCanaryVerified,
+                    "TEST_CODE_OLD_RECEIPT",
+                    "c".repeat(64),
+                    chrono::DateTime::parse_from_rfc3339("2026-07-29T00:02:00+08:00").unwrap(),
+                ))
+                .unwrap();
+            let old = GlobalSchemaVersionOwner::for_test_code()
+                .inspect_selection_with_audit_for_test(&fixture.root, &writer)
+                .unwrap();
+            assert!(matches!(old, SelectionSchemaInspectionOutcome::Amended(_)));
+            drop(old);
+            let conn = Connection::open(fixture.database()).unwrap();
+            for (_, _, _, sql) in super::super::paper_ledger_schema_v1::STATEMENTS {
                 conn.execute_batch(sql).unwrap();
             }
-        }
-        conn.pragma_update(None, "user_version", generation)
-            .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .unwrap();
-        drop(conn);
-        // Only the just-created, closed private fixture sidecars are cleaned.
-        // The production inspector must continue rejecting unknown sidecars.
-        for suffix in ["-wal", "-shm"] {
-            let path = sidecar_path(&fixture.database(), suffix);
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => panic!("closed TEST_CODE fixture sidecar: {error}"),
-            }
-        }
-        let before = fs::read(fixture.database()).unwrap();
-        let outcome = GlobalSchemaVersionOwner::for_test_code()
-            .inspect_selection_with_audit_for_test(&fixture.root, &writer)
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            SelectionSchemaInspectionOutcome::Diagnostic(_)
-        ));
-        assert_eq!(
-            outcome.authority_state(),
             if generation == REVIEW_CATALOG_GENERATION {
-                SelectionSchemaAuthorityDiagnostic::CatalogV3RequalificationRequired
-            } else {
-                SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired
+                for (_, _, _, sql) in super::super::daily_change_review_schema_v1::STATEMENTS {
+                    conn.execute_batch(sql).unwrap();
+                }
             }
-        );
-        drop(outcome);
-        assert_eq!(
-            fs::read(fixture.database()).unwrap(),
-            before,
-            "classification must not auto migrate/qualify"
-        );
+            conn.pragma_update(None, "user_version", generation)
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            drop(conn);
+            // Only the just-created, closed private fixture sidecars are cleaned.
+            // The production inspector must continue rejecting unknown sidecars.
+            for suffix in ["-wal", "-shm"] {
+                let path = sidecar_path(&fixture.database(), suffix);
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("closed TEST_CODE fixture sidecar: {error}"),
+                }
+            }
+            let before = fs::read(fixture.database()).unwrap();
+            let outcome = GlobalSchemaVersionOwner::for_test_code()
+                .inspect_selection_with_audit_for_test(&fixture.root, &writer)
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                SelectionSchemaInspectionOutcome::Diagnostic(_)
+            ));
+            assert_eq!(
+                outcome.authority_state(),
+                if generation == REVIEW_CATALOG_GENERATION {
+                    SelectionSchemaAuthorityDiagnostic::CatalogV3RequalificationRequired
+                } else {
+                    SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired
+                }
+            );
+            drop(outcome);
+            assert_eq!(
+                fs::read(fixture.database()).unwrap(),
+                before,
+                "classification must not auto migrate/qualify"
+            );
         }
     }
 

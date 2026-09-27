@@ -179,7 +179,10 @@ enum ExternalControlTarget {
 }
 
 impl ExternalControlTarget {
-    async fn connect(self, generation: crate::grpc_client::connection_qualification::ConnectionGeneration) -> Result<GrpcMarketClient, GrpcError> {
+    async fn connect(
+        self,
+        generation: crate::grpc_client::connection_qualification::ConnectionGeneration,
+    ) -> Result<GrpcMarketClient, GrpcError> {
         match self {
             Self::Prepared(prepared) => prepared.connect_generation(generation).await,
             Self::Connected(client) => Ok(client),
@@ -273,7 +276,8 @@ impl AuthorizedHealthAttempt {
         let mut client = match self.target.connect(self.generation).await {
             Ok(client) => client,
             Err(error) => {
-                return ExternalControlCompletion::connect_unavailable(error).bind_identity(identity);
+                return ExternalControlCompletion::connect_unavailable(error)
+                    .bind_identity(identity);
             }
         };
         let (request_id, request) = self.core.into_request();
@@ -296,7 +300,9 @@ impl AuthorizedHealthAttempt {
         completion.bind_identity(identity)
     }
 
-    pub(crate) fn connection_identity(&self) -> crate::grpc_client::connection_qualification::ConnectionIdentity {
+    pub(crate) fn connection_identity(
+        &self,
+    ) -> crate::grpc_client::connection_qualification::ConnectionIdentity {
         self.generation.identity()
     }
 }
@@ -347,10 +353,14 @@ impl AuthorizedCapabilitiesAttempt {
         Ok(self)
     }
 
-    pub(crate) async fn execute(self) -> Result<ExternalControlCompletion<CapabilitiesResponse>, GrpcError> {
+    pub(crate) async fn execute(
+        self,
+    ) -> Result<ExternalControlCompletion<CapabilitiesResponse>, GrpcError> {
         let mut client = match self.target {
             ExternalControlTarget::Connected(client) => client,
-            ExternalControlTarget::Prepared(_) => return Err(crate::grpc_client::connection_qualification::unqualified()),
+            ExternalControlTarget::Prepared(_) => {
+                return Err(crate::grpc_client::connection_qualification::unqualified())
+            }
         };
         client.require_external_qualification()?;
         let identity = client.external_connection_identity()?;
@@ -367,19 +377,27 @@ impl AuthorizedCapabilitiesAttempt {
                 })
             }
             ExternalSystemCall::UnaryStatus(status) => {
-                Ok(ExternalControlCompletion::status(status, &request_id, &identity).bind_identity(identity))
+                Ok(
+                    ExternalControlCompletion::status(status, &request_id, &identity)
+                        .bind_identity(identity),
+                )
             }
         }
     }
 }
 
 impl<T> ExternalControlCompletion<T> {
-    fn bind_identity(mut self, identity: crate::grpc_client::connection_qualification::ConnectionIdentity) -> Self {
+    fn bind_identity(
+        mut self,
+        identity: crate::grpc_client::connection_qualification::ConnectionIdentity,
+    ) -> Self {
         self.connection_identity = Some(identity);
         self
     }
 
-    pub(crate) fn connection_identity(&self) -> Option<&crate::grpc_client::connection_qualification::ConnectionIdentity> {
+    pub(crate) fn connection_identity(
+        &self,
+    ) -> Option<&crate::grpc_client::connection_qualification::ConnectionIdentity> {
         self.connection_identity.as_ref()
     }
     fn connect_unavailable(error: GrpcError) -> Self {
@@ -391,10 +409,20 @@ impl<T> ExternalControlCompletion<T> {
         }
     }
 
-    fn status(status: tonic::Status, request_id: &str, identity: &crate::grpc_client::connection_qualification::ConnectionIdentity) -> Self {
+    fn status(
+        status: tonic::Status,
+        request_id: &str,
+        identity: &crate::grpc_client::connection_qualification::ConnectionIdentity,
+    ) -> Self {
         let (code, details, error_detail_trailer) = capture_status_material(&status);
-        let error = match crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(&identity.descriptor_sha256) {
-            Ok(decoder) => GrpcError::from_status_with_decoder(status, StatusErrorContext::control(ContractProfile::ExternalV1, request_id), decoder),
+        let error = match crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(
+            &identity.descriptor_sha256,
+        ) {
+            Ok(decoder) => GrpcError::from_status_with_decoder(
+                status,
+                StatusErrorContext::control(ContractProfile::ExternalV1, request_id),
+                decoder,
+            ),
             Err(error) => error,
         };
         Self {

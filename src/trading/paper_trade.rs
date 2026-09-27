@@ -689,9 +689,10 @@ fn refresh_account_ledger_from_snapshot_with_cancel(
     let snapshot_effective_at = chrono::DateTime::parse_from_rfc3339(&summary.effective_at)
         .map_err(|error| format!("snapshot effective_at invalid: {error}"))?;
     let snapshot_date = snapshot_effective_at.date_naive();
-    let position_snapshot = crate::database::user_position_snapshot::latest_user_position_snapshot()
-        .map_err(|error| format!("持仓快照读取失败: {error}"))?
-        .ok_or_else(|| "无持仓快照，无法绑定账户估值事实 (BR-234b)".to_string())?;
+    let position_snapshot =
+        crate::database::user_position_snapshot::latest_user_position_snapshot()
+            .map_err(|error| format!("持仓快照读取失败: {error}"))?
+            .ok_or_else(|| "无持仓快照，无法绑定账户估值事实 (BR-234b)".to_string())?;
     validate_account_position_binding(snapshot_effective_at, position_snapshot.effective_at)?;
     let other_assets = account_other_assets(
         summary.total_assets,
@@ -705,24 +706,23 @@ fn refresh_account_ledger_from_snapshot_with_cancel(
     let today_str = today.to_string();
 
     // 口径分派：快照新鲜（用户当天上传）→ 快照为准；过期 → 持仓 × 实时价自算。
-    let (total_assets, cash, market_value, daily_pnl) =
-        if snapshot_date == today {
-            (
-                summary.total_assets,
-                summary.available_cash,
-                summary.securities_market_value,
-                summary.daily_pnl,
-            )
-        } else {
-            estimate_ledger_from_snapshot_with_cancel(
-                &position_snapshot,
-                &mut conn,
-                summary.available_cash,
-                other_assets,
-                today,
-                cancelled,
-            )?
-        };
+    let (total_assets, cash, market_value, daily_pnl) = if snapshot_date == today {
+        (
+            summary.total_assets,
+            summary.available_cash,
+            summary.securities_market_value,
+            summary.daily_pnl,
+        )
+    } else {
+        estimate_ledger_from_snapshot_with_cancel(
+            &position_snapshot,
+            &mut conn,
+            summary.available_cash,
+            other_assets,
+            today,
+            cancelled,
+        )?
+    };
 
     // upsert 当日 ledger（created_at 每 tick 刷新 → age≤30s 结构门通过）
     check_scan_cancelled(cancelled)?;
@@ -801,8 +801,8 @@ fn estimate_ledger_from_snapshot_with_reads(
     let mut market_value = 0.0;
     for item in &snapshot.items {
         check_scan_cancelled(cancelled)?;
-        market_value += item.quantity as f64
-            * valuation_price_with_reads(&item.code, cancelled, reads)?;
+        market_value +=
+            item.quantity as f64 * valuation_price_with_reads(&item.code, cancelled, reads)?;
     }
     check_scan_cancelled(cancelled)?;
     let total = estimated_account_total(market_value, cash, other_assets);
@@ -873,7 +873,11 @@ fn validate_account_position_binding(
 /// 两者都失败 → Err（fail-closed，不写失真估值，成本价永不作估值价）。
 #[cfg(test)]
 fn valuation_price(code: &str) -> Result<f64, String> {
-    valuation_price_with_reads(code, &std::sync::atomic::AtomicBool::new(false), &ProductionValuationReads)
+    valuation_price_with_reads(
+        code,
+        &std::sync::atomic::AtomicBool::new(false),
+        &ProductionValuationReads,
+    )
 }
 
 trait ValuationReads {
@@ -895,13 +899,18 @@ impl ValuationReads for ProductionValuationReads {
     }
 }
 
-fn valuation_price_with_reads(code: &str, cancelled: &std::sync::atomic::AtomicBool, reads: &impl ValuationReads) -> Result<f64, String> {
+fn valuation_price_with_reads(
+    code: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+    reads: &impl ValuationReads,
+) -> Result<f64, String> {
     check_scan_cancelled(cancelled)?;
     match reads.quote_price(code) {
         Ok(price) => Ok(price),
         Err(realtime_error) => {
             check_scan_cancelled(cancelled)?;
-            let close = reads.daily_close(code)
+            let close = reads
+                .daily_close(code)
                 .map_err(|error| {
                     format!("{code} 估值价获取失败: 实时={realtime_error}, 日K={error}")
                 })?
@@ -937,7 +946,11 @@ fn require_confirmed_position_snapshot(
 }
 
 pub fn portfolio_state_snapshot(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
-    portfolio_state_snapshot_with_cancel(code, quote_price, &std::sync::atomic::AtomicBool::new(false))
+    portfolio_state_snapshot_with_cancel(
+        code,
+        quote_price,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
 }
 
 pub(crate) fn portfolio_state_snapshot_with_cancel(
@@ -1065,10 +1078,17 @@ fn persist_paper_trade_with_audit(
 #[cfg(test)]
 pub(crate) trait PaperTradeStore {
     fn reserve(&self, plan_id: &str) -> Result<bool, String>;
-    fn record_audit(&self, record: &crate::database::order_audit::OrderAuditRecord<'_>) -> Result<(), String>;
+    fn record_audit(
+        &self,
+        record: &crate::database::order_audit::OrderAuditRecord<'_>,
+    ) -> Result<(), String>;
     fn persist(
-        &self, sql: &str, signal: &PaperSignal, result: &PaperResult,
-        observed_at: &str, evidence: Option<&PaperAuditEvidence>,
+        &self,
+        sql: &str,
+        signal: &PaperSignal,
+        result: &PaperResult,
+        observed_at: &str,
+        evidence: Option<&PaperAuditEvidence>,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String>;
 }
@@ -1078,19 +1098,43 @@ impl PaperTradeStore for DatabaseManager {
     fn reserve(&self, plan_id: &str) -> Result<bool, String> {
         self.reserve_business_order_id(plan_id)
     }
-    fn record_audit(&self, record: &crate::database::order_audit::OrderAuditRecord<'_>) -> Result<(), String> {
+    fn record_audit(
+        &self,
+        record: &crate::database::order_audit::OrderAuditRecord<'_>,
+    ) -> Result<(), String> {
         self.record_order_audit(record)
     }
-    fn persist(&self, sql: &str, signal: &PaperSignal, result: &PaperResult, observed_at: &str, evidence: Option<&PaperAuditEvidence>, cancelled: &std::sync::atomic::AtomicBool) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String> {
+    fn persist(
+        &self,
+        sql: &str,
+        signal: &PaperSignal,
+        result: &PaperResult,
+        observed_at: &str,
+        evidence: Option<&PaperAuditEvidence>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String> {
         let mut conn = self.get_conn().map_err(|e| format!("DB 连接失败: {}", e))?;
-        persist_paper_trade_if_active(&mut conn, sql, signal, result, observed_at, evidence, cancelled)
+        persist_paper_trade_if_active(
+            &mut conn,
+            sql,
+            signal,
+            result,
+            observed_at,
+            evidence,
+            cancelled,
+        )
     }
 }
 
 #[cfg(test)]
 fn persist_paper_trade_if_active(
-    conn: &mut SqliteConnection, sql: &str, signal: &PaperSignal, result: &PaperResult,
-    observed_at: &str, evidence: Option<&PaperAuditEvidence>, cancelled: &std::sync::atomic::AtomicBool,
+    conn: &mut SqliteConnection,
+    sql: &str,
+    signal: &PaperSignal,
+    result: &PaperResult,
+    observed_at: &str,
+    evidence: Option<&PaperAuditEvidence>,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(usize, Option<PaperTradePersistenceReceipt>), String> {
     // Checkout may have blocked while shutdown was requested. The transaction
     // starts only after checking cancellation with the actual connection held.
@@ -1109,8 +1153,17 @@ fn simulate_with_scope(
     snapshot_scope: bool,
     audit_evidence: Option<&PaperAuditEvidence>,
 ) -> Result<PaperOutcome, String> {
-    simulate_with_scope_and_store(signal, quote_price, current_cash, total_value,
-        current_position_pct, snapshot_scope, audit_evidence, None, &std::sync::atomic::AtomicBool::new(false))
+    simulate_with_scope_and_store(
+        signal,
+        quote_price,
+        current_cash,
+        total_value,
+        current_position_pct,
+        snapshot_scope,
+        audit_evidence,
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
 }
 
 #[cfg(test)]
@@ -1243,9 +1296,12 @@ fn simulate_with_scope_and_store(
 /// Legacy financial-authority interface is deliberately closed. Production
 /// owners must use PaperLedger; naked caller cash cannot authorize a fill.
 pub fn simulate(
-    _signal: &PaperSignal, _quote_price: f64, _current_cash: f64,
-    _total_value: f64, _current_position_pct: f64,
-) -> Result<PaperOutcome,String> {
+    _signal: &PaperSignal,
+    _quote_price: f64,
+    _current_cash: f64,
+    _total_value: f64,
+    _current_position_pct: f64,
+) -> Result<PaperOutcome, String> {
     Err("legacy paper simulate disabled: explicit PaperLedger account/epoch required".into())
 }
 
@@ -1271,10 +1327,26 @@ pub(crate) fn simulate_legacy_fixture(
 
 #[cfg(test)]
 pub(crate) fn simulate_with_audit_evidence_controlled(
-    signal: &PaperSignal, quote_price: f64, cash: f64, total: f64, position_pct: f64,
-    evidence: &PaperAuditEvidence, store: Option<&dyn PaperTradeStore>, cancelled: &std::sync::atomic::AtomicBool,
+    signal: &PaperSignal,
+    quote_price: f64,
+    cash: f64,
+    total: f64,
+    position_pct: f64,
+    evidence: &PaperAuditEvidence,
+    store: Option<&dyn PaperTradeStore>,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<PaperOutcome, String> {
-    simulate_with_scope_and_store(signal, quote_price, cash, total, position_pct, false, Some(evidence), store, cancelled)
+    simulate_with_scope_and_store(
+        signal,
+        quote_price,
+        cash,
+        total,
+        position_pct,
+        false,
+        Some(evidence),
+        store,
+        cancelled,
+    )
 }
 
 /// BR-146/147: paper-only execution from a confirmed closing snapshot.
@@ -2005,11 +2077,12 @@ mod tests {
 
     #[test]
     fn stale_valuation_preserves_unexplained_account_assets() {
-        let residual = account_other_assets(59_201.32, 38_234.00, 14_307.22)
-            .expect("finite account residual");
+        let residual =
+            account_other_assets(59_201.32, 38_234.00, 14_307.22).expect("finite account residual");
         assert!((residual - 6_660.10).abs() < 0.000_001);
-        assert!((estimated_account_total(38_000.0, 14_307.22, residual) - 58_967.32).abs()
-            < 0.000_001);
+        assert!(
+            (estimated_account_total(38_000.0, 14_307.22, residual) - 58_967.32).abs() < 0.000_001
+        );
     }
 
     #[test]

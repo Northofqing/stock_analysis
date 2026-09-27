@@ -6,14 +6,10 @@ use std::time::Duration;
 
 const V10_SHA256: &str = "1f66f45fb534da1fa7b77fedf161924b60a6e2b69ae1a7c4d1577ab04125ccd8";
 const V11_SHA256: &str = "8ee02c8ab5bb7e23ee7904f4db08ccc86b7f504a7ae86b37fc88c75d4a453faa";
-const FUTURE_11_SHA256: &str =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUTURE_12_SHA256: &str =
-    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const FUTURE_13_SHA256: &str =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const FUTURE_14_SHA256: &str =
-    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const FUTURE_11_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FUTURE_12_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const FUTURE_13_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const FUTURE_14_SHA256: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 const V11_TABLES: [&str; 8] = [
     "chain_post_close_macro_plans",
@@ -178,14 +174,12 @@ struct RealV10 {
 async fn real_v10_fixture(run_id: &str) -> RealV10 {
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
-    let built = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(60),
-        async {
+    let built =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(60), async {
             control_tests::setup_v10_parent(&mut business, &mut parent_server, run_id).await
-        },
-    ))
-    .catch_unwind()
-    .await;
+        }))
+        .catch_unwind()
+        .await;
     match built {
         Ok(Ok(baseline)) => {
             let control_tests::ExternalParentBaseline {
@@ -206,16 +200,16 @@ async fn real_v10_fixture(run_id: &str) -> RealV10 {
         Ok(Err(_)) => {
             if let Some(server) = parent_server.take() {
                 let _ = std::panic::AssertUnwindSafe(server.finish())
-                .catch_unwind()
-                .await;
+                    .catch_unwind()
+                    .await;
             }
             panic!("TEST_CODE v10 fixture body deadline");
         }
         Err(panic) => {
             if let Some(server) = parent_server.take() {
                 let _ = std::panic::AssertUnwindSafe(server.finish())
-                .catch_unwind()
-                .await;
+                    .catch_unwind()
+                    .await;
             }
             std::panic::resume_unwind(panic)
         }
@@ -282,7 +276,10 @@ fn assert_v10_rows_preserved(before: &DatabaseState, after: &DatabaseState) {
     assert_eq!(after.query_only, before.query_only);
     assert_eq!(after.autocommit, before.autocommit);
     for old in &before.catalog {
-        assert!(after.catalog.contains(old), "TEST_CODE old catalog row changed: {old:?}");
+        assert!(
+            after.catalog.contains(old),
+            "TEST_CODE old catalog row changed: {old:?}"
+        );
     }
     for (name, old_rows) in &before.tables {
         let current = after.tables.get(name).unwrap();
@@ -337,7 +334,10 @@ fn assert_only_v11_generated_indexes(before: &DatabaseState, after: &DatabaseSta
 }
 
 fn expected_v11_names() -> Vec<String> {
-    let mut names = V11_OBJECTS.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+    let mut names = V11_OBJECTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
     names.sort();
     names
 }
@@ -680,9 +680,7 @@ fn inject_v10_metadata_damage(connection: &Connection, damage: MetadataDamage) -
                 .get_mut("chain_post_close_layout_objects")
                 .unwrap()
                 .iter_mut()
-                .find(|row| {
-                    row[0] == Value::Integer(10) && row[1] == Value::Text(name.clone())
-                })
+                .find(|row| row[0] == Value::Integer(10) && row[1] == Value::Text(name.clone()))
                 .unwrap();
             row[3] = Value::Text(damaged.clone());
             Some((name, damaged))
@@ -799,7 +797,10 @@ async fn v10_to_v11_half_installed_first_macro_object_is_rejected_without_repair
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        damaged
+    );
     assert_eq!(
         fixture
             .business
@@ -807,13 +808,19 @@ async fn v10_to_v11_half_installed_first_macro_object_is_rejected_without_repair
             .migrate_schema_v10_to_v11(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        damaged
+    );
     fixture.business.reopen();
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        damaged
+    );
 }
 
 #[tokio::test]
@@ -847,7 +854,10 @@ async fn v10_to_v11_real_commit_contention_rolls_back_and_reopens_for_retry() {
             operation: "v11 commit"
         })
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), before);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        before
+    );
     assert_eq!(DatabaseState::capture(&reader.connection), reader_before);
     assert!(fixture.business.connection().is_autocommit());
     assert_eq!(
@@ -870,7 +880,10 @@ async fn v10_to_v11_real_commit_contention_rolls_back_and_reopens_for_retry() {
             .schema_version(),
         10
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), before);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        before
+    );
     assert_eq!(
         fixture
             .business
@@ -890,34 +903,52 @@ async fn exact_v10_catalog_with_future_metadata_is_unsupported_and_never_repaire
     let mut forged_12 = before.clone();
     append_future_metadata(&mut forged_12, &[11, 12]);
     install_future_11_and_12(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_12);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_12
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_12);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_12
+    );
 
     // Layout 13 is a sealed layout now: a copied catalog under its header is
     // drift of a known layout, not an unknown future version.
     let mut forged_13 = forged_12.clone();
     append_future_metadata(&mut forged_13, &[13]);
     install_future_13(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_13);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_13
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_13);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_13
+    );
 
     let mut expected = forged_13.clone();
     append_future_metadata(&mut expected, &[14]);
     install_future_14(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     assert_eq!(
         fixture
             .business
@@ -925,7 +956,10 @@ async fn exact_v10_catalog_with_future_metadata_is_unsupported_and_never_repaire
             .verify_schema_v10_reader(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     assert_eq!(
         fixture
             .business
@@ -933,13 +967,19 @@ async fn exact_v10_catalog_with_future_metadata_is_unsupported_and_never_repaire
             .migrate_schema_v10_to_v11(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     fixture.business.reopen();
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -954,34 +994,52 @@ async fn real_v11_catalog_with_future_metadata_distinguishes_current_and_migrati
     let mut forged_12 = before.clone();
     append_future_metadata(&mut forged_12, &[12]);
     install_future_12(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_12);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_12
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_12);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_12
+    );
 
     // Layout 13 is a sealed layout now: a copied catalog under its header is
     // drift of a known layout, not an unknown future version.
     let mut forged_13 = forged_12.clone();
     append_future_metadata(&mut forged_13, &[13]);
     install_future_13(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_13);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_13
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), forged_13);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        forged_13
+    );
 
     let mut expected = forged_13.clone();
     append_future_metadata(&mut expected, &[14]);
     install_future_14(fixture.business.connection());
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     assert_eq!(
         fixture
             .business
@@ -989,19 +1047,28 @@ async fn real_v11_catalog_with_future_metadata_distinguishes_current_and_migrati
             .migrate_schema_v10_to_v11(),
         Err(ChainPostCloseError::SchemaRejected)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
     fixture.business.reopen();
     assert_eq!(
         fixture.business.chain_post_close().verify_schema(),
         Err(ChainPostCloseError::UnsupportedVersion)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), expected);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        expected
+    );
 }
 
 #[tokio::test]
 async fn damaged_v10_header_and_registry_are_rejected_without_repair() {
     for (run_id, damage) in [
-        ("TEST_CODE_V11_MIGRATION_DAMAGED_HEADER", MetadataDamage::Header),
+        (
+            "TEST_CODE_V11_MIGRATION_DAMAGED_HEADER",
+            MetadataDamage::Header,
+        ),
         (
             "TEST_CODE_V11_MIGRATION_DAMAGED_REGISTRY",
             MetadataDamage::Registry,
@@ -1013,7 +1080,10 @@ async fn damaged_v10_header_and_registry_are_rejected_without_repair() {
             fixture.business.chain_post_close().verify_schema(),
             Err(ChainPostCloseError::SchemaRejected)
         );
-        assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+        assert_eq!(
+            DatabaseState::capture(fixture.business.connection()),
+            damaged
+        );
         assert_eq!(
             fixture
                 .business
@@ -1028,13 +1098,19 @@ async fn damaged_v10_header_and_registry_are_rejected_without_repair() {
                 .migrate_schema_v10_to_v11(),
             Err(ChainPostCloseError::SchemaRejected)
         );
-        assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+        assert_eq!(
+            DatabaseState::capture(fixture.business.connection()),
+            damaged
+        );
         fixture.business.reopen();
         assert_eq!(
             fixture.business.chain_post_close().verify_schema(),
             Err(ChainPostCloseError::SchemaRejected)
         );
-        assert_eq!(DatabaseState::capture(fixture.business.connection()), damaged);
+        assert_eq!(
+            DatabaseState::capture(fixture.business.connection()),
+            damaged
+        );
     }
 }
 
@@ -1055,7 +1131,10 @@ async fn query_only_v10_writer_rejects_migration_without_state_change() {
             .migrate_schema_v10_to_v11(),
         Err(ChainPostCloseError::ConnectionSafeguardFailed)
     );
-    assert_eq!(DatabaseState::capture(fixture.business.connection()), before);
+    assert_eq!(
+        DatabaseState::capture(fixture.business.connection()),
+        before
+    );
 }
 
 #[tokio::test]
@@ -1063,7 +1142,10 @@ async fn already_open_idle_read_only_connection_observes_committed_v11_without_w
     let mut fixture = real_v10_fixture("TEST_CODE_V11_MIGRATION_OPEN_READER").await;
     let database = fixture.business.database();
     let mut reader = BusinessIntentStore::open(&database).unwrap();
-    reader.connection.execute_batch("PRAGMA query_only=ON").unwrap();
+    reader
+        .connection
+        .execute_batch("PRAGMA query_only=ON")
+        .unwrap();
     assert!(reader.connection.is_autocommit());
     assert_eq!(
         reader

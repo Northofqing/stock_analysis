@@ -393,6 +393,8 @@ fn final_admission_error(provider: ProviderId, error: String) -> GatewayError {
         "manual_confirmation_required"
     } else if error.contains("manual_confirmation_lookup_failed") {
         "manual_confirmation_lookup_failed"
+    } else if error.contains("suspension_evidence_unavailable_v1") {
+        "suspension_evidence_unavailable_v1"
     } else {
         "selected_batch_quality_rejected"
     };
@@ -786,12 +788,14 @@ async fn finalize_ordinary_batch_async(
     batch: GatewayBatch<KlineData>,
 ) -> Result<GatewayBatch<KlineData>, GatewayError> {
     let mut records = batch.records().to_vec();
+    let pending = crate::monitor::data_quality::validate_daily_kline_structure(&mut records, &code)
+        .map_err(|error| final_admission_error(batch.evidence().provider, error))?;
     records.sort_by_key(|r| r.date);
     let ordered = GatewayBatch::Available {
         records,
         evidence: batch.evidence().clone(),
     };
-    if outcome_pending_changes(&code, &ordered)?.is_empty() {
+    if pending.is_empty() {
         return Ok(batch);
     }
     let (start, end) = batch_window(&ordered)?;
@@ -816,6 +820,24 @@ pub(super) async fn finalize_outcome_sequence_async(
     batch: GatewayBatch<KlineData>,
     raw: super::outcome_daily_bars::OutcomeReviewEvidence,
 ) -> Result<(GatewayBatch<KlineData>, OutcomeLifecycleAdmission), GatewayError> {
+    let actual_dates = batch
+        .records()
+        .iter()
+        .map(|record| record.date)
+        .collect::<Vec<_>>();
+    if actual_dates != raw.expected_trading_dates() {
+        return Err(GatewayError::classified(
+            CAPABILITY,
+            Some(batch.evidence().provider),
+            "partial",
+            "outcome_trading_date_vector_mismatch",
+            false,
+            format!(
+                "outcome immutable provider sequence does not match its receipted trading-date vector: actual={actual_dates:?} expected={:?}",
+                raw.expected_trading_dates()
+            ),
+        ));
+    }
     let pending = outcome_pending_changes(&code, &batch)?;
     let (window_start, window_end) = batch_window(&batch)?;
     let lifecycle = SecurityLifecycleGateway::new()

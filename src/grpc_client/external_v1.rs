@@ -304,7 +304,10 @@ mod tests {
         .expect("published CurrentAuctionObservations contract");
         assert_eq!(request.preferred_provider, "HithinkFinance");
         let payload = request.payload.expect("versioned auction payload");
-        assert_eq!(payload.schema, "magic.market.current_auction_observations.request");
+        assert_eq!(
+            payload.schema,
+            "magic.market.current_auction_observations.request"
+        );
         assert_eq!(payload.schema_version, 1);
         assert_eq!(
             serde_json::from_slice::<Value>(&payload.data).unwrap(),
@@ -327,7 +330,10 @@ mod tests {
         .expect("published Jin10 rolling release contract");
         assert_eq!(request.preferred_provider, "Jin10");
         let payload = request.payload.expect("versioned release payload");
-        assert_eq!(payload.schema, "magic.market.economic_release_observations.request");
+        assert_eq!(
+            payload.schema,
+            "magic.market.economic_release_observations.request"
+        );
         assert_eq!(payload.schema_version, 1);
         assert_eq!(
             serde_json::from_slice::<Value>(&payload.data).unwrap(),
@@ -345,7 +351,10 @@ mod tests {
         .expect("published FRED release schedule contract");
         assert_eq!(request.preferred_provider, "Fred");
         let payload = request.payload.expect("versioned schedule payload");
-        assert_eq!(payload.schema, "magic.market.economic_release_schedule.request");
+        assert_eq!(
+            payload.schema,
+            "magic.market.economic_release_schedule.request"
+        );
         assert_eq!(payload.schema_version, 1);
         assert_eq!(
             serde_json::from_slice::<Value>(&payload.data).unwrap(),

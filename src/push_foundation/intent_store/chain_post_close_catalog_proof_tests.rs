@@ -1,12 +1,10 @@
-use super::*;
 use super::super::super::{check_lease, inspect_run_and_macro_with_catalog, schema};
+use super::*;
 use rusqlite::{params, TransactionBehavior};
 
 const PROOF_OWNER: &str = "TEST_CODE_CATALOG_PROOF_OWNER";
-const FUTURE_DIGEST_14: &str =
-    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-const FUTURE_DIGEST: &str =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const FUTURE_DIGEST_14: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const FUTURE_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 #[derive(Debug, PartialEq)]
 struct CatalogSnapshot {
@@ -124,7 +122,11 @@ fn v14_retired_terminal_sidecar_migrates_sealed_v13_catalog() {
     );
     let old_terminals: i64 = fixture
         .connection()
-        .query_row("SELECT count(*) FROM chain_post_close_macro_query_terminals", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM chain_post_close_macro_query_terminals",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(
         fixture
@@ -134,16 +136,32 @@ fn v14_retired_terminal_sidecar_migrates_sealed_v13_catalog() {
             .schema_version(),
         14
     );
-    assert_eq!(fixture.chain_post_close().verify_schema().unwrap().schema_version(), 14);
+    assert_eq!(
+        fixture
+            .chain_post_close()
+            .verify_schema()
+            .unwrap()
+            .schema_version(),
+        14
+    );
     let new_terminals: i64 = fixture
         .connection()
-        .query_row("SELECT count(*) FROM chain_post_close_macro_retired_terminals", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM chain_post_close_macro_retired_terminals",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(new_terminals, 0);
     assert_eq!(
-        fixture.connection().query_row(
-            "SELECT count(*) FROM chain_post_close_macro_query_terminals", [], |row| row.get::<_, i64>(0)
-        ).unwrap(),
+        fixture
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM chain_post_close_macro_query_terminals",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
         old_terminals
     );
 }
@@ -152,18 +170,31 @@ fn v14_retired_terminal_sidecar_migrates_sealed_v13_catalog() {
 fn task6_layout15_requires_explicit_migration_and_preserves_legacy_seals() {
     let mut fixture = V2BusinessFixture::new();
     install_v12(&mut fixture);
-    fixture.chain_post_close().migrate_schema_v12_to_v13().unwrap();
-    fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v12_to_v13()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v13_to_v14()
+        .unwrap();
     let old = catalog_snapshot(fixture.connection());
     fixture.reopen();
-    assert_eq!(catalog_snapshot(fixture.connection()), old, "ordinary reopen cannot install qualification schema");
+    assert_eq!(
+        catalog_snapshot(fixture.connection()),
+        old,
+        "ordinary reopen cannot install qualification schema"
+    );
     let receipt = schema::migrate_v15(&mut fixture.store.as_mut().unwrap().connection).unwrap();
     assert_eq!(receipt.schema_version(), 15);
     let upgraded = catalog_snapshot(fixture.connection());
     assert_eq!(&upgraded.layouts[..old.layouts.len()], &old.layouts);
     fixture.reopen();
     assert_eq!(catalog_snapshot(fixture.connection()), upgraded);
-    assert_eq!(schema::runtime_layout_version(fixture.connection()).unwrap(), 15);
+    assert_eq!(
+        schema::runtime_layout_version(fixture.connection()).unwrap(),
+        15
+    );
     fixture.execute("CREATE TABLE chain_post_close_macro_shadow_qualification(secret TEXT)");
     assert!(schema::runtime_layout_version(fixture.connection()).is_err());
 }
@@ -212,9 +243,7 @@ fn run_fact_snapshot(connection: &Connection, intent: &IntentId) -> RunFactSnaps
         ),
         finals: all_rows(
             connection,
-            &format!(
-                "SELECT * FROM chain_post_close_concept_rpc_finals WHERE intent_id={quoted}"
-            ),
+            &format!("SELECT * FROM chain_post_close_concept_rpc_finals WHERE intent_id={quoted}"),
         ),
     }
 }
@@ -261,7 +290,10 @@ fn single_user_local_v12_catalog_proof_binds_transaction_and_rejects_catalog_dri
         .unwrap();
     let proof_a = schema::verify_v12_transaction(&transaction_a).unwrap();
     assert_eq!(proof_a.check(&transaction_a), Ok(()));
-    assert_eq!(schema::verify_v12_read_pass(&transaction_a, &proof_a), Ok(()));
+    assert_eq!(
+        schema::verify_v12_read_pass(&transaction_a, &proof_a),
+        Ok(())
+    );
     let transaction_b = second
         .connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -399,9 +431,7 @@ fn single_user_local_v12_catalog_proof_binds_transaction_and_rejects_catalog_dri
     assert_eq!(proof.check(&transaction), Ok(()));
     let cookie_before = schema_cookie(&transaction);
     transaction
-        .execute_batch(
-            "CREATE TABLE chain_post_close_TEST_CODE_PROOF_DDL(value INTEGER)",
-        )
+        .execute_batch("CREATE TABLE chain_post_close_TEST_CODE_PROOF_DDL(value INTEGER)")
         .unwrap();
     assert_ne!(schema_cookie(&transaction), cookie_before);
     assert!(matches!(
@@ -575,11 +605,7 @@ fn single_user_local_v12_catalog_proof_rechecks_mutable_run_and_fact_state() {
             .unwrap(),
         1
     );
-    let request = ConceptProviderRequest::try_new(
-        0,
-        "TEST_CODE_MISSING_1".to_owned(),
-    )
-    .unwrap();
+    let request = ConceptProviderRequest::try_new(0, "TEST_CODE_MISSING_1".to_owned()).unwrap();
     let request_code = request.code;
     let request_bytes = request_code.as_bytes();
     assert_eq!(

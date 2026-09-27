@@ -1,4 +1,5 @@
 //! V12 transport Adapter. Scheduling, fallback and rendering live in one runner.
+use super::schema;
 use super::{
     macro_codec as codec,
     macro_live::{Live, Ticket},
@@ -12,9 +13,7 @@ use crate::grpc_client::client::{
     external_control_attempt::{
         AuthorizedCapabilitiesAttempt, AuthorizedHealthAttempt, ExternalControlCompletion,
     },
-    macro_attempt::{
-        AuthorizedMacroAttempt, ExternalMacroAttemptCompletion,
-    },
+    macro_attempt::{AuthorizedMacroAttempt, ExternalMacroAttemptCompletion},
     GrpcMarketClient, PreparedExternalEndpoint,
 };
 use crate::grpc_client::external_pb::magic::market::v1::{CapabilitiesResponse, HealthResponse};
@@ -25,7 +24,6 @@ use crate::search_service::{
 };
 use futures::{future::LocalBoxFuture, FutureExt};
 use std::{cell::Cell, rc::Rc, time::Duration};
-use super::schema;
 
 pub(super) enum Outcome {
     Full(String),
@@ -45,16 +43,33 @@ pub(super) async fn drive(
 
 #[cfg(test)]
 pub(super) async fn drive_test_prepared(
-    local: &mut LocalChainPostClose<'_>, lease: RunLease, source: &GrpcSource,
-    clock: &dyn MacroObservationClock, cancelled: Rc<Cell<bool>>, search: &SearchService,
+    local: &mut LocalChainPostClose<'_>,
+    lease: RunLease,
+    source: &GrpcSource,
+    clock: &dyn MacroObservationClock,
+    cancelled: Rc<Cell<bool>>,
+    search: &SearchService,
     prepared: PreparedExternalEndpoint,
 ) -> anyhow::Result<(RunLease, Outcome)> {
-    drive_prepared(local, lease, source, clock, cancelled, search, Some(prepared)).await
+    drive_prepared(
+        local,
+        lease,
+        source,
+        clock,
+        cancelled,
+        search,
+        Some(prepared),
+    )
+    .await
 }
 
 async fn drive_prepared(
-    local: &mut LocalChainPostClose<'_>, lease: RunLease, source: &GrpcSource,
-    clock: &dyn MacroObservationClock, cancelled: Rc<Cell<bool>>, search: &SearchService,
+    local: &mut LocalChainPostClose<'_>,
+    lease: RunLease,
+    source: &GrpcSource,
+    clock: &dyn MacroObservationClock,
+    cancelled: Rc<Cell<bool>>,
+    search: &SearchService,
     prepared_override: Option<PreparedExternalEndpoint>,
 ) -> anyhow::Result<(RunLease, Outcome)> {
     let intent = lease.intent_id.as_str().to_owned();
@@ -72,7 +87,9 @@ async fn drive_prepared(
         {
             return Ok((
                 live.into_lease(),
-                Outcome::Full(String::from_utf8(output).map_err(|_| ChainPostCloseError::SchemaRejected)?),
+                Outcome::Full(
+                    String::from_utf8(output).map_err(|_| ChainPostCloseError::SchemaRejected)?,
+                ),
             ));
         }
         // This is deliberately after the durable Unknown/final checks.
@@ -187,7 +204,9 @@ async fn drive_prepared(
         let output = if legacy {
             runner::continue_legacy_source(&mut adapter).await?;
             Outcome::LegacySourceConfirmed
-        } else { Outcome::Full(runner::run(&mut adapter).await?) };
+        } else {
+            Outcome::Full(runner::run(&mut adapter).await?)
+        };
         Ok((adapter.live.into_lease(), output))
     }
     .await;
@@ -232,11 +251,17 @@ impl Durable<'_, '_, '_> {
     fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let mut snapshot = self.live.snapshot()?;
         if snapshot.definition.external_news
-            && matches!(snapshot.external, runner::RouteState::NeedsCapabilities | runner::RouteState::Ready)
-            && (1..=4).any(|ordinal| snapshot.terminal(QueryKey::Gateway(ordinal)).is_none()) {
+            && matches!(
+                snapshot.external,
+                runner::RouteState::NeedsCapabilities | runner::RouteState::Ready
+            )
+            && (1..=4).any(|ordinal| snapshot.terminal(QueryKey::Gateway(ordinal)).is_none())
+        {
             if self.connected_external.is_none() {
                 snapshot.external = runner::RouteState::NeedsHealth;
-            } else if snapshot.external == runner::RouteState::Ready && !self.current_capabilities_confirmed {
+            } else if snapshot.external == runner::RouteState::Ready
+                && !self.current_capabilities_confirmed
+            {
                 snapshot.external = runner::RouteState::NeedsCapabilities;
             }
         }
@@ -255,15 +280,23 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
         if self.live.needs_historical_rejection() {
             self.live.checkpoint()?;
             let definition = self.live.snapshot()?.definition;
-            let prepared = self.external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+            let prepared = self
+                .external
+                .as_ref()
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
             let mut requests = Vec::with_capacity(3);
             for ordinal in 2..=4 {
                 let identity = definition.identity(QueryKey::Gateway(ordinal))?;
                 let authorized = prepared.prepare_macro_query(identity.clone())?;
-                requests.push(codec::Request::capture_prepared_for(&identity, &authorized)?);
+                requests.push(codec::Request::capture_prepared_for(
+                    &identity,
+                    &authorized,
+                )?);
             }
             self.live.settle_historical_rejection(
-                requests.try_into().map_err(|_| ChainPostCloseError::SchemaRejected)?,
+                requests
+                    .try_into()
+                    .map_err(|_| ChainPostCloseError::SchemaRejected)?,
                 prepared.endpoint_uri(),
             )?;
         }
@@ -291,10 +324,19 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
         step: Step,
     ) -> anyhow::Result<LocalBoxFuture<'clock, anyhow::Result<Returned<AdapterTicket, Material>>>>
     {
-        let qualification = matches!(step, Step::Health | Step::Capabilities) && self.live.current()
-            .and_then(|recovery| recovery.readiness_episodes.first())
-            .and_then(|episode| episode.controls.get(if step == Step::Health { 0 } else { 1 }))
-            .is_some_and(|control| control.outcome == Some(super::macro_stage::MacroControlOutcome::Ready));
+        let qualification = matches!(step, Step::Health | Step::Capabilities)
+            && self
+                .live
+                .current()
+                .and_then(|recovery| recovery.readiness_episodes.first())
+                .and_then(|episode| {
+                    episode
+                        .controls
+                        .get(if step == Step::Health { 0 } else { 1 })
+                })
+                .is_some_and(|control| {
+                    control.outcome == Some(super::macro_stage::MacroControlOutcome::Ready)
+                });
         let (ticket, attempt) = match step {
             Step::Data { query, attempt } => {
                 if self.retired_layout && query == QueryKey::Gateway(5) {
@@ -327,18 +369,30 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
                                 .request
                                 .restored_external(&original.endpoint, attempt),
                         )?
-                    } else if let Some(legacy) = self.live.current().filter(|current| current.full.is_none()) {
+                    } else if let Some(legacy) =
+                        self.live.current().filter(|current| current.full.is_none())
+                    {
                         codec::require(query == QueryKey::Gateway(1))?;
-                        prepared.resume_macro_query(identity.clone(), legacy.plan.request.restored_external(legacy.plan.endpoint(), attempt))?
+                        prepared.resume_macro_query(
+                            identity.clone(),
+                            legacy
+                                .plan
+                                .request
+                                .restored_external(legacy.plan.endpoint(), attempt),
+                        )?
                     } else {
                         codec::require(attempt == 1)?;
                         prepared.prepare_macro_query(identity.clone())?
                     };
                     let request = codec::Request::capture_prepared_for(&identity, &authorized)?;
                     let endpoint = prepared.endpoint_uri().to_owned();
-                    let client = self.connected_external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+                    let client = self
+                        .connected_external
+                        .as_ref()
+                        .ok_or(ChainPostCloseError::SchemaRejected)?;
                     let connection = client.external_connection_identity()?;
-                    let attempt = OwnedAttempt::Connected(authorized.bind_connected(client.clone())?);
+                    let attempt =
+                        OwnedAttempt::Connected(authorized.bind_connected(client.clone())?);
                     (
                         self.live.begin_data_connection(
                             query,
@@ -374,37 +428,73 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
             }
             Step::Health | Step::Capabilities => {
                 let index = if step == Step::Health { 0 } else { 1 };
-                let prepared = self.external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
-                let fresh_health = if qualification && step == Step::Health { Some(prepared.prepare_health_attempt()?) } else { None };
-                let fresh_capabilities = if qualification && step == Step::Capabilities { Some(prepared.prepare_capabilities_attempt()?) } else { None };
-                let material = if let Some(health) = &fresh_health { health.request_material() }
-                else if let Some(capabilities) = &fresh_capabilities { capabilities.request_material() } else { self
-                    .live
-                    .current()
-                    .and_then(|recovery| recovery.readiness_episodes.first())
-                    .and_then(|episode| episode.controls.get(index))
-                    .ok_or(ChainPostCloseError::SchemaRejected)?
-                    .request_material() };
+                let prepared = self
+                    .external
+                    .as_ref()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                let fresh_health = if qualification && step == Step::Health {
+                    Some(prepared.prepare_health_attempt()?)
+                } else {
+                    None
+                };
+                let fresh_capabilities = if qualification && step == Step::Capabilities {
+                    Some(prepared.prepare_capabilities_attempt()?)
+                } else {
+                    None
+                };
+                let material = if let Some(health) = &fresh_health {
+                    health.request_material()
+                } else if let Some(capabilities) = &fresh_capabilities {
+                    capabilities.request_material()
+                } else {
+                    self.live
+                        .current()
+                        .and_then(|recovery| recovery.readiness_episodes.first())
+                        .and_then(|episode| episode.controls.get(index))
+                        .ok_or(ChainPostCloseError::SchemaRejected)?
+                        .request_material()
+                };
                 let prepared = self
                     .external
                     .as_ref()
                     .ok_or(ChainPostCloseError::SchemaRejected)?;
                 let attempt = if step == Step::Health {
-                    OwnedAttempt::Health(match fresh_health { Some(health) => health, None => prepared.resume_health_attempt(material.clone())? })
+                    OwnedAttempt::Health(match fresh_health {
+                        Some(health) => health,
+                        None => prepared.resume_health_attempt(material.clone())?,
+                    })
                 } else {
-                    let authorized = match fresh_capabilities { Some(capabilities) => capabilities, None => prepared.resume_capabilities_attempt(material.clone())? };
-                    let client = self.connected_external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
+                    let authorized = match fresh_capabilities {
+                        Some(capabilities) => capabilities,
+                        None => prepared.resume_capabilities_attempt(material.clone())?,
+                    };
+                    let client = self
+                        .connected_external
+                        .as_ref()
+                        .ok_or(ChainPostCloseError::SchemaRejected)?;
                     OwnedAttempt::Capabilities(authorized.bind_connected(client.clone())?)
                 };
                 let connection = match &attempt {
                     OwnedAttempt::Health(health) => Some(health.connection_identity()),
-                    OwnedAttempt::Capabilities(_) => Some(self.connected_external.as_ref()
-                        .ok_or(ChainPostCloseError::SchemaRejected)?.external_connection_identity()?),
+                    OwnedAttempt::Capabilities(_) => Some(
+                        self.connected_external
+                            .as_ref()
+                            .ok_or(ChainPostCloseError::SchemaRejected)?
+                            .external_connection_identity()?,
+                    ),
                     _ => None,
                 };
-                (if qualification {
-                    self.live.begin_qualification_control(material, connection.ok_or(ChainPostCloseError::SchemaRejected)?)?
-                } else { self.live.begin_control_connection(material, connection)? }, attempt)
+                (
+                    if qualification {
+                        self.live.begin_qualification_control(
+                            material,
+                            connection.ok_or(ChainPostCloseError::SchemaRejected)?,
+                        )?
+                    } else {
+                        self.live.begin_control_connection(material, connection)?
+                    },
+                    attempt,
+                )
             }
             Step::Prepare(_) => return Err(ChainPostCloseError::SchemaRejected.into()),
         };
@@ -443,7 +533,11 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
             })??;
             check()?;
             Ok(Returned {
-                ticket: if qualification { AdapterTicket::Qualification(ticket) } else { AdapterTicket::Effect(ticket) },
+                ticket: if qualification {
+                    AdapterTicket::Qualification(ticket)
+                } else {
+                    AdapterTicket::Effect(ticket)
+                },
                 material,
             })
         }
@@ -456,34 +550,64 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
     ) -> anyhow::Result<Snapshot> {
         match (step, returned.ticket, returned.material) {
             (Step::Health, AdapterTicket::Qualification(ticket), Material::Health(completion)) => {
-                let identity = completion.connection_identity().cloned().ok_or(ChainPostCloseError::SchemaRejected)?;
-                let qualified = self.live.record_qualification_control(ticket, codec::ControlRawResult::capture_health(&completion), identity)?;
+                let identity = completion
+                    .connection_identity()
+                    .cloned()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                let qualified = self.live.record_qualification_control(
+                    ticket,
+                    codec::ControlRawResult::capture_health(&completion),
+                    identity,
+                )?;
                 codec::require(qualified)?;
                 self.connected_external = completion.into_connected_client();
                 self.snapshot()
             }
-            (Step::Capabilities, AdapterTicket::Qualification(ticket), Material::Capabilities(completion)) => {
-                self.connected_external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?.external_connection_identity()?;
-                let identity = completion.connection_identity().cloned().ok_or(ChainPostCloseError::SchemaRejected)?;
-                let qualified = self.live.record_qualification_control(ticket, codec::ControlRawResult::capture_capabilities(&completion), identity)?;
+            (
+                Step::Capabilities,
+                AdapterTicket::Qualification(ticket),
+                Material::Capabilities(completion),
+            ) => {
+                self.connected_external
+                    .as_ref()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?
+                    .external_connection_identity()?;
+                let identity = completion
+                    .connection_identity()
+                    .cloned()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?;
+                let qualified = self.live.record_qualification_control(
+                    ticket,
+                    codec::ControlRawResult::capture_capabilities(&completion),
+                    identity,
+                )?;
                 codec::require(qualified)?;
                 self.connected_external = completion.into_connected_client();
                 self.current_capabilities_confirmed = true;
                 self.snapshot()
             }
             (Step::Data { .. }, AdapterTicket::Effect(ticket), Material::Data(completion)) => {
-                if matches!(step, Step::Data { query: QueryKey::Gateway(1..=4), .. })
-                    && self.external.is_some() {
-                    self.connected_external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?
+                if matches!(
+                    step,
+                    Step::Data {
+                        query: QueryKey::Gateway(1..=4),
+                        ..
+                    }
+                ) && self.external.is_some()
+                {
+                    self.connected_external
+                        .as_ref()
+                        .ok_or(ChainPostCloseError::SchemaRejected)?
                         .external_connection_identity()?;
                 }
                 self.live.record_data(ticket, &completion)
             }
             (Step::Health, AdapterTicket::Effect(ticket), Material::Health(completion)) => {
-                self
-                    .live
-                    .record_control_connection(ticket, codec::ControlRawResult::capture_health(&completion),
-                        completion.connection_identity().cloned())?;
+                self.live.record_control_connection(
+                    ticket,
+                    codec::ControlRawResult::capture_health(&completion),
+                    completion.connection_identity().cloned(),
+                )?;
                 self.connected_external = completion.into_connected_client();
                 self.snapshot()
             }
@@ -492,7 +616,9 @@ impl<'local, 'store, 'clock> MacroStepIo for Durable<'local, 'store, 'clock> {
                 AdapterTicket::Effect(ticket),
                 Material::Capabilities(completion),
             ) => {
-                self.connected_external.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?
+                self.connected_external
+                    .as_ref()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?
                     .external_connection_identity()?;
                 self.live.record_control_connection(
                     ticket,

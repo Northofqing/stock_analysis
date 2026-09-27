@@ -128,12 +128,10 @@ pub(super) fn local_unavailable_outcome(
 }
 
 pub(super) fn operation_retired_outcome() -> NativeOutcome {
-    NativeOutcome::Economic(Err(
-        crate::data_gateway::GatewayError::retired_operation(
-            crate::data_gateway::economic_calendar::CAPABILITY,
-            Some(crate::market_domain::ProviderId::Jin10),
-        ),
-    ))
+    NativeOutcome::Economic(Err(crate::data_gateway::GatewayError::retired_operation(
+        crate::data_gateway::economic_calendar::CAPABILITY,
+        Some(crate::market_domain::ProviderId::Jin10),
+    )))
 }
 
 pub(super) fn request_rejected_outcome(
@@ -208,7 +206,9 @@ impl DataResult {
         } else {
             RawResult::capture_external(completion)
         };
-        if let Some(connection) = connection { raw.bind_current_connection(connection)?; }
+        if let Some(connection) = connection {
+            raw.bind_current_connection(connection)?;
+        }
         let (processed, _, _) = raw.project_for(identity, request, attempt, provider_catalog)?;
         let native = native_bytes(&project_frozen_native(
             identity,
@@ -266,8 +266,12 @@ pub(super) struct DataBegin {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) enum TerminalCause {
-    DataResult { version: u64 },
-    SharedControlRejected { version: u64 },
+    DataResult {
+        version: u64,
+    },
+    SharedControlRejected {
+        version: u64,
+    },
     HistoricalControlRejected {
         control_result_version: u64,
         control_result_sha256: String,
@@ -315,7 +319,10 @@ pub(crate) enum FinalKind {
 pub(crate) enum ExpiryBasis {
     None,
     WallDeadline,
-    MonotonicRemaining { opened_wall_at: i64, elapsed_us: i64 },
+    MonotonicRemaining {
+        opened_wall_at: i64,
+        elapsed_us: i64,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -354,11 +361,19 @@ impl FinalizeBegin {
                 match self.expiry {
                     ExpiryBasis::None => Err(ChainPostCloseError::SchemaRejected),
                     ExpiryBasis::WallDeadline => Ok(()),
-                    ExpiryBasis::MonotonicRemaining { opened_wall_at, elapsed_us } => {
-                        let remaining = self.deadline_at.checked_sub(opened_wall_at)
+                    ExpiryBasis::MonotonicRemaining {
+                        opened_wall_at,
+                        elapsed_us,
+                    } => {
+                        let remaining = self
+                            .deadline_at
+                            .checked_sub(opened_wall_at)
                             .ok_or(ChainPostCloseError::SchemaRejected)?;
-                        require(self.started_at <= opened_wall_at
-                            && opened_wall_at < self.deadline_at && elapsed_us >= remaining)
+                        require(
+                            self.started_at <= opened_wall_at
+                                && opened_wall_at < self.deadline_at
+                                && elapsed_us >= remaining,
+                        )
                     }
                 }
             }
@@ -379,9 +394,10 @@ impl FinalizeBegin {
     pub(super) fn expiry_columns(&self) -> (Option<i64>, Option<i64>) {
         match self.expiry {
             ExpiryBasis::None | ExpiryBasis::WallDeadline => (None, None),
-            ExpiryBasis::MonotonicRemaining { opened_wall_at, elapsed_us } => {
-                (Some(opened_wall_at), Some(elapsed_us))
-            }
+            ExpiryBasis::MonotonicRemaining {
+                opened_wall_at,
+                elapsed_us,
+            } => (Some(opened_wall_at), Some(elapsed_us)),
         }
     }
 }

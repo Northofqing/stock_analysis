@@ -178,23 +178,42 @@ async fn task6_connection_qualification_cold_capabilities_has_zero_business_rpc(
     let completion = tokio::time::timeout(Duration::from_secs(5), capabilities.execute())
         .await
         .expect("TEST_CODE bounded cold execution");
-    let rejected = completion.as_ref().err().map(|error| error.details().code.clone());
+    let rejected = completion
+        .as_ref()
+        .err()
+        .map(|error| error.details().code.clone());
     drop(completion);
-    let cold_data = prepared.prepare_macro_query(MacroQueryIdentity::GlobalNews { provider: GlobalNewsProvider::Eastmoney, limit: 20 }).unwrap();
-    assert!(cold_data.execute().await.is_err(), "cold data cannot bypass explicit Health");
+    let cold_data = prepared
+        .prepare_macro_query(MacroQueryIdentity::GlobalNews {
+            provider: GlobalNewsProvider::Eastmoney,
+            limit: 20,
+        })
+        .unwrap();
+    assert!(
+        cold_data.execute().await.is_err(),
+        "cold data cannot bypass explicit Health"
+    );
     drop(prepared);
     let observed = fixture.snapshot();
     fixture.finish().await.expect("TEST_CODE fixture cleanup");
-    assert_eq!(observed.capabilities_calls, 0, "cold transport is not qualified");
+    assert_eq!(
+        observed.capabilities_calls, 0,
+        "cold transport is not qualified"
+    );
     assert_eq!(observed.data_calls, 0);
-    assert!(observed.health_requests.is_empty(), "no hidden Health effect");
+    assert!(
+        observed.health_requests.is_empty(),
+        "no hidden Health effect"
+    );
     assert_eq!(rejected.as_deref(), Some("external_connection_unqualified"));
 }
 
 async fn qualified_mtls_client(fixture: &ExternalMtlsMacroFixture) -> GrpcMarketClient {
     let prepared = GrpcMarketClient::prepare_client_bundle(fixture.bundle_path()).unwrap();
-    execute_health(fixture, prepared.prepare_health_attempt().unwrap()).await
-        .into_connected_client().expect("explicit real Health qualifies fixture connection")
+    execute_health(fixture, prepared.prepare_health_attempt().unwrap())
+        .await
+        .into_connected_client()
+        .expect("explicit real Health qualifies fixture connection")
 }
 
 async fn execute_wire_attempt(
@@ -203,19 +222,27 @@ async fn execute_wire_attempt(
 ) -> Result<ExternalMacroAttemptCompletion, GrpcError> {
     let mut client = prepared.connect_once().await?;
     client.get_external_health().await?;
-    Ok(ExternalMacroAttemptCompletion::Unary(attempt.bind_connected(client)?.execute().await))
+    Ok(ExternalMacroAttemptCompletion::Unary(
+        attempt.bind_connected(client)?.execute().await,
+    ))
 }
 
 #[tokio::test]
 async fn task6_connection_qualification_same_uri_disconnect_cannot_reconnect_business() {
     use super::external_control_loopback_fixture::ExternalMtlsSwitch;
-    let a = ExternalMtlsMacroFixture::bind_data_success_for_test().await.unwrap();
-    let b = ExternalMtlsMacroFixture::bind_data_success_for_test().await.unwrap();
+    let a = ExternalMtlsMacroFixture::bind_data_success_for_test()
+        .await
+        .unwrap();
+    let b = ExternalMtlsMacroFixture::bind_data_success_for_test()
+        .await
+        .unwrap();
     let switch = ExternalMtlsSwitch::bind(a.endpoint()).await;
     let prepared = GrpcMarketClient::prepare_client_bundle(switch.bundle_path()).unwrap();
     let health = prepared.prepare_health_attempt().unwrap();
     let completion = execute_health(&a, health).await;
-    let client = completion.into_connected_client().expect("TEST_CODE qualified A");
+    let client = completion
+        .into_connected_client()
+        .expect("TEST_CODE qualified A");
     let mut clone = client.clone();
     // These are two independent TLS server incarnations behind one unchanged URI.
     switch.switch_to(b.endpoint()).await;
@@ -223,7 +250,9 @@ async fn task6_connection_qualification_same_uri_disconnect_cannot_reconnect_bus
     for _ in 0..3 {
         b.release_capabilities();
         failed &= tokio::time::timeout(Duration::from_secs(5), clone.get_external_capabilities())
-            .await.expect("TEST_CODE bounded revoked call").is_err();
+            .await
+            .expect("TEST_CODE bounded revoked call")
+            .is_err();
     }
     let b_seen = b.snapshot();
     drop(clone);
@@ -233,18 +262,28 @@ async fn task6_connection_qualification_same_uri_disconnect_cannot_reconnect_bus
     a.finish().await.unwrap();
     b.finish().await.unwrap();
     assert!(failed);
-    assert_eq!(b_seen.tcp_accepts, 0, "old Channel must never dial another incarnation");
+    assert_eq!(
+        b_seen.tcp_accepts, 0,
+        "old Channel must never dial another incarnation"
+    );
     assert_eq!(b_seen.capabilities_calls, 0);
     assert_eq!(b_seen.data_calls, 0);
-    assert!(b_seen.health_requests.is_empty(), "no hidden qualification RPC");
+    assert!(
+        b_seen.health_requests.is_empty(),
+        "no hidden qualification RPC"
+    );
 }
 
 #[tokio::test]
 async fn task6_connection_qualification_new_b_requires_b_policy_and_new_health() {
     use super::external_control_loopback_fixture::{ExternalMtlsSwitch, HealthReply};
     use crate::grpc_client::build_identity::BuildIdentityTrust;
-    let a = ExternalMtlsMacroFixture::bind_data_success_for_test().await.unwrap();
-    let b = ExternalMtlsMacroFixture::bind_health_reply_for_test(HealthReply::TrustedBuildB).await.unwrap();
+    let a = ExternalMtlsMacroFixture::bind_data_success_for_test()
+        .await
+        .unwrap();
+    let b = ExternalMtlsMacroFixture::bind_health_reply_for_test(HealthReply::TrustedBuildB)
+        .await
+        .unwrap();
     let switch = ExternalMtlsSwitch::bind(a.endpoint()).await;
     let prepared_a = GrpcMarketClient::prepare_client_bundle(switch.bundle_path()).unwrap();
     let old = execute_health(&a, prepared_a.prepare_health_attempt().unwrap()).await;
@@ -258,14 +297,22 @@ async fn task6_connection_qualification_new_b_requires_b_policy_and_new_health()
     let rejection = rejected.processed().is_err();
     drop(rejected);
     let before_new = b.snapshot();
-    let prepared_b = GrpcMarketClient::prepare_client_bundle(switch.bundle_path()).unwrap()
+    let prepared_b = GrpcMarketClient::prepare_client_bundle(switch.bundle_path())
+        .unwrap()
         .with_test_build_trust(BuildIdentityTrust::test_client_b());
     let new = execute_health(&b, prepared_b.prepare_health_attempt().unwrap()).await;
     let accepted = new.processed().is_ok();
     let mut b_business = false;
     if let Some(client) = new.into_connected_client() {
-        let capabilities = prepared_b.prepare_capabilities_attempt().unwrap().bind_connected(client).unwrap();
-        b_business = execute_capabilities(&b, capabilities).await.processed().is_ok();
+        let capabilities = prepared_b
+            .prepare_capabilities_attempt()
+            .unwrap()
+            .bind_connected(client)
+            .unwrap();
+        b_business = execute_capabilities(&b, capabilities)
+            .await
+            .processed()
+            .is_ok();
     }
     let b_seen = b.snapshot();
     let a_unchanged = a.snapshot().health_responses == frozen_a;
@@ -277,7 +324,10 @@ async fn task6_connection_qualification_new_b_requires_b_policy_and_new_health()
     assert!(old_accepted && rejection && a_unchanged);
     assert_eq!(before_new.capabilities_calls, 0);
     assert_eq!(before_new.data_calls, 0);
-    assert!(accepted && b_business, "explicit B policy must qualify B independently");
+    assert!(
+        accepted && b_business,
+        "explicit B policy must qualify B independently"
+    );
     assert_eq!(b_seen.health_requests.len(), 2);
     assert_eq!(b_seen.capabilities_calls, 1);
 }
@@ -480,9 +530,16 @@ async fn external_mtls_bundle_controls_then_restored_cold_data_use_original_requ
             assert_eq!(before_data.capabilities_calls, 1);
             assert_eq!(before_data.data_calls, 0);
 
-            let new_health = execute_health(fixture, reopened.prepare_health_attempt().unwrap()).await;
-            let connected = resumed.bind_connected(new_health.into_connected_client().unwrap()).unwrap();
-            let execution = async { Ok::<_, GrpcError>(ExternalMacroAttemptCompletion::Unary(connected.execute().await)) };
+            let new_health =
+                execute_health(fixture, reopened.prepare_health_attempt().unwrap()).await;
+            let connected = resumed
+                .bind_connected(new_health.into_connected_client().unwrap())
+                .unwrap();
+            let execution = async {
+                Ok::<_, GrpcError>(ExternalMacroAttemptCompletion::Unary(
+                    connected.execute().await,
+                ))
+            };
             tokio::pin!(execution);
             let receipt_deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -794,7 +851,10 @@ async fn grpc_dual_contract_external_three_query_routes_use_generated_client_and
                 .connect_once()
                 .await
                 .expect("TEST_CODE External generated routes connection");
-            client.get_external_health().await.expect("explicit generated-route Health");
+            client
+                .get_external_health()
+                .await
+                .expect("explicit generated-route Health");
 
             let cases = [
                 (
@@ -930,12 +990,20 @@ async fn current_auction_external_61_uses_generated_rpc_and_preserves_nullable_r
     let fixture = ExternalQueryWireFixture::bind_generated_routes()
         .await
         .expect("External generated auction fixture");
-    let prepared = GrpcMarketClient::prepare_client_bundle(fixture.bundle_path())
-        .expect("auction bundle");
-    let mut client = prepared.connect_once().await.expect("auction mTLS connection");
-    client.get_external_health().await.expect("explicit auction Health");
+    let prepared =
+        GrpcMarketClient::prepare_client_bundle(fixture.bundle_path()).expect("auction bundle");
+    let mut client = prepared
+        .connect_once()
+        .await
+        .expect("auction mTLS connection");
+    client
+        .get_external_health()
+        .await
+        .expect("explicit auction Health");
     fixture.release();
-    let result = tokio::time::timeout(Duration::from_secs(10), client.query_external_native(
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.query_external_native(
             Operation::CurrentAuctionObservations,
             serde_json::json!({
                 "instruments": [{
@@ -943,13 +1011,17 @@ async fn current_auction_external_61_uses_generated_rpc_and_preserves_nullable_r
                 }],
                 "stage": "live"
             }),
-        ))
-        .await
-        .expect("auction query deadline")
-        .expect("generated auction result");
+        ),
+    )
+    .await
+    .expect("auction query deadline")
+    .expect("generated auction result");
     assert_eq!(result.selected_provider, "HithinkFinance");
     assert_eq!(result.records.len(), 1);
-    assert_eq!(result.records[0].schema, "magic.market.current_auction_observation");
+    assert_eq!(
+        result.records[0].schema,
+        "magic.market.current_auction_observation"
+    );
     let record: serde_json::Value = serde_json::from_slice(&result.records[0].data).unwrap();
     assert_eq!(record["auction_price"], serde_json::Value::Null);
     assert_eq!(record["auction_volume_ratio"], serde_json::Value::Null);
@@ -2062,7 +2134,10 @@ async fn external_capabilities_catalog_lifecycle_is_atomic_across_refresh_outcom
             let mut client = GrpcMarketClient::connect_client_bundle(fixture.bundle_path())
                 .await
                 .expect("TEST_CODE catalog lifecycle client");
-            client.get_external_health().await.expect("explicit catalog lifecycle Health");
+            client
+                .get_external_health()
+                .await
+                .expect("explicit catalog lifecycle Health");
 
             fixture.release_capabilities();
             let wrong_initial = client
@@ -2252,8 +2327,14 @@ async fn external_capabilities_catalog_is_owned_and_isolated_per_endpoint_client
                 GrpcMarketClient::connect_client_bundle(cailianpress.bundle_path())
                     .await
                     .expect("TEST_CODE Cailianpress endpoint client");
-            eastmoney_client.get_external_health().await.expect("explicit Eastmoney Health");
-            cailianpress_client.get_external_health().await.expect("explicit Cailianpress Health");
+            eastmoney_client
+                .get_external_health()
+                .await
+                .expect("explicit Eastmoney Health");
+            cailianpress_client
+                .get_external_health()
+                .await
+                .expect("explicit Cailianpress Health");
 
             eastmoney.release_capabilities();
             let eastmoney_capabilities = eastmoney_client

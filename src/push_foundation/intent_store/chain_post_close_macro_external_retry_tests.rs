@@ -76,11 +76,7 @@ fn expected_data_response(request_id: &str) -> Vec<u8> {
     bytes
 }
 
-fn data_result_bytes(
-    database: &std::path::Path,
-    intent: &IntentId,
-    ordinal: i64,
-) -> Vec<u8> {
+fn data_result_bytes(database: &std::path::Path, intent: &IntentId, ordinal: i64) -> Vec<u8> {
     let reader = BusinessIntentStore::open(database).unwrap();
     let bytes = reader
         .connection
@@ -228,10 +224,7 @@ fn durable_attempt_links(
     }
 }
 
-fn stored_data_result(
-    connection: &rusqlite::Connection,
-    intent: &IntentId,
-) -> StoredDataResult {
+fn stored_data_result(connection: &rusqlite::Connection, intent: &IntentId) -> StoredDataResult {
     connection
         .query_row(
             "SELECT bytes,byte_length,sha256 \
@@ -432,7 +425,6 @@ fn mutate_copied_v2_result(
     (before, after)
 }
 
-
 fn assert_wire_prefix(
     wire: &ExternalControlObservation,
     checkpoint: &control_recovery_tests::ConfirmedHealthCheckpoint,
@@ -450,15 +442,14 @@ fn assert_wire_prefix(
         vec![checkpoint.capabilities.bytes.clone()]
     );
     assert_eq!(wire.capabilities_authorized, vec![true]);
-    assert_eq!(wire.capabilities_responses, vec![capabilities_response.to_vec()]);
+    assert_eq!(
+        wire.capabilities_responses,
+        vec![capabilities_response.to_vec()]
+    );
     assert!(wire.capabilities_statuses.is_empty());
 }
 
-
-fn assert_historical_provider_attempts(
-    provider_attempts: &ProviderAttempts,
-    checkpoint: &str,
-) {
+fn assert_historical_provider_attempts(provider_attempts: &ProviderAttempts, checkpoint: &str) {
     let attempts = provider_attempts
         .accepted()
         .unwrap_or_else(|| panic!("{checkpoint}: expected an accepted historical attempt trace"));
@@ -532,8 +523,7 @@ impl ValidFailureWriterCase {
 
     fn evidence(self) -> crate::grpc_client::external_query_transport::ExternalWireMaterialV1 {
         use crate::grpc_client::external_query_transport::{
-            ExternalFrameFailureV1, ExternalWireMaterialV1,
-            EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+            ExternalFrameFailureV1, ExternalWireMaterialV1, EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
         };
 
         match self {
@@ -542,15 +532,13 @@ impl ValidFailureWriterCase {
             },
             Self::Overflow => ExternalWireMaterialV1::Overflow {
                 framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
-                observed_framed_body_bytes_at_least:
-                    EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES + 1,
+                observed_framed_body_bytes_at_least: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES + 1,
             },
             Self::InvalidFrame => ExternalWireMaterialV1::InvalidFrame {
                 failure: ExternalFrameFailureV1::CompressionUnsupported,
                 grpc_body_bytes: vec![1, 0, 0, 0, 0],
-                body_sha256:
-                    "957b88b12730e646e0f33d3618b77dfa579e8231e3c59c7104be7165611c8027"
-                        .to_owned(),
+                body_sha256: "957b88b12730e646e0f33d3618b77dfa579e8231e3c59c7104be7165611c8027"
+                    .to_owned(),
                 framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
             },
         }
@@ -1253,9 +1241,7 @@ impl HistoricalProviderAttemptsCase {
             Self::CapabilitiesRequestIdTamper => {
                 "TEST_CODE_EXTERNAL_HISTORICAL_CAPABILITIES_ID_TAMPER_RUN"
             }
-            Self::ReadinessLinkTamper => {
-                "TEST_CODE_EXTERNAL_HISTORICAL_READINESS_LINK_TAMPER_RUN"
-            }
+            Self::ReadinessLinkTamper => "TEST_CODE_EXTERNAL_HISTORICAL_READINESS_LINK_TAMPER_RUN",
         }
     }
 
@@ -1345,10 +1331,7 @@ struct HistoricalDatabaseSnapshot {
     tables: BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>,
 }
 
-fn historical_rows(
-    connection: &Connection,
-    sql: &str,
-) -> Vec<Vec<rusqlite::types::Value>> {
+fn historical_rows(connection: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
     let mut statement = connection.prepare(sql).unwrap();
     let width = statement.column_count();
     statement
@@ -1428,8 +1411,7 @@ fn historical_target_row(
     }
     match case {
         HistoricalProviderAttemptsCase::CapabilitiesRequestIdTamper => {
-            historical_value_integer(&row[12]) == 1
-                && historical_value_integer(&row[13]) == 2
+            historical_value_integer(&row[12]) == 1 && historical_value_integer(&row[13]) == 2
         }
         HistoricalProviderAttemptsCase::ReadinessLinkTamper => {
             historical_value_text(&row[12]) == "Gateway"
@@ -1470,11 +1452,21 @@ fn assert_historical_database_delta(
             (after.tables.get(name).unwrap() != rows).then_some(name.as_str())
         })
         .collect::<Vec<_>>();
-    assert_eq!(changed_tables, vec![target_table], "{}: tables", case.label());
+    assert_eq!(
+        changed_tables,
+        vec![target_table],
+        "{}: tables",
+        case.label()
+    );
 
     let before_rows = &before.tables[target_table];
     let after_rows = &after.tables[target_table];
-    assert_eq!(after_rows.len(), before_rows.len(), "{}: row count", case.label());
+    assert_eq!(
+        after_rows.len(),
+        before_rows.len(),
+        "{}: row count",
+        case.label()
+    );
     let changed_rows = before_rows
         .iter()
         .zip(after_rows)
@@ -1503,17 +1495,18 @@ fn assert_historical_database_delta(
             );
         }
         HistoricalProviderAttemptsCase::ReadinessLinkTamper => {
-            assert_eq!(changed_columns, vec![18], "{}: readiness column", case.label());
+            assert_eq!(
+                changed_columns,
+                vec![18],
+                "{}: readiness column",
+                case.label()
+            );
         }
         _ => unreachable!(),
     }
 }
 
-fn replace_historical_segment_once(
-    bytes: &[u8],
-    needle: &[u8],
-    replacement: &[u8],
-) -> Vec<u8> {
+fn replace_historical_segment_once(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     assert!(!needle.is_empty());
     let offsets = bytes
         .windows(needle.len())
@@ -1522,8 +1515,7 @@ fn replace_historical_segment_once(
         .collect::<Vec<_>>();
     assert_eq!(offsets.len(), 1);
     let offset = offsets[0];
-    let mut changed =
-        Vec::with_capacity(bytes.len() - needle.len() + replacement.len());
+    let mut changed = Vec::with_capacity(bytes.len() - needle.len() + replacement.len());
     changed.extend_from_slice(&bytes[..offset]);
     changed.extend_from_slice(replacement);
     changed.extend_from_slice(&bytes[offset + needle.len()..]);
@@ -1531,10 +1523,7 @@ fn replace_historical_segment_once(
     changed
 }
 
-fn historical_trigger_sql(
-    transaction: &rusqlite::Transaction<'_>,
-    name: &str,
-) -> String {
+fn historical_trigger_sql(transaction: &rusqlite::Transaction<'_>, name: &str) -> String {
     transaction
         .query_row(
             "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
@@ -1568,10 +1557,12 @@ fn inject_historical_capabilities_request_id_tamper(
     assert_eq!(original_length, i64::try_from(original.len()).unwrap());
     assert_eq!(original_digest, raw_digest(&original).as_str());
 
-    let original_outer: macro_codec::ControlRawResult =
-        macro_codec::decode(&original).unwrap();
+    let original_outer: macro_codec::ControlRawResult = macro_codec::decode(&original).unwrap();
     let original_response = original_outer.response_bytes().unwrap().to_vec();
-    assert_eq!(original_response, expected_capabilities(original_request_id));
+    assert_eq!(
+        original_response,
+        expected_capabilities(original_request_id)
+    );
     let mut response = CapabilitiesResponse::decode(original_response.as_slice()).unwrap();
     assert_eq!(response.encode_to_vec(), original_response);
     assert_eq!(response.request_id, original_request_id);
@@ -1588,13 +1579,9 @@ fn inject_historical_capabilities_request_id_tamper(
 
     let original_segment = serde_json::to_vec(&original_response).unwrap();
     let replacement_segment = serde_json::to_vec(&replacement_response).unwrap();
-    let damaged_bytes = replace_historical_segment_once(
-        &original,
-        &original_segment,
-        &replacement_segment,
-    );
-    let damaged_outer: macro_codec::ControlRawResult =
-        macro_codec::decode(&damaged_bytes).unwrap();
+    let damaged_bytes =
+        replace_historical_segment_once(&original, &original_segment, &replacement_segment);
+    let damaged_outer: macro_codec::ControlRawResult = macro_codec::decode(&damaged_bytes).unwrap();
     assert_eq!(
         damaged_outer.response_bytes(),
         Some(replacement_response.as_slice()),
@@ -1675,19 +1662,31 @@ fn inject_historical_readiness_link_tamper(
         .unwrap();
     assert_eq!(controls.len(), 2);
     assert_eq!(
-        (&controls[0].0, controls[0].1.as_str(), controls[0].2.as_str()),
+        (
+            &controls[0].0,
+            controls[0].1.as_str(),
+            controls[0].2.as_str()
+        ),
         (&1, "Health", "Ready"),
     );
     assert_eq!(
-        (&controls[1].0, controls[1].1.as_str(), controls[1].2.as_str()),
+        (
+            &controls[1].0,
+            controls[1].1.as_str(),
+            controls[1].2.as_str()
+        ),
         (&2, "Capabilities", "Ready"),
     );
     let health_result_version = controls[0].3;
     let capabilities_result_version = controls[1].3;
     assert_ne!(health_result_version, capabilities_result_version);
 
-    let (begin_bytes, begin_length, begin_digest, readiness_result_version):
-        (Vec<u8>, i64, String, Option<i64>) = connection
+    let (begin_bytes, begin_length, begin_digest, readiness_result_version): (
+        Vec<u8>,
+        i64,
+        String,
+        Option<i64>,
+    ) = connection
         .query_row(
             "SELECT bytes,byte_length,sha256,readiness_result_version \
              FROM chain_post_close_macro_attempt_begins \
@@ -1699,10 +1698,7 @@ fn inject_historical_readiness_link_tamper(
         .unwrap();
     assert_eq!(begin_length, i64::try_from(begin_bytes.len()).unwrap());
     assert_eq!(begin_digest, raw_digest(&begin_bytes).as_str());
-    assert_eq!(
-        readiness_result_version,
-        Some(capabilities_result_version),
-    );
+    assert_eq!(readiness_result_version, Some(capabilities_result_version),);
     let begin: crate::push_foundation::intent_store::chain_post_close::macro_stage::Begin =
         macro_codec::decode(&begin_bytes).unwrap();
     assert_eq!(macro_codec::encode(&begin).unwrap(), begin_bytes);
@@ -1715,10 +1711,8 @@ fn inject_historical_readiness_link_tamper(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    let trigger_sql = historical_trigger_sql(
-        &transaction,
-        "chain_post_close_macro_attempt_begins_update",
-    );
+    let trigger_sql =
+        historical_trigger_sql(&transaction, "chain_post_close_macro_attempt_begins_update");
     transaction
         .execute_batch("DROP TRIGGER chain_post_close_macro_attempt_begins_update")
         .unwrap();
@@ -1779,9 +1773,8 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
-    let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(120),
-        async {
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
             let baseline = control_tests::setup_external_parent(
                 &mut business,
                 &mut parent_server,
@@ -1789,9 +1782,11 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
             )
             .await;
             external_server = Some(
-                ExternalMtlsMacroFixture::bind_data_provider_attempts_for_test(case.unpublished_provider())
-                    .await
-                    .expect("TEST_CODE historical attempts mTLS fixture"),
+                ExternalMtlsMacroFixture::bind_data_provider_attempts_for_test(
+                    case.unpublished_provider(),
+                )
+                .await
+                .expect("TEST_CODE historical attempts mTLS fixture"),
             );
             let external = external_server
                 .as_ref()
@@ -1845,18 +1840,26 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                 )
                 .unwrap();
             external.release_capabilities();
-            let capabilities_completion =
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    // Fixture generation on frozen v11; live continuations
-                    // use the explicit v15 owner tested separately.
-                    external.release_health();
-                    let connected = prepared.prepare_health_attempt().unwrap().execute().await
-                        .into_connected_client().unwrap();
-                    capabilities_attempt.bind_connected(connected).unwrap().execute().await
-                })
+            let capabilities_completion = tokio::time::timeout(Duration::from_secs(5), async {
+                // Fixture generation on frozen v11; live continuations
+                // use the explicit v15 owner tested separately.
+                external.release_health();
+                let connected = prepared
+                    .prepare_health_attempt()
+                    .unwrap()
+                    .execute()
                     .await
-                    .expect("TEST_CODE historical attempts Capabilities deadline")
-                    .expect("TEST_CODE qualified Capabilities admission");
+                    .into_connected_client()
+                    .unwrap();
+                capabilities_attempt
+                    .bind_connected(connected)
+                    .unwrap()
+                    .execute()
+                    .await
+            })
+            .await
+            .expect("TEST_CODE historical attempts Capabilities deadline")
+            .expect("TEST_CODE qualified Capabilities admission");
             assert!(capabilities_completion.processed().is_ok());
             let (lease, outcome) = local
                 .record_capabilities_control_result(
@@ -1968,14 +1971,14 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
             assert!(!recovered.has_unconfirmed_effect());
             assert_eq!(recovered.attempts().len(), 1);
             let attempt = &recovered.attempts()[0];
-            assert_eq!(attempt.readiness_result_version(), Some(ready_result_version));
+            assert_eq!(
+                attempt.readiness_result_version(),
+                Some(ready_result_version)
+            );
             assert_eq!(attempt.continuation(), Some(MacroContinuation::Terminal));
             let material = attempt.result_material().unwrap();
             let recovered_diagnostic = material.diagnostic.map(str::to_owned);
-            assert_eq!(
-                material.diagnostic,
-                Some("[redacted-unclassified-status]")
-            );
+            assert_eq!(material.diagnostic, Some("[redacted-unclassified-status]"));
             assert_eq!(material.retry_decision, RetryDecision::NoRetry);
             assert_eq!(material.continuation, MacroContinuation::Terminal);
             match material.wire {
@@ -2009,14 +2012,9 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
 
             let audit_snapshot = control_tests::audit_snapshot_at(&database);
             let facts = fact_snapshot_at(&database, &baseline.tables);
-            let parent_network_before = parent_server
-                .as_ref()
-                .unwrap()
-                .snapshot_with_tcp_for_test();
-            let parent_membership_before = parent_server
-                .as_ref()
-                .unwrap()
-                .membership_snapshot();
+            let parent_network_before =
+                parent_server.as_ref().unwrap().snapshot_with_tcp_for_test();
+            let parent_membership_before = parent_server.as_ref().unwrap().membership_snapshot();
             let wire_before = external.snapshot();
             assert_wire_prefix(
                 &wire_before,
@@ -2025,7 +2023,10 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
             );
             assert_eq!(wire_before.tcp_accepts, 2);
             assert_eq!(wire_before.data_calls, 1);
-            assert_eq!(wire_before.data_requests, vec![checkpoint.data.bytes.clone()]);
+            assert_eq!(
+                wire_before.data_requests,
+                vec![checkpoint.data.bytes.clone()]
+            );
             assert_eq!(wire_before.data_authorized, vec![true]);
             assert!(wire_before.data_responses.is_empty());
             assert_eq!(wire_before.data_statuses.len(), 1);
@@ -2067,10 +2068,7 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                         )
                     }
                     HistoricalProviderAttemptsCase::ReadinessLinkTamper => {
-                        inject_historical_readiness_link_tamper(
-                            &database,
-                            &baseline.intent,
-                        )
+                        inject_historical_readiness_link_tamper(&database, &baseline.intent)
                     }
                     _ => unreachable!(),
                 };
@@ -2082,10 +2080,7 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                 assert_eq!(historical_snapshot_at(&database), damaged);
                 assert_eq!(external.snapshot(), wire_before);
                 assert_eq!(
-                    parent_server
-                        .as_ref()
-                        .unwrap()
-                        .snapshot_with_tcp_for_test(),
+                    parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                     parent_network_before
                 );
                 assert_eq!(
@@ -2106,10 +2101,7 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                 assert_eq!(historical_snapshot_at(&database), damaged);
                 assert_eq!(external.snapshot(), wire_before);
                 assert_eq!(
-                    parent_server
-                        .as_ref()
-                        .unwrap()
-                        .snapshot_with_tcp_for_test(),
+                    parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                     parent_network_before
                 );
                 assert_eq!(
@@ -2145,14 +2137,8 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                 reopened_material.diagnostic,
                 recovered_diagnostic.as_deref()
             );
-            assert_eq!(
-                reopened_material.retry_decision,
-                RetryDecision::NoRetry
-            );
-            assert_eq!(
-                reopened_material.continuation,
-                MacroContinuation::Terminal
-            );
+            assert_eq!(reopened_material.retry_decision, RetryDecision::NoRetry);
+            assert_eq!(reopened_material.continuation, MacroContinuation::Terminal);
             match reopened_material.wire {
                 MacroRecoveredWire::Status {
                     code,
@@ -2171,9 +2157,7 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
                 case,
                 "true reopen recovery",
             );
-            let reopened_source = reopened
-                .global_news(GlobalNewsProvider::Eastmoney)
-                .unwrap();
+            let reopened_source = reopened.global_news(GlobalNewsProvider::Eastmoney).unwrap();
             assert_eq!(reopened_source.final_bytes(), Some(final_bytes.as_slice()));
             assert_eq!(reopened_source.audit_receipt(), Some(&receipt));
             drop(reopened);
@@ -2184,20 +2168,16 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
             assert_eq!(fact_snapshot_at(&database, &baseline.tables), facts);
             assert_eq!(external.snapshot(), wire_before);
             assert_eq!(
-                parent_server
-                    .as_ref()
-                    .unwrap()
-                    .snapshot_with_tcp_for_test(),
+                parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                 parent_network_before
             );
             assert_eq!(
                 parent_server.as_ref().unwrap().membership_snapshot(),
                 parent_membership_before
             );
-        },
-    ))
-    .catch_unwind()
-    .await;
+        }))
+        .catch_unwind()
+        .await;
 
     control_tests::cleanup_external_case(
         &mut business,
@@ -2208,13 +2188,10 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
     .await;
     drop(business);
     match body {
-        Ok(result) => result.unwrap_or_else(|_| {
-            panic!("TEST_CODE {} body timeout", case.label())
-        }),
+        Ok(result) => result.unwrap_or_else(|_| panic!("TEST_CODE {} body timeout", case.label())),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
-
 
 #[tokio::test]
 async fn single_user_external_macro_historical_provider_attempts_survive_true_reopen() {
@@ -2227,7 +2204,8 @@ async fn single_user_external_macro_unpublished_provider_attempts_reopen_as_reje
 }
 
 #[tokio::test]
-async fn single_user_external_macro_historical_capabilities_request_id_tamper_rejects_without_rpc() {
+async fn single_user_external_macro_historical_capabilities_request_id_tamper_rejects_without_rpc()
+{
     run_historical_provider_attempts_case(
         HistoricalProviderAttemptsCase::CapabilitiesRequestIdTamper,
     )

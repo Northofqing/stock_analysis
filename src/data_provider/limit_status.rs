@@ -1,7 +1,8 @@
-//! 涨跌停价 / ST / 停牌 状态计算器
+//! Legacy limit-status diagnostics plus the production qualified-fact gate.
 //!
-//! 单一来源：从股票代码 + 昨收 + 名称推出所有限价相关字段。
-//! 不依赖 market_analyzer/limit_up.rs（避免循环依赖）。
+//! `LimitStatusCalculator` remains for historical tests/diagnostics only. New
+//! production decisions use `qualified_price_band_for_code` and fail closed
+//! when the authority contract is unavailable.
 //!
 //! 修复：QUANT_ANALYST_REVIEW.md §1.1
 //! 原 bug：data_provider 中 is_limit_up/down/suspended 硬编码 false，全系统涨跌停检测是死代码。
@@ -77,9 +78,9 @@ pub fn fill_limit_flags(
     // 容忍 ±0.5 分的浮点误差
     k.is_limit_up = s.limit_up_price > 0.0 && (k.close - s.limit_up_price).abs() < 0.005;
     k.is_limit_down = s.limit_down_price > 0.0 && (k.close - s.limit_down_price).abs() < 0.005;
-    // v11-P0-3 commit 2 修订: 查 HALTED_PERIODS 缓存 (K 线缺口推断 / 公告),
-    // 不再永远 false (limit_status.rs:60 之前). 解决"幸存者偏差".
-    k.is_suspended = s.is_suspended || crate::monitor::data_quality::is_halted_period(code, k.date);
+    // Legacy calculation has no qualified suspension authority. Never promote
+    // the diagnostic gap cache into a formal K-line flag.
+    k.is_suspended = false;
 }
 
 /// 批量为 K 线列表（按日期降序）填涨跌停标记。
@@ -117,26 +118,127 @@ pub fn apply_limit_flags_inplace(code: &str, name: Option<&str>, klines: &mut [K
 /// 用于在调用 BacktestEngine::buy / sell 之前做合规检查。
 pub fn validate_limit_price(
     code: &str,
-    name: &str,
-    prev_close: f64,
+    _name: &str,
+    _prev_close: f64,
     price: f64,
 ) -> Result<(), LimitPriceError> {
-    let s = LimitStatusCalculator::new().calculate(code, prev_close, name);
-    if s.limit_up_price > 0.0 && price > s.limit_up_price + 0.005 {
-        return Err(LimitPriceError::AboveLimitUp {
-            code: code.to_string(),
-            price,
-            limit_up: s.limit_up_price,
+    let date = chrono::Local::now().date_naive();
+    let band = qualified_price_band_for_code(code, date)?;
+    validate_price_against_qualified_band(code, price, &band)
+}
+
+/// Validate one price against the exact authority-qualified band already
+/// acquired for the same instrument/effective date. Callers that already own
+/// that evidence must use this seam instead of performing a second lookup
+/// against the wall-clock date.
+pub(crate) fn validate_price_against_qualified_band(
+    code: &str,
+    price: f64,
+    band: &crate::data_gateway::QualifiedPriceBand,
+) -> Result<(), LimitPriceError> {
+    let price_micros = price_to_micros(code, price)?;
+    band.validate_price_micros(price_micros).map_err(|error| {
+        LimitPriceError::QualifiedRangeRejected {
+            code: code.to_owned(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+pub fn qualified_price_band_for_code(
+    code: &str,
+    effective_on: chrono::NaiveDate,
+) -> Result<crate::data_gateway::QualifiedPriceBand, LimitPriceError> {
+    #[cfg(test)]
+    if code.starts_with("TEST_CODE_") {
+        return crate::data_gateway::QualifiedPriceBand::new(
+            crate::data_gateway::SecurityBoard::Main,
+            false,
+            10_000,
+            9_000_000,
+            11_000_000,
+            effective_on,
+            effective_on,
+            "TEST_CODE_EXPLICIT_MAIN_REGIME_V1",
+        )
+        .map_err(|error| LimitPriceError::QualifiedFactsUnavailable {
+            code: code.to_owned(),
+            reason_code: "test_fixture_invalid",
+            detail: error.to_string(),
         });
     }
-    if s.limit_down_price > 0.0 && price < s.limit_down_price - 0.005 {
-        return Err(LimitPriceError::BelowLimitDown {
-            code: code.to_string(),
-            price,
-            limit_down: s.limit_down_price,
+
+    let identity = crate::data_gateway::instrument_identity::resolve_production_equity(code, None)
+        .map_err(|error| LimitPriceError::QualifiedFactsUnavailable {
+            code: code.to_owned(),
+            reason_code: "invalid_instrument_identity",
+            detail: error.to_string(),
+        })?;
+    let facts = crate::data_gateway::QualifiedTradingFactsGateway::new().acquire(
+        crate::data_gateway::QualifiedTradingFactsRequest::new(
+            identity.instrument().clone(),
+            effective_on,
+        ),
+    );
+    match facts.lifecycle().require() {
+        Ok(crate::data_gateway::QualifiedListingStatus::Listed) => {}
+        Ok(status) => {
+            return Err(LimitPriceError::QualifiedFactsUnavailable {
+                code: code.to_owned(),
+                reason_code: "instrument_not_listed",
+                detail: format!("{status:?}"),
+            })
+        }
+        Err(error) => {
+            return Err(LimitPriceError::QualifiedFactsUnavailable {
+                code: code.to_owned(),
+                reason_code: error.reason_code(),
+                detail: error.message().to_owned(),
+            })
+        }
+    }
+    match facts.suspension().require() {
+        Ok(crate::data_gateway::QualifiedSuspensionStatus::Trading) => {}
+        Ok(status) => {
+            return Err(LimitPriceError::QualifiedFactsUnavailable {
+                code: code.to_owned(),
+                reason_code: "instrument_suspended",
+                detail: format!("{status:?}"),
+            })
+        }
+        Err(error) => {
+            return Err(LimitPriceError::QualifiedFactsUnavailable {
+                code: code.to_owned(),
+                reason_code: error.reason_code(),
+                detail: error.message().to_owned(),
+            })
+        }
+    }
+    facts.price_regime().require().cloned().map_err(|error| {
+        LimitPriceError::QualifiedFactsUnavailable {
+            code: code.to_owned(),
+            reason_code: error.reason_code(),
+            detail: error.message().to_owned(),
+        }
+    })
+}
+
+fn price_to_micros(code: &str, price: f64) -> Result<i64, LimitPriceError> {
+    let scaled = price * 1_000_000.0;
+    if !scaled.is_finite() || scaled <= 0.0 || scaled >= i64::MAX as f64 {
+        return Err(LimitPriceError::QualifiedRangeRejected {
+            code: code.to_owned(),
+            detail: format!("price is not positive finite micro-CNY: {price:?}"),
         });
     }
-    Ok(())
+    let rounded = scaled.round();
+    if (scaled - rounded).abs() > 1e-6 {
+        return Err(LimitPriceError::QualifiedRangeRejected {
+            code: code.to_owned(),
+            detail: format!("price precision exceeds micro-CNY: {price:?}"),
+        });
+    }
+    Ok(rounded as i64)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +255,14 @@ pub enum LimitPriceError {
         price: f64,
         limit_down: f64,
     },
+    #[error("{code} qualified trading facts unavailable reason_code={reason_code}: {detail}")]
+    QualifiedFactsUnavailable {
+        code: String,
+        reason_code: &'static str,
+        detail: String,
+    },
+    #[error("{code} price rejected by qualified range: {detail}")]
+    QualifiedRangeRejected { code: String, detail: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

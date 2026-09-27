@@ -52,10 +52,18 @@ impl BuildIdentityTrust {
         self.recorded_identity(digest, descriptor).is_some()
     }
 
-    pub(crate) fn recorded_health(&self, digest: &str, descriptor: &str, response: &HealthResponse) -> Result<(), BuildIdentityError> {
-        let expected = self.recorded_identity(digest, descriptor)
+    pub(crate) fn recorded_health(
+        &self,
+        digest: &str,
+        descriptor: &str,
+        response: &HealthResponse,
+    ) -> Result<(), BuildIdentityError> {
+        let expected = self
+            .recorded_identity(digest, descriptor)
             .ok_or(BuildIdentityError::ExpectedIdentityUnavailable)?;
-        if !response.live || !response.ready { return Err(BuildIdentityError::NotReady); }
+        if !response.live || !response.ready {
+            return Err(BuildIdentityError::NotReady);
+        }
         qualify_identity(response.build_identity.as_ref(), &expected)
     }
 
@@ -64,7 +72,8 @@ impl BuildIdentityTrust {
         if descriptor == self.current_descriptor && digest == self.current_policy_sha256() {
             return Some(self.current.clone());
         } else if super::historical_external::accepts_descriptor(descriptor)
-            && digest == policy_sha256(&self.historical_v3, descriptor) {
+            && digest == policy_sha256(&self.historical_v3, descriptor)
+        {
             return Some(self.historical_v3.clone());
         }
         // Explicit compiled test release, never learned from response/env. This
@@ -84,22 +93,32 @@ impl BuildIdentityTrust {
         Ok(Self {
             current: expected_identity()?,
             historical_v3: parse_expected_identity(HISTORICAL_V3_METADATA)?,
-            current_descriptor: super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+            current_descriptor:
+                super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         })
     }
 
-    pub(crate) fn historical_identity(&self, identity: &BuildIdentity) -> Result<(), BuildIdentityError> {
+    pub(crate) fn historical_identity(
+        &self,
+        identity: &BuildIdentity,
+    ) -> Result<(), BuildIdentityError> {
         qualify_identity(Some(identity), &self.historical_v3)
     }
 
-    pub(crate) fn current_health(&self, response: &HealthResponse) -> Result<(), BuildIdentityError> {
+    pub(crate) fn current_health(
+        &self,
+        response: &HealthResponse,
+    ) -> Result<(), BuildIdentityError> {
         if !response.live || !response.ready {
             return Err(BuildIdentityError::NotReady);
         }
         qualify_identity(response.build_identity.as_ref(), &self.current)
     }
 
-    pub(crate) fn historical_health(&self, response: &HealthResponse) -> Result<(), BuildIdentityError> {
+    pub(crate) fn historical_health(
+        &self,
+        response: &HealthResponse,
+    ) -> Result<(), BuildIdentityError> {
         if !response.live || !response.ready {
             return Err(BuildIdentityError::NotReady);
         }
@@ -129,9 +148,15 @@ impl BuildIdentityTrust {
 
 fn policy_sha256(identity: &ExpectedBuildIdentity, descriptor: &str) -> String {
     // Ordered, versioned public trust inputs. Never hash or learn the response.
-    let bytes = serde_json::to_vec(&("stock_analysis.external_qualification_policy.v1", identity, descriptor))
-        .expect("public identity contains only serializable strings");
-    crate::monitor::push_job::raw_digest(&bytes).as_str().to_owned()
+    let bytes = serde_json::to_vec(&(
+        "stock_analysis.external_qualification_policy.v1",
+        identity,
+        descriptor,
+    ))
+    .expect("public identity contains only serializable strings");
+    crate::monitor::push_job::raw_digest(&bytes)
+        .as_str()
+        .to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,8 +199,8 @@ fn expected_identity() -> Result<ExpectedBuildIdentity, BuildIdentityError> {
 }
 
 fn parse_expected_identity(bytes: &str) -> Result<ExpectedBuildIdentity, BuildIdentityError> {
-    let metadata: BundleMetadata = serde_json::from_str(bytes)
-        .map_err(|_| BuildIdentityError::ExpectedIdentityUnavailable)?;
+    let metadata: BundleMetadata =
+        serde_json::from_str(bytes).map_err(|_| BuildIdentityError::ExpectedIdentityUnavailable)?;
     let expected = metadata
         .deployment_build_identity
         .ok_or(BuildIdentityError::ExpectedIdentityUnavailable)?;

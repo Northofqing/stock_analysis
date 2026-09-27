@@ -45,6 +45,284 @@ pub struct RealtimeMarketQuote {
     pub batch_id: String,
 }
 
+/// Consumer-visible completeness for one requested realtime-quote set.
+///
+/// This is intentionally quote-specific: generic [`GatewayBatch`] keeps its
+/// existing provider-envelope meaning, while this result additionally records
+/// per-instrument coverage and local admission failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteCoverageDisposition {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteRecordRejection {
+    pub code: Option<String>,
+    pub reason_code: &'static str,
+    pub message: String,
+}
+
+/// Sealed quote projection retaining the exact requested set and raw batch
+/// lineage. Only failures attributable to one uniquely identified record are
+/// isolated; envelope, provider, batch, timestamp and identity conflicts make
+/// the whole result unavailable.
+#[derive(Debug, Clone)]
+pub struct RealtimeQuoteCoverage {
+    disposition: QuoteCoverageDisposition,
+    requested: Vec<String>,
+    accepted: Vec<RealtimeMarketQuote>,
+    rejected: Vec<QuoteRecordRejection>,
+    missing: Vec<String>,
+    evidence: Option<BatchEvidence>,
+    unavailable_error: Option<GatewayError>,
+}
+
+impl RealtimeQuoteCoverage {
+    pub fn classify(
+        requested: &[String],
+        result: Result<GatewayBatch<RealtimeMarketQuote>, GatewayError>,
+    ) -> Self {
+        use std::collections::HashSet;
+
+        let requested_owned = requested.to_vec();
+        let requested_set = requested.iter().map(String::as_str).collect::<HashSet<_>>();
+        if requested.is_empty() || requested_set.len() != requested.len() {
+            return Self::unavailable(
+                requested_owned,
+                Vec::new(),
+                requested.to_vec(),
+                None,
+                GatewayError::invalid_request(
+                    CAPABILITY,
+                    "realtime quote coverage requires a non-empty unique requested set",
+                ),
+            );
+        }
+
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(error) => {
+                return Self::unavailable(
+                    requested_owned,
+                    Vec::new(),
+                    requested.to_vec(),
+                    None,
+                    error,
+                );
+            }
+        };
+        let (records, evidence) = match batch {
+            GatewayBatch::Available { records, evidence } if !records.is_empty() => {
+                (records, evidence)
+            }
+            GatewayBatch::Available { evidence, .. } | GatewayBatch::VerifiedEmpty(evidence) => {
+                return Self::unavailable(
+                    requested_owned,
+                    Vec::new(),
+                    requested.to_vec(),
+                    Some(evidence.clone()),
+                    GatewayError::classified(
+                        CAPABILITY,
+                        Some(evidence.provider),
+                        "unavailable",
+                        "quote_coverage_unavailable",
+                        true,
+                        "provider returned no independently admitted realtime quote records",
+                    ),
+                );
+            }
+        };
+
+        let mut returned = HashSet::with_capacity(records.len());
+        for record in &records {
+            if record.code.trim().is_empty()
+                || !requested_set.contains(record.code.as_str())
+                || !returned.insert(record.code.as_str())
+            {
+                return Self::unavailable(
+                    requested_owned,
+                    Vec::new(),
+                    requested.to_vec(),
+                    Some(evidence.clone()),
+                    GatewayError::invalid_evidence(
+                        CAPABILITY,
+                        Some(evidence.provider),
+                        format!(
+                            "realtime quote response has an empty, duplicate or unrequested identity {:?}",
+                            record.code
+                        ),
+                    ),
+                );
+            }
+            if let Err(error) = validate_admitted_projection(record, &evidence) {
+                return Self::unavailable(
+                    requested_owned,
+                    Vec::new(),
+                    requested.to_vec(),
+                    Some(evidence.clone()),
+                    error,
+                );
+            }
+        }
+
+        let missing = requested
+            .iter()
+            .filter(|code| !returned.contains(code.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut accepted = Vec::with_capacity(records.len());
+        let mut rejected = Vec::new();
+        for record in records {
+            let rejection = if record.name.trim().is_empty() {
+                Some((
+                    "invalid_quote_name",
+                    "quote name must be a non-empty string".to_owned(),
+                ))
+            } else if !record.price.is_finite() || record.price <= 0.0 {
+                Some((
+                    "invalid_quote_price",
+                    format!(
+                        "quote price must be positive and finite, got {:?}",
+                        record.price
+                    ),
+                ))
+            } else if !record.previous_close.is_finite() || record.previous_close <= 0.0 {
+                Some((
+                    "invalid_previous_close",
+                    format!(
+                        "quote previous_close must be positive and finite, got {:?}",
+                        record.previous_close
+                    ),
+                ))
+            } else if !record.change_percent.is_finite() {
+                Some((
+                    "invalid_change_percent",
+                    format!(
+                        "quote change_percent must be finite, got {:?}",
+                        record.change_percent
+                    ),
+                ))
+            } else {
+                None
+            };
+            if let Some((reason_code, message)) = rejection {
+                rejected.push(QuoteRecordRejection {
+                    code: Some(record.code),
+                    reason_code,
+                    message,
+                });
+            } else {
+                accepted.push(record);
+            }
+        }
+
+        let disposition = if accepted.is_empty() {
+            QuoteCoverageDisposition::Unavailable
+        } else if rejected.is_empty() && missing.is_empty() {
+            QuoteCoverageDisposition::Complete
+        } else {
+            QuoteCoverageDisposition::Partial
+        };
+        let unavailable_error = (disposition == QuoteCoverageDisposition::Unavailable).then(|| {
+            GatewayError::classified(
+                CAPABILITY,
+                Some(evidence.provider),
+                "unavailable",
+                "quote_coverage_unavailable",
+                false,
+                "no requested realtime quote passed record-local admission",
+            )
+        });
+        Self {
+            disposition,
+            requested: requested_owned,
+            accepted,
+            rejected,
+            missing,
+            evidence: Some(evidence),
+            unavailable_error,
+        }
+    }
+
+    fn unavailable(
+        requested: Vec<String>,
+        rejected: Vec<QuoteRecordRejection>,
+        missing: Vec<String>,
+        evidence: Option<BatchEvidence>,
+        error: GatewayError,
+    ) -> Self {
+        Self {
+            disposition: QuoteCoverageDisposition::Unavailable,
+            requested,
+            accepted: Vec::new(),
+            rejected,
+            missing,
+            evidence,
+            unavailable_error: Some(error),
+        }
+    }
+
+    pub const fn disposition(&self) -> QuoteCoverageDisposition {
+        self.disposition
+    }
+
+    pub fn requested(&self) -> &[String] {
+        &self.requested
+    }
+
+    pub fn accepted(&self) -> &[RealtimeMarketQuote] {
+        &self.accepted
+    }
+
+    pub fn rejected(&self) -> &[QuoteRecordRejection] {
+        &self.rejected
+    }
+
+    pub fn missing(&self) -> &[String] {
+        &self.missing
+    }
+
+    pub const fn evidence(&self) -> Option<&BatchEvidence> {
+        self.evidence.as_ref()
+    }
+
+    pub const fn unavailable_error(&self) -> Option<&GatewayError> {
+        self.unavailable_error.as_ref()
+    }
+
+    pub fn require_complete(self) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+        if self.disposition == QuoteCoverageDisposition::Complete {
+            return Ok(GatewayBatch::Available {
+                records: self.accepted,
+                evidence: self
+                    .evidence
+                    .expect("complete quote coverage always retains batch evidence"),
+            });
+        }
+        if let Some(error) = self.unavailable_error {
+            return Err(error);
+        }
+        Err(GatewayError::classified(
+            CAPABILITY,
+            self.evidence.as_ref().map(|evidence| evidence.provider),
+            "partial",
+            "quote_coverage_incomplete",
+            true,
+            format!(
+                "strict quote consumer requires complete coverage: rejected={} missing={}",
+                self.rejected.len(),
+                self.missing.len()
+            ),
+        ))
+    }
+
+    pub fn into_accepted(self) -> Vec<RealtimeMarketQuote> {
+        self.accepted
+    }
+}
+
 /// One realtime quote that cannot be separated from the audited source batch
 /// that admitted it.
 ///
@@ -198,13 +476,31 @@ impl MarketDataGateway {
         // (fail-closed), 绝不静默回退。
     }
 
+    /// Quote-specific request coverage. Callers that produce account-wide or
+    /// atomic decisions must call [`RealtimeQuoteCoverage::require_complete`];
+    /// scanners may explicitly consume `Partial` and surface rejected/missing
+    /// instruments without marking whole-account quote readiness.
+    pub fn realtime_quote_coverage(&self, codes: &[String]) -> RealtimeQuoteCoverage {
+        let request_hash = acquisition_request_hash(CAPABILITY, codes.join(","));
+        let result = match super::grpc_source::bridge_for("RealtimeQuotes") {
+            Ok(bridge) => bridge.realtime_quote_candidates(codes),
+            Err(error) => Err(error),
+        };
+        RealtimeQuoteCoverage::classify(
+            codes,
+            audit_routed_gateway_result(CAPABILITY, &request_hash, result),
+        )
+    }
+
     /// Acquire a non-empty batch whose quote projections cannot be detached
     /// from their audited provider evidence.
     pub fn required_realtime_quotes(
         &self,
         codes: &[String],
     ) -> Result<AdmittedRealtimeQuotes, GatewayError> {
-        AdmittedRealtimeQuotes::from_audited_batch(self.realtime_quotes(codes)?)
+        AdmittedRealtimeQuotes::from_audited_batch(
+            self.realtime_quote_coverage(codes).require_complete()?,
+        )
     }
 
     /// Acquire exactly one source-bound realtime quote.
@@ -283,6 +579,122 @@ mod tests {
     use super::*;
     use crate::database::DatabaseManager;
     use diesel::RunQueryDsl;
+
+    fn task9_evidence() -> BatchEvidence {
+        BatchEvidence {
+            provider: ProviderId::Tencent,
+            source: "TEST_CODE_quote_source".to_owned(),
+            source_at: Some("2026-09-25T01:30:00Z".to_owned()),
+            observed_at: "2026-09-25T01:30:01Z".to_owned(),
+            batch_id: "TEST_CODE_quote_coverage".to_owned(),
+        }
+    }
+
+    fn task9_quote(code: &str, price: f64) -> RealtimeMarketQuote {
+        RealtimeMarketQuote {
+            code: code.to_owned(),
+            name: format!("TEST_CODE_{code}"),
+            price,
+            previous_close: 10.0,
+            change_percent: 1.0,
+            source_at: DateTime::parse_from_rfc3339("2026-09-25T01:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            observed_at: DateTime::parse_from_rfc3339("2026-09-25T01:30:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            provider: ProviderId::Tencent,
+            batch_id: "TEST_CODE_quote_coverage".to_owned(),
+        }
+    }
+
+    #[test]
+    fn task9_quote_coverage_isolates_record_local_failure_and_strict_consumer_rejects_partial() {
+        let requested = vec!["TEST_CODE_A".to_owned(), "TEST_CODE_B".to_owned()];
+        let coverage = RealtimeQuoteCoverage::classify(
+            &requested,
+            Ok(GatewayBatch::Available {
+                records: vec![
+                    task9_quote("TEST_CODE_A", 10.0),
+                    task9_quote("TEST_CODE_B", f64::NAN),
+                ],
+                evidence: task9_evidence(),
+            }),
+        );
+
+        assert_eq!(coverage.disposition(), QuoteCoverageDisposition::Partial);
+        assert_eq!(coverage.requested(), requested.as_slice());
+        assert_eq!(coverage.accepted()[0].code, "TEST_CODE_A");
+        assert_eq!(coverage.rejected()[0].code.as_deref(), Some("TEST_CODE_B"));
+        assert_eq!(coverage.rejected()[0].reason_code, "invalid_quote_price");
+        assert!(coverage.missing().is_empty());
+        assert_eq!(
+            coverage.evidence().expect("raw lineage").batch_id,
+            "TEST_CODE_quote_coverage"
+        );
+        assert_eq!(
+            coverage
+                .clone()
+                .require_complete()
+                .expect_err("strict consumer must reject partial coverage")
+                .reason_code(),
+            "quote_coverage_incomplete"
+        );
+    }
+
+    #[test]
+    fn task9_quote_coverage_distinguishes_complete_missing_all_bad_and_shared_failure() {
+        let requested = vec!["TEST_CODE_A".to_owned(), "TEST_CODE_B".to_owned()];
+        let complete = RealtimeQuoteCoverage::classify(
+            &requested,
+            Ok(GatewayBatch::Available {
+                records: vec![
+                    task9_quote("TEST_CODE_A", 10.0),
+                    task9_quote("TEST_CODE_B", 11.0),
+                ],
+                evidence: task9_evidence(),
+            }),
+        );
+        assert_eq!(complete.disposition(), QuoteCoverageDisposition::Complete);
+        assert_eq!(complete.require_complete().unwrap().records().len(), 2);
+
+        let missing = RealtimeQuoteCoverage::classify(
+            &requested,
+            Ok(GatewayBatch::Available {
+                records: vec![task9_quote("TEST_CODE_A", 10.0)],
+                evidence: task9_evidence(),
+            }),
+        );
+        assert_eq!(missing.disposition(), QuoteCoverageDisposition::Partial);
+        assert_eq!(missing.missing(), &["TEST_CODE_B".to_owned()]);
+
+        let all_bad = RealtimeQuoteCoverage::classify(
+            &requested,
+            Ok(GatewayBatch::Available {
+                records: vec![
+                    task9_quote("TEST_CODE_A", 0.0),
+                    task9_quote("TEST_CODE_B", f64::INFINITY),
+                ],
+                evidence: task9_evidence(),
+            }),
+        );
+        assert_eq!(all_bad.disposition(), QuoteCoverageDisposition::Unavailable);
+        assert_eq!(all_bad.rejected().len(), 2);
+        assert!(all_bad.accepted().is_empty());
+
+        let mut shared_identity_failure = task9_quote("TEST_CODE_A", 10.0);
+        shared_identity_failure.batch_id = "TEST_CODE_WRONG_BATCH".to_owned();
+        let shared = RealtimeQuoteCoverage::classify(
+            &requested,
+            Ok(GatewayBatch::Available {
+                records: vec![shared_identity_failure, task9_quote("TEST_CODE_B", 11.0)],
+                evidence: task9_evidence(),
+            }),
+        );
+        assert_eq!(shared.disposition(), QuoteCoverageDisposition::Unavailable);
+        assert!(shared.accepted().is_empty());
+        assert!(shared.rejected().is_empty());
+    }
 
     #[derive(diesel::QueryableByName)]
     struct AuditProviderRow {

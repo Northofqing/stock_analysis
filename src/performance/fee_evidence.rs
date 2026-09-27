@@ -132,11 +132,9 @@ mod tests {
 
     #[test]
     fn ledger_covers_every_fill_with_stable_basis() {
-        let ledger = lot_rate_fill_cost_ledger(&[
-            (1, FillSide::Buy, 1000.0),
-            (2, FillSide::Sell, 1000.0),
-        ])
-        .expect("ledger");
+        let ledger =
+            lot_rate_fill_cost_ledger(&[(1, FillSide::Buy, 1000.0), (2, FillSide::Sell, 1000.0)])
+                .expect("ledger");
         assert_eq!(ledger.basis_id, "lot-rates-v1");
         assert_eq!(ledger.kind, CostBasisKind::Scenario);
         assert_eq!(ledger.costs.len(), 2);

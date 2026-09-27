@@ -282,7 +282,7 @@ impl SecurityLifecycleGateway {
                     .security_metadata_async(std::slice::from_ref(&code))
                     .await
                     .and_then(|batch| admit_lifecycle_tdx(LISTING_CAPABILITY, batch))
-                    .map(bridge_listing_projection);
+                    .and_then(|batch| bridge_listing_projection(&code, batch));
                 let metadata =
                     audit_routed_gateway_result(LISTING_CAPABILITY, &listing_hash, metadata);
                 let actions = bridge
@@ -331,17 +331,35 @@ struct ListingProjection {
 /// (非 Option) → 记录恒携带日期; 空批 (VerifiedEmpty) 原样传递, 由 listing_state
 /// 统一映射为 Unavailable-with-evidence (fail-closed, 与本地 "omitted" 语义等效)。
 fn bridge_listing_projection(
+    requested_code: &str,
     batch: GatewayBatch<MarketSecurityMetadata>,
-) -> GatewayBatch<ListingProjection> {
+) -> Result<GatewayBatch<ListingProjection>, GatewayError> {
     match batch {
-        GatewayBatch::Available { records, evidence } => {
-            let listed_on = records.first().map(|r| r.listed_on);
-            GatewayBatch::Available {
-                records: vec![ListingProjection { listed_on }],
+        GatewayBatch::Available { records, evidence } => match records.as_slice() {
+            [record] if record.code == requested_code => Ok(GatewayBatch::Available {
+                records: vec![ListingProjection {
+                    listed_on: Some(record.listed_on),
+                }],
                 evidence,
-            }
-        }
-        GatewayBatch::VerifiedEmpty(evidence) => GatewayBatch::VerifiedEmpty(evidence),
+            }),
+            [record] => Err(GatewayError::invalid_evidence(
+                LISTING_CAPABILITY,
+                Some(evidence.provider),
+                format!(
+                    "security metadata identity mismatch: requested {requested_code:?}, returned {:?}",
+                    record.code
+                ),
+            )),
+            _ => Err(GatewayError::invalid_evidence(
+                LISTING_CAPABILITY,
+                Some(evidence.provider),
+                format!(
+                    "security metadata must contain exactly one record for {requested_code:?}; returned {} records",
+                    records.len()
+                ),
+            )),
+        },
+        GatewayBatch::VerifiedEmpty(evidence) => Ok(GatewayBatch::VerifiedEmpty(evidence)),
     }
 }
 

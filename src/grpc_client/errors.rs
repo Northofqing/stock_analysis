@@ -7,10 +7,10 @@
 use prost::Message; // ErrorDetail::decode (tonic 0.14 details() 返回 &[u8])
 use sha2::{Digest, Sha256};
 
+use crate::grpc_client::provider_attempts::ExternalProviderCatalog;
 pub use crate::grpc_client::provider_attempts::{
     ProviderAttempt, ProviderAttemptText, ProviderAttemptValue, ProviderAttempts,
 };
-use crate::grpc_client::provider_attempts::ExternalProviderCatalog;
 use crate::grpc_contract::methods::{ContractProfile, ExternalMethod, LocalMethod, MethodIdentity};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -71,11 +71,23 @@ impl GrpcError {
         )
     }
 
-    pub(crate) fn from_status_with_decoder(status: tonic::Status, context: StatusErrorContext<'_>, decoder: crate::grpc_client::external_decoder::ExternalDecoder) -> Self {
+    pub(crate) fn from_status_with_decoder(
+        status: tonic::Status,
+        context: StatusErrorContext<'_>,
+        decoder: crate::grpc_client::external_decoder::ExternalDecoder,
+    ) -> Self {
         let diagnostic = safe_status_message(status.message());
-        let standard = if status.details().is_empty() { Ok(None) } else { Ok(Some(status.details().to_vec())) };
+        let standard = if status.details().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(status.details().to_vec()))
+        };
         let trailer = match status.metadata().get_bin(ERROR_DETAIL_TRAILER) {
-            None => Ok(None), Some(value) => value.to_bytes().map(|bytes| Some(bytes.to_vec())).map_err(|_| ()),
+            None => Ok(None),
+            Some(value) => value
+                .to_bytes()
+                .map(|bytes| Some(bytes.to_vec()))
+                .map_err(|_| ()),
         };
         let wire = reconcile_raw_error_detail(standard, trailer)
             .and_then(|bytes| decode_error_detail_bytes_at_contract(&bytes, context, decoder));
@@ -515,7 +527,11 @@ fn decode_error_detail_bytes(
     bytes: &[u8],
     context: StatusErrorContext<'_>,
 ) -> Option<DecodedWireErrorDetail> {
-    decode_error_detail_bytes_at_contract(bytes, context, crate::grpc_client::external_decoder::ExternalDecoder::Current)
+    decode_error_detail_bytes_at_contract(
+        bytes,
+        context,
+        crate::grpc_client::external_decoder::ExternalDecoder::Current,
+    )
 }
 
 fn decode_error_detail_bytes_at_contract(
@@ -657,7 +673,14 @@ pub(crate) fn restore_persisted_status_error(
     diagnostic: Option<&str>,
     context: StatusErrorContext<'_>,
 ) -> Option<GrpcError> {
-    restore_status_at_contract(code, standard, trailer, diagnostic, context, crate::grpc_client::external_decoder::ExternalDecoder::Current)
+    restore_status_at_contract(
+        code,
+        standard,
+        trailer,
+        diagnostic,
+        context,
+        crate::grpc_client::external_decoder::ExternalDecoder::Current,
+    )
 }
 
 /// Decoder is selected from the validated record/connection, never carriers.
@@ -1136,8 +1159,7 @@ mod tests {
     #[test]
     fn grpc_dual_contract_error_detail_carriers_reject_new_field_conflict() {
         use crate::grpc_client::external_pb::magic::market::v1::{
-            AdmissionState, ErrorDetail as ExternalErrorDetail, Operation,
-            ProviderAttemptDetail,
+            AdmissionState, ErrorDetail as ExternalErrorDetail, Operation, ProviderAttemptDetail,
         };
         use tonic::metadata::MetadataValue;
 
@@ -1276,11 +1298,7 @@ mod tests {
                 LocalMethod::try_from_raw(raw).expect("known Local raw method"),
             );
             let error = GrpcError::from_status(
-                tonic::Status::with_details(
-                    Code::Unavailable,
-                    "",
-                    wire.encode_to_vec().into(),
-                ),
+                tonic::Status::with_details(Code::Unavailable, "", wire.encode_to_vec().into()),
                 StatusErrorContext::data(method, "TEST_CODE_LOCAL_RAW_METHOD"),
             );
 
@@ -1307,11 +1325,7 @@ mod tests {
                 ExternalMethod::try_from_raw(raw).expect("known External raw method"),
             );
             let error = GrpcError::from_status(
-                tonic::Status::with_details(
-                    Code::Unavailable,
-                    "",
-                    wire.encode_to_vec().into(),
-                ),
+                tonic::Status::with_details(Code::Unavailable, "", wire.encode_to_vec().into()),
                 StatusErrorContext::data(method, "TEST_CODE_EXTERNAL_RAW_METHOD"),
             );
 
@@ -1341,34 +1355,25 @@ mod tests {
         assert_eq!(standard_only.details().provider.as_deref(), Some("Tdx"));
 
         let mut trailer_only = tonic::Status::new(Code::Unavailable, "");
-        trailer_only.metadata_mut().insert_bin(
-            ERROR_DETAIL_TRAILER,
-            MetadataValue::from_bytes(&bytes),
-        );
+        trailer_only
+            .metadata_mut()
+            .insert_bin(ERROR_DETAIL_TRAILER, MetadataValue::from_bytes(&bytes));
         assert_eq!(
             GrpcError::from(trailer_only).details().provider.as_deref(),
             Some("Tdx")
         );
 
-        let mut equal = tonic::Status::with_details(
-            Code::Unavailable,
-            "",
-            bytes.clone().into(),
-        );
-        equal.metadata_mut().insert_bin(
-            ERROR_DETAIL_TRAILER,
-            MetadataValue::from_bytes(&bytes),
-        );
+        let mut equal = tonic::Status::with_details(Code::Unavailable, "", bytes.clone().into());
+        equal
+            .metadata_mut()
+            .insert_bin(ERROR_DETAIL_TRAILER, MetadataValue::from_bytes(&bytes));
         assert_eq!(
             GrpcError::from(equal).details().provider.as_deref(),
             Some("Tdx")
         );
 
-        let mut conflicting = tonic::Status::with_details(
-            Code::Unavailable,
-            "",
-            bytes.clone().into(),
-        );
+        let mut conflicting =
+            tonic::Status::with_details(Code::Unavailable, "", bytes.clone().into());
         let mut conflicting_wire = wire.clone();
         conflicting_wire.retryable = false;
         conflicting.metadata_mut().insert_bin(
@@ -1397,10 +1402,7 @@ mod tests {
             "",
             vec![0xff].into(),
         ));
-        assert!(matches!(
-            &malformed_standard,
-            GrpcError::Unavailable { .. }
-        ));
+        assert!(matches!(&malformed_standard, GrpcError::Unavailable { .. }));
         assert_eq!(malformed_standard.details().provider, None);
     }
 
@@ -1415,11 +1417,7 @@ mod tests {
         .expect("Local GlobalNews method");
         let exact = local_detail("TEST_CODE_EXPECTED_REQUEST", Operation::GlobalNews);
         let exact_error = GrpcError::from_status(
-            tonic::Status::with_details(
-                Code::Internal,
-                "",
-                exact.encode_to_vec().into(),
-            ),
+            tonic::Status::with_details(Code::Internal, "", exact.encode_to_vec().into()),
             StatusErrorContext::data(method, "TEST_CODE_EXPECTED_REQUEST"),
         );
         assert_eq!(exact_error.details().provider.as_deref(), Some("Tdx"));
@@ -1435,11 +1433,7 @@ mod tests {
         ];
         for wire in cases {
             let error = GrpcError::from_status(
-                tonic::Status::with_details(
-                    Code::Internal,
-                    "",
-                    wire.encode_to_vec().into(),
-                ),
+                tonic::Status::with_details(Code::Internal, "", wire.encode_to_vec().into()),
                 StatusErrorContext::data(method, "TEST_CODE_EXPECTED_REQUEST"),
             );
             assert!(matches!(&error, GrpcError::Internal { .. }));
@@ -1460,15 +1454,8 @@ mod tests {
 
         let exact = external_detail("TEST_CODE_CONTROL_REQUEST", Operation::Unspecified, vec![]);
         let exact_error = GrpcError::from_status(
-            tonic::Status::with_details(
-                Code::Unavailable,
-                "",
-                exact.encode_to_vec().into(),
-            ),
-            StatusErrorContext::control(
-                ContractProfile::ExternalV1,
-                "TEST_CODE_CONTROL_REQUEST",
-            ),
+            tonic::Status::with_details(Code::Unavailable, "", exact.encode_to_vec().into()),
+            StatusErrorContext::control(ContractProfile::ExternalV1, "TEST_CODE_CONTROL_REQUEST"),
         );
         assert_eq!(exact_error.details().method, None);
         assert_eq!(
@@ -1483,11 +1470,7 @@ mod tests {
         ];
         for wire in cases {
             let error = GrpcError::from_status(
-                tonic::Status::with_details(
-                    Code::Unavailable,
-                    "",
-                    wire.encode_to_vec().into(),
-                ),
+                tonic::Status::with_details(Code::Unavailable, "", wire.encode_to_vec().into()),
                 StatusErrorContext::control(
                     ContractProfile::ExternalV1,
                     "TEST_CODE_CONTROL_REQUEST",
@@ -1549,7 +1532,11 @@ mod tests {
                 one_error.details().reason_code.as_deref(),
                 one_error.details().retryable,
             ),
-            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+            (
+                Some("Cailianpress"),
+                Some("provider_unavailable"),
+                Some(true)
+            ),
         );
         let one = one_error
             .details()
@@ -1576,19 +1563,54 @@ mod tests {
         assert_eq!(sixteen.len(), 16);
         let expected_sixteen = [
             (1, "Cailianpress", "selected", "selected", false, false),
-            (2, "Cailianpress", "rejected", "query_rejected", false, false),
+            (
+                2,
+                "Cailianpress",
+                "rejected",
+                "query_rejected",
+                false,
+                false,
+            ),
             (3, "Cailianpress", "failed", "unavailable", true, false),
             (4, "Cailianpress", "selected", "selected", false, false),
-            (5, "Cailianpress", "rejected", "query_rejected", false, false),
+            (
+                5,
+                "Cailianpress",
+                "rejected",
+                "query_rejected",
+                false,
+                false,
+            ),
             (6, "Cailianpress", "failed", "unavailable", true, true),
             (7, "Cailianpress", "selected", "selected", false, false),
-            (8, "Cailianpress", "rejected", "query_rejected", false, false),
+            (
+                8,
+                "Cailianpress",
+                "rejected",
+                "query_rejected",
+                false,
+                false,
+            ),
             (9, "Cailianpress", "failed", "unavailable", true, false),
             (10, "Cailianpress", "selected", "selected", false, false),
-            (11, "Cailianpress", "rejected", "query_rejected", false, false),
+            (
+                11,
+                "Cailianpress",
+                "rejected",
+                "query_rejected",
+                false,
+                false,
+            ),
             (12, "Cailianpress", "failed", "unavailable", true, true),
             (13, "Cailianpress", "selected", "selected", false, false),
-            (14, "Cailianpress", "rejected", "query_rejected", false, false),
+            (
+                14,
+                "Cailianpress",
+                "rejected",
+                "query_rejected",
+                false,
+                false,
+            ),
             (15, "Cailianpress", "failed", "unavailable", true, false),
             (16, "Cailianpress", "selected", "selected", false, false),
         ];
@@ -1728,10 +1750,7 @@ mod tests {
         }
     }
 
-    fn assert_attempt_trace_unsupported_without_top_level_change(
-        error: &GrpcError,
-        case: &str,
-    ) {
+    fn assert_attempt_trace_unsupported_without_top_level_change(error: &GrpcError, case: &str) {
         assert!(matches!(error, GrpcError::Unavailable { .. }), "{case}");
         assert_eq!(
             (
@@ -1739,7 +1758,11 @@ mod tests {
                 error.details().reason_code.as_deref(),
                 error.details().retryable,
             ),
-            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+            (
+                Some("Cailianpress"),
+                Some("provider_unavailable"),
+                Some(true)
+            ),
             "{case}: attempts validity must not rewrite the top-level detail",
         );
         assert_eq!(
@@ -1765,7 +1788,11 @@ mod tests {
                 error.details().reason_code.as_deref(),
                 error.details().retryable,
             ),
-            (Some("Cailianpress"), Some("provider_unavailable"), Some(true)),
+            (
+                Some("Cailianpress"),
+                Some("provider_unavailable"),
+                Some(true)
+            ),
             "{case}: attempts interpretation must not rewrite the top-level detail",
         );
         assert_eq!(
@@ -1815,7 +1842,10 @@ mod tests {
             ("starts-at-two", vec![attempt(2)]),
             ("gap", vec![attempt(1), attempt(3)]),
             ("duplicate", vec![attempt(1), attempt(1)]),
-            ("wire-order-is-not-ordinal-order", vec![attempt(2), attempt(1)]),
+            (
+                "wire-order-is-not-ordinal-order",
+                vec![attempt(2), attempt(1)],
+            ),
         ];
 
         for (case, attempts) in cases {
@@ -1830,11 +1860,29 @@ mod tests {
             ("selected-reason", "selected", "transport", false, false),
             ("selected-retryable", "selected", "selected", true, false),
             ("selected-terminal", "selected", "selected", false, true),
-            ("rejected-retryable", "rejected", "invalid_request", true, false),
+            (
+                "rejected-retryable",
+                "rejected",
+                "invalid_request",
+                true,
+                false,
+            ),
             ("rejected-terminal", "rejected", "evidence", false, true),
             ("failed-selected-reason", "failed", "selected", false, false),
-            ("failed-retry-required", "failed", "unavailable", false, true),
-            ("failed-no-retry-required", "failed", "invalid_request", true, false),
+            (
+                "failed-retry-required",
+                "failed",
+                "unavailable",
+                false,
+                true,
+            ),
+            (
+                "failed-no-retry-required",
+                "failed",
+                "invalid_request",
+                true,
+                false,
+            ),
         ];
 
         for (case, outcome, reason, retryable, terminal) in cases {
@@ -1857,16 +1905,38 @@ mod tests {
     fn grpc_dual_contract_external_attempts_without_capability_or_unknown_field_are_uninterpretable(
     ) {
         let cases = [
-            ("no-same-endpoint-capability-evidence", "Cailianpress", "failed", "unavailable"),
-            ("unknown-provider", "TEST_ONLY_UNKNOWN_PROVIDER", "failed", "unavailable"),
-            ("unknown-outcome", "Cailianpress", "TEST_ONLY_UNKNOWN_OUTCOME", "unavailable"),
-            ("unknown-reason", "Cailianpress", "failed", "TEST_ONLY_UNKNOWN_REASON"),
+            (
+                "no-same-endpoint-capability-evidence",
+                "Cailianpress",
+                "failed",
+                "unavailable",
+            ),
+            (
+                "unknown-provider",
+                "TEST_ONLY_UNKNOWN_PROVIDER",
+                "failed",
+                "unavailable",
+            ),
+            (
+                "unknown-outcome",
+                "Cailianpress",
+                "TEST_ONLY_UNKNOWN_OUTCOME",
+                "unavailable",
+            ),
+            (
+                "unknown-reason",
+                "Cailianpress",
+                "failed",
+                "TEST_ONLY_UNKNOWN_REASON",
+            ),
         ];
 
         for (case, provider, outcome, reason) in cases {
             let error = decode_closed_contract_attempts(
                 "TEST_CODE_ATTEMPT_AUTHORITY",
-                vec![closed_contract_attempt(1, provider, outcome, reason, true, false)],
+                vec![closed_contract_attempt(
+                    1, provider, outcome, reason, true, false,
+                )],
             );
             assert_attempt_trace_unsupported_without_top_level_change(&error, case);
             assert!(
@@ -1883,12 +1953,7 @@ mod tests {
             &[PUBLISHED],
             "TEST_CODE_ATTEMPT_SELECTED_MATRIX",
             vec![closed_contract_attempt(
-                1,
-                PUBLISHED,
-                "selected",
-                "selected",
-                false,
-                false,
+                1, PUBLISHED, "selected", "selected", false, false,
             )],
         );
         assert_single_supported_attempt_without_top_level_change(
@@ -1924,12 +1989,7 @@ mod tests {
                 &[PUBLISHED],
                 "TEST_CODE_ATTEMPT_REJECTED_MATRIX",
                 vec![closed_contract_attempt(
-                    1,
-                    PUBLISHED,
-                    "rejected",
-                    reason,
-                    false,
-                    false,
+                    1, PUBLISHED, "rejected", reason, false, false,
                 )],
             );
             assert_single_supported_attempt_without_top_level_change(
@@ -1995,8 +2055,18 @@ mod tests {
     fn grpc_dual_contract_external_attempts_reject_complete_cross_and_boolean_matrix() {
         const PUBLISHED: &str = "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER";
         let structure_cases = [
-            ("ordinal-zero", vec![closed_contract_attempt(0, PUBLISHED, "selected", "selected", false, false)]),
-            ("ordinal-start-two", vec![closed_contract_attempt(2, PUBLISHED, "selected", "selected", false, false)]),
+            (
+                "ordinal-zero",
+                vec![closed_contract_attempt(
+                    0, PUBLISHED, "selected", "selected", false, false,
+                )],
+            ),
+            (
+                "ordinal-start-two",
+                vec![closed_contract_attempt(
+                    2, PUBLISHED, "selected", "selected", false, false,
+                )],
+            ),
             (
                 "ordinal-gap",
                 vec![
@@ -2073,18 +2143,18 @@ mod tests {
                     &[PUBLISHED],
                     "TEST_CODE_ATTEMPT_REJECTED_NEGATIVE",
                     vec![closed_contract_attempt(
-                        1,
-                        PUBLISHED,
-                        "rejected",
-                        reason,
-                        retryable,
-                        terminal,
+                        1, PUBLISHED, "rejected", reason, retryable, terminal,
                     )],
                 );
                 assert_attempt_trace_unsupported_without_top_level_change(&error, reason);
             }
         }
-        for reason in ["selected", "unavailable", "provider_busy", "worker_unavailable"] {
+        for reason in [
+            "selected",
+            "unavailable",
+            "provider_busy",
+            "worker_unavailable",
+        ] {
             let error = decode_validated_closed_contract_attempts(
                 &[PUBLISHED],
                 "TEST_CODE_ATTEMPT_REJECTED_CROSS",
@@ -2166,7 +2236,10 @@ mod tests {
                 )],
             );
             assert_attempt_trace_unsupported_without_top_level_change(&error, case);
-            assert!(!format!("{error:?}").contains("TEST_ONLY_UNKNOWN"), "{case}");
+            assert!(
+                !format!("{error:?}").contains("TEST_ONLY_UNKNOWN"),
+                "{case}"
+            );
         }
     }
 
@@ -2174,7 +2247,10 @@ mod tests {
     fn grpc_dual_contract_external_attempts_bind_exact_published_provider_identity() {
         let provider_64 = "p".repeat(64);
         let provider_65 = "p".repeat(65);
-        for provider in [provider_64.as_str(), "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER"] {
+        for provider in [
+            provider_64.as_str(),
+            "TEST_ONLY_ENDPOINT_PUBLISHED_PROVIDER",
+        ] {
             let error = decode_validated_closed_contract_attempts(
                 &[provider],
                 "TEST_CODE_ATTEMPT_PROVIDER_POSITIVE",
@@ -2215,8 +2291,8 @@ mod tests {
         };
         use crate::grpc_client::pb::magic::market::v1::Operation as LocalOperation;
 
-        let local_bytes = local_detail("TEST_CODE_LOCAL_PARITY", LocalOperation::GlobalNews)
-            .encode_to_vec();
+        let local_bytes =
+            local_detail("TEST_CODE_LOCAL_PARITY", LocalOperation::GlobalNews).encode_to_vec();
         let local_method = MethodIdentity::from_client_operation(
             ContractProfile::LocalBridgeV1,
             LocalOperation::GlobalNews,

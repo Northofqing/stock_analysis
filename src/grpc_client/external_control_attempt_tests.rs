@@ -1058,7 +1058,13 @@ async fn execute_loopback_capabilities(
     let request_id = capabilities.request_id().to_owned();
     let request_bytes = capabilities.request_bytes();
     let (_, _, health) = execute_loopback_health(server).await;
-    let capabilities = capabilities.bind_connected(health.into_connected_client().expect("explicit Health qualified this connection")).unwrap();
+    let capabilities = capabilities
+        .bind_connected(
+            health
+                .into_connected_client()
+                .expect("explicit Health qualified this connection"),
+        )
+        .unwrap();
     let execution = capabilities.execute();
     tokio::pin!(execution);
     let receipt_deadline = Instant::now() + Duration::from_secs(5);
@@ -1157,7 +1163,10 @@ async fn external_capabilities_restored_pending_requires_explicit_health_and_pre
             assert_no_external_control_effects(server);
 
             let material = capabilities.request_material();
-            assert!(capabilities.execute().await.is_err(), "cold Capabilities must not connect or send");
+            assert!(
+                capabilities.execute().await.is_err(),
+                "cold Capabilities must not connect or send"
+            );
             assert_no_external_control_effects(server);
             let capabilities = current.resume_capabilities_attempt(material).unwrap();
 
@@ -1782,7 +1791,9 @@ async fn external_capabilities_without_qualification_rejects_before_connect() {
             let result = tokio::time::timeout(Duration::from_secs(5), capabilities.execute())
                 .await
                 .expect("TEST_CODE bounded local rejection");
-            let Err(error) = result else { panic!("cold Capabilities cannot mint a transport result") };
+            let Err(error) = result else {
+                panic!("cold Capabilities cannot mint a transport result")
+            };
             assert!(matches!(error, GrpcError::FailedPrecondition { .. }));
             assert_eq!(error.details().code, "external_connection_unqualified");
             drop(prepared);
@@ -1931,8 +1942,14 @@ async fn external_macro_restored_pending_after_explicit_health_sends_original_da
             assert!(before_execute.data_requests.is_empty());
 
             let (_, _, health) = execute_loopback_health(server).await;
-            let connected = resumed.bind_connected(health.into_connected_client().unwrap()).unwrap();
-            let execution = async { Ok::<_, crate::grpc_client::errors::GrpcError>(ExternalMacroAttemptCompletion::Unary(connected.execute().await)) };
+            let connected = resumed
+                .bind_connected(health.into_connected_client().unwrap())
+                .unwrap();
+            let execution = async {
+                Ok::<_, crate::grpc_client::errors::GrpcError>(
+                    ExternalMacroAttemptCompletion::Unary(connected.execute().await),
+                )
+            };
             tokio::pin!(execution);
             let receipt_deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -2632,8 +2649,14 @@ async fn external_macro_unary_status_remains_distinct_from_connect_unavailable()
             let request_id = request.request_id().to_owned();
             let request_bytes = request.request_bytes();
             let (_, _, health) = execute_loopback_health(server).await;
-            let connected = request.bind_connected(health.into_connected_client().unwrap()).unwrap();
-            let execution = async { Ok::<_, crate::grpc_client::errors::GrpcError>(ExternalMacroAttemptCompletion::Unary(connected.execute().await)) };
+            let connected = request
+                .bind_connected(health.into_connected_client().unwrap())
+                .unwrap();
+            let execution = async {
+                Ok::<_, crate::grpc_client::errors::GrpcError>(
+                    ExternalMacroAttemptCompletion::Unary(connected.execute().await),
+                )
+            };
             tokio::pin!(execution);
             let receipt_deadline = Instant::now() + Duration::from_secs(5);
             loop {

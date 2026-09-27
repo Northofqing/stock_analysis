@@ -3034,7 +3034,12 @@ impl DurableDeliveryCoordinator {
             )?;
             let decision_identities = statement
                 .query_map(
-                    params![business_date, push_kind.as_str(), sub_kind.as_str(), scope_key],
+                    params![
+                        business_date,
+                        push_kind.as_str(),
+                        sub_kind.as_str(),
+                        scope_key
+                    ],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -105,9 +105,7 @@ pub(super) fn format_bound_closing_valuation_note(
 
     let position = match compared_position {
         Err(_) => {
-            return format!(
-                "{account_note}；持仓快照读取失败，收盘估值不可用，等待按当前持仓重算"
-            )
+            return format!("{account_note}；持仓快照读取失败，收盘估值不可用，等待按当前持仓重算")
         }
         Ok(None) => return format!("{account_note}；持仓快照缺失，收盘估值不可用"),
         Ok(Some(position)) => position,
@@ -143,13 +141,9 @@ pub(super) fn format_bound_closing_valuation_note(
     }
 
     let valuation = match valuation {
-        Err(_) => {
-            return format!("{account_note}；{position_context}；收盘估值不可用（读取失败）")
-        }
+        Err(_) => return format!("{account_note}；{position_context}；收盘估值不可用（读取失败）"),
         Ok(None) => {
-            return format!(
-                "{account_note}；{position_context}；收盘估值不可用（目标日无记录）"
-            )
+            return format!("{account_note}；{position_context}；收盘估值不可用（目标日无记录）")
         }
         Ok(Some(valuation)) => valuation,
     };
@@ -600,12 +594,7 @@ mod tests_account_valuation_binding {
         extra.valuation.items.push(extra_item);
         extra.valuation.covered = 3;
         extra.valuation.total = 3;
-        cases.push((
-            "extra_code",
-            valid_position(),
-            extra,
-            "与当前持仓不匹配",
-        ));
+        cases.push(("extra_code", valid_position(), extra, "与当前持仓不匹配"));
 
         let mut duplicate = valid_valuation();
         duplicate.valuation.items[1].code = "TEST_CODE_000011".to_string();
@@ -654,12 +643,7 @@ mod tests_account_valuation_binding {
 
         let mut uncovered = valid_valuation();
         uncovered.valuation.covered = 1;
-        cases.push((
-            "coverage",
-            valid_position(),
-            uncovered,
-            "覆盖不完整",
-        ));
+        cases.push(("coverage", valid_position(), uncovered, "覆盖不完整"));
 
         let mut length_mismatch = valid_valuation();
         length_mismatch.valuation.items.pop();
@@ -746,12 +730,7 @@ mod tests_account_valuation_binding {
                 "持仓快照读取失败",
             ),
             (
-                render(
-                    Some(&account),
-                    Ok(None),
-                    Ok(None),
-                    Ok(Some(&valuation)),
-                ),
+                render(Some(&account), Ok(None), Ok(None), Ok(Some(&valuation))),
                 "持仓快照缺失",
             ),
             (
@@ -889,10 +868,7 @@ mod tests_account_valuation_binding {
                 Ok(Some(&position)),
                 Ok(Some(&valuation)),
             );
-            assert!(
-                note.contains("金额不完整或无效"),
-                "case={case}: {note}"
-            );
+            assert!(note.contains("金额不完整或无效"), "case={case}: {note}");
             assert_totals_hidden(&note);
         }
     }
@@ -917,7 +893,10 @@ mod tests_account_valuation_binding {
         assert!(note.contains("source=TEST_CODE_POSITION"), "{note}");
         assert!(note.contains("收盘估值价格日 2026-09-15"), "{note}");
         assert!(note.contains("目标日覆盖 2/2"), "{note}");
-        assert!(note.contains("provider=TEST_CODE_VALIDATED_CLOSE"), "{note}");
+        assert!(
+            note.contains("provider=TEST_CODE_VALIDATED_CLOSE"),
+            "{note}"
+        );
         assert!(note.contains("系统估值市值 4900.00"), "{note}");
         assert!(
             note.contains("系统按显示成本计算的未实现盈亏 -100.00"),
@@ -1176,8 +1155,8 @@ impl BannerCtx {
             .then(|| source.closing_valuation_note())
             .flatten();
         let user_confirmed_account = (needs_external_account_note && closing_valuation.is_none())
-        .then(|| source.user_confirmed_account_note())
-        .flatten();
+            .then(|| source.user_confirmed_account_note())
+            .flatten();
         let position = if !self.account_metrics_complete && self.total_pos.is_some() {
             "仓位批次不完整".to_string()
         } else {
@@ -1196,10 +1175,9 @@ impl BannerCtx {
                     }
                 },
                 |value| match self.account_fact.as_ref() {
-                    Some(fact) => format!(
-                        "{}截图日盈亏{value:+.1}%",
-                        fact.effective_at.date_naive()
-                    ),
+                    Some(fact) => {
+                        format!("{}截图日盈亏{value:+.1}%", fact.effective_at.date_naive())
+                    }
                     None => "盈亏事实未绑定".to_string(),
                 },
             )
@@ -1374,10 +1352,7 @@ struct DataModeTextParams<'a> {
     eta: Option<&'a str>,
 }
 
-fn render_data_mode_body(
-    params: &DataModeTextParams<'_>,
-    account_status: Option<&str>,
-) -> String {
+fn render_data_mode_body(params: &DataModeTextParams<'_>, account_status: Option<&str>) -> String {
     let mut out = format!(
         "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
         params.hhmm,
@@ -3088,30 +3063,29 @@ pub async fn push_account_mode_change(
     // 3. dispatch (2026-09-20: T-01 升级 counted, MU-account-mode)。
     // WindowMode::None 无冷却 (旧语义); 变迁对精确去重; 健康提醒类
     // 豁免预算; retry_authorized=true (状态变迁事实)。
-    let outcome =
-        match build_account_mode_counted_binding(
-            chrono::Local::now().date_naive(),
-            Some(prev_mode),
-            new_mode,
-            &text,
+    let outcome = match build_account_mode_counted_binding(
+        chrono::Local::now().date_naive(),
+        Some(prev_mode),
+        new_mode,
+        &text,
+    )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "T-01-account-mode",
+            crate::notify::PushKind::AccountMode,
+            "account_mode_hook",
+            "render_account_mode",
         )
-        .and_then(|binding| {
-            crate::presentation_registry::acquire_token(
-                "T-01-account-mode",
-                crate::notify::PushKind::AccountMode,
-                "account_mode_hook",
-                "render_account_mode",
-            )
-            .map(|token| (token, binding))
-        }) {
-            Ok((token, binding)) => {
-                crate::notify::push_counted_with_binding(token, &text, None, binding).await
-            }
-            Err(reason) => {
-                log::error!("[T-01][BR-196] counted 准备失败: {reason}");
-                crate::notify::PushOutcome::Denied(reason)
-            }
-        };
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[T-01][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    };
 
     // 3a. Frozen transition: also emit one MarketActionAlert (NOT for initial eval, NOT for unchanged)
     if is_new_transition && !is_initial_evaluation && new_mode == LibAM::Frozen {
@@ -4289,12 +4263,13 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> Result<IndustryChainSnap
         ));
     }
 
-    let live_limit_quotes: Vec<_> = quote_map
-        .values()
-        .filter(|quote| {
-            quote.change_pct >= super::market_data::infer_limit_pct(&quote.code, &quote.name) - 0.2
-        })
-        .collect();
+    let mut live_limit_quotes = Vec::new();
+    let today = chrono::Local::now().date_naive();
+    for quote in quote_map.values() {
+        if super::market_data::is_qualified_limit_up_quote(quote, today)? {
+            live_limit_quotes.push(quote);
+        }
+    }
     if live_limit_quotes.is_empty() {
         return Ok(IndustryChainSnapshot::default());
     }
@@ -6095,7 +6070,8 @@ pub fn build_st_price_counted_binding(
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     // 权威交易所解析 (BJ/ETF 安全, 不用 starts_with('6') 启发式 — 配方 §4)。
     let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        params.code, None,
+        params.code,
+        None,
     )
     .and_then(|identity| {
         identity.require_a_share()?;
@@ -6114,7 +6090,12 @@ pub fn build_st_price_counted_binding(
         None,
         true,
     )
-    .map_err(|error| format!("T-16 counted binding 构造失败 code={}: {error}", params.code))
+    .map_err(|error| {
+        format!(
+            "T-16 counted binding 构造失败 code={}: {error}",
+            params.code
+        )
+    })
 }
 
 /// A-12 归因日推 counted binding: occurrence = attribution-daily:{业务日},
@@ -6152,7 +6133,10 @@ pub fn build_g5b_counted_binding(
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
-        format!("g5b-attribution:{business_date}:{}:{event_hash}", record.code),
+        format!(
+            "g5b-attribution:{business_date}:{}:{event_hash}",
+            record.code
+        ),
         canonical_bytes,
         crate::durable_delivery_runtime::CountedDeliveryScope::Global,
         subject_hash,
@@ -6325,14 +6309,13 @@ pub fn build_block_trade_confirm_counted_binding(
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     // 权威交易所解析 (BJ/别名码 fail-closed — 配方 §4)。BR-033 票池
     // 300/301/688 均为 A 股, require_a_share 恒成立; 解析失败拒绝推送。
-    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        code, None,
-    )
-    .and_then(|identity| {
-        identity.require_a_share()?;
-        Ok(identity)
-    })
-    .map_err(|error| format!("BR-033 证券身份解析失败 code={code}: {error}"))?;
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("BR-033 证券身份解析失败 code={code}: {error}"))?;
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         format!("block-trade-confirm:{business_date}:{code}"),
@@ -6566,14 +6549,13 @@ pub fn build_candidate_invalidated_counted_binding(
     let canonical_bytes = canonical.to_string().into_bytes();
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     // 权威交易所解析 (配方 §4); 解析失败 fail-closed 拒绝推送。
-    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        code, None,
-    )
-    .and_then(|identity| {
-        identity.require_a_share()?;
-        Ok(identity)
-    })
-    .map_err(|error| format!("T-08 证券身份解析失败 code={code}: {error}"))?;
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("T-08 证券身份解析失败 code={code}: {error}"))?;
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         format!("candidate-invalidated:{business_date}:{code}"),
@@ -6708,14 +6690,13 @@ pub fn build_news_to_idea_counted_binding(
     let canonical_bytes = canonical.to_string().into_bytes();
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     // 权威交易所解析 (配方 §4); 手工工具任意码解析失败 fail-closed。
-    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        code, None,
-    )
-    .and_then(|identity| {
-        identity.require_a_share()?;
-        Ok(identity)
-    })
-    .map_err(|error| format!("D-01 证券身份解析失败 code={code}: {error}"))?;
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("D-01 证券身份解析失败 code={code}: {error}"))?;
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         format!("news-to-idea:{business_date}:{code}:{hhmm}"),
@@ -6883,14 +6864,13 @@ pub fn build_industry_chain_intraday_counted_binding(
     let canonical_bytes = canonical.to_string().into_bytes();
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     // 权威交易所解析 (配方 §4); 手工工具任意码解析失败 fail-closed。
-    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        code, None,
-    )
-    .and_then(|identity| {
-        identity.require_a_share()?;
-        Ok(identity)
-    })
-    .map_err(|error| format!("I-03 证券身份解析失败 code={code}: {error}"))?;
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("I-03 证券身份解析失败 code={code}: {error}"))?;
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         format!("industry-chain-intraday:{business_date}:{code}:{hhmm}"),
@@ -6944,7 +6924,14 @@ pub fn build_news_flash_aggregated_counted_binding(
 
 /// MU-paper-sell 渲染 (2026-09-20): 虚拟盘卖出成交卡文本 (原 main.rs inline,
 /// 单一事实源收敛)。
-pub fn render_paper_sell(name: &str, code: &str, quantity: i64, price: f64, return_rate_pct: f64, reason: &str) -> String {
+pub fn render_paper_sell(
+    name: &str,
+    code: &str,
+    quantity: i64,
+    price: f64,
+    return_rate_pct: f64,
+    reason: &str,
+) -> String {
     format!(
         "[虚拟盘卖出] {name}({code}) 卖出{quantity}股 @{price:.2} | 收益率{return_rate_pct:+.2}% | 原因:{reason}"
     )
@@ -6980,14 +6967,13 @@ pub fn build_paper_sell_counted_binding(
     });
     let canonical_bytes = canonical.to_string().into_bytes();
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    let identity = stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-        code, None,
-    )
-    .and_then(|identity| {
-        identity.require_a_share()?;
-        Ok(identity)
-    })
-    .map_err(|error| format!("虚拟盘卖出 证券身份解析失败 code={code}: {error}"))?;
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .and_then(|identity| {
+                identity.require_a_share()?;
+                Ok(identity)
+            })
+            .map_err(|error| format!("虚拟盘卖出 证券身份解析失败 code={code}: {error}"))?;
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
         format!("paper-sell:{business_date}:{code}"),
@@ -7038,13 +7024,11 @@ pub fn build_market_action_alert_counted_binding(
     let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     let identity = code
         .map(|code| {
-            stock_analysis::data_gateway::instrument_identity::resolve_production_equity(
-                code, None,
-            )
-            .and_then(|identity| {
-                identity.require_a_share()?;
-                Ok(identity)
-            })
+            stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+                .and_then(|identity| {
+                    identity.require_a_share()?;
+                    Ok(identity)
+                })
         })
         .transpose()
         .map_err(|error| format!("S-06 证券身份解析失败: {error}"))?;
@@ -7192,10 +7176,7 @@ pub async fn push_limit_boards_counted(
 ) -> crate::notify::PushOutcome {
     let (family, assembler) = match shape {
         LimitBoardsShape::First => ("L-01-limit-boards-first", "assemble_limit_boards_first"),
-        LimitBoardsShape::Second => (
-            "L-02-limit-boards-second",
-            "assemble_limit_boards_second",
-        ),
+        LimitBoardsShape::Second => ("L-02-limit-boards-second", "assemble_limit_boards_second"),
         LimitBoardsShape::ThirdPlus => (
             "L-03-limit-boards-third-plus",
             "assemble_limit_boards_third_plus",
@@ -7755,10 +7736,20 @@ fn load_today_paper_trade_reports() -> Result<Vec<PaperTradeDispatchReport>, Str
     let mut conn = db
         .get_conn()
         .map_err(|error| format!("P-04 数据库连接失败: {error}"))?;
-    load_paper_trade_reports_on(&mut conn, chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap()).date_naive(),stock_analysis::risk::env_guard::current_env())
+    load_paper_trade_reports_on(
+        &mut conn,
+        chrono::Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive(),
+        stock_analysis::risk::env_guard::current_env(),
+    )
 }
 
-fn load_paper_trade_reports_on(conn:&mut diesel::sqlite::SqliteConnection,date:chrono::NaiveDate,env:stock_analysis::risk::env_guard::TradingEnv)->Result<Vec<PaperTradeDispatchReport>,String> {
+fn load_paper_trade_reports_on(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    date: chrono::NaiveDate,
+    env: stock_analysis::risk::env_guard::TradingEnv,
+) -> Result<Vec<PaperTradeDispatchReport>, String> {
     use diesel::RunQueryDsl;
     let rows = diesel::sql_query(
         "SELECT p.id, p.plan_id, p.code, p.name, p.direction, p.price, p.quantity, \
@@ -7799,7 +7790,7 @@ fn load_paper_trade_reports_on(conn:&mut diesel::sqlite::SqliteConnection,date:c
     .map_err(|error| format!("P-04 查询当日 paper_trades 失败: {error}"))?;
     let reports = rows
         .into_iter()
-        .map(|row|validate_paper_trade_dispatch_row_for_env(row,env))
+        .map(|row| validate_paper_trade_dispatch_row_for_env(row, env))
         .collect::<Result<Vec<_>, _>>()?;
     reject_ambiguous_paper_trade_reports(&reports)?;
     Ok(reports)
@@ -7815,11 +7806,20 @@ struct PreparedPaperTrade {
 
 fn prepare_paper_trade_daily() -> Result<Vec<PreparedPaperTrade>, String> {
     let reports = load_today_paper_trade_reports()?;
-    let effective = if reports.iter().any(|report| report.status == PaperTradeStatus::Filled) {
-        Some(stock_analysis::performance::economic_position::query_effective_fills_through(
-            chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()).date_naive(),
-        )?)
-    } else { None };
+    let effective = if reports
+        .iter()
+        .any(|report| report.status == PaperTradeStatus::Filled)
+    {
+        Some(
+            stock_analysis::performance::economic_position::query_effective_fills_through(
+                chrono::Utc::now()
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                    .date_naive(),
+            )?,
+        )
+    } else {
+        None
+    };
     reports
         .into_iter()
         .filter_map(|report| {
@@ -9793,30 +9793,27 @@ pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
     // Rolling 600s 镜像显式 L4; retry_authorized=false (盘中竞价快照时刻
     // 锚定 + 下一轮 repush 重渲染补偿)。业务日取 Local::now (I-01
     // SectorRotation 同形态)。
-    let result = match build_auction_repush_counted_binding(
-        chrono::Local::now().date_naive(),
-        hhmm,
-        &text,
-    )
-    .and_then(|binding| {
-        crate::presentation_registry::acquire_token(
-            "A-02-auction-repush",
-            crate::notify::PushKind::AuctionRepush,
-            "auction_repush_dispatcher",
-            "render_auction_repush",
-        )
-        .map(|token| (token, binding))
-    }) {
-        Ok((token, binding)) => {
-            crate::notify::push_counted_with_binding(token, &text, None, binding)
-                .await
-                .is_pushed()
-        }
-        Err(reason) => {
-            log::error!("[A-02][BR-196] counted 准备失败: {reason}");
-            false
-        }
-    };
+    let result =
+        match build_auction_repush_counted_binding(chrono::Local::now().date_naive(), hhmm, &text)
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "A-02-auction-repush",
+                    crate::notify::PushKind::AuctionRepush,
+                    "auction_repush_dispatcher",
+                    "render_auction_repush",
+                )
+                .map(|token| (token, binding))
+            }) {
+            Ok((token, binding)) => {
+                crate::notify::push_counted_with_binding(token, &text, None, binding)
+                    .await
+                    .is_pushed()
+            }
+            Err(reason) => {
+                log::error!("[A-02][BR-196] counted 准备失败: {reason}");
+                false
+            }
+        };
     log_dispatcher_attempt("A-02", result, top5.len(), "");
     result
 }
@@ -10169,19 +10166,17 @@ pub async fn dispatch_ipo_catalyst(date: &str) -> bool {
     // 取 CountedSourceOnly (requires_banner=false, BR-241 公共源形态 — 不虚构
     // banner 依赖), 与 T-16/A-12/BR-033 同形态。BusinessDateOnce 幂等 + 豁免
     // 日预算。
-    let result = match build_ipo_catalyst_counted_binding(date_naive, &text).and_then(
-        |binding| {
-            crate::presentation_registry::acquire_token(
-                "A-11-ipo-catalyst",
-                crate::notify::PushKind::IpoCatalyst,
-                "ipo_catalyst_dispatcher",
-                // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
-                // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
-                "render_ipo_catalyst",
-            )
-            .map(|token| (token, binding))
-        },
-    ) {
+    let result = match build_ipo_catalyst_counted_binding(date_naive, &text).and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "A-11-ipo-catalyst",
+            crate::notify::PushKind::IpoCatalyst,
+            "ipo_catalyst_dispatcher",
+            // renderer seam id 保持原注册名 (BR-196 token 按 family+renderer 派生,
+            // 2026-08-06 曾改名为 _dynamic 导致 token 拒绝)
+            "render_ipo_catalyst",
+        )
+        .map(|token| (token, binding))
+    }) {
         Ok((token, binding)) => {
             crate::notify::push_counted_with_binding(token, &text, None, binding)
                 .await
@@ -10394,8 +10389,15 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
                 .find(|entry| &entry.code == code)
                 .map(|entry| entry.name.clone())
                 .unwrap_or_else(|| code.clone());
-            let _ = push_candidate_invalidated(business_date, code, &hhmm, &name, "候选", "从候选台消失")
-                .await;
+            let _ = push_candidate_invalidated(
+                business_date,
+                code,
+                &hhmm,
+                &name,
+                "候选",
+                "从候选台消失",
+            )
+            .await;
         }
     }
     // BR-232: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
@@ -10436,8 +10438,8 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
     let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Local::now().date_naive());
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
-    let result = match build_candidate_board_counted_binding(business_date, &hhmm, &text)
-        .and_then(|binding| {
+    let result = match build_candidate_board_counted_binding(business_date, &hhmm, &text).and_then(
+        |binding| {
             crate::presentation_registry::acquire_token(
                 "P-05-candidate-board",
                 crate::notify::PushKind::CandidateBoard,
@@ -10445,7 +10447,8 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
                 "format_candidate_board",
             )
             .map(|token| (token, binding))
-        }) {
+        },
+    ) {
         Ok((token, binding)) => {
             crate::notify::push_counted_with_binding(token, &text, None, binding)
                 .await
@@ -15649,15 +15652,12 @@ mod tests_r_dispatchers {
 
         let loader_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&loader_calls);
-        let outcome = dispatch_r12_backtest_outcome_with_runner(
-            "2026-08-17",
-            true,
-            move |_| async move {
+        let outcome =
+            dispatch_r12_backtest_outcome_with_runner("2026-08-17", true, move |_| async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 crate::review_batch::ReviewTaskOutcome::no_data("TEST_CODE loader reached")
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(
             loader_calls.load(Ordering::SeqCst),
@@ -15681,17 +15681,14 @@ mod tests_r_dispatchers {
 
         let loader_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&loader_calls);
-        let outcome = dispatch_r12_backtest_outcome_with_runner(
-            "2026-08-17",
-            false,
-            move |_| async move {
+        let outcome =
+            dispatch_r12_backtest_outcome_with_runner("2026-08-17", false, move |_| async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 crate::review_batch::ReviewTaskOutcome::no_data(
                     "TEST_CODE loader unexpectedly called",
                 )
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -16776,20 +16773,16 @@ async fn push_intraday_market_outcome(
     // 每时间槽独立 occurrence; retry_authorized=false (手工重跑即补偿)。
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
     let today = chrono::Local::now().date_naive();
-    match build_intraday_counted_binding(
-        today,
-        IntradayProducer::SectorRotation { hhmm },
-        &text,
-    )
-    .and_then(|binding| {
-        crate::presentation_registry::acquire_token(
-            "I-01-intraday-market",
-            crate::notify::PushKind::IntradayMarket,
-            "intraday_market_dispatcher",
-            "render_intraday_market",
-        )
-        .map(|token| (token, binding))
-    }) {
+    match build_intraday_counted_binding(today, IntradayProducer::SectorRotation { hhmm }, &text)
+        .and_then(|binding| {
+            crate::presentation_registry::acquire_token(
+                "I-01-intraday-market",
+                crate::notify::PushKind::IntradayMarket,
+                "intraday_market_dispatcher",
+                "render_intraday_market",
+            )
+            .map(|token| (token, binding))
+        }) {
         Ok((token, binding)) => {
             crate::notify::push_counted_with_binding(token, &text, None, binding).await
         }
@@ -19167,7 +19160,14 @@ pub fn build_test_template_catalog(
     // 虚拟盘卖出 (2026-09-20): MU-paper-sell 全 7 触点新增
     push(
         "T-21-paper-sell",
-        render_paper_sell("TEST_CODE 测试股", "TEST_CODE_600001", 100, 10.50, 8.20, "TEST_CODE 触发原因"),
+        render_paper_sell(
+            "TEST_CODE 测试股",
+            "TEST_CODE_600001",
+            100,
+            10.50,
+            8.20,
+            "TEST_CODE 触发原因",
+        ),
     );
 
     if catalog.len() != EXPECTED_CATALOG_TOTAL {
@@ -19642,6 +19642,13 @@ mod tests {
                 },
             ],
             evidence: evidence("TEST_CODE_quote", "TEST_CODE_quote_batch"),
+            coverage: stock_analysis::data_gateway::QuoteCoverageDisposition::Complete,
+            requested: vec![
+                "TEST_CODE_600001".to_string(),
+                "TEST_CODE_000001".to_string(),
+            ],
+            rejected: Vec::new(),
+            missing: Vec::new(),
         };
         let statistics_batch = CandidateStatisticsBatch {
             rows: vec![
@@ -19898,8 +19905,14 @@ mod tests {
 
         let rendered = banner.render();
         assert!(rendered.contains("2026-09-21截图日盈亏+0.3%"), "{rendered}");
-        assert!(rendered.contains("账户快照截至 2026-09-21T15:00:00+08:00"), "{rendered}");
-        assert!(rendered.contains("source=TEST_CODE_USER_CONFIRMED"), "{rendered}");
+        assert!(
+            rendered.contains("账户快照截至 2026-09-21T15:00:00+08:00"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("source=TEST_CODE_USER_CONFIRMED"),
+            "{rendered}"
+        );
         assert!(rendered.contains("收盘估值价格日未绑定"), "{rendered}");
     }
 
@@ -19926,7 +19939,9 @@ mod tests {
         let rendered = banner.capture_with_external_notes(&ForbiddenExternalNotes);
         assert!(rendered.render().contains("当前日盈亏未确认"));
         assert!(rendered.render().contains("2026-09-18T15:00:00+08:00"));
-        assert!(rendered.render().contains("source=TEST_CODE_FRIDAY_SNAPSHOT"));
+        assert!(rendered
+            .render()
+            .contains("source=TEST_CODE_FRIDAY_SNAPSHOT"));
     }
 
     struct NoBannerExternalNotes;
@@ -19950,7 +19965,10 @@ mod tests {
     #[test]
     fn banner_normal_full_format() {
         let b = banner_normal();
-        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]");
+        assert_eq!(
+            b.render(),
+            "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]"
+        );
     }
 
     #[test]
@@ -19986,7 +20004,10 @@ mod tests {
         assert!(!text.contains("日盈亏已确认"), "false confirmation: {text}");
         assert!(!text.contains("仓位7成"), "incomplete batch: {text}");
         assert!(!text.contains("日盈亏-2.5%"), "incomplete batch: {text}");
-        assert!(text.contains("[⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]"), "{text}");
+        assert!(
+            text.contains("[⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]"),
+            "{text}"
+        );
         assert!(text.contains("2026-09-14T18:50:00+08:00"), "{text}");
         assert!(text.contains("source=TEST_CODE_USER_CONFIRMED"), "{text}");
         assert!(text.contains("2026-09-14 当日盈亏 -12.50"), "{text}");
@@ -20330,7 +20351,10 @@ mod tests {
             data_missing_note: Some("不该出现".to_string()),
         };
         // Full 模式下 data_missing_note 被忽略
-        assert_eq!(b.render(), "[🔴 Frozen | 仓位0成 | 盈亏事实未绑定 | 数据Full]");
+        assert_eq!(
+            b.render(),
+            "[🔴 Frozen | 仓位0成 | 盈亏事实未绑定 | 数据Full]"
+        );
     }
 
     #[test]
@@ -23119,11 +23143,9 @@ mod tests {
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
         assert!(binding.retry_authorized());
-        assert!(
-            binding
-                .schedule_occurrence_identity()
-                .starts_with("g5b-attribution:2026-09-20:600001:")
-        );
+        assert!(binding
+            .schedule_occurrence_identity()
+            .starts_with("g5b-attribution:2026-09-20:600001:"));
         // 同事件同日 → 同 occurrence; 同票不同事件 → 不同 occurrence (不互杀)
         let again = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
         assert_eq!(
@@ -23139,12 +23161,11 @@ mod tests {
         );
         // 不同业务日 → 不同 occurrence
         let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
-        let next_binding = build_g5b_counted_binding(next, &record, summary).expect("valid binding");
-        assert!(
-            next_binding
-                .schedule_occurrence_identity()
-                .starts_with("g5b-attribution:2026-09-21:600001:")
-        );
+        let next_binding =
+            build_g5b_counted_binding(next, &record, summary).expect("valid binding");
+        assert!(next_binding
+            .schedule_occurrence_identity()
+            .starts_with("g5b-attribution:2026-09-21:600001:"));
     }
 
     #[test]
@@ -23165,14 +23186,16 @@ mod tests {
         );
         // 文本变化不改变 occurrence (当日一次不变式), 只改变 canonical
         let other_text = "不同内容的摘要";
-        let other = build_attribution_daily_counted_binding(date, other_text).expect("valid binding");
+        let other =
+            build_attribution_daily_counted_binding(date, other_text).expect("valid binding");
         assert_eq!(
             other.schedule_occurrence_identity(),
             "attribution-daily:2026-09-20"
         );
         // 不同业务日 → 不同 occurrence
         let next = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
-        let next_binding = build_attribution_daily_counted_binding(next, text).expect("valid binding");
+        let next_binding =
+            build_attribution_daily_counted_binding(next, text).expect("valid binding");
         assert_eq!(
             next_binding.schedule_occurrence_identity(),
             "attribution-daily:2026-09-21"
@@ -23196,7 +23219,10 @@ mod tests {
             new_take_profit: None,
         };
         assert!(build_st_price_counted_binding(date, &test_code).is_err());
-        let malformed = StPriceLimitChangedParams { code: "12345", ..test_code };
+        let malformed = StPriceLimitChangedParams {
+            code: "12345",
+            ..test_code
+        };
         assert!(build_st_price_counted_binding(date, &malformed).is_err());
     }
 
@@ -23208,7 +23234,9 @@ mod tests {
         // R-02 周期卡: 每时间槽独立 occurrence (跨槽重试不互杀身份)
         let slot_a = build_intraday_counted_binding(
             date,
-            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            IntradayProducer::MarketView {
+                hhmm: "10:15".to_owned(),
+            },
             text,
         )
         .expect("valid binding");
@@ -23218,7 +23246,9 @@ mod tests {
         );
         let slot_b = build_intraday_counted_binding(
             date,
-            IntradayProducer::MarketView { hhmm: "10:20".to_owned() },
+            IntradayProducer::MarketView {
+                hhmm: "10:20".to_owned(),
+            },
             text,
         )
         .expect("valid binding");
@@ -23228,12 +23258,9 @@ mod tests {
         );
 
         // 每日一次提醒: 同业务日同生产者 → 同 occurrence
-        let reminder = build_intraday_counted_binding(
-            date,
-            IntradayProducer::SnapshotReminder,
-            text,
-        )
-        .expect("valid binding");
+        let reminder =
+            build_intraday_counted_binding(date, IntradayProducer::SnapshotReminder, text)
+                .expect("valid binding");
         assert_eq!(
             reminder.schedule_occurrence_identity(),
             "intraday:2026-09-20:snapshot-reminder"
@@ -23252,7 +23279,9 @@ mod tests {
         // 手工工具轮动总览: 同样每时间槽独立
         let rotation = build_intraday_counted_binding(
             date,
-            IntradayProducer::SectorRotation { hhmm: "10:30".to_owned() },
+            IntradayProducer::SectorRotation {
+                hhmm: "10:30".to_owned(),
+            },
             text,
         )
         .expect("valid binding");
@@ -23273,11 +23302,16 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
         let binding = build_intraday_counted_binding(
             date,
-            IntradayProducer::MarketView { hhmm: "10:15".to_owned() },
+            IntradayProducer::MarketView {
+                hhmm: "10:15".to_owned(),
+            },
             "盘中盘面走向样本",
         )
         .expect("valid binding");
-        assert_eq!(binding.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert_eq!(
+            binding.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
         assert!(!binding.retry_authorized());
         assert_eq!(binding.business_date(), date);
     }
@@ -23307,7 +23341,10 @@ mod tests {
             slot_a.schedule_occurrence_identity()
         );
         // 旧语义一次性调用失败即弃 → retry_authorized=false, Global scope
-        assert_eq!(slot_a.scope(), &crate::durable_delivery_runtime::CountedDeliveryScope::Global);
+        assert_eq!(
+            slot_a.scope(),
+            &crate::durable_delivery_runtime::CountedDeliveryScope::Global
+        );
         assert!(!slot_a.retry_authorized());
         assert_eq!(slot_a.business_date(), date);
     }
@@ -23384,23 +23421,20 @@ mod tests {
     fn u07_counted_binding_is_global_daily_digest_with_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
         let text = "🛰️ IPO 产业链催化（2026-09-20 动态）";
-        let binding =
-            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        let binding = build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
             "ipo-catalyst:2026-09-20"
         );
         // 同业务日同事实 → 同 occurrence (decision 回放稳定)
-        let again =
-            build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
+        let again = build_ipo_catalyst_counted_binding(date, text).expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
         );
         // 不同业务日 → 不同 occurrence (修复旧跨日期共享空code冷却缺陷)
         let next_day = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("valid date");
-        let next =
-            build_ipo_catalyst_counted_binding(next_day, text).expect("valid binding");
+        let next = build_ipo_catalyst_counted_binding(next_day, text).expect("valid binding");
         assert_ne!(
             next.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
@@ -23610,15 +23644,15 @@ mod tests {
     #[test]
     fn u11_counted_binding_is_per_time_slot_without_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
-        let binding =
-            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        let binding = build_auction_repush_counted_binding(date, "09:25", "竞价重推样本")
+            .expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
             "auction-repush:2026-09-20:09:25"
         );
         // 同槽同事实 → 同 occurrence (decision 回放稳定)
-        let again =
-            build_auction_repush_counted_binding(date, "09:25", "竞价重推样本").expect("valid binding");
+        let again = build_auction_repush_counted_binding(date, "09:25", "竞价重推样本")
+            .expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
@@ -23772,15 +23806,15 @@ mod tests {
     #[test]
     fn u17_counted_binding_is_per_slot_without_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
-        let binding =
-            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        let binding = build_auction_volume_counted_binding(date, "09:22", "竞价量能样本")
+            .expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
             "auction-volume:2026-09-20:09:22"
         );
         // 同槽同事实 → 同 occurrence (decision 回放稳定)
-        let again =
-            build_auction_volume_counted_binding(date, "09:22", "竞价量能样本").expect("valid binding");
+        let again = build_auction_volume_counted_binding(date, "09:22", "竞价量能样本")
+            .expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
@@ -23797,25 +23831,17 @@ mod tests {
     #[test]
     fn u18_counted_binding_is_per_ticket_per_slot_without_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
-        let binding = build_industry_chain_intraday_counted_binding(
-            date,
-            "600001",
-            "10:30",
-            "涨停扩散样本",
-        )
-        .expect("valid binding");
+        let binding =
+            build_industry_chain_intraday_counted_binding(date, "600001", "10:30", "涨停扩散样本")
+                .expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
             "industry-chain-intraday:2026-09-20:600001:10:30"
         );
         // 同票同槽同事实 → 同 occurrence (decision 回放稳定)
-        let again = build_industry_chain_intraday_counted_binding(
-            date,
-            "600001",
-            "10:30",
-            "涨停扩散样本",
-        )
-        .expect("valid binding");
+        let again =
+            build_industry_chain_intraday_counted_binding(date, "600001", "10:30", "涨停扩散样本")
+                .expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
@@ -23832,25 +23858,17 @@ mod tests {
     #[test]
     fn u19_counted_binding_is_per_window_per_slot_without_replay() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date");
-        let binding = build_news_flash_aggregated_counted_binding(
-            date,
-            "morning",
-            "10:30",
-            "新闻聚合样本",
-        )
-        .expect("valid binding");
+        let binding =
+            build_news_flash_aggregated_counted_binding(date, "morning", "10:30", "新闻聚合样本")
+                .expect("valid binding");
         assert_eq!(
             binding.schedule_occurrence_identity(),
             "news-flash-agg:2026-09-20:morning:10:30"
         );
         // 同窗口同槽同事实 → 同 occurrence (decision 回放稳定)
-        let again = build_news_flash_aggregated_counted_binding(
-            date,
-            "morning",
-            "10:30",
-            "新闻聚合样本",
-        )
-        .expect("valid binding");
+        let again =
+            build_news_flash_aggregated_counted_binding(date, "morning", "10:30", "新闻聚合样本")
+                .expect("valid binding");
         assert_eq!(
             again.schedule_occurrence_identity(),
             binding.schedule_occurrence_identity()
@@ -25010,21 +25028,34 @@ mod tests {
 
     #[test]
     fn effective_fill_p04_accepts_precise_native_terminal_time_without_changing_legacy_bytes() {
-        let legacy=validate_paper_trade_dispatch_row_for_env(valid_paper_trade_dispatch_row(),stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
-        let frozen=legacy.terminal_binding.canonical_bytes().unwrap();
-        let mut native=valid_paper_trade_dispatch_row();
-        native.paper_trade_created_at="2026-07-30 01:31:00.125".into();
-        native.terminal_at=Some("2026-07-30 01:31:00.125".into());
-        let report=validate_paper_trade_dispatch_row_for_env(native,stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
-        assert!(String::from_utf8(report.terminal_binding.canonical_bytes().unwrap()).unwrap().contains("01:31:00.125"));
-        assert_eq!(legacy.terminal_binding.canonical_bytes().unwrap(),frozen);
+        let legacy = validate_paper_trade_dispatch_row_for_env(
+            valid_paper_trade_dispatch_row(),
+            stock_analysis::risk::env_guard::TradingEnv::Test,
+        )
+        .unwrap();
+        let frozen = legacy.terminal_binding.canonical_bytes().unwrap();
+        let mut native = valid_paper_trade_dispatch_row();
+        native.paper_trade_created_at = "2026-07-30 01:31:00.125".into();
+        native.terminal_at = Some("2026-07-30 01:31:00.125".into());
+        let report = validate_paper_trade_dispatch_row_for_env(
+            native,
+            stock_analysis::risk::env_guard::TradingEnv::Test,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(report.terminal_binding.canonical_bytes().unwrap())
+                .unwrap()
+                .contains("01:31:00.125")
+        );
+        assert_eq!(legacy.terminal_binding.canonical_bytes().unwrap(), frozen);
     }
 
     #[test]
     fn effective_fill_p04_sqlite_join_keeps_native_and_legacy_fact_clock_exact() {
-        use diesel::{Connection,connection::SimpleConnection};
-        let file=tempfile::NamedTempFile::new().unwrap();
-        let mut conn=diesel::sqlite::SqliteConnection::establish(file.path().to_str().unwrap()).unwrap();
+        use diesel::{connection::SimpleConnection, Connection};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut conn =
+            diesel::sqlite::SqliteConnection::establish(file.path().to_str().unwrap()).unwrap();
         conn.batch_execute("CREATE TABLE paper_trades(id INTEGER,plan_id TEXT,code TEXT,name TEXT,direction TEXT,price REAL,quantity INTEGER,status TEXT,fill_price REAL,not_fill_reason TEXT,virtual_reason TEXT,account_mode TEXT,data_mode TEXT,ts TEXT);
             CREATE TABLE order_audit(id INTEGER,business_order_id TEXT,source TEXT,decision_basis TEXT,side TEXT,code TEXT,requested_price REAL,quantity INTEGER,outcome TEXT,execution_price REAL,failure_reason TEXT,quote_observed_at TEXT,created_at TEXT);
             CREATE TABLE order_audit_chain(order_audit_id INTEGER,previous_hash TEXT,record_hash TEXT);
@@ -25033,12 +25064,21 @@ mod tests {
             INSERT INTO order_audit VALUES(1,'TEST_CODE_legacy','PaperTrade','NewsCatalyst','buy','TEST_CODE_600001',10,100,'Filled',10,NULL,'2026-07-30T09:31:00+08:00','2026-07-30 01:31:00'),
             (2,'TEST_CODE_native','PaperTrade','NewsCatalyst | PaperLedgerV1 account=TEST_CODE epoch=TEST_CODE head=fixture inventory=fixture fee_model=fixture','buy','TEST_CODE_600001',10,100,'Filled',10,NULL,'2026-07-30T09:31:00+08:00','2026-07-30 01:31:00');
             INSERT INTO order_audit_chain VALUES(1,'BR086_ORDER_AUDIT_GENESIS_V1','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),(2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');").unwrap();
-        let reports=load_paper_trade_reports_on(&mut conn,chrono::NaiveDate::from_ymd_opt(2026,7,30).unwrap(),stock_analysis::risk::env_guard::TradingEnv::Test).unwrap();
-        assert_eq!(reports.len(),2);
-        let native:serde_json::Value=serde_json::from_slice(&reports[1].terminal_binding.canonical_bytes().unwrap()).unwrap();
-        assert_eq!(native["paper_trade_created_at"],"2026-07-30T01:31:00.125Z");
-        let legacy:serde_json::Value=serde_json::from_slice(&reports[0].terminal_binding.canonical_bytes().unwrap()).unwrap();
-        assert_eq!(legacy["paper_trade_created_at"],"2026-07-30T01:31:00Z");
+        let reports = load_paper_trade_reports_on(
+            &mut conn,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            stock_analysis::risk::env_guard::TradingEnv::Test,
+        )
+        .unwrap();
+        assert_eq!(reports.len(), 2);
+        let native: serde_json::Value =
+            serde_json::from_slice(&reports[1].terminal_binding.canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(native["paper_trade_created_at"], "2026-07-30T01:31:00.125Z");
+        let legacy: serde_json::Value =
+            serde_json::from_slice(&reports[0].terminal_binding.canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(legacy["paper_trade_created_at"], "2026-07-30T01:31:00Z");
     }
 
     #[test]
@@ -25702,7 +25742,10 @@ mod tests {
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
-        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]");
+        assert_eq!(
+            b.render(),
+            "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]"
+        );
     }
 
     #[test]

@@ -278,10 +278,7 @@ impl GatewayError {
         }
     }
 
-    pub fn retired_operation(
-        capability: &'static str,
-        provider: Option<ProviderId>,
-    ) -> Self {
+    pub fn retired_operation(capability: &'static str, provider: Option<ProviderId>) -> Self {
         Self {
             capability,
             provider,
@@ -2559,14 +2556,12 @@ mod tests {
             complete: true,
             observed_at,
             source_at: String::new(),
-            records: vec![
-                crate::grpc_client::envelope::CanonicalRecord {
-                    schema: "market.benchmark_bars".to_owned(),
-                    schema_version: 1,
-                    content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&replayed).expect("TEST_CODE replay payload"),
-                },
-            ],
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&replayed).expect("TEST_CODE replay payload"),
+            }],
             provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
                 "TEST_CODE persisted request A provider".to_owned(),
             ),
@@ -2672,14 +2667,12 @@ mod tests {
             complete: true,
             observed_at,
             source_at: String::new(),
-            records: vec![
-                crate::grpc_client::envelope::CanonicalRecord {
-                    schema: "market.benchmark_bars".to_owned(),
-                    schema_version: 1,
-                    content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&replayed).expect("TEST_CODE bad OHLC replay payload"),
-                },
-            ],
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&replayed).expect("TEST_CODE bad OHLC replay payload"),
+            }],
             provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
                 "TEST_CODE persisted request A bad OHLC replay".to_owned(),
             ),
@@ -2762,14 +2755,12 @@ mod tests {
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
-            records: vec![
-                crate::grpc_client::envelope::CanonicalRecord {
-                    schema: "market.benchmark_bars".to_owned(),
-                    schema_version: 1,
-                    content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
-                },
-            ],
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
+            }],
             provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
                 "TEST_CODE forged provider response".to_owned(),
             ),
@@ -2852,14 +2843,12 @@ mod tests {
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
-            records: vec![
-                crate::grpc_client::envelope::CanonicalRecord {
-                    schema: "market.benchmark_bars".to_owned(),
-                    schema_version: 1,
-                    content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
-                },
-            ],
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&wire).expect("TEST_CODE benchmark payload"),
+            }],
             provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
                 "TEST_CODE forged bad OHLC response".to_owned(),
             ),
@@ -2948,14 +2937,12 @@ mod tests {
             complete: true,
             observed_at: "2026-08-21T15:01:00+08:00".to_owned(),
             source_at: String::new(),
-            records: vec![
-                crate::grpc_client::envelope::CanonicalRecord {
-                    schema: "market.benchmark_bars".to_owned(),
-                    schema_version: 1,
-                    content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&wire_json).expect("TEST_CODE benchmark payload"),
-                },
-            ],
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "market.benchmark_bars".to_owned(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_owned(),
+                data: serde_json::to_vec(&wire_json).expect("TEST_CODE benchmark payload"),
+            }],
             provenance: crate::grpc_client::envelope::AcquisitionProvenance::LocalWireSource(
                 "TEST_CODE benchmark provider".to_owned(),
             ),

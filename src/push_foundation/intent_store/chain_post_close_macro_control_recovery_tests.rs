@@ -76,7 +76,14 @@ pub(super) async fn reach_confirmed_health_checkpoint(
     external: &ExternalMtlsMacroFixture,
     owner: &str,
 ) -> ConfirmedHealthCheckpoint {
-    reach_confirmed_health_checkpoint_at_bundle(business, baseline, external, owner, external.bundle_path()).await
+    reach_confirmed_health_checkpoint_at_bundle(
+        business,
+        baseline,
+        external,
+        owner,
+        external.bundle_path(),
+    )
+    .await
 }
 
 pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
@@ -98,9 +105,7 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
     let earlier_facts = &baseline.facts;
     let baseline_audit = &baseline.audit;
     let database = business.database();
-    let macro_source = GrpcSource::from_external_macro_bundle_for_test(
-        bundle_path.to_path_buf(),
-    );
+    let macro_source = GrpcSource::from_external_macro_bundle_for_test(bundle_path.to_path_buf());
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let before_prepare = external.snapshot();
@@ -123,9 +128,7 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
     let search_service = macro_search_service(&registered);
     let inspect = || {
         let mut reader = BusinessIntentStore::open(&database).unwrap();
-        let mut read_local = reader
-            .single_user_local_chain_post_close(config)
-            .unwrap();
+        let mut read_local = reader.single_user_local_chain_post_close(config).unwrap();
         let recovery = read_local.inspect_macro(intent).unwrap();
         let run = read_local.inspect_run(intent).unwrap();
         let snapshot = (
@@ -146,12 +149,7 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
     let lease = local
         .resume_run(
             intent,
-            macro_lease(
-                owner,
-                started_at,
-                started_at + 2_000_000,
-                parent_head,
-            ),
+            macro_lease(owner, started_at, started_at + 2_000_000, parent_head),
         )
         .unwrap();
     let mut io = local
@@ -203,8 +201,7 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
             tokio::task::yield_now().await;
         }
 
-        let (health_pending, (pending_head, pending_generation, pending_context)) =
-            inspect();
+        let (health_pending, (pending_head, pending_generation, pending_context)) = inspect();
         assert!(!health_pending.is_complete());
         assert!(health_pending.has_unconfirmed_effect());
         assert!(health_pending.attempts().is_empty());
@@ -217,7 +214,12 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
         let plan = health_pending.plan();
         assert_eq!(plan.profile(), ContractProfile::ExternalV1);
         assert_eq!(plan.acquisition_authority(), Some(AUTHORITY));
-        assert_eq!(plan.endpoint(), crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(bundle_path).unwrap().endpoint_uri());
+        assert_eq!(
+            plan.endpoint(),
+            crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(bundle_path)
+                .unwrap()
+                .endpoint_uri()
+        );
         assert_eq!(plan.started_at().get(), started_at);
         assert_eq!(plan.deadline_at().get(), started_at + 15_000_000);
         assert_eq!(plan.observed_local(), STARTED_LOCAL);
@@ -278,7 +280,10 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
         let health_request = HealthRequest::decode(health_bytes.as_slice()).unwrap();
         assert_eq!(health_request.encode_to_vec(), health_bytes);
         assert_eq!(health_request.context.as_ref().unwrap().protocol_version, 1);
-        assert_eq!(health_request.context.as_ref().unwrap().request_id, health_id);
+        assert_eq!(
+            health_request.context.as_ref().unwrap().request_id,
+            health_id
+        );
         let capabilities_request =
             CapabilitiesRequest::decode(capabilities_bytes.as_slice()).unwrap();
         assert_eq!(capabilities_request.encode_to_vec(), capabilities_bytes);
@@ -327,14 +332,13 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
         }
         .encode_to_vec();
         external.release_health();
-        let checkpoint_deadline =
-            std::time::Instant::now() + Duration::from_secs(5);
+        let checkpoint_deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (health_result_version, health_ready_head) = loop {
             match futures::poll!(&mut prepared) {
                 std::task::Poll::Pending => {}
-                std::task::Poll::Ready(result) => panic!(
-                    "TEST_CODE Health-ready prepare returned before checkpoint: {result:?}"
-                ),
+                std::task::Poll::Ready(result) => {
+                    panic!("TEST_CODE Health-ready prepare returned before checkpoint: {result:?}")
+                }
             }
             let (recovery, (run_head, run_generation, run_context)) = inspect();
             let episode = &recovery.readiness_episodes()[0];
@@ -363,7 +367,10 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
                 assert_eq!(episode.ready_result_version(), None);
                 assert_eq!(controls[0].request_id(), health_id);
                 assert_eq!(controls[0].request_bytes(), health_bytes);
-                assert_eq!(controls[0].response_bytes(), Some(health_response_bytes.as_slice()));
+                assert_eq!(
+                    controls[0].response_bytes(),
+                    Some(health_response_bytes.as_slice())
+                );
                 assert_eq!(controls[1].request_id(), capabilities_id);
                 assert_eq!(controls[1].request_bytes(), capabilities_bytes);
                 assert_eq!(controls[1].result_version(), None);
@@ -422,7 +429,10 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
     };
     drop(io);
     assert_eq!(clock.observation_calls.get(), 1);
-    assert_eq!(local.inspect_run(intent).unwrap().head_version(), health_ready_head);
+    assert_eq!(
+        local.inspect_run(intent).unwrap().head_version(),
+        health_ready_head
+    );
     drop(local);
     assert_eq!(
         &old_fact_rows(business.connection(), earlier_tables),
@@ -458,7 +468,6 @@ pub(super) async fn reach_confirmed_health_checkpoint_at_bundle(
         raw,
     }
 }
-
 
 #[tokio::test]
 async fn single_user_external_macro_confirmed_health_reopens_and_continues_only_original_capabilities(

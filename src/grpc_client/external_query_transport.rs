@@ -4,9 +4,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
 };
 use http_body::{Frame, SizeHint};
 use prost::bytes::Buf as _;
-use prost::encoding::{
-    decode_key, decode_varint, skip_field, DecodeContext, WireType,
-};
+use prost::encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -56,9 +54,7 @@ impl ExternalQueryMethod {
 
     fn path(self) -> &'static str {
         match self {
-            Self::SecurityMetadata => {
-                "/magic.market.v1.MarketDataService/SecurityMetadata"
-            }
+            Self::SecurityMetadata => "/magic.market.v1.MarketDataService/SecurityMetadata",
             Self::GlobalNews => "/magic.market.v1.MarketDataService/GlobalNews",
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
             Self::CurrentAuctionObservations => {
@@ -73,11 +69,7 @@ impl ExternalQueryMethod {
         }
     }
 
-    fn matches_binding(
-        self,
-        path: &str,
-        grpc_method: Option<&tonic::GrpcMethod<'static>>,
-    ) -> bool {
+    fn matches_binding(self, path: &str, grpc_method: Option<&tonic::GrpcMethod<'static>>) -> bool {
         path == self.path()
             && grpc_method.is_some_and(|grpc_method| {
                 grpc_method.service() == Self::SERVICE
@@ -173,20 +165,39 @@ impl ExternalWireEvidenceV1 {
     }
 
     pub(crate) fn validate(&self, method: ExternalQueryMethod) -> Result<(), GrpcError> {
-        self.validate_bound(method, self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
-            && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
+        self.validate_bound(
+            method,
+            self.client_descriptor_sha256 == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+                && compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+        )
     }
 
     pub(crate) fn validate_historical(&self, method: ExternalQueryMethod) -> Result<(), GrpcError> {
-        self.validate_bound(method, crate::grpc_client::historical_external::accepts_descriptor(&self.client_descriptor_sha256))
+        self.validate_bound(
+            method,
+            crate::grpc_client::historical_external::accepts_descriptor(
+                &self.client_descriptor_sha256,
+            ),
+        )
     }
 
-    pub(crate) fn validate_descriptor(&self, method: ExternalQueryMethod, descriptor: &str) -> Result<(), GrpcError> {
-        self.validate_bound(method, self.client_descriptor_sha256 == descriptor
-            && super::external_decoder::ExternalDecoder::for_descriptor(descriptor).is_ok())
+    pub(crate) fn validate_descriptor(
+        &self,
+        method: ExternalQueryMethod,
+        descriptor: &str,
+    ) -> Result<(), GrpcError> {
+        self.validate_bound(
+            method,
+            self.client_descriptor_sha256 == descriptor
+                && super::external_decoder::ExternalDecoder::for_descriptor(descriptor).is_ok(),
+        )
     }
 
-    fn validate_bound(&self, method: ExternalQueryMethod, descriptor_valid: bool) -> Result<(), GrpcError> {
+    fn validate_bound(
+        &self,
+        method: ExternalQueryMethod,
+        descriptor_valid: bool,
+    ) -> Result<(), GrpcError> {
         if self.material != EXTERNAL_WIRE_MATERIAL
             || self.profile != "ExternalV1"
             || self.method != method
@@ -274,11 +285,22 @@ impl ExternalQueryTransport {
     }
 
     pub(crate) async fn call_with_descriptor(
-        &mut self, method: ExternalQueryMethod, mut request: tonic::Request<QueryRequest>, descriptor: &str,
+        &mut self,
+        method: ExternalQueryMethod,
+        mut request: tonic::Request<QueryRequest>,
+        descriptor: &str,
     ) -> ExternalQueryCall {
         if let Err(error) = super::external_decoder::ExternalDecoder::for_descriptor(descriptor)
-            .and_then(|decoder| decoder.query_request(&prost::Message::encode_to_vec(request.get_ref()))) {
-            let mut evidence = ExternalWireEvidenceV1::new(method, ExternalWireMaterialV1::Missing { framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES });
+            .and_then(|decoder| {
+                decoder.query_request(&prost::Message::encode_to_vec(request.get_ref()))
+            })
+        {
+            let mut evidence = ExternalWireEvidenceV1::new(
+                method,
+                ExternalWireMaterialV1::Missing {
+                    framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+                },
+            );
             evidence.client_descriptor_sha256 = descriptor.to_owned();
             return ExternalQueryCall::LocalWireFailure { error, evidence };
         }
@@ -298,7 +320,10 @@ impl ExternalQueryTransport {
                 self.client.economic_release_schedule(request).await
             }
         };
-        let bind = |mut evidence: ExternalWireEvidenceV1| { evidence.client_descriptor_sha256 = descriptor.to_owned(); evidence };
+        let bind = |mut evidence: ExternalWireEvidenceV1| {
+            evidence.client_descriptor_sha256 = descriptor.to_owned();
+            evidence
+        };
         match response {
             Err(status) => ExternalQueryCall::UnaryStatus {
                 status,
@@ -309,14 +334,21 @@ impl ExternalQueryTransport {
                     let evidence = bind(evidence);
                     let _ = response;
                     match super::external_decoder::ExternalDecoder::for_descriptor(descriptor)
-                        .and_then(|decoder| decoder.query(evidence.payload().ok_or_else(|| wire_error("external_response_wire_invalid"))?)) {
+                        .and_then(|decoder| {
+                            decoder.query(
+                                evidence
+                                    .payload()
+                                    .ok_or_else(|| wire_error("external_response_wire_invalid"))?,
+                            )
+                        }) {
                         Ok(message) => ExternalQueryCall::Response { message, evidence },
                         Err(error) => ExternalQueryCall::LocalWireFailure { error, evidence },
                     }
                 }
-                Err((error, evidence)) => {
-                    ExternalQueryCall::LocalWireFailure { error, evidence: bind(evidence) }
-                }
+                Err((error, evidence)) => ExternalQueryCall::LocalWireFailure {
+                    error,
+                    evidence: bind(evidence),
+                },
             },
         }
     }
@@ -352,11 +384,8 @@ impl std::error::Error for CapturedExternalChannelError {
 impl Service<http::Request<Body>> for CapturedExternalChannel {
     type Response = http::Response<Body>;
     type Error = CapturedExternalChannelError;
-    type Future = Pin<
-        Box<
-            dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static,
-        >,
-    >;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.0
@@ -371,9 +400,7 @@ impl Service<http::Request<Body>> for CapturedExternalChannel {
         };
         if !capture.method.matches_binding(
             request.uri().path(),
-            request
-                .extensions()
-                .get::<tonic::GrpcMethod<'static>>(),
+            request.extensions().get::<tonic::GrpcMethod<'static>>(),
         ) {
             return Box::pin(async { Err(CapturedExternalChannelError::Binding) });
         }
@@ -515,9 +542,7 @@ impl http_body::Body for CapturedBody {
     }
 }
 
-fn parse_uncompressed_unary_frame(
-    bytes: &[u8],
-) -> Result<&[u8], ExternalFrameFailureV1> {
+fn parse_uncompressed_unary_frame(bytes: &[u8]) -> Result<&[u8], ExternalFrameFailureV1> {
     if bytes.len() < 5 {
         return Err(ExternalFrameFailureV1::HeaderTruncated);
     }
@@ -558,8 +583,8 @@ pub(crate) fn compiled_descriptor_sha256() -> String {
 pub(crate) fn admit_external_payload(payload: &[u8]) -> Result<(), GrpcError> {
     let mut remaining = payload;
     while remaining.has_remaining() {
-        let (field, wire) = decode_key(&mut remaining)
-            .map_err(|_| wire_error("external_response_wire_invalid"))?;
+        let (field, wire) =
+            decode_key(&mut remaining).map_err(|_| wire_error("external_response_wire_invalid"))?;
         if field == 11 {
             if wire != WireType::LengthDelimited {
                 return Err(wire_error("external_response_wire_invalid"));

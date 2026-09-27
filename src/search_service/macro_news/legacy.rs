@@ -13,7 +13,6 @@ use crate::data_gateway::grpc_source::{
     GrpcSource,
 };
 use crate::data_gateway::{GatewayError, GlobalNewsProvider};
-use crate::market_domain::ProviderId;
 use crate::grpc_client::client::{
     external_control_attempt::ExternalControlCompletion,
     macro_attempt::{
@@ -23,6 +22,7 @@ use crate::grpc_client::client::{
     ContractProfile,
 };
 use crate::grpc_client::external_pb::magic::market::v1::{CapabilitiesResponse, HealthResponse};
+use crate::market_domain::ProviderId;
 use crate::search_service::{service::RegisteredProvider, SearchResponse, SearchService};
 use futures::{future::BoxFuture, FutureExt};
 use std::{
@@ -312,16 +312,15 @@ impl<'providers> MacroStepIo for Legacy<'providers> {
                         }
                     });
                 match attempt {
-                    Ok(attempt) => {
-                        async move {
-                            Ok(match attempt.execute().await {
-                                Ok(completion) => Material::Capabilities(completion),
-                                Err(error) => Material::External(Err(
-                                    grpc_source::map_external_connection_error(error),
-                                )),
-                            })
-                        }.boxed()
+                    Ok(attempt) => async move {
+                        Ok(match attempt.execute().await {
+                            Ok(completion) => Material::Capabilities(completion),
+                            Err(error) => Material::External(Err(
+                                grpc_source::map_external_connection_error(error),
+                            )),
+                        })
                     }
+                    .boxed(),
                     Err(error) => {
                         let error = grpc_source::map_external_connection_error(error);
                         async move { Ok(Material::External(Err(error))) }.boxed()

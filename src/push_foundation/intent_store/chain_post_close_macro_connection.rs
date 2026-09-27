@@ -258,23 +258,28 @@ pub(super) fn load(
                 let raw: codec::ControlRawResult = codec::decode(&raw_bytes)?;
                 raw.validate_connection_binding(&value.identity, None)?;
                 let qualified = raw.project(&begin.request)?.is_ok();
-                let policy_qualified = raw
-                    .response_bytes()
-                    .and_then(|bytes| crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(&value.identity.descriptor_sha256).and_then(|decoder| decoder.health(bytes)).ok())
-                    .is_some_and(|response| {
-                        crate::grpc_client::build_identity::BuildIdentityTrust::bundled().is_ok_and(
-                            |trust| {
-                                response.request_id == begin.request.request_id()
-                                    && trust
-                                        .recorded_health(
-                                            &value.identity.policy_sha256,
-                                            &value.identity.descriptor_sha256,
-                                            &response,
-                                        )
-                                        .is_ok()
-                            },
-                        )
-                    });
+                let policy_qualified =
+                    raw.response_bytes()
+                        .and_then(|bytes| {
+                            crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(
+                                &value.identity.descriptor_sha256,
+                            )
+                            .and_then(|decoder| decoder.health(bytes))
+                            .ok()
+                        })
+                        .is_some_and(|response| {
+                            crate::grpc_client::build_identity::BuildIdentityTrust::bundled()
+                                .is_ok_and(|trust| {
+                                    response.request_id == begin.request.request_id()
+                                        && trust
+                                            .recorded_health(
+                                                &value.identity.policy_sha256,
+                                                &value.identity.descriptor_sha256,
+                                                &response,
+                                            )
+                                            .is_ok()
+                                })
+                        });
                 require(qualified == value.qualified && qualified == policy_qualified)?;
                 if let Some(bytes) = raw.response_bytes() {
                     require(
@@ -471,7 +476,12 @@ pub(super) fn load(
                         params![intent.as_str(),value.effect_begin_version,data.request_plan_version,raw_digest(&data.request.bytes).as_str(),phase,item,candidate,data.attempt,fact.owner,fact.generation,fact.time],
                         |row| row.get(0),
                     ).map_err(|_| ChainPostCloseError::SchemaRejected)?;
-                    require(recovered.data_connections.insert(value.effect_begin_version, value.identity.clone()).is_none())?;
+                    require(
+                        recovered
+                            .data_connections
+                            .insert(value.effect_begin_version, value.identity.clone())
+                            .is_none(),
+                    )?;
                     require(
                         paired == 1
                             && recovered

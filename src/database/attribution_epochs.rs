@@ -2526,7 +2526,9 @@ pub fn reconstruct_epoch_daily(
             target_date,
             &carry,
         )
-        .map_err(|detail| failed_integrity(format!("BR-255 reconstruction fill scoping: {detail}")))?;
+        .map_err(|detail| {
+            failed_integrity(format!("BR-255 reconstruction fill scoping: {detail}"))
+        })?;
         let rows = scoped
             .attributable
             .iter()
@@ -2542,15 +2544,21 @@ pub fn reconstruct_epoch_daily(
             })
             .collect::<Vec<_>>();
         let (attributions, open) = crate::performance::attribution::fifo_match(&rows, target_date)
-            .map_err(|detail| failed_integrity(format!("BR-255 reconstruction FIFO match: {detail}")))?;
-        let families = crate::performance::attribution::aggregate_families(&attributions, &open, prices);
+            .map_err(|detail| {
+                failed_integrity(format!("BR-255 reconstruction FIFO match: {detail}"))
+            })?;
+        let families =
+            crate::performance::attribution::aggregate_families(&attributions, &open, prices);
         let daily = DailyAttribution {
             date: target_date,
             families,
             top_trades: crate::performance::attribution::top_trades(&attributions),
         };
-        let window = crate::performance::attribution::aggregate_window(target_date, 30, &rows, prices)
-            .map_err(|detail| failed_integrity(format!("BR-255 reconstruction window: {detail}")))?;
+        let window =
+            crate::performance::attribution::aggregate_window(target_date, 30, &rows, prices)
+                .map_err(|detail| {
+                    failed_integrity(format!("BR-255 reconstruction window: {detail}"))
+                })?;
         Ok((daily, window))
     })
 }
@@ -2949,14 +2957,28 @@ fn verified_epoch_retained_carry(
 
 /// Economic callers without a PaperLedger scope must not silently read raw fills.
 /// Raw audit/prefix verification deliberately does not call this guard.
-pub(crate) fn require_explicit_paper_scope_if_bound(conn: &mut SqliteConnection) -> Result<(), AttributionEpochStoreError> {
-    let declared=diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_user_version WHERE user_version NOT IN (0,1)").get_result::<CountRow>(conn)?;
-    if declared.count>0 {
+pub(crate) fn require_explicit_paper_scope_if_bound(
+    conn: &mut SqliteConnection,
+) -> Result<(), AttributionEpochStoreError> {
+    let declared = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM pragma_user_version WHERE user_version NOT IN (0,1)",
+    )
+    .get_result::<CountRow>(conn)?;
+    if declared.count > 0 {
         return Err(AttributionEpochStoreError::Unavailable{reason_code:"paper_scope_required",retryable:false,detail:"extended or unknown catalog requires explicit verified paper scope; no implicit legacy fallback".into()});
     }
     let exists=diesel::sql_query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='paper_ledger_account'").get_result::<CountRow>(conn)?;
-    if exists.count>0 && diesel::sql_query("SELECT COUNT(*) AS count FROM paper_ledger_account").get_result::<CountRow>(conn)?.count>0 {
-        return Err(AttributionEpochStoreError::Unavailable {reason_code:"paper_scope_required",retryable:false,detail:"bound PaperLedger requires explicit economic scope/history".into()});
+    if exists.count > 0
+        && diesel::sql_query("SELECT COUNT(*) AS count FROM paper_ledger_account")
+            .get_result::<CountRow>(conn)?
+            .count
+            > 0
+    {
+        return Err(AttributionEpochStoreError::Unavailable {
+            reason_code: "paper_scope_required",
+            retryable: false,
+            detail: "bound PaperLedger requires explicit economic scope/history".into(),
+        });
     }
     Ok(())
 }
@@ -2977,8 +2999,12 @@ pub(crate) fn load_verified_legacy_prefix(
     paper_high_water: i64,
     audit_high_water: i64,
 ) -> Result<VerifiedEpochFillSet, AttributionEpochStoreError> {
-    load_verified_epoch_fills_with_limits(conn, &ResolvedAttributionEpoch::Legacy, NaiveDate::MAX,
-        Some((paper_high_water, audit_high_water)))
+    load_verified_epoch_fills_with_limits(
+        conn,
+        &ResolvedAttributionEpoch::Legacy,
+        NaiveDate::MAX,
+        Some((paper_high_water, audit_high_water)),
+    )
 }
 
 fn load_verified_epoch_fills_with_limits(
@@ -4260,9 +4286,7 @@ mod tests {
             requested_price: 10.0,
             execution_price: Some(10.0),
             quantity: 100,
-            quote_observed_at: Some(
-                "2026-08-28T10:05:00+08:00".to_owned(),
-            ),
+            quote_observed_at: Some("2026-08-28T10:05:00+08:00".to_owned()),
             outcome: "Filled".to_owned(),
             failure_reason: None,
             created_at: "2026-08-28 10:05:00".to_owned(),
@@ -4288,12 +4312,11 @@ mod tests {
         .bind::<Text, _>(&orphan_audit.created_at)
         .execute(&mut conn)
         .unwrap();
-        let orphan_hash =
-            crate::database::order_audit::canonical_order_audit_record_hash(
-                &previous,
-                &orphan_audit,
-            )
-            .expect("TEST_CODE chain hash");
+        let orphan_hash = crate::database::order_audit::canonical_order_audit_record_hash(
+            &previous,
+            &orphan_audit,
+        )
+        .expect("TEST_CODE chain hash");
         diesel::sql_query(
             "INSERT INTO order_audit_chain
              (order_audit_id,previous_hash,record_hash,created_at) VALUES (?,?,?,?)",

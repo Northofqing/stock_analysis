@@ -30,6 +30,7 @@ pub mod market_capabilities;
 pub mod market_data;
 pub mod outcome_daily_bars;
 pub mod position_chain;
+pub mod qualified_trading_facts;
 pub mod research;
 pub mod review;
 pub mod security_lifecycle;
@@ -103,12 +104,23 @@ pub use market_capabilities::{
     MarketOrderBook, MarketSecurityMetadata, SecurityBoard, METADATA_PROVIDER_ORDER,
     MINUTE_PROVIDER_ORDER, MONEY_FLOW_PROVIDER_ORDER, ORDER_BOOK_PROVIDER_ORDER,
 };
-pub use market_data::{MarketDataGateway, RealtimeMarketQuote};
+pub use market_data::{
+    MarketDataGateway, QuoteCoverageDisposition, QuoteRecordRejection, RealtimeMarketQuote,
+    RealtimeQuoteCoverage,
+};
 pub use outcome_daily_bars::{AdmittedOutcomeDailyBars, OutcomeDailyBarsGateway};
 pub use position_chain::{
     acquire_candidate_position_chain, derive_position_chain, refresh_position_chains,
     CanonicalPositionMembership, PositionChainAssignment, PositionChainRefreshOutcome,
     PositionChainRefreshReport, PositionChainRefreshStatus,
+};
+pub use qualified_trading_facts::{
+    AuthorityLifecycle, AuthoritySuspensionCoverage, QualifiedFact, QualifiedListingStatus,
+    QualifiedPriceBand, QualifiedPriceError, QualifiedSuspensionEvidence,
+    QualifiedSuspensionEvidenceError, QualifiedSuspensionStatus, QualifiedTradingFacts,
+    QualifiedTradingFactsError, QualifiedTradingFactsGateway, QualifiedTradingFactsRequest,
+    SuspensionWindow, TradingFactField, TradingFactUnavailable, TradingFactUnavailableReason,
+    QUALIFIED_TRADING_FACTS_CONTRACT_V1,
 };
 pub use research::{ResearchDataGateway, ResearchReportFact};
 pub use review::{

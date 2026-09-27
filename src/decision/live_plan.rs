@@ -299,7 +299,10 @@ mod tests {
         assert!(!r.is_executable());
         if let LivePlanResult::Advice(a) = r {
             let reason = a.downgrade_reason.unwrap();
-            assert!(!reason.contains("Gate"), "2026-09-22 决策: Gate 不再 deny, reason={reason}");
+            assert!(
+                !reason.contains("Gate"),
+                "2026-09-22 决策: Gate 不再 deny, reason={reason}"
+            );
             assert!(reason.contains("Unsafe"));
             assert!(reason.contains("无股可卖"));
         }

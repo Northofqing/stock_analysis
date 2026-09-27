@@ -182,8 +182,7 @@ pub fn pre_trade_check(
             ));
         }
 
-        let projected_position_value =
-            current_position_pct / 100.0 * total_value + order_notional;
+        let projected_position_value = current_position_pct / 100.0 * total_value + order_notional;
         // Concentration is measured against the same pre-trade account basis
         // supplied by the ledger. Commission is charged to projected cash;
         // it must not turn an exact 10% position into an artificial breach.

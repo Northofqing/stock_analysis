@@ -50,16 +50,27 @@ pub(crate) struct QueryTerminalRecovery {
     pub(super) cause: native::TerminalCause,
 }
 impl QueryTerminalRecovery {
-    pub(crate) fn owner(&self) -> &str { &self.owner }
-    pub(crate) fn generation(&self) -> u64 { self.generation }
-    pub(crate) fn request_version(&self) -> Option<u64> { self.request_version }
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn request_version(&self) -> Option<u64> {
+        self.request_version
+    }
     pub(crate) fn historical_rejection(&self) -> Option<HistoricalRejectionLink<'_>> {
         match &self.cause {
             native::TerminalCause::HistoricalControlRejected {
-                control_result_version, control_result_sha256, source_final_version, source_final_sha256,
+                control_result_version,
+                control_result_sha256,
+                source_final_version,
+                source_final_sha256,
             } => Some(HistoricalRejectionLink {
-                control_result_version: *control_result_version, control_result_sha256,
-                source_final_version: *source_final_version, source_final_sha256,
+                control_result_version: *control_result_version,
+                control_result_sha256,
+                source_final_version: *source_final_version,
+                source_final_sha256,
             }),
             _ => None,
         }
@@ -99,12 +110,24 @@ pub(crate) struct HistoricalFact {
     fact: Fact,
 }
 impl HistoricalFact {
-    pub(crate) fn bytes(&self) -> &[u8] { &self.fact.bytes }
-    pub(crate) fn sha256(&self) -> &str { &self.fact.digest }
-    pub(crate) fn version(&self) -> u64 { self.fact.version }
-    pub(crate) fn recorded_at(&self) -> i64 { self.fact.time }
-    pub(crate) fn owner(&self) -> &str { &self.fact.owner }
-    pub(crate) fn generation(&self) -> u64 { self.fact.generation }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.fact.bytes
+    }
+    pub(crate) fn sha256(&self) -> &str {
+        &self.fact.digest
+    }
+    pub(crate) fn version(&self) -> u64 {
+        self.fact.version
+    }
+    pub(crate) fn recorded_at(&self) -> i64 {
+        self.fact.time
+    }
+    pub(crate) fn owner(&self) -> &str {
+        &self.fact.owner
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.fact.generation
+    }
 }
 pub(crate) struct HistoricalRejectionOrigin {
     control: HistoricalFact,
@@ -112,8 +135,12 @@ pub(crate) struct HistoricalRejectionOrigin {
     pub(super) error: crate::data_gateway::GatewayError,
 }
 impl HistoricalRejectionOrigin {
-    pub(crate) fn control(&self) -> &HistoricalFact { &self.control }
-    pub(crate) fn source(&self) -> &HistoricalFact { &self.source }
+    pub(crate) fn control(&self) -> &HistoricalFact {
+        &self.control
+    }
+    pub(crate) fn source(&self) -> &HistoricalFact {
+        &self.source
+    }
     pub(super) fn cause(&self) -> native::TerminalCause {
         native::TerminalCause::HistoricalControlRejected {
             control_result_version: self.control.version(),
@@ -308,8 +335,11 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
             // One frozen request with no full-stage facts is the old single
             // source contract, even when it recorded a Local observation.
             // A layout migration must not broaden its execution scope.
-            if layout >= 15 && groups[1].len() == 1 && groups[8..].iter().all(Vec::is_empty)
-                && groups[5].len() == legacy.attempts.len() {
+            if layout >= 15
+                && groups[1].len() == 1
+                && groups[8..].iter().all(Vec::is_empty)
+                && groups[5].len() == legacy.attempts.len()
+            {
                 return Ok(Some(legacy));
             }
             let local = match plan3::legacy_local_route(&legacy.plan) {
@@ -349,7 +379,9 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
     bound(&fact, plan)?;
     let connection_history = if layout >= 15 {
         super::macro_connection::load(transaction, intent, run, plan, fact.version, &fact.digest)?
-    } else { super::macro_connection::Recovery::default() };
+    } else {
+        super::macro_connection::Recovery::default()
+    };
     recovery.qualification_pending = connection_history.pending.clone();
     let mut requests = BTreeMap::new();
     for request_fact in std::mem::take(&mut groups[1]) {
@@ -507,7 +539,9 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
         } else {
             require(extra.6.is_none())?;
         }
-        let provider_catalog = connection_history.data_catalogs.get(&begin.version)
+        let provider_catalog = connection_history
+            .data_catalogs
+            .get(&begin.version)
             .or_else(|| old::historical_provider_catalog(&recovery.readiness_episodes, extra.6));
         let mut attempt = MacroAttemptRecovery {
             query: decoded.query,
@@ -527,7 +561,9 @@ pub(super) fn load_on<'transaction, 'connection, 'run>(
                 params![intent.as_str(),result.version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))
                 .map_err(|_| storage("full macro result"))?;
             let data: native::DataResult = codec::decode(&result.bytes)?;
-            data.raw.validate_current_connection(connection_history.data_connections.get(&begin.version))?;
+            data.raw.validate_current_connection(
+                connection_history.data_connections.get(&begin.version),
+            )?;
             require(
                 key(&extra.0, extra.1, extra.2)? == decoded.query
                     && data.query == decoded.query
@@ -640,17 +676,35 @@ fn finish_recovery(
     let mut terminals = BTreeMap::new();
     let historical_rejection = if !is_v3 && recovery.source.is_some() && rejected.is_some() {
         require(plan.format_version() == 2 && definition.external_news)?;
-        require(!recovery.attempts.iter().any(|attempt|
-            matches!(attempt.query, QueryKey::Gateway(1..=4))))?;
-        let (version, error) = rejected.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
-        let control = groups[4].iter().find(|fact| fact.version == *version)
+        require(
+            !recovery
+                .attempts
+                .iter()
+                .any(|attempt| matches!(attempt.query, QueryKey::Gateway(1..=4))),
+        )?;
+        let (version, error) = rejected
+            .as_ref()
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        let source = groups[7].first().ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(source.prior == control.version && source.owner == control.owner
-            && source.generation == control.generation && source.time == control.time)?;
+        let control = groups[4]
+            .iter()
+            .find(|fact| fact.version == *version)
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        let source = groups[7]
+            .first()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(
+            source.prior == control.version
+                && source.owner == control.owner
+                && source.generation == control.generation
+                && source.time == control.time,
+        )?;
         Some(HistoricalRejectionOrigin {
-            control: HistoricalFact { fact: control.clone() },
-            source: HistoricalFact { fact: source.clone() },
+            control: HistoricalFact {
+                fact: control.clone(),
+            },
+            source: HistoricalFact {
+                fact: source.clone(),
+            },
             error: error.clone(),
         })
     } else {
@@ -691,17 +745,13 @@ fn finish_recovery(
             },
         );
     }
-    for (fact, table) in groups[8]
-        .iter()
-        .map(|fact| (fact, TABLES[0]))
-        .chain(
-            groups
-                .get(12)
-                .into_iter()
-                .flatten()
-                .map(|fact| (fact, RETIRED_TABLE)),
-        )
-    {
+    for (fact, table) in groups[8].iter().map(|fact| (fact, TABLES[0])).chain(
+        groups
+            .get(12)
+            .into_iter()
+            .flatten()
+            .map(|fact| (fact, RETIRED_TABLE)),
+    ) {
         bound(fact, plan)?;
         let value: native::QueryTerminal = codec::decode(&fact.bytes)?;
         require(
@@ -795,20 +845,27 @@ fn finish_recovery(
                 NativeOutcome::News(Err(error.clone()))
             }
             native::TerminalCause::HistoricalControlRejected {
-                control_result_version, ref control_result_sha256,
-                source_final_version, ref source_final_sha256,
+                control_result_version,
+                ref control_result_sha256,
+                source_final_version,
+                ref source_final_sha256,
             } => {
-                let origin = historical_rejection.as_ref()
+                let origin = historical_rejection
+                    .as_ref()
                     .ok_or(ChainPostCloseError::SchemaRejected)?;
-                require(matches!(value.query, QueryKey::Gateway(2..=4))
-                    && control_result_version == origin.control.version()
-                    && control_result_sha256 == origin.control.sha256()
-                    && source_final_version == origin.source.version()
-                    && source_final_sha256 == origin.source.sha256()
-                    && extra.7 == "HistoricalControlRejected"
-                    && extra.8.is_none() && extra.9 == Some(control_result_version)
-                    && extra.10 == "NotCalled" && fact.prior >= source_final_version
-                    && fact.time >= origin.source.recorded_at())?;
+                require(
+                    matches!(value.query, QueryKey::Gateway(2..=4))
+                        && control_result_version == origin.control.version()
+                        && control_result_sha256 == origin.control.sha256()
+                        && source_final_version == origin.source.version()
+                        && source_final_sha256 == origin.source.sha256()
+                        && extra.7 == "HistoricalControlRejected"
+                        && extra.8.is_none()
+                        && extra.9 == Some(control_result_version)
+                        && extra.10 == "NotCalled"
+                        && fact.prior >= source_final_version
+                        && fact.time >= origin.source.recorded_at(),
+                )?;
                 NativeOutcome::News(Err(origin.error.clone()))
             }
             native::TerminalCause::RequestRejected => {
@@ -859,7 +916,9 @@ fn finish_recovery(
             (retired
                 || (extra.5 == request.map(|request| request.fact.version)
                     && extra.6
-                        == request.map(|request| raw_digest(&request.request.bytes).as_str().to_owned())))
+                        == request.map(|request| {
+                            raw_digest(&request.request.bytes).as_str().to_owned()
+                        })))
                 && native::native_bytes(&outcome)? == extra.11,
         )?;
         let receipt = if matches!(value.query, QueryKey::Gateway(_)) {
@@ -1010,7 +1069,11 @@ fn finish_recovery(
                 .map(|fact| (fact.version, fact.digest.clone())),
         )
         .collect::<Vec<_>>();
-    digest_material.extend(connection_facts.into_iter().map(|fact| (fact.version, fact.digest)));
+    digest_material.extend(
+        connection_facts
+            .into_iter()
+            .map(|fact| (fact.version, fact.digest)),
+    );
     digest_material.sort_by_key(|(version, _)| *version);
     require(digest_material.windows(2).all(|pair| pair[0].0 < pair[1].0))?;
     let facts_sha256 = raw_digest(&codec::encode(&digest_material)?)
@@ -1159,44 +1222,75 @@ fn validate_historical_group(
     terminals: &BTreeMap<QueryKey, QueryTerminalRecovery>,
     terminal_facts: &[Fact],
 ) -> Result<()> {
-    let any = (2..=4).any(|ordinal| requests.contains_key(&QueryKey::Gateway(ordinal))
-        || terminals.contains_key(&QueryKey::Gateway(ordinal)));
+    let any = (2..=4).any(|ordinal| {
+        requests.contains_key(&QueryKey::Gateway(ordinal))
+            || terminals.contains_key(&QueryKey::Gateway(ordinal))
+    });
     if !any {
         return Ok(()); // The original prefix may separately have E or a budget final.
     }
     let mut facts = Vec::with_capacity(6);
     for ordinal in 2..=4 {
-        let request = requests.get(&QueryKey::Gateway(ordinal))
+        let request = requests
+            .get(&QueryKey::Gateway(ordinal))
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(request.endpoint == plan.endpoint() && request.request.profile == plan.request.profile
-            && request.request.authority == plan.request.authority && request.request.policy == plan.request.policy)?;
+        require(
+            request.endpoint == plan.endpoint()
+                && request.request.profile == plan.request.profile
+                && request.request.authority == plan.request.authority
+                && request.request.policy == plan.request.policy,
+        )?;
         facts.push(&request.fact);
     }
     let mut audit_ids = BTreeSet::new();
     for ordinal in 2..=4 {
         let key = QueryKey::Gateway(ordinal);
-        let terminal = terminals.get(&key).ok_or(ChainPostCloseError::SchemaRejected)?;
-        let link = terminal.historical_rejection().ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(link.control_result_version == origin.control.version()
-            && link.control_result_sha256 == origin.control.sha256()
-            && link.source_final_version == origin.source.version()
-            && link.source_final_sha256 == origin.source.sha256()
-            && terminal.request_version == Some(facts[usize::from(ordinal - 2)].version))?;
-        require(audit_ids.insert(terminal.receipt.as_ref()
-            .ok_or(ChainPostCloseError::SchemaRejected)?.audit_id))?;
-        facts.push(terminal_facts.iter().find(|fact| fact.version == terminal.version)
-            .ok_or(ChainPostCloseError::SchemaRejected)?);
+        let terminal = terminals
+            .get(&key)
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        let link = terminal
+            .historical_rejection()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(
+            link.control_result_version == origin.control.version()
+                && link.control_result_sha256 == origin.control.sha256()
+                && link.source_final_version == origin.source.version()
+                && link.source_final_sha256 == origin.source.sha256()
+                && terminal.request_version == Some(facts[usize::from(ordinal - 2)].version),
+        )?;
+        require(
+            audit_ids.insert(
+                terminal
+                    .receipt
+                    .as_ref()
+                    .ok_or(ChainPostCloseError::SchemaRejected)?
+                    .audit_id,
+            ),
+        )?;
+        facts.push(
+            terminal_facts
+                .iter()
+                .find(|fact| fact.version == terminal.version)
+                .ok_or(ChainPostCloseError::SchemaRejected)?,
+        );
     }
     let first = facts[0];
     require(first.prior >= origin.source.version() && first.time >= origin.source.recorded_at())?;
     for (index, fact) in facts.iter().enumerate() {
-        let prior = first.prior.checked_add(u64::try_from(index)
-            .map_err(|_| ChainPostCloseError::SchemaRejected)?)
+        let prior = first
+            .prior
+            .checked_add(u64::try_from(index).map_err(|_| ChainPostCloseError::SchemaRejected)?)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(fact.prior == prior && fact.version == prior.checked_add(1)
-            .ok_or(ChainPostCloseError::SchemaRejected)?
-            && fact.owner == first.owner && fact.generation == first.generation
-            && fact.time == first.time)?;
+        require(
+            fact.prior == prior
+                && fact.version
+                    == prior
+                        .checked_add(1)
+                        .ok_or(ChainPostCloseError::SchemaRejected)?
+                && fact.owner == first.owner
+                && fact.generation == first.generation
+                && fact.time == first.time,
+        )?;
     }
     Ok(())
 }

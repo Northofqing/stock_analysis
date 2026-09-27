@@ -18,7 +18,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[path = "attribution_effective.rs"]
 mod effective;
-pub use effective::{commit_effective_window, compute_effective_attribution, EffectiveAttributionRunner, EffectiveAttributionReport, EffectiveCycleAttribution, PreparedEffectiveAttributionReport};
+pub use effective::{
+    commit_effective_window, compute_effective_attribution, EffectiveAttributionReport,
+    EffectiveAttributionRunner, EffectiveCycleAttribution, PreparedEffectiveAttributionReport,
+};
 
 use super::attribution::SignalFamily;
 use super::attribution_epoch::{
@@ -1054,11 +1057,18 @@ fn update_canonical_replay_fill(hasher: &mut Sha256, evidence: &ReplayFillEviden
             hasher.update(audit_id.to_be_bytes());
             update_len_prefixed(
                 hasher,
-                evidence.terminal_audit_hash.as_deref().unwrap_or_default().as_bytes(),
+                evidence
+                    .terminal_audit_hash
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
             );
             update_optional_text(
                 hasher,
-                evidence.terminal_time.map(|time| time.to_rfc3339()).as_deref(),
+                evidence
+                    .terminal_time
+                    .map(|time| time.to_rfc3339())
+                    .as_deref(),
             );
         }
         // 前审计时代 legacy fill: 无 terminal 证据, 显式 marker 防证据交换。
@@ -1364,10 +1374,11 @@ impl AttributionReplayLoader {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| source_read_error("begin one read transaction", error))
             .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
-        let generation:i64=transaction.query_row("PRAGMA user_version",[],|row|row.get(0))
-            .map_err(|error|source_read_error("check paper generation",error))
-            .map_err(|error|progress.failure(error,AttributionReplayLoadStage::Trade,None))?;
-        if !matches!(generation,0|1) {
+        let generation: i64 = transaction
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| source_read_error("check paper generation", error))
+            .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+        if !matches!(generation, 0 | 1) {
             return Err(progress.failure(AttributionReplayError::unavailable(
                 AttributionUnavailable::PaperScopeRequired,false,
                 "extended or unknown catalog requires explicit verified paper scope; no implicit legacy fallback",
@@ -1379,10 +1390,16 @@ impl AttributionReplayLoader {
         ).map_err(|error| source_read_error("check paper scope", error))
             .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
         if has_paper_account_table {
-            let bound: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM paper_ledger_account)", [], |row| row.get(0),
-            ).map_err(|error| source_read_error("check paper binding", error))
-                .map_err(|error| progress.failure(error, AttributionReplayLoadStage::Trade, None))?;
+            let bound: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM paper_ledger_account)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| source_read_error("check paper binding", error))
+                .map_err(|error| {
+                    progress.failure(error, AttributionReplayLoadStage::Trade, None)
+                })?;
             if bound {
                 return Err(progress.failure(AttributionReplayError::unavailable(
                     AttributionUnavailable::PaperScopeRequired, false,
@@ -2961,26 +2978,28 @@ fn exact_cycle_anchor(
     }
     // 前审计时代 legacy fill: 无 audit quote 时间, 以 paper fill 时间锚定
     // (审计时代 quote 与 fill ≤5s, 时间锚同义)。
-    let occurred_at = parse_paper_fill_timestamp(fill_id, &evidence.fill.occurred_at).map_err(
-        |detail| {
+    let occurred_at =
+        parse_paper_fill_timestamp(fill_id, &evidence.fill.occurred_at).map_err(|detail| {
             AttributionReplayError::integrity(
                 AttributionIntegrityFailure::ReplayEvidence,
                 format!("economic cycle legacy fill id={fill_id} timestamp invalid: {detail}"),
             )
-        },
-    )?;
+        })?;
     let shanghai = FixedOffset::east_opt(8 * 60 * 60).ok_or_else(|| {
         AttributionReplayError::integrity(
             AttributionIntegrityFailure::ReplayEvidence,
             "Shanghai fixed offset is unavailable",
         )
     })?;
-    occurred_at.and_local_timezone(shanghai).earliest().ok_or_else(|| {
-        AttributionReplayError::integrity(
-            AttributionIntegrityFailure::ReplayEvidence,
-            format!("economic cycle legacy fill id={fill_id} Shanghai mapping failed"),
-        )
-    })
+    occurred_at
+        .and_local_timezone(shanghai)
+        .earliest()
+        .ok_or_else(|| {
+            AttributionReplayError::integrity(
+                AttributionIntegrityFailure::ReplayEvidence,
+                format!("economic cycle legacy fill id={fill_id} Shanghai mapping failed"),
+            )
+        })
 }
 
 fn research_limitations() -> Vec<String> {
@@ -4810,14 +4829,26 @@ fn load_runner_benchmarks(
     supplied: &[BenchmarkDayManifest],
     summary: &mut FailureEvidenceSummary,
 ) -> Result<(Vec<BenchmarkBar>, String, Vec<BenchmarkDayManifest>), ReplayError> {
-    let mut required = calendar.required_trading_dates().iter().copied().collect::<BTreeSet<_>>();
-    required.extend(evidence.fills().iter().filter_map(|fill|fill.terminal_time().map(|time|time.date_naive())));
-    load_runner_benchmarks_for_dates(database,instrument,&required,supplied,summary)
+    let mut required = calendar
+        .required_trading_dates()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    required.extend(
+        evidence
+            .fills()
+            .iter()
+            .filter_map(|fill| fill.terminal_time().map(|time| time.date_naive())),
+    );
+    load_runner_benchmarks_for_dates(database, instrument, &required, supplied, summary)
 }
 
 fn load_runner_benchmarks_for_dates(
-    database:&DatabaseManager,instrument:&str,required:&BTreeSet<NaiveDate>,
-    supplied:&[BenchmarkDayManifest],summary:&mut FailureEvidenceSummary,
+    database: &DatabaseManager,
+    instrument: &str,
+    required: &BTreeSet<NaiveDate>,
+    supplied: &[BenchmarkDayManifest],
+    summary: &mut FailureEvidenceSummary,
 ) -> Result<(Vec<BenchmarkBar>, String, Vec<BenchmarkDayManifest>), ReplayError> {
     if supplied
         .windows(2)

@@ -12,9 +12,7 @@ use crate::push_foundation::intent_store::chain_post_close::macro_codec;
 use crate::search_service::SearchService;
 use futures::FutureExt as _;
 
-pub(super) fn macro_search_service(
-    registered: &[GeneralWebResearchProvider],
-) -> SearchService {
+pub(super) fn macro_search_service(registered: &[GeneralWebResearchProvider]) -> SearchService {
     SearchService::from_general_web_providers_for_test(registered)
 }
 
@@ -4980,32 +4978,32 @@ async fn single_user_local_macro_invalid_instance_auth_leaves_no_plan_before_val
     }
 }
 
-#[path = "chain_post_close_macro_control_tests.rs"]
-mod control_tests;
-#[path = "chain_post_close_macro_full_tests.rs"]
-mod full_tests;
-#[path = "chain_post_close_macro_control_recovery_tests.rs"]
-mod control_recovery_tests;
-#[path = "chain_post_close_macro_control_connect_tests.rs"]
-mod control_connect_tests;
 #[path = "chain_post_close_macro_control_caps_connect_tests.rs"]
 mod control_caps_connect_tests;
+#[path = "chain_post_close_macro_control_connect_tests.rs"]
+mod control_connect_tests;
+#[path = "chain_post_close_macro_control_recovery_tests.rs"]
+mod control_recovery_tests;
+#[path = "chain_post_close_macro_control_tests.rs"]
+mod control_tests;
 #[path = "chain_post_close_macro_control_unknown_commit_tests.rs"]
 mod control_unknown_commit_tests;
+#[path = "chain_post_close_macro_corruption_tests.rs"]
+mod corruption_tests;
+#[path = "chain_post_close_macro_external_retry_tests.rs"]
+mod external_retry_tests;
+#[path = "chain_post_close_macro_full_tests.rs"]
+mod full_tests;
+#[path = "chain_post_close_models_tests.rs"]
+mod models_tests;
 #[path = "chain_post_close_macro_pre_effect_refusal_tests.rs"]
 mod pre_effect_refusal_tests;
 #[path = "chain_post_close_macro_route_refusal_tests.rs"]
 mod route_refusal_tests;
-#[path = "chain_post_close_macro_external_retry_tests.rs"]
-mod external_retry_tests;
-#[path = "chain_post_close_macro_corruption_tests.rs"]
-mod corruption_tests;
 #[path = "chain_post_close_schema_v11_migration_tests.rs"]
 mod v11_migration_tests;
 #[path = "chain_post_close_schema_v12_migration_tests.rs"]
 mod v12_migration_tests;
-#[path = "chain_post_close_models_tests.rs"]
-mod models_tests;
 
 #[tokio::test]
 async fn single_user_external_macro_confirmed_controls_reopen_and_execute_only_original_data() {

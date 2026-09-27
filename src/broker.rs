@@ -67,20 +67,25 @@ impl QuoteProvider for PublicQuoteProvider {
     fn get_execution_quote(&self, code: &str) -> Result<ExecutionQuote, String> {
         let requested = vec![code.to_string()];
         let batch = crate::data_gateway::MarketDataGateway::new()
-            .realtime_quotes(&requested)
+            .realtime_quote_coverage(&requested)
+            .require_complete()
             .map_err(|error| format!("remote realtime quote {code}: {error}"))?;
         let quote = batch.records().first().ok_or_else(|| {
             format!("remote realtime quote {code}: verified-empty is invalid for execution")
         })?;
         let price = validate_quote_price(code, quote.price)?;
-        let previous_close = validate_quote_price(code, quote.previous_close)?;
-        let limit = crate::data_provider::limit_status::LimitStatusCalculator::new().calculate(
-            code,
-            previous_close,
-            &quote.name,
-        );
-        let limit_down_price = validate_quote_price(code, limit.limit_down_price)?;
-        let limit_up_price = validate_quote_price(code, limit.limit_up_price)?;
+        let shanghai =
+            chrono::FixedOffset::east_opt(8 * 60 * 60).expect("Shanghai UTC offset is fixed");
+        let effective_on = quote.source_at.with_timezone(&shanghai).date_naive();
+        let band =
+            crate::data_provider::limit_status::qualified_price_band_for_code(code, effective_on)
+                .map_err(|error| format!("remote realtime quote {code}: {error}"))?;
+        crate::data_provider::limit_status::validate_price_against_qualified_band(
+            code, price, &band,
+        )
+        .map_err(|error| format!("remote realtime quote {code}: {error}"))?;
+        let limit_down_price = band.lower_price_micros() as f64 / 1_000_000.0;
+        let limit_up_price = band.upper_price_micros() as f64 / 1_000_000.0;
         if limit_down_price > limit_up_price {
             return Err(format!(
                 "remote realtime quote {code}: invalid daily range {limit_down_price}..{limit_up_price}"
@@ -151,9 +156,6 @@ pub fn execution_quote(code: &str) -> Result<ExecutionQuote, String> {
             "realtime quote for {code} is stale: age_ms={age_ms}"
         ));
     }
-    crate::monitor::data_mode::mark_capability_success(
-        crate::monitor::data_mode::Capability::Quote,
-    )?;
     Ok(quote)
 }
 

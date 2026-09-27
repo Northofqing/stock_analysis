@@ -109,11 +109,19 @@ fn status_completion(
     let (status_code, status_details, status_error_detail_trailer) =
         capture_status_material(&status);
     let error = if let Some(wire) = &external_wire {
-        match crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(&wire.client_descriptor_sha256) {
-            Ok(decoder) => GrpcError::from_status_with_decoder(status, client.data_status_context(method, request_id), decoder),
+        match crate::grpc_client::external_decoder::ExternalDecoder::for_descriptor(
+            &wire.client_descriptor_sha256,
+        ) {
+            Ok(decoder) => GrpcError::from_status_with_decoder(
+                status,
+                client.data_status_context(method, request_id),
+                decoder,
+            ),
             Err(error) => error,
         }
-    } else { GrpcError::from_status(status, client.data_status_context(method, request_id)) };
+    } else {
+        GrpcError::from_status(status, client.data_status_context(method, request_id))
+    };
     let (decision, continuation) = failure_retry(&error, &client.retry, attempt_ordinal);
     UnaryAttemptCompletion {
         response_bytes: None,

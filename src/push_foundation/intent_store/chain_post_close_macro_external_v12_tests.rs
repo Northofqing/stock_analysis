@@ -110,53 +110,131 @@ async fn task6_connection_journal_data_requires_current_capability_and_effect_li
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn task6_legacy_v11_continuation_qualifies_new_connection_and_finishes_only_original_source() {
+async fn task6_legacy_v11_continuation_qualifies_new_connection_and_finishes_only_original_source()
+{
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
-    let body = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
-        let baseline = control_tests::setup_external_parent(
-            &mut business, &mut parent_server, "TEST_CODE_TASK6_LEGACY_CONTINUATION",
-        ).await;
-        external_server = Some(ExternalMtlsMacroFixture::bind_data_success_for_test().await.unwrap());
-        let external = external_server.as_ref().unwrap();
-        let checkpoint = control_recovery_tests::reach_confirmed_health_checkpoint(
-            &mut business, &baseline, external, "TEST_CODE_LEGACY_A_OWNER",
-        ).await;
-        business.chain_post_close().migrate_schema_v11_to_v12().unwrap();
-        business.chain_post_close().migrate_schema_v12_to_v13().unwrap();
-        business.chain_post_close().migrate_schema_v13_to_v14().unwrap();
-        business.chain_post_close().migrate_schema_v14_to_v15().unwrap();
-        business.reopen();
-        let source = GrpcSource::from_external_macro_bundle_for_test(external.bundle_path().to_path_buf());
-        let started = micros(STARTED_LOCAL);
-        let clock = MacroClock {
-            now: Cell::new(UtcMicros::try_new(started + 3_000_000).unwrap()),
-            observation: DateTime::parse_from_rfc3339(STARTED_LOCAL).unwrap(),
-            observation_calls: Cell::new(0),
-        };
-        let search = macro_search_service(&[]);
-        let mut local = business.store.as_mut().unwrap().single_user_local_chain_post_close(&baseline.config).unwrap();
-        let lease = local.resume_run(&baseline.intent, macro_lease("TEST_CODE_LEGACY_CONTINUE_OWNER", started + 3_000_000, started + 14_000_000, checkpoint.head_version)).unwrap();
-        external.release_health();
-        external.release_capabilities();
-        external.release_data();
-        let continued = crate::push_foundation::intent_store::chain_post_close::macro_driver::drive(
-            &mut local, lease, &source, &clock, Rc::new(Cell::new(false)), &search,
-        ).await;
-        assert!(continued.is_ok(), "verified single-source v11 plan must continue without inventing LocalRoute: {:?}", continued.err());
-        let recovered = local.inspect_macro(&baseline.intent).unwrap();
-        assert!(recovered.global_news(GlobalNewsProvider::Eastmoney).is_some());
-        assert_eq!(recovered.plan_bytes(), checkpoint.plan_bytes);
-        assert_eq!(recovered.readiness_episodes()[0].controls()[0].response_bytes(), Some(checkpoint.health.response_bytes.as_slice()));
-        assert_eq!(external.snapshot().health_requests.len(), 2);
-        assert_ne!(external.snapshot().health_requests[0], external.snapshot().health_requests[1]);
-        assert_eq!(external.snapshot().capabilities_requests, vec![checkpoint.capabilities.bytes]);
-        assert_eq!(external.snapshot().data_requests, vec![checkpoint.data.bytes]);
-        assert_eq!(external.snapshot().data_methods, vec!["global_news"]);
-    })).catch_unwind().await;
-    control_tests::cleanup_external_case(&mut business, &mut parent_server, &mut external_server, "Task6 legacy continuation").await;
-    match body { Ok(result) => result.expect("legacy continuation watchdog"), Err(panic) => std::panic::resume_unwind(panic) }
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
+            let baseline = control_tests::setup_external_parent(
+                &mut business,
+                &mut parent_server,
+                "TEST_CODE_TASK6_LEGACY_CONTINUATION",
+            )
+            .await;
+            external_server = Some(
+                ExternalMtlsMacroFixture::bind_data_success_for_test()
+                    .await
+                    .unwrap(),
+            );
+            let external = external_server.as_ref().unwrap();
+            let checkpoint = control_recovery_tests::reach_confirmed_health_checkpoint(
+                &mut business,
+                &baseline,
+                external,
+                "TEST_CODE_LEGACY_A_OWNER",
+            )
+            .await;
+            business
+                .chain_post_close()
+                .migrate_schema_v11_to_v12()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v12_to_v13()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v13_to_v14()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v14_to_v15()
+                .unwrap();
+            business.reopen();
+            let source = GrpcSource::from_external_macro_bundle_for_test(
+                external.bundle_path().to_path_buf(),
+            );
+            let started = micros(STARTED_LOCAL);
+            let clock = MacroClock {
+                now: Cell::new(UtcMicros::try_new(started + 3_000_000).unwrap()),
+                observation: DateTime::parse_from_rfc3339(STARTED_LOCAL).unwrap(),
+                observation_calls: Cell::new(0),
+            };
+            let search = macro_search_service(&[]);
+            let mut local = business
+                .store
+                .as_mut()
+                .unwrap()
+                .single_user_local_chain_post_close(&baseline.config)
+                .unwrap();
+            let lease = local
+                .resume_run(
+                    &baseline.intent,
+                    macro_lease(
+                        "TEST_CODE_LEGACY_CONTINUE_OWNER",
+                        started + 3_000_000,
+                        started + 14_000_000,
+                        checkpoint.head_version,
+                    ),
+                )
+                .unwrap();
+            external.release_health();
+            external.release_capabilities();
+            external.release_data();
+            let continued =
+                crate::push_foundation::intent_store::chain_post_close::macro_driver::drive(
+                    &mut local,
+                    lease,
+                    &source,
+                    &clock,
+                    Rc::new(Cell::new(false)),
+                    &search,
+                )
+                .await;
+            assert!(
+                continued.is_ok(),
+                "verified single-source v11 plan must continue without inventing LocalRoute: {:?}",
+                continued.err()
+            );
+            let recovered = local.inspect_macro(&baseline.intent).unwrap();
+            assert!(recovered
+                .global_news(GlobalNewsProvider::Eastmoney)
+                .is_some());
+            assert_eq!(recovered.plan_bytes(), checkpoint.plan_bytes);
+            assert_eq!(
+                recovered.readiness_episodes()[0].controls()[0].response_bytes(),
+                Some(checkpoint.health.response_bytes.as_slice())
+            );
+            assert_eq!(external.snapshot().health_requests.len(), 2);
+            assert_ne!(
+                external.snapshot().health_requests[0],
+                external.snapshot().health_requests[1]
+            );
+            assert_eq!(
+                external.snapshot().capabilities_requests,
+                vec![checkpoint.capabilities.bytes]
+            );
+            assert_eq!(
+                external.snapshot().data_requests,
+                vec![checkpoint.data.bytes]
+            );
+            assert_eq!(external.snapshot().data_methods, vec!["global_news"]);
+        }))
+        .catch_unwind()
+        .await;
+    control_tests::cleanup_external_case(
+        &mut business,
+        &mut parent_server,
+        &mut external_server,
+        "Task6 legacy continuation",
+    )
+    .await;
+    match body {
+        Ok(result) => result.expect("legacy continuation watchdog"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -191,8 +269,10 @@ async fn task6_durable_b_original_business_unknown_blocks_even_new_qualification
 
 pub(super) async fn assert_task6_durable_b(mode: u8) {
     let retry_case = matches!(mode, 3 | 6);
-    use crate::grpc_client::client::external_control_loopback_fixture::{ExternalMtlsSwitch, HealthReply};
     use crate::grpc_client::build_identity::BuildIdentityTrust;
+    use crate::grpc_client::client::external_control_loopback_fixture::{
+        ExternalMtlsSwitch, HealthReply,
+    };
     use crate::grpc_client::client::GrpcMarketClient;
     use crate::push_foundation::intent_store::chain_post_close::macro_driver;
     let mut business = V2BusinessFixture::new();
@@ -423,9 +503,20 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
         }
     })).catch_unwind().await;
     drop(switch.take());
-    if let Some(b) = server_b.take() { b.finish().await.unwrap(); }
-    control_tests::cleanup_external_case(&mut business, &mut parent_server, &mut external_server, "Task6 durable B").await;
-    match body { Ok(result) => result.expect("durable B watchdog"), Err(panic) => std::panic::resume_unwind(panic) }
+    if let Some(b) = server_b.take() {
+        b.finish().await.unwrap();
+    }
+    control_tests::cleanup_external_case(
+        &mut business,
+        &mut parent_server,
+        &mut external_server,
+        "Task6 durable B",
+    )
+    .await;
+    match body {
+        Ok(result) => result.expect("durable B watchdog"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -444,10 +535,12 @@ async fn assert_task6_reopen_qualification(capabilities_ready: bool) {
 
 async fn assert_task6_reopen_qualification_on(capabilities_ready: bool, new_b: bool) {
     use crate::data_gateway::grpc_source::macro_queries::PreparedMacroQueries;
-    use crate::push_foundation::intent_store::chain_post_close::{macro_live::Live, macro_driver};
-    use crate::grpc_client::client::external_control_loopback_fixture::{ExternalMtlsSwitch, HealthReply};
-    use crate::grpc_client::client::GrpcMarketClient;
     use crate::grpc_client::build_identity::BuildIdentityTrust;
+    use crate::grpc_client::client::external_control_loopback_fixture::{
+        ExternalMtlsSwitch, HealthReply,
+    };
+    use crate::grpc_client::client::GrpcMarketClient;
+    use crate::push_foundation::intent_store::chain_post_close::{macro_driver, macro_live::Live};
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
@@ -568,9 +661,20 @@ async fn assert_task6_reopen_qualification_on(capabilities_ready: bool, new_b: b
         }
     })).catch_unwind().await;
     drop(switch.take());
-    if let Some(server) = second_server.take() { server.finish().await.unwrap(); }
-    control_tests::cleanup_external_case(&mut business, &mut parent_server, &mut external_server, "Task6 qualification reopen").await;
-    match body { Ok(result) => result.expect("reopen watchdog"), Err(panic) => std::panic::resume_unwind(panic) }
+    if let Some(server) = second_server.take() {
+        server.finish().await.unwrap();
+    }
+    control_tests::cleanup_external_case(
+        &mut business,
+        &mut parent_server,
+        &mut external_server,
+        "Task6 qualification reopen",
+    )
+    .await;
+    match body {
+        Ok(result) => result.expect("reopen watchdog"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 async fn assert_task6_connection_journal(phase: u8) {
@@ -701,7 +805,13 @@ async fn assert_task6_connection_journal(phase: u8) {
             ));
         }
     })).catch_unwind().await;
-    control_tests::cleanup_external_case(&mut business, &mut parent_server, &mut external_server, "Task6 journal begin").await;
+    control_tests::cleanup_external_case(
+        &mut business,
+        &mut parent_server,
+        &mut external_server,
+        "Task6 journal begin",
+    )
+    .await;
     match body {
         Ok(result) => result.expect("TEST_CODE Task6 journal test deadline"),
         Err(panic) => std::panic::resume_unwind(panic),
@@ -732,9 +842,18 @@ async fn assert_v12_control_receipt_cancelled_reopens_unknown(cancel_capabilitie
                     .schema_version(),
                 12
             );
-            business.chain_post_close().migrate_schema_v12_to_v13().unwrap();
-            business.chain_post_close().migrate_schema_v13_to_v14().unwrap();
-            business.chain_post_close().migrate_schema_v14_to_v15().unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v12_to_v13()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v13_to_v14()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v14_to_v15()
+                .unwrap();
             external_server = Some(
                 ExternalMtlsMacroFixture::bind_data_provider_attempts_for_test(false)
                     .await
@@ -848,8 +967,7 @@ async fn assert_v12_control_receipt_cancelled_reopens_unknown(cancel_capabilitie
             business.reopen();
             let reopened_clock = MacroClock {
                 now: Cell::new(UtcMicros::try_new(started_at + 3_000_000).unwrap()),
-                observation: DateTime::parse_from_rfc3339("2026-09-14T15:34:00+08:00")
-                    .unwrap(),
+                observation: DateTime::parse_from_rfc3339("2026-09-14T15:34:00+08:00").unwrap(),
                 observation_calls: Cell::new(0),
             };
             let mut reopened_local = business
@@ -915,7 +1033,10 @@ async fn assert_v12_control_receipt_cancelled_reopens_unknown(cancel_capabilitie
             let wire_after = external.snapshot();
             assert_eq!(wire_after.tcp_accepts, wire_before.tcp_accepts);
             assert_eq!(wire_after.health_requests, wire_before.health_requests);
-            assert_eq!(wire_after.capabilities_requests, wire_before.capabilities_requests);
+            assert_eq!(
+                wire_after.capabilities_requests,
+                wire_before.capabilities_requests
+            );
             assert_eq!(wire_after.data_calls, 0);
         }))
         .catch_unwind()

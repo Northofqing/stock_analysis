@@ -619,6 +619,35 @@ pub fn realtime_quotes_at(
     q: &QueryResult,
     now: DateTime<Utc>,
 ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+    let batch = realtime_quote_candidates_at(q, now)?;
+    for record in batch.records() {
+        if record.name.trim().is_empty()
+            || !record.price.is_finite()
+            || record.price <= 0.0
+            || !record.previous_close.is_finite()
+            || record.previous_close <= 0.0
+            || !record.change_percent.is_finite()
+        {
+            return Err(GatewayError::invalid_evidence(
+                "RealtimeMarketQuotes",
+                Some(record.provider),
+                format!(
+                    "realtime quote {} has invalid record-local fields",
+                    record.code
+                ),
+            ));
+        }
+    }
+    Ok(batch)
+}
+
+/// Preserve record-local quote failures for the quote-specific coverage
+/// classifier. Shared envelope/timestamp failures and unbindable identities
+/// still reject the complete batch here.
+pub(crate) fn realtime_quote_candidates_at(
+    q: &QueryResult,
+    now: DateTime<Utc>,
+) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
     let capability = "RealtimeMarketQuotes";
     let (evidence, source_at, observed_at) = live_evidence_times(q, capability, now)?;
     let parsed = parse_records(q, capability)?;
@@ -628,12 +657,13 @@ pub fn realtime_quotes_at(
     let records = parsed
         .iter()
         .map(|value| {
+            let code = as_str(value, "code", capability)?;
             Ok(RealtimeMarketQuote {
-                code: as_str(value, "code", capability)?,
-                name: as_str(value, "name", capability)?,
-                price: as_positive_finite_f64(value, "price", capability)?,
-                change_percent: as_f64(value, "change_pct", capability)?,
-                previous_close: as_positive_finite_f64(value, "previous_close", capability)?,
+                code,
+                name: as_str(value, "name", capability).unwrap_or_default(),
+                price: as_f64(value, "price", capability).unwrap_or(f64::NAN),
+                change_percent: as_f64(value, "change_pct", capability).unwrap_or(f64::NAN),
+                previous_close: as_f64(value, "previous_close", capability).unwrap_or(f64::NAN),
                 source_at,
                 observed_at,
                 provider: evidence.provider,

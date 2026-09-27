@@ -28,8 +28,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    stock_analysis::database::DatabaseManager::init(Some(database))
-        .expect("database init failed");
+    stock_analysis::database::DatabaseManager::init(Some(database)).expect("database init failed");
 
     let run = || -> Result<(), String> {
         let observed_at = chrono::Local::now().fixed_offset();
@@ -41,7 +40,10 @@ fn main() -> ExitCode {
         let age = observed_at.signed_duration_since(effective_at);
         println!(
             "summary: effective_at={} age={age} total={:.2} pos={:.1}% pnl={:.2}",
-            summary.effective_at, summary.total_assets, summary.position_ratio_pct, summary.daily_pnl
+            summary.effective_at,
+            summary.total_assets,
+            summary.position_ratio_pct,
+            summary.daily_pnl
         );
         if age < chrono::Duration::zero() {
             return Err(format!("summary from the future: age={age}"));
@@ -56,17 +58,15 @@ fn main() -> ExitCode {
             // 与生产 compute_account_mode_metrics_blocking 同路径: 费率口径
             // 逐笔成本 ledger 喂引擎 (评估 #1), 净口径计数.
             let as_of = chrono::Local::now().date_naive();
-            stock_analysis::performance::economic_position::compute_economic_position_report(
-                as_of,
-            )
-            .map_err(|error| format!("paper ledger anchor: {error}"))?
+            stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
+                .map_err(|error| format!("paper ledger anchor: {error}"))?
         };
         println!(
             "ledger: closed_positions={} open_positions={} (费率逐笔成本净口径)",
             report.closed_positions.len(),
             report.open_positions.len()
         );
-        if let Some(opening)=&report.opening_inventory {
+        if let Some(opening) = &report.opening_inventory {
             println!("opening inventory: remaining_lots={} excluded_exit_parts={} projection={} seed={:?} (期初份额不计策略连续止损)",opening.remaining_opening_lots.len(),opening.excluded_exits.len(),opening.projection_hash,opening.seed_binding);
         }
         let mut realized: Vec<(chrono::NaiveDateTime, String, f64)> = report

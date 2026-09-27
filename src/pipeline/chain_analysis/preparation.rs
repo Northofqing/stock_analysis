@@ -1839,45 +1839,41 @@ async fn observed_search(
     searches: &mut Vec<SearchObservation>,
 ) -> Result<Vec<SearchResult>> {
     let budget = std::time::Duration::from_secs(timeout_seconds);
-    let (results, source) = match tokio::time::timeout(
-        budget,
-        io.search_effect(stage, &query, limit, budget),
-    )
-    .await
-    {
-        Ok(Ok(results)) => {
-            // Empty Vec from the old search interface is not evidence of verified emptiness.
-            let status = if results.is_empty() {
-                SourceStatus::Unknown
-            } else {
-                SourceStatus::Available
-            };
-            (
-                results,
-                SourceObservation {
-                    status,
-                    ..SourceObservation::unknown()
-                },
-            )
-        }
-        Ok(Err(error)) if error.downcast_ref::<PreparationStop>().is_some() => {
-            return Err(error);
-        }
-        Ok(Err(error)) => {
-            log::warn!("[产业链] 搜索阶段 {:?} 失败，降级为空背景", stage);
-            (
-                Vec::new(),
-                SourceObservation::unavailable(error.to_string()),
-            )
-        }
-        Err(_) => {
-            log::warn!("[产业链] 搜索阶段 {:?} 超时，降级为空背景", stage);
-            (
-                Vec::new(),
-                SourceObservation::unavailable(format!("新闻搜索超时（{timeout_seconds}秒）")),
-            )
-        }
-    };
+    let (results, source) =
+        match tokio::time::timeout(budget, io.search_effect(stage, &query, limit, budget)).await {
+            Ok(Ok(results)) => {
+                // Empty Vec from the old search interface is not evidence of verified emptiness.
+                let status = if results.is_empty() {
+                    SourceStatus::Unknown
+                } else {
+                    SourceStatus::Available
+                };
+                (
+                    results,
+                    SourceObservation {
+                        status,
+                        ..SourceObservation::unknown()
+                    },
+                )
+            }
+            Ok(Err(error)) if error.downcast_ref::<PreparationStop>().is_some() => {
+                return Err(error);
+            }
+            Ok(Err(error)) => {
+                log::warn!("[产业链] 搜索阶段 {:?} 失败，降级为空背景", stage);
+                (
+                    Vec::new(),
+                    SourceObservation::unavailable(error.to_string()),
+                )
+            }
+            Err(_) => {
+                log::warn!("[产业链] 搜索阶段 {:?} 超时，降级为空背景", stage);
+                (
+                    Vec::new(),
+                    SourceObservation::unavailable(format!("新闻搜索超时（{timeout_seconds}秒）")),
+                )
+            }
+        };
     searches.push(SearchObservation {
         stage,
         query,

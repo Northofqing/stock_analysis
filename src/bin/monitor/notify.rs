@@ -2571,9 +2571,9 @@ pub(super) fn classify_counted_admission(outcome: &PushOutcome) -> NewsAiCounted
         PushOutcome::Pushed => NewsAiCountedAdmission::Admitted,
         PushOutcome::Denied(reason) => NewsAiCountedAdmission::Rejected(reason.clone()),
         PushOutcome::SinkError(reason) => NewsAiCountedAdmission::AttemptedFailure(reason.clone()),
-        PushOutcome::Deduped => NewsAiCountedAdmission::Rejected(
-            "counted_delivery_returned_legacy_dedup".to_owned(),
-        ),
+        PushOutcome::Deduped => {
+            NewsAiCountedAdmission::Rejected("counted_delivery_returned_legacy_dedup".to_owned())
+        }
     }
 }
 
@@ -6861,7 +6861,10 @@ mod tests {
             .await,
             Err(NewsAiNotifyOutcome::SinkError(_))
         ));
-        assert_eq!(marker.calls, 0, "no counted delivery means no BR-172 sink marker");
+        assert_eq!(
+            marker.calls, 0,
+            "no counted delivery means no BR-172 sink marker"
+        );
         assert_eq!(
             record_news_ai_counted_delivery(&PushOutcome::Pushed, &mut marker).await,
             Ok(())

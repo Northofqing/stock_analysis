@@ -1284,7 +1284,11 @@ pub(crate) fn classify_database_half(
     let paper_v2 = actual.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION;
     let review_v3 = actual.identity.user_version == REVIEW_CATALOG_GENERATION;
     let (legacy_reference, transitional_reference, amended_reference) = if review_v3 {
-        (&references.review_v3.legacy, &references.review_v3.transitional, &references.review_v3.amended)
+        (
+            &references.review_v3.legacy,
+            &references.review_v3.transitional,
+            &references.review_v3.amended,
+        )
     } else if paper_v2 {
         (
             &references.paper_v2.legacy,
@@ -1354,7 +1358,11 @@ pub(crate) fn classify_database_half(
     if paper_v2 || review_v3 {
         expected_identity = DatabaseSchemaIdentity {
             application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-            user_version: if review_v3 { REVIEW_CATALOG_GENERATION } else { PAPER_LEDGER_CATALOG_GENERATION },
+            user_version: if review_v3 {
+                REVIEW_CATALOG_GENERATION
+            } else {
+                PAPER_LEDGER_CATALOG_GENERATION
+            },
         };
     }
     require_exact_ancillary_catalog(actual, expected_reference)?;
@@ -1710,7 +1718,10 @@ fn build_same_runtime_catalog_state_with_extensions(
         expected_registry.extend(paper_registry);
     }
     if review_v3 {
-        for (i, (kind, name, table, sql)) in super::daily_change_review_schema_v1::STATEMENTS.iter().enumerate() {
+        for (i, (kind, name, table, sql)) in super::daily_change_review_schema_v1::STATEMENTS
+            .iter()
+            .enumerate()
+        {
             let entry = FrozenCatalogRegistryEntry {
                 identity: CatalogObjectIdentity {
                     kind: parse_catalog_object_kind("daily-change-review-v1", kind)?,
@@ -1720,10 +1731,24 @@ fn build_same_runtime_catalog_state_with_extensions(
                 ddl_id: format!("daily-change-review-v1:{name}"),
                 source_line: i + 1,
             };
-            connection.execute_batch(sql).map_err(|error| sqlite_reference_build_error("execute-daily-change-review-v1", Some(&entry.ddl_id), error))?;
-            capture_exact_catalog_object(&connection, &entry.identity, &entry.ddl_id, "daily-change-review-v1")?;
+            connection.execute_batch(sql).map_err(|error| {
+                sqlite_reference_build_error(
+                    "execute-daily-change-review-v1",
+                    Some(&entry.ddl_id),
+                    error,
+                )
+            })?;
+            capture_exact_catalog_object(
+                &connection,
+                &entry.identity,
+                &entry.ddl_id,
+                "daily-change-review-v1",
+            )?;
             if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
-                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch { catalog: "daily-change-review-v1", detail: "duplicate DDL identity".into() });
+                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch {
+                    catalog: "daily-change-review-v1",
+                    detail: "duplicate DDL identity".into(),
+                });
             }
             expected_registry.push(entry);
         }
@@ -2160,9 +2185,12 @@ fn capture_managed_index_geometry(
                 .filter(|(kind, _, _, _)| *kind == "table")
                 .map(|(_, name, _, _)| (*name).to_owned()),
         )
-        .chain(super::daily_change_review_schema_v1::STATEMENTS.iter()
-            .filter(|(kind, _, _, _)| *kind == "table")
-            .map(|(_, name, _, _)| (*name).to_owned()))
+        .chain(
+            super::daily_change_review_schema_v1::STATEMENTS
+                .iter()
+                .filter(|(kind, _, _, _)| *kind == "table")
+                .map(|(_, name, _, _)| (*name).to_owned()),
+        )
         .filter(|table| existing_tables.contains(table.as_str()))
         .collect::<Vec<_>>();
     let mut geometry = Vec::new();
@@ -2310,10 +2338,30 @@ fn issue_same_runtime_catalog_references(
     {
         return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
     }
-    let (review_runtime, review_legacy) = build_same_runtime_catalog_state_with_extensions(built.mode, None, true, true)?;
-    let (review_transitional_runtime, review_transitional) = build_same_runtime_catalog_state_with_extensions(built.mode, Some(SelectionCatalogDdlPhase::Transitional), true, true)?;
-    let (review_amended_runtime, review_amended) = build_same_runtime_catalog_state_with_extensions(built.mode, Some(SelectionCatalogDdlPhase::Final), true, true)?;
-    if [review_runtime, review_transitional_runtime, review_amended_runtime].iter().any(|runtime| runtime != &built.runtime) {
+    let (review_runtime, review_legacy) =
+        build_same_runtime_catalog_state_with_extensions(built.mode, None, true, true)?;
+    let (review_transitional_runtime, review_transitional) =
+        build_same_runtime_catalog_state_with_extensions(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Transitional),
+            true,
+            true,
+        )?;
+    let (review_amended_runtime, review_amended) =
+        build_same_runtime_catalog_state_with_extensions(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Final),
+            true,
+            true,
+        )?;
+    if [
+        review_runtime,
+        review_transitional_runtime,
+        review_amended_runtime,
+    ]
+    .iter()
+    .any(|runtime| runtime != &built.runtime)
+    {
         return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
     }
     Ok(SameRuntimeCatalogReferences {
@@ -3668,29 +3716,72 @@ mod tests {
 
     #[test]
     fn task8_catalog_v3_exact_extension_preserves_v1_v2_and_rejects_partial_unknown() {
-        let mode=GlobalSchemaCatalogMode::Test;
-        let refs=same_runtime_references(mode);
-        let authority=SelectionCatalogCaptureAuthority::for_test_code();
-        for phase in [None,Some(SelectionCatalogDdlPhase::Transitional),Some(SelectionCatalogDdlPhase::Final)] {
-            let conn=Connection::open_in_memory().unwrap(); let mut ids=BTreeSet::new();
-            execute_legacy_catalog_ddl(&conn,&legacy_catalog_registry_entries_v1().unwrap(),&legacy_catalog_ddl_entries_v1().unwrap(),"TEST_CODE_review",&mut ids).unwrap();
-            if let Some(phase)=phase{execute_selection_catalog_ddl(&conn,mode,phase,&mut ids).unwrap();}
-            for (_,_,_,sql) in super::super::paper_ledger_schema_v1::STATEMENTS{conn.execute_batch(sql).unwrap();}
-            conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=2").unwrap();
-            let v2=capture_catalog_snapshot(&authority,&conn,mode).unwrap();
-            classify_database_half(&v2,&refs).unwrap();
-            for (_,_,_,sql) in super::super::daily_change_review_schema_v1::STATEMENTS{conn.execute_batch(sql).unwrap();}
-            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err(),"old generation cannot authorize extension");
+        let mode = GlobalSchemaCatalogMode::Test;
+        let refs = same_runtime_references(mode);
+        let authority = SelectionCatalogCaptureAuthority::for_test_code();
+        for phase in [
+            None,
+            Some(SelectionCatalogDdlPhase::Transitional),
+            Some(SelectionCatalogDdlPhase::Final),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            let mut ids = BTreeSet::new();
+            execute_legacy_catalog_ddl(
+                &conn,
+                &legacy_catalog_registry_entries_v1().unwrap(),
+                &legacy_catalog_ddl_entries_v1().unwrap(),
+                "TEST_CODE_review",
+                &mut ids,
+            )
+            .unwrap();
+            if let Some(phase) = phase {
+                execute_selection_catalog_ddl(&conn, mode, phase, &mut ids).unwrap();
+            }
+            for (_, _, _, sql) in super::super::paper_ledger_schema_v1::STATEMENTS {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=2")
+                .unwrap();
+            let v2 = capture_catalog_snapshot(&authority, &conn, mode).unwrap();
+            classify_database_half(&v2, &refs).unwrap();
+            for (_, _, _, sql) in super::super::daily_change_review_schema_v1::STATEMENTS {
+                conn.execute_batch(sql).unwrap();
+            }
+            assert!(
+                classify_database_half(
+                    &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                    &refs
+                )
+                .is_err(),
+                "old generation cannot authorize extension"
+            );
             conn.execute_batch("PRAGMA user_version=3").unwrap();
-            let v3=capture_catalog_snapshot(&authority,&conn,mode).unwrap();
-            classify_database_half(&v3,&refs).expect("complete explicit CatalogV3 review extension");
-            assert_ne!(v2.objects,v3.objects);
-            conn.execute_batch("CREATE TABLE daily_change_review_shadow(value TEXT)").unwrap();
-            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
-            conn.execute_batch("DROP TABLE daily_change_review_shadow; DROP TRIGGER daily_change_review_no_delete").unwrap();
-            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
+            let v3 = capture_catalog_snapshot(&authority, &conn, mode).unwrap();
+            classify_database_half(&v3, &refs)
+                .expect("complete explicit CatalogV3 review extension");
+            assert_ne!(v2.objects, v3.objects);
+            conn.execute_batch("CREATE TABLE daily_change_review_shadow(value TEXT)")
+                .unwrap();
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
+            conn.execute_batch(
+                "DROP TABLE daily_change_review_shadow; DROP TRIGGER daily_change_review_no_delete",
+            )
+            .unwrap();
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
             conn.execute_batch("CREATE TRIGGER daily_change_review_no_delete BEFORE DELETE ON daily_change_review_event BEGIN SELECT 1; END").unwrap();
-            assert!(classify_database_half(&capture_catalog_snapshot(&authority,&conn,mode).unwrap(),&refs).is_err());
+            assert!(classify_database_half(
+                &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+                &refs
+            )
+            .is_err());
         }
     }
 

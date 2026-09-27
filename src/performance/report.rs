@@ -3,18 +3,34 @@
 use super::attribution::{DailyAttribution, FamilyAggregate, SignalFamily, WindowAttribution};
 
 /// Append-only file presentation; the immutable database report is authoritative.
-pub fn persist_report_revision(directory:&std::path::Path,date:chrono::NaiveDate,bytes:&[u8])->Result<std::path::PathBuf,String> {
+pub fn persist_report_revision(
+    directory: &std::path::Path,
+    date: chrono::NaiveDate,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    use sha2::{Digest, Sha256};
     use std::io::Write;
-    use sha2::{Digest,Sha256};
-    std::fs::create_dir_all(directory).map_err(|e|format!("create report directory: {e}"))?;
-    let digest=hex::encode(Sha256::digest(bytes));
-    let path=directory.join(format!("{date}.{digest}.md"));
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file)=>{file.write_all(bytes).and_then(|()|file.sync_all()).map_err(|e|format!("append report revision: {e}"))?;},
-        Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{
-            if std::fs::read(&path).map_err(|e|format!("read existing report revision: {e}"))?!=bytes {return Err("existing report revision bytes differ; no overwrite permitted".into());}
-        },
-        Err(error)=>return Err(format!("create report revision: {error}")),
+    std::fs::create_dir_all(directory).map_err(|e| format!("create report directory: {e}"))?;
+    let digest = hex::encode(Sha256::digest(bytes));
+    let path = directory.join(format!("{date}.{digest}.md"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("append report revision: {e}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(&path).map_err(|e| format!("read existing report revision: {e}"))?
+                != bytes
+            {
+                return Err("existing report revision bytes differ; no overwrite permitted".into());
+            }
+        }
+        Err(error) => return Err(format!("create report revision: {error}")),
     }
     Ok(path)
 }
@@ -22,15 +38,17 @@ pub fn persist_report_revision(directory:&std::path::Path,date:chrono::NaiveDate
 #[cfg(test)]
 #[test]
 fn effective_fill_report_artifact_preserves_old_daily_bytes_and_reuses_revision() {
-    let dir=tempfile::tempdir().unwrap();
-    let date=chrono::NaiveDate::from_ymd_opt(2026,9,15).unwrap();
-    let legacy=dir.path().join("2026-09-15.md");std::fs::write(&legacy,b"TEST_CODE_frozen_original").unwrap();
-    let first=persist_report_revision(dir.path(),date,b"TEST_CODE_restated_A").unwrap();
-    let repeat=persist_report_revision(dir.path(),date,b"TEST_CODE_restated_A").unwrap();
-    let second=persist_report_revision(dir.path(),date,b"TEST_CODE_restated_B").unwrap();
-    assert_eq!(first,repeat);assert_ne!(first,second);
-    assert_eq!(std::fs::read(legacy).unwrap(),b"TEST_CODE_frozen_original");
-    assert_eq!(std::fs::read(first).unwrap(),b"TEST_CODE_restated_A");
+    let dir = tempfile::tempdir().unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+    let legacy = dir.path().join("2026-09-15.md");
+    std::fs::write(&legacy, b"TEST_CODE_frozen_original").unwrap();
+    let first = persist_report_revision(dir.path(), date, b"TEST_CODE_restated_A").unwrap();
+    let repeat = persist_report_revision(dir.path(), date, b"TEST_CODE_restated_A").unwrap();
+    let second = persist_report_revision(dir.path(), date, b"TEST_CODE_restated_B").unwrap();
+    assert_eq!(first, repeat);
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read(legacy).unwrap(), b"TEST_CODE_frozen_original");
+    assert_eq!(std::fs::read(first).unwrap(), b"TEST_CODE_restated_A");
 }
 
 /// 千分位 + 符号金额: -8120 → "-8,120"

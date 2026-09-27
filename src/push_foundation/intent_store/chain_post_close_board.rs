@@ -2748,7 +2748,14 @@ pub(super) fn validate_and_capture_board_facts_for_read_pass<'pass, 'connection>
     parent: Option<&'pass BoardParentFact>,
     proof: &schema::V12CatalogProof<'_, '_>,
 ) -> Result<ValidatedBoardFacts<'pass, 'connection>, ChainPostCloseError> {
-    validate_existing_board_facts_scoped(transaction, intent, run, parent, proof.layout(), Some(proof))?;
+    validate_existing_board_facts_scoped(
+        transaction,
+        intent,
+        run,
+        parent,
+        proof.layout(),
+        Some(proof),
+    )?;
     Ok(ValidatedBoardFacts {
         transaction,
         run,

@@ -3,8 +3,7 @@ use rusqlite::params;
 use rusqlite::types::Value;
 use std::time::Duration;
 
-const FUTURE_14_SHA256: &str =
-    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const FUTURE_14_SHA256: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const FUTURE_15_SHA256: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 const FUTURE_16_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FUTURE_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -304,7 +303,12 @@ fn assert_future_layout_delta(
             );
         }
     }
-    let forged = [Value::Integer(13), Value::Integer(14), Value::Integer(15), Value::Integer(16)];
+    let forged = [
+        Value::Integer(13),
+        Value::Integer(14),
+        Value::Integer(15),
+        Value::Integer(16),
+    ];
     let old_headers = damaged.tables["chain_post_close_layouts"]
         .iter()
         .filter(|row| !forged.contains(&row[0]))

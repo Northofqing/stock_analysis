@@ -15,7 +15,9 @@ use crate::trading::paper_lot_ledger::parse_paper_fill_timestamp;
 const MIN_CLOSED_POSITIONS: usize = 200;
 const MIN_COVERAGE_DAYS: i64 = 84;
 
-#[derive(diesel::QueryableByName, Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    diesel::QueryableByName, Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize,
+)]
 pub struct EconomicFillRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub id: i64,
@@ -970,26 +972,52 @@ pub fn select_economic_rows_through(
 
 /// Current runtime selection is explicit: an activated binding reads its epoch;
 /// without one, only an unbound LegacyRaw/as-known database is accepted.
-pub fn query_effective_fills_through(as_of_date: NaiveDate) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
-    use crate::trading::paper_ledger::{EffectiveFillRequest,EffectiveFillScope,EffectiveHistory,PaperLedger};
+pub fn query_effective_fills_through(
+    as_of_date: NaiveDate,
+) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
+    use crate::trading::paper_ledger::{
+        EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, PaperLedger,
+    };
     let db = crate::database::DatabaseManager::try_get()
         .ok_or_else(|| "economic-position database is not initialized".to_owned())?;
-    let (scope,history)=match std::env::var(crate::trading::paper_ledger_runtime::BINDING_ENV) {
-        Ok(raw)=>(EffectiveFillScope::Epoch(serde_json::from_str(&raw).map_err(|e|format!("invalid paper binding: {e}"))?),EffectiveHistory::RestatedLatest),
-        Err(std::env::VarError::NotPresent)=>(EffectiveFillScope::LegacyRaw,EffectiveHistory::AsKnown{ledger_version:None}),
-        Err(error)=>return Err(format!("invalid paper binding: {error}")),
+    let (scope, history) = match std::env::var(crate::trading::paper_ledger_runtime::BINDING_ENV) {
+        Ok(raw) => (
+            EffectiveFillScope::Epoch(
+                serde_json::from_str(&raw).map_err(|e| format!("invalid paper binding: {e}"))?,
+            ),
+            EffectiveHistory::RestatedLatest,
+        ),
+        Err(std::env::VarError::NotPresent) => (
+            EffectiveFillScope::LegacyRaw,
+            EffectiveHistory::AsKnown {
+                ledger_version: None,
+            },
+        ),
+        Err(error) => return Err(format!("invalid paper binding: {error}")),
     };
-    PaperLedger::open(db,&chrono::Utc::now).verified_effective_fills(&EffectiveFillRequest{scope,history,as_of:as_of_date}).map_err(|e|e.to_string())
+    PaperLedger::open(db, &chrono::Utc::now)
+        .verified_effective_fills(&EffectiveFillRequest {
+            scope,
+            history,
+            as_of: as_of_date,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Financial rows and fees are obtained from one opaque frozen read capability.
 pub fn report_from_effective(
     effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
 ) -> Result<EconomicPositionReport, String> {
-    let sample=effective.opening_inventory_sample().map_err(|e|e.to_string())?;
-    let mut report=rebuild_economic_positions(&sample.strategy_rows,effective.receipt().request.as_of,Some(&sample.strategy_costs))?;
-    report.effective_projection=Some(effective.receipt().clone());
-    report.opening_inventory=Some(sample);
+    let sample = effective
+        .opening_inventory_sample()
+        .map_err(|e| e.to_string())?;
+    let mut report = rebuild_economic_positions(
+        &sample.strategy_rows,
+        effective.receipt().request.as_of,
+        Some(&sample.strategy_costs),
+    )?;
+    report.effective_projection = Some(effective.receipt().clone());
+    report.opening_inventory = Some(sample);
     Ok(report)
 }
 

@@ -332,10 +332,8 @@ pub fn classify_tier(evidence: &[String]) -> EvidenceTier {
 ///
 /// 剔除 (P5 §3.3):
 /// 1. 已持仓 — 归 P0-4 管, 不进候选
-/// 2. 停牌 — 用 v11 HALTED_CODES 缓存
-/// 3. ST — 名字含 "*ST"/"ST"/"SST" 等
-/// 4. 北交所 (8/4 开头) / 科创板 (688 开头) — 承接现有过滤
-/// 5. 已涨停 (change_pct >= 9.9%) — 涨停次日接盘风险高
+/// 2–5. 停复牌、ST、板块与涨停状态必须来自当日合格交易事实。
+/// 名字、代码前缀、涨幅百分比和 legacy halt bool 都没有授权能力。
 ///
 /// 输入 entries + 持仓 codes, 输出 过滤后的 entries.
 pub fn filter_hard_gates(
@@ -349,47 +347,72 @@ pub fn filter_hard_gates(
             if held_codes.contains(&e.code) {
                 return false;
             }
-            // 2. 剔除停牌 (用 v11 HALTED_CODES 缓存)
-            if is_halted(&e.code) {
-                return false;
-            }
-            // 3. 剔除 ST (从 name 字段判断)
-            if e.name.contains("ST") {
-                return false;
-            }
-            // 4. 剔除北交所/科创板 (8/4/688 开头, 承接现有过滤)
-            let market_code = market_rule_code(&e.code);
-            if market_code.starts_with('8')
-                || market_code.starts_with('4')
-                || market_code.starts_with("688")
-            {
-                return false;
-            }
-            // 5. 剔除已涨停 (change_pct >= 9.9%)
-            if e.change_pct.is_some_and(|value| value >= 9.9) {
-                return false;
-            }
-            true
+            qualified_candidate_allowed(e)
         })
         .collect()
 }
 
-fn market_rule_code(code: &str) -> &str {
+fn qualified_candidate_allowed(entry: &CandidateEntry) -> bool {
+    let code = entry.code.as_str();
     #[cfg(test)]
-    {
-        code.strip_prefix("TEST_CODE_").unwrap_or(code)
-    }
+    let identity = if code.starts_with("TEST_CODE_") {
+        crate::data_gateway::instrument_identity::resolve_test_equity(code, None)
+    } else {
+        crate::data_gateway::instrument_identity::resolve_production_equity(code, None)
+    };
     #[cfg(not(test))]
-    {
-        code
+    let identity = crate::data_gateway::instrument_identity::resolve_production_equity(code, None);
+    let Ok(identity) = identity else {
+        return false;
+    };
+    let today = chrono::Local::now().date_naive();
+    let facts = crate::data_gateway::QualifiedTradingFactsGateway::new().acquire(
+        crate::data_gateway::QualifiedTradingFactsRequest::new(
+            identity.instrument().clone(),
+            today,
+        ),
+    );
+    if !matches!(
+        facts.lifecycle().require(),
+        Ok(crate::data_gateway::QualifiedListingStatus::Listed)
+    ) || !matches!(
+        facts.suspension().require(),
+        Ok(crate::data_gateway::QualifiedSuspensionStatus::Trading)
+    ) {
+        return false;
     }
+    let Ok(regime) = facts.price_regime().require() else {
+        return false;
+    };
+    candidate_allowed_with_regime(entry, regime)
 }
 
-/// 调 v11 HALTED_PERIODS 查 code 今天是否停牌 (用公开的 is_halted_period, 不依赖私有 is_halted)
-fn is_halted(code: &str) -> bool {
-    use chrono::Local;
-    let today = Local::now().date_naive();
-    crate::monitor::data_quality::is_halted_period(code, today)
+fn candidate_allowed_with_regime(
+    entry: &CandidateEntry,
+    regime: &crate::data_gateway::QualifiedPriceBand,
+) -> bool {
+    if regime.is_st()
+        || matches!(
+            regime.board(),
+            crate::data_gateway::SecurityBoard::Beijing | crate::data_gateway::SecurityBoard::Star
+        )
+    {
+        return false;
+    }
+    let Some(price) = entry.current_price else {
+        return false;
+    };
+    if crate::data_provider::limit_status::validate_price_against_qualified_band(
+        &entry.code,
+        price,
+        regime,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let price_micros = (price * 1_000_000.0).round() as i64;
+    price_micros != regime.upper_price_micros()
 }
 
 #[cfg(test)]
@@ -421,9 +444,9 @@ mod tests_b {
         assert_eq!(classify_tier(&evidence), EvidenceTier::Theme);
     }
 
-    /// 硬门槛: 剔除已持仓
+    /// 权威合同未交付时，即使不是持仓也不得制造候选。
     #[test]
-    fn hard_gate_exclude_held() {
+    fn hard_gate_fails_closed_when_qualified_facts_are_unavailable() {
         let entries = vec![
             CandidateEntry {
                 code: "TEST_CODE_000001".to_string(),
@@ -447,76 +470,68 @@ mod tests_b {
             },
         ];
         let result = filter_hard_gates(entries, &["TEST_CODE_000001".to_string()]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].code, "TEST_CODE_000002",
-            "已持仓 (000001) 应被剔除"
-        );
+        assert!(result.is_empty());
     }
 
-    /// 硬门槛: 剔除 ST/北交所/科创板/已涨停
+    fn regime(
+        board: crate::data_gateway::SecurityBoard,
+        is_st: bool,
+    ) -> crate::data_gateway::QualifiedPriceBand {
+        let today = chrono::Local::now().date_naive();
+        crate::data_gateway::QualifiedPriceBand::new(
+            board,
+            is_st,
+            10_000,
+            9_000_000,
+            11_000_000,
+            today,
+            today,
+            "TEST_EXPLICIT_CANDIDATE_REGIME_V1",
+        )
+        .unwrap()
+    }
+
+    fn candidate(code: &str, name: &str, price: f64) -> CandidateEntry {
+        CandidateEntry {
+            code: code.to_string(),
+            name: name.to_string(),
+            sources: vec![CandidateSource::StockPick],
+            tier: EvidenceTier::Strong,
+            evidence: vec![],
+            current_price: Some(price),
+            change_pct: Some(1.0),
+            heat_score: None,
+        }
+    }
+
+    /// 硬门槛只读取显式板块/ST/价格带事实，不读取名称、代码前缀或涨幅猜测。
     #[test]
-    fn hard_gate_exclude_st_bse_star() {
-        let entries = vec![
-            // ST 票 — 剔除
-            CandidateEntry {
-                code: "TEST_CODE_000005".to_string(),
-                name: "ST 测试".to_string(),
-                sources: vec![CandidateSource::StockPick],
-                tier: EvidenceTier::Strong,
-                evidence: vec![],
-                current_price: Some(10.0),
-                change_pct: Some(1.0),
-                heat_score: None,
-            },
-            // 北交所 (8 开头) — 剔除
-            CandidateEntry {
-                code: "TEST_CODE_830799".to_string(),
-                name: "北交所测试".to_string(),
-                sources: vec![CandidateSource::StockPick],
-                tier: EvidenceTier::Strong,
-                evidence: vec![],
-                current_price: Some(10.0),
-                change_pct: Some(1.0),
-                heat_score: None,
-            },
-            // 科创板 (688 开头) — 剔除
-            CandidateEntry {
-                code: "TEST_CODE_688981".to_string(),
-                name: "科创板测试".to_string(),
-                sources: vec![CandidateSource::StockPick],
-                tier: EvidenceTier::Strong,
-                evidence: vec![],
-                current_price: Some(10.0),
-                change_pct: Some(1.0),
-                heat_score: None,
-            },
-            // 已涨停 (10%+) — 剔除
-            CandidateEntry {
-                code: "TEST_CODE_000999".to_string(),
-                name: "涨停测试".to_string(),
-                sources: vec![CandidateSource::StockPick],
-                tier: EvidenceTier::Strong,
-                evidence: vec![],
-                current_price: Some(11.0),
-                change_pct: Some(10.0),
-                heat_score: None,
-            },
-            // 正常票 — 保留
-            CandidateEntry {
-                code: "TEST_CODE_600000".to_string(),
-                name: "正常".to_string(),
-                sources: vec![CandidateSource::StockPick],
-                tier: EvidenceTier::Strong,
-                evidence: vec![],
-                current_price: Some(10.0),
-                change_pct: Some(1.0),
-                heat_score: None,
-            },
-        ];
-        let result = filter_hard_gates(entries, &[]);
-        assert_eq!(result.len(), 1, "只 1 只正常票应通过 5 个门槛");
-        assert_eq!(result[0].code, "TEST_CODE_600000");
+    fn explicit_regime_excludes_st_bse_star_and_exact_upper_limit() {
+        let misleading_name_and_code = candidate("688FAKE", "ST 假名字", 10.0);
+        assert!(candidate_allowed_with_regime(
+            &misleading_name_and_code,
+            &regime(crate::data_gateway::SecurityBoard::Main, false)
+        ));
+        assert!(!candidate_allowed_with_regime(
+            &candidate("600000", "正常", 10.0),
+            &regime(crate::data_gateway::SecurityBoard::Main, true)
+        ));
+        assert!(!candidate_allowed_with_regime(
+            &candidate("600000", "正常", 10.0),
+            &regime(crate::data_gateway::SecurityBoard::Beijing, false)
+        ));
+        assert!(!candidate_allowed_with_regime(
+            &candidate("600000", "正常", 10.0),
+            &regime(crate::data_gateway::SecurityBoard::Star, false)
+        ));
+        assert!(!candidate_allowed_with_regime(
+            &candidate("600000", "正常", 11.0),
+            &regime(crate::data_gateway::SecurityBoard::Main, false)
+        ));
+        assert!(!candidate_allowed_with_regime(
+            &candidate("600000", "正常", 10.0000004),
+            &regime(crate::data_gateway::SecurityBoard::Main, false)
+        ));
     }
 }
 

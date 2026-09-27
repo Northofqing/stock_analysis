@@ -980,26 +980,32 @@ pub(crate) fn map_external_build_identity_error(
     error: crate::grpc_client::build_identity::BuildIdentityError,
 ) -> GatewayError {
     use crate::grpc_client::build_identity::BuildIdentityError;
-        let (outcome, reason_code, retryable) = match error {
-            BuildIdentityError::NotReady => ("unavailable", "external_health_not_ready", true),
-            BuildIdentityError::ExpectedIdentityUnavailable => {
-                ("invalid_request", "external_expected_identity_missing", false)
-            }
-            _ => ("invalid_evidence", "external_build_identity_unverified", false),
-        };
-        let message = if matches!(error, BuildIdentityError::NotReady) {
-            "ExternalV1 health 未达到 live+ready".to_owned()
-        } else {
-            format!("ExternalV1 health qualification failed: {error}")
-        };
-        GatewayError::classified(
-            "GrpcExternalV1",
-            None,
-            outcome,
-            reason_code,
-            retryable,
-            message,
-        )
+    let (outcome, reason_code, retryable) = match error {
+        BuildIdentityError::NotReady => ("unavailable", "external_health_not_ready", true),
+        BuildIdentityError::ExpectedIdentityUnavailable => (
+            "invalid_request",
+            "external_expected_identity_missing",
+            false,
+        ),
+        _ => (
+            "invalid_evidence",
+            "external_build_identity_unverified",
+            false,
+        ),
+    };
+    let message = if matches!(error, BuildIdentityError::NotReady) {
+        "ExternalV1 health 未达到 live+ready".to_owned()
+    } else {
+        format!("ExternalV1 health qualification failed: {error}")
+    };
+    GatewayError::classified(
+        "GrpcExternalV1",
+        None,
+        outcome,
+        reason_code,
+        retryable,
+        message,
+    )
 }
 
 /// Historical V1 control-row interpretation only. It preserves the outcome
@@ -2524,7 +2530,10 @@ where
 /// Reuse the bounded bridge runtime for synchronous Gateway finalizers that
 /// need async lifecycle evidence. This does not create another transport owner.
 pub(super) fn block_on_gateway<F, T>(future: F) -> Result<T, GatewayError>
-where F: std::future::Future<Output=Result<T,GatewayError>> + Send, T: Send {
+where
+    F: std::future::Future<Output = Result<T, GatewayError>> + Send,
+    T: Send,
+{
     block_on(future)
 }
 
@@ -2738,9 +2747,9 @@ impl ConnectedBoardQueries {
     pub(crate) fn memberships_completion(
         completion: BoardAttemptCompletion,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
-        let query = completion
-            .processed
-            .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))?;
+        let query = completion.processed.map_err(|error| {
+            map_legacy_durable_query_error(Operation::BoardConstituents, &error)
+        })?;
         convert::board_constituents(&query)
     }
 
@@ -3208,10 +3217,7 @@ impl GrpcSource {
             "[data_gateway] ExternalV1 已通过 health/capability gate: method={}",
             method.as_str_name()
         );
-        *self.external_client.lock().await = Some(ExternalClientState {
-            client,
-            prepared,
-        });
+        *self.external_client.lock().await = Some(ExternalClientState { client, prepared });
         Ok(())
     }
 
@@ -3360,6 +3366,30 @@ impl GrpcSource {
             batch.evidence().provider,
         )?;
         Ok(batch)
+    }
+
+    /// Quote-only permissive ingress. Shared evidence stays strict while
+    /// missing rows and bindable record-local failures are classified by the
+    /// quote-specific coverage layer.
+    pub(crate) async fn realtime_quote_candidates_async(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+        require_valid_requested_codes("RealtimeMarketQuotes", codes)?;
+        let q = self
+            .query_op(
+                Operation::RealtimeQuotes,
+                serde_json::json!({ "codes": codes }),
+            )
+            .await?;
+        convert::realtime_quote_candidates_at(&q, chrono::Utc::now())
+    }
+
+    pub(crate) fn realtime_quote_candidates(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<RealtimeMarketQuote>, GatewayError> {
+        block_on(self.realtime_quote_candidates_async(codes))
     }
 
     /// 同步包装 (spawn_blocking / 纯同步线程)。
@@ -3651,10 +3681,14 @@ impl GrpcSource {
     pub async fn futures_delivery_async(
         &self,
     ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
-        let q = self
-            .query_op(Operation::FuturesDelivery, serde_json::json!({}))
-            .await?;
-        convert::futures_delivery(&q)
+        Err(GatewayError::classified(
+            "FuturesDelivery",
+            None,
+            "unavailable",
+            crate::data_gateway::futures_delivery::FUTURES_DELIVERY_CONTRACT_UNAVAILABLE_V1,
+            false,
+            "futures delivery request/coverage contract is unavailable; raw source bypass is disabled",
+        ))
     }
 
     // ---------- M3 批次 2: 龙虎榜/大宗/一致预期/板块/研报/北向/财务/技术/资金流/排行/指数/个股新闻/形态/涨停复盘/T0 ----------
@@ -4343,7 +4377,7 @@ mod tests {
     use futures::FutureExt as _;
     use prost::Message; // pb::ErrorDetail::encode_to_vec
                         // env 是进程级: 这些测试并行时会互相看到对方的 env (race)。
-    // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
+                        // 共享锁串行化 env 敏感的测试 (M3 全量并行跑时暴露)。
 
     #[tokio::test(flavor = "current_thread")]
     async fn retired_economic_calendar_does_not_initialize_transport() {
@@ -4704,15 +4738,33 @@ mod tests {
             retryable: true,
             ..Default::default()
         };
-        let status = tonic::Status::with_details(tonic::Code::InvalidArgument, "TEST_CODE error", wire.encode_to_vec().into());
+        let status = tonic::Status::with_details(
+            tonic::Code::InvalidArgument,
+            "TEST_CODE error",
+            wire.encode_to_vec().into(),
+        );
         let error = map_legacy_durable_query_error(Operation::Consensus, &GrpcError::from(status));
-        assert_eq!(error.provider(), None, "frozen durable v1 projection must keep its original bytes");
+        assert_eq!(
+            error.provider(),
+            None,
+            "frozen durable v1 projection must keep its original bytes"
+        );
         let stored = crate::data_gateway::review::store_gateway_error(&error);
         let bytes = serde_json::to_vec(&stored).unwrap();
-        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), r#"{"capability":"GrpcBridge","provider":null,"audit_outcome":"invalid_request","reason_code":"invalid_request","retryable":false,"message":"gRPC Consensus 查询失败: 请求参数错误 (不重试)"}"#);
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            r#"{"capability":"GrpcBridge","provider":null,"audit_outcome":"invalid_request","reason_code":"invalid_request","retryable":false,"message":"gRPC Consensus 查询失败: 请求参数错误 (不重试)"}"#
+        );
         let restored = crate::data_gateway::review::restore_gateway_error(&stored).unwrap();
-        assert_eq!(serde_json::to_vec(&crate::data_gateway::review::store_gateway_error(&restored)).unwrap(), bytes);
-        assert_eq!(restored.message(), "gRPC Consensus 查询失败: 请求参数错误 (不重试)");
+        assert_eq!(
+            serde_json::to_vec(&crate::data_gateway::review::store_gateway_error(&restored))
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            restored.message(),
+            "gRPC Consensus 查询失败: 请求参数错误 (不重试)"
+        );
     }
 
     /// D2: Unavailable 无 ErrorDetail (服务端不可达, connect 失败) →
@@ -5608,6 +5660,62 @@ mod tests {
     }
 
     #[test]
+    fn task9_wire_quote_candidates_preserve_local_failure_for_coverage_classifier() {
+        let query = br238_query(
+            "market.realtime_quotes",
+            1,
+            serde_json::json!([
+                {
+                    "code": "TEST_CODE_A",
+                    "name": "A",
+                    "price": 10.0,
+                    "change_pct": 1.0,
+                    "previous_close": 9.9
+                },
+                {
+                    "code": "TEST_CODE_B",
+                    "name": "B",
+                    "price": "bad-local-value",
+                    "change_pct": 1.0,
+                    "previous_close": 9.9
+                }
+            ]),
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-17T01:30:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let candidates = convert::realtime_quote_candidates_at(&query, now)
+            .expect("shared envelope remains admissible");
+        let requested = vec!["TEST_CODE_A".to_owned(), "TEST_CODE_B".to_owned()];
+        let coverage =
+            crate::data_gateway::RealtimeQuoteCoverage::classify(&requested, Ok(candidates));
+        assert_eq!(
+            coverage.disposition(),
+            crate::data_gateway::QuoteCoverageDisposition::Partial
+        );
+        assert_eq!(coverage.accepted()[0].code, "TEST_CODE_A");
+        assert_eq!(coverage.rejected()[0].code.as_deref(), Some("TEST_CODE_B"));
+        assert_eq!(coverage.rejected()[0].reason_code, "invalid_quote_price");
+        assert!(convert::realtime_quotes_at(&query, now).is_err());
+    }
+
+    #[test]
+    fn task9_raw_futures_delivery_source_is_disabled_before_transport() {
+        let _env = test_grpc_env_guard();
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        reset_bridge();
+        let bridge = bridge_for("FuturesDelivery").expect("bridge construction is lazy");
+        let error = block_on(bridge.futures_delivery_async()).unwrap_err();
+        assert_eq!(
+            error.reason_code(),
+            crate::data_gateway::futures_delivery::FUTURES_DELIVERY_CONTRACT_UNAVAILABLE_V1
+        );
+        assert!(!error.retryable());
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        reset_bridge();
+    }
+
+    #[test]
     fn br238_diagnostic_report_retains_a_failure_and_later_success() {
         let mut report = OpeningDiagnosticReport::default();
         report.record_failure(
@@ -6030,7 +6138,8 @@ mod tests {
             "取数失败",
             pb_detail.encode_to_vec().into(),
         );
-        let g = map_legacy_durable_query_error(Operation::OutcomeDailyBars, &GrpcError::from(status));
+        let g =
+            map_legacy_durable_query_error(Operation::OutcomeDailyBars, &GrpcError::from(status));
         assert_eq!(g.provider(), Some(ProviderId::Tdx));
         assert_eq!(g.reason_code(), "no_verified_batch");
         assert!(g.retryable());

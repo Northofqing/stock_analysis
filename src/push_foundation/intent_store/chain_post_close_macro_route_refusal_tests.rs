@@ -3,9 +3,7 @@ use crate::data_gateway::grpc_source::macro_queries::PreparedMacroQueries;
 use crate::grpc_client::client::external_control_loopback_fixture::{
     ExternalControlObservation, ExternalMtlsMacroFixture,
 };
-use crate::grpc_client::client::macro_loopback_fixture::{
-    MacroLoopbackServer, MacroObservation,
-};
+use crate::grpc_client::client::macro_loopback_fixture::{MacroLoopbackServer, MacroObservation};
 use crate::grpc_client::client::ContractProfile;
 use crate::grpc_client::errors::{ErrorDetail as GrpcErrorDetail, GrpcError};
 use crate::pipeline::chain_analysis::preparation::ChainPreparationIo;
@@ -355,7 +353,10 @@ async fn start_original(
         ContractProfile::LocalBridgeV1 => {
             assert!(recovery.readiness_episodes().is_empty());
             assert_eq!(recovery.attempts().len(), 1);
-            assert_eq!(recovery.attempts()[0].request_bytes(), expected.request_bytes);
+            assert_eq!(
+                recovery.attempts()[0].request_bytes(),
+                expected.request_bytes
+            );
             assert_eq!(recovery.attempts()[0].result_version(), None);
             let (tcp, wire) = local_server.snapshot_with_tcp_for_test();
             assert_eq!(tcp, 1);
@@ -400,7 +401,10 @@ async fn start_original(
     assert_eq!(fixed.health_raw, None);
     assert_eq!(fixed.capabilities_raw, None);
     assert_eq!(fixed.control_results, 0);
-    assert_eq!(fixed.data_begins, i64::from(expected.profile == ContractProfile::LocalBridgeV1));
+    assert_eq!(
+        fixed.data_begins,
+        i64::from(expected.profile == ContractProfile::LocalBridgeV1)
+    );
     assert_eq!(fixed.source_finals, 0);
 }
 
@@ -410,9 +414,8 @@ async fn run_case(case: RouteCase) {
     let mut local_server = None;
     let mut external_a = None;
     let mut external_b = None;
-    let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(120),
-        async {
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
             let baseline = control_tests::setup_external_parent(
                 &mut business,
                 &mut parent_server,
@@ -445,10 +448,9 @@ async fn run_case(case: RouteCase) {
             let external_source_b = GrpcSource::from_external_macro_bundle_for_test(
                 external_b_ref.bundle_path().to_path_buf(),
             );
-            let external_source_wrong_authority =
-                GrpcSource::from_external_macro_bundle_for_test(
-                    external_a_ref.wrong_name_bundle_path().to_path_buf(),
-                );
+            let external_source_wrong_authority = GrpcSource::from_external_macro_bundle_for_test(
+                external_a_ref.wrong_name_bundle_path().to_path_buf(),
+            );
             let (expected, plan_head) = if case == RouteCase::LocalToExternal {
                 plan_local_without_begin(
                     &mut business,
@@ -475,9 +477,18 @@ async fn run_case(case: RouteCase) {
                 )
             };
             assert_eq!(expected.profile, case.original_profile());
-            assert_eq!(local_server_ref.snapshot_with_tcp_for_test(), local_connected);
-            assert_eq!(external_a_ref.snapshot(), ExternalControlObservation::default());
-            assert_eq!(external_b_ref.snapshot(), ExternalControlObservation::default());
+            assert_eq!(
+                local_server_ref.snapshot_with_tcp_for_test(),
+                local_connected
+            );
+            assert_eq!(
+                external_a_ref.snapshot(),
+                ExternalControlObservation::default()
+            );
+            assert_eq!(
+                external_b_ref.snapshot(),
+                ExternalControlObservation::default()
+            );
             business.reopen();
 
             let now = micros(STARTED_LOCAL) + 2_000_000;
@@ -577,10 +588,16 @@ async fn run_case(case: RouteCase) {
             .await;
             match expected.profile {
                 ContractProfile::LocalBridgeV1 => {
-                    assert_eq!(external_b_ref.snapshot(), ExternalControlObservation::default());
+                    assert_eq!(
+                        external_b_ref.snapshot(),
+                        ExternalControlObservation::default()
+                    );
                 }
                 ContractProfile::ExternalV1 => {
-                    assert_eq!(external_b_ref.snapshot(), ExternalControlObservation::default());
+                    assert_eq!(
+                        external_b_ref.snapshot(),
+                        ExternalControlObservation::default()
+                    );
                     assert_eq!(local_server_ref.snapshot_with_tcp_for_test().0, 1);
                 }
             }
@@ -596,17 +613,24 @@ async fn run_case(case: RouteCase) {
             local_server_ref.release_response();
             control_unknown_commit_tests::release_all(external_a_ref);
             control_unknown_commit_tests::release_all(external_b_ref);
-        },
-    ))
-    .catch_unwind()
-    .await;
+        }))
+        .catch_unwind()
+        .await;
 
     let local_cleanup = match local_server.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await,
+        Some(server) => {
+            std::panic::AssertUnwindSafe(server.finish())
+                .catch_unwind()
+                .await
+        }
         None => Ok(Ok(())),
     };
     let external_b_cleanup = match external_b.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await,
+        Some(server) => {
+            std::panic::AssertUnwindSafe(server.finish())
+                .catch_unwind()
+                .await
+        }
         None => Ok(Ok(())),
     };
     let common_cleanup = std::panic::AssertUnwindSafe(control_tests::cleanup_external_case(
@@ -631,21 +655,25 @@ async fn run_case(case: RouteCase) {
 }
 
 #[tokio::test]
-async fn single_user_local_macro_plan_rejects_external_route_before_rpc_then_original_local_starts() {
+async fn single_user_local_macro_plan_rejects_external_route_before_rpc_then_original_local_starts()
+{
     run_case(RouteCase::LocalToExternal).await;
 }
 
 #[tokio::test]
-async fn single_user_external_macro_plan_rejects_local_route_before_rpc_then_original_health_starts() {
+async fn single_user_external_macro_plan_rejects_local_route_before_rpc_then_original_health_starts(
+) {
     run_case(RouteCase::ExternalToLocal).await;
 }
 
 #[tokio::test]
-async fn single_user_external_macro_plan_rejects_changed_endpoint_before_rpc_then_original_health_starts() {
+async fn single_user_external_macro_plan_rejects_changed_endpoint_before_rpc_then_original_health_starts(
+) {
     run_case(RouteCase::ExternalEndpoint).await;
 }
 
 #[tokio::test]
-async fn single_user_external_macro_plan_rejects_changed_authority_before_rpc_then_original_health_starts() {
+async fn single_user_external_macro_plan_rejects_changed_authority_before_rpc_then_original_health_starts(
+) {
     run_case(RouteCase::ExternalAuthority).await;
 }

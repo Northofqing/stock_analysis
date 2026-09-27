@@ -4161,10 +4161,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         hit: bool,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         if prediction_id <= 0 {
-            return Err(invalid_input(format!(
-                "prediction_id 必须为正整数: {prediction_id}"
-            ))
-            .into());
+            return Err(
+                invalid_input(format!("prediction_id 必须为正整数: {prediction_id}")).into(),
+            );
         }
         if !actual_change.is_finite() || actual_change < -100.0 {
             return Err(invalid_input(format!(
@@ -4228,18 +4227,18 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
     }
 
     /// Freeze the scan's upper ID so concurrent inserts are deferred to the next run.
-    pub fn prediction_verification_high_water_id(
-        &self,
-    ) -> Result<i32, Box<dyn std::error::Error>> {
+    pub fn prediction_verification_high_water_id(&self) -> Result<i32, Box<dyn std::error::Error>> {
         #[derive(QueryableByName)]
         struct Id {
             #[diesel(sql_type = diesel::sql_types::Integer)]
             id: i32,
         }
         let mut conn = self.get_conn()?;
-        Ok(diesel::sql_query("SELECT COALESCE(MAX(id),0) AS id FROM prediction_tracker")
-            .get_result::<Id>(&mut conn)?
-            .id)
+        Ok(
+            diesel::sql_query("SELECT COALESCE(MAX(id),0) AS id FROM prediction_tracker")
+                .get_result::<Id>(&mut conn)?
+                .id,
+        )
     }
 
     /// Stable keyset over all due rows, not a lookback over prediction creation dates.

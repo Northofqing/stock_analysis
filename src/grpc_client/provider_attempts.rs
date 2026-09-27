@@ -15,9 +15,7 @@ pub(crate) struct ExternalProviderCatalog {
 }
 
 impl ExternalProviderCatalog {
-    pub(crate) fn from_request_id_validated_capabilities(
-        response: &CapabilitiesResponse,
-    ) -> Self {
+    pub(crate) fn from_request_id_validated_capabilities(response: &CapabilitiesResponse) -> Self {
         Self {
             providers: response
                 .capabilities
@@ -152,8 +150,8 @@ impl ProviderAttempts {
 
         let mut projected = Vec::with_capacity(observed_count);
         for (index, attempt) in attempts.into_iter().enumerate() {
-            let expected_ordinal = u32::try_from(index + 1)
-                .expect("provider-attempt count is bounded at sixteen");
+            let expected_ordinal =
+                u32::try_from(index + 1).expect("provider-attempt count is bounded at sixteen");
             if attempt.ordinal != expected_ordinal
                 || !valid_provider_identity(&attempt.provider)
                 || !catalog.contains(&attempt.provider)
@@ -223,8 +221,8 @@ fn valid_outcome_contract(
         "failed" => match reason_code {
             "transport" | "timeout" | "rate_limited" | "unavailable" | "provider_busy"
             | "worker_unavailable" => retryable,
-            "invalid_request" | "unsupported" | "no_data" | "protocol" | "quality"
-            | "evidence" | "provider" => !retryable,
+            "invalid_request" | "unsupported" | "no_data" | "protocol" | "quality" | "evidence"
+            | "provider" => !retryable,
             _ => false,
         },
         _ => false,

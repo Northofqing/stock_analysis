@@ -9,23 +9,20 @@
 use chrono::NaiveDate;
 
 use crate::data_gateway::historical_bars::HistoricalBarsGateway;
-use crate::data_provider::limit_status::LimitStatusCalculator;
+use crate::data_gateway::QualifiedPriceBand;
 use crate::data_provider::KlineData;
 use crate::database::catalyst_watchlist::{WatchEntry, WatchOutcome, WatchlistSnapshot};
 
-/// 涨停价容差: limit_status.rs fill_limit_flags 同款 ±0.005 (容忍浮点误差)
-const LIMIT_TOLERANCE: f64 = 0.005;
 /// 「冲高回落」判定: 未涨停且收盘距最高价回落 ≥ 1%
 const PULLBACK_PCT: f64 = 0.01;
 
 /// 单只核对 (纯逻辑, 无 IO)。
-/// `close/prev_close/open/high/low` 来自当日/昨日日线; 涨停价按
-/// `LimitStatusCalculator::calculate(code, prev_close, name)` 精确计算
-/// (主板 10% / 创业科创 20% / 北交 30% / ST 5%)。
+/// `close/prev_close/open/high/low` 来自当日/昨日日线；涨停边界必须由
+/// 同一证券、同一生效日的 authority-qualified price band 显式提供。
 // Keep the stable pure-function boundary aligned with the complete OHLC evidence tuple;
 // introducing a parameter object would expand this public API and all of its call sites.
 #[allow(clippy::too_many_arguments)]
-pub fn check_entry(
+pub(crate) fn check_entry(
     watch_date: NaiveDate,
     entry: &WatchEntry,
     today: NaiveDate,
@@ -34,14 +31,24 @@ pub fn check_entry(
     open: f64,
     high: f64,
     low: f64,
-) -> WatchOutcome {
-    let calc = LimitStatusCalculator::new();
-    let status = calc.calculate(&entry.code, prev_close, &entry.name);
-    let is_limit_up =
-        status.limit_up_price > 0.0 && (close - status.limit_up_price).abs() < LIMIT_TOLERANCE;
-    let is_one_word = is_limit_up
-        && (open - high).abs() < LIMIT_TOLERANCE
-        && (high - low).abs() < LIMIT_TOLERANCE;
+    band: &QualifiedPriceBand,
+) -> Result<WatchOutcome, String> {
+    let close_micros = price_to_micros(&entry.code, "close", close)?;
+    let open_micros = price_to_micros(&entry.code, "open", open)?;
+    let high_micros = price_to_micros(&entry.code, "high", high)?;
+    let low_micros = price_to_micros(&entry.code, "low", low)?;
+    for (field, price_micros) in [
+        ("close", close_micros),
+        ("open", open_micros),
+        ("high", high_micros),
+        ("low", low_micros),
+    ] {
+        band.validate_price_micros(price_micros).map_err(|error| {
+            format!("{} {field} rejected by qualified band: {error}", entry.code)
+        })?;
+    }
+    let is_limit_up = close_micros == band.upper_price_micros();
+    let is_one_word = is_limit_up && open_micros == high_micros && high_micros == low_micros;
     let limit_up_type = if is_one_word {
         "一字"
     } else if is_limit_up {
@@ -55,7 +62,7 @@ pub fn check_entry(
     } else {
         0.0
     };
-    WatchOutcome {
+    Ok(WatchOutcome {
         watch_date,
         checked_date: today,
         code: entry.code.clone(),
@@ -68,7 +75,23 @@ pub fn check_entry(
         streak_today,
         high: Some(high),
         open: Some(open),
+    })
+}
+
+fn price_to_micros(code: &str, field: &str, price: f64) -> Result<i64, String> {
+    let scaled = price * 1_000_000.0;
+    if !scaled.is_finite() || scaled <= 0.0 || scaled >= i64::MAX as f64 {
+        return Err(format!(
+            "{code} {field} is not a positive finite price: {price:?}"
+        ));
     }
+    let rounded = scaled.round();
+    if (scaled - rounded).abs() > 1e-6 {
+        return Err(format!(
+            "{code} {field} precision exceeds micro-CNY: {price:?}"
+        ));
+    }
+    Ok(rounded as i64)
 }
 
 /// 从日线批次取「最新 + 前一根」。
@@ -104,6 +127,21 @@ pub fn check_watchlist_today(
     let mut outcomes = Vec::new();
     let mut skipped = Vec::new();
     for entry in snapshot.leading.iter().chain(snapshot.other.iter()) {
+        let band = match crate::data_provider::limit_status::qualified_price_band_for_code(
+            &entry.code,
+            today,
+        ) {
+            Ok(band) => band,
+            Err(error) => {
+                log::warn!(
+                    "[R-13] {} {} qualified trading facts unavailable: {error}, skip",
+                    entry.code,
+                    entry.name
+                );
+                skipped.push(entry.code.clone());
+                continue;
+            }
+        };
         match gateway.required_daily_bars(&entry.code, 2) {
             Ok(batch) => {
                 let Some((latest, prev)) = latest_and_prev(batch.records()) else {
@@ -135,7 +173,7 @@ pub fn check_watchlist_today(
                     skipped.push(entry.code.clone());
                     continue;
                 }
-                outcomes.push(check_entry(
+                match check_entry(
                     snapshot.watch_date,
                     entry,
                     today,
@@ -144,7 +182,14 @@ pub fn check_watchlist_today(
                     latest.open,
                     latest.high,
                     latest.low,
-                ));
+                    &band,
+                ) {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(error) => {
+                        log::warn!("[R-13] {error}, skip");
+                        skipped.push(entry.code.clone());
+                    }
+                }
             }
             Err(error) => {
                 log::warn!(
@@ -263,6 +308,20 @@ mod tests {
         }
     }
 
+    fn price_band(today: NaiveDate, upper: f64, is_st: bool) -> QualifiedPriceBand {
+        QualifiedPriceBand::new(
+            crate::data_gateway::SecurityBoard::Main,
+            is_st,
+            10_000,
+            1_000_000,
+            (upper * 1_000_000.0).round() as i64,
+            today,
+            today,
+            "TEST_EXPLICIT_WATCHLIST_PRICE_BAND_V1",
+        )
+        .unwrap()
+    }
+
     fn kline(date: &str, close: f64) -> KlineData {
         KlineData {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
@@ -329,16 +388,20 @@ mod tests {
     fn check_entry_limit_up_sealed() {
         // 主板 10%: 昨收 11.59 → 涨停价 12.75 (round_to_cent(11.59*1.1))
         let e = entry("600721", "百花医药", 1);
+        let watch_date = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
         let o = check_entry(
-            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            watch_date,
             &e,
-            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
+            today,
             12.75,
             11.59,
             12.20,
-            12.80,
+            12.70,
             12.10,
-        );
+            &price_band(today, 12.75, false),
+        )
+        .unwrap();
         assert!(o.limit_up);
         assert_eq!(o.limit_up_type, "封板");
         assert_eq!(o.streak_today, 2); // 昨日 1 板 + 今日涨停
@@ -354,16 +417,20 @@ mod tests {
     fn check_entry_one_word_limit() {
         // 一字板: open == high == low == close == 涨停价
         let e = entry("603758", "秦安股份", 1);
+        let watch_date = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
         let o = check_entry(
-            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            watch_date,
             &e,
-            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
+            today,
             12.98,
             11.80,
             12.98,
             12.98,
             12.98,
-        );
+            &price_band(today, 12.98, false),
+        )
+        .unwrap();
         assert!(o.limit_up);
         assert_eq!(o.limit_up_type, "一字");
         assert_eq!(o.streak_today, 2);
@@ -372,16 +439,20 @@ mod tests {
     #[test]
     fn check_entry_not_limit_breaks_streak() {
         let e = entry("600833", "第一医药", 1);
+        let watch_date = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
         let o = check_entry(
-            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            watch_date,
             &e,
-            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
+            today,
             10.14,
             10.00,
             10.05,
             10.40,
             10.01,
-        );
+            &price_band(today, 11.00, false),
+        )
+        .unwrap();
         assert!(!o.limit_up);
         assert_eq!(o.limit_up_type, "");
         assert_eq!(o.streak_today, 0); // 断板
@@ -392,30 +463,39 @@ mod tests {
     fn check_entry_st_stock_five_percent() {
         // ST 5%: 昨收 10.00 → 涨停价 10.50
         let e = entry("600001", "ST百花", 0);
+        let watch_date = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let band = price_band(today, 10.50, true);
         let o = check_entry(
-            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
-            &e,
-            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
-            10.50,
-            10.00,
-            10.10,
-            10.52,
-            10.05,
-        );
+            watch_date, &e, today, 10.50, 10.00, 10.10, 10.50, 10.05, &band,
+        )
+        .unwrap();
         assert!(o.limit_up);
         assert_eq!(o.limit_up_type, "封板");
         // 10.49 (未到 10.50) 不算涨停
         let not_up = check_entry(
-            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
-            &e,
-            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
-            10.49,
-            10.00,
-            10.10,
-            10.52,
-            10.05,
-        );
+            watch_date, &e, today, 10.49, 10.00, 10.10, 10.50, 10.05, &band,
+        )
+        .unwrap();
         assert!(!not_up.limit_up);
+    }
+
+    #[test]
+    fn task9_check_entry_rejects_any_ohlc_outside_or_off_qualified_band() {
+        let watch_date = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let entry = entry("600001", "任意名称", 0);
+        let band = price_band(today, 11.00, false);
+        let above = check_entry(
+            watch_date, &entry, today, 10.0, 9.5, 10.0, 11.01, 9.5, &band,
+        )
+        .unwrap_err();
+        assert!(above.contains("high rejected by qualified band"));
+        let off_tick = check_entry(
+            watch_date, &entry, today, 10.0, 9.5, 10.001, 10.5, 9.5, &band,
+        )
+        .unwrap_err();
+        assert!(off_tick.contains("open rejected by qualified band"));
     }
 
     fn outcome(
@@ -548,7 +628,15 @@ mod tests {
             other: vec![entry("600833", "第一医药", 1)],
         };
         // 两个前排成员都被跳过 (例如停牌/数据不可用), 只有「其余」核对成功。
-        let outcomes = vec![outcome("600833", "第一医药", 1.40, false, "", 0, Some(10.40))];
+        let outcomes = vec![outcome(
+            "600833",
+            "第一医药",
+            1.40,
+            false,
+            "",
+            0,
+            Some(10.40),
+        )];
         let text = render_watchlist_tracking(&snapshot, &outcomes);
         // 前排一只都没核对到 → 不再输出 "前排 X/N" (那会是伪造的前排口径),
         // 改走 conclusion 的全局兜底分支; 涨停 0 只 → 退潮。

@@ -37,35 +37,129 @@ const V12_TABLES: [&str; 4] = [
 ];
 
 const V12_OBJECTS: [(&str, &str, &str); 16] = [
-    ("chain_post_close_macro_query_terminals", "table", "chain_post_close_macro_query_terminals"),
-    ("chain_post_close_macro_query_terminals_guard", "trigger", "chain_post_close_macro_query_terminals"),
-    ("chain_post_close_macro_query_terminals_update", "trigger", "chain_post_close_macro_query_terminals"),
-    ("chain_post_close_macro_query_terminals_delete", "trigger", "chain_post_close_macro_query_terminals"),
-    ("chain_post_close_macro_dimension_terminals", "table", "chain_post_close_macro_dimension_terminals"),
-    ("chain_post_close_macro_dimension_terminals_guard", "trigger", "chain_post_close_macro_dimension_terminals"),
-    ("chain_post_close_macro_dimension_terminals_update", "trigger", "chain_post_close_macro_dimension_terminals"),
-    ("chain_post_close_macro_dimension_terminals_delete", "trigger", "chain_post_close_macro_dimension_terminals"),
-    ("chain_post_close_macro_finalize_begins", "table", "chain_post_close_macro_finalize_begins"),
-    ("chain_post_close_macro_finalize_begins_guard", "trigger", "chain_post_close_macro_finalize_begins"),
-    ("chain_post_close_macro_finalize_begins_update", "trigger", "chain_post_close_macro_finalize_begins"),
-    ("chain_post_close_macro_finalize_begins_delete", "trigger", "chain_post_close_macro_finalize_begins"),
-    ("chain_post_close_macro_stage_finals", "table", "chain_post_close_macro_stage_finals"),
-    ("chain_post_close_macro_stage_finals_guard", "trigger", "chain_post_close_macro_stage_finals"),
-    ("chain_post_close_macro_stage_finals_update", "trigger", "chain_post_close_macro_stage_finals"),
-    ("chain_post_close_macro_stage_finals_delete", "trigger", "chain_post_close_macro_stage_finals"),
+    (
+        "chain_post_close_macro_query_terminals",
+        "table",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "chain_post_close_macro_query_terminals_guard",
+        "trigger",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "chain_post_close_macro_query_terminals_update",
+        "trigger",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "chain_post_close_macro_query_terminals_delete",
+        "trigger",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "chain_post_close_macro_dimension_terminals",
+        "table",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "chain_post_close_macro_dimension_terminals_guard",
+        "trigger",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "chain_post_close_macro_dimension_terminals_update",
+        "trigger",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "chain_post_close_macro_dimension_terminals_delete",
+        "trigger",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "chain_post_close_macro_finalize_begins",
+        "table",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "chain_post_close_macro_finalize_begins_guard",
+        "trigger",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "chain_post_close_macro_finalize_begins_update",
+        "trigger",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "chain_post_close_macro_finalize_begins_delete",
+        "trigger",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "chain_post_close_macro_stage_finals",
+        "table",
+        "chain_post_close_macro_stage_finals",
+    ),
+    (
+        "chain_post_close_macro_stage_finals_guard",
+        "trigger",
+        "chain_post_close_macro_stage_finals",
+    ),
+    (
+        "chain_post_close_macro_stage_finals_update",
+        "trigger",
+        "chain_post_close_macro_stage_finals",
+    ),
+    (
+        "chain_post_close_macro_stage_finals_delete",
+        "trigger",
+        "chain_post_close_macro_stage_finals",
+    ),
 ];
 
 const V12_AUTOINDEXES: [(&str, &str); 10] = [
-    ("sqlite_autoindex_chain_post_close_macro_query_terminals_1", "chain_post_close_macro_query_terminals"),
-    ("sqlite_autoindex_chain_post_close_macro_query_terminals_2", "chain_post_close_macro_query_terminals"),
-    ("sqlite_autoindex_chain_post_close_macro_query_terminals_3", "chain_post_close_macro_query_terminals"),
-    ("sqlite_autoindex_chain_post_close_macro_dimension_terminals_1", "chain_post_close_macro_dimension_terminals"),
-    ("sqlite_autoindex_chain_post_close_macro_dimension_terminals_2", "chain_post_close_macro_dimension_terminals"),
-    ("sqlite_autoindex_chain_post_close_macro_finalize_begins_1", "chain_post_close_macro_finalize_begins"),
-    ("sqlite_autoindex_chain_post_close_macro_finalize_begins_2", "chain_post_close_macro_finalize_begins"),
-    ("sqlite_autoindex_chain_post_close_macro_finalize_begins_3", "chain_post_close_macro_finalize_begins"),
-    ("sqlite_autoindex_chain_post_close_macro_stage_finals_1", "chain_post_close_macro_stage_finals"),
-    ("sqlite_autoindex_chain_post_close_macro_stage_finals_2", "chain_post_close_macro_stage_finals"),
+    (
+        "sqlite_autoindex_chain_post_close_macro_query_terminals_1",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_query_terminals_2",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_query_terminals_3",
+        "chain_post_close_macro_query_terminals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_dimension_terminals_1",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_dimension_terminals_2",
+        "chain_post_close_macro_dimension_terminals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_finalize_begins_1",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_finalize_begins_2",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_finalize_begins_3",
+        "chain_post_close_macro_finalize_begins",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_stage_finals_1",
+        "chain_post_close_macro_stage_finals",
+    ),
+    (
+        "sqlite_autoindex_chain_post_close_macro_stage_finals_2",
+        "chain_post_close_macro_stage_finals",
+    ),
 ];
 
 fn text(row: &[Value], column: usize) -> &str {
@@ -82,10 +176,7 @@ fn definition(row: &[Value]) -> &[u8] {
     }
 }
 
-fn catalog_row<'a>(
-    state: &'a v11_migration_tests::DatabaseState,
-    name: &str,
-) -> &'a [Value] {
+fn catalog_row<'a>(state: &'a v11_migration_tests::DatabaseState, name: &str) -> &'a [Value] {
     state
         .catalog
         .iter()
@@ -134,7 +225,8 @@ fn assert_real_v11_macro_facts(connection: &Connection) {
     for (table, expected) in V11_MACRO_FACTS {
         assert_eq!(
             connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0))
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             expected,
             "TEST_CODE real v11 fact count: {table}"
@@ -174,7 +266,10 @@ fn assert_old_rows_preserved(
     );
     assert_eq!(after.tables.len(), before.tables.len() + V12_TABLES.len());
     for table in V12_TABLES {
-        assert!(after.tables[table].is_empty(), "TEST_CODE v12 table is not empty: {table}");
+        assert!(
+            after.tables[table].is_empty(),
+            "TEST_CODE v12 table is not empty: {table}"
+        );
     }
 }
 
@@ -187,8 +282,16 @@ fn assert_exact_v12_catalog_delta(
         let name = text(old, 1);
         let current = catalog_row(after, name);
         if REPLACED_GUARDS.contains(&name) {
-            assert_eq!(&current[..4], &old[..4], "TEST_CODE guard identity changed: {name}");
-            assert_ne!(definition(current), definition(old), "TEST_CODE guard was not replaced: {name}");
+            assert_eq!(
+                &current[..4],
+                &old[..4],
+                "TEST_CODE guard identity changed: {name}"
+            );
+            assert_ne!(
+                definition(current),
+                definition(old),
+                "TEST_CODE guard was not replaced: {name}"
+            );
             assert_eq!(definition(current), expected_definitions[name].as_slice());
         } else {
             assert_eq!(current, old, "TEST_CODE old catalog row changed: {name}");
@@ -198,10 +301,7 @@ fn assert_exact_v12_catalog_delta(
     let mut defined_additions = after
         .catalog
         .iter()
-        .filter(|row| {
-            row[4] != Value::Null
-                && !before.catalog.iter().any(|old| old[1] == row[1])
-        })
+        .filter(|row| row[4] != Value::Null && !before.catalog.iter().any(|old| old[1] == row[1]))
         .map(|row| text(row, 1).to_owned())
         .collect::<Vec<_>>();
     defined_additions.sort();
@@ -221,10 +321,7 @@ fn assert_exact_v12_catalog_delta(
     let mut generated = after
         .catalog
         .iter()
-        .filter(|row| {
-            row[4] == Value::Null
-                && !before.catalog.iter().any(|old| old[1] == row[1])
-        })
+        .filter(|row| row[4] == Value::Null && !before.catalog.iter().any(|old| old[1] == row[1]))
         .map(|row| {
             assert_eq!(text(row, 0), "index");
             (text(row, 1).to_owned(), text(row, 2).to_owned())
@@ -255,34 +352,49 @@ fn assert_v12_metadata(connection: &Connection) {
         .unwrap();
     assert_eq!(
         header,
-        (12, 11, V11_SHA256.to_owned(), 1, 1, 1, "chain-post-close-layout-v12".to_owned(), V12_SHA256.to_owned())
+        (
+            12,
+            11,
+            V11_SHA256.to_owned(),
+            1,
+            1,
+            1,
+            "chain-post-close-layout-v12".to_owned(),
+            V12_SHA256.to_owned()
+        )
     );
     assert_eq!(
-        connection.query_row(
-            "SELECT count(*) FROM chain_post_close_layouts WHERE layout_version>=12",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap(),
+        connection
+            .query_row(
+                "SELECT count(*) FROM chain_post_close_layouts WHERE layout_version>=12",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
         1
     );
     assert_eq!(
-        connection.query_row(
-            "SELECT count(*) FROM chain_post_close_layout_objects WHERE layout_version>=12",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap(),
+        connection
+            .query_row(
+                "SELECT count(*) FROM chain_post_close_layout_objects WHERE layout_version>=12",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
         241
     );
     assert_eq!(
-        connection.query_row(
-            "SELECT count(*) FROM chain_post_close_layout_objects registry \
+        connection
+            .query_row(
+                "SELECT count(*) FROM chain_post_close_layout_objects registry \
              JOIN sqlite_schema catalog \
                ON catalog.name=registry.name AND catalog.type=registry.object_type \
               AND CAST(catalog.sql AS BLOB)=CAST(registry.definition AS BLOB) \
              WHERE registry.layout_version=12",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap(),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
         241
     );
 }
@@ -298,18 +410,37 @@ fn assert_real_macro_semantics_unchanged(
     assert_eq!(after.parent_final_bytes(), before.parent_final_bytes());
     let (before_plan, after_plan) = (before.plan(), after.plan());
     assert_eq!(after_plan.profile(), before_plan.profile());
-    assert_eq!(after_plan.acquisition_authority(), before_plan.acquisition_authority());
+    assert_eq!(
+        after_plan.acquisition_authority(),
+        before_plan.acquisition_authority()
+    );
     assert_eq!(after_plan.endpoint(), before_plan.endpoint());
     assert_eq!(after_plan.started_at(), before_plan.started_at());
     assert_eq!(after_plan.deadline_at(), before_plan.deadline_at());
     assert_eq!(after_plan.observed_local(), before_plan.observed_local());
-    assert_eq!(after_plan.research_providers(), before_plan.research_providers());
-    assert_eq!(after_plan.research_decision_provenance(), before_plan.research_decision_provenance());
-    assert_eq!(after_plan.research_decisions().len(), before_plan.research_decisions().len());
-    for (old, current) in before_plan.research_decisions().iter().zip(after_plan.research_decisions()) {
+    assert_eq!(
+        after_plan.research_providers(),
+        before_plan.research_providers()
+    );
+    assert_eq!(
+        after_plan.research_decision_provenance(),
+        before_plan.research_decision_provenance()
+    );
+    assert_eq!(
+        after_plan.research_decisions().len(),
+        before_plan.research_decisions().len()
+    );
+    for (old, current) in before_plan
+        .research_decisions()
+        .iter()
+        .zip(after_plan.research_decisions())
+    {
         assert_eq!(current.registration_ordinal(), old.registration_ordinal());
         assert_eq!(current.availability_source(), old.availability_source());
-        assert_eq!(current.local_transport_endpoint(), old.local_transport_endpoint());
+        assert_eq!(
+            current.local_transport_endpoint(),
+            old.local_transport_endpoint()
+        );
         assert_eq!(current.remote_health(), old.remote_health());
     }
     let (before_request, after_request) = (
@@ -317,11 +448,21 @@ fn assert_real_macro_semantics_unchanged(
         after_plan.first_source_request(),
     );
     assert_eq!(after_request.request_id(), before_request.request_id());
-    assert_eq!(after_request.request_bytes(), before_request.request_bytes());
+    assert_eq!(
+        after_request.request_bytes(),
+        before_request.request_bytes()
+    );
     assert_eq!(after_request.retry_policy(), before_request.retry_policy());
 
-    assert_eq!(after.readiness_episodes().len(), before.readiness_episodes().len());
-    for (old, current) in before.readiness_episodes().iter().zip(after.readiness_episodes()) {
+    assert_eq!(
+        after.readiness_episodes().len(),
+        before.readiness_episodes().len()
+    );
+    for (old, current) in before
+        .readiness_episodes()
+        .iter()
+        .zip(after.readiness_episodes())
+    {
         assert_eq!(current.episode_ordinal(), old.episode_ordinal());
         assert_eq!(current.initiating_source(), old.initiating_source());
         assert_eq!(current.ready_result_version(), old.ready_result_version());
@@ -331,9 +472,15 @@ fn assert_real_macro_semantics_unchanged(
             assert_eq!(current_control.request_id(), old_control.request_id());
             assert_eq!(current_control.request_bytes(), old_control.request_bytes());
             assert_eq!(current_control.begin_version(), old_control.begin_version());
-            assert_eq!(current_control.result_version(), old_control.result_version());
+            assert_eq!(
+                current_control.result_version(),
+                old_control.result_version()
+            );
             assert_eq!(current_control.outcome(), old_control.outcome());
-            assert_eq!(current_control.response_bytes(), old_control.response_bytes());
+            assert_eq!(
+                current_control.response_bytes(),
+                old_control.response_bytes()
+            );
         }
     }
 
@@ -343,7 +490,10 @@ fn assert_real_macro_semantics_unchanged(
         assert_eq!(current.attempt_ordinal(), old.attempt_ordinal());
         assert_eq!(current.request_id(), old.request_id());
         assert_eq!(current.request_bytes(), old.request_bytes());
-        assert_eq!(current.readiness_result_version(), old.readiness_result_version());
+        assert_eq!(
+            current.readiness_result_version(),
+            old.readiness_result_version()
+        );
         assert_eq!(current.begin_version(), old.begin_version());
         assert_eq!(current.result_version(), old.result_version());
         assert_eq!(current.response_bytes(), old.response_bytes());
@@ -354,19 +504,46 @@ fn assert_real_macro_semantics_unchanged(
     let after_source = after.global_news(GlobalNewsProvider::Eastmoney).unwrap();
     assert!(after_source.is_complete());
     assert_eq!(after_source.profile(), before_source.profile());
-    assert_eq!(after_source.acquisition_authority(), before_source.acquisition_authority());
+    assert_eq!(
+        after_source.acquisition_authority(),
+        before_source.acquisition_authority()
+    );
     assert_eq!(after_source.retry_policy(), before_source.retry_policy());
     assert_eq!(after_source.final_bytes(), before_source.final_bytes());
     assert_eq!(after_source.audit_receipt(), before_source.audit_receipt());
-    let (before_batch, after_batch) = (before_source.batch().unwrap(), after_source.batch().unwrap());
-    assert_eq!(after_batch.evidence().provider, before_batch.evidence().provider);
-    assert_eq!(after_batch.evidence().source, before_batch.evidence().source);
-    assert_eq!(after_batch.evidence().source_at, before_batch.evidence().source_at);
-    assert_eq!(after_batch.evidence().observed_at, before_batch.evidence().observed_at);
-    assert_eq!(after_batch.evidence().batch_id, before_batch.evidence().batch_id);
+    let (before_batch, after_batch) = (
+        before_source.batch().unwrap(),
+        after_source.batch().unwrap(),
+    );
+    assert_eq!(
+        after_batch.evidence().provider,
+        before_batch.evidence().provider
+    );
+    assert_eq!(
+        after_batch.evidence().source,
+        before_batch.evidence().source
+    );
+    assert_eq!(
+        after_batch.evidence().source_at,
+        before_batch.evidence().source_at
+    );
+    assert_eq!(
+        after_batch.evidence().observed_at,
+        before_batch.evidence().observed_at
+    );
+    assert_eq!(
+        after_batch.evidence().batch_id,
+        before_batch.evidence().batch_id
+    );
     assert_eq!(after_batch.records(), before_batch.records());
-    assert_eq!(after.pending_source_identities(), before.pending_source_identities());
-    assert_eq!(after.pending_research_queries(), before.pending_research_queries());
+    assert_eq!(
+        after.pending_source_identities(),
+        before.pending_source_identities()
+    );
+    assert_eq!(
+        after.pending_research_queries(),
+        before.pending_research_queries()
+    );
 }
 
 fn assert_reopened_real_macro_semantics(
@@ -427,15 +604,9 @@ impl MacroDigestDamage {
 
     fn replacement(self) -> &'static str {
         match self {
-            Self::Context => {
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-            }
-            Self::Input => {
-                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-            }
-            Self::Payload => {
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            }
+            Self::Context => "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Self::Input => "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            Self::Payload => "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         }
     }
 
@@ -671,9 +842,8 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
     let mut parent_server = None;
     let mut external_server = None;
     let mut lock_reader = None;
-    let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(120),
-        async {
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
             let control_tests::ConfirmedExternalBaseline { config, intent, .. } =
                 control_tests::establish_confirmed_external_first_source(
                     &mut business,
@@ -701,7 +871,10 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
                 let recovery = local.inspect_macro(&intent).unwrap();
                 assert!(!recovery.is_complete());
                 assert!(!recovery.has_unconfirmed_effect());
-                assert!(recovery.global_news(GlobalNewsProvider::Eastmoney).unwrap().is_complete());
+                assert!(recovery
+                    .global_news(GlobalNewsProvider::Eastmoney)
+                    .unwrap()
+                    .is_complete());
                 let run = local.inspect_run(&intent).unwrap();
                 let snapshot = (
                     run.context().canonical_bytes(),
@@ -736,21 +909,21 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
                     i64::try_from(before.catalog.len()).unwrap()
                 );
                 assert_eq!(
-                    reader.connection.query_row(
-                        "SELECT count(*) FROM chain_post_close_macro_source_finals",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    ).unwrap(),
+                    reader
+                        .connection
+                        .query_row(
+                            "SELECT count(*) FROM chain_post_close_macro_source_finals",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
                     1
                 );
-                let reader_before =
-                    v11_migration_tests::DatabaseState::capture(&reader.connection);
+                let reader_before = v11_migration_tests::DatabaseState::capture(&reader.connection);
                 lock_reader = Some(reader);
 
                 assert_eq!(
-                    business
-                        .chain_post_close()
-                        .migrate_schema_v11_to_v12(),
+                    business.chain_post_close().migrate_schema_v11_to_v12(),
                     Err(ChainPostCloseError::StorageFailed {
                         operation: "v12 commit"
                     })
@@ -804,9 +977,15 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
                     head,
                     generation,
                 );
-                assert_eq!(external_server.as_ref().unwrap().snapshot(), external_network);
+                assert_eq!(
+                    external_server.as_ref().unwrap().snapshot(),
+                    external_network
+                );
                 assert_eq!(parent_server.as_ref().unwrap().snapshot(), parent_network);
-                assert_eq!(parent_server.as_ref().unwrap().membership_snapshot(), memberships);
+                assert_eq!(
+                    parent_server.as_ref().unwrap().membership_snapshot(),
+                    memberships
+                );
 
                 business
                     .chain_post_close()
@@ -826,15 +1005,24 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
             assert_old_rows_preserved(&before, &after);
             assert_exact_v12_catalog_delta(&before, &after, &expected_definitions);
             assert_v12_metadata(business.connection());
-            assert_eq!(external_server.as_ref().unwrap().snapshot(), external_network);
+            assert_eq!(
+                external_server.as_ref().unwrap().snapshot(),
+                external_network
+            );
             assert_eq!(parent_server.as_ref().unwrap().snapshot(), parent_network);
-            assert_eq!(parent_server.as_ref().unwrap().membership_snapshot(), memberships);
+            assert_eq!(
+                parent_server.as_ref().unwrap().membership_snapshot(),
+                memberships
+            );
 
             business.reopen();
             let reopened = business.chain_post_close().verify_schema().unwrap();
             assert_eq!(reopened.schema_version(), 12);
             assert_eq!(reopened.ddl_sha256().as_str(), V12_SHA256);
-            assert_eq!(v11_migration_tests::DatabaseState::capture(business.connection()), after);
+            assert_eq!(
+                v11_migration_tests::DatabaseState::capture(business.connection()),
+                after
+            );
             assert_reopened_real_macro_semantics(
                 &mut business,
                 &config,
@@ -844,13 +1032,18 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
                 head,
                 generation,
             );
-            assert_eq!(external_server.as_ref().unwrap().snapshot(), external_network);
+            assert_eq!(
+                external_server.as_ref().unwrap().snapshot(),
+                external_network
+            );
             assert_eq!(parent_server.as_ref().unwrap().snapshot(), parent_network);
-            assert_eq!(parent_server.as_ref().unwrap().membership_snapshot(), memberships);
-        },
-    ))
-    .catch_unwind()
-    .await;
+            assert_eq!(
+                parent_server.as_ref().unwrap().membership_snapshot(),
+                memberships
+            );
+        }))
+        .catch_unwind()
+        .await;
 
     let reader_cleanup = lock_reader.take().map(|reader| {
         let rollback = if reader.connection.is_autocommit() {
@@ -873,7 +1066,9 @@ async fn run_v11_to_v12_migration_scenario(scenario: V12MigrationScenario) {
     .await;
     drop(business);
     if let Some(result) = reader_cleanup {
-        result.unwrap_or_else(|error| panic!("TEST_CODE {} reader cleanup: {error}", scenario.label()));
+        result.unwrap_or_else(|error| {
+            panic!("TEST_CODE {} reader cleanup: {error}", scenario.label())
+        });
     }
     match body {
         Ok(Ok(())) => {}

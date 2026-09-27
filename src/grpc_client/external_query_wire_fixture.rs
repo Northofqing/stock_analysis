@@ -118,7 +118,9 @@ impl SystemService for ExternalQueryWireService {
             state.observation.health_calls += 1;
         }
         if !authorized {
-            return Err(Status::unauthenticated("TEST_CODE auction Health bearer required"));
+            return Err(Status::unauthenticated(
+                "TEST_CODE auction Health bearer required",
+            ));
         }
         let request_id = request
             .context
@@ -417,14 +419,17 @@ impl ExternalQueryWireService {
             ));
         }
         if operation == Operation::CurrentAuctionObservations {
-            let payload = request.payload.as_ref().ok_or_else(|| {
-                Status::invalid_argument("TEST_CODE auction payload missing")
-            })?;
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE auction payload missing"))?;
             if payload.schema != "magic.market.current_auction_observations.request"
                 || payload.schema_version != 1
                 || requested_provider != "HithinkFinance"
             {
-                return Err(Status::invalid_argument("TEST_CODE auction request contract"));
+                return Err(Status::invalid_argument(
+                    "TEST_CODE auction request contract",
+                ));
             }
             return Ok(Response::new(QueryResponse {
                 request_id,
@@ -445,9 +450,10 @@ impl ExternalQueryWireService {
             }));
         }
         if operation == Operation::EconomicReleaseObservations {
-            let payload = request.payload.as_ref().ok_or_else(|| {
-                Status::invalid_argument("TEST_CODE release payload missing")
-            })?;
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE release payload missing"))?;
             let body: serde_json::Value = serde_json::from_slice(&payload.data)
                 .map_err(|_| Status::invalid_argument("TEST_CODE release JSON invalid"))?;
             if payload.schema != "magic.market.economic_release_observations.request"
@@ -455,7 +461,9 @@ impl ExternalQueryWireService {
                 || requested_provider != "Jin10"
                 || body != serde_json::json!({"limit":20,"country":"中国"})
             {
-                return Err(Status::invalid_argument("TEST_CODE release request contract"));
+                return Err(Status::invalid_argument(
+                    "TEST_CODE release request contract",
+                ));
             }
             return Ok(Response::new(QueryResponse {
                 request_id,
@@ -476,9 +484,10 @@ impl ExternalQueryWireService {
             }));
         }
         if operation == Operation::EconomicReleaseSchedule {
-            let payload = request.payload.as_ref().ok_or_else(|| {
-                Status::invalid_argument("TEST_CODE schedule payload missing")
-            })?;
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE schedule payload missing"))?;
             let body: serde_json::Value = serde_json::from_slice(&payload.data)
                 .map_err(|_| Status::invalid_argument("TEST_CODE schedule JSON invalid"))?;
             if payload.schema != "magic.market.economic_release_schedule.request"
@@ -486,7 +495,9 @@ impl ExternalQueryWireService {
                 || requested_provider != "Fred"
                 || body != serde_json::json!({"start":"2026-09-13","end":"2026-10-13","limit":20})
             {
-                return Err(Status::invalid_argument("TEST_CODE schedule request contract"));
+                return Err(Status::invalid_argument(
+                    "TEST_CODE schedule request contract",
+                ));
             }
             return Ok(Response::new(QueryResponse {
                 request_id,

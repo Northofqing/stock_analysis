@@ -97,7 +97,11 @@ pub fn fetch_attribution_close_prices(
                     .num_hours()
                     <= 24;
                 if fresh {
-                    snapshot.items.iter().map(|item| item.code.clone()).collect()
+                    snapshot
+                        .items
+                        .iter()
+                        .map(|item| item.code.clone())
+                        .collect()
                 } else {
                     stock_analysis::portfolio::get_positions()
                         .map_err(|error| format!("持仓批次查询失败: {error}"))?
@@ -118,11 +122,16 @@ pub fn fetch_attribution_close_prices(
     // 当日成交代码并入覆盖: 未估值 lot 全部来自当日新开仓 (快照只覆盖持仓代码),
     // 不并入则当日新开仓浮盈无法估值 (2026-09-01 实测教训)。只读查询。
     {
-        let effective=stock_analysis::performance::economic_position::query_effective_fills_through(today)?;
+        let effective =
+            stock_analysis::performance::economic_position::query_effective_fills_through(today)?;
         // Include the whole scoped inventory history, not only today's raw fills:
         // a historical correction may change an open lot's economic contribution.
-        let trade_codes: Vec<String> = effective.rows().map_err(|error|error.to_string())?
-            .iter().map(|row|row.code.clone()).collect();
+        let trade_codes: Vec<String> = effective
+            .rows()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| row.code.clone())
+            .collect();
         codes.extend(trade_codes);
         codes.sort();
         codes.dedup();
@@ -149,7 +158,10 @@ pub fn fetch_attribution_close_prices(
                             .iter()
                             .map(|k| k.date.to_string())
                             .collect();
-                        format!("{code}: 目标日 {today} 无日线记录 (可用: {})", dates.join(","))
+                        format!(
+                            "{code}: 目标日 {today} 无日线记录 (可用: {})",
+                            dates.join(",")
+                        )
                     })?;
                 prices.insert(code.clone(), bar.close);
             }
@@ -249,6 +261,9 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
     if quotes.is_empty() {
         return Err("持仓行情源成功响应但无有效行".to_string());
     }
+    // This is the only quote-readiness owner: the exact current position set
+    // has passed strict coverage. Single-symbol execution and arbitrary
+    // scanner/probe requests must not refresh account-wide Quote health.
     mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
     Ok(quotes)
 }
@@ -257,17 +272,28 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
 pub fn fetch_realtime_quotes(
     codes: &[String],
 ) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    Ok(fetch_realtime_quote_batch(codes)?.stocks)
+    let coverage =
+        stock_analysis::data_gateway::MarketDataGateway::new().realtime_quote_coverage(codes);
+    let projected = project_top_stock_coverage(codes, coverage, true)?;
+    Ok(projected.stocks)
+}
+
+/// Explicit scanner-only partial projection. The result retains disposition,
+/// missing identities, rejected records and raw batch evidence; it never
+/// refreshes account-wide Quote health.
+#[allow(dead_code)]
+pub(super) fn fetch_realtime_quote_partial(codes: &[String]) -> Result<TopStockBatch, String> {
+    let coverage =
+        stock_analysis::data_gateway::MarketDataGateway::new().realtime_quote_coverage(codes);
+    project_top_stock_coverage(codes, coverage, false)
 }
 
 /// BR-159 evidence-preserving quote batch for downstream atomic joins.
 pub(super) fn fetch_realtime_quote_batch(codes: &[String]) -> Result<TopStockBatch, String> {
-    let batch = stock_analysis::data_gateway::MarketDataGateway::new()
-        .realtime_quotes(codes)
-        .map_err(|error| format!("统一实时行情 Gateway 不可用: {error}"))?;
-    let projected = project_top_stock_batch(codes, batch)?;
+    let coverage =
+        stock_analysis::data_gateway::MarketDataGateway::new().realtime_quote_coverage(codes);
+    let projected = project_top_stock_coverage(codes, coverage, true)?;
     audit_top_stock_projection(&projected);
-    mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
     Ok(projected)
 }
 
@@ -275,6 +301,10 @@ pub(super) fn fetch_realtime_quote_batch(codes: &[String]) -> Result<TopStockBat
 pub(super) struct TopStockBatch {
     pub(super) stocks: Vec<stock_analysis::market_data::TopStock>,
     pub(super) evidence: stock_analysis::data_gateway::BatchEvidence,
+    pub(super) coverage: stock_analysis::data_gateway::QuoteCoverageDisposition,
+    pub(super) requested: Vec<String>,
+    pub(super) rejected: Vec<stock_analysis::data_gateway::QuoteRecordRejection>,
+    pub(super) missing: Vec<String>,
 }
 
 fn project_top_stock_batch(
@@ -283,14 +313,57 @@ fn project_top_stock_batch(
         stock_analysis::data_gateway::RealtimeMarketQuote,
     >,
 ) -> Result<TopStockBatch, String> {
-    use stock_analysis::data_gateway::GatewayBatch;
+    let coverage = stock_analysis::data_gateway::RealtimeQuoteCoverage::classify(codes, Ok(batch));
+    project_top_stock_coverage(codes, coverage, true)
+}
+
+fn project_top_stock_coverage(
+    codes: &[String],
+    coverage: stock_analysis::data_gateway::RealtimeQuoteCoverage,
+    require_complete: bool,
+) -> Result<TopStockBatch, String> {
+    use stock_analysis::data_gateway::{GatewayBatch, QuoteCoverageDisposition};
     use stock_analysis::market_data::TopStock;
 
-    let (quotes, evidence) = match batch {
-        GatewayBatch::Available { records, evidence } if !records.is_empty() => (records, evidence),
-        GatewayBatch::Available { .. } | GatewayBatch::VerifiedEmpty(_) => {
-            return Err("统一实时行情 Gateway 返回不允许的空批次".to_string());
+    let disposition = coverage.disposition();
+    if disposition == QuoteCoverageDisposition::Unavailable {
+        let detail = coverage
+            .unavailable_error()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "no classified upstream error".to_owned());
+        return Err(format!("统一实时行情覆盖不可用: {detail}"));
+    }
+    let requested = coverage.requested().to_vec();
+    let rejected = coverage.rejected().to_vec();
+    let missing = coverage.missing().to_vec();
+    let evidence = coverage
+        .evidence()
+        .cloned()
+        .ok_or_else(|| "统一实时行情覆盖结果缺少原始批次证据".to_string())?;
+    if disposition == QuoteCoverageDisposition::Partial && !require_complete {
+        log::warn!(
+            "[Task9][QuoteCoverage] partial requested={} accepted={} rejected={:?} missing={:?} batch_id={}",
+            coverage.requested().len(),
+            coverage.accepted().len(),
+            coverage
+                .rejected()
+                .iter()
+                .map(|rejection| (rejection.code.as_deref(), rejection.reason_code))
+                .collect::<Vec<_>>(),
+            coverage.missing(),
+            evidence.batch_id
+        );
+    }
+    let quotes = if require_complete {
+        match coverage
+            .require_complete()
+            .map_err(|error| format!("统一实时行情严格覆盖不可用: {error}"))?
+        {
+            GatewayBatch::Available { records, .. } => records,
+            GatewayBatch::VerifiedEmpty(_) => unreachable!("complete quote coverage is non-empty"),
         }
+    } else {
+        coverage.into_accepted()
     };
     let evidence_observed_at = stock_analysis::data_gateway::parse_evidence_instant(
         "RealtimeMarketQuotes",
@@ -322,24 +395,25 @@ fn project_top_stock_batch(
                     quote.code, quote.name, quote.price
                 ));
             }
-            let change_pct = validate_change_pct(
-                &quote.code,
-                &quote.name,
-                quote.change_percent,
-                "统一实时行情",
-            )?;
             Ok(TopStock {
                 code: quote.code,
                 name: quote.name,
                 price: quote.price,
-                change_pct,
+                change_pct: quote.change_percent,
                 volume_ratio: None,
                 main_net_yi: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     validate_quote_batch_subset(codes, &stocks, "unified_market_gateway")?;
-    Ok(TopStockBatch { stocks, evidence })
+    Ok(TopStockBatch {
+        stocks,
+        evidence,
+        coverage: disposition,
+        requested,
+        rejected,
+        missing,
+    })
 }
 
 fn audit_top_stock_projection(batch: &TopStockBatch) {
@@ -354,38 +428,89 @@ fn audit_top_stock_projection(batch: &TopStockBatch) {
     );
 }
 
-pub fn infer_limit_pct(code: &str, name: &str) -> f64 {
-    #[cfg(test)]
-    let code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
-    if name.contains("ST") || name.contains("st") {
-        5.0
-    } else if code.starts_with("30") || code.starts_with("688") {
-        20.0
-    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with("92") {
-        30.0
-    } else {
-        10.0
-    }
+fn qualified_trading_facts(
+    code: &str,
+    effective_on: chrono::NaiveDate,
+) -> Result<stock_analysis::data_gateway::QualifiedTradingFacts, String> {
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None);
+    let identity = identity.map_err(|error| format!("{code} 证券身份无效: {error}"))?;
+    let request = stock_analysis::data_gateway::QualifiedTradingFactsRequest::new(
+        identity.instrument().clone(),
+        effective_on,
+    );
+    Ok(stock_analysis::data_gateway::QualifiedTradingFactsGateway::new().acquire(request))
 }
 
-fn validate_change_pct(
+fn qualified_price_band(
     code: &str,
-    name: &str,
-    change_pct: f64,
-    source: &str,
-) -> Result<f64, String> {
-    let limit = infer_limit_pct(code, name);
-    if !change_pct.is_finite() {
-        return Err(format!(
-            "{source} {code}({name}) change_pct 缺失/非法: {change_pct:?}"
-        ));
+    effective_on: chrono::NaiveDate,
+) -> Result<stock_analysis::data_gateway::QualifiedPriceBand, String> {
+    let facts = qualified_trading_facts(code, effective_on)?;
+    match facts.lifecycle().require() {
+        Ok(stock_analysis::data_gateway::QualifiedListingStatus::Listed) => {}
+        Ok(status) => {
+            return Err(format!(
+                "{code} {effective_on} 上市状态不可交易: {status:?}"
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "{code} {effective_on} lifecycle unavailable reason_code={}: {}",
+                error.reason_code(),
+                error.message()
+            ))
+        }
     }
-    if change_pct.abs() > limit {
-        return Err(format!(
-            "[DQ-2.3] {source} {code}({name}) change_pct={change_pct:.2}% 超过证券板块±{limit:.0}%规则阈值"
-        ));
+    match facts.suspension().require() {
+        Ok(stock_analysis::data_gateway::QualifiedSuspensionStatus::Trading) => {}
+        Ok(status) => {
+            return Err(format!(
+                "{code} {effective_on} 停复牌状态不可交易: {status:?}"
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "{code} {effective_on} suspension unavailable reason_code={}: {}",
+                error.reason_code(),
+                error.message()
+            ))
+        }
     }
-    Ok(change_pct)
+    facts.price_regime().require().cloned().map_err(|error| {
+        format!(
+            "{code} {effective_on} price_regime unavailable reason_code={}: {}",
+            error.reason_code(),
+            error.message()
+        )
+    })
+}
+
+fn price_to_micros(code: &str, price: f64) -> Result<i64, String> {
+    let scaled = price * 1_000_000.0;
+    if !scaled.is_finite() || scaled <= 0.0 || scaled >= i64::MAX as f64 {
+        return Err(format!("{code} 价格不可转换为 micro-CNY: {price:?}"));
+    }
+    let rounded = scaled.round();
+    if (scaled - rounded).abs() > 1e-6 {
+        return Err(format!("{code} 价格精度超过 micro-CNY: {price:?}"));
+    }
+    Ok(rounded as i64)
+}
+
+pub(super) fn is_qualified_limit_up_quote(
+    quote: &stock_analysis::market_data::TopStock,
+    effective_on: chrono::NaiveDate,
+) -> Result<bool, String> {
+    let band = qualified_price_band(&quote.code, effective_on)?;
+    let price_micros = price_to_micros(&quote.code, quote.price)?;
+    band.validate_price_micros(price_micros).map_err(|error| {
+        format!(
+            "{} {} 价格不满足合格制度: {error}",
+            quote.code, effective_on
+        )
+    })?;
+    Ok(price_micros == band.upper_price_micros())
 }
 
 /// 批量查询连板数，返回 1=首板 / 2=二板 / 3=三板+
@@ -424,13 +549,12 @@ fn classify_board_level_from_parts(
     let latest = kline
         .first()
         .ok_or_else(|| format!("[连板识别] {name}({code}) K 线为空"))?;
-    let threshold = infer_limit_pct(code, name) - 0.2;
     let history_start = usize::from(latest.date == today);
     let prior_limit_days = kline
         .iter()
         .skip(history_start)
         .take(2)
-        .take_while(|bar| bar.is_limit_up || bar.pct_chg >= threshold)
+        .take_while(|bar| bar.is_limit_up)
         .count();
     let level = u8::try_from(1 + prior_limit_days)
         .map_err(|_| format!("[连板识别] {name}({code}) 连板数溢出"))?;
@@ -453,6 +577,10 @@ fn lookup_board_level_facts(codes: &[(String, String)]) -> Result<Vec<BoardLevel
     let mut facts = Vec::with_capacity(codes.len());
 
     for (code, name) in codes {
+        // Board-level decisions are price-limit decisions. Until the exact
+        // per-security/day regime is qualified, do not let historical pct/name
+        // heuristics manufacture a limit-up streak.
+        let _current_regime = qualified_price_band(code, today)?;
         let batch = gateway
             .required_daily_bars(code, 5)
             .map_err(|error| format!("[连板识别] {name}({code}) 统一日线不可用: {error}"))?;
@@ -625,24 +753,6 @@ mod quote_batch_tests {
     }
 
     #[test]
-    fn limit_percent_inference_covers_st_and_all_registered_boards() {
-        assert_eq!(infer_limit_pct("TEST_CODE_600000", "普通测试股"), 10.0);
-        assert_eq!(infer_limit_pct("TEST_CODE_300001", "创业板测试股"), 20.0);
-        assert_eq!(infer_limit_pct("TEST_CODE_688001", "科创板测试股"), 20.0);
-        assert_eq!(infer_limit_pct("TEST_CODE_830001", "北交所测试股"), 30.0);
-        assert_eq!(infer_limit_pct("TEST_CODE_920001", "北交所测试股"), 30.0);
-        assert_eq!(infer_limit_pct("TEST_CODE_600001", "*ST测试"), 5.0);
-    }
-
-    #[test]
-    fn board_aware_change_pct_validation_accepts_real_values_and_flags_overrun() {
-        assert!(validate_change_pct("TEST_CODE_300001", "创业板测试股", 20.0, "test").is_ok());
-        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.0, "test").is_ok());
-        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test").is_err());
-        assert!(validate_change_pct("TEST_CODE_600001", "普通测试股", f64::NAN, "test").is_err());
-    }
-
-    #[test]
     fn br159_top_stock_projection_retains_evidence_and_rejects_bad_market_data_without_network() {
         let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-26T08:00:00Z")
             .unwrap()
@@ -677,7 +787,7 @@ mod quote_batch_tests {
         assert_eq!(projected.evidence, evidence);
 
         let bad_quote = RealtimeMarketQuote {
-            change_percent: 10.01,
+            price: f64::NAN,
             ..quote
         };
         let error = project_top_stock_batch(
@@ -688,7 +798,7 @@ mod quote_batch_tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("超过证券板块"));
+        assert!(error.contains("quote_coverage_unavailable"), "{error}");
     }
 
     fn projection_batch_with_observed_at(

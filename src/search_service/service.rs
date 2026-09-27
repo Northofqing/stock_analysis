@@ -206,7 +206,9 @@ pub(crate) struct MacroWebSnapshot {
 }
 
 impl MacroWebSnapshot {
-    pub(crate) fn local_transport(&self) -> &LocalSemanticSearchConnectionState { &self.local_transport }
+    pub(crate) fn local_transport(&self) -> &LocalSemanticSearchConnectionState {
+        &self.local_transport
+    }
     pub(crate) fn decisions(&self) -> &[MacroWebDecision] {
         &self.decisions
     }

@@ -118,7 +118,9 @@ fn all_audits() -> Vec<Audit> {
 async fn d15_attribution_public_gateways_wire_failures_and_history() {
     let _env = init();
     let mut failures = Vec::new();
-    for entry in 0..18 {
+    // Entry 2 (FuturesDelivery) is intentionally absent: Task 9 blocks before
+    // business RPC/audit until the request/coverage contract is delivered.
+    for entry in (0..18).filter(|entry| *entry != 2) {
         for (provider, expected) in [
             (Some("Sina"), "Sina"),
             (None, "Custom"),
@@ -375,6 +377,74 @@ async fn d15_attribution_lifecycle_fixed_tdx_contract_rejects_other_success() {
         assert_eq!(audit.provider, "Sina");
         assert_eq!(audit.outcome, "partial");
         assert_eq!(audit.reason_code, "invalid_evidence");
+    }
+}
+
+#[tokio::test]
+async fn task9_lifecycle_listing_requires_exact_requested_identity_and_cardinality() {
+    let _env = init();
+    let date = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+    let requested = "600519";
+    let metadata = |code: &str, listed_on: &str| {
+        serde_json::json!({
+            "code": code,
+            "name": format!("TEST_CODE_{code}"),
+            "board": "Main",
+            "is_st": false,
+            "listed_on": listed_on,
+            "price_limit_percent": 10.0,
+            "source_at": "2026-09-25T15:00:00+08:00"
+        })
+    };
+    let cases = [
+        (
+            "wrong instrument",
+            serde_json::json!([metadata("600000", "1999-11-10")]),
+            None,
+        ),
+        (
+            "requested plus extra",
+            serde_json::json!([
+                metadata(requested, "2001-08-27"),
+                metadata("600000", "1999-11-10")
+            ]),
+            None,
+        ),
+        (
+            "duplicate requested instrument",
+            serde_json::json!([
+                metadata(requested, "2001-08-27"),
+                metadata(requested, "2001-08-27")
+            ]),
+            None,
+        ),
+        ("empty", serde_json::json!([]), None),
+        (
+            "exact requested instrument",
+            serde_json::json!([metadata(requested, "2001-08-27")]),
+            Some(NaiveDate::from_ymd_opt(2001, 8, 27).unwrap()),
+        ),
+    ];
+
+    for (label, records, expected_listing) in cases {
+        grpc_source::set_test_query_responses(vec![
+            Ok(wire_batch("Tdx", records)),
+            Ok(wire_batch("Tdx", serde_json::json!([]))),
+        ]);
+        let context = SecurityLifecycleGateway::new()
+            .acquire(requested, date, date)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: public acquire failed unexpectedly: {error}"));
+
+        match (context.listing, expected_listing) {
+            (security_lifecycle::ListingDateState::Available(listing), Some(expected)) => {
+                assert_eq!(listing.listed_on, expected, "{label}");
+            }
+            (security_lifecycle::ListingDateState::Unavailable { .. }, None) => {}
+            (actual, expected) => {
+                panic!("{label}: listing state {actual:?} did not match {expected:?}")
+            }
+        }
     }
 }
 

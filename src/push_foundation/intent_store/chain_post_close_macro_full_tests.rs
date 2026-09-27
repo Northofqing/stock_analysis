@@ -2,8 +2,8 @@ use super::*;
 use crate::grpc_client::client::macro_full_loopback_fixture::{
     Call, Lane, MacroFullLoopbackServer, QUERIES,
 };
-use crate::search_service::macro_news::{runner::QueryKey, NativeOutcome};
 use crate::push_foundation::intent_store::chain_post_close::macro_native::ExpiryBasis;
+use crate::search_service::macro_news::{runner::QueryKey, NativeOutcome};
 
 // Frozen from the pre-Task3 public wrapper's documented formatting, worked by
 // hand from the fixture facts. Both actual prepare and the native StageFinal
@@ -45,8 +45,12 @@ const EXPECTED_MACRO: &str = concat!(
 
 fn assert_models_stop(callsite: &str, error: &anyhow::Error, observed_calls: &[Call]) {
     assert!(
-        matches!(error.downcast_ref::<PreparationStop>(),
-            Some(PreparationStop::StageNotMigrated { next: UnmigratedStage::ModelsSearchAndReport })),
+        matches!(
+            error.downcast_ref::<PreparationStop>(),
+            Some(PreparationStop::StageNotMigrated {
+                next: UnmigratedStage::ModelsSearchAndReport
+            })
+        ),
         "TEST_CODE real prepare must complete five Gateway lanes and six Web dimensions, \
          then stop at ModelsSearchAndReport at {callsite}; received {error:?}; \
          actual Macro calls={observed_calls:?}"
@@ -198,7 +202,8 @@ async fn single_user_local_prepare_completes_full_macro_and_reopens_before_model
 }
 
 #[tokio::test]
-async fn single_user_local_monotonic_expiry_after_five_confirmed_gateways_preserves_wall_and_reopens_empty_final() {
+async fn single_user_local_monotonic_expiry_after_five_confirmed_gateways_preserves_wall_and_reopens_empty_final(
+) {
     full_macro_scenario(FullMacroScenario::MonotonicExpiry).await;
 }
 
@@ -214,17 +219,20 @@ fn snapshot_query_rows(
 ) -> Vec<Vec<rusqlite::types::Value>> {
     let mut statement = connection.prepare(sql).unwrap();
     let width = statement.column_count();
-    let rows = statement.query_map([intent.as_str()], |row| {
-        (0..width)
-            .map(|column| row.get(column))
-            .collect::<rusqlite::Result<Vec<_>>>()
-    }).unwrap();
+    let rows = statement
+        .query_map([intent.as_str()], |row| {
+            (0..width)
+                .map(|column| row.get(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap();
     rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
 }
 
-fn old_macro_history(connection: &rusqlite::Connection, intent: &IntentId)
-    -> Vec<Vec<Vec<rusqlite::types::Value>>>
-{
+fn old_macro_history(
+    connection: &rusqlite::Connection,
+    intent: &IntentId,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     [
         "SELECT * FROM chain_post_close_runs WHERE intent_id=?1",
         "SELECT * FROM chain_post_close_macro_query_terminals WHERE intent_id=?1 ORDER BY run_version",
@@ -240,44 +248,84 @@ fn old_macro_history(connection: &rusqlite::Connection, intent: &IntentId)
 #[tokio::test]
 async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal() {
     let mut fixture = V2BusinessFixture::new();
-    let (parent_endpoint, parent_server) = spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
+    let (parent_endpoint, parent_server) =
+        spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
     let server = MacroFullLoopbackServer::bind().await;
     let parent_source = GrpcSource::from_board_loopback_test_client(
         connect_parent_instance(&parent_endpoint).await,
     );
     let queries = parent_source.connected_board_queries().await.unwrap();
-    let (stocks, config, intent, v9_head) = populate_completed_v9_parent(
-        &mut fixture, &queries, "TEST_CODE_RUN_RETIRED_ECONOMIC",
-    ).await;
-    fixture.chain_post_close().migrate_schema_v9_to_v10().unwrap();
-    let mut local = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap();
-    let lease = local.resume_run(&intent, lease_request(
-        "TEST_CODE_RETIRED_PARENT", 68_300_000_000, 90_000_000_000, Some(v9_head),
-    )).unwrap();
+    let (stocks, config, intent, v9_head) =
+        populate_completed_v9_parent(&mut fixture, &queries, "TEST_CODE_RUN_RETIRED_ECONOMIC")
+            .await;
+    fixture
+        .chain_post_close()
+        .migrate_schema_v9_to_v10()
+        .unwrap();
+    let mut local = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap();
+    let lease = local
+        .resume_run(
+            &intent,
+            lease_request(
+                "TEST_CODE_RETIRED_PARENT",
+                68_300_000_000,
+                90_000_000_000,
+                Some(v9_head),
+            ),
+        )
+        .unwrap();
     let parent_clock = DragonTigerClock {
         now: UtcMicros::try_new(micros("2026-07-22T10:30:00+08:00")).unwrap(),
         request_observed_at: DateTime::parse_from_rfc3339("2026-07-22T10:30:00+08:00").unwrap(),
-        request_calls: Cell::new(0), cache_calls: Cell::new(0),
+        request_calls: Cell::new(0),
+        cache_calls: Cell::new(0),
     };
-    let mut io = local.dragon_tiger_preparation_io_v10(
-        lease, &queries, &parent_clock, FixedClusterConfiguration::resolve(Some("2")),
-        &parent_source,
-    ).unwrap();
+    let mut io = local
+        .dragon_tiger_preparation_io_v10(
+            lease,
+            &queries,
+            &parent_clock,
+            FixedClusterConfiguration::resolve(Some("2")),
+            &parent_source,
+        )
+        .unwrap();
     let stopped = prepare_chain_analysis_with_io(
-        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks.clone(), None, &mut io,
-    ).await.expect_err("TEST_CODE parent stops at Macro");
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks.clone(),
+        None,
+        &mut io,
+    )
+    .await
+    .expect_err("TEST_CODE parent stops at Macro");
     assert_partial_macro_stop(&stopped);
     drop(io);
     let parent_head = local.inspect_run(&intent).unwrap().head_version();
     drop(local);
-    fixture.chain_post_close().migrate_schema_v10_to_v11().unwrap();
-    fixture.chain_post_close().migrate_schema_v11_to_v12().unwrap();
-    fixture.chain_post_close().migrate_schema_v12_to_v13().unwrap();
-    fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v10_to_v11()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v11_to_v12()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v12_to_v13()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v13_to_v14()
+        .unwrap();
 
     let macro_source = GrpcSource::from_macro_loopback_test_client(
-        server.connect().await, server.endpoint().to_owned(),
+        server.connect().await,
+        server.endpoint().to_owned(),
     );
     let started_at = micros("2026-09-14T15:30:00+08:00");
     let clock = MacroClock {
@@ -285,23 +333,48 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
         observation: DateTime::parse_from_rfc3339("2026-09-14T15:30:00+08:00").unwrap(),
         observation_calls: Cell::new(0),
     };
-    let registered = [GeneralWebResearchProvider::SerpApi,
-        GeneralWebResearchProvider::Bocha, GeneralWebResearchProvider::Tavily];
+    let registered = [
+        GeneralWebResearchProvider::SerpApi,
+        GeneralWebResearchProvider::Bocha,
+        GeneralWebResearchProvider::Tavily,
+    ];
     let search_service = macro_search_service(&registered);
     let database = fixture.database();
-    let mut local = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap();
-    let lease = local.resume_run(&intent, macro_lease(
-        "TEST_CODE_RETIRED_MACRO", started_at, started_at + 60_000_000, parent_head,
-    )).unwrap();
-    let mut io = local.macro_preparation_io_v14(
-        lease, &queries, &clock, FixedClusterConfiguration::resolve(Some("2")),
-        &parent_source, &macro_source, &search_service,
-    ).unwrap();
+    let mut local = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap();
+    let lease = local
+        .resume_run(
+            &intent,
+            macro_lease(
+                "TEST_CODE_RETIRED_MACRO",
+                started_at,
+                started_at + 60_000_000,
+                parent_head,
+            ),
+        )
+        .unwrap();
+    let mut io = local
+        .macro_preparation_io_v14(
+            lease,
+            &queries,
+            &clock,
+            FixedClusterConfiguration::resolve(Some("2")),
+            &parent_source,
+            &macro_source,
+            &search_service,
+        )
+        .unwrap();
     let mut reader = BusinessIntentStore::open(&database).unwrap();
     let mut read_local = reader.single_user_local_chain_post_close(&config).unwrap();
     let mut prepare = Box::pin(prepare_chain_analysis_with_io(
-        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks, None, &mut io,
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        None,
+        &mut io,
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::select! {
@@ -310,8 +383,17 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
         }
     }).await.unwrap();
     let wave = server.snapshot();
-    assert_eq!(wave.calls.iter().filter(|call| matches!(call.call, Call::Gateway(_))).count(), 4);
-    assert!(!wave.calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    assert_eq!(
+        wave.calls
+            .iter()
+            .filter(|call| matches!(call.call, Call::Gateway(_)))
+            .count(),
+        4
+    );
+    assert!(!wave
+        .calls
+        .iter()
+        .any(|call| call.call == Call::Gateway(Lane::E)));
     let observed = read_local.inspect_macro(&intent).unwrap();
     let retired = observed.query_terminal(QueryKey::Gateway(5)).unwrap();
     assert!(!retired.was_called());
@@ -323,7 +405,10 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
         }
         other => panic!("TEST_CODE expected retired EconomicCalendar: {other:?}"),
     }
-    assert!(!observed.attempts().iter().any(|attempt| attempt.query_key() == QueryKey::Gateway(5)));
+    assert!(!observed
+        .attempts()
+        .iter()
+        .any(|attempt| attempt.query_key() == QueryKey::Gateway(5)));
     let sql_reader = rusqlite::Connection::open(&database).unwrap();
     let (cause, call_state): (String, String) = sql_reader.query_row(
         "SELECT cause_kind,call_state FROM chain_post_close_macro_retired_terminals WHERE intent_id=?1",
@@ -334,7 +419,10 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
         [intent.as_str()], |row| row.get(0),
     ).unwrap();
     drop(sql_reader);
-    assert_eq!((cause.as_str(), call_state.as_str()), ("OperationRetired", "NotCalled"));
+    assert_eq!(
+        (cause.as_str(), call_state.as_str()),
+        ("OperationRetired", "NotCalled")
+    );
     assert_eq!(retired_request_plans, 0);
     server.release_all();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -343,12 +431,19 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
                 result = &mut prepare => panic!("TEST_CODE premature Macro completion: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
-            if (1..=4).all(|ordinal| read_local.inspect_macro(&intent).unwrap()
-                .query_terminal(QueryKey::Gateway(ordinal)).is_some()) {
+            if (1..=4).all(|ordinal| {
+                read_local
+                    .inspect_macro(&intent)
+                    .unwrap()
+                    .query_terminal(QueryKey::Gateway(ordinal))
+                    .is_some()
+            }) {
                 break;
             }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     drop(prepare);
     drop(io);
     drop(read_local);
@@ -358,14 +453,34 @@ async fn v14_connected_local_retires_economic_without_rpc_and_reopens_terminal()
     drop(parent_source);
     drop(macro_source);
     fixture.reopen();
-    let reopened = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap()
-        .inspect_macro(&intent).unwrap();
-    assert_eq!(reopened.query_terminal(QueryKey::Gateway(5)).unwrap().native_bytes(),
-        retired.native_bytes());
-    assert_eq!(reopened.attempts().iter()
-        .filter(|attempt| matches!(attempt.query_key(), QueryKey::Gateway(_))).count(), 4);
-    assert!(!server.snapshot().calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    let reopened = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap()
+        .inspect_macro(&intent)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .query_terminal(QueryKey::Gateway(5))
+            .unwrap()
+            .native_bytes(),
+        retired.native_bytes()
+    );
+    assert_eq!(
+        reopened
+            .attempts()
+            .iter()
+            .filter(|attempt| matches!(attempt.query_key(), QueryKey::Gateway(_)))
+            .count(),
+        4
+    );
+    assert!(!server
+        .snapshot()
+        .calls
+        .iter()
+        .any(|call| call.call == Call::Gateway(Lane::E)));
     server.finish().await.unwrap();
     parent_server.finish().await;
 }
@@ -382,43 +497,80 @@ async fn v14_preserves_v13_unconfirmed_economic_attempt_on_reopen() {
 
 async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
     let mut fixture = V2BusinessFixture::new();
-    let (parent_endpoint, parent_server) = spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
+    let (parent_endpoint, parent_server) =
+        spawn_macro_parent_listener(DRAGON_TIGER_RECORDS.as_bytes()).await;
     let server = MacroFullLoopbackServer::bind().await;
     let parent_source = GrpcSource::from_board_loopback_test_client(
         connect_parent_instance(&parent_endpoint).await,
     );
     let queries = parent_source.connected_board_queries().await.unwrap();
-    let (stocks, config, intent, v9_head) = populate_completed_v9_parent(
-        &mut fixture, &queries, "TEST_CODE_RUN_V13_RETIRED_RESUME",
-    ).await;
-    fixture.chain_post_close().migrate_schema_v9_to_v10().unwrap();
-    let mut local = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap();
-    let lease = local.resume_run(&intent, lease_request(
-        "TEST_CODE_RETIRED_RESUME_PARENT", 68_300_000_000, 90_000_000_000, Some(v9_head),
-    )).unwrap();
+    let (stocks, config, intent, v9_head) =
+        populate_completed_v9_parent(&mut fixture, &queries, "TEST_CODE_RUN_V13_RETIRED_RESUME")
+            .await;
+    fixture
+        .chain_post_close()
+        .migrate_schema_v9_to_v10()
+        .unwrap();
+    let mut local = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap();
+    let lease = local
+        .resume_run(
+            &intent,
+            lease_request(
+                "TEST_CODE_RETIRED_RESUME_PARENT",
+                68_300_000_000,
+                90_000_000_000,
+                Some(v9_head),
+            ),
+        )
+        .unwrap();
     let parent_clock = DragonTigerClock {
         now: UtcMicros::try_new(micros("2026-07-22T10:30:00+08:00")).unwrap(),
         request_observed_at: DateTime::parse_from_rfc3339("2026-07-22T10:30:00+08:00").unwrap(),
-        request_calls: Cell::new(0), cache_calls: Cell::new(0),
+        request_calls: Cell::new(0),
+        cache_calls: Cell::new(0),
     };
-    let mut io = local.dragon_tiger_preparation_io_v10(
-        lease, &queries, &parent_clock, FixedClusterConfiguration::resolve(Some("2")),
-        &parent_source,
-    ).unwrap();
+    let mut io = local
+        .dragon_tiger_preparation_io_v10(
+            lease,
+            &queries,
+            &parent_clock,
+            FixedClusterConfiguration::resolve(Some("2")),
+            &parent_source,
+        )
+        .unwrap();
     let stopped = prepare_chain_analysis_with_io(
-        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks.clone(), None, &mut io,
-    ).await.expect_err("TEST_CODE parent stops at Macro");
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks.clone(),
+        None,
+        &mut io,
+    )
+    .await
+    .expect_err("TEST_CODE parent stops at Macro");
     assert_partial_macro_stop(&stopped);
     drop(io);
     let parent_head = local.inspect_run(&intent).unwrap().head_version();
     drop(local);
-    fixture.chain_post_close().migrate_schema_v10_to_v11().unwrap();
-    fixture.chain_post_close().migrate_schema_v11_to_v12().unwrap();
-    fixture.chain_post_close().migrate_schema_v12_to_v13().unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v10_to_v11()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v11_to_v12()
+        .unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v12_to_v13()
+        .unwrap();
 
     let macro_source = GrpcSource::from_macro_loopback_test_client(
-        server.connect().await, server.endpoint().to_owned(),
+        server.connect().await,
+        server.endpoint().to_owned(),
     );
     let connected = macro_source.connected_macro_queries().unwrap();
     let started_at = micros("2026-09-14T15:30:00+08:00");
@@ -427,43 +579,95 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
         observation: DateTime::parse_from_rfc3339("2026-09-14T15:30:00+08:00").unwrap(),
         observation_calls: Cell::new(0),
     };
-    let registered = [GeneralWebResearchProvider::SerpApi,
-        GeneralWebResearchProvider::Bocha, GeneralWebResearchProvider::Tavily];
+    let registered = [
+        GeneralWebResearchProvider::SerpApi,
+        GeneralWebResearchProvider::Bocha,
+        GeneralWebResearchProvider::Tavily,
+    ];
     let search_service = macro_search_service(&registered);
     let web = search_service.macro_web_snapshot(&macro_source).unwrap();
-    let requests = (1..=5).map(|ordinal| {
-        let identity = if ordinal == 5 {
-            MacroQueryIdentity::EconomicCalendar
-        } else {
-            MacroQueryIdentity::GlobalNews {
-                provider: [GlobalNewsProvider::Eastmoney, GlobalNewsProvider::Cailianpress,
-                    GlobalNewsProvider::Jin10, GlobalNewsProvider::ThePaper][usize::from(ordinal - 1)],
-                limit: 20,
-            }
-        };
-        let authorized = connected.session(identity.clone()).unwrap().authorize_next().unwrap();
-        (QueryKey::Gateway(ordinal), macro_codec::Request::capture_for(&identity, &authorized).unwrap(),
-            connected.endpoint().to_owned())
-    }).collect::<Vec<_>>();
+    let requests = (1..=5)
+        .map(|ordinal| {
+            let identity = if ordinal == 5 {
+                MacroQueryIdentity::EconomicCalendar
+            } else {
+                MacroQueryIdentity::GlobalNews {
+                    provider: [
+                        GlobalNewsProvider::Eastmoney,
+                        GlobalNewsProvider::Cailianpress,
+                        GlobalNewsProvider::Jin10,
+                        GlobalNewsProvider::ThePaper,
+                    ][usize::from(ordinal - 1)],
+                    limit: 20,
+                }
+            };
+            let authorized = connected
+                .session(identity.clone())
+                .unwrap()
+                .authorize_next()
+                .unwrap();
+            (
+                QueryKey::Gateway(ordinal),
+                macro_codec::Request::capture_for(&identity, &authorized).unwrap(),
+                connected.endpoint().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
     let database = fixture.database();
-    let mut local = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap();
-    let lease = local.resume_run(&intent, macro_lease(
-        "TEST_CODE_RETIRED_RESUME_MACRO", started_at,
-        started_at + if unconfirmed_attempt { 2_000_000 } else { 60_000_000 }, parent_head,
-    )).unwrap();
+    let mut local = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap();
+    let lease = local
+        .resume_run(
+            &intent,
+            macro_lease(
+                "TEST_CODE_RETIRED_RESUME_MACRO",
+                started_at,
+                started_at
+                    + if unconfirmed_attempt {
+                        2_000_000
+                    } else {
+                        60_000_000
+                    },
+                parent_head,
+            ),
+        )
+        .unwrap();
     let mut live = crate::push_foundation::intent_store::chain_post_close::macro_live::Live::open(
-        &mut local, lease, &clock, std::rc::Rc::new(Cell::new(false)),
-    ).unwrap();
-    let economic_request = requests.iter()
-        .find(|(query, _, _)| *query == QueryKey::Gateway(5)).unwrap().1.clone();
-    live.initialize(clock.macro_request_observation(), connected.endpoint(), requests, None, &web).unwrap();
+        &mut local,
+        lease,
+        &clock,
+        std::rc::Rc::new(Cell::new(false)),
+    )
+    .unwrap();
+    let economic_request = requests
+        .iter()
+        .find(|(query, _, _)| *query == QueryKey::Gateway(5))
+        .unwrap()
+        .1
+        .clone();
+    live.initialize(
+        clock.macro_request_observation(),
+        connected.endpoint(),
+        requests,
+        None,
+        &web,
+    )
+    .unwrap();
     if unconfirmed_attempt {
         // The durable begin has committed, but no response was confirmed before
         // the process disappeared. Retirement cannot reinterpret this as NotCalled.
-        let ticket = live.begin_data(
-            QueryKey::Gateway(5), 1, economic_request, connected.endpoint(),
-        ).unwrap();
+        let ticket = live
+            .begin_data(
+                QueryKey::Gateway(5),
+                1,
+                economic_request,
+                connected.endpoint(),
+            )
+            .unwrap();
         drop(ticket);
     }
     let planned_lease = live.into_lease();
@@ -474,8 +678,12 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
     ).unwrap();
     assert_eq!(old_request_count, 1);
     if unconfirmed_attempt {
-        let mut local = fixture.store.as_mut().unwrap()
-            .single_user_local_chain_post_close(&config).unwrap();
+        let mut local = fixture
+            .store
+            .as_mut()
+            .unwrap()
+            .single_user_local_chain_post_close(&config)
+            .unwrap();
         let original = local.inspect_macro(&intent).unwrap();
         let original_head = local.inspect_run(&intent).unwrap().head_version();
         assert!(original.has_unconfirmed_effect());
@@ -488,27 +696,56 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
         drop(local);
         drop(planned_lease);
         fixture.reopen();
-        fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+        fixture
+            .chain_post_close()
+            .migrate_schema_v13_to_v14()
+            .unwrap();
 
-        clock.now.set(UtcMicros::try_new(started_at + 3_000_000).unwrap());
-        let mut local = fixture.store.as_mut().unwrap()
-            .single_user_local_chain_post_close(&config).unwrap();
-        let lease = local.resume_run(&intent, macro_lease(
-            "TEST_CODE_RETIRED_UNKNOWN_REOPENED", started_at + 3_000_000,
-            started_at + 10_000_000, original_head,
-        )).unwrap();
+        clock
+            .now
+            .set(UtcMicros::try_new(started_at + 3_000_000).unwrap());
+        let mut local = fixture
+            .store
+            .as_mut()
+            .unwrap()
+            .single_user_local_chain_post_close(&config)
+            .unwrap();
+        let lease = local
+            .resume_run(
+                &intent,
+                macro_lease(
+                    "TEST_CODE_RETIRED_UNKNOWN_REOPENED",
+                    started_at + 3_000_000,
+                    started_at + 10_000_000,
+                    original_head,
+                ),
+            )
+            .unwrap();
         let resumed_head = local.inspect_run(&intent).unwrap().head_version();
         assert!(resumed_head > original_head);
-        let mut io = local.macro_preparation_io_v14(
-            lease, &queries, &clock, FixedClusterConfiguration::resolve(Some("2")),
-            &parent_source, &macro_source, &search_service,
-        ).unwrap();
-        let stopped = tokio::time::timeout(Duration::from_secs(10),
+        let mut io = local
+            .macro_preparation_io_v14(
+                lease,
+                &queries,
+                &clock,
+                FixedClusterConfiguration::resolve(Some("2")),
+                &parent_source,
+                &macro_source,
+                &search_service,
+            )
+            .unwrap();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
             prepare_chain_analysis_with_io(
-                NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks, None, &mut io,
+                NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+                stocks,
+                None,
+                &mut io,
             ),
-        ).await.expect("TEST_CODE Unknown must stop promptly")
-            .expect_err("TEST_CODE retirement must not clear an unconfirmed attempt");
+        )
+        .await
+        .expect("TEST_CODE Unknown must stop promptly")
+        .expect_err("TEST_CODE retirement must not clear an unconfirmed attempt");
         assert!(matches!(stopped.downcast_ref::<PreparationStop>(),
             Some(PreparationStop::IncompleteOnReopen { intent_id }) if intent_id == intent.as_str()));
         drop(io);
@@ -525,18 +762,29 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
         assert!(attempt.result_material().is_none());
         assert!(attempt.response_bytes().is_none());
         assert!(recovered.query_terminal(QueryKey::Gateway(5)).is_none());
-        assert_eq!(local.inspect_run(&intent).unwrap().head_version(), resumed_head);
+        assert_eq!(
+            local.inspect_run(&intent).unwrap().head_version(),
+            resumed_head
+        );
         drop(local);
         assert_eq!(fixture.count("chain_post_close_macro_retired_terminals"), 0);
-        assert!(server.snapshot().calls.is_empty(), "TEST_CODE Unknown must stop all new Macro effects");
+        assert!(
+            server.snapshot().calls.is_empty(),
+            "TEST_CODE Unknown must stop all new Macro effects"
+        );
         drop(connected);
         drop(queries);
         drop(parent_source);
         drop(macro_source);
         fixture.reopen();
-        let reopened = fixture.store.as_mut().unwrap()
-            .single_user_local_chain_post_close(&config).unwrap()
-            .inspect_macro(&intent).unwrap();
+        let reopened = fixture
+            .store
+            .as_mut()
+            .unwrap()
+            .single_user_local_chain_post_close(&config)
+            .unwrap()
+            .inspect_macro(&intent)
+            .unwrap();
         assert!(reopened.has_unconfirmed_effect());
         assert_eq!(reopened.plan_bytes(), plan_bytes);
         assert_eq!(reopened.attempts()[0].request_bytes(), request_bytes);
@@ -545,18 +793,35 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
         parent_server.finish().await;
         return;
     }
-    fixture.chain_post_close().migrate_schema_v13_to_v14().unwrap();
+    fixture
+        .chain_post_close()
+        .migrate_schema_v13_to_v14()
+        .unwrap();
 
-    let mut local = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap();
-    let mut io = local.macro_preparation_io_v14(
-        planned_lease, &queries, &clock, FixedClusterConfiguration::resolve(Some("2")),
-        &parent_source, &macro_source, &search_service,
-    ).unwrap();
+    let mut local = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap();
+    let mut io = local
+        .macro_preparation_io_v14(
+            planned_lease,
+            &queries,
+            &clock,
+            FixedClusterConfiguration::resolve(Some("2")),
+            &parent_source,
+            &macro_source,
+            &search_service,
+        )
+        .unwrap();
     let mut reader = BusinessIntentStore::open(&database).unwrap();
     let mut read_local = reader.single_user_local_chain_post_close(&config).unwrap();
     let mut prepare = Box::pin(prepare_chain_analysis_with_io(
-        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(), stocks, None, &mut io,
+        NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        None,
+        &mut io,
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::select! {
@@ -567,10 +832,19 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
     let observed = read_local.inspect_macro(&intent).unwrap();
     let retired = observed.query_terminal(QueryKey::Gateway(5)).unwrap();
     assert!(!retired.was_called());
-    assert!(matches!(retired.native(), NativeOutcome::Economic(Err(error))
-        if error.reason_code() == "operation_retired" && !error.retryable()));
-    assert!(!observed.attempts().iter().any(|attempt| attempt.query_key() == QueryKey::Gateway(5)));
-    assert!(!server.snapshot().calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    assert!(
+        matches!(retired.native(), NativeOutcome::Economic(Err(error))
+        if error.reason_code() == "operation_retired" && !error.retryable())
+    );
+    assert!(!observed
+        .attempts()
+        .iter()
+        .any(|attempt| attempt.query_key() == QueryKey::Gateway(5)));
+    assert!(!server
+        .snapshot()
+        .calls
+        .iter()
+        .any(|call| call.call == Call::Gateway(Lane::E)));
     let preserved_request_count: i64 = rusqlite::Connection::open(&database).unwrap().query_row(
         "SELECT count(*) FROM chain_post_close_macro_request_plans WHERE intent_id=?1 AND phase='Gateway' AND item_ordinal=5",
         [intent.as_str()], |row| row.get(0),
@@ -599,12 +873,26 @@ async fn v14_resumes_v13_economic_plan(unconfirmed_attempt: bool) {
     drop(parent_source);
     drop(macro_source);
     fixture.reopen();
-    let reopened = fixture.store.as_mut().unwrap()
-        .single_user_local_chain_post_close(&config).unwrap()
-        .inspect_macro(&intent).unwrap();
-    assert_eq!(reopened.query_terminal(QueryKey::Gateway(5)).unwrap().native_bytes(),
-        retired.native_bytes());
-    assert!(!server.snapshot().calls.iter().any(|call| call.call == Call::Gateway(Lane::E)));
+    let reopened = fixture
+        .store
+        .as_mut()
+        .unwrap()
+        .single_user_local_chain_post_close(&config)
+        .unwrap()
+        .inspect_macro(&intent)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .query_terminal(QueryKey::Gateway(5))
+            .unwrap()
+            .native_bytes(),
+        retired.native_bytes()
+    );
+    assert!(!server
+        .snapshot()
+        .calls
+        .iter()
+        .any(|call| call.call == Call::Gateway(Lane::E)));
     server.finish().await.unwrap();
     parent_server.finish().await;
 }
@@ -633,8 +921,7 @@ impl MacroFinalizeCommitClock {
     ) -> Self {
         let connection = rusqlite::Connection::open_with_flags(
             database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .expect("TEST_CODE open owned Macro final commit reader");
         connection
@@ -809,17 +1096,25 @@ fn assert_empty_models_stop(error: &anyhow::Error, calls: &[Call]) {
         "TEST_CODE after five confirmed Gateways, monotonic expiry must complete Macro with empty context; actual={error:?}; calls={calls:?}");
     let failure = error.downcast_ref::<PreparationFailure>().unwrap();
     assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
-    assert_eq!(failure.completed_stages().last(), Some(&PreparationStage::Macro));
+    assert_eq!(
+        failure.completed_stages().last(),
+        Some(&PreparationStage::Macro)
+    );
     assert_eq!(failure.macro_context().as_bytes(), b"");
-    assert_eq!(failure.lhb_map()["TEST_CODE_600001"].to_bits(), 12.5_f64.to_bits());
-    assert_eq!(failure.lhb_source().source(), Some("TEST_CODE_LHB_SOURCE_FIRST"));
+    assert_eq!(
+        failure.lhb_map()["TEST_CODE_600001"].to_bits(),
+        12.5_f64.to_bits()
+    );
+    assert_eq!(
+        failure.lhb_source().source(),
+        Some("TEST_CODE_LHB_SOURCE_FIRST")
+    );
 }
 
 async fn full_macro_scenario(scenario: FullMacroScenario) {
     let mut fixture = V2BusinessFixture::new();
     let mut parent_server = None;
-    let finalize_fault_reader =
-        std::rc::Rc::new(RefCell::new(None::<rusqlite::Connection>));
+    let finalize_fault_reader = std::rc::Rc::new(RefCell::new(None::<rusqlite::Connection>));
     let mut macro_server = None;
     let body = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
         let (parent_endpoint, server) = tokio::time::timeout(Duration::from_secs(5),
@@ -1761,8 +2056,8 @@ enum GatewayBeginExpiryScenario {
 async fn gateway_begin_expiry_scenario(scenario: GatewayBeginExpiryScenario) {
     use crate::push_foundation::intent_store::chain_post_close::macro_live::Live;
     use crate::search_service::macro_news::runner::{BudgetExpired, RunEnd};
-    use std::rc::Rc;
     use sha2::Digest as _;
+    use std::rc::Rc;
 
     let mut fixture = V2BusinessFixture::new();
     let mut parent_server = None;
@@ -2213,11 +2508,18 @@ async fn gateway_begin_expiry_scenario(scenario: GatewayBeginExpiryScenario) {
     // The body and its Live/IO/reader borrows are gone on panic/timeout too.
     // Owners bound their own shutdown: never timeout a taken finish handle.
     let macro_cleanup = match macro_server.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await,
+        Some(server) => {
+            std::panic::AssertUnwindSafe(server.finish())
+                .catch_unwind()
+                .await
+        }
         None => Ok(Ok(())),
     };
     let parent_cleanup = match parent_server.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await.map(|_| ()),
+        Some(server) => std::panic::AssertUnwindSafe(server.finish())
+            .catch_unwind()
+            .await
+            .map(|_| ()),
         None => Ok(()),
     };
     let database_cleanup = fixture.store.take().map(|store| {
@@ -2227,7 +2529,9 @@ async fn gateway_begin_expiry_scenario(scenario: GatewayBeginExpiryScenario) {
         })
     });
     drop(fixture);
-    macro_cleanup.expect("TEST_CODE rollback Macro cleanup panic").expect("TEST_CODE rollback Macro cleanup");
+    macro_cleanup
+        .expect("TEST_CODE rollback Macro cleanup panic")
+        .expect("TEST_CODE rollback Macro cleanup");
     parent_cleanup.expect("TEST_CODE rollback parent cleanup after join");
     if let Some(result) = database_cleanup {
         result.expect("TEST_CODE rollback database close");
@@ -2437,8 +2741,7 @@ impl HistoricalGroupCommitClock {
     ) -> Self {
         let connection = rusqlite::Connection::open_with_flags(
             database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .expect("TEST_CODE open owned historical group commit reader");
         connection
@@ -2585,12 +2888,14 @@ impl MacroObservationClock for HistoricalContinuationClock {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn single_user_v2_external_rejected_prefix_continues_under_new_owner_without_replaying_controls() {
+async fn single_user_v2_external_rejected_prefix_continues_under_new_owner_without_replaying_controls(
+) {
     historical_rejection_scenario(HistoricalRejectionScenario::Success).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn single_user_v2_historical_rejection_group_commit_failure_rolls_back_atomically_after_reopen() {
+async fn single_user_v2_historical_rejection_group_commit_failure_rolls_back_atomically_after_reopen(
+) {
     historical_rejection_scenario(HistoricalRejectionScenario::GroupCommitFailure).await;
 }
 
@@ -2611,16 +2916,24 @@ async fn historical_rejection_scenario(scenario: HistoricalRejectionScenario) {
         );
         let failure = error.downcast_ref::<PreparationFailure>().unwrap();
         assert_eq!(failure.stage(), PreparationStage::ModelsSearchAndReport);
-        assert_eq!(failure.completed_stages().last(), Some(&PreparationStage::Macro));
-        assert_eq!(failure.macro_context().as_bytes(), EXPECTED_V2_REJECTED_MACRO.as_bytes());
-        assert_eq!(failure.lhb_map()["TEST_CODE_600001"].to_bits(), 12.5_f64.to_bits());
+        assert_eq!(
+            failure.completed_stages().last(),
+            Some(&PreparationStage::Macro)
+        );
+        assert_eq!(
+            failure.macro_context().as_bytes(),
+            EXPECTED_V2_REJECTED_MACRO.as_bytes()
+        );
+        assert_eq!(
+            failure.lhb_map()["TEST_CODE_600001"].to_bits(),
+            12.5_f64.to_bits()
+        );
     }
 
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
-    let historical_fault_reader =
-        std::rc::Rc::new(RefCell::new(None::<rusqlite::Connection>));
+    let historical_fault_reader = std::rc::Rc::new(RefCell::new(None::<rusqlite::Connection>));
     let body = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
         let baseline = control_tests::setup_external_parent(
             &mut business, &mut parent_server, "TEST_CODE_V2_REJECTED_FORWARD",
@@ -3095,21 +3408,35 @@ async fn historical_rejection_scenario(scenario: HistoricalRejectionScenario) {
     // one panics, and each fixture handles its own abort+join deadline.
     let reader_cleanup = close_macro_finalize_fault_reader(&historical_fault_reader);
     let external_cleanup = match external_server.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await,
+        Some(server) => {
+            std::panic::AssertUnwindSafe(server.finish())
+                .catch_unwind()
+                .await
+        }
         None => Ok(Ok(())),
     };
     let parent_cleanup = match parent_server.take() {
-        Some(server) => std::panic::AssertUnwindSafe(server.finish()).catch_unwind().await.map(|_| ()),
+        Some(server) => std::panic::AssertUnwindSafe(server.finish())
+            .catch_unwind()
+            .await
+            .map(|_| ()),
         None => Ok(()),
     };
     let database_cleanup = business.store.take().map(|store| {
-        store.connection.close().map_err(|(connection, error)| { drop(connection); error })
+        store.connection.close().map_err(|(connection, error)| {
+            drop(connection);
+            error
+        })
     });
     drop(business);
     reader_cleanup.expect("TEST_CODE historical group fault reader cleanup");
-    external_cleanup.expect("TEST_CODE External finish panic").expect("TEST_CODE External finish");
+    external_cleanup
+        .expect("TEST_CODE External finish panic")
+        .expect("TEST_CODE External finish");
     parent_cleanup.expect("TEST_CODE parent finish panic after join");
-    if let Some(result) = database_cleanup { result.expect("TEST_CODE database close"); }
+    if let Some(result) = database_cleanup {
+        result.expect("TEST_CODE database close");
+    }
     match body {
         Ok(result) => result.expect("TEST_CODE v2 rejected fixture watchdog"),
         Err(panic) => std::panic::resume_unwind(panic),

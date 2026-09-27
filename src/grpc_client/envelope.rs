@@ -198,7 +198,12 @@ pub(crate) fn parse_external_query_response(
         Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
         Operation::GlobalNews => ExternalOperation::GlobalNews,
         Operation::InstrumentNews => ExternalOperation::InstrumentNews,
-        _ => return Err(EnvelopeError::OperationMismatch(expected_operation as i32, resp.operation)),
+        _ => {
+            return Err(EnvelopeError::OperationMismatch(
+                expected_operation as i32,
+                resp.operation,
+            ))
+        }
     };
     parse_external_native_query_response(expected_request_id, expected_external, authority, resp)
 }

@@ -167,7 +167,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             ));
         }
         let layout = catalog.layout();
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("full Macro open commit"))?;
         if let Some(recovery) = &current {
             if recovery.full.is_none() {
@@ -186,10 +187,15 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                     .checked_add(15_000_000)
                     .ok_or(ChainPostCloseError::SchemaRejected)?,
             );
-        let remaining = u64::try_from(deadline.checked_sub(entered.get())
-            .ok_or(ChainPostCloseError::SchemaRejected)?.max(0))
-            .map_err(|_| ChainPostCloseError::SchemaRejected)?;
-        let limit = monotonic.checked_add(Duration::from_micros(remaining))
+        let remaining = u64::try_from(
+            deadline
+                .checked_sub(entered.get())
+                .ok_or(ChainPostCloseError::SchemaRejected)?
+                .max(0),
+        )
+        .map_err(|_| ChainPostCloseError::SchemaRejected)?;
+        let limit = monotonic
+            .checked_add(Duration::from_micros(remaining))
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         Ok(Self {
             local,
@@ -214,7 +220,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         &mut self,
         clock: &'clock Cell<UtcMicros>,
     ) {
-        assert!(self.gateway_a_begin_wall_expiry.is_none(), "TEST_CODE expiry already armed");
+        assert!(
+            self.gateway_a_begin_wall_expiry.is_none(),
+            "TEST_CODE expiry already armed"
+        );
         self.gateway_a_begin_wall_expiry = Some((GatewayABeginExpiryPhase::BeforeCommit, clock));
     }
 
@@ -223,7 +232,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         &mut self,
         clock: &'clock Cell<UtcMicros>,
     ) {
-        assert!(self.gateway_a_begin_wall_expiry.is_none(), "TEST_CODE expiry already armed");
+        assert!(
+            self.gateway_a_begin_wall_expiry.is_none(),
+            "TEST_CODE expiry already armed"
+        );
         self.gateway_a_begin_wall_expiry = Some((GatewayABeginExpiryPhase::AfterCommit, clock));
     }
 
@@ -241,7 +253,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         self.current.as_ref()
     }
     pub(super) fn snapshot(&self) -> anyhow::Result<Snapshot> {
-        let current = self.current.as_ref().ok_or(ChainPostCloseError::MacroNotStarted)?;
+        let current = self
+            .current
+            .as_ref()
+            .ok_or(ChainPostCloseError::MacroNotStarted)?;
         Ok(match &current.full {
             Some(full) => full.snapshot.clone(),
             None => current.legacy_snapshot()?,
@@ -288,7 +303,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             &self.active,
             self.finalizing,
         )?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("Macro checkpoint commit"))?;
         self.current = current;
         gate.sample(false)?;
@@ -424,7 +440,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         drop(writer);
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
         gate.sample(false)?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("full Macro plan commit"))?;
         self.lease.head = candidate.head;
         self.current = current;
@@ -442,23 +459,47 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
     }
 
     pub(super) fn begin_data_connection(
-        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+        &mut self,
+        query: QueryKey,
+        attempt: u32,
+        request: codec::Request,
+        endpoint: &str,
         connection: Option<crate::grpc_client::connection_qualification::ConnectionIdentity>,
     ) -> anyhow::Result<Ticket> {
-        self.begin_data_with_authority(query, attempt, request, endpoint, DataAppendAuthority::Connection(connection))
+        self.begin_data_with_authority(
+            query,
+            attempt,
+            request,
+            endpoint,
+            DataAppendAuthority::Connection(connection),
+        )
     }
 
     /// Only builds frozen v12 bytes offline. The returned ticket is a journal
     /// fact, not a client/session or permission to issue an RPC.
     #[cfg(test)]
     pub(super) fn begin_historical_v12_data_fixture(
-        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+        &mut self,
+        query: QueryKey,
+        attempt: u32,
+        request: codec::Request,
+        endpoint: &str,
     ) -> anyhow::Result<Ticket> {
-        self.begin_data_with_authority(query, attempt, request, endpoint, DataAppendAuthority::HistoricalV12Fixture)
+        self.begin_data_with_authority(
+            query,
+            attempt,
+            request,
+            endpoint,
+            DataAppendAuthority::HistoricalV12Fixture,
+        )
     }
 
     fn begin_data_with_authority(
-        &mut self, query: QueryKey, attempt: u32, request: codec::Request, endpoint: &str,
+        &mut self,
+        query: QueryKey,
+        attempt: u32,
+        request: codec::Request,
+        endpoint: &str,
         authority: DataAppendAuthority,
     ) -> anyhow::Result<Ticket> {
         let (connection, historical_fixture) = match authority {
@@ -483,8 +524,11 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let checkpoint_now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
         if historical_fixture {
-            require(catalog.layout() == 12
-                && request.contract_profile() == crate::grpc_client::client::ContractProfile::ExternalV1)?;
+            require(
+                catalog.layout() == 12
+                    && request.contract_profile()
+                        == crate::grpc_client::client::ContractProfile::ExternalV1,
+            )?;
         }
         let (run, current) = admitted(
             &transaction,
@@ -513,14 +557,13 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             .as_ref()
             .ok_or(ChainPostCloseError::MacroNotStarted)?;
         let full = current.full.as_ref();
-        let snapshot = match full { Some(full) => full.snapshot.clone(), None => current.legacy_snapshot()? };
+        let snapshot = match full {
+            Some(full) => full.snapshot.clone(),
+            None => current.legacy_snapshot()?,
+        };
         let identity = snapshot.definition.identity(query)?;
         request.validate_for(&identity)?;
-        let state = snapshot
-            .queries
-            .get(&query)
-            .cloned()
-            .unwrap_or_default();
+        let state = snapshot.queries.get(&query).cloned().unwrap_or_default();
         require(
             state.terminal.is_none()
                 && state.next_attempt == attempt
@@ -530,9 +573,12 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
         let request_version = if full.is_none() {
-            require(catalog.layout() == 15 && query == QueryKey::Gateway(1)
-                && endpoint == current.plan.endpoint()
-                && codec::encode(&request)? == codec::encode(&current.plan.request)?)?;
+            require(
+                catalog.layout() == 15
+                    && query == QueryKey::Gateway(1)
+                    && endpoint == current.plan.endpoint()
+                    && codec::encode(&request)? == codec::encode(&current.plan.request)?,
+            )?;
             current.request_plan_version
         } else if let Some(original) = full.and_then(|full| full.requests.get(&query)) {
             require(
@@ -565,14 +611,14 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             // This checks the frozen episode's shape only. It grants no send
             // authority: the layout15/current-generation receipt gate below
             // is required for every new external data effect.
-            require(current
-                .readiness_episodes
-                .first()
-                .is_some_and(|episode| episode.controls.len() == 2
-                    && episode.controls.iter().all(|control|
+            require(current.readiness_episodes.first().is_some_and(|episode| {
+                episode.controls.len() == 2
+                    && episode.controls.iter().all(|control| {
                         control.outcome == Some(old::MacroControlOutcome::Ready)
                             && matches!(control.qualification_version, Some(3 | 4))
-                            && control.request.has_wire_identity())))?;
+                            && control.request.has_wire_identity()
+                    })
+            }))?;
             Some(
                 current
                     .readiness_episodes
@@ -597,21 +643,43 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
                 .find(|previous| previous.query == query)
                 .and_then(|previous| previous.result),
         };
-        if request.contract_profile() == crate::grpc_client::client::ContractProfile::ExternalV1 && !historical_fixture {
+        if request.contract_profile() == crate::grpc_client::client::ContractProfile::ExternalV1
+            && !historical_fixture
+        {
             require(catalog.layout() == 15)?;
             let identity = connection.ok_or(ChainPostCloseError::SchemaRejected)?;
             let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
-            let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-                &current.plan, current.plan_version, &plan_sha256)?;
+            let history = super::macro_connection::load(
+                &transaction,
+                &self.lease.intent_id,
+                &run,
+                &current.plan,
+                current.plan_version,
+                &plan_sha256,
+            )?;
             let (qualification, _) = history.qualified(&identity)?;
-            let capabilities = history.capabilities.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
+            let capabilities = history
+                .capabilities
+                .get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
             let link = super::macro_connection::EffectLink {
-                version: 1, identity, plan_version: current.plan_version, plan_sha256,
-                qualification_version: qualification.version, qualification_sha256: qualification.digest.clone(),
-                effect_begin_version: writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?,
+                version: 1,
+                identity,
+                plan_version: current.plan_version,
+                plan_sha256,
+                qualification_version: qualification.version,
+                qualification_sha256: qualification.digest.clone(),
+                effect_begin_version: writer
+                    .lease
+                    .head
+                    .checked_add(2)
+                    .ok_or(ChainPostCloseError::SchemaRejected)?,
                 request: capabilities.request.clone(),
                 data: Some(super::macro_connection::DataEffect {
-                    query, attempt, request_plan_version: request_version, request: request.clone(),
+                    query,
+                    attempt,
+                    request_plan_version: request_version,
+                    request: request.clone(),
                     capabilities_begin_version: capabilities.begin_version,
                     capabilities_result_version: capabilities.result_version,
                     capabilities_result_sha256: capabilities.result_sha256.clone(),
@@ -619,13 +687,18 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             };
             writer.append(Body::ConnectionEffectLink(&link))?;
         }
-        let begin = if full.is_some() { writer.append(Body::DataBegin(&value))? } else {
+        let begin = if full.is_some() {
+            writer.append(Body::DataBegin(&value))?
+        } else {
             writer.append(Body::LegacyDataBegin {
                 value: &old::Begin {
-                    version: 1, ordinal: attempt,
+                    version: 1,
+                    ordinal: attempt,
                     plan_sha256: raw_digest(&current.plan_bytes).as_str().to_owned(),
-                    request_sha256: value.request_sha256.clone(), previous_result: value.previous_result_version,
-                }, links: &value,
+                    request_sha256: value.request_sha256.clone(),
+                    previous_result: value.previous_result_version,
+                },
+                links: &value,
             })?
         };
         let receipt = writer.receipt(initial_head)?;
@@ -634,15 +707,20 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(expected.insert(step, begin).is_none())?;
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
         #[cfg(test)]
-        if query == QueryKey::Gateway(1) && attempt == 1
-            && matches!(self.gateway_a_begin_wall_expiry, Some((GatewayABeginExpiryPhase::BeforeCommit, _)))
+        if query == QueryKey::Gateway(1)
+            && attempt == 1
+            && matches!(
+                self.gateway_a_begin_wall_expiry,
+                Some((GatewayABeginExpiryPhase::BeforeCommit, _))
+            )
         {
             if let Some((_, clock)) = self.gateway_a_begin_wall_expiry.take() {
                 clock.set(UtcMicros::try_new(self.deadline).expect("TEST_CODE original deadline"));
             }
         }
         gate.sample(false)?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("full Macro data begin commit"))?;
         self.lease.head = candidate.head;
         self.active = expected;
@@ -655,8 +733,12 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             guard: EffectGuard::new(Rc::clone(&self.cancelled)),
         };
         #[cfg(test)]
-        if query == QueryKey::Gateway(1) && attempt == 1
-            && matches!(self.gateway_a_begin_wall_expiry, Some((GatewayABeginExpiryPhase::AfterCommit, _)))
+        if query == QueryKey::Gateway(1)
+            && attempt == 1
+            && matches!(
+                self.gateway_a_begin_wall_expiry,
+                Some((GatewayABeginExpiryPhase::AfterCommit, _))
+            )
         {
             if let Some((_, clock)) = self.gateway_a_begin_wall_expiry.take() {
                 clock.set(UtcMicros::try_new(self.deadline).expect("TEST_CODE original deadline"));
@@ -676,39 +758,75 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         self.checkpoint()?;
         require(self.active.is_empty())?;
         let gate = self.gate();
-        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let transaction = self
+            .local
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage("Macro qualification begin"))?;
         let now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
         require(catalog.layout() == 15)?;
-        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let (run, current) =
+            admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
         let request = codec::ControlRequest::capture_current(material, &identity)?;
         let health = request.kind() == ExternalControlKind::Health;
-        let step = if health { Step::Health } else { Step::Capabilities };
-        require(current.readiness_episodes.first().and_then(|episode| episode.controls.get(if health { 0 } else { 1 }))
-            .is_some_and(|control| control.outcome == Some(old::MacroControlOutcome::Ready)
-                && control.request.request_id() != request.request_id()))?;
+        let step = if health {
+            Step::Health
+        } else {
+            Step::Capabilities
+        };
+        require(
+            current
+                .readiness_episodes
+                .first()
+                .and_then(|episode| episode.controls.get(if health { 0 } else { 1 }))
+                .is_some_and(|control| {
+                    control.outcome == Some(old::MacroControlOutcome::Ready)
+                        && control.request.request_id() != request.request_id()
+                }),
+        )?;
         let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
         let initial = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
         let begin = if health {
             let value = super::macro_connection::HealthBegin {
-                version: 1, identity, plan_version: current.plan_version, plan_sha256,
-                request, control_begin_version: None,
+                version: 1,
+                identity,
+                plan_version: current.plan_version,
+                plan_sha256,
+                request,
+                control_begin_version: None,
             };
             value.validate()?;
             writer.append(Body::ConnectionHealthBegin(&value))?
         } else {
-            let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-                &current.plan, current.plan_version, &plan_sha256)?;
+            let history = super::macro_connection::load(
+                &transaction,
+                &self.lease.intent_id,
+                &run,
+                &current.plan,
+                current.plan_version,
+                &plan_sha256,
+            )?;
             let (fact, _) = history.qualified(&identity)?;
-            require(!history.capability_begins.contains_key(&identity.epoch) && !history.capabilities.contains_key(&identity.epoch))?;
-            writer.append(Body::ConnectionCapabilitiesBegin(&super::macro_connection::CapabilitiesBegin {
-                version: 1, identity, plan_version: current.plan_version, plan_sha256, request,
-                qualification_version: fact.version, qualification_sha256: fact.digest.clone(),
-            }))?
+            require(
+                !history.capability_begins.contains_key(&identity.epoch)
+                    && !history.capabilities.contains_key(&identity.epoch),
+            )?;
+            writer.append(Body::ConnectionCapabilitiesBegin(
+                &super::macro_connection::CapabilitiesBegin {
+                    version: 1,
+                    identity,
+                    plan_version: current.plan_version,
+                    plan_sha256,
+                    request,
+                    qualification_version: fact.version,
+                    qualification_sha256: fact.digest.clone(),
+                },
+            ))?
         };
         let receipt = writer.receipt(initial)?;
         drop(writer);
@@ -716,11 +834,17 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(expected.insert(step, begin).is_none())?;
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
         gate.sample(false)?;
-        transaction.commit().map_err(|_| storage("Macro qualification begin commit"))?;
+        transaction
+            .commit()
+            .map_err(|_| storage("Macro qualification begin commit"))?;
         self.lease.head = candidate.head;
         self.active = expected;
         self.current = current;
-        let ticket = Ticket { step, begin, guard: EffectGuard::new(Rc::clone(&self.cancelled)) };
+        let ticket = Ticket {
+            step,
+            begin,
+            guard: EffectGuard::new(Rc::clone(&self.cancelled)),
+        };
         gate.after_commit(receipt, false)?;
         Ok(ticket)
     }
@@ -731,50 +855,100 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         mut raw: codec::ControlRawResult,
         identity: crate::grpc_client::connection_qualification::ConnectionIdentity,
     ) -> anyhow::Result<bool> {
-        require(matches!(ticket.step, Step::Health | Step::Capabilities) && self.active.get(&ticket.step) == Some(&ticket.begin))?;
+        require(
+            matches!(ticket.step, Step::Health | Step::Capabilities)
+                && self.active.get(&ticket.step) == Some(&ticket.begin),
+        )?;
         let gate = self.gate();
-        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let transaction = self
+            .local
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage("Macro qualification result"))?;
         let now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
         require(catalog.layout() == 15)?;
-        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let (run, current) =
+            admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
         let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
-        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-            &current.plan, current.plan_version, &plan_sha256)?;
+        let history = super::macro_connection::load(
+            &transaction,
+            &self.lease.intent_id,
+            &run,
+            &current.plan,
+            current.plan_version,
+            &plan_sha256,
+        )?;
         let (begin_fact, request) = if ticket.step == Step::Health {
-            let (fact, begin) = history.begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
-            require(begin.identity == identity && begin.control_begin_version.is_none() && !history.results.contains_key(&identity.epoch))?;
+            let (fact, begin) = history
+                .begins
+                .get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(
+                begin.identity == identity
+                    && begin.control_begin_version.is_none()
+                    && !history.results.contains_key(&identity.epoch),
+            )?;
             raw.bind_connection_identity(&begin.request, &identity, None)?;
             (fact, &begin.request)
         } else {
-            let (fact, begin) = history.capability_begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
-            require(begin.identity == identity && !history.capabilities.contains_key(&identity.epoch))?;
-            let (_, health_begin) = history.begins.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
-            let response = history.health_responses.get(&identity.epoch).ok_or(ChainPostCloseError::SchemaRejected)?;
-            raw.bind_connection_identity(&begin.request, &identity, Some((&health_begin.request, response)))?;
+            let (fact, begin) = history
+                .capability_begins
+                .get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            require(
+                begin.identity == identity && !history.capabilities.contains_key(&identity.epoch),
+            )?;
+            let (_, health_begin) = history
+                .begins
+                .get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            let response = history
+                .health_responses
+                .get(&identity.epoch)
+                .ok_or(ChainPostCloseError::SchemaRejected)?;
+            raw.bind_connection_identity(
+                &begin.request,
+                &identity,
+                Some((&health_begin.request, response)),
+            )?;
             (fact, &begin.request)
         };
         require(begin_fact.version == ticket.begin)?;
         let qualified = raw.project(request)?.is_ok();
         let value = super::macro_connection::HealthResult {
-            version: 1, identity, plan_version: current.plan_version, plan_sha256,
-            begin_version: begin_fact.version, begin_sha256: begin_fact.digest.clone(),
-            control_result_version: None, control_result_sha256: raw_digest(&codec::encode(&raw)?).as_str().to_owned(),
-            raw: Some(raw), qualified,
+            version: 1,
+            identity,
+            plan_version: current.plan_version,
+            plan_sha256,
+            begin_version: begin_fact.version,
+            begin_sha256: begin_fact.digest.clone(),
+            control_result_version: None,
+            control_result_sha256: raw_digest(&codec::encode(&raw)?).as_str().to_owned(),
+            raw: Some(raw),
+            qualified,
         };
         let initial = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
-        writer.append(if ticket.step == Step::Health { Body::ConnectionHealthResult(&value) } else { Body::ConnectionCapabilitiesResult(&value) })?;
+        writer.append(if ticket.step == Step::Health {
+            Body::ConnectionHealthResult(&value)
+        } else {
+            Body::ConnectionCapabilitiesResult(&value)
+        })?;
         let receipt = writer.receipt(initial)?;
         drop(writer);
         let mut expected = self.active.clone();
         require(expected.remove(&ticket.step) == Some(ticket.begin))?;
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
         gate.sample(false)?;
-        transaction.commit().map_err(|_| PreparationStop::ResultUnconfirmed { intent_id: gate.intent.clone() })?;
+        transaction
+            .commit()
+            .map_err(|_| PreparationStop::ResultUnconfirmed {
+                intent_id: gate.intent.clone(),
+            })?;
         self.lease.head = candidate.head;
         self.active = expected;
         self.current = current;
@@ -818,8 +992,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         control.request.matches_material(&material)?;
         let health_result = if ordinal == 2 {
             require(episode.controls[0].outcome == Some(old::MacroControlOutcome::Ready))?;
-            require(matches!(episode.controls[0].qualification_version, Some(3 | 4))
-                && episode.controls[0].request.has_wire_identity())?;
+            require(
+                matches!(episode.controls[0].qualification_version, Some(3 | 4))
+                    && episode.controls[0].request.has_wire_identity(),
+            )?;
             Some(
                 episode.controls[0]
                     .result
@@ -849,20 +1025,43 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             let plan_sha256 = raw_digest(&current.plan_bytes).as_str().to_owned();
             if ordinal == 1 {
                 let qualification = super::macro_connection::HealthBegin {
-                    version: 1, identity, plan_version: current.plan_version, plan_sha256,
+                    version: 1,
+                    identity,
+                    plan_version: current.plan_version,
+                    plan_sha256,
                     request: control.request.clone(),
-                    control_begin_version: Some(writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?),
+                    control_begin_version: Some(
+                        writer
+                            .lease
+                            .head
+                            .checked_add(2)
+                            .ok_or(ChainPostCloseError::SchemaRejected)?,
+                    ),
                 };
                 qualification.validate()?;
                 writer.append(Body::ConnectionHealthBegin(&qualification))?;
             } else {
-                let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-                    &current.plan, current.plan_version, &plan_sha256)?;
+                let history = super::macro_connection::load(
+                    &transaction,
+                    &self.lease.intent_id,
+                    &run,
+                    &current.plan,
+                    current.plan_version,
+                    &plan_sha256,
+                )?;
                 let (fact, _) = history.qualified(&identity)?;
                 let link = super::macro_connection::EffectLink {
-                    version: 1, identity, plan_version: current.plan_version, plan_sha256,
-                    qualification_version: fact.version, qualification_sha256: fact.digest.clone(),
-                    effect_begin_version: writer.lease.head.checked_add(2).ok_or(ChainPostCloseError::SchemaRejected)?,
+                    version: 1,
+                    identity,
+                    plan_version: current.plan_version,
+                    plan_sha256,
+                    qualification_version: fact.version,
+                    qualification_sha256: fact.digest.clone(),
+                    effect_begin_version: writer
+                        .lease
+                        .head
+                        .checked_add(2)
+                        .ok_or(ChainPostCloseError::SchemaRejected)?,
                     request: control.request.clone(),
                     data: None,
                 };
@@ -899,7 +1098,11 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         mut ticket: Ticket,
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
     ) -> anyhow::Result<Snapshot> {
-        if self.current.as_ref().is_some_and(|current| current.full.is_none()) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.full.is_none())
+        {
             return self.record_legacy_data(ticket, completion);
         }
         let Step::Data { query, attempt } = ticket.step else {
@@ -939,26 +1142,38 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             })
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         let connection_history = if catalog.layout() == 15 {
-            Some(super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-                &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?)
-        } else { None };
-        let provider_catalog = connection_history.as_ref()
+            Some(super::macro_connection::load(
+                &transaction,
+                &self.lease.intent_id,
+                &run,
+                &current.plan,
+                current.plan_version,
+                raw_digest(&current.plan_bytes).as_str(),
+            )?)
+        } else {
+            None
+        };
+        let provider_catalog = connection_history
+            .as_ref()
             .and_then(|history| history.data_catalogs.get(&original.begin))
-            .or_else(|| old::historical_provider_catalog(
-            &current.readiness_episodes,
-            original.readiness_result_version(),
-        ));
+            .or_else(|| {
+                old::historical_provider_catalog(
+                    &current.readiness_episodes,
+                    original.readiness_result_version(),
+                )
+            });
         let identity = full.snapshot.definition.identity(query)?;
-        let data =
-            native::DataResult::capture_external(
-                query,
-                &identity,
-                request,
-                attempt,
-                completion,
-                provider_catalog,
-                connection_history.as_ref().and_then(|history| history.data_connections.get(&original.begin)),
-            )?;
+        let data = native::DataResult::capture_external(
+            query,
+            &identity,
+            request,
+            attempt,
+            completion,
+            provider_catalog,
+            connection_history
+                .as_ref()
+                .and_then(|history| history.data_connections.get(&original.begin)),
+        )?;
         let (outcome, material) = data.project(&identity, request, provider_catalog)?;
         let retry_due = match material.continuation {
             MacroContinuation::Terminal => None,
@@ -1007,7 +1222,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(expected.remove(&ticket.step) == Some(ticket.begin))?;
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
         gate.sample(false)?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| PreparationStop::ResultUnconfirmed {
                 intent_id: gate.intent.clone(),
             })?;
@@ -1024,46 +1240,93 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         mut ticket: Ticket,
         completion: &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion,
     ) -> anyhow::Result<Snapshot> {
-        let Step::Data { query: QueryKey::Gateway(1), attempt } = ticket.step else { return Err(ChainPostCloseError::SchemaRejected.into()); };
+        let Step::Data {
+            query: QueryKey::Gateway(1),
+            attempt,
+        } = ticket.step
+        else {
+            return Err(ChainPostCloseError::SchemaRejected.into());
+        };
         require(self.active.get(&ticket.step) == Some(&ticket.begin))?;
         let gate = self.gate();
-        let transaction = self.local.store.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let transaction = self
+            .local
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage("legacy continuation result"))?;
         let now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
         require(catalog.layout() == 15)?;
-        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let (run, current) =
+            admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
         current.legacy_snapshot()?;
-        require(current.attempts.last().is_some_and(|last| last.begin == ticket.begin && last.ordinal == attempt && last.result.is_none()))?;
-        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-            &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?;
-        let provider_catalog = history.data_catalogs.get(&ticket.begin).ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(current.attempts.last().is_some_and(|last| {
+            last.begin == ticket.begin && last.ordinal == attempt && last.result.is_none()
+        }))?;
+        let history = super::macro_connection::load(
+            &transaction,
+            &self.lease.intent_id,
+            &run,
+            &current.plan,
+            current.plan_version,
+            raw_digest(&current.plan_bytes).as_str(),
+        )?;
+        let provider_catalog = history
+            .data_catalogs
+            .get(&ticket.begin)
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
         let request = &current.plan.request;
-        let mut raw = codec::RawResult::capture_external_bound(completion, &codec::first_identity(), request)?;
-        raw.bind_current_connection(history.data_connections.get(&ticket.begin).ok_or(ChainPostCloseError::SchemaRejected)?)?;
+        let mut raw = codec::RawResult::capture_external_bound(
+            completion,
+            &codec::first_identity(),
+            request,
+        )?;
+        raw.bind_current_connection(
+            history
+                .data_connections
+                .get(&ticket.begin)
+                .ok_or(ChainPostCloseError::SchemaRejected)?,
+        )?;
         let (gateway, _, _) = raw.project(request, attempt, Some(provider_catalog))?;
         let retry_due = match raw.continuation() {
             MacroContinuation::Terminal => None,
-            MacroContinuation::Retry { backoff_ms } => Some(now.get().checked_add(
-                i64::try_from(backoff_ms).ok().and_then(|ms| ms.checked_mul(1000)).ok_or(ChainPostCloseError::SchemaRejected)?
-            ).ok_or(ChainPostCloseError::SchemaRejected)?),
+            MacroContinuation::Retry { backoff_ms } => Some(
+                now.get()
+                    .checked_add(
+                        i64::try_from(backoff_ms)
+                            .ok()
+                            .and_then(|ms| ms.checked_mul(1000))
+                            .ok_or(ChainPostCloseError::SchemaRejected)?,
+                    )
+                    .ok_or(ChainPostCloseError::SchemaRejected)?,
+            ),
         };
         let initial = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
         let result = writer.append(Body::LegacyDataResult {
-            value: &raw, attempt, begin: ticket.begin,
-            request_sha: raw_digest(&request.bytes).as_str(), retry_due,
+            value: &raw,
+            attempt,
+            begin: ticket.begin,
+            request_sha: raw_digest(&request.bytes).as_str(),
+            retry_due,
         })?;
-        if retry_due.is_none() { writer.legacy_terminal("DataResult", result, &gateway)?; }
+        if retry_due.is_none() {
+            writer.legacy_terminal("DataResult", result, &gateway)?;
+        }
         let receipt = writer.receipt(initial)?;
         drop(writer);
         let mut expected = self.active.clone();
         require(expected.remove(&ticket.step) == Some(ticket.begin))?;
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &expected, None)?;
         gate.sample(false)?;
-        transaction.commit().map_err(|_| PreparationStop::ResultUnconfirmed { intent_id: gate.intent.clone() })?;
+        transaction
+            .commit()
+            .map_err(|_| PreparationStop::ResultUnconfirmed {
+                intent_id: gate.intent.clone(),
+            })?;
         self.lease.head = candidate.head;
         self.active = expected;
         self.current = current;
@@ -1098,7 +1361,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
         let full = current.full.as_ref();
-        if full.is_none() { require(catalog.layout() == 15)?; current.legacy_snapshot()?; }
+        if full.is_none() {
+            require(catalog.layout() == 15)?;
+            current.legacy_snapshot()?;
+        }
         let control = current
             .readiness_episodes
             .first()
@@ -1107,21 +1373,37 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(control.begin == Some(ticket.begin) && control.result.is_none())?;
         require(catalog.layout() == 15)?;
         let identity = connection.ok_or(ChainPostCloseError::SchemaRejected)?;
-        let history = super::macro_connection::load(&transaction, &self.lease.intent_id, &run,
-            &current.plan, current.plan_version, raw_digest(&current.plan_bytes).as_str())?;
-        let (health_fact, health_begin) = history.begins.get(&identity.epoch)
+        let history = super::macro_connection::load(
+            &transaction,
+            &self.lease.intent_id,
+            &run,
+            &current.plan,
+            current.plan_version,
+            raw_digest(&current.plan_bytes).as_str(),
+        )?;
+        let (health_fact, health_begin) = history
+            .begins
+            .get(&identity.epoch)
             .ok_or(ChainPostCloseError::SchemaRejected)?;
         require(health_begin.identity == identity)?;
         let qualification_begin = if ordinal == 1 {
-            require(health_begin.control_begin_version == Some(ticket.begin)
-                && !history.results.contains_key(&identity.epoch))?;
+            require(
+                health_begin.control_begin_version == Some(ticket.begin)
+                    && !history.results.contains_key(&identity.epoch),
+            )?;
             raw.bind_connection_identity(&control.request, &identity, None)?;
             Some((health_fact.clone(), health_begin.clone()))
         } else {
             history.qualified(&identity)?;
-            let response = history.health_responses.get(&identity.epoch)
+            let response = history
+                .health_responses
+                .get(&identity.epoch)
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
-            raw.bind_connection_identity(&control.request, &identity, Some((&health_begin.request, response)))?;
+            raw.bind_connection_identity(
+                &control.request,
+                &identity,
+                Some((&health_begin.request, response)),
+            )?;
             None
         };
         let projected = raw.project(&control.request)?;
@@ -1143,10 +1425,12 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         }
         if let Some((begin_fact, begin)) = qualification_begin {
             let qualification = super::macro_connection::HealthResult {
-                version: 1, identity: begin.identity,
+                version: 1,
+                identity: begin.identity,
                 plan_version: current.plan_version,
                 plan_sha256: raw_digest(&current.plan_bytes).as_str().to_owned(),
-                begin_version: begin_fact.version, begin_sha256: begin_fact.digest,
+                begin_version: begin_fact.version,
+                begin_sha256: begin_fact.digest,
                 control_result_version: Some(result),
                 control_result_sha256: raw_digest(&codec::encode(&raw)?).as_str().to_owned(),
                 raw: None,
@@ -1270,7 +1554,10 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             current.full.as_ref().is_some_and(|full| {
                 full.local.state == plan3::LocalRouteState::ObservedConnected
                     && !full.terminals.contains_key(&QueryKey::Gateway(5))
-                    && !current.attempts.iter().any(|attempt| attempt.query == QueryKey::Gateway(5))
+                    && !current
+                        .attempts
+                        .iter()
+                        .any(|attempt| attempt.query == QueryKey::Gateway(5))
             })
         });
         if !needed {
@@ -1278,18 +1565,30 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         }
         self.checkpoint()?;
         let gate = self.gate();
-        let transaction = self.local.store.connection
+        let transaction = self
+            .local
+            .store
+            .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage("retired Macro EconomicCalendar terminal"))?;
         let now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
         require(catalog.layout() >= 14)?;
-        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let (run, current) =
+            admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
-        let full = current.full.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(full.local.state == plan3::LocalRouteState::ObservedConnected
-            && !full.terminals.contains_key(&QueryKey::Gateway(5))
-            && !current.attempts.iter().any(|attempt| attempt.query == QueryKey::Gateway(5)))?;
+        let full = current
+            .full
+            .as_ref()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(
+            full.local.state == plan3::LocalRouteState::ObservedConnected
+                && !full.terminals.contains_key(&QueryKey::Gateway(5))
+                && !current
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.query == QueryKey::Gateway(5)),
+        )?;
         let outcome = native::operation_retired_outcome();
         let value = native::QueryTerminal {
             version: 2,
@@ -1299,7 +1598,9 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             request_plan_version: None,
             request_sha256: None,
             cause: native::TerminalCause::OperationRetired,
-            native_sha256: raw_digest(&native::native_bytes(&outcome)?).as_str().to_owned(),
+            native_sha256: raw_digest(&native::native_bytes(&outcome)?)
+                .as_str()
+                .to_owned(),
         };
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
@@ -1309,16 +1610,22 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         drop(writer);
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
         gate.sample(false)?;
-        transaction.commit().map_err(|_| storage("retired Macro EconomicCalendar commit"))?;
+        transaction
+            .commit()
+            .map_err(|_| storage("retired Macro EconomicCalendar commit"))?;
         self.lease.head = candidate.head;
         self.current = current;
         gate.after_commit(receipt, false)
     }
 
     pub(super) fn needs_historical_rejection(&self) -> bool {
-        self.current.as_ref().and_then(|current| current.full.as_ref())
-            .is_some_and(|full| full.historical_rejection.is_some()
-                && !full.terminals.contains_key(&QueryKey::Gateway(2)))
+        self.current
+            .as_ref()
+            .and_then(|current| current.full.as_ref())
+            .is_some_and(|full| {
+                full.historical_rejection.is_some()
+                    && !full.terminals.contains_key(&QueryKey::Gateway(2))
+            })
     }
 
     pub(super) fn settle_historical_rejection(
@@ -1329,45 +1636,73 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         require(self.active.is_empty() && self.finalizing.is_none() && !self.cancelled.get())?;
         self.checkpoint()?;
         let gate = self.gate();
-        let transaction = self.local.store.connection
+        let transaction = self
+            .local
+            .store
+            .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| storage("historical Macro rejection begin"))?;
         let now = gate.sample(false)?;
         let catalog = schema::verify_v12_transaction(&transaction)?;
-        let (run, current) = admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
+        let (run, current) =
+            admitted(&transaction, &catalog, &self.lease, now, &self.active, None)?;
         let current = current.ok_or(ChainPostCloseError::MacroNotStarted)?;
-        let full = current.full.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
-        let origin = full.historical_rejection.as_ref().ok_or(ChainPostCloseError::SchemaRejected)?;
-        require(full.begin.is_none() && full.final_.is_none()
-            && (2..=4).all(|ordinal| !full.requests.contains_key(&QueryKey::Gateway(ordinal))
-                && !full.terminals.contains_key(&QueryKey::Gateway(ordinal))))?;
+        let full = current
+            .full
+            .as_ref()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        let origin = full
+            .historical_rejection
+            .as_ref()
+            .ok_or(ChainPostCloseError::SchemaRejected)?;
+        require(
+            full.begin.is_none()
+                && full.final_.is_none()
+                && (2..=4).all(|ordinal| {
+                    !full.requests.contains_key(&QueryKey::Gateway(ordinal))
+                        && !full.terminals.contains_key(&QueryKey::Gateway(ordinal))
+                }),
+        )?;
         let outcome = NativeOutcome::News(Err(origin.error.clone()));
         let plan_sha = raw_digest(&current.plan_bytes).as_str().to_owned();
-        let native_sha = raw_digest(&native::native_bytes(&outcome)?).as_str().to_owned();
+        let native_sha = raw_digest(&native::native_bytes(&outcome)?)
+            .as_str()
+            .to_owned();
         let initial_head = self.lease.head;
         let mut candidate = transaction_lease_candidate(&self.lease);
         let mut writer = Writer::new(&transaction, &mut candidate, &run, now);
         let mut request_versions = [0_u64; 3];
         for (index, request) in requests.iter().enumerate() {
-            require(request.profile == current.plan.request.profile
-                && request.authority == current.plan.request.authority
-                && request.policy == current.plan.request.policy)?;
+            require(
+                request.profile == current.plan.request.profile
+                    && request.authority == current.plan.request.authority
+                    && request.policy == current.plan.request.policy,
+            )?;
             let value = plan3::RequestPlan {
                 version: 2,
-                query: QueryKey::Gateway(u8::try_from(index + 2)
-                    .map_err(|_| ChainPostCloseError::SchemaRejected)?),
+                query: QueryKey::Gateway(
+                    u8::try_from(index + 2).map_err(|_| ChainPostCloseError::SchemaRejected)?,
+                ),
                 request: request.clone(),
             };
-            value.validate(&full.snapshot.definition, &full.local, current.plan.endpoint(), endpoint)?;
+            value.validate(
+                &full.snapshot.definition,
+                &full.local,
+                current.plan.endpoint(),
+                endpoint,
+            )?;
             request_versions[index] = writer.append(Body::Request {
-                value: &value, plan_version: current.plan_version, endpoint,
+                value: &value,
+                plan_version: current.plan_version,
+                endpoint,
             })?;
         }
         for (index, request) in requests.iter().enumerate() {
             let value = native::QueryTerminal {
                 version: 2,
-                query: QueryKey::Gateway(u8::try_from(index + 2)
-                    .map_err(|_| ChainPostCloseError::SchemaRejected)?),
+                query: QueryKey::Gateway(
+                    u8::try_from(index + 2).map_err(|_| ChainPostCloseError::SchemaRejected)?,
+                ),
                 plan_version: current.plan_version,
                 plan_sha256: plan_sha.clone(),
                 request_plan_version: Some(request_versions[index]),
@@ -1381,9 +1716,11 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         drop(writer);
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
         gate.sample(false)?;
-        transaction.commit().map_err(|_| PreparationStop::ResultUnconfirmed {
-            intent_id: gate.intent.clone(),
-        })?;
+        transaction
+            .commit()
+            .map_err(|_| PreparationStop::ResultUnconfirmed {
+                intent_id: gate.intent.clone(),
+            })?;
         self.lease.head = candidate.head;
         self.current = current;
         gate.after_commit(receipt, false)
@@ -1499,7 +1836,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         drop(writer);
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
         gate.sample(false)?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("Macro dimension commit"))?;
         self.lease.head = candidate.head;
         self.current = current;
@@ -1528,7 +1866,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         } else if now.get() >= self.deadline {
             native::ExpiryBasis::WallDeadline
         } else {
-            let elapsed = tokio::time::Instant::now().checked_duration_since(self.opened_monotonic)
+            let elapsed = tokio::time::Instant::now()
+                .checked_duration_since(self.opened_monotonic)
                 .ok_or(ChainPostCloseError::SchemaRejected)?;
             native::ExpiryBasis::MonotonicRemaining {
                 opened_wall_at: self.opened_wall_at,
@@ -1582,7 +1921,8 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
             Some(begin_version),
         )?;
         gate.sample(expired)?;
-        transaction.commit()
+        transaction
+            .commit()
             .map_err(|_| storage("Macro finalize begin commit"))?;
         self.lease.head = candidate.head;
         self.finalizing = Some(begin_version);
@@ -1645,10 +1985,9 @@ impl<'local, 'store, 'clock> Live<'local, 'store, 'clock> {
         drop(writer);
         let (_, current) = admitted(&transaction, &catalog, &candidate, now, &self.active, None)?;
         gate.sample(expired)?;
-        transaction.commit()
-            .map_err(|_| {
-                result_unconfirmed(storage("Macro StageFinal commit"), gate.intent.clone())
-            })?;
+        transaction.commit().map_err(|_| {
+            result_unconfirmed(storage("Macro StageFinal commit"), gate.intent.clone())
+        })?;
         self.lease.head = candidate.head;
         self.finalizing = None;
         self.current = current;
@@ -1734,8 +2073,17 @@ fn validate_admitted(
 }
 
 enum Body<'a> {
-    LegacyDataBegin { value: &'a old::Begin, links: &'a native::DataBegin },
-    LegacyDataResult { value: &'a codec::RawResult, attempt: u32, begin: u64, request_sha: &'a str, retry_due: Option<i64> },
+    LegacyDataBegin {
+        value: &'a old::Begin,
+        links: &'a native::DataBegin,
+    },
+    LegacyDataResult {
+        value: &'a codec::RawResult,
+        attempt: u32,
+        begin: u64,
+        request_sha: &'a str,
+        retry_due: Option<i64>,
+    },
     ConnectionHealthBegin(&'a super::macro_connection::HealthBegin),
     ConnectionHealthResult(&'a super::macro_connection::HealthResult),
     ConnectionEffectLink(&'a super::macro_connection::EffectLink),
@@ -1803,9 +2151,20 @@ struct Writer<'transaction, 'connection, 'state> {
 }
 
 impl<'transaction, 'connection, 'state> Writer<'transaction, 'connection, 'state> {
-    fn legacy_terminal(&mut self, cause: &str, version: u64, gateway: &codec::NewsResult) -> Result<()> {
+    fn legacy_terminal(
+        &mut self,
+        cause: &str,
+        version: u64,
+        gateway: &codec::NewsResult,
+    ) -> Result<()> {
         let (digest, receipt) = LocalChainPostClose::insert_macro_source_final(
-            self.transaction, self.lease, self.run, cause, version, gateway, self.now,
+            self.transaction,
+            self.lease,
+            self.run,
+            cause,
+            version,
+            gateway,
+            self.now,
         )?;
         self.last_sha = digest;
         self.audits.push(receipt);

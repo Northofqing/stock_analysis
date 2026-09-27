@@ -2026,7 +2026,11 @@ mod tests {
     fn only_live_trading_kinds_respect_frozen_deny() {
         // 2026-09-21 评估 #11 恢复: Frozen 拦截收敛到交易动作类 kind;
         // 状态卡/复盘/新闻保持出声.
-        for kind in [PushKind::T0Advice, PushKind::HoldingPlan, PushKind::PaperSell] {
+        for kind in [
+            PushKind::T0Advice,
+            PushKind::HoldingPlan,
+            PushKind::PaperSell,
+        ] {
             assert!(
                 default_profile_for_kind(kind).frozen_mode_respect,
                 "{kind:?} 应在 Frozen 下被拦截"

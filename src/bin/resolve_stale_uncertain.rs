@@ -32,9 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          ORDER BY business_date, scope_key",
     )?;
     let candidates: Vec<(String, String, String)> = statement
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
     drop(statement);
     drop(connection);
@@ -58,9 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = coordinator
             .resolve_uncertain(&command, &append)
             .map_err(|error| {
-                format!(
-                    "resolve {decision_identity} ({scope_key} {business_date}) failed: {error}"
-                )
+                format!("resolve {decision_identity} ({scope_key} {business_date}) failed: {error}")
             })?;
         println!("resolved {decision_identity} ({scope_key} {business_date}) -> {state:?}");
     }

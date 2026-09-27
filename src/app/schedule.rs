@@ -77,10 +77,7 @@ async fn run_time_schedule(args: &Args, schedule_time: &str, run_now: bool) -> R
     }
     // 范围校验: 循环内的 and_hms_opt 对越界小时/分钟返回 None 并 panic (原缺陷),
     // 且纯非法 weekday 会使 contains 等待循环永不终止 —— 在此处优雅拒绝。
-    if let Some(&(h, m)) = time_points
-        .iter()
-        .find(|&&(h, m)| h >= 24 || m >= 60)
-    {
+    if let Some(&(h, m)) = time_points.iter().find(|&&(h, m)| h >= 24 || m >= 60) {
         return Err(anyhow::anyhow!(
             "无效的定时时间 {h}:{m:02}，HH:MM 需满足 0<=H<24, 0<=M<60"
         ));

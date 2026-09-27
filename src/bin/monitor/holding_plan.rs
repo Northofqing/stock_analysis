@@ -25,6 +25,19 @@ pub(super) fn prepare_holding_plan_messages_with(
         .collect::<Vec<_>>();
     let quote_batch = fetch_quote_batch(&requested_codes)
         .map_err(|error| format!("持仓行情批次拒绝: {error}"))?;
+    if quote_batch.coverage != stock_analysis::data_gateway::QuoteCoverageDisposition::Complete
+        || quote_batch.requested != requested_codes
+        || !quote_batch.rejected.is_empty()
+        || !quote_batch.missing.is_empty()
+    {
+        return Err(format!(
+            "持仓行情批次拒绝: coverage={:?} requested={:?} rejected={} missing={:?}",
+            quote_batch.coverage,
+            quote_batch.requested,
+            quote_batch.rejected.len(),
+            quote_batch.missing
+        ));
+    }
     let quote_map: std::collections::HashMap<String, &stock_analysis::market_data::TopStock> =
         quote_batch
             .stocks
@@ -111,6 +124,14 @@ pub(super) fn prepare_holding_plan_messages_with(
                 "source_at": quote_batch.evidence.source_at,
                 "observed_at": quote_batch.evidence.observed_at,
                 "batch_id": quote_batch.evidence.batch_id,
+                "coverage": format!("{:?}", quote_batch.coverage),
+                "requested": quote_batch.requested,
+                "rejected": quote_batch.rejected.iter().map(|row| serde_json::json!({
+                    "code": row.code,
+                    "reason_code": row.reason_code,
+                    "message": row.message,
+                })).collect::<Vec<_>>(),
+                "missing": quote_batch.missing,
             },
             "requested_codes": requested_codes,
         });
@@ -201,6 +222,7 @@ mod tests {
         batch_id: &str,
         source_at: Option<&str>,
     ) -> market_data::TopStockBatch {
+        let requested = stocks.iter().map(|stock| stock.code.clone()).collect();
         market_data::TopStockBatch {
             stocks,
             evidence: BatchEvidence {
@@ -210,6 +232,10 @@ mod tests {
                 observed_at: "2026-09-10T09:30:01+08:00".to_owned(),
                 batch_id: batch_id.to_owned(),
             },
+            coverage: stock_analysis::data_gateway::QuoteCoverageDisposition::Complete,
+            requested,
+            rejected: Vec::new(),
+            missing: Vec::new(),
         }
     }
 
@@ -348,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_quote_coverage_prepares_only_covered_positions() {
+    fn task9_partial_quote_coverage_cannot_prepare_any_holding_decision() {
         let snapshot = snapshot_with(
             "TEST_CODE_PARTIAL",
             vec![
@@ -356,17 +382,22 @@ mod tests {
                 position("000001", "平安银行", 200, 10.0),
             ],
         );
-        let prepared = prepare_holding_plan_messages_with(
+        let error = prepare_holding_plan_messages_with(
             &push_templates::BannerCtx::test_default(),
             || Ok(Some(snapshot)),
-            |_| Ok(quote_batch()),
+            |_| {
+                let mut batch = quote_batch();
+                batch.coverage = stock_analysis::data_gateway::QuoteCoverageDisposition::Partial;
+                batch.requested = vec!["600000".to_owned(), "000001".to_owned()];
+                batch.missing = vec!["000001".to_owned()];
+                Ok(batch)
+            },
             now,
         )
-        .expect("partial batch remains usable");
-
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].code, "600000");
-        assert!(prepared[0].text.contains("浦发银行(600000)"));
+        .err()
+        .expect("partial coverage must fail the atomic holding-plan join");
+        assert!(error.contains("coverage=Partial"));
+        assert!(error.contains("000001"));
     }
 
     #[test]

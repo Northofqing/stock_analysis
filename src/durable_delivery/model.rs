@@ -565,7 +565,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 2026-09-20: G5b 深链归因升级 counted — 每事件一推 (≤3/日, LLM 非确定),
         // 无冷却 (WindowMode::None, 镜像 HoldingEvent 先例); 盘后归因类豁免日预算
         // (分流规则: 复盘/归因不被盘中信号饿死)。
-        (G5bAttribution, Global, std::option::Option::None, WindowMode::None),
+        (
+            G5bAttribution,
+            Global,
+            std::option::Option::None,
+            WindowMode::None,
+        ),
         // 2026-09-20: I-01 盘中轮动升级 counted — R-02 盘面走向每 5 分钟硬推,
         // Rolling 900s 镜像旧 L4 (notify cooldown_secs 900, per-kind 全局头);
         // 盘中信息卡计入 30 条/日预算 (分流规则)。同 kind 两个每日一次借用点
@@ -582,7 +587,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // BusinessDateOnce 与 ReviewMarket 同语义 (按业务日幂等, 名义时长
         // 不作 rolling 过期解释); 盘后复盘类豁免日预算 (分流规则, BR-237
         // 原理: 复盘不被盘中信号挤掉)。
-        (BlockTradeIntradayConfirm, PerTicket, Some(86_400), BusinessDateOnce),
+        (
+            BlockTradeIntradayConfirm,
+            PerTicket,
+            Some(86_400),
+            BusinessDateOnce,
+        ),
         // 2026-09-20: A-11 IPO 阶段催化升级 counted (MU-ipo-catalyst 接线)。
         // 19:00 盘后 review side route (BR-223), 每日一次全市场 digest (旧
         // 调用形态 code="" — 旧 L4 冷却键实为 kind-全局)。BusinessDateOnce
@@ -606,7 +616,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // BR-116 语义: 已确认状态对本身负责精确去重, 不设跨状态粗粒度冷却
         // (br116_rapid_distinct_data_mode_transitions_are_both_delivered
         // 行为测试为权威: 快速不同变迁必须双双送达)。
-        (DataMode, Global, std::option::Option::None, WindowMode::None),
+        (
+            DataMode,
+            Global,
+            std::option::Option::None,
+            WindowMode::None,
+        ),
         // 2026-09-20: A-02 竞价重推升级 counted (MU-auction-candidates
         // 接线)。盘中信息卡计入预算 (分流规则); Rolling 600s 镜像显式
         // L4 (notify.rs:418 AuctionVolume|AuctionRepush 共用行)。
@@ -619,7 +634,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 盘中信息卡计入预算 (分流规则); WindowMode::None 无冷却 (G5b/
         // DataMode 先例: event_id 精确去重是旧语义, 批量公告同日全达 —
         // 8/30 周日 19 条实证)。
-        (Announcement, Global, std::option::Option::None, WindowMode::None),
+        (
+            Announcement,
+            Global,
+            std::option::Option::None,
+            WindowMode::None,
+        ),
         // 2026-09-20: S-05 分析师上调升级 counted (MU-analyst 接线)。
         // 盘中信息卡计入预算 (分流规则); Rolling 86400s 镜像显式 L4
         // (notify.rs:448 "1次/日" — 旧 kind-全局日级 throttle 保真)。
@@ -661,7 +681,12 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         // 账户状态告警 = 健康提醒类 → 豁免日预算 (DataMode 先例);
         // WindowMode::None 无冷却 (旧 dispatcher 注释明示 "AccountMode
         // 无冷却", 变迁对精确去重 — DataMode 同款)。
-        (AccountMode, Global, std::option::Option::None, WindowMode::None),
+        (
+            AccountMode,
+            Global,
+            std::option::Option::None,
+            WindowMode::None,
+        ),
         // 2026-09-20: P-05 候选台升级 counted (MU-auction-candidates
         // 接线)。盘中信息卡计入预算 (分流规则); Rolling 1800s 镜像旧
         // L4 默认 (无显式行, kind-全局 30 min)。

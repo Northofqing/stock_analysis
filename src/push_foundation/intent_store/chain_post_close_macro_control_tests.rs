@@ -426,12 +426,7 @@ pub(super) async fn establish_confirmed_external_first_source(
     const RECORD_DATA: &[u8] = br#"{"item_id":"TEST_CODE_EXTERNAL_NEWS_001","title":"TEST_CODE external data title","summary":"TEST_CODE external data summary","content":"TEST_CODE external data content","publisher":"TEST_CODE Eastmoney publisher","url":"https://example.com/TEST_CODE_EXTERNAL_NEWS_001","published_at":"2026-09-14T15:30:00+08:00","instruments":[{"exchange":"Shanghai","code":"TEST_CODE_600001","asset_class":"Equity"}],"topics":["TEST_CODE_external_topic"],"language":"zh-CN","evidence":{"provider":"Eastmoney","source_at":"2026-09-14 15:30","observed_at":"2026-09-14T15:31:00+08:00","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}}"#;
     const EXPECTED_NATIVE: &[u8] = br#"{"evidence":{"batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH","observed_at":"2026-09-14T15:31:00+08:00","provider":"Eastmoney","source":"eastmoney-web","source_at":"2026-09-14 15:30"},"kind":"Available","records":[{"canonical_url":"https://example.com/TEST_CODE_EXTERNAL_NEWS_001","content":"TEST_CODE external data content","evidence":{"batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH","observed_at":"2026-09-14T15:31:00+08:00","provider":"Eastmoney","source_at":"2026-09-14 15:30"},"instruments":["TEST_CODE_600001"],"item_id":"TEST_CODE_EXTERNAL_NEWS_001","language":"zh-CN","observed_at":"2026-09-14T07:31:00+00:00","published_at":"2026-09-14T07:30:00+00:00","publisher":"TEST_CODE Eastmoney publisher","summary":"TEST_CODE external data summary","title":"TEST_CODE external data title","topics":["TEST_CODE_external_topic"]}],"version":1}"#;
 
-    let baseline = setup_external_parent(
-        business,
-        parent_server,
-        run_id,
-    )
-    .await;
+    let baseline = setup_external_parent(business, parent_server, run_id).await;
     *external_server = Some(
         ExternalMtlsMacroFixture::bind_data_success_for_test()
             .await
@@ -457,9 +452,8 @@ pub(super) async fn establish_confirmed_external_first_source(
     let old_memberships = baseline.memberships;
     let database = business.database();
 
-    let macro_source = GrpcSource::from_external_macro_bundle_for_test(
-        external.bundle_path().to_path_buf(),
-    );
+    let macro_source =
+        GrpcSource::from_external_macro_bundle_for_test(external.bundle_path().to_path_buf());
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     let before_prepare = external.snapshot();
@@ -470,8 +464,7 @@ pub(super) async fn establish_confirmed_external_first_source(
     let started_at = micros("2026-09-14T15:31:00+08:00");
     let clock = MacroClock {
         now: Cell::new(UtcMicros::try_new(started_at).unwrap()),
-        observation: DateTime::parse_from_rfc3339("2026-09-14T15:31:00+08:00")
-            .unwrap(),
+        observation: DateTime::parse_from_rfc3339("2026-09-14T15:31:00+08:00").unwrap(),
         observation_calls: Cell::new(0),
     };
     let registered = [
@@ -510,9 +503,7 @@ pub(super) async fn establish_confirmed_external_first_source(
         .unwrap();
     let inspect = || {
         let mut reader = BusinessIntentStore::open(&database).unwrap();
-        let mut read_local = reader
-            .single_user_local_chain_post_close(&config)
-            .unwrap();
+        let mut read_local = reader.single_user_local_chain_post_close(&config).unwrap();
         let recovery = read_local.inspect_macro(&intent).unwrap();
         drop(read_local);
         reader.connection.close().unwrap();
@@ -631,8 +622,7 @@ pub(super) async fn establish_confirmed_external_first_source(
         assert_eq!(health_wire.encode_to_vec(), health_bytes);
         assert_eq!(health_wire.context.as_ref().unwrap().protocol_version, 1);
         assert_eq!(health_wire.context.as_ref().unwrap().request_id, health_id);
-        let capabilities_wire =
-            CapabilitiesRequest::decode(capabilities_bytes.as_slice()).unwrap();
+        let capabilities_wire = CapabilitiesRequest::decode(capabilities_bytes.as_slice()).unwrap();
         assert_eq!(capabilities_wire.encode_to_vec(), capabilities_bytes);
         assert_eq!(
             capabilities_wire.context.as_ref().unwrap().protocol_version,
@@ -668,8 +658,7 @@ pub(super) async fn establish_confirmed_external_first_source(
         assert_eq!(wire.data_calls, 0);
 
         external.release_health();
-        let capabilities_deadline =
-            std::time::Instant::now() + Duration::from_secs(5);
+        let capabilities_deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             tokio::select! {
                 biased;
@@ -830,7 +819,10 @@ pub(super) async fn establish_confirmed_external_first_source(
         Some(expected_capabilities_bytes.as_slice())
     );
     assert_eq!(ready_recovery.plan_bytes(), plan_bytes);
-    assert_eq!(ready_recovery.plan().deadline_at().get(), started_at + 15_000_000);
+    assert_eq!(
+        ready_recovery.plan().deadline_at().get(),
+        started_at + 15_000_000
+    );
     assert_eq!(ready_recovery.parent_final_bytes(), parent_final);
     assert!(!ready_recovery.has_unconfirmed_effect());
     assert!(ready_recovery.attempts().is_empty());
@@ -847,7 +839,10 @@ pub(super) async fn establish_confirmed_external_first_source(
     assert_eq!(confirmed_wire.health_requests, vec![health_bytes]);
     assert_eq!(confirmed_wire.health_authorized, vec![true]);
     assert_eq!(confirmed_wire.capabilities_calls, 1);
-    assert_eq!(confirmed_wire.capabilities_requests, vec![capabilities_bytes]);
+    assert_eq!(
+        confirmed_wire.capabilities_requests,
+        vec![capabilities_bytes]
+    );
     assert_eq!(confirmed_wire.capabilities_authorized, vec![true]);
     assert_eq!(
         confirmed_wire.capabilities_responses,
@@ -859,17 +854,18 @@ pub(super) async fn establish_confirmed_external_first_source(
     drop(parent_source);
     drop(macro_source);
     business.reopen();
-    let reopened_macro_source = GrpcSource::from_external_macro_bundle_for_test(
-        external.bundle_path().to_path_buf(),
-    );
+    let reopened_macro_source =
+        GrpcSource::from_external_macro_bundle_for_test(external.bundle_path().to_path_buf());
     let reopened_parent_source = GrpcSource::from_board_loopback_test_client(
         connect_parent_instance(&parent_endpoint).await,
     );
-    let reopened_queries = reopened_parent_source.connected_board_queries().await.unwrap();
+    let reopened_queries = reopened_parent_source
+        .connected_board_queries()
+        .await
+        .unwrap();
     let reopened_clock = MacroClock {
         now: Cell::new(UtcMicros::try_new(started_at + 3_000_000).unwrap()),
-        observation: DateTime::parse_from_rfc3339("2026-09-14T15:32:00+08:00")
-            .unwrap(),
+        observation: DateTime::parse_from_rfc3339("2026-09-14T15:32:00+08:00").unwrap(),
         observation_calls: Cell::new(0),
     };
     let mut local = business
@@ -893,20 +889,30 @@ pub(super) async fn establish_confirmed_external_first_source(
     // A genuine new transport still requires its own explicit Health. Only
     // the historical fixture append omits a v15 receipt; no production driver
     // can enter this function or use old Ready as transport authority.
-    let transport = crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(
-        external.bundle_path(),
-    ).unwrap();
+    let transport =
+        crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(external.bundle_path())
+            .unwrap();
     external.release_health();
-    let client = transport.prepare_health_attempt().unwrap().execute().await
-        .into_connected_client().expect("TEST_CODE historical fixture qualification");
+    let client = transport
+        .prepare_health_attempt()
+        .unwrap()
+        .execute()
+        .await
+        .into_connected_client()
+        .expect("TEST_CODE historical fixture qualification");
     let recovered = local.inspect_macro(&intent).unwrap();
-    let authorized = transport.resume_macro_query(
-        macro_codec::first_identity(),
-        recovered.plan().first_source_request().restored_external(recovered.plan().endpoint(), 1),
-    ).unwrap();
-    let (lease, call) = local.begin_prepared_macro_attempt(
-        lease, &authorized, reopened_clock.now.get(),
-    ).unwrap();
+    let authorized = transport
+        .resume_macro_query(
+            macro_codec::first_identity(),
+            recovered
+                .plan()
+                .first_source_request()
+                .restored_external(recovered.plan().endpoint(), 1),
+        )
+        .unwrap();
+    let (lease, call) = local
+        .begin_prepared_macro_attempt(lease, &authorized, reopened_clock.now.get())
+        .unwrap();
     let qualified_attempt = authorized.bind_connected(client).unwrap();
     let mut prepared = Box::pin(qualified_attempt.execute());
     let data_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -926,9 +932,7 @@ pub(super) async fn establish_confirmed_external_first_source(
     }
     let (data_pending, pending_audit_count) = {
         let mut reader = BusinessIntentStore::open(&database).unwrap();
-        let mut read_local = reader
-            .single_user_local_chain_post_close(&config)
-            .unwrap();
+        let mut read_local = reader.single_user_local_chain_post_close(&config).unwrap();
         let recovery = read_local.inspect_macro(&intent).unwrap();
         drop(read_local);
         let count = reader
@@ -944,8 +948,14 @@ pub(super) async fn establish_confirmed_external_first_source(
     assert!(data_pending.has_unconfirmed_effect());
     assert_eq!(data_pending.plan_bytes(), plan_bytes);
     assert_eq!(data_pending.plan().started_at().get(), started_at);
-    assert_eq!(data_pending.plan().deadline_at().get(), started_at + 15_000_000);
-    assert_eq!(data_pending.plan().observed_local(), "2026-09-14T15:31:00+08:00");
+    assert_eq!(
+        data_pending.plan().deadline_at().get(),
+        started_at + 15_000_000
+    );
+    assert_eq!(
+        data_pending.plan().observed_local(),
+        "2026-09-14T15:31:00+08:00"
+    );
     assert_eq!(reopened_clock.observation_calls.get(), 0);
     assert_eq!(data_pending.readiness_episodes().len(), 1);
     assert_eq!(
@@ -974,7 +984,10 @@ pub(super) async fn establish_confirmed_external_first_source(
     let data_receipt = external.snapshot();
     assert_eq!(data_receipt.tcp_accepts, 2);
     assert_eq!(data_receipt.health_requests.len(), 2);
-    assert_ne!(data_receipt.health_requests[0], data_receipt.health_requests[1]);
+    assert_ne!(
+        data_receipt.health_requests[0],
+        data_receipt.health_requests[1]
+    );
     assert_eq!(data_receipt.capabilities_calls, 1);
     assert_eq!(data_receipt.data_calls, 1);
     assert_eq!(data_receipt.data_methods, vec!["global_news"]);
@@ -983,14 +996,20 @@ pub(super) async fn establish_confirmed_external_first_source(
     assert!(data_receipt.data_responses.is_empty());
 
     external.release_data();
-    let completion = tokio::time::timeout(Duration::from_secs(5), &mut prepared).await
+    let completion = tokio::time::timeout(Duration::from_secs(5), &mut prepared)
+        .await
         .expect("TEST_CODE External data completion watchdog elapsed");
     drop(prepared);
-    local.record_external_macro_result(
-        lease, call,
-        &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion::Unary(completion),
-        reopened_clock.now.get(),
-    ).unwrap();
+    local
+        .record_external_macro_result(
+            lease,
+            call,
+            &crate::grpc_client::client::macro_attempt::ExternalMacroAttemptCompletion::Unary(
+                completion,
+            ),
+            reopened_clock.now.get(),
+        )
+        .unwrap();
     let recovered = local.inspect_macro(&intent).unwrap();
     assert!(!recovered.is_complete());
     assert!(!recovered.has_unconfirmed_effect());
@@ -1047,8 +1066,14 @@ pub(super) async fn establish_confirmed_external_first_source(
     let record = &batch.records()[0];
     assert_eq!(record.item_id, "TEST_CODE_EXTERNAL_NEWS_001");
     assert_eq!(record.title, "TEST_CODE external data title");
-    assert_eq!(record.summary.as_deref(), Some("TEST_CODE external data summary"));
-    assert_eq!(record.content.as_deref(), Some("TEST_CODE external data content"));
+    assert_eq!(
+        record.summary.as_deref(),
+        Some("TEST_CODE external data summary")
+    );
+    assert_eq!(
+        record.content.as_deref(),
+        Some("TEST_CODE external data content")
+    );
     assert_eq!(record.publisher, "TEST_CODE Eastmoney publisher");
     assert_eq!(
         record.canonical_url,
@@ -1166,12 +1191,21 @@ pub(super) fn assert_connect_unavailable_source(
         error.message(),
         "ExternalV1 client-bundle 连接或 readiness 检查失败"
     );
-    assert_eq!(source.final_bytes().unwrap(), RejectionCase::HealthConnectUnavailable.native());
+    assert_eq!(
+        source.final_bytes().unwrap(),
+        RejectionCase::HealthConnectUnavailable.native()
+    );
     let receipt = source.audit_receipt().unwrap().clone();
     assert_eq!(receipt.previous_outcome, None);
     assert_eq!(receipt.current_outcome, "unavailable");
-    assert_eq!(recovery.pending_source_identities(), pending_sources().as_slice());
-    assert_eq!(recovery.pending_research_queries(), pending_research().as_slice());
+    assert_eq!(
+        recovery.pending_source_identities(),
+        pending_sources().as_slice()
+    );
+    assert_eq!(
+        recovery.pending_research_queries(),
+        pending_research().as_slice()
+    );
     receipt
 }
 
@@ -1193,7 +1227,14 @@ pub(super) fn assert_connect_unavailable_audit(
     assert_eq!(audit.observed_at, expected_observed_utc);
     assert_eq!(audit.batch_id, None);
     assert_eq!(audit.outcome, "unavailable");
-    assert_eq!((audit.request_count, audit.accepted_count, audit.rejected_count), (1, 0, 1));
+    assert_eq!(
+        (
+            audit.request_count,
+            audit.accepted_count,
+            audit.rejected_count
+        ),
+        (1, 0, 1)
+    );
     assert_eq!(audit.reason_code, "external_transport_unavailable");
     assert!(audit.retryable);
     read_acquisition_in_transaction(&transaction, parent_receipt).unwrap();
@@ -1205,20 +1246,31 @@ pub(super) fn assert_same_terminal_recovery(
     after: &crate::push_foundation::intent_store::chain_post_close::macro_stage::MacroRecovery,
 ) {
     assert_eq!(after.is_complete(), before.is_complete());
-    assert_eq!(after.has_unconfirmed_effect(), before.has_unconfirmed_effect());
+    assert_eq!(
+        after.has_unconfirmed_effect(),
+        before.has_unconfirmed_effect()
+    );
     assert_eq!(after.plan_bytes(), before.plan_bytes());
     assert_eq!(after.parent_final_bytes(), before.parent_final_bytes());
     let (before_plan, after_plan) = (before.plan(), after.plan());
     assert_eq!(after_plan.profile(), before_plan.profile());
-    assert_eq!(after_plan.acquisition_authority(), before_plan.acquisition_authority());
+    assert_eq!(
+        after_plan.acquisition_authority(),
+        before_plan.acquisition_authority()
+    );
     assert_eq!(after_plan.endpoint(), before_plan.endpoint());
     assert_eq!(after_plan.started_at(), before_plan.started_at());
     assert_eq!(after_plan.deadline_at(), before_plan.deadline_at());
     assert_eq!(after_plan.observed_local(), before_plan.observed_local());
-    let (before_request, after_request) =
-        (before_plan.first_source_request(), after_plan.first_source_request());
+    let (before_request, after_request) = (
+        before_plan.first_source_request(),
+        after_plan.first_source_request(),
+    );
     assert_eq!(after_request.request_id(), before_request.request_id());
-    assert_eq!(after_request.request_bytes(), before_request.request_bytes());
+    assert_eq!(
+        after_request.request_bytes(),
+        before_request.request_bytes()
+    );
     assert_eq!(after_request.retry_policy(), before_request.retry_policy());
     assert_eq!(after.attempts().len(), before.attempts().len());
     assert!(after.attempts().is_empty());
@@ -1226,31 +1278,63 @@ pub(super) fn assert_same_terminal_recovery(
         (before.readiness_episodes(), after.readiness_episodes());
     assert_eq!(after_episodes.len(), before_episodes.len());
     for (before_episode, after_episode) in before_episodes.iter().zip(after_episodes) {
-        assert_eq!(after_episode.episode_ordinal(), before_episode.episode_ordinal());
-        assert_eq!(after_episode.initiating_source(), before_episode.initiating_source());
-        assert_eq!(after_episode.ready_result_version(), before_episode.ready_result_version());
-        assert_eq!(after_episode.controls().len(), before_episode.controls().len());
-        for (before_control, after_control) in
-            before_episode.controls().iter().zip(after_episode.controls())
+        assert_eq!(
+            after_episode.episode_ordinal(),
+            before_episode.episode_ordinal()
+        );
+        assert_eq!(
+            after_episode.initiating_source(),
+            before_episode.initiating_source()
+        );
+        assert_eq!(
+            after_episode.ready_result_version(),
+            before_episode.ready_result_version()
+        );
+        assert_eq!(
+            after_episode.controls().len(),
+            before_episode.controls().len()
+        );
+        for (before_control, after_control) in before_episode
+            .controls()
+            .iter()
+            .zip(after_episode.controls())
         {
             assert_eq!(after_control.kind(), before_control.kind());
             assert_eq!(after_control.request_id(), before_control.request_id());
-            assert_eq!(after_control.request_bytes(), before_control.request_bytes());
-            assert_eq!(after_control.begin_version(), before_control.begin_version());
-            assert_eq!(after_control.result_version(), before_control.result_version());
+            assert_eq!(
+                after_control.request_bytes(),
+                before_control.request_bytes()
+            );
+            assert_eq!(
+                after_control.begin_version(),
+                before_control.begin_version()
+            );
+            assert_eq!(
+                after_control.result_version(),
+                before_control.result_version()
+            );
             assert_eq!(after_control.outcome(), before_control.outcome());
-            assert_eq!(after_control.response_bytes(), before_control.response_bytes());
+            assert_eq!(
+                after_control.response_bytes(),
+                before_control.response_bytes()
+            );
         }
     }
     let before_source = before.global_news(GlobalNewsProvider::Eastmoney).unwrap();
     let after_source = after.global_news(GlobalNewsProvider::Eastmoney).unwrap();
     assert_eq!(after_source.is_complete(), before_source.is_complete());
     assert_eq!(after_source.profile(), before_source.profile());
-    assert_eq!(after_source.acquisition_authority(), before_source.acquisition_authority());
+    assert_eq!(
+        after_source.acquisition_authority(),
+        before_source.acquisition_authority()
+    );
     assert_eq!(after_source.retry_policy(), before_source.retry_policy());
     assert!(before_source.batch().is_none());
     assert!(after_source.batch().is_none());
-    let (before_error, after_error) = (before_source.error().unwrap(), after_source.error().unwrap());
+    let (before_error, after_error) = (
+        before_source.error().unwrap(),
+        after_source.error().unwrap(),
+    );
     assert_eq!(after_error.capability(), before_error.capability());
     assert_eq!(after_error.provider(), before_error.provider());
     assert_eq!(after_error.audit_outcome(), before_error.audit_outcome());
@@ -1259,8 +1343,14 @@ pub(super) fn assert_same_terminal_recovery(
     assert_eq!(after_error.message(), before_error.message());
     assert_eq!(after_source.final_bytes(), before_source.final_bytes());
     assert_eq!(after_source.audit_receipt(), before_source.audit_receipt());
-    assert_eq!(after.pending_source_identities(), before.pending_source_identities());
-    assert_eq!(after.pending_research_queries(), before.pending_research_queries());
+    assert_eq!(
+        after.pending_source_identities(),
+        before.pending_source_identities()
+    );
+    assert_eq!(
+        after.pending_research_queries(),
+        before.pending_research_queries()
+    );
 }
 
 pub(super) async fn cleanup_external_case(
@@ -1567,16 +1657,18 @@ fn audit_snapshot(connection: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
     )
 }
 
-pub(super) fn audit_snapshot_at(
-    database: &std::path::Path,
-) -> Vec<Vec<rusqlite::types::Value>> {
+pub(super) fn audit_snapshot_at(database: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
     let reader = BusinessIntentStore::open(database).unwrap();
     let rows = audit_snapshot(&reader.connection);
     reader.connection.close().unwrap();
     rows
 }
 
-pub(super) fn raw_control_bytes(database: &std::path::Path, intent: &IntentId, ordinal: i64) -> Vec<u8> {
+pub(super) fn raw_control_bytes(
+    database: &std::path::Path,
+    intent: &IntentId,
+    ordinal: i64,
+) -> Vec<u8> {
     let reader = BusinessIntentStore::open(database).unwrap();
     let bytes = reader
         .connection
@@ -1612,10 +1704,13 @@ pub(super) fn assert_response_raw(bytes: &[u8], response: &[u8]) {
         }
     };
     assert_bound_control_result(&mut actual, kind, &id, true);
-    assert_eq!(actual, serde_json::json!({
-        "version": 3, "connect_unavailable": false, "response": response,
-        "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
-    }));
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "version": 3, "connect_unavailable": false, "response": response,
+            "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
+        })
+    );
 }
 
 fn assert_bound_control_result(
@@ -1627,23 +1722,29 @@ fn assert_bound_control_result(
     assert_eq!(actual["version"], 3);
     let object = actual.as_object_mut().unwrap();
     let identity = object.remove("wire_identity").unwrap();
-    assert_eq!(identity, serde_json::json!({
-        "profile": "ExternalV1",
-        "method": kind,
-        "request_id": request_id,
-        "client_descriptor_sha256":
-            crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
-    }));
+    assert_eq!(
+        identity,
+        serde_json::json!({
+            "profile": "ExternalV1",
+            "method": kind,
+            "request_id": request_id,
+            "client_descriptor_sha256":
+                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+        })
+    );
     let build = object.remove("verified_build_identity");
     if expected_build {
         let identity = test_external_build_identity();
-        assert_eq!(build, Some(serde_json::json!({
-            "service_version": identity.service_version,
-            "source_revision": identity.source_revision,
-            "contract_sha256": identity.contract_sha256,
-            "binary_sha256": identity.binary_sha256,
-            "identity_error": identity.identity_error,
-        })));
+        assert_eq!(
+            build,
+            Some(serde_json::json!({
+                "service_version": identity.service_version,
+                "source_revision": identity.source_revision,
+                "contract_sha256": identity.contract_sha256,
+                "binary_sha256": identity.binary_sha256,
+                "identity_error": identity.identity_error,
+            }))
+        );
     } else {
         assert_eq!(build, None);
     }
@@ -1662,10 +1763,13 @@ pub(super) fn assert_connect_unavailable_raw(
         request_id,
         kind == ExternalControlKind::Capabilities,
     );
-    assert_eq!(actual, serde_json::json!({
-        "version": 3, "connect_unavailable": true, "response": null,
-        "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
-    }));
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "version": 3, "connect_unavailable": true, "response": null,
+            "code": null, "details": null, "trailer": "Absent", "diagnostic": null,
+        })
+    );
 }
 
 fn expected_status(case: HealthStatusCase, request_id: &str) -> (Vec<u8>, ObservedHealthStatus) {

@@ -3434,10 +3434,7 @@ mod tests {
     fn t16_st_price_kind_maps_to_durable_st_price_limit_changed() {
         assert_eq!(
             durable_kind_and_sub_kind(PushKind::StPriceLimitChanged),
-            Some((
-                DurablePushKind::StPriceLimitChanged,
-                DeliverySubKind::None
-            ))
+            Some((DurablePushKind::StPriceLimitChanged, DeliverySubKind::None))
         );
         assert!(is_counted_kind(PushKind::StPriceLimitChanged));
     }
@@ -3621,7 +3618,10 @@ mod tests {
     fn industry_chain_intraday_kind_maps_to_durable_industry_chain_intraday() {
         assert_eq!(
             durable_kind_and_sub_kind(PushKind::IndustryChainIntraday),
-            Some((DurablePushKind::IndustryChainIntraday, DeliverySubKind::None))
+            Some((
+                DurablePushKind::IndustryChainIntraday,
+                DeliverySubKind::None
+            ))
         );
         assert!(is_counted_kind(PushKind::IndustryChainIntraday));
     }

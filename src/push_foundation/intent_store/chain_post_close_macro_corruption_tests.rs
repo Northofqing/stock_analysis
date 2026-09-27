@@ -56,9 +56,7 @@ impl CorruptionCase {
     fn trigger(self) -> &'static str {
         match self {
             Self::RequestWrapperIdentity => "chain_post_close_macro_request_plans_update",
-            Self::ControlRawVersion => {
-                "chain_post_close_macro_control_attempt_results_update"
-            }
+            Self::ControlRawVersion => "chain_post_close_macro_control_attempt_results_update",
             Self::DataRawVersion => "chain_post_close_macro_attempt_results_update",
             Self::SourceNativeContent | Self::Br159ReceiptHash => {
                 "chain_post_close_macro_source_finals_update"
@@ -130,10 +128,7 @@ fn snapshot_path(database: &std::path::Path) -> DatabaseSnapshot {
     snapshot
 }
 
-fn changed_tables<'a>(
-    before: &'a DatabaseSnapshot,
-    after: &'a DatabaseSnapshot,
-) -> Vec<&'a str> {
+fn changed_tables<'a>(before: &'a DatabaseSnapshot, after: &'a DatabaseSnapshot) -> Vec<&'a str> {
     assert_eq!(after.catalog, before.catalog);
     assert_eq!(
         after.rows.keys().collect::<Vec<_>>(),
@@ -192,11 +187,7 @@ fn integer(row: &[rusqlite::types::Value], column: usize) -> i64 {
     }
 }
 
-fn is_target_row(
-    row: &[rusqlite::types::Value],
-    intent: &IntentId,
-    case: CorruptionCase,
-) -> bool {
+fn is_target_row(row: &[rusqlite::types::Value], intent: &IntentId, case: CorruptionCase) -> bool {
     if text(row, 0) != intent.as_str() {
         return false;
     }
@@ -368,10 +359,7 @@ fn prepare_damage(
     PreparedDamage { expected, values }
 }
 
-fn drop_fixed_trigger(
-    transaction: &rusqlite::Transaction<'_>,
-    case: CorruptionCase,
-) {
+fn drop_fixed_trigger(transaction: &rusqlite::Transaction<'_>, case: CorruptionCase) {
     match case {
         CorruptionCase::RequestWrapperIdentity => transaction
             .execute_batch("DROP TRIGGER chain_post_close_macro_request_plans_update")
@@ -514,9 +502,8 @@ async fn run_corruption_case(case: CorruptionCase) {
     let mut business = V2BusinessFixture::new();
     let mut parent_server = None;
     let mut external_server = None;
-    let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(120),
-        async {
+    let body =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(120), async {
             let confirmed = control_tests::establish_confirmed_external_first_source(
                 &mut business,
                 &mut parent_server,
@@ -541,9 +528,7 @@ async fn run_corruption_case(case: CorruptionCase) {
                     .unwrap();
                 let recovery = local.inspect_macro(&confirmed.intent).unwrap();
                 assert!(!recovery.has_unconfirmed_effect());
-                let source = recovery
-                    .global_news(GlobalNewsProvider::Eastmoney)
-                    .unwrap();
+                let source = recovery.global_news(GlobalNewsProvider::Eastmoney).unwrap();
                 assert!(source.is_complete());
                 assert!(source.batch().is_some());
                 assert!(source.error().is_none());
@@ -559,13 +544,8 @@ async fn run_corruption_case(case: CorruptionCase) {
             );
             let started_at = micros(STARTED_LOCAL);
             let clock = MacroClock {
-                now: Cell::new(
-                    UtcMicros::try_new(started_at + 11_000_000).unwrap(),
-                ),
-                observation: DateTime::parse_from_rfc3339(
-                    "2026-09-14T15:33:00+08:00",
-                )
-                .unwrap(),
+                now: Cell::new(UtcMicros::try_new(started_at + 11_000_000).unwrap()),
+                observation: DateTime::parse_from_rfc3339("2026-09-14T15:33:00+08:00").unwrap(),
                 observation_calls: Cell::new(0),
             };
             let registered = [
@@ -610,13 +590,9 @@ async fn run_corruption_case(case: CorruptionCase) {
                 changed_tables(&successful, &before_damage),
                 vec!["chain_post_close_runs"]
             );
-            let parent_before_damage = parent_server
-                .as_ref()
-                .unwrap()
-                .snapshot_with_tcp_for_test();
+            let parent_before_damage = parent_server.as_ref().unwrap().snapshot_with_tcp_for_test();
             assert!(parent_before_damage.0 > 0);
-            let memberships_before_damage =
-                parent_server.as_ref().unwrap().membership_snapshot();
+            let memberships_before_damage = parent_server.as_ref().unwrap().membership_snapshot();
             let external_before_damage = external.snapshot();
 
             let mut injector = Connection::open_with_flags(
@@ -645,10 +621,7 @@ async fn run_corruption_case(case: CorruptionCase) {
             assert_eq!(snapshot_path(&database), damaged);
             assert_eq!(external.snapshot(), external_before_damage);
             assert_eq!(
-                parent_server
-                    .as_ref()
-                    .unwrap()
-                    .snapshot_with_tcp_for_test(),
+                parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                 parent_before_damage
             );
             assert_eq!(
@@ -665,10 +638,7 @@ async fn run_corruption_case(case: CorruptionCase) {
             assert_eq!(snapshot_path(&database), damaged);
             assert_eq!(external.snapshot(), external_before_damage);
             assert_eq!(
-                parent_server
-                    .as_ref()
-                    .unwrap()
-                    .snapshot_with_tcp_for_test(),
+                parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                 parent_before_damage
             );
             assert_eq!(
@@ -692,20 +662,16 @@ async fn run_corruption_case(case: CorruptionCase) {
             assert_eq!(database_snapshot(business.connection()), damaged);
             assert_eq!(external.snapshot(), external_before_damage);
             assert_eq!(
-                parent_server
-                    .as_ref()
-                    .unwrap()
-                    .snapshot_with_tcp_for_test(),
+                parent_server.as_ref().unwrap().snapshot_with_tcp_for_test(),
                 parent_before_damage
             );
             assert_eq!(
                 parent_server.as_ref().unwrap().membership_snapshot(),
                 memberships_before_damage
             );
-        },
-    ))
-    .catch_unwind()
-    .await;
+        }))
+        .catch_unwind()
+        .await;
 
     control_tests::cleanup_external_case(
         &mut business,
@@ -866,11 +832,7 @@ fn v12_gateway_row<'a>(
     rows[0]
 }
 
-fn replace_v12_fact_bytes(
-    row: &mut [rusqlite::types::Value],
-    needle: &[u8],
-    replacement: &[u8],
-) {
+fn replace_v12_fact_bytes(row: &mut [rusqlite::types::Value], needle: &[u8], replacement: &[u8]) {
     let original = blob(row, 9);
     let damaged = replace_once(&original, needle, replacement);
     let (length, digest) = blob_digest(&damaged);
@@ -899,9 +861,7 @@ fn prepare_v12_fact_damage(
             let cause_version = integer(&original_row, 20);
             let causes = before.rows["chain_post_close_macro_attempt_results"]
                 .iter()
-                .filter(|row| {
-                    text(row, 0) == intent.as_str() && integer(row, 7) == cause_version
-                })
+                .filter(|row| text(row, 0) == intent.as_str() && integer(row, 7) == cause_version)
                 .collect::<Vec<_>>();
             assert_eq!(causes.len(), 1);
             let cause_time = integer(causes[0], 8);
@@ -935,15 +895,17 @@ fn prepare_v12_fact_damage(
         V12FactCorruptionCase::DimensionChoice => {
             let row = &mut expected.rows.get_mut(case.table()).unwrap()[target];
             assert_eq!(integer(row, 17), 2);
-            replace_v12_fact_bytes(row, br#""selected_candidate":2"#, br#""selected_candidate":3"#);
+            replace_v12_fact_bytes(
+                row,
+                br#""selected_candidate":2"#,
+                br#""selected_candidate":3"#,
+            );
             row[17] = rusqlite::types::Value::Integer(3);
         }
         V12FactCorruptionCase::DimensionPaceChain => {
             let dimension_two = before.rows[case.table()]
                 .iter()
-                .find(|row| {
-                    text(row, 0) == intent.as_str() && integer(row, 12) == 2
-                })
+                .find(|row| text(row, 0) == intent.as_str() && integer(row, 12) == 2)
                 .unwrap();
             let new_due = integer(dimension_two, 8).checked_add(1).unwrap();
             let new_recorded = new_due.checked_sub(300_000).unwrap();
@@ -951,8 +913,7 @@ fn prepare_v12_fact_damage(
             let last_terminal = before.rows["chain_post_close_macro_query_terminals"]
                 .iter()
                 .find(|row| {
-                    text(row, 0) == intent.as_str()
-                        && integer(row, 7) == last_terminal_version
+                    text(row, 0) == intent.as_str() && integer(row, 7) == last_terminal_version
                 })
                 .unwrap();
             assert!(new_recorded >= integer(last_terminal, 8));
@@ -1021,7 +982,10 @@ fn prepare_v12_fact_damage(
     );
     assert_eq!(changed_tables(before, &expected), vec![case.table()]);
     if matches!(case, V12FactCorruptionCase::QueryNativeBinding) {
-        assert_eq!(integer(row, 24), i64::try_from(blob(row, 23).len()).unwrap());
+        assert_eq!(
+            integer(row, 24),
+            i64::try_from(blob(row, 23).len()).unwrap()
+        );
         assert_eq!(text(row, 25), raw_digest(&blob(row, 23)).as_str());
     } else if changed_columns.contains(&9) {
         assert_eq!(integer(row, 10), i64::try_from(blob(row, 9).len()).unwrap());
@@ -1030,10 +994,7 @@ fn prepare_v12_fact_damage(
     expected
 }
 
-fn drop_v12_fact_trigger(
-    transaction: &rusqlite::Transaction<'_>,
-    case: V12FactCorruptionCase,
-) {
+fn drop_v12_fact_trigger(transaction: &rusqlite::Transaction<'_>, case: V12FactCorruptionCase) {
     match case {
         V12FactCorruptionCase::QueryCauseLink
         | V12FactCorruptionCase::QueryRecordedOrder
@@ -1041,10 +1002,11 @@ fn drop_v12_fact_trigger(
         | V12FactCorruptionCase::QueryAuditLink => transaction
             .execute_batch("DROP TRIGGER chain_post_close_macro_query_terminals_update")
             .unwrap(),
-        V12FactCorruptionCase::DimensionChoice
-        | V12FactCorruptionCase::DimensionPaceChain => transaction
-            .execute_batch("DROP TRIGGER chain_post_close_macro_dimension_terminals_update")
-            .unwrap(),
+        V12FactCorruptionCase::DimensionChoice | V12FactCorruptionCase::DimensionPaceChain => {
+            transaction
+                .execute_batch("DROP TRIGGER chain_post_close_macro_dimension_terminals_update")
+                .unwrap()
+        }
         V12FactCorruptionCase::FinalizeBeginBytesVersion
         | V12FactCorruptionCase::FinalizeBeginFactsParent => transaction
             .execute_batch("DROP TRIGGER chain_post_close_macro_finalize_begins_update")
@@ -1095,7 +1057,12 @@ fn inject_v12_fact_damage(
                 "UPDATE chain_post_close_macro_query_terminals \
                  SET native_bytes=?1,native_length=?2,native_sha256=?3 \
                  WHERE intent_id=?4 AND phase='Gateway' AND item_ordinal=1",
-                params![blob(row, 23), integer(row, 24), text(row, 25), intent.as_str()],
+                params![
+                    blob(row, 23),
+                    integer(row, 24),
+                    text(row, 25),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
         V12FactCorruptionCase::QueryAuditLink => transaction
@@ -1110,7 +1077,13 @@ fn inject_v12_fact_damage(
                 "UPDATE chain_post_close_macro_dimension_terminals \
                  SET bytes=?1,byte_length=?2,sha256=?3,selected_candidate_ordinal=?4 \
                  WHERE intent_id=?5 AND dimension=1",
-                params![blob(row, 9), integer(row, 10), text(row, 11), integer(row, 17), intent.as_str()],
+                params![
+                    blob(row, 9),
+                    integer(row, 10),
+                    text(row, 11),
+                    integer(row, 17),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
         V12FactCorruptionCase::DimensionPaceChain => transaction
@@ -1118,21 +1091,39 @@ fn inject_v12_fact_damage(
                 "UPDATE chain_post_close_macro_dimension_terminals \
                  SET recorded_at=?1,bytes=?2,byte_length=?3,sha256=?4,pace_due=?5 \
                  WHERE intent_id=?6 AND dimension=1",
-                params![integer(row, 8), blob(row, 9), integer(row, 10), text(row, 11), integer(row, 18), intent.as_str()],
+                params![
+                    integer(row, 8),
+                    blob(row, 9),
+                    integer(row, 10),
+                    text(row, 11),
+                    integer(row, 18),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
         V12FactCorruptionCase::FinalizeBeginBytesVersion => transaction
             .execute(
                 "UPDATE chain_post_close_macro_finalize_begins \
                  SET bytes=?1,byte_length=?2,sha256=?3 WHERE intent_id=?4",
-                params![blob(row, 9), integer(row, 10), text(row, 11), intent.as_str()],
+                params![
+                    blob(row, 9),
+                    integer(row, 10),
+                    text(row, 11),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
         V12FactCorruptionCase::FinalizeBeginFactsParent => transaction
             .execute(
                 "UPDATE chain_post_close_macro_finalize_begins \
                  SET bytes=?1,byte_length=?2,sha256=?3,facts_sha256=?4 WHERE intent_id=?5",
-                params![blob(row, 9), integer(row, 10), text(row, 11), text(row, 17), intent.as_str()],
+                params![
+                    blob(row, 9),
+                    integer(row, 10),
+                    text(row, 11),
+                    text(row, 17),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
         V12FactCorruptionCase::StageFinalBytesVersion
@@ -1140,7 +1131,12 @@ fn inject_v12_fact_damage(
             .execute(
                 "UPDATE chain_post_close_macro_stage_finals \
                  SET bytes=?1,byte_length=?2,sha256=?3 WHERE intent_id=?4",
-                params![blob(row, 9), integer(row, 10), text(row, 11), intent.as_str()],
+                params![
+                    blob(row, 9),
+                    integer(row, 10),
+                    text(row, 11),
+                    intent.as_str()
+                ],
             )
             .unwrap(),
     };
@@ -1162,7 +1158,10 @@ fn assert_v12_full_positive(
         .collect::<Vec<_>>();
     assert_eq!(query_rows.len(), 18);
     assert_eq!(
-        query_rows.iter().filter(|row| text(row, 12) == "Gateway").count(),
+        query_rows
+            .iter()
+            .filter(|row| text(row, 12) == "Gateway")
+            .count(),
         5
     );
     assert_eq!(
@@ -1292,9 +1291,24 @@ pub(super) async fn assert_v12_full_fact_corruption_matrix(
             let recovery = local.inspect_macro(intent).unwrap();
             assert_v12_full_positive(&copied, &recovery, intent, expected_macro);
         }
-        assert_eq!(macro_server.snapshot(), macro_network, "TEST_CODE {} positive Macro RPC", case.label());
-        assert_eq!(parent_server.snapshot_with_tcp_for_test(), parent_network, "TEST_CODE {} positive parent RPC", case.label());
-        assert_eq!(parent_server.membership_snapshot(), memberships, "TEST_CODE {} positive membership", case.label());
+        assert_eq!(
+            macro_server.snapshot(),
+            macro_network,
+            "TEST_CODE {} positive Macro RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.snapshot_with_tcp_for_test(),
+            parent_network,
+            "TEST_CODE {} positive parent RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.membership_snapshot(),
+            memberships,
+            "TEST_CODE {} positive membership",
+            case.label()
+        );
 
         let mut injector = Connection::open_with_flags(
             &database,
@@ -1305,19 +1319,59 @@ pub(super) async fn assert_v12_full_fact_corruption_matrix(
         let expected = prepare_v12_fact_damage(&copied, intent, case);
         inject_v12_fact_damage(&mut injector, intent, case, &expected);
         let damaged = database_snapshot(&injector);
-        assert_eq!(damaged, expected, "TEST_CODE {} exact damaged snapshot", case.label());
-        assert_eq!(macro_server.snapshot(), macro_network, "TEST_CODE {} injection Macro RPC", case.label());
-        assert_eq!(parent_server.snapshot_with_tcp_for_test(), parent_network, "TEST_CODE {} injection parent RPC", case.label());
-        assert_eq!(parent_server.membership_snapshot(), memberships, "TEST_CODE {} injection membership", case.label());
+        assert_eq!(
+            damaged,
+            expected,
+            "TEST_CODE {} exact damaged snapshot",
+            case.label()
+        );
+        assert_eq!(
+            macro_server.snapshot(),
+            macro_network,
+            "TEST_CODE {} injection Macro RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.snapshot_with_tcp_for_test(),
+            parent_network,
+            "TEST_CODE {} injection parent RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.membership_snapshot(),
+            memberships,
+            "TEST_CODE {} injection membership",
+            case.label()
+        );
 
         assert!(matches!(
             local.inspect_macro(intent),
             Err(ChainPostCloseError::SchemaRejected)
         ));
-        assert_eq!(database_snapshot(&injector), damaged, "TEST_CODE {} held reader repair", case.label());
-        assert_eq!(macro_server.snapshot(), macro_network, "TEST_CODE {} held Macro RPC", case.label());
-        assert_eq!(parent_server.snapshot_with_tcp_for_test(), parent_network, "TEST_CODE {} held parent RPC", case.label());
-        assert_eq!(parent_server.membership_snapshot(), memberships, "TEST_CODE {} held membership", case.label());
+        assert_eq!(
+            database_snapshot(&injector),
+            damaged,
+            "TEST_CODE {} held reader repair",
+            case.label()
+        );
+        assert_eq!(
+            macro_server.snapshot(),
+            macro_network,
+            "TEST_CODE {} held Macro RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.snapshot_with_tcp_for_test(),
+            parent_network,
+            "TEST_CODE {} held parent RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.membership_snapshot(),
+            memberships,
+            "TEST_CODE {} held membership",
+            case.label()
+        );
 
         drop(local);
         assert!(store.connection.is_autocommit());
@@ -1329,13 +1383,37 @@ pub(super) async fn assert_v12_full_fact_corruption_matrix(
             Err(ChainPostCloseError::SchemaRejected)
         ));
         assert!(reopened.connection.is_autocommit());
-        assert_eq!(snapshot_path(&database), damaged, "TEST_CODE {} fresh bind repair", case.label());
-        assert_eq!(macro_server.snapshot(), macro_network, "TEST_CODE {} fresh Macro RPC", case.label());
-        assert_eq!(parent_server.snapshot_with_tcp_for_test(), parent_network, "TEST_CODE {} fresh parent RPC", case.label());
-        assert_eq!(parent_server.membership_snapshot(), memberships, "TEST_CODE {} fresh membership", case.label());
+        assert_eq!(
+            snapshot_path(&database),
+            damaged,
+            "TEST_CODE {} fresh bind repair",
+            case.label()
+        );
+        assert_eq!(
+            macro_server.snapshot(),
+            macro_network,
+            "TEST_CODE {} fresh Macro RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.snapshot_with_tcp_for_test(),
+            parent_network,
+            "TEST_CODE {} fresh parent RPC",
+            case.label()
+        );
+        assert_eq!(
+            parent_server.membership_snapshot(),
+            memberships,
+            "TEST_CODE {} fresh membership",
+            case.label()
+        );
         reopened.connection.close().unwrap();
         for suffix in ["-journal", "-wal", "-shm"] {
-            assert!(!sidecar(&database, suffix).exists(), "TEST_CODE {} leaves SQLite sidecar {suffix}", case.label());
+            assert!(
+                !sidecar(&database, suffix).exists(),
+                "TEST_CODE {} leaves SQLite sidecar {suffix}",
+                case.label()
+            );
         }
         drop(directory);
         tokio::task::yield_now().await;

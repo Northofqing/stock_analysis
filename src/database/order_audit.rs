@@ -147,7 +147,9 @@ pub(crate) fn validate_canonical_order_audit_chain(
     Ok(previous)
 }
 
-pub(crate) fn validate_order_audit_chain(conn: &mut SqliteConnection) -> diesel::QueryResult<String> {
+pub(crate) fn validate_order_audit_chain(
+    conn: &mut SqliteConnection,
+) -> diesel::QueryResult<String> {
     let audits = load_audit_rows(conn)?;
     let chain = load_chain_rows(conn)?;
     validate_canonical_order_audit_chain(&audits, &chain).map_err(audit_chain_error)

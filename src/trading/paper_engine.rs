@@ -921,7 +921,7 @@ mod tests {
         );
         // 2026-09-22 用户决策: 账户模式完全解除, Frozen 不再 gate 动作
         // (纯状态展示). DataMode::Full 下 sell 应正常发出.
-        let _result = emit_sell_signal(&decision, context)
-            .expect("2026-09-22 决策后 Frozen 不再拦截动作");
+        let _result =
+            emit_sell_signal(&decision, context).expect("2026-09-22 决策后 Frozen 不再拦截动作");
     }
 }

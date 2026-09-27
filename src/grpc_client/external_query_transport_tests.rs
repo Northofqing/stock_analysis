@@ -55,10 +55,7 @@ impl http_body::Body for TestBody {
     }
 }
 
-fn capture_body(
-    method: ExternalQueryMethod,
-    body: TestBody,
-) -> (CapturedBody, CaptureHandle) {
+fn capture_body(method: ExternalQueryMethod, body: TestBody) -> (CapturedBody, CaptureHandle) {
     let capture = CaptureHandle::new(method);
     (
         CapturedBody {
@@ -100,21 +97,14 @@ fn framed(payload: &[u8]) -> Vec<u8> {
 }
 
 async fn invalid_evidence(body: Vec<u8>) -> (GrpcError, ExternalWireEvidenceV1) {
-    let (captured, handle) = capture_body(
-        ExternalQueryMethod::GlobalNews,
-        TestBody::data([body]),
-    );
-    drain(captured)
-        .await
-        .expect("TEST_CODE drain invalid body");
+    let (captured, handle) = capture_body(ExternalQueryMethod::GlobalNews, TestBody::data([body]));
+    drain(captured).await.expect("TEST_CODE drain invalid body");
     handle
         .evidence()
         .expect_err("TEST_CODE invalid frame evidence")
 }
 
-async fn controlled_channel(
-    fixture: &ExternalQueryWireFixture,
-) -> CapturedExternalChannel {
+async fn controlled_channel(fixture: &ExternalQueryWireFixture) -> CapturedExternalChannel {
     let ClientBundleConfig {
         endpoint_uri,
         tls_server_name,
@@ -148,13 +138,10 @@ async fn binding_error(
     path: &'static str,
     grpc_method: Option<tonic::GrpcMethod<'static>>,
 ) -> CapturedExternalChannelError {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        poll_fn(|cx| service.poll_ready(cx)),
-    )
-    .await
-    .expect("TEST_CODE controlled channel readiness deadline")
-    .expect("TEST_CODE controlled channel ready");
+    tokio::time::timeout(Duration::from_secs(5), poll_fn(|cx| service.poll_ready(cx)))
+        .await
+        .expect("TEST_CODE controlled channel readiness deadline")
+        .expect("TEST_CODE controlled channel ready");
     let mut request = http::Request::builder()
         .uri(path)
         .body(Body::empty())
@@ -165,21 +152,17 @@ async fn binding_error(
     if let Some(grpc_method) = grpc_method {
         request.extensions_mut().insert(grpc_method);
     }
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        Service::call(service, request),
-    )
-    .await
-    .expect("TEST_CODE binding rejection deadline")
-    .expect_err("TEST_CODE binding must fail before inner call")
+    tokio::time::timeout(Duration::from_secs(5), Service::call(service, request))
+        .await
+        .expect("TEST_CODE binding rejection deadline")
+        .expect_err("TEST_CODE binding must fail before inner call")
 }
 
 #[tokio::test]
 async fn captured_channel_rejects_missing_or_mismatched_closed_binding_before_inner_call() {
     let mut fixture = None;
-    let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(
-        Duration::from_secs(30),
-        async {
+    let outcome =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(30), async {
             fixture = Some(
                 ExternalQueryWireFixture::bind()
                     .await
@@ -234,10 +217,9 @@ async fn captured_channel_rejects_missing_or_mismatched_closed_binding_before_in
             assert_eq!(observation.calls, 0);
             assert!(observation.methods.is_empty());
             assert!(observation.requests.is_empty());
-        },
-    ))
-    .catch_unwind()
-    .await;
+        }))
+        .catch_unwind()
+        .await;
     let cleanup = match fixture.take() {
         Some(fixture) => fixture.finish().await,
         None => Ok(()),
@@ -275,7 +257,9 @@ async fn captured_body_forwards_chunks_and_trailers_and_accepts_exact_limit() {
             ForwardedFrame::Trailers(trailers),
         ]
     );
-    let evidence = handle.evidence().expect("TEST_CODE chunked payload evidence");
+    let evidence = handle
+        .evidence()
+        .expect("TEST_CODE chunked payload evidence");
     assert_eq!(evidence.payload(), Some(&payload[..]));
     evidence
         .validate(ExternalQueryMethod::GlobalNews)
@@ -346,8 +330,13 @@ async fn captured_body_closes_missing_overflow_and_each_framing_subkind() {
     );
     assert!(drain(captured).await.unwrap().is_empty());
     let (_, missing) = handle.evidence().expect_err("TEST_CODE missing evidence");
-    assert!(matches!(missing.evidence, ExternalWireMaterialV1::Missing { .. }));
-    missing.validate(ExternalQueryMethod::InstrumentNews).unwrap();
+    assert!(matches!(
+        missing.evidence,
+        ExternalWireMaterialV1::Missing { .. }
+    ));
+    missing
+        .validate(ExternalQueryMethod::InstrumentNews)
+        .unwrap();
 
     let over = vec![0; EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES + 1];
     let (captured, handle) = capture_body(
@@ -366,7 +355,9 @@ async fn captured_body_closes_missing_overflow_and_each_framing_subkind() {
             ..
         } if observed_framed_body_bytes_at_least == EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES + 1
     ));
-    overflow.validate(ExternalQueryMethod::SecurityMetadata).unwrap();
+    overflow
+        .validate(ExternalQueryMethod::SecurityMetadata)
+        .unwrap();
 
     let declared_over = (EXTERNAL_QUERY_DECODE_LIMIT_BYTES as u32 + 1).to_be_bytes();
     let cases = [

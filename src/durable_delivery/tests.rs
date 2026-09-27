@@ -5889,7 +5889,10 @@ fn t16_st_price_policy_is_per_ticket_rolling_and_budget_counted() {
     assert_eq!(row.sub_kind, DeliverySubKind::None);
     assert_eq!(row.base_cooldown_secs, Some(86_400));
     assert!(row.counts_against_daily_budget);
-    assert_eq!(row.push_kind.stable_template_id(), "st_price_limit_changed_v1");
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "st_price_limit_changed_v1"
+    );
 }
 #[test]
 fn g5b_policy_is_global_no_cooldown_and_budget_exempt() {
@@ -6226,7 +6229,10 @@ fn news_flash_aggregated_policy_is_global_rolling_3600_and_budget_counted() {
     assert_eq!(row.sub_kind, DeliverySubKind::None);
     assert_eq!(row.base_cooldown_secs, Some(3_600));
     assert!(row.counts_against_daily_budget);
-    assert_eq!(row.push_kind.stable_template_id(), "news_flash_aggregated_v1");
+    assert_eq!(
+        row.push_kind.stable_template_id(),
+        "news_flash_aggregated_v1"
+    );
 }
 
 #[test]

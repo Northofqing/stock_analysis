@@ -190,7 +190,10 @@ pub(crate) fn economic_outcome(
 ) -> Result<GatewayBatch<EconomicReleaseFact>, GatewayError> {
     match processed {
         Ok(query) => convert::economic_calendar(query),
-        Err(error) => Err(map_current_routed_query_error(Operation::EconomicCalendar, error)),
+        Err(error) => Err(map_current_routed_query_error(
+            Operation::EconomicCalendar,
+            error,
+        )),
     }
 }
 
@@ -207,7 +210,10 @@ pub(crate) fn web_outcome(
     let query = validate_request(provider, query, limit)?;
     match processed {
         Ok(result) => convert::semantic_search(result, query, provider, limit),
-        Err(error) => Err(map_current_routed_query_error(Operation::SemanticSearch, error)),
+        Err(error) => Err(map_current_routed_query_error(
+            Operation::SemanticSearch,
+            error,
+        )),
     }
     .map_err(|error| transport_error(provider, error))
 }

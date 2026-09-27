@@ -10,11 +10,10 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     CapabilitiesResponse as ExternalCapabilitiesResponse, EventCursor as ExternalEventCursor,
     EventFilter as ExternalEventFilter, HealthRequest as ExternalHealthRequest,
     HealthResponse as ExternalHealthResponse,
-    Operation as ExternalOperation,
     ListenerStatusRequest as ExternalListenerStatusRequest,
     ListenerStatusResponse as ExternalListenerStatusResponse,
-    MarketEventEnvelope as ExternalMarketEventEnvelope, RequestContext as ExternalRequestContext,
-    SetWatchlistRequest as ExternalSetWatchlistRequest,
+    MarketEventEnvelope as ExternalMarketEventEnvelope, Operation as ExternalOperation,
+    RequestContext as ExternalRequestContext, SetWatchlistRequest as ExternalSetWatchlistRequest,
     SetWatchlistResponse as ExternalSetWatchlistResponse,
     SubscribeRequest as ExternalSubscribeRequest,
 };
@@ -171,16 +170,30 @@ pub struct GrpcMarketClient {
 }
 
 impl GrpcMarketClient {
-    fn external_status_error(&self, status: tonic::Status, context: StatusErrorContext<'_>) -> GrpcError {
-        match self.connection_generation.as_ref().ok_or_else(super::connection_qualification::unqualified)
-            .and_then(|generation| super::external_decoder::ExternalDecoder::for_descriptor(&generation.identity().descriptor_sha256)) {
+    fn external_status_error(
+        &self,
+        status: tonic::Status,
+        context: StatusErrorContext<'_>,
+    ) -> GrpcError {
+        match self
+            .connection_generation
+            .as_ref()
+            .ok_or_else(super::connection_qualification::unqualified)
+            .and_then(|generation| {
+                super::external_decoder::ExternalDecoder::for_descriptor(
+                    &generation.identity().descriptor_sha256,
+                )
+            }) {
             Ok(decoder) => GrpcError::from_status_with_decoder(status, context, decoder),
             Err(error) => error,
         }
     }
-    pub(crate) fn external_connection_identity(&self) -> Result<super::connection_qualification::ConnectionIdentity, GrpcError> {
+    pub(crate) fn external_connection_identity(
+        &self,
+    ) -> Result<super::connection_qualification::ConnectionIdentity, GrpcError> {
         self.require_external_qualification()?;
-        self.connection_generation.as_ref()
+        self.connection_generation
+            .as_ref()
             .map(|generation| generation.identity())
             .ok_or_else(super::connection_qualification::unqualified)
     }
@@ -377,9 +390,7 @@ impl GrpcMarketClient {
             ContractProfile::LocalBridgeV1 => {
                 SystemTransport::Local(LocalSystemServiceClient::new(channel.clone()))
             }
-            ContractProfile::ExternalV1 => {
-                SystemTransport::External(channel.clone())
-            }
+            ContractProfile::ExternalV1 => SystemTransport::External(channel.clone()),
         };
         let data = match profile {
             ContractProfile::LocalBridgeV1 => {
@@ -583,10 +594,20 @@ impl GrpcMarketClient {
         &mut self,
         request: tonic::Request<ExternalHealthRequest>,
     ) -> ExternalSystemCall<ExternalHealthResponse> {
-        let descriptor = self.connection_generation.as_ref().map(|generation| generation.identity().descriptor_sha256);
-        let decoder = match descriptor.as_deref().map(super::external_decoder::ExternalDecoder::for_descriptor) {
+        let descriptor = self
+            .connection_generation
+            .as_ref()
+            .map(|generation| generation.identity().descriptor_sha256);
+        let decoder = match descriptor
+            .as_deref()
+            .map(super::external_decoder::ExternalDecoder::for_descriptor)
+        {
             Some(Ok(decoder)) => decoder,
-            _ => return ExternalSystemCall::UnaryStatus(tonic::Status::failed_precondition("unsupported external connection descriptor")),
+            _ => {
+                return ExternalSystemCall::UnaryStatus(tonic::Status::failed_precondition(
+                    "unsupported external connection descriptor",
+                ))
+            }
         };
         let system = match &mut self.system {
             SystemTransport::External(system) => system,
@@ -594,7 +615,15 @@ impl GrpcMarketClient {
                 unreachable!("GrpcMarketClient profile/SystemTransport invariant")
             }
         };
-        match super::external_decoder::control_call(system.clone(), request, "/magic.market.v1.SystemService/GetHealth", decoder, super::external_decoder::ExternalDecoder::health).await {
+        match super::external_decoder::control_call(
+            system.clone(),
+            request,
+            "/magic.market.v1.SystemService/GetHealth",
+            decoder,
+            super::external_decoder::ExternalDecoder::health,
+        )
+        .await
+        {
             Ok((response, bytes)) => ExternalSystemCall::Response(response, bytes),
             Err(status) => ExternalSystemCall::UnaryStatus(status),
         }
@@ -604,9 +633,15 @@ impl GrpcMarketClient {
         &mut self,
         request: tonic::Request<ExternalCapabilitiesRequest>,
     ) -> ExternalSystemCall<ExternalCapabilitiesResponse> {
-        let decoder = match self.external_connection_identity().and_then(|identity| super::external_decoder::ExternalDecoder::for_descriptor(&identity.descriptor_sha256)) {
+        let decoder = match self.external_connection_identity().and_then(|identity| {
+            super::external_decoder::ExternalDecoder::for_descriptor(&identity.descriptor_sha256)
+        }) {
             Ok(decoder) => decoder,
-            Err(_) => return ExternalSystemCall::UnaryStatus(tonic::Status::failed_precondition("unsupported external connection descriptor")),
+            Err(_) => {
+                return ExternalSystemCall::UnaryStatus(tonic::Status::failed_precondition(
+                    "unsupported external connection descriptor",
+                ))
+            }
         };
         let system = match &mut self.system {
             SystemTransport::External(system) => system,
@@ -614,7 +649,15 @@ impl GrpcMarketClient {
                 unreachable!("GrpcMarketClient profile/SystemTransport invariant")
             }
         };
-        match super::external_decoder::control_call(system.clone(), request, "/magic.market.v1.SystemService/GetCapabilities", decoder, super::external_decoder::ExternalDecoder::capabilities).await {
+        match super::external_decoder::control_call(
+            system.clone(),
+            request,
+            "/magic.market.v1.SystemService/GetCapabilities",
+            decoder,
+            super::external_decoder::ExternalDecoder::capabilities,
+        )
+        .await
+        {
             Ok((response, bytes)) => ExternalSystemCall::Response(response, bytes),
             Err(status) => ExternalSystemCall::UnaryStatus(status),
         }
@@ -684,17 +727,18 @@ impl GrpcMarketClient {
             .map_err(|_| GrpcError::Unimplemented {
                 details: Box::default(),
             })?;
-        let request = crate::grpc_client::external_v1::build_external_native_query_request(
-            operation, params,
-        )
-        .map_err(map_external_contract_error)?;
+        let request =
+            crate::grpc_client::external_v1::build_external_native_query_request(operation, params)
+                .map_err(map_external_contract_error)?;
         let request_id = request
             .context
             .as_ref()
             .map(|context| context.request_id.clone())
-            .ok_or_else(|| crate::grpc_client::external_query_transport::wire_error(
-                "external_request_context_missing",
-            ))?;
+            .ok_or_else(|| {
+                crate::grpc_client::external_query_transport::wire_error(
+                    "external_request_context_missing",
+                )
+            })?;
         let authority = self.acquisition_authority.clone().ok_or_else(|| {
             crate::grpc_client::external_query_transport::wire_error(
                 "external_acquisition_authority_missing",
@@ -707,7 +751,10 @@ impl GrpcMarketClient {
             let mut authorized = tonic::Request::new(request.clone());
             self.attach_request_auth(&mut authorized)?;
             let outcome = match &mut self.data {
-                DataTransport::External(data) => data.call_with_descriptor(route, authorized, &descriptor).await,
+                DataTransport::External(data) => {
+                    data.call_with_descriptor(route, authorized, &descriptor)
+                        .await
+                }
                 DataTransport::Local(_) => unreachable!("ExternalV1 profile/data invariant"),
             };
             let result = match outcome {
@@ -720,14 +767,15 @@ impl GrpcMarketClient {
                     })?;
                     admit_external_payload(payload)?;
                     crate::grpc_client::envelope::parse_external_native_query_response(
-                        &request_id, operation, &authority, message,
+                        &request_id,
+                        operation,
+                        &authority,
+                        message,
                     )
                     .map_err(GrpcError::from)
                 }
-                ExternalQueryCall::UnaryStatus { status, .. } => Err(self.external_status_error(
-                    status,
-                    self.data_status_context(method, &request_id),
-                )),
+                ExternalQueryCall::UnaryStatus { status, .. } => Err(self
+                    .external_status_error(status, self.data_status_context(method, &request_id))),
                 ExternalQueryCall::LocalWireFailure { error, .. } => Err(error),
             };
             match result {
@@ -802,9 +850,10 @@ impl GrpcMarketClient {
                 )
                 .map_err(GrpcError::from)
             }
-            DataCallAuthorized::External(ExternalQueryCall::UnaryStatus { status, .. }) => Err(
-                self.external_status_error(status, self.data_status_context(method, &request_id)),
-            ),
+            DataCallAuthorized::External(ExternalQueryCall::UnaryStatus { status, .. }) => {
+                Err(self
+                    .external_status_error(status, self.data_status_context(method, &request_id)))
+            }
             DataCallAuthorized::External(ExternalQueryCall::LocalWireFailure { error, .. }) => {
                 Err(error)
             }
@@ -822,7 +871,10 @@ impl GrpcMarketClient {
         if let Err(error) = self.require_external_qualification() {
             return DataCallAuthorized::Rejected(error);
         }
-        let descriptor = self.connection_generation.as_ref().map(|generation| generation.identity().descriptor_sha256);
+        let descriptor = self
+            .connection_generation
+            .as_ref()
+            .map(|generation| generation.identity().descriptor_sha256);
         let (data, req) = match (&mut self.data, req) {
             (DataTransport::Local(data), ProfileAuthorizedRequest::Local(req)) => (data, req),
             (DataTransport::External(data), ProfileAuthorizedRequest::External(req)) => {
@@ -831,8 +883,14 @@ impl GrpcMarketClient {
                         details: Box::default(),
                     });
                 };
-                let Some(descriptor) = descriptor else { return DataCallAuthorized::Rejected(super::connection_qualification::unqualified()); };
-                return DataCallAuthorized::External(data.call_with_descriptor(method, req, &descriptor).await);
+                let Some(descriptor) = descriptor else {
+                    return DataCallAuthorized::Rejected(
+                        super::connection_qualification::unqualified(),
+                    );
+                };
+                return DataCallAuthorized::External(
+                    data.call_with_descriptor(method, req, &descriptor).await,
+                );
             }
             _ => {
                 return DataCallAuthorized::Rejected(GrpcError::FailedPrecondition {
@@ -1079,7 +1137,10 @@ impl GrpcMarketClient {
 
 impl PreparedExternalEndpoint {
     #[cfg(test)]
-    pub(crate) fn with_test_build_trust(mut self, trust: super::build_identity::BuildIdentityTrust) -> Self {
+    pub(crate) fn with_test_build_trust(
+        mut self,
+        trust: super::build_identity::BuildIdentityTrust,
+    ) -> Self {
         self.qualification_trust = trust;
         self
     }
@@ -1146,22 +1207,28 @@ impl PreparedExternalEndpoint {
     }
 
     pub(crate) async fn connect_once(&self) -> Result<GrpcMarketClient, GrpcError> {
-        self.connect_generation(self.plan_connection_generation()).await
+        self.connect_generation(self.plan_connection_generation())
+            .await
     }
 
-    pub(super) fn plan_connection_generation(&self) -> super::connection_qualification::ConnectionGeneration {
+    pub(super) fn plan_connection_generation(
+        &self,
+    ) -> super::connection_qualification::ConnectionGeneration {
         super::connection_qualification::ConnectionGeneration::new(self.qualification_trust.clone())
     }
 
-    pub(super) async fn connect_generation(&self, generation: super::connection_qualification::ConnectionGeneration) -> Result<GrpcMarketClient, GrpcError> {
-        let channel =
-            self.endpoint
-                .clone()
-                .connect_with_connector(generation.connector())
-                .await
-                .map_err(|_| GrpcError::Unavailable {
-                    details: Box::default(),
-                })?;
+    pub(super) async fn connect_generation(
+        &self,
+        generation: super::connection_qualification::ConnectionGeneration,
+    ) -> Result<GrpcMarketClient, GrpcError> {
+        let channel = self
+            .endpoint
+            .clone()
+            .connect_with_connector(generation.connector())
+            .await
+            .map_err(|_| GrpcError::Unavailable {
+                details: Box::default(),
+            })?;
         let mut client = GrpcMarketClient::from_channel(
             channel,
             ContractProfile::ExternalV1,
@@ -1531,7 +1598,10 @@ mod tests {
         .expect("retired operation must not wait for network")
         .unwrap_err();
         assert!(matches!(error, GrpcError::Unimplemented { .. }));
-        assert_eq!(error.details().reason_code.as_deref(), Some("operation_retired"));
+        assert_eq!(
+            error.details().reason_code.as_deref(),
+            Some("operation_retired")
+        );
         assert_eq!(error.details().provider.as_deref(), Some("Jin10"));
         assert_eq!(error.details().retryable, Some(false));
     }

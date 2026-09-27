@@ -12,7 +12,9 @@ pub(super) struct V11Bundle {
 }
 static V11: OnceLock<V11Bundle> = OnceLock::new();
 
-pub(super) fn owned_catalog(connection: &Connection) -> Result<Vec<Definition>, ChainPostCloseError> {
+pub(super) fn owned_catalog(
+    connection: &Connection,
+) -> Result<Vec<Definition>, ChainPostCloseError> {
     let mut statement=connection.prepare("SELECT name,type,tbl_name,CAST(sql AS BLOB) FROM main.sqlite_schema WHERE (lower(name) GLOB 'chain_post_close_*' OR lower(tbl_name) GLOB 'chain_post_close_*') AND NOT(type='index' AND name GLOB 'sqlite_autoindex_*' AND sql IS NULL) ORDER BY name")
         .map_err(|_|ChainPostCloseError::SchemaRejected)?;
     let definitions = statement

@@ -469,22 +469,50 @@ pub fn entries_from_effective(
     effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
     days: usize,
 ) -> Result<(Vec<SignalEntry>, usize), String> {
-    let rows=effective.rows().map_err(|e|e.to_string())?.iter().map(|row| {
-        let local=crate::trading::paper_lot_ledger::parse_paper_fill_timestamp(row.id,&row.occurred_at)?;
-        let utc=local.checked_sub_signed(Duration::hours(8)).ok_or("effective timestamp underflow")?;
-        Ok(PaperFilledReviewRow{id:row.id,plan_id:row.plan_id.clone(),code:row.code.clone(),name:row.name.clone(),direction:row.direction.clone(),fill_price:row.fill_price,quantity:row.quantity,occurred_at:utc.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),virtual_reason:row.virtual_reason.clone()})
-    }).collect::<Result<Vec<_>,String>>()?;
-    parse_paper_signal_rows(rows,effective.receipt().request.as_of,days)
+    let rows = effective
+        .rows()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|row| {
+            let local = crate::trading::paper_lot_ledger::parse_paper_fill_timestamp(
+                row.id,
+                &row.occurred_at,
+            )?;
+            let utc = local
+                .checked_sub_signed(Duration::hours(8))
+                .ok_or("effective timestamp underflow")?;
+            Ok(PaperFilledReviewRow {
+                id: row.id,
+                plan_id: row.plan_id.clone(),
+                code: row.code.clone(),
+                name: row.name.clone(),
+                direction: row.direction.clone(),
+                fill_price: row.fill_price,
+                quantity: row.quantity,
+                occurred_at: utc.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
+                virtual_reason: row.virtual_reason.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    parse_paper_signal_rows(rows, effective.receipt().request.as_of, days)
 }
 
 /// 读取并严格校验纸面成交，再按显式评估日投影买入事件。卖出只计数，不评分。
 pub fn read_paper_signal_entries(
     as_of_date: NaiveDate,
     days: usize,
-) -> Result<(Vec<SignalEntry>, usize,crate::trading::paper_ledger::EffectiveProjectionReceipt), String> {
-    let effective=crate::performance::economic_position::query_effective_fills_through(as_of_date)?;
-    let (entries,excluded)=entries_from_effective(&effective,days)?;
-    Ok((entries,excluded,effective.receipt().clone()))
+) -> Result<
+    (
+        Vec<SignalEntry>,
+        usize,
+        crate::trading::paper_ledger::EffectiveProjectionReceipt,
+    ),
+    String,
+> {
+    let effective =
+        crate::performance::economic_position::query_effective_fills_through(as_of_date)?;
+    let (entries, excluded) = entries_from_effective(&effective, days)?;
+    Ok((entries, excluded, effective.receipt().clone()))
 }
 
 /// 虚拟仓信号回测: 每笔信号 → 15min bars 对齐 → forward return 分组。
@@ -510,7 +538,7 @@ pub fn backtest_virtual_signals(
     as_of_date: NaiveDate,
     days: usize,
 ) -> Result<R12BacktestResult, String> {
-    let (entries, exit_rows_excluded,projection) = read_paper_signal_entries(as_of_date, days)?;
+    let (entries, exit_rows_excluded, projection) = read_paper_signal_entries(as_of_date, days)?;
     let gateway = HistoricalBarsGateway::new();
     let mut cache = TechnicalBarsCache::new();
     let mut loader = |code: &str| {
@@ -518,13 +546,13 @@ pub fn backtest_virtual_signals(
             .fifteen_min_bars(code, 800)
             .map_err(|error| error.to_string())
     };
-    let mut result=backtest_virtual_signals_with_entries_and_cache(
+    let mut result = backtest_virtual_signals_with_entries_and_cache(
         &entries,
         exit_rows_excluded,
         &mut cache,
         &mut loader,
     )?;
-    result.effective_projection=Some(projection);
+    result.effective_projection = Some(projection);
     Ok(result)
 }
 
@@ -662,8 +690,11 @@ pub fn render_r12(result: &R12BacktestResult) -> String {
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
         "ℹ️ 上涨比例仅描述入场后短期价格路径，不是买入→卖出扣成本策略胜率。".to_string(),
     ];
-    if let Some(projection)=&result.effective_projection {
-        lines.push(format!("经济投影 {}；范围 {:?}；历史口径 {:?}",projection.projection_hash,projection.request.scope,projection.request.history));
+    if let Some(projection) = &result.effective_projection {
+        lines.push(format!(
+            "经济投影 {}；范围 {:?}；历史口径 {:?}",
+            projection.projection_hash, projection.request.scope, projection.request.history
+        ));
     }
 
     lines.push("【虚拟仓买入事件】".to_string());
@@ -755,14 +786,15 @@ fn signed_pct(rate: Option<f64>) -> String {
 
 /// 供 dispatcher 用的组合入口：调用方必须传入同一复盘业务日。
 pub fn run_full_backtest(as_of_date: NaiveDate, days: usize) -> Result<R12BacktestResult, String> {
-    let (entries, exit_rows_excluded,projection) = read_paper_signal_entries(as_of_date, days)?;
+    let (entries, exit_rows_excluded, projection) = read_paper_signal_entries(as_of_date, days)?;
     let gateway = HistoricalBarsGateway::new();
-    let mut result=run_full_backtest_with_entries_and_loader(&entries, exit_rows_excluded, |code| {
-        gateway
-            .fifteen_min_bars(code, 800)
-            .map_err(|error| error.to_string())
-    })?;
-    result.effective_projection=Some(projection);
+    let mut result =
+        run_full_backtest_with_entries_and_loader(&entries, exit_rows_excluded, |code| {
+            gateway
+                .fifteen_min_bars(code, 800)
+                .map_err(|error| error.to_string())
+        })?;
+    result.effective_projection = Some(projection);
     Ok(result)
 }
 

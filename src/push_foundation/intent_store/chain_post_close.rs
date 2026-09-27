@@ -27,8 +27,7 @@ use crate::pipeline::chain_analysis::preparation::{
     build_cluster_material, parse_concept_provider_raw, ChainPreparationIo, ConceptEffectClock,
     ConceptProviderRawIo, DragonTigerObservationClock, FixedClusterConfiguration,
     MacroObservationClock, ModelEffect, ModelStage, ModelsObservationClock,
-    PositionObservationClock, PreparationStop, PreparedChainAnalysis, SearchStage,
-    UnmigratedStage,
+    PositionObservationClock, PreparationStop, PreparedChainAnalysis, SearchStage, UnmigratedStage,
 };
 use crate::push_foundation::LeaseOwnerId;
 use crate::search_service::SearchService;
@@ -1360,15 +1359,28 @@ impl<'store> LocalChainPostClose<'store> {
 
     /// Requires an explicitly migrated/qualified layout15. Never migrates on open.
     pub(crate) fn macro_preparation_io_v15<'local, 'provider, C>(
-        &'local mut self, lease: RunLease, queries: &'provider ConnectedBoardQueries,
-        clock: &'provider C, configuration: FixedClusterConfiguration,
-        parent_source: &'provider GrpcSource, source: &'provider GrpcSource,
+        &'local mut self,
+        lease: RunLease,
+        queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C,
+        configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource,
+        source: &'provider GrpcSource,
         search_service: &'provider SearchService,
     ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
-    where C: MacroObservationClock,
+    where
+        C: MacroObservationClock,
     {
-        self.macro_preparation_io_at_layout(lease, queries, clock, configuration,
-            parent_source, source, search_service, MacroLayout::V15)
+        self.macro_preparation_io_at_layout(
+            lease,
+            queries,
+            clock,
+            configuration,
+            parent_source,
+            source,
+            search_service,
+            MacroLayout::V15,
+        )
     }
 
     fn macro_preparation_io_at_layout<'local, 'provider, C>(
@@ -1440,8 +1452,16 @@ impl<'store> LocalChainPostClose<'store> {
         C: ModelsObservationClock,
     {
         self.models_preparation_io_at_layout(
-            lease, queries, clock, configuration, parent_source, source,
-            search_service, analyzer, 13, MacroLayout::V12,
+            lease,
+            queries,
+            clock,
+            configuration,
+            parent_source,
+            source,
+            search_service,
+            analyzer,
+            13,
+            MacroLayout::V12,
         )
     }
 
@@ -1461,22 +1481,46 @@ impl<'store> LocalChainPostClose<'store> {
         C: ModelsObservationClock,
     {
         self.models_preparation_io_at_layout(
-            lease, queries, clock, configuration, parent_source, source,
-            search_service, analyzer, 14, MacroLayout::V14,
+            lease,
+            queries,
+            clock,
+            configuration,
+            parent_source,
+            source,
+            search_service,
+            analyzer,
+            14,
+            MacroLayout::V14,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn models_preparation_io_v15<'local, 'provider, C>(
-        &'local mut self, lease: RunLease, queries: &'provider ConnectedBoardQueries,
-        clock: &'provider C, configuration: FixedClusterConfiguration,
-        parent_source: &'provider GrpcSource, source: &'provider GrpcSource,
-        search_service: &'provider SearchService, analyzer: &'provider crate::analyzer::GeminiAnalyzer,
+        &'local mut self,
+        lease: RunLease,
+        queries: &'provider ConnectedBoardQueries,
+        clock: &'provider C,
+        configuration: FixedClusterConfiguration,
+        parent_source: &'provider GrpcSource,
+        source: &'provider GrpcSource,
+        search_service: &'provider SearchService,
+        analyzer: &'provider crate::analyzer::GeminiAnalyzer,
     ) -> Result<LocalConceptBatchPreparationIo<'local, 'provider, 'store, C>, ChainPostCloseError>
-    where C: ModelsObservationClock,
+    where
+        C: ModelsObservationClock,
     {
-        self.models_preparation_io_at_layout(lease, queries, clock, configuration, parent_source,
-            source, search_service, analyzer, 15, MacroLayout::V15)
+        self.models_preparation_io_at_layout(
+            lease,
+            queries,
+            clock,
+            configuration,
+            parent_source,
+            source,
+            search_service,
+            analyzer,
+            15,
+            MacroLayout::V15,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1688,7 +1732,13 @@ fn inspect_run_and_macro_scoped_with_catalog<'transaction, 'connection, T>(
         dragon_tiger::ValidatedDragonTiger<'transaction, 'connection, 'run>,
     ) -> Result<T, ChainPostCloseError>,
 ) -> Result<(RunRecovery, Option<macro_stage::MacroRecovery>, Option<T>), ChainPostCloseError> {
-    inspect_run_and_macro_at_layout_with_catalog(connection, intent_id, proof.layout(), Some(proof), consume)
+    inspect_run_and_macro_at_layout_with_catalog(
+        connection,
+        intent_id,
+        proof.layout(),
+        Some(proof),
+        consume,
+    )
 }
 
 fn inspect_run_and_macro_at_layout_with_catalog<'transaction, 'connection, T>(
@@ -4000,9 +4050,12 @@ where
                     self.lease = Some(lease);
                     return match output {
                         macro_driver::Outcome::Full(output) => Ok(output),
-                        macro_driver::Outcome::LegacySourceConfirmed => Err(PreparationStop::StageNotMigrated {
-                            next: UnmigratedStage::Macro,
-                        }.into()),
+                        macro_driver::Outcome::LegacySourceConfirmed => {
+                            Err(PreparationStop::StageNotMigrated {
+                                next: UnmigratedStage::Macro,
+                            }
+                            .into())
+                        }
                     };
                 }
             }
@@ -4076,7 +4129,8 @@ where
             }
             Ok(ModelsStep::Begun(begun)) => {
                 let available = analyzer.is_available();
-                if let Err(error) = self.models_record(begun, &models::Outcome::Available(available))
+                if let Err(error) =
+                    self.models_record(begun, &models::Outcome::Available(available))
                 {
                     self.models_park(error);
                 }
@@ -4131,11 +4185,7 @@ where
     }
 
     fn search_available(&mut self) -> bool {
-        let Some(search) = self
-            .models_input
-            .as_ref()
-            .map(|input| input.search_service)
-        else {
+        let Some(search) = self.models_input.as_ref().map(|input| input.search_service) else {
             panic!("search configuration I/O not supplied")
         };
         match self.models_step(models::Request::SearchAvailable) {
@@ -4147,7 +4197,8 @@ where
             }
             Ok(ModelsStep::Begun(begun)) => {
                 let available = search.is_available();
-                if let Err(error) = self.models_record(begun, &models::Outcome::Available(available))
+                if let Err(error) =
+                    self.models_record(begun, &models::Outcome::Available(available))
                 {
                     self.models_park(error);
                 }
@@ -4167,11 +4218,7 @@ where
         limit: usize,
         budget: std::time::Duration,
     ) -> AnyResult<Vec<crate::search_service::SearchResult>> {
-        let Some(search) = self
-            .models_input
-            .as_ref()
-            .map(|input| input.search_service)
-        else {
+        let Some(search) = self.models_input.as_ref().map(|input| input.search_service) else {
             panic!("topic search I/O not supplied")
         };
         let request = models::Request::Search {
@@ -4201,10 +4248,7 @@ where
         let mut guard = EffectGuard::new(Rc::clone(&self.cancelled));
         let result = match tokio::time::timeout(inner, search.search_topic(query, limit)).await {
             Ok(results) => Ok(results),
-            Err(_) => Err(anyhow::anyhow!(
-                "新闻搜索超时（{}秒）",
-                inner.as_secs()
-            )),
+            Err(_) => Err(anyhow::anyhow!("新闻搜索超时（{}秒）", inner.as_secs())),
         };
         let outcome = match &result {
             Ok(results) => models::Outcome::SearchReturned(results.clone()),

@@ -205,7 +205,10 @@ impl SystemService for ExternalControlService {
             .expect("TEST_CODE External control Health reply mode")
             .health_reply;
         match health_reply {
-            HealthReply::Success | HealthReply::NotReady | HealthReply::MismatchedId | HealthReply::TrustedBuildB => {
+            HealthReply::Success
+            | HealthReply::NotReady
+            | HealthReply::MismatchedId
+            | HealthReply::TrustedBuildB => {
                 let ready = health_reply != HealthReply::NotReady;
                 let response = HealthResponse {
                     request_id: if health_reply == HealthReply::MismatchedId {
@@ -227,10 +230,13 @@ impl SystemService for ExternalControlService {
                         build.source_revision = "TEST_CODE_TRUSTED_RELEASE_B".into();
                         build.binary_sha256 = "b".repeat(64);
                         if self.state.lock().unwrap().descriptor_b {
-                            build.contract_sha256 = crate::grpc_client::external_decoder::test_b::descriptor().into();
+                            build.contract_sha256 =
+                                crate::grpc_client::external_decoder::test_b::descriptor().into();
                         }
                         build
-                    } else { test_external_build_identity() }),
+                    } else {
+                        test_external_build_identity()
+                    }),
                 };
                 self.state
                     .lock()
@@ -1007,7 +1013,9 @@ impl Encoder for ExternalControlDataEncoder {
         if state.append_zero_length_source {
             payload.extend_from_slice(&[0x5a, 0x00]);
         }
-        if state.descriptor_b { append_b_field(&mut payload); }
+        if state.descriptor_b {
+            append_b_field(&mut payload);
+        }
         destination.put_slice(&payload);
         state.observation.data_responses.push(payload);
         Ok(())
@@ -1086,62 +1094,119 @@ fn append_b_field(payload: &mut Vec<u8>) {
 }
 
 #[derive(Clone)]
-struct ExternalControlSystemServer { generated: SystemServiceServer<ExternalControlService>, inner: Arc<ExternalControlService> }
+struct ExternalControlSystemServer {
+    generated: SystemServiceServer<ExternalControlService>,
+    inner: Arc<ExternalControlService>,
+}
 impl ExternalControlSystemServer {
     fn new(service: ExternalControlService) -> Self {
         let inner = Arc::new(service);
-        Self { generated: SystemServiceServer::from_arc(Arc::clone(&inner)), inner }
+        Self {
+            generated: SystemServiceServer::from_arc(Arc::clone(&inner)),
+            inner,
+        }
     }
 }
-struct BControlCodec<Q, R> { state: Arc<Mutex<ExternalControlState>>, health: bool, marker: std::marker::PhantomData<(Q, R)> }
-struct BControlEncoder<R> { state: Arc<Mutex<ExternalControlState>>, health: bool, marker: std::marker::PhantomData<R> }
-impl<Q: Message + Default + Send + 'static, R: Message + Send + 'static> Codec for BControlCodec<Q, R> {
-    type Encode = R; type Decode = Q;
-    type Encoder = BControlEncoder<R>; type Decoder = tonic_prost::ProstDecoder<Q>;
-    fn encoder(&mut self) -> Self::Encoder { BControlEncoder { state: self.state.clone(), health: self.health, marker: std::marker::PhantomData } }
-    fn decoder(&mut self) -> Self::Decoder { tonic_prost::ProstDecoder::new(BufferSettings::default()) }
+struct BControlCodec<Q, R> {
+    state: Arc<Mutex<ExternalControlState>>,
+    health: bool,
+    marker: std::marker::PhantomData<(Q, R)>,
+}
+struct BControlEncoder<R> {
+    state: Arc<Mutex<ExternalControlState>>,
+    health: bool,
+    marker: std::marker::PhantomData<R>,
+}
+impl<Q: Message + Default + Send + 'static, R: Message + Send + 'static> Codec
+    for BControlCodec<Q, R>
+{
+    type Encode = R;
+    type Decode = Q;
+    type Encoder = BControlEncoder<R>;
+    type Decoder = tonic_prost::ProstDecoder<Q>;
+    fn encoder(&mut self) -> Self::Encoder {
+        BControlEncoder {
+            state: self.state.clone(),
+            health: self.health,
+            marker: std::marker::PhantomData,
+        }
+    }
+    fn decoder(&mut self) -> Self::Decoder {
+        tonic_prost::ProstDecoder::new(BufferSettings::default())
+    }
 }
 impl<R: Message> Encoder for BControlEncoder<R> {
-    type Item = R; type Error = Status;
+    type Item = R;
+    type Error = Status;
     fn encode(&mut self, item: R, destination: &mut EncodeBuf<'_>) -> Result<(), Status> {
         let mut bytes = item.encode_to_vec();
         append_b_field(&mut bytes);
         let mut state = self.state.lock().unwrap();
-        let captured = if self.health { &mut state.observation.health_responses } else { &mut state.observation.capabilities_responses };
+        let captured = if self.health {
+            &mut state.observation.health_responses
+        } else {
+            &mut state.observation.capabilities_responses
+        };
         *captured.last_mut().unwrap() = bytes.clone();
         destination.put_slice(&bytes);
         Ok(())
     }
 }
 impl<B> Service<http::Request<B>> for ExternalControlSystemServer
-where B: Body + Send + 'static, B::Error: Into<StdError> + Send + 'static {
-    type Response = http::Response<tonic::body::Body>; type Error = Infallible;
+where
+    B: Body + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        if !self.inner.state.lock().unwrap().descriptor_b { return self.generated.call(request); }
+        if !self.inner.state.lock().unwrap().descriptor_b {
+            return self.generated.call(request);
+        }
         macro_rules! serve {
             ($q:ty, $r:ty, $method:ident, $health:expr) => {{
                 struct Method(Arc<ExternalControlService>);
                 impl UnaryService<$q> for Method {
-                    type Response = $r; type Future = BoxFuture<Response<$r>, Status>;
+                    type Response = $r;
+                    type Future = BoxFuture<Response<$r>, Status>;
                     fn call(&mut self, request: Request<$q>) -> Self::Future {
-                        let inner = self.0.clone(); Box::pin(async move { <ExternalControlService as SystemService>::$method(&inner, request).await })
+                        let inner = self.0.clone();
+                        Box::pin(async move {
+                            <ExternalControlService as SystemService>::$method(&inner, request)
+                                .await
+                        })
                     }
                 }
-                let codec = BControlCodec::<$q, $r> { state: self.inner.state.clone(), health: $health, marker: std::marker::PhantomData };
+                let codec = BControlCodec::<$q, $r> {
+                    state: self.inner.state.clone(),
+                    health: $health,
+                    marker: std::marker::PhantomData,
+                };
                 let method = Method(self.inner.clone());
                 Box::pin(async move { Ok(Grpc::new(codec).unary(method, request).await) })
-            }}
+            }};
         }
         match request.uri().path() {
-            "/magic.market.v1.SystemService/GetHealth" => serve!(HealthRequest, HealthResponse, get_health, true),
-            "/magic.market.v1.SystemService/GetCapabilities" => serve!(CapabilitiesRequest, CapabilitiesResponse, get_capabilities, false),
+            "/magic.market.v1.SystemService/GetHealth" => {
+                serve!(HealthRequest, HealthResponse, get_health, true)
+            }
+            "/magic.market.v1.SystemService/GetCapabilities" => serve!(
+                CapabilitiesRequest,
+                CapabilitiesResponse,
+                get_capabilities,
+                false
+            ),
             _ => self.generated.call(request),
         }
     }
 }
-impl NamedService for ExternalControlSystemServer { const NAME: &'static str = "magic.market.v1.SystemService"; }
+impl NamedService for ExternalControlSystemServer {
+    const NAME: &'static str = "magic.market.v1.SystemService";
+}
 
 pub(crate) struct ExternalControlLoopbackServer {
     endpoint: String,
@@ -1387,8 +1452,11 @@ impl ExternalMtlsSwitch {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = format!("https://{}", listener.local_addr().unwrap());
         let temp_dir = tempfile::tempdir().unwrap();
-        let bundle_path = write_test_code_bundle(temp_dir.path(), "switch", &front, "macro.test.invalid").unwrap();
-        let (route, receiver) = tokio::sync::watch::channel(endpoint.trim_start_matches("https://").to_owned());
+        let bundle_path =
+            write_test_code_bundle(temp_dir.path(), "switch", &front, "macro.test.invalid")
+                .unwrap();
+        let (route, receiver) =
+            tokio::sync::watch::channel(endpoint.trim_start_matches("https://").to_owned());
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_active = active.clone();
         let task = tokio::spawn(async move {
@@ -1416,23 +1484,36 @@ impl ExternalMtlsSwitch {
                 }
             }
         });
-        Self { bundle_path, _temp_dir: temp_dir, route, active, task }
+        Self {
+            bundle_path,
+            _temp_dir: temp_dir,
+            route,
+            active,
+            task,
+        }
     }
 
-    pub(crate) fn bundle_path(&self) -> &Path { &self.bundle_path }
+    pub(crate) fn bundle_path(&self) -> &Path {
+        &self.bundle_path
+    }
 
     pub(crate) async fn switch_to(&self, endpoint: &str) {
-        self.route.send_replace(endpoint.trim_start_matches("https://").to_owned());
+        self.route
+            .send_replace(endpoint.trim_start_matches("https://").to_owned());
         tokio::time::timeout(Duration::from_secs(5), async {
             while self.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("TEST_CODE old relay closed");
+        })
+        .await
+        .expect("TEST_CODE old relay closed");
     }
 }
 
 impl Drop for ExternalMtlsSwitch {
-    fn drop(&mut self) { self.task.abort(); }
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 pub(crate) struct ExternalMtlsMacroFixture {
@@ -1443,7 +1524,15 @@ pub(crate) struct ExternalMtlsMacroFixture {
 }
 
 impl ExternalMtlsMacroFixture {
-    pub(crate) fn use_descriptor_b_for_test(&self) { self.server.as_ref().unwrap().state.lock().unwrap().descriptor_b = true; }
+    pub(crate) fn use_descriptor_b_for_test(&self) {
+        self.server
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .descriptor_b = true;
+    }
     pub(crate) async fn bind_data_success_for_test() -> Result<Self, String> {
         Self::bind_with_modes_for_test(
             HealthReply::Success,
@@ -1495,8 +1584,12 @@ impl ExternalMtlsMacroFixture {
     }
 
     pub(crate) fn append_zero_length_source_for_test(&self) {
-        self.server.as_ref().expect("TEST_CODE zero-length server").state
-            .lock().expect("TEST_CODE zero-length response mode")
+        self.server
+            .as_ref()
+            .expect("TEST_CODE zero-length server")
+            .state
+            .lock()
+            .expect("TEST_CODE zero-length response mode")
             .append_zero_length_source = true;
     }
 

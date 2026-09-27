@@ -75,7 +75,9 @@ fn reference_cache_rechecks_independent_connection_after_warmup() {
     let valid_receipt = attest_bundled_connection(&corrupted).unwrap();
     assert_eq!(valid_receipt, warm_receipt);
     corrupted
-        .execute_batch(&format!("PRAGMA query_only=OFF; DROP TRIGGER {TARGET_TRIGGER};"))
+        .execute_batch(&format!(
+            "PRAGMA query_only=OFF; DROP TRIGGER {TARGET_TRIGGER};"
+        ))
         .unwrap();
     assert_check(
         attest_bundled_connection(&corrupted).unwrap_err(),
@@ -129,7 +131,13 @@ fn reference_cache_rejects_matching_tampered_registry_and_sqlite_schema() {
     connection
         .execute_batch("ROLLBACK; PRAGMA query_only=OFF;")
         .unwrap();
-    assert_eq!(live_definition(&connection, TARGET_TRIGGER), original_target);
+    assert_eq!(
+        live_definition(&connection, TARGET_TRIGGER),
+        original_target
+    );
     assert_eq!(live_definition(&connection, REGISTRY_GUARD), original_guard);
-    assert_eq!(attest_bundled_connection(&connection).unwrap(), warm_receipt);
+    assert_eq!(
+        attest_bundled_connection(&connection).unwrap(),
+        warm_receipt
+    );
 }

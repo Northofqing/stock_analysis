@@ -162,10 +162,11 @@ fn is_halted(code: &str) -> bool {
 // 停牌时间段缓存 (v11-P0-3 commit 2 新建)
 //
 // 与 HALTED_CODES 不同: HALTED_CODES 只存"现在是否停牌", HALTED_PERIODS 存历史时间段.
-// 数据来源: ① K 线缺口推断 (commit 2) ② 交易所公告 (留 P0-4).
+// Legacy diagnostic cache only. K-line gaps no longer write this cache and a
+// bool lookup here is never qualified suspension authority for new decisions.
 //
-// 解决"幸存者偏差": apply_limit_flags_inplace 之前 is_suspended 永远 false,
-// 回测在停牌日虚成交 → 虚高收益. 现在 is_halted_period(code, date) 查 HALTED_PERIODS.
+// 仅保留历史诊断/回归测试兼容；任何生产准入必须消费
+// QualifiedSuspensionEvidence，禁止读取本 bool 缓存作授权。
 // ============================================================================
 
 type HaltedPeriod = (NaiveDate, NaiveDate);
@@ -173,7 +174,9 @@ type HaltedPeriodsByCode = HashMap<String, Vec<HaltedPeriod>>;
 static HALTED_PERIODS: Lazy<RwLock<HaltedPeriodsByCode>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// 喂入停牌时间段. (from, to) 半开区间 [from, to].
+/// Legacy diagnostic insertion. `(from, to)` is inclusive despite the old
+/// comment/implementation mismatch. New production admission must use
+/// `QualifiedSuspensionEvidence` instead of this bool cache.
 pub fn mark_halted_period(code: &str, from: NaiveDate, to: NaiveDate) {
     if let Ok(mut guard) = HALTED_PERIODS.write() {
         guard
@@ -416,9 +419,12 @@ pub struct AdjacentDailyChange {
 /// threshold: every such move is returned to the final evidence-bound admission
 /// stage. Keeping this function crate-private prevents a transport router from
 /// turning structural validation into a production admission shortcut.
-pub(crate) fn validate_daily_kline_structure(
+fn validate_daily_kline_structure_with_evidence(
     kline: &mut [KlineData],
     code: &str,
+    suspension_evidence: Option<
+        &crate::data_gateway::qualified_trading_facts::QualifiedSuspensionEvidence,
+    >,
 ) -> Result<Vec<AdjacentDailyChange>, String> {
     if kline.is_empty() {
         return Err("日线数据为空".to_string());
@@ -463,26 +469,35 @@ pub(crate) fn validate_daily_kline_structure(
         }
         let expected = calendar::next_trading_day(prev.date);
         if cur.date != expected {
-            // BR-228: 停牌容忍 — 缺失交易日按停牌处理 (单次 ≤ 5 个交易日),
-            // 跳过该相邻对 (不计算涨跌幅), 记录警告; 超过阈值仍硬拒。
-            let mut gap_days = 0usize;
+            let mut missing_trading_dates = Vec::new();
             let mut probe = expected;
-            while probe < cur.date && gap_days <= 5 {
+            while probe < cur.date {
+                missing_trading_dates.push(probe);
                 probe = calendar::next_trading_day(probe);
-                gap_days += 1;
             }
-            if gap_days <= 5 {
-                log::warn!(
-                    "[{code}] 停牌容忍: {} 后为 {} (缺失 {gap_days} 个交易日, 视为停牌)",
-                    prev.date,
-                    cur.date
-                );
-                continue;
+            if missing_trading_dates.is_empty() || probe != cur.date {
+                return Err(format!(
+                    "[{code}] 交易日断档无法按权威日历枚举: {} 后应为 {}, 实际为 {}",
+                    prev.date, expected, cur.date
+                ));
             }
-            return Err(format!(
-                "[{code}] 交易日断档: {} 后应为 {}, 实际为 {}",
-                prev.date, expected, cur.date
-            ));
+            let evidence = suspension_evidence.ok_or_else(|| {
+                format!(
+                    "[{code}] suspension_evidence_unavailable_v1 {}→{} missing_trading_dates={missing_trading_dates:?}",
+                    prev.date, cur.date
+                )
+            })?;
+            evidence
+                .explain_gap(code, &missing_trading_dates, cur.date)
+                .map_err(|error| format!("[{code}] {error}"))?;
+            log::info!(
+                "[{code}] qualified suspension evidence explains {} missing trading dates {}→{} source={} batch_id={}",
+                missing_trading_dates.len(),
+                prev.date,
+                cur.date,
+                evidence.evidence().source,
+                evidence.evidence().batch_id
+            );
         }
         let computed_pct = (cur.close - prev.close) / prev.close * 100.0;
         if cur.pct_chg.abs() > 1e-9 && (cur.pct_chg - computed_pct).abs() > 0.25 {
@@ -511,6 +526,13 @@ pub(crate) fn validate_daily_kline_structure(
     Ok(pending_confirmations)
 }
 
+pub(crate) fn validate_daily_kline_structure(
+    kline: &mut [KlineData],
+    code: &str,
+) -> Result<Vec<AdjacentDailyChange>, String> {
+    validate_daily_kline_structure_with_evidence(kline, code, None)
+}
+
 /// BR-092 strict daily validation with an evidence-bound BR-171 confirmation resolver.
 ///
 /// The resolver must return `true` only for a durable confirmation matching the
@@ -524,7 +546,24 @@ pub fn validate_daily_kline_quality_with_confirmation<Confirm>(
 where
     Confirm: FnMut(&AdjacentDailyChange) -> Result<bool, String>,
 {
-    for change in validate_daily_kline_structure(kline, code)? {
+    validate_daily_kline_quality_with_evidence(kline, code, None, confirm)
+}
+
+/// BR-092/D20 validation with exact authority suspension coverage. Suspension
+/// explains missing rows only; the adjacent price/pct and BR-171 gates below
+/// still run for the reopen pair.
+pub fn validate_daily_kline_quality_with_evidence<Confirm>(
+    kline: &mut [KlineData],
+    code: &str,
+    suspension_evidence: Option<
+        &crate::data_gateway::qualified_trading_facts::QualifiedSuspensionEvidence,
+    >,
+    mut confirm: Confirm,
+) -> Result<(), String>
+where
+    Confirm: FnMut(&AdjacentDailyChange) -> Result<bool, String>,
+{
+    for change in validate_daily_kline_structure_with_evidence(kline, code, suspension_evidence)? {
         let confirmed = confirm(&change).map_err(|error| {
             format!(
                 "[{}] BR-171 manual_confirmation_lookup_failed {}→{}: {error}",
@@ -913,31 +952,156 @@ mod tests {
         assert_eq!(bars.len(), 2, "失败不得删除任一重复源行");
     }
 
-    #[test]
-    fn test_daily_kline_quality_tolerates_single_day_gap_as_suspension() {
-        // BR-228: 单次 ≤5 个交易日的缺口视为停牌, 不再硬拒
-        let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
-        let d3 = NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
-        let mut bars = vec![
-            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d3, 10.2, 10.6, 10.1, 10.4),
-        ];
-        validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
-            .expect("suspension gap tolerated");
+    fn task9_suspension_evidence(
+        code: &str,
+        covered_from: NaiveDate,
+        covered_through: NaiveDate,
+        halted_from: NaiveDate,
+        halted_through: NaiveDate,
+    ) -> crate::data_gateway::qualified_trading_facts::QualifiedSuspensionEvidence {
+        use crate::data_gateway::qualified_trading_facts::{
+            AuthoritySuspensionCoverage, QualifiedSuspensionEvidence, SuspensionWindow,
+        };
+        use crate::data_gateway::BatchEvidence;
+        use crate::market_domain::{AssetClass, Exchange, InstrumentId, ProviderId};
+
+        QualifiedSuspensionEvidence::admit(
+            InstrumentId::new(Exchange::Shenzhen, code, AssetClass::Equity).unwrap(),
+            AuthoritySuspensionCoverage::with_windows(
+                covered_from,
+                covered_through,
+                vec![SuspensionWindow {
+                    halted_from,
+                    halted_through,
+                }],
+            ),
+            BatchEvidence {
+                provider: ProviderId::Custom,
+                source: "TEST_CODE_EXCHANGE_SUSPENSION".to_owned(),
+                source_at: Some("2026-07-01T00:00:00Z".to_owned()),
+                observed_at: "2026-07-01T00:00:01Z".to_owned(),
+                batch_id: format!("TEST_CODE_{code}_SUSPENSION"),
+            },
+            "TEST_CODE_SUSPENSION_CONTRACT_V1",
+            format!("TEST_CODE_{code}_SUSPENSION_EVENT"),
+            "a".repeat(64),
+        )
+        .unwrap()
+    }
+
+    fn task9_gap_dates(missing_count: usize) -> (NaiveDate, Vec<NaiveDate>, NaiveDate) {
+        let previous = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let mut missing = Vec::new();
+        let mut next = calendar::next_trading_day(previous);
+        for _ in 0..missing_count {
+            missing.push(next);
+            next = calendar::next_trading_day(next);
+        }
+        (previous, missing, next)
     }
 
     #[test]
-    fn test_daily_kline_quality_rejects_long_gap() {
-        // BR-228: 超过 5 个交易日的缺口仍硬拒
-        let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
-        let d3 = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+    fn task9_daily_kline_gap_of_any_duration_requires_exact_suspension_evidence() {
+        for missing_count in [1, 5, 6] {
+            let (previous, missing, reopen) = task9_gap_dates(missing_count);
+            let mut bars = vec![
+                make_kline(previous, 10.0, 10.5, 9.8, 10.0),
+                make_kline(reopen, 10.2, 10.6, 10.1, 10.4),
+            ];
+            let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
+                .expect_err("gap duration alone can never prove suspension");
+            assert!(
+                error.contains("suspension_evidence_unavailable_v1"),
+                "missing_count={missing_count}: {error}"
+            );
+
+            let evidence = task9_suspension_evidence(
+                "TEST_CODE_000001",
+                missing[0],
+                reopen,
+                missing[0],
+                *missing.last().unwrap(),
+            );
+            validate_daily_kline_quality_with_evidence(
+                &mut bars,
+                "TEST_CODE_000001",
+                Some(&evidence),
+                |_| Ok(false),
+            )
+            .unwrap_or_else(|error| {
+                panic!("missing_count={missing_count}: exact evidence rejected: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn task9_partial_suspension_coverage_and_halted_reopen_date_fail_closed() {
+        let (previous, missing, reopen) = task9_gap_dates(5);
+        for (label, halted_through, reason) in [
+            (
+                "partial",
+                missing[3],
+                "suspension_evidence_partial_coverage",
+            ),
+            (
+                "reopen still halted",
+                reopen,
+                "suspension_reopen_date_still_halted",
+            ),
+        ] {
+            let evidence = task9_suspension_evidence(
+                "TEST_CODE_000001",
+                missing[0],
+                reopen,
+                missing[0],
+                halted_through,
+            );
+            let mut bars = vec![
+                make_kline(previous, 10.0, 10.5, 9.8, 10.0),
+                make_kline(reopen, 10.2, 10.6, 10.1, 10.4),
+            ];
+            let error = validate_daily_kline_quality_with_evidence(
+                &mut bars,
+                "TEST_CODE_000001",
+                Some(&evidence),
+                |_| Ok(false),
+            )
+            .expect_err(label);
+            assert!(error.contains(reason), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn task9_proven_suspension_still_requires_br171_for_large_reopen_move() {
+        let (previous, missing, reopen) = task9_gap_dates(1);
+        let evidence = task9_suspension_evidence(
+            "TEST_CODE_000001",
+            missing[0],
+            reopen,
+            missing[0],
+            missing[0],
+        );
         let mut bars = vec![
-            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d3, 10.2, 10.6, 10.1, 10.4),
+            make_kline(previous, 10.0, 10.5, 9.8, 10.0),
+            make_kline(reopen, 13.0, 13.1, 12.9, 13.0),
         ];
-        let error = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001")
-            .expect_err("long gap must fail");
-        assert!(error.contains("交易日断档"));
+        bars[1].pct_chg = 30.0;
+        let error = validate_daily_kline_quality_with_evidence(
+            &mut bars,
+            "TEST_CODE_000001",
+            Some(&evidence),
+            |_| Ok(false),
+        )
+        .expect_err("halt evidence cannot authorize the reopen price move");
+        assert!(error.contains("manual_confirmation_required"), "{error}");
+
+        validate_daily_kline_quality_with_evidence(
+            &mut bars,
+            "TEST_CODE_000001",
+            Some(&evidence),
+            |_| Ok(true),
+        )
+        .expect("independent exact BR-171 confirmation may admit the move");
     }
 
     #[test]

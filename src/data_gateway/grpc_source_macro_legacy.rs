@@ -92,9 +92,12 @@ impl GrpcSource {
                     "External initialization qualification closed",
                 )
             })?;
-        let cached = self.external_client.lock().await.as_ref().map(|state| {
-            (state.prepared.clone(), state.client.clone())
-        });
+        let cached = self
+            .external_client
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| (state.prepared.clone(), state.client.clone()));
         // A cached Channel may have reconnected to a different service build.
         // Resume the control qualification even when an earlier operation was
         // admitted; neither Health nor Capabilities is reusable by itself.

@@ -419,6 +419,7 @@ struct StructurallyAdmittedBatch {
 /// transport qualification. It cannot be built from CLI JSON or GatewayError.
 pub(super) struct OutcomeReviewEvidence {
     instrument: InstrumentId,
+    expected_trading_dates: Vec<NaiveDate>,
     batch_facts: serde_json::Value,
     raw: serde_json::Value,
 }
@@ -431,6 +432,7 @@ impl OutcomeReviewEvidence {
     ) -> Result<Self, GatewayError> {
         Ok(Self {
             instrument: plan.instrument.clone(),
+            expected_trading_dates: plan.applicable_trading_dates.clone(),
             batch_facts: super::historical_bars::review_batch_facts(batch)?,
             raw: serde_json::json!({
                 "schema":"outcome-provider-review-evidence-v1",
@@ -459,6 +461,9 @@ impl OutcomeReviewEvidence {
     }
     pub(super) fn instrument(&self) -> &InstrumentId {
         &self.instrument
+    }
+    pub(super) fn expected_trading_dates(&self) -> &[NaiveDate] {
+        &self.expected_trading_dates
     }
 }
 
@@ -494,6 +499,7 @@ pub(super) fn task8_review_fixture() -> (GatewayBatch<KlineData>, OutcomeReviewE
     };
     let raw = OutcomeReviewEvidence {
         instrument,
+        expected_trading_dates: batch.records().iter().map(|record| record.date).collect(),
         batch_facts: super::historical_bars::review_batch_facts(&batch).unwrap(),
         raw: serde_json::json!({"fixture":"TEST_CODE_synthetic_qualified_outcome_preimages"}),
     };

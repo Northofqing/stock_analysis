@@ -1,14 +1,15 @@
 //! Macro facts on the BusinessIntentStore's owned connection; no network here.
-use chrono::{TimeZone as _, Utc};
 #[cfg(test)]
 use chrono::{DateTime, FixedOffset};
+use chrono::{TimeZone as _, Utc};
 use rusqlite::{params, Transaction, TransactionBehavior};
 
+#[cfg(test)]
+use super::inspect_run_on;
 use super::macro_codec::{self as codec, require, NewsResult, Plan, RawResult, Result};
 use super::{
-    check_lease, dragon_tiger, inspect_run_and_macro_on, inspect_run_and_macro_scoped,
-    schema, storage, ChainPostCloseError, LocalChainPostClose, RunLease,
-    RunRecovery,
+    check_lease, dragon_tiger, inspect_run_and_macro_on, inspect_run_and_macro_scoped, schema,
+    storage, ChainPostCloseError, LocalChainPostClose, RunLease, RunRecovery,
 };
 use crate::data_gateway::review::map_gateway_audit_record;
 use crate::data_gateway::{GatewayBatch, GatewayError, GlobalNewsProvider, GlobalNewsRecord};
@@ -16,8 +17,6 @@ use crate::database::data_acquisition_audit::{
     append_acquisition_in_transaction, verify_acquisition_receipt_in_transaction,
     DataAcquisitionAuditReceipt,
 };
-#[cfg(test)]
-use super::inspect_run_on;
 #[cfg(test)]
 use crate::grpc_client::client::external_control_attempt::{
     AuthorizedCapabilitiesAttempt, AuthorizedHealthAttempt, ExternalControlCompletion,
@@ -31,11 +30,9 @@ use crate::grpc_client::client::macro_attempt::{
     MacroAttemptCompletion,
 };
 use crate::grpc_client::client::macro_attempt::{MacroContinuation, MacroQueryIdentity};
-#[cfg(test)]
-use crate::grpc_client::external_pb::magic::market::v1::{
-    CapabilitiesResponse, HealthResponse,
-};
 use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
+#[cfg(test)]
+use crate::grpc_client::external_pb::magic::market::v1::{CapabilitiesResponse, HealthResponse};
 use crate::grpc_client::provider_attempts::{ExternalProviderCatalog, ProviderAttempts};
 use crate::grpc_client::retry::RetryDecision;
 use crate::monitor::push_job::{raw_digest, IntentId, Sha256Digest, UtcMicros};
@@ -319,7 +316,10 @@ mod control_identity_tests {
 
         let mut mixed_plan = serde_json::to_value(&plan).unwrap();
         mixed_plan["capabilities"]["version"] = serde_json::json!(1);
-        mixed_plan["capabilities"].as_object_mut().unwrap().remove("method");
+        mixed_plan["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("method");
         mixed_plan["capabilities"]
             .as_object_mut()
             .unwrap()
@@ -388,41 +388,68 @@ pub(crate) struct MacroRecovery {
     pub(super) source: Option<MacroNewsRecovery>,
 }
 impl MacroRecovery {
-    pub(super) fn legacy_snapshot(&self) -> Result<crate::search_service::macro_news::runner::Snapshot> {
-        use crate::search_service::macro_news::runner::{BudgetMode, QueryKey, QueryOutcome, QueryState, RouteState, Snapshot};
-        require(self.full.is_none() && self.plan.format_version() == 2
-            && self.plan.profile() == crate::grpc_client::client::ContractProfile::ExternalV1
-            && self.request_plan_version > self.plan_version)?;
-        let controls = &self.readiness_episodes.first().ok_or(ChainPostCloseError::SchemaRejected)?.controls;
+    pub(super) fn legacy_snapshot(
+        &self,
+    ) -> Result<crate::search_service::macro_news::runner::Snapshot> {
+        use crate::search_service::macro_news::runner::{
+            BudgetMode, QueryKey, QueryOutcome, QueryState, RouteState, Snapshot,
+        };
+        require(
+            self.full.is_none()
+                && self.plan.format_version() == 2
+                && self.plan.profile() == crate::grpc_client::client::ContractProfile::ExternalV1
+                && self.request_plan_version > self.plan_version,
+        )?;
+        let controls = &self
+            .readiness_episodes
+            .first()
+            .ok_or(ChainPostCloseError::SchemaRejected)?
+            .controls;
         require(controls.len() == 2)?;
-        let external = if controls.iter().any(|control| control.outcome == Some(MacroControlOutcome::Rejected)) {
+        let external = if controls
+            .iter()
+            .any(|control| control.outcome == Some(MacroControlOutcome::Rejected))
+        {
             RouteState::Rejected
         } else if controls[0].outcome != Some(MacroControlOutcome::Ready) {
             RouteState::NeedsHealth
         } else if controls[1].outcome != Some(MacroControlOutcome::Ready) {
             RouteState::NeedsCapabilities
-        } else { RouteState::Ready };
+        } else {
+            RouteState::Ready
+        };
         let previous = self.attempts.last();
         let state = QueryState {
             next_attempt: previous.map_or(1, |attempt| attempt.ordinal + 1),
             retry_due: previous.and_then(|attempt| attempt.retry_not_before),
-            terminal: self.source.as_ref().map(|source| QueryOutcome::Native(crate::search_service::macro_news::NativeOutcome::News(source.result.clone()))),
+            terminal: self.source.as_ref().map(|source| {
+                QueryOutcome::Native(crate::search_service::macro_news::NativeOutcome::News(
+                    source.result.clone(),
+                ))
+            }),
             // Single-source completion has no full-Macro pacing anchor.
-            terminal_version: None, terminal_at: None,
+            terminal_version: None,
+            terminal_at: None,
         };
         Ok(Snapshot {
-            budget: BudgetMode::DurableAbsolute { started_at: self.plan.started, deadline_at: self.plan.deadline },
+            budget: BudgetMode::DurableAbsolute {
+                started_at: self.plan.started,
+                deadline_at: self.plan.deadline,
+            },
             definition: super::macro_plan_v3::definition(&self.plan)?,
-            local: RouteState::Unprepared, external,
+            local: RouteState::Unprepared,
+            external,
             queries: [(QueryKey::Gateway(1), state)].into_iter().collect(),
-            dimensions: Default::default(), final_output: None,
+            dimensions: Default::default(),
+            final_output: None,
         })
     }
     pub(crate) fn is_complete(&self) -> bool {
         self.full.as_ref().is_some_and(|full| full.final_.is_some())
     }
     pub(crate) fn has_unconfirmed_effect(&self) -> bool {
-        !self.qualification_pending.is_empty() || self.attempts.iter().any(|a| a.result.is_none())
+        !self.qualification_pending.is_empty()
+            || self.attempts.iter().any(|a| a.result.is_none())
             || self
                 .full
                 .as_ref()
@@ -774,8 +801,7 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
     let control_begins = facts(transaction, intent, TABLES[3])?;
     let control_results = facts(transaction, intent, TABLES[4])?;
     let begins = compatibility_facts(transaction, intent, TABLES[5], legacy_subset)?;
-    let results =
-        compatibility_results(transaction, intent, begins.as_slice(), legacy_subset)?;
+    let results = compatibility_results(transaction, intent, begins.as_slice(), legacy_subset)?;
     let finals = facts(transaction, intent, TABLES[7])?;
     let Some(fact) = plans.first() else {
         require(
@@ -881,7 +907,9 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
     )?;
     let connection_history = if schema::runtime_layout_version(transaction)? >= 15 {
         super::macro_connection::load(transaction, intent, run, &plan, fact.version, &fact.digest)?
-    } else { super::macro_connection::Recovery::default() };
+    } else {
+        super::macro_connection::Recovery::default()
+    };
 
     let mut attempts = Vec::<MacroAttemptRecovery>::new();
     let readiness_result = readiness_episodes
@@ -931,7 +959,9 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
                         && a.retry_not_before.is_some_and(|due| due <= begin.time)
                 }),
         )?;
-        let provider_catalog = connection_history.data_catalogs.get(&begin.version)
+        let provider_catalog = connection_history
+            .data_catalogs
+            .get(&begin.version)
             .or_else(|| historical_provider_catalog(&readiness_episodes, extra.6));
         let mut attempt = MacroAttemptRecovery {
             query: crate::search_service::macro_news::runner::QueryKey::Gateway(1),
@@ -963,7 +993,9 @@ fn load_on_with_dragon_validation<'validated, 'transaction, 'connection, 'run>(
                     && result.generation == begin.generation,
             )?;
             let raw: RawResult = codec::decode(&result.bytes)?;
-            raw.validate_current_connection(connection_history.data_connections.get(&begin.version))?;
+            raw.validate_current_connection(
+                connection_history.data_connections.get(&begin.version),
+            )?;
             let (gateway, retry_decision, provider_attempts) =
                 raw.project(&plan.request, ordinal, provider_catalog)?;
             match raw.continuation() {

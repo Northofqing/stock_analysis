@@ -667,12 +667,7 @@ pub(super) fn plan_health_without_begin_for_owner(
     let lease = local
         .resume_run(
             &baseline.intent,
-            macro_lease(
-                owner,
-                started_at,
-                started_at + 1_000_000,
-                baseline.head,
-            ),
+            macro_lease(owner, started_at, started_at + 1_000_000, baseline.head),
         )
         .unwrap();
     let registered = registered();
@@ -759,7 +754,9 @@ async fn exercise_receipt_or_result_fault(
         &mut io,
     ));
     let receipt_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    if case.target == ControlTarget::Capabilities { external.release_health(); }
+    if case.target == ControlTarget::Capabilities {
+        external.release_health();
+    }
     loop {
         match futures::poll!(&mut prepared) {
             std::task::Poll::Pending => {}
@@ -833,7 +830,10 @@ async fn exercise_receipt_or_result_fault(
             assert_eq!(receipt.health_requests.len(), 2);
             assert_eq!(receipt.health_requests[0], checkpoint.health.request.bytes);
             assert_ne!(receipt.health_requests[0], receipt.health_requests[1]);
-            assert_eq!(receipt.health_responses[0], checkpoint.health.response_bytes);
+            assert_eq!(
+                receipt.health_responses[0],
+                checkpoint.health.response_bytes
+            );
             assert_eq!(
                 receipt.capabilities_requests,
                 vec![original.capabilities.bytes.clone()]
@@ -891,10 +891,7 @@ async fn exercise_receipt_or_result_fault(
     drop(io);
     drop(local);
     drop(source);
-    assert_eq!(
-        clock.observation_calls.get(),
-        0
-    );
+    assert_eq!(clock.observation_calls.get(), 0);
     FaultEvidence {
         original,
         target_begin,
@@ -1092,7 +1089,9 @@ async fn drive_original_control_to_ready(
         &mut io,
     ));
     let receipt_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    if case.target == ControlTarget::Capabilities { external.release_health(); }
+    if case.target == ControlTarget::Capabilities {
+        external.release_health();
+    }
     loop {
         match futures::poll!(&mut prepared) {
             std::task::Poll::Pending => {}
@@ -1164,9 +1163,7 @@ async fn drive_original_control_to_ready(
             let episode = &ready.readiness_episodes()[0];
             let controls = episode.controls();
             let target = match case.target {
-                ControlTarget::Health => {
-                    &controls[0]
-                }
+                ControlTarget::Health => &controls[0],
                 ControlTarget::Capabilities => {
                     assert_checkpoint_health(&ready, checkpoint.unwrap());
                     assert!(ready.attempts().len() <= 1);
@@ -1221,7 +1218,10 @@ async fn drive_original_control_to_ready(
     assert_eq!(clock.observation_calls.get(), 0);
     let fixed = fixed_snapshot(&database, &baseline.intent);
     assert_eq!(fixed.source_finals, 0);
-    assert_eq!(fixed.data_begins, i64::from(case.target == ControlTarget::Capabilities));
+    assert_eq!(
+        fixed.data_begins,
+        i64::from(case.target == ControlTarget::Capabilities)
+    );
     match case.target {
         ControlTarget::Health => {
             assert_v15_response_raw(
@@ -1251,7 +1251,14 @@ fn assert_v15_response_raw(bytes: &[u8], response: &[u8]) {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     assert_eq!(value["version"], 4);
     let identity: crate::grpc_client::connection_qualification::ConnectionIdentity =
-        serde_json::from_value(value.as_object_mut().unwrap().remove("connection_identity").unwrap()).unwrap();
+        serde_json::from_value(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("connection_identity")
+                .unwrap(),
+        )
+        .unwrap();
     assert!(identity.validate_recorded());
     // Compare unchanged response/wire/build fields with the old golden helper,
     // without changing any stored V4 bytes.
@@ -1443,14 +1450,36 @@ async fn run_case(case: Case) {
                 None
             };
             let planned_health = if case.target == ControlTarget::Health {
-                Some(plan_health_without_begin_for_owner(&mut business, &baseline, external, &case.owner("PLAN")))
-            } else { None };
-            let target_base_head = checkpoint.as_ref().map(|checkpoint| checkpoint.head_version)
-                .or_else(|| planned_health.as_ref().map(|(_, head)| *head)).unwrap();
-            business.chain_post_close().migrate_schema_v11_to_v12().unwrap();
-            business.chain_post_close().migrate_schema_v12_to_v13().unwrap();
-            business.chain_post_close().migrate_schema_v13_to_v14().unwrap();
-            business.chain_post_close().migrate_schema_v14_to_v15().unwrap();
+                Some(plan_health_without_begin_for_owner(
+                    &mut business,
+                    &baseline,
+                    external,
+                    &case.owner("PLAN"),
+                ))
+            } else {
+                None
+            };
+            let target_base_head = checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.head_version)
+                .or_else(|| planned_health.as_ref().map(|(_, head)| *head))
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v11_to_v12()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v12_to_v13()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v13_to_v14()
+                .unwrap();
+            business
+                .chain_post_close()
+                .migrate_schema_v14_to_v15()
+                .unwrap();
 
             if case.fault == FaultPoint::BeginCommit {
                 let (original, plan_head) = if case.target == ControlTarget::Health {
@@ -1498,7 +1527,10 @@ async fn run_case(case: Case) {
                         assert_eq!(ready_wire.health_requests, vec![original.health.bytes]);
                         assert!(ready_wire.capabilities_calls <= 1);
                         if ready_wire.capabilities_calls == 1 {
-                            assert_eq!(ready_wire.capabilities_requests, vec![original.capabilities.bytes]);
+                            assert_eq!(
+                                ready_wire.capabilities_requests,
+                                vec![original.capabilities.bytes]
+                            );
                         }
                         assert_eq!(ready_wire.data_calls, 0);
                     }

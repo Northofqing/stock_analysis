@@ -151,7 +151,9 @@ mod attribution_epoch_runtime;
 mod blocking_market_data;
 #[cfg(test)]
 mod paper_scan_runtime_tests;
-use stock_analysis::trading::paper_sell::{PaperScanFailure, PaperScanPhase, PaperScanSession, PaperSellResult};
+use stock_analysis::trading::paper_sell::{
+    PaperScanFailure, PaperScanPhase, PaperScanSession, PaperSellResult,
+};
 mod closing_valuation_runtime;
 mod data_mode_probe;
 mod manual_push;
@@ -1815,10 +1817,8 @@ mod tests_account_banner_values {
         let batch = AccountModeMetricsBatch {
             metrics: PortfolioMetrics::complete(0.3, 0, 5),
             account_fact: Some(push_templates::AccountSnapshotFact {
-                effective_at: chrono::DateTime::parse_from_rfc3339(
-                    "2026-09-21T15:00:00+08:00",
-                )
-                .expect("account snapshot time"),
+                effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
+                    .expect("account snapshot time"),
                 source: "TEST_CODE_USER_CONFIRMED".to_string(),
             }),
         };
@@ -1835,7 +1835,10 @@ mod tests_account_banner_values {
 
         let rendered = banner.render();
         assert!(rendered.contains("2026-09-21截图日盈亏+0.3%"), "{rendered}");
-        assert!(rendered.contains("source=TEST_CODE_USER_CONFIRMED"), "{rendered}");
+        assert!(
+            rendered.contains("source=TEST_CODE_USER_CONFIRMED"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1852,21 +1855,21 @@ mod tests_account_banner_values {
             total_pos_cheng: Some(5),
         };
         assert!(!metrics.is_complete());
-        let evaluation = stock_analysis::risk::account_mode::evaluate(
-            &metrics,
-            None,
-            &Default::default(),
-        );
+        let evaluation =
+            stock_analysis::risk::account_mode::evaluate(&metrics, None, &Default::default());
         assert_eq!(evaluation.mode, AccountMode::ReduceOnly);
     }
 
     #[test]
     fn account_fact_day_uses_shanghai_time_for_offset_timestamps() {
-        let snapshot_utc = chrono::DateTime::parse_from_rfc3339("2026-09-21T16:30:00Z")
-            .expect("UTC account fact");
+        let snapshot_utc =
+            chrono::DateTime::parse_from_rfc3339("2026-09-21T16:30:00Z").expect("UTC account fact");
         let evaluation = chrono::DateTime::parse_from_rfc3339("2026-09-22T09:00:00+08:00")
             .expect("Shanghai evaluation");
-        assert_eq!(current_day_pnl_pct(snapshot_utc, evaluation, 0.3), Some(0.3));
+        assert_eq!(
+            current_day_pnl_pct(snapshot_utc, evaluation, 0.3),
+            Some(0.3)
+        );
     }
 }
 
@@ -1981,30 +1984,29 @@ async fn check_snapshot_staleness_and_notify() {
     // CountedCombinedAccount (requires_banner=true, 门内部取 banner — T-16
     // 同形态)。BusinessDateOnce 幂等 + 豁免日预算; retry_authorized=false
     // (days_behind 时刻锚定 + 进程内 gate 失败保留重试资格补偿)。
-    let outcome =
-        match crate::push_templates::build_snapshot_stale_counted_binding(
-            today,
-            days_behind,
-            &summary.effective_at,
-            summary.total_assets,
+    let outcome = match crate::push_templates::build_snapshot_stale_counted_binding(
+        today,
+        days_behind,
+        &summary.effective_at,
+        summary.total_assets,
+    )
+    .and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "T-20-snapshot-stale",
+            PushKind::SnapshotStale,
+            "snapshot_stale_dispatcher",
+            "render_snapshot_stale",
         )
-        .and_then(|binding| {
-            crate::presentation_registry::acquire_token(
-                "T-20-snapshot-stale",
-                PushKind::SnapshotStale,
-                "snapshot_stale_dispatcher",
-                "render_snapshot_stale",
-            )
-            .map(|token| (token, binding))
-        }) {
-            Ok((token, binding)) => {
-                crate::notify::push_counted_with_binding(token, &text, None, binding).await
-            }
-            Err(reason) => {
-                log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
-                crate::notify::PushOutcome::Denied(reason)
-            }
-        };
+        .map(|token| (token, binding))
+    }) {
+        Ok((token, binding)) => {
+            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+        }
+        Err(reason) => {
+            log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
+            crate::notify::PushOutcome::Denied(reason)
+        }
+    };
     let confirmed = periodic_delivery_confirmed(&outcome);
     {
         let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
@@ -2043,8 +2045,7 @@ fn refresh_closing_valuation_note() {
     let observed_at = chrono::Utc::now()
         .with_timezone(&china_offset)
         .naive_local();
-    let target_price_date =
-        stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
+    let target_price_date = stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
 
     let account = stock_analysis::database::user_account_summary::latest();
     let compared_position =
@@ -2540,11 +2541,7 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
     if !snapshot_pnl_pct.is_finite() {
         return Err("BR-103 daily PnL ratio is non-finite".to_string());
     }
-    let today_pnl_pct = current_day_pnl_pct(
-        effective_at,
-        observed_at,
-        snapshot_pnl_pct,
-    );
+    let today_pnl_pct = current_day_pnl_pct(effective_at, observed_at, snapshot_pnl_pct);
     let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
     // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
@@ -2552,10 +2549,8 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
     // 账本重建失败 → Err (不允许放行交易门).
     let as_of = observed_at.date_naive();
     let report =
-        stock_analysis::performance::economic_position::compute_economic_position_report(
-            as_of,
-        )
-        .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
+        stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
+            .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
     let realized: Vec<(chrono::NaiveDateTime, String, f64)> = report
         .closed_positions
         .iter()
@@ -4437,13 +4432,18 @@ where
         let producer_shutdown = quiesce_background_tasks(background_tasks).await;
         bus.shutdown();
         let mut error = "BR-141 writer handle is missing while monitor is running".to_owned();
-        for failure in [paper_shutdown.err(), producer_shutdown.err()].into_iter().flatten() {
+        for failure in [paper_shutdown.err(), producer_shutdown.err()]
+            .into_iter()
+            .flatten()
+        {
             error.push_str(&format!("; shutdown failed: {failure}"));
         }
         return Err(error);
     }
     let trigger = {
-        let writer = writer_handle.as_mut().expect("writer presence checked above");
+        let writer = writer_handle
+            .as_mut()
+            .expect("writer presence checked above");
         tokio::pin!(main_loops);
         tokio::pin!(shutdown_signal);
         let trigger = tokio::select! {
@@ -4491,15 +4491,28 @@ where
 
 fn log_completed_paper_sales(sold: &[PaperSellResult]) {
     for result in sold {
-        log::warn!("[paper_sell] retained completed sale code={} quantity={} price={} reason={}",
-            result.code, result.quantity, result.price, result.reason);
+        log::warn!(
+            "[paper_sell] retained completed sale code={} quantity={} price={} reason={}",
+            result.code,
+            result.quantity,
+            result.price,
+            result.reason
+        );
     }
 }
 
-fn observe_paper_scan_drain(result: Result<Vec<PaperSellResult>, PaperScanFailure>) -> Result<(), String> {
+fn observe_paper_scan_drain(
+    result: Result<Vec<PaperSellResult>, PaperScanFailure>,
+) -> Result<(), String> {
     match result {
-        Ok(sold) => { log_completed_paper_sales(&sold); Ok(()) }
-        Err(error) => { log_completed_paper_sales(&error.sold); Err(error.to_string()) }
+        Ok(sold) => {
+            log_completed_paper_sales(&sold);
+            Ok(())
+        }
+        Err(error) => {
+            log_completed_paper_sales(&error.sold);
+            Err(error.to_string())
+        }
     }
 }
 
@@ -4857,7 +4870,7 @@ async fn main() {
         log::info!("[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=supported");
     } else {
         log::warn!(
-            "[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=unsupported; EventCalendar delivery remains retryable and sink-blocked"
+            "[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=unavailable reason_code=futures_delivery_contract_unavailable_v1; upstream product is published but local request/coverage contract is not verified; EventCalendar sink remains blocked"
         );
     }
     if test_mode {
@@ -8096,23 +8109,22 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             // before BR-172 selection ingress, NewsAI and candidate/LLM work.
             if let Some(batch) = raw_batch {
                 let session = stock_analysis::calendar::current_session();
-                let admitted: Vec<
-                    stock_analysis::news::aggregator::AdmittedGlobalNewsBatch,
-                > = batch
-                    .attempts()
-                    .iter()
-                    .filter_map(|attempt| {
-                        let terminal = attempt.terminal();
-                        let records = terminal.records()?;
-                        let evidence = terminal.evidence()?;
-                        Some(
+                let admitted: Vec<stock_analysis::news::aggregator::AdmittedGlobalNewsBatch> =
+                    batch
+                        .attempts()
+                        .iter()
+                        .filter_map(|attempt| {
+                            let terminal = attempt.terminal();
+                            let records = terminal.records()?;
+                            let evidence = terminal.evidence()?;
+                            Some(
                             stock_analysis::news::aggregator::AdmittedGlobalNewsBatch::from_parts(
                                 records.to_vec(),
                                 evidence.clone(),
                             ),
                         )
-                    })
-                    .collect();
+                        })
+                        .collect();
                 news_ai_batches = Some(admitted);
                 if selection_v2_enabled && (session.is_trading() || session.is_auction()) {
                     let titles: Vec<String> = batch
@@ -9042,10 +9054,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 // 卖出含 3 笔收益率 >100% (最高 +22751% 为买价记录错误), 11 笔当日
                 // 买入即卖, 7 笔买入后 60s 内卖出。暂停投递直到批次账本重建。
                 if !paper_sell_paused("盘中") {
-                    match paper_scans.scan(PaperScanPhase::Intraday, risk_context).await {
+                    match paper_scans
+                        .scan(PaperScanPhase::Intraday, risk_context)
+                        .await
+                    {
                         Ok(sold) if !sold.is_empty() => {
                             for result in &sold {
-                                if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
+                                if paper_scans.is_cancelled() {
+                                    log_completed_paper_sales(&sold);
+                                    break;
+                                }
                                 let outcome = push_templates::dispatch_paper_sell_counted(
                                     chrono::Local::now().date_naive(),
                                     &result.name,
@@ -9066,7 +9084,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => { log_completed_paper_sales(&e.sold); log::warn!("[paper_sell] 盘中扫描失败: {}", e); },
+                        Err(e) => {
+                            log_completed_paper_sales(&e.sold);
+                            log::warn!("[paper_sell] 盘中扫描失败: {}", e);
+                        }
                     }
                 }
             }
@@ -9131,10 +9152,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         // BR-234: 收盘后卖出评估 — 无交易时段守卫，收盘 K 线完整评估
                         // (盘后卖出: FIFO 账本已重建 2026-08-23, gate 已解除 2026-09-01, 见 paper_sell_paused)
                         if !paper_sell_paused("盘后") {
-                            match paper_scans.scan(PaperScanPhase::PostClose, risk_context).await {
+                            match paper_scans
+                                .scan(PaperScanPhase::PostClose, risk_context)
+                                .await
+                            {
                                 Ok(sold) if !sold.is_empty() => {
                                     for result in &sold {
-                                        if paper_scans.is_cancelled() { log_completed_paper_sales(&sold); break; }
+                                        if paper_scans.is_cancelled() {
+                                            log_completed_paper_sales(&sold);
+                                            break;
+                                        }
                                         let outcome = push_templates::dispatch_paper_sell_counted(
                                             chrono::Local::now().date_naive(),
                                             &result.name,
@@ -9155,7 +9182,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                 }
                                 Ok(_) => {}
-                                Err(e) => { log_completed_paper_sales(&e.sold); log::warn!("[paper_sell] 收盘后扫描失败: {}", e); },
+                                Err(e) => {
+                                    log_completed_paper_sales(&e.sold);
+                                    log::warn!("[paper_sell] 收盘后扫描失败: {}", e);
+                                }
                             }
                         }
                     }
@@ -9175,14 +9205,20 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             {
                 let today = chain_today;
                 match run_scheduled_chain_analysis(
-                    &ChainScheduleStore::production(), ChainPhase::Postclose, today,
-                ).await {
+                    &ChainScheduleStore::production(),
+                    ChainPhase::Postclose,
+                    today,
+                )
+                .await
+                {
                     Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
-                        "[产业链][盘后15:30] 新闻+AI 链分析完成，渠道弱接受 (date={})", today
+                        "[产业链][盘后15:30] 新闻+AI 链分析完成，渠道弱接受 (date={})",
+                        today
                     ),
-                    Ok(ChainScheduleOutcome::AlreadyClosed) => {},
+                    Ok(ChainScheduleOutcome::AlreadyClosed) => {}
                     Ok(ChainScheduleOutcome::NeedsReview) => log::warn!(
-                        "[产业链][盘后15:30] 发送状态不明，停止自动重发，需人工核对 (date={})", today
+                        "[产业链][盘后15:30] 发送状态不明，停止自动重发，需人工核对 (date={})",
+                        today
                     ),
                     Err(error) => {
                         log::error!("[产业链][盘后15:30] 链分析未完成，请核对发送状态: {error}");
@@ -9287,9 +9323,20 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 if !already_run {
                     match (|| -> Result<String, AttributionEpochRuntimeError> {
                         let database = stock_analysis::database::DatabaseManager::get();
-                        if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() {
-                            let map_effective=|detail:String|AttributionEpochRuntimeError::Unavailable{reason_code:"effective_attribution_unavailable",retryable:false,detail};
-                            let binding=stock_analysis::trading::paper_ledger_runtime::active_binding().map_err(map_effective)?;
+                        if std::env::var_os(
+                            stock_analysis::trading::paper_ledger_runtime::BINDING_ENV,
+                        )
+                        .is_some()
+                        {
+                            let map_effective =
+                                |detail: String| AttributionEpochRuntimeError::Unavailable {
+                                    reason_code: "effective_attribution_unavailable",
+                                    retryable: false,
+                                    detail,
+                                };
+                            let binding =
+                                stock_analysis::trading::paper_ledger_runtime::active_binding()
+                                    .map_err(map_effective)?;
                             let (prepared,_receipt)=stock_analysis::performance::attribution_replay::commit_effective_window(database,binding,today,30,chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap())).map_err(|error| {
                                 use stock_analysis::performance::attribution_replay::ReplayErrorClass;
                                 match error.class() {
@@ -9297,8 +9344,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     ReplayErrorClass::Unavailable|ReplayErrorClass::Storage=>AttributionEpochRuntimeError::Unavailable{reason_code:error.code(),retryable:error.retryable(),detail:error.to_string()},
                                 }
                             })?;
-                            let md=prepared.report().render_markdown().map_err(map_effective)?;
-                            stock_analysis::performance::report::persist_report_revision(std::path::Path::new("data/attribution"),today,md.as_bytes()).map_err(map_effective)?;
+                            let md = prepared.report().render_markdown().map_err(map_effective)?;
+                            stock_analysis::performance::report::persist_report_revision(
+                                std::path::Path::new("data/attribution"),
+                                today,
+                                md.as_bytes(),
+                            )
+                            .map_err(map_effective)?;
                             return Ok(prepared.report().render_summary());
                         }
                         // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
@@ -9318,7 +9370,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         persist_epoch_daily(database, &daily)?;
                         let md = render_full_markdown(daily.daily(), window.window());
                         stock_analysis::performance::report::persist_report_revision(
-                            std::path::Path::new("data/attribution"),today,md.as_bytes(),
+                            std::path::Path::new("data/attribution"),
+                            today,
+                            md.as_bytes(),
                         )
                         .map_err(|error| {
                             AttributionEpochRuntimeError::Unavailable {
@@ -9337,29 +9391,30 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             // Reserved/Rejected-retry (可跨日补发原 15:05 文本);
                             // Uncertain 需人工裁定; binding/token 准备失败无 durable 行
                             // 与原路径等价。原路径推送失败即永久丢, 新路径可补偿。
-                            let outcome = match push_templates::build_attribution_daily_counted_binding(
-                                today, &text,
-                            )
-                            .and_then(|binding| {
-                                crate::presentation_registry::acquire_token(
-                                    "A-12-attribution-daily",
-                                    PushKind::AttributionDaily,
-                                    "attribution_daily_dispatcher",
-                                    "render_attribution_daily",
+                            let outcome =
+                                match push_templates::build_attribution_daily_counted_binding(
+                                    today, &text,
                                 )
-                                .map(|token| (token, binding))
-                            }) {
-                                Ok((token, binding)) => {
-                                    crate::notify::push_counted_with_binding(
-                                        token, &text, None, binding,
+                                .and_then(|binding| {
+                                    crate::presentation_registry::acquire_token(
+                                        "A-12-attribution-daily",
+                                        PushKind::AttributionDaily,
+                                        "attribution_daily_dispatcher",
+                                        "render_attribution_daily",
                                     )
-                                    .await
-                                }
-                                Err(reason) => {
-                                    log::error!("[attribution][BR-192][BR-196] counted 准备失败: {reason}");
-                                    crate::notify::PushOutcome::Denied(reason)
-                                }
-                            };
+                                    .map(|token| (token, binding))
+                                }) {
+                                    Ok((token, binding)) => {
+                                        crate::notify::push_counted_with_binding(
+                                            token, &text, None, binding,
+                                        )
+                                        .await
+                                    }
+                                    Err(reason) => {
+                                        log::error!("[attribution][BR-192][BR-196] counted 准备失败: {reason}");
+                                        crate::notify::PushOutcome::Denied(reason)
+                                    }
+                                };
                             log::info!("[attribution] 15:05 归因推送完成: {:?}", outcome);
                             *ATTRIBUTION_LAST_RUN
                                 .lock()
@@ -9482,7 +9537,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             .await
                                         }
                                         Err(reason) => {
-                                            log::error!("[g5b][BR-192][BR-196] counted 准备失败: {reason}");
+                                            log::error!(
+                                                "[g5b][BR-192][BR-196] counted 准备失败: {reason}"
+                                            );
                                             crate::notify::PushOutcome::Denied(reason)
                                         }
                                     };
@@ -9568,8 +9625,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             .map(|token| (token, binding))
                         }) {
                             Ok((token, binding)) => {
-                                crate::notify::push_counted_with_binding(token, &text, None, binding)
-                                    .await
+                                crate::notify::push_counted_with_binding(
+                                    token, &text, None, binding,
+                                )
+                                .await
                             }
                             Err(reason) => {
                                 log::error!("[BR-226][BR-196] counted 准备失败: {reason}");
@@ -9704,14 +9763,20 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             {
                 let today = chain_today;
                 match run_scheduled_chain_analysis(
-                    &ChainScheduleStore::production(), ChainPhase::Preopen, today,
-                ).await {
+                    &ChainScheduleStore::production(),
+                    ChainPhase::Preopen,
+                    today,
+                )
+                .await
+                {
                     Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
-                        "[产业链][盘前9:05] 新闻+AI 链分析完成，渠道弱接受 (date={})", today
+                        "[产业链][盘前9:05] 新闻+AI 链分析完成，渠道弱接受 (date={})",
+                        today
                     ),
-                    Ok(ChainScheduleOutcome::AlreadyClosed) => {},
+                    Ok(ChainScheduleOutcome::AlreadyClosed) => {}
                     Ok(ChainScheduleOutcome::NeedsReview) => log::warn!(
-                        "[产业链][盘前9:05] 发送状态不明，停止自动重发，需人工核对 (date={})", today
+                        "[产业链][盘前9:05] 发送状态不明，停止自动重发，需人工核对 (date={})",
+                        today
                     ),
                     Err(error) => {
                         log::error!("[产业链][盘前9:05] 链分析未完成，请核对发送状态: {error}");
@@ -9972,33 +10037,34 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         // 2026-09-20: I-01 升级 counted 持久投递
                                         // (MU-intraday-market)。窗口即弃语义保真:
                                         // retry_authorized=false (9:20 后补发无意义)。
-                                        let outcome = match push_templates::build_intraday_counted_binding(
-                                            probe_today,
-                                            push_templates::IntradayProducer::PreopenProbe,
-                                            &text,
-                                        )
-                                        .and_then(|binding| {
-                                            crate::presentation_registry::acquire_token(
-                                                "I-01-intraday-market",
-                                                PushKind::IntradayMarket,
-                                                "intraday_market_dispatcher",
-                                                "render_intraday_market",
+                                        let outcome =
+                                            match push_templates::build_intraday_counted_binding(
+                                                probe_today,
+                                                push_templates::IntradayProducer::PreopenProbe,
+                                                &text,
                                             )
-                                            .map(|token| (token, binding))
-                                        }) {
-                                            Ok((token, binding)) => {
-                                                crate::notify::push_counted_with_binding(
-                                                    token, &text, None, binding,
+                                            .and_then(|binding| {
+                                                crate::presentation_registry::acquire_token(
+                                                    "I-01-intraday-market",
+                                                    PushKind::IntradayMarket,
+                                                    "intraday_market_dispatcher",
+                                                    "render_intraday_market",
                                                 )
-                                                .await
-                                            }
-                                            Err(reason) => {
-                                                log::error!(
+                                                .map(|token| (token, binding))
+                                            }) {
+                                                Ok((token, binding)) => {
+                                                    crate::notify::push_counted_with_binding(
+                                                        token, &text, None, binding,
+                                                    )
+                                                    .await
+                                                }
+                                                Err(reason) => {
+                                                    log::error!(
                                                     "[预检][行情源][BR-196] counted 准备失败: {reason}"
                                                 );
-                                                crate::notify::PushOutcome::Denied(reason)
-                                            }
-                                        };
+                                                    crate::notify::PushOutcome::Denied(reason)
+                                                }
+                                            };
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
@@ -10012,33 +10078,34 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         // 2026-09-20: I-01 升级 counted 持久投递
                                         // (MU-intraday-market)。窗口即弃语义保真:
                                         // retry_authorized=false (9:20 后补发无意义)。
-                                        let outcome = match push_templates::build_intraday_counted_binding(
-                                            probe_today,
-                                            push_templates::IntradayProducer::PreopenProbe,
-                                            &text,
-                                        )
-                                        .and_then(|binding| {
-                                            crate::presentation_registry::acquire_token(
-                                                "I-01-intraday-market",
-                                                PushKind::IntradayMarket,
-                                                "intraday_market_dispatcher",
-                                                "render_intraday_market",
+                                        let outcome =
+                                            match push_templates::build_intraday_counted_binding(
+                                                probe_today,
+                                                push_templates::IntradayProducer::PreopenProbe,
+                                                &text,
                                             )
-                                            .map(|token| (token, binding))
-                                        }) {
-                                            Ok((token, binding)) => {
-                                                crate::notify::push_counted_with_binding(
-                                                    token, &text, None, binding,
+                                            .and_then(|binding| {
+                                                crate::presentation_registry::acquire_token(
+                                                    "I-01-intraday-market",
+                                                    PushKind::IntradayMarket,
+                                                    "intraday_market_dispatcher",
+                                                    "render_intraday_market",
                                                 )
-                                                .await
-                                            }
-                                            Err(reason) => {
-                                                log::error!(
+                                                .map(|token| (token, binding))
+                                            }) {
+                                                Ok((token, binding)) => {
+                                                    crate::notify::push_counted_with_binding(
+                                                        token, &text, None, binding,
+                                                    )
+                                                    .await
+                                                }
+                                                Err(reason) => {
+                                                    log::error!(
                                                     "[预检][行情源][BR-196] counted 准备失败: {reason}"
                                                 );
-                                                crate::notify::PushOutcome::Denied(reason)
-                                            }
-                                        };
+                                                    crate::notify::PushOutcome::Denied(reason)
+                                                }
+                                            };
                                         log::info!(
                                             "[预检][行情源] 预警推送 pushed={}",
                                             outcome.is_pushed()
@@ -11137,37 +11204,41 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     // 实际每 15 分钟一推)。失败 retry_authorized=false
                                     // — 5 分钟循环新渲染重试即进程内补偿, durable
                                     // 不补发过时时间戳卡 (防全天失败重启 flood)。
-                                    let view_hhmm = chrono::Local::now().format("%H:%M").to_string();
+                                    let view_hhmm =
+                                        chrono::Local::now().format("%H:%M").to_string();
                                     let view_date = chrono::Local::now().date_naive();
-                                    let outcome = match push_templates::build_intraday_counted_binding(
-                                        view_date,
-                                        push_templates::IntradayProducer::MarketView {
-                                            hhmm: view_hhmm,
-                                        },
-                                        &text,
-                                    )
-                                    .and_then(|binding| {
-                                        crate::presentation_registry::acquire_token(
-                                            "I-01-intraday-market",
-                                            notify::PushKind::IntradayMarket,
-                                            "intraday_market_dispatcher",
-                                            "render_intraday_market",
+                                    let outcome =
+                                        match push_templates::build_intraday_counted_binding(
+                                            view_date,
+                                            push_templates::IntradayProducer::MarketView {
+                                                hhmm: view_hhmm,
+                                            },
+                                            &text,
                                         )
-                                        .map(|token| (token, binding))
-                                    }) {
-                                        Ok((token, binding)) => {
-                                            crate::notify::push_counted_with_binding(
-                                                token, &text, None, binding,
-                                            )
-                                            .await
-                                        }
-                                        Err(reason) => {
-                                            log::error!(
+                                        .and_then(
+                                            |binding| {
+                                                crate::presentation_registry::acquire_token(
+                                                    "I-01-intraday-market",
+                                                    notify::PushKind::IntradayMarket,
+                                                    "intraday_market_dispatcher",
+                                                    "render_intraday_market",
+                                                )
+                                                .map(|token| (token, binding))
+                                            },
+                                        ) {
+                                            Ok((token, binding)) => {
+                                                crate::notify::push_counted_with_binding(
+                                                    token, &text, None, binding,
+                                                )
+                                                .await
+                                            }
+                                            Err(reason) => {
+                                                log::error!(
                                                 "[BR-116][BR-196] 盘中盘面 counted 准备失败: {reason}"
                                             );
-                                            crate::notify::PushOutcome::Denied(reason)
-                                        }
-                                    };
+                                                crate::notify::PushOutcome::Denied(reason)
+                                            }
+                                        };
                                     if periodic_delivery_confirmed(&outcome) {
                                         last_market_view = std::time::Instant::now();
                                     } else {
@@ -11305,7 +11376,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                     })
                                                     .lock()
                                                     .unwrap_or_else(|e| e.into_inner());
-                                                let cap = caps.entry(prepared.code.clone()).or_insert(0);
+                                                let cap =
+                                                    caps.entry(prepared.code.clone()).or_insert(0);
                                                 *cap += 1;
                                                 if *cap >= 3 {
                                                     log::warn!(
@@ -11313,7 +11385,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                         prepared.code,
                                                         *cap
                                                     );
-                                                    holding_plan_daily_record(today, &prepared.code);
+                                                    holding_plan_daily_record(
+                                                        today,
+                                                        &prepared.code,
+                                                    );
                                                 }
                                             } else {
                                                 log::info!(

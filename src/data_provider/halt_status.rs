@@ -1,49 +1,41 @@
-//! v11-P0-3 commit 2: 停牌数据源 — K 线缺口推断
+//! Legacy K-line gap diagnostics.
 //!
 //! ## 背景
 //!
 //! `LimitStatus.is_suspended` 之前永远 false (limit_status.rs:60), 停牌检测是死代码.
-//! P0-3 修这个洞的两级 fallback (grill Q5 C 方案):
-//! - ② K 线缺口推断 (本文件, commit 2 主力)
-//! - ① 交易所公告解析 (留 P0-4, 公告标题/正文解析复杂)
+//! A gap is not authority for a suspension. This module may identify ranges
+//! worth investigating, but it must never write the formal halted-period cache
+//! or authorize trading/backtest behavior.
 //!
-//! ## 推断规则
+//! ## 诊断规则（没有交易授权能力）
 //!
 //! 给定某只股票的 K 线列表 (按日期**升序**, 来自 `validate_daily_kline_quality` 排序后),
-//! 如果相邻 K 线的日期间隔 > 7 个自然日, 中间这几天是"疑似停牌":
-//! - date[i+1] - date[i] > 7 天 → 中间 days = (date[i]+1, date[i+1]-1) 是停牌
+//! 如果相邻 K 线的日期间隔 > 7 个自然日，仅输出待人工调查的缺口范围：
+//! - date[i+1] - date[i] > 7 天 → 中间 days = (date[i]+1, date[i+1]-1)
 //!
 //! **为什么是 7 天**: A 股最长连续休市是春节 (通常 7 天), 7 天以上必有停牌.
 //! 用 7 天阈值避免误判春节/国庆.
 //!
-//! ## 用法
-//!
-//! ```ignore
-//! use crate::data_provider::halt_status::infer_halt_from_kline_gaps;
-//! let periods = infer_halt_from_kline_gaps("600519", &klines);  // klines 升序
-//! for (from, to) in periods {
-//!     crate::monitor::data_quality::mark_halted_period("600519", from, to);
-//! }
-//! ```
+//! 调用方只能记录/展示这些范围，不得写入交易门或替代
+//! `QualifiedSuspensionEvidence`。
 
 use chrono::NaiveDate;
 
 use crate::data_provider::KlineData;
-use crate::monitor::data_quality::mark_halted_period;
-
-/// 停牌推断阈值: 相邻 K 线日期间隔超过 N 个自然日 → 中间为停牌.
+/// Diagnostic threshold: an interval longer than this is worth investigating.
 ///
 /// 7 天 = A 股最长连续休市 (春节), 7 天以上必有停牌.
 pub const HALT_GAP_THRESHOLD_DAYS: i64 = 7;
 
-/// K 线缺口推断 → 停牌时间段列表 [(from, to), ...].
+/// K-line gaps → diagnostic candidate ranges [(from, to), ...].
 ///
 /// # Arguments
-/// - `code`: 股票代码 (用于 mark_halted_period 的 key)
+/// - `code`: 股票代码（仅用于诊断日志）
 /// - `klines`: K 线列表, **任意顺序** (内部按日期 sort 升序)
 ///
 /// # Returns
-/// 推断出的停牌时间段列表. 每个 (from, to) 是**半闭区间** [from, to] (含两端).
+/// Candidate ranges only. Every (from, to) is inclusive; no returned range is
+/// a qualified suspension fact.
 pub fn infer_halt_from_kline_gaps(code: &str, klines: &[KlineData]) -> Vec<(NaiveDate, NaiveDate)> {
     let mut periods = Vec::new();
     if klines.len() < 2 {
@@ -60,8 +52,9 @@ pub fn infer_halt_from_kline_gaps(code: &str, klines: &[KlineData]) -> Vec<(Naiv
             // 中间 (prev.date + 1, cur.date - 1) 是停牌
             let from = prev.date + chrono::Duration::days(1);
             let to = cur.date - chrono::Duration::days(1);
-            // mark_halted_period 直接喂入缓存 (P0-3 commit 2 设计意图)
-            mark_halted_period(code, from, to);
+            log::warn!(
+                "[{code}] diagnostic_only kline_gap_candidate={from}..={to}; not suspension authority"
+            );
             periods.push((from, to));
         }
     }
@@ -120,10 +113,10 @@ mod tests {
         let periods = infer_halt_from_kline_gaps(code, &klines);
         // d1→d8 = 8 天 → 中间 7 天 (1/21~1/27) 停牌 (春节只有 7 天, 8 天间隔意味着更长停牌)
         assert_eq!(periods.len(), 1, "8 天间隔应识别为停牌");
-        assert!(is_halted_period(
-            code,
-            NaiveDate::from_ymd_opt(2026, 1, 25).unwrap()
-        ));
+        assert!(
+            !is_halted_period(code, NaiveDate::from_ymd_opt(2026, 1, 25).unwrap()),
+            "diagnostic gap must not populate formal halt cache"
+        );
     }
 
     /// v11-P0-3 commit 2: 7 天间隔 (春节正常) 不算停牌
@@ -149,11 +142,11 @@ mod tests {
         ];
         let periods = infer_halt_from_kline_gaps(code, &klines);
         assert_eq!(periods.len(), 2, "应识别 2 段停牌");
-        assert!(is_halted_period(
+        assert!(!is_halted_period(
             code,
             NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()
         ));
-        assert!(is_halted_period(
+        assert!(!is_halted_period(
             code,
             NaiveDate::from_ymd_opt(2026, 3, 20).unwrap()
         ));
