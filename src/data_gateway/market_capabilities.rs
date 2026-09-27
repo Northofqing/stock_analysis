@@ -221,19 +221,25 @@ impl MarketCapabilitiesGateway {
         }
     }
 
-    /// Returns a typed non-retryable unsupported error because the pinned
-    /// providers do not prove the complete security-master contract.
+    /// Returns a request-bound legacy metadata batch when the configured
+    /// bridge supports it. This view does not prove qualified trading facts.
     pub async fn security_metadata(
         &self,
         codes: &[String],
     ) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
         let storage_codes = codes.to_vec();
         let request_hash = acquisition_request_hash(METADATA_CAPABILITY, storage_codes.join(","));
+        if let Err(error) = validate_security_metadata_request(&storage_codes) {
+            return audit_routed_gateway_result(METADATA_CAPABILITY, &request_hash, Err(error));
+        }
         // P4 M2 钩子: gRPC 通道 (fail-closed, audit 对等; library 路径仍是
         // unsupported_security_metadata 显式错误)。
         match super::grpc_source::bridge_for("SecurityMetadata") {
             Ok(bridge) => {
-                let result = bridge.security_metadata_async(&storage_codes).await;
+                let result = bridge
+                    .security_metadata_async(&storage_codes)
+                    .await
+                    .and_then(|batch| admit_requested_security_metadata(&storage_codes, batch));
                 return audit_routed_gateway_result(METADATA_CAPABILITY, &request_hash, result);
             }
             Err(error) => {
@@ -271,6 +277,62 @@ impl MarketCapabilitiesGateway {
             audit_gateway_result_with_receipt(SECURITY_IDENTITY_CAPABILITY, provider, hash, result)
         })
     }
+}
+
+fn validate_security_metadata_request(codes: &[String]) -> Result<(), GatewayError> {
+    if codes.is_empty() {
+        return Err(GatewayError::invalid_request(
+            METADATA_CAPABILITY,
+            "security metadata request must contain at least one code",
+        ));
+    }
+    if codes.iter().any(|code| code.trim().is_empty()) {
+        return Err(GatewayError::invalid_request(
+            METADATA_CAPABILITY,
+            "security metadata request contains an empty code",
+        ));
+    }
+    let mut unique = std::collections::HashSet::with_capacity(codes.len());
+    if codes.iter().any(|code| !unique.insert(code.as_str())) {
+        return Err(GatewayError::invalid_request(
+            METADATA_CAPABILITY,
+            "security metadata request contains duplicate codes",
+        ));
+    }
+    Ok(())
+}
+
+fn admit_requested_security_metadata(
+    codes: &[String],
+    batch: GatewayBatch<MarketSecurityMetadata>,
+) -> Result<GatewayBatch<MarketSecurityMetadata>, GatewayError> {
+    let (records, evidence) = match &batch {
+        GatewayBatch::Available { records, evidence } => (records, evidence),
+        GatewayBatch::VerifiedEmpty(evidence) => {
+            return Err(GatewayError::invalid_evidence(
+                METADATA_CAPABILITY,
+                Some(evidence.provider),
+                "security metadata response is empty for a non-empty request",
+            ));
+        }
+    };
+    let mut remaining = codes
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    if records.len() != codes.len()
+        || records
+            .iter()
+            .any(|record| !remaining.remove(record.code.as_str()))
+        || !remaining.is_empty()
+    {
+        return Err(GatewayError::invalid_evidence(
+            METADATA_CAPABILITY,
+            Some(evidence.provider),
+            "security metadata response must contain exactly one record for each requested code",
+        ));
+    }
+    Ok(batch)
 }
 
 fn retain_security_identities_observation<Audit>(
@@ -352,6 +414,64 @@ mod observation_tests {
     struct AuditProviderRow {
         #[diesel(sql_type = Text)]
         provider: String,
+    }
+
+    #[test]
+    fn metadata_gateway_requires_exact_requested_identity_set() {
+        let requested = vec!["600519".to_owned()];
+        let timestamp = DateTime::<Utc>::from_timestamp(1_790_300_000, 0).unwrap();
+        let evidence = BatchEvidence {
+            provider: ProviderId::Tdx,
+            source: "TEST_CODE metadata source".to_owned(),
+            source_at: Some(timestamp.to_rfc3339()),
+            observed_at: timestamp.to_rfc3339(),
+            batch_id: "TEST_CODE_metadata_batch".to_owned(),
+        };
+        let record = |code: &str| MarketSecurityMetadata {
+            code: code.to_owned(),
+            name: format!("TEST_CODE_{code}"),
+            board: SecurityBoard::Main,
+            is_st: false,
+            listed_on: NaiveDate::from_ymd_opt(2001, 8, 27).unwrap(),
+            price_limit_percent: 10.0,
+            price_limit_version: String::new(),
+            source_at: timestamp,
+            observed_at: timestamp,
+            provider: ProviderId::Tdx,
+            batch_id: evidence.batch_id.clone(),
+        };
+        for (label, codes, admitted) in [
+            ("A", vec!["600519"], true),
+            ("B", vec!["600000"], false),
+            ("A+B", vec!["600519", "600000"], false),
+            ("duplicate A", vec!["600519", "600519"], false),
+            ("empty available", vec![], false),
+        ] {
+            let batch = GatewayBatch::Available {
+                records: codes.into_iter().map(&record).collect(),
+                evidence: evidence.clone(),
+            };
+            assert_eq!(
+                admit_requested_security_metadata(&requested, batch).is_ok(),
+                admitted,
+                "{label}"
+            );
+        }
+        assert!(admit_requested_security_metadata(
+            &requested,
+            GatewayBatch::VerifiedEmpty(evidence.clone())
+        )
+        .is_err());
+        assert!(validate_security_metadata_request(&[]).is_err());
+        assert!(validate_security_metadata_request(&[" ".into()]).is_err());
+        assert!(validate_security_metadata_request(&["600519".into(), "600519".into()]).is_err());
+
+        let requested_pair = vec!["600519".to_owned(), "600000".to_owned()];
+        let reversed = GatewayBatch::Available {
+            records: vec![record("600000"), record("600519")],
+            evidence,
+        };
+        assert!(admit_requested_security_metadata(&requested_pair, reversed).is_ok());
     }
 
     #[tokio::test]

@@ -449,6 +449,37 @@ async fn task9_lifecycle_listing_requires_exact_requested_identity_and_cardinali
 }
 
 #[tokio::test]
+async fn metadata_gateway_rejects_wrong_security_before_success_audit() {
+    let _env = init();
+    grpc_source::set_test_query_responses(vec![Ok(wire_batch(
+        "Tdx",
+        serde_json::json!([{
+            "code": "600000",
+            "name": "TEST_CODE_wrong_security",
+            "board": "Main",
+            "is_st": false,
+            "listed_on": "1999-11-10",
+            "price_limit_percent": 10.0,
+            "source_at": "2026-09-25T15:00:00+08:00"
+        }]),
+    ))]);
+
+    let before = all_audits().len();
+    let error = MarketCapabilitiesGateway::new()
+        .security_metadata(&["600519".to_owned()])
+        .await
+        .expect_err("response for B cannot satisfy request for A");
+    assert_eq!(error.reason_code(), "invalid_evidence");
+    let audits = all_audits();
+    assert_eq!(audits.len(), before + 1);
+    let audit = audits.last().unwrap();
+    assert_eq!(audit.capability, "SecurityMetadata");
+    assert_eq!(audit.provider, "Tdx");
+    assert_eq!(audit.reason_code, "invalid_evidence");
+    assert_ne!(audit.outcome, "success");
+}
+
+#[tokio::test]
 async fn d15_attribution_retired_economic_remains_local_and_jin10() {
     let _env = init();
     // Any network query would exhaust this queue and fail the test.
