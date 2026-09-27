@@ -10,6 +10,8 @@
 
 2026-09-27 执行交接：[R-08 虚拟机服务端合同、部署和本地接收门](2026-09-27-r08-futures-delivery-vm-handoff.md)。按 VM 合同与真实 RPC 逐项回填，不用静态类型定义代替部署验证。
 
+D17 / D20 权威事实交接：[证券交易资格与停复牌权威事实](2026-09-27-d17-d20-authority-trading-facts-vm-handoff.md)。本地生产门已 fail-closed；VM 需交付逐证券日期的生命周期、精确价位/限价及停复牌来源、覆盖和空结果合同，才能接通并验证。
+
 上线前身份对账：[ExternalV1 Health 构建身份资格](2026-09-25-external-build-identity-qualification.md)。仓内客户端已钉住公开部署元数据；当前服务是否仍匹配须由上游提供当次构建身份和真实 Health 证据。
 
 退役调用处理：[生产宏观搜索的 EconomicCalendar 停止调用与新产品边界](2026-09-25-retired-economic-calendar-production-path.md)。旧审计身份保留，生产宏观搜索明确报告 `operation_retired`；两个新经济数据产品仍需分别接线和真实批次验收。
