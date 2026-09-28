@@ -1,13 +1,13 @@
 # 2026-09-29 monitor 分批上线候选
 
-状态：release 已构建并完成隔离验收；**尚未写入新 activation、尚未重启生产 monitor**。本批只接管已提交的本机源码改动，不宣称 M1–M7 完成。
+状态：release 已构建并完成隔离验收；**尚未写入新 activation、尚未重启生产 monitor**。01:30 CST 已将生产磁盘上的源码和 monitor 恢复为当前旧进程对应的版本，避免 launchd 意外重启到未激活候选；新候选独立保存待切换。本批只接管已提交的本机源码改动，不宣称 M1–M7 完成。
 
 ## 版本与输入
 
 | 项 | 当前生产 / 回退 | 候选 |
 | --- | --- | --- |
-| 本仓源码 | 生产运行根旧 `src/` 已归档于 `/private/tmp/stock-analysis-rollout-20260929-src.tar`，SHA-256 `59172dea34c2e5f302139232003003d8388ed746df7072e836f7c7a973c93ec9` | `master@d7835cee`；`rsync -anic --delete src/ <运行根>/src/` 无内容差异 |
-| monitor | SHA-256 `a2589f0115d6f3ee89bf11d7714c7bd4bce58f6d3e5bcbc12b06831ffc5b8b34`，备份 `/private/tmp/stock-analysis-rollout-20260929-monitor` | 从生产根 `cargo build --locked --offline --release -j 2` 构建，SHA-256 `88c1ff0136f277fbdb2a963b3ddad04fcb478ec53cc7eba8053db6cda7ffebcb` |
+| 本仓源码 | 生产运行根旧 `src/` 已从 `/private/tmp/stock-analysis-rollout-20260929-src.tar` 恢复；备份 SHA-256 `59172dea34c2e5f302139232003003d8388ed746df7072e836f7c7a973c93ec9`，恢复后逐文件 `rsync -anic --delete` 无差异 | `master@d7835cee` 的候选源码保存于 `/private/tmp/stock-analysis-rollout-20260929-candidate-src-live/`，与当前本仓 `src/` 逐文件无差异；候选 tar SHA-256 `0118b25c648ffab3e846b06a504e970edbb38fabd5472962ac8c870c5cf8a9ff` |
+| monitor | 生产磁盘与当前运行进程均为旧 SHA-256 `a2589f0115d6f3ee89bf11d7714c7bd4bce58f6d3e5bcbc12b06831ffc5b8b34`，备份 `/private/tmp/stock-analysis-rollout-20260929-monitor` | 从生产根 `cargo build --locked --offline --release -j 2` 构建，SHA-256 `88c1ff0136f277fbdb2a963b3ddad04fcb478ec53cc7eba8053db6cda7ffebcb`，现保存于 `/private/tmp/stock-analysis-rollout-20260929-candidate-monitor` |
 | gRPC bundle | manifest SHA-256 `cc3d97239da5bc224e487eef355b7154901739bafd76d64f78ab6337cad9f89f` | 同一 manifest，9/9 文件校验通过；VM Health 构建身份匹配 |
 | activation | 旧 `expected_config_hash=ba4087dbd9d76d377a3804cd56738e91dd40e177dc131c3e5056650be660b158` | `selection_activation_prepare` 计算新 hash `3cff3b27c7b0f457949b1bafa1f281d686f4f6ccfc6cc55542b76ad05555513f`；候选 JSON 在 `/private/tmp/stock-analysis-rollout-20260929-activation.json`，未安装 |
 
@@ -24,6 +24,8 @@
 01:04 CST 的只读生产预检：旧 monitor PID `17089` 仍占用同一运行根的主库与 durable 库，桥接 PID `56417` 未变。`monitor --health --json` 报 `monitor_running=true`、快照新鲜，但 `Frozen/Unsafe`、四项能力缺失；该命令只覆盖 banner/account/data，夜间结果不能代替盘中健康。durable `delivery_decisions` 聚合为 `Delivered=841`、`RejectedDurable=3987`、`ManualResolvedRejected=6`、`UncertainManualReview=78`；其中 73 条是 2026-09-24 的 `DataMode`，其余 5 条分属 WatchlistTracking、CloseCall、T0Advice。只读统计未查看外部渠道结果，不授权裁定或重发这些不确定投递。四家 GlobalNews 于 01:03:33 CST 的旧进程日志均有 `available` 样本；PaperLedger 仍报未激活。
 
 当晚 00–01 时日志按 `[DataGateway]` 聚合：四家 GlobalNews 与 SecurityIdentity 各 7 次 `available`，`board-memberships` 有 366 次 `available`；旧进程的 `R-08-announcements` 有 8 次 `invalid_request`，最后一条在 01:10:55 CST。该旧 adapter 缺口已在候选源码修复并由只读真实 RPC 证明，切换后须确认新进程不再产生同一请求错误。
+
+01:30 CST 恢复磁盘启动输入后，`launchctl` 仍显示旧 monitor PID `17089`，未重启；磁盘二进制 SHA 与旧备份一致，生产 `src/` 与旧 tar 解包目录逐文件一致。候选二进制及源码已分别保存在上表的 `/private/tmp` 路径。复核通过后需重新将这组候选精确同步到运行根，再重算/核对 activation hash 并按生效时刻单实例切换；不能直接使用当前旧源码目录生成新 activation。
 
 ## 待执行的单实例切换
 
