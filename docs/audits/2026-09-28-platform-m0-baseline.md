@@ -32,7 +32,7 @@
 | #3 DB 初始化/测试隔离 | 代码已修，原 flaky 家族稳态待核 | `DatabaseManager::init` 在非测试模式尊重显式路径，测试模式拒绝显式路径并提供隔离入口。2026-09-29 定向 `database::tests::explicit_test_database_paths_are_isolated_instead_of_remapped` 1/1 通过，证明显式路径不能被共享单例吞掉，两个独立测试库的写入互不串扰；尚未覆盖原 23–28 个顺序相关 flaky 用例的并行稳态。 |
 | #4 NewsAI counted binding | 代码已修，生产送达待核 | `notify.rs` 的 `NewsAiAnalysis` 走 counted 准入和专用审计；补机器目录及真实 receipt。 |
 | #5 NewsAI 批次重复身份 | v3 路径已修，旧记录待核 | `news_ai.rs` 有 `NewsAiIdentityV3` 和恢复 envelope；旧版本兼容/重复计数及生产结果待核。 |
-| #6 Gateway 错误归类 | 关键已知码已修，穷举未完成 | `raw_v2.rs::classify_gateway_error` 已单列 route exhausted/stopped、source precondition、external transport 等，仍保留未知码 fallback；需从当前失败样本验证原始 retryable 保真。 |
+| #6 Gateway 错误归类 | 关键已知码已修，穷举未完成 | `raw_v2.rs::classify_gateway_error` 已单列 route exhausted/stopped、source precondition、external transport 等。2026-09-29 将未知码 fallback 改为保留原始 `reason_code` 与 `retryable`，同时用独立诊断码标出映射缺口；该模块定向 18/18 通过。仍需从真实失败样本核对各来源的原始分类。 |
 | #7 指标测试 | 代码已补基础测试，覆盖待核 | RSI/MACD/KDJ/cross/divergence 五文件均有测试；不据存在性宣称边界充分。 |
 | #8 NewsFlash gate 拒绝审计 | 代码已修，生产计数待核 | `news_aggregator_init.rs` 在校验失败处调用 `record_gate_rejection`；需用运行数据核分母与原因。 |
 | #9 铜箔文案/规则 | 代码已修 | `config/chain.toml` 已使用“铜箔”；来源规则有效性需正常样本验证。 |

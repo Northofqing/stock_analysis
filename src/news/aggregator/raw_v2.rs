@@ -1110,7 +1110,7 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
         "internal" => ("internal", "internal", error.retryable()),
         _ => (
             "provider_error_mapping_missing",
-            "provider_error_mapping_missing",
+            error.reason_code(),
             error.retryable(),
         ),
     }
@@ -1372,6 +1372,15 @@ mod tests {
                 "external_transport_unavailable",
                 true,
             )
+        );
+    }
+
+    #[test]
+    fn unmapped_gateway_reason_remains_visible_without_claiming_a_known_diagnostic() {
+        let error = GatewayError::retired_operation("GlobalNews", None);
+        assert_eq!(
+            classify_gateway_error(&error),
+            ("provider_error_mapping_missing", "operation_retired", false)
         );
     }
 
