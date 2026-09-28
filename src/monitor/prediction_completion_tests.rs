@@ -18,6 +18,27 @@ fn close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
         .unwrap();
 }
 
+fn qualified_status(db: &DatabaseManager, code: &str, date: &str, status: &str) {
+    assert!(code.starts_with("TEST_CODE_"));
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query(
+        "INSERT INTO qualified_daily_trading_status \
+         (code,date,status,contract_version,source,source_at,observed_at,batch_id) \
+         VALUES (?1,?2,?3,'TEST_CODE_AUTHORITY_V1','TEST_CODE_AUTHORITY', \
+                 '2026-02-26T00:00:00Z','2026-02-26T00:00:01Z','TEST_CODE_BATCH')",
+    )
+    .bind::<diesel::sql_types::Text, _>(code)
+    .bind::<diesel::sql_types::Text, _>(date)
+    .bind::<diesel::sql_types::Text, _>(status)
+    .execute(&mut conn)
+    .unwrap();
+}
+
+fn qualified_close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
+    close(db, code, date, value);
+    qualified_status(db, code, date, "trading");
+}
+
 #[tokio::test]
 async fn task2_candidate_save_reports_each_row_and_worker_failure() {
     let (_dir, db) = private_db();
@@ -65,8 +86,8 @@ fn task2_zero_update_errors_and_invalid_inputs_remain_pending() {
             None,
         )
         .unwrap();
-        close(&db, code, "2026-02-02", 100.);
-        close(&db, code, "2026-02-25", price);
+        qualified_close(&db, code, "2026-02-02", 100.);
+        qualified_close(&db, code, "2026-02-25", price);
     }
     let mut conn = db.get_conn().unwrap();
     diesel::sql_query("CREATE TRIGGER skip_update BEFORE UPDATE ON prediction_tracker WHEN OLD.stock_code = 'TEST_CODE_zero' BEGIN SELECT RAISE(IGNORE); END").execute(&mut conn).unwrap();
@@ -142,9 +163,9 @@ async fn task2_due_rows_exact_dates_large_returns_direction_and_keyset() {
     ] {
         db.save_prediction_legacy("2026-02-02", target, None, Some(code), direction, 80., None)
             .unwrap();
-        close(&db, code, "2026-02-02", 100.);
+        qualified_close(&db, code, "2026-02-02", 100.);
         if let Some(value) = value {
-            close(&db, code, target, value);
+            qualified_close(&db, code, target, value);
         }
     }
     close(&db, "TEST_CODE_missing", "2026-02-26", 130.);
@@ -206,8 +227,8 @@ async fn task2_due_rows_exact_dates_large_returns_direction_and_keyset() {
 #[tokio::test]
 async fn task2_missing_target_close_never_uses_future_price() {
     let (_dir, db) = private_db();
-    close(&db, "TEST_CODE_exact", "2026-02-02", 100.);
-    close(&db, "TEST_CODE_exact", "2026-02-26", 125.);
+    qualified_close(&db, "TEST_CODE_exact", "2026-02-02", 100.);
+    qualified_close(&db, "TEST_CODE_exact", "2026-02-26", 125.);
     assert!(
         verify_one(&db, "TEST_CODE_exact", "2026-02-02", "2026-02-25", "看多")
             .await
@@ -229,8 +250,9 @@ fn task2_suspended_target_close_keeps_prediction_pending() {
         None,
     )
     .unwrap();
-    close(&db, code, "2026-02-02", 100.);
+    qualified_close(&db, code, "2026-02-02", 100.);
     close(&db, code, "2026-02-25", 125.);
+    qualified_status(&db, code, "2026-02-25", "trading");
     diesel::sql_query("UPDATE stock_daily SET is_suspended = 1 WHERE code = ?1 AND date = ?2")
         .bind::<diesel::sql_types::Text, _>(code)
         .bind::<diesel::sql_types::Text, _>("2026-02-25")
@@ -248,5 +270,76 @@ fn task2_suspended_target_close_keeps_prediction_pending() {
             .unwrap()
             .hit,
         None
+    );
+}
+
+#[test]
+fn d10_suspended_status_blocks_stale_close_even_when_legacy_flag_is_false() {
+    let (_dir, db) = private_db();
+    let code = "TEST_CODE_authority_suspended";
+    db.save_prediction_legacy(
+        "2026-02-02",
+        "2026-02-25",
+        None,
+        Some(code),
+        "up",
+        80.,
+        None,
+    )
+    .unwrap();
+    qualified_close(&db, code, "2026-02-02", 100.);
+    close(&db, code, "2026-02-25", 125.);
+    qualified_status(&db, code, "2026-02-25", "suspended");
+
+    let report =
+        verify_due_predictions(&db, chrono::NaiveDate::from_ymd_opt(2026, 2, 26).unwrap()).unwrap();
+    assert_eq!(
+        (report.pending, report.verified, report.deferred),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        db.get_prediction_by_code_date(code, "2026-02-02")
+            .unwrap()
+            .actual_change,
+        None
+    );
+}
+
+#[test]
+fn d10_legacy_default_false_and_unknown_start_day_cannot_verify() {
+    let (_dir, db) = private_db();
+    let code = "TEST_CODE_unknown_trade_state";
+    db.save_prediction_legacy(
+        "2026-02-02",
+        "2026-02-25",
+        None,
+        Some(code),
+        "up",
+        80.,
+        None,
+    )
+    .unwrap();
+    close(&db, code, "2026-02-02", 100.);
+    close(&db, code, "2026-02-25", 125.);
+
+    let as_of = chrono::NaiveDate::from_ymd_opt(2026, 2, 26).unwrap();
+    let first = verify_due_predictions(&db, as_of).unwrap();
+    assert_eq!((first.pending, first.verified, first.deferred), (1, 0, 1));
+
+    qualified_status(&db, code, "2026-02-25", "trading");
+    let second = verify_due_predictions(&db, as_of).unwrap();
+    assert_eq!(
+        (second.pending, second.verified, second.deferred),
+        (1, 0, 1)
+    );
+
+    qualified_status(&db, code, "2026-02-02", "trading");
+    let third = verify_due_predictions(&db, as_of).unwrap();
+    assert_eq!((third.pending, third.verified, third.deferred), (1, 1, 0));
+    assert_eq!(
+        db.get_prediction_by_code_date(code, "2026-02-02")
+            .unwrap()
+            .actual_change,
+        Some(25.)
     );
 }

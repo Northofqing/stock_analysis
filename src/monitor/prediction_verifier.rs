@@ -52,7 +52,11 @@ fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Opti
     }
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let row = diesel::sql_query(
-        "SELECT close FROM stock_daily WHERE code = ?1 AND date = ?2 AND is_suspended = 0 LIMIT 1",
+        "SELECT daily.close FROM stock_daily AS daily \
+         WHERE daily.code = ?1 AND daily.date = ?2 AND daily.is_suspended = 0 \
+         AND EXISTS (SELECT 1 FROM qualified_daily_trading_status AS state \
+                     WHERE state.code = daily.code AND state.date = daily.date \
+                     AND state.status = 'trading') LIMIT 1",
     )
     .bind::<diesel::sql_types::Text, _>(code)
     .bind::<diesel::sql_types::Text, _>(date)

@@ -3312,6 +3312,26 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             "TINYINT NOT NULL DEFAULT 0",
         )?;
 
+        // A legacy is_suspended=0 is Unknown, not proof of Trading. Absence
+        // from this table means Unknown. The current v1 daily-bar path has no
+        // writer; a future authority adapter must admit facts before writing.
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS qualified_daily_trading_status (
+                code TEXT NOT NULL,
+                date DATE NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('trading', 'suspended')),
+                contract_version TEXT NOT NULL CHECK (length(trim(contract_version)) > 0),
+                source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+                source_at TEXT NOT NULL CHECK (length(trim(source_at)) > 0),
+                observed_at TEXT NOT NULL CHECK (length(trim(observed_at)) > 0),
+                batch_id TEXT NOT NULL CHECK (length(trim(batch_id)) > 0),
+                PRIMARY KEY (code, date)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+
         // 老库升级：增量添加 6 列 (修复 P1.3 trades 业绩归因)
         // 量化分析师要求: 必须能算真实 PnL (扣除 commission/stamp_tax/slippage)
         Self::add_column_if_missing(conn, "trades", "commission_amount", "REAL DEFAULT 0")?;
