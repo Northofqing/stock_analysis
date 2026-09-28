@@ -5,9 +5,11 @@ use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
+use super::chain_acquisition::ChainAcquisitionEvidence;
 use super::chain_schedule::ChainPhase;
 
 pub(super) const COVERAGE: &str = "prepared_report_utf8_only";
+pub(super) const ACQUISITION_COVERAGE: &str = "partial_limit_up_global_news_and_report_utf8";
 
 #[derive(Debug)]
 pub(super) struct ChainReportInputObservation {
@@ -19,6 +21,8 @@ pub(super) struct ChainReportInputObservation {
     pub report_input_sha256: String,
     pub report_input_bytes: usize,
     pub prepared_report_equals_input: bool,
+    pub acquisition_sha256: Option<String>,
+    pub acquisition_report_binding_sha256: Option<String>,
     pub coverage: &'static str,
 }
 
@@ -29,18 +33,48 @@ pub(super) fn observe(
     schedule_date: NaiveDate,
     prepared: &PreparedChainAnalysis,
     report_input: &[u8],
+    acquisition: Option<&ChainAcquisitionEvidence>,
 ) -> Result<ChainReportInputObservation> {
     let artifact = prepared.to_artifact_bytes()?;
+    let acquisition_sha256 = acquisition
+        .map(|retained| {
+            anyhow::ensure!(
+                retained.business_date == prepared.business_date(),
+                "产业链采集与准备的业务日期不一致"
+            );
+            retained.sha256()
+        })
+        .transpose()?;
+    let artifact_sha256 = format!("{:x}", Sha256::digest(&artifact));
+    let report_input_sha256 = format!("{:x}", Sha256::digest(report_input));
+    let acquisition_report_binding_sha256 = acquisition_sha256
+        .as_ref()
+        .map(|source_sha256| {
+            let binding = serde_json::to_vec(&serde_json::json!({
+                "schema": "chain-acquisition-report-binding-v1",
+                "source_sha256": source_sha256,
+                "artifact_sha256": artifact_sha256,
+                "report_input_sha256": report_input_sha256,
+            }))?;
+            Ok::<_, anyhow::Error>(format!("{:x}", Sha256::digest(binding)))
+        })
+        .transpose()?;
     Ok(ChainReportInputObservation {
         phase,
         schedule_date,
         prepared_business_date: prepared.business_date(),
-        artifact_sha256: format!("{:x}", Sha256::digest(&artifact)),
+        artifact_sha256,
         artifact_bytes: artifact.len(),
-        report_input_sha256: format!("{:x}", Sha256::digest(report_input)),
+        report_input_sha256,
         report_input_bytes: report_input.len(),
         prepared_report_equals_input: prepared.report().as_bytes() == report_input,
-        coverage: COVERAGE,
+        acquisition_sha256,
+        acquisition_report_binding_sha256,
+        coverage: if acquisition.is_some() {
+            ACQUISITION_COVERAGE
+        } else {
+            COVERAGE
+        },
     })
 }
 
@@ -88,7 +122,7 @@ mod tests {
         let preparations = Rc::new(Cell::new(0));
         let prepared = test_prepared(business_date, preparations.clone()).await;
         let input = prepared.report().as_bytes();
-        let observed = observe(ChainPhase::Preopen, schedule_date, &prepared, input).unwrap();
+        let observed = observe(ChainPhase::Preopen, schedule_date, &prepared, input, None).unwrap();
         assert_eq!(preparations.get(), 1);
         assert_eq!(observed.schedule_date, schedule_date);
         assert_eq!(observed.prepared_business_date, business_date);
@@ -112,9 +146,17 @@ mod tests {
             date,
             &prepared,
             prepared.report().as_bytes(),
+            None,
         )
         .unwrap();
-        let altered = observe(ChainPhase::Postclose, date, &prepared, b"changed input").unwrap();
+        let altered = observe(
+            ChainPhase::Postclose,
+            date,
+            &prepared,
+            b"changed input",
+            None,
+        )
+        .unwrap();
         assert!(!altered.prepared_report_equals_input);
         assert_ne!(original.report_input_sha256, altered.report_input_sha256);
         assert_eq!(original.artifact_sha256, altered.artifact_sha256);

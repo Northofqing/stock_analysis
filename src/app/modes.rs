@@ -126,6 +126,7 @@ pub async fn run_chain_analysis_mode_with_send_guard(
 /// Data retained for a scheduled, read-only observation. It grants no delivery authority.
 pub(super) struct ChainDeliveryEnvelope {
     pub prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    pub acquisition: Option<super::chain_acquisition::ChainAcquisitionEvidence>,
     pub send_attempted: bool,
     pub report_input: Vec<u8>,
     pub legacy_result: Result<()>,
@@ -141,57 +142,38 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
 
     info!("模式: 产业链联动分析");
 
-    let observed_at = Local::now().naive_local();
-    let business_date = stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
-
-    // 涨停池获取使用阻塞 HTTP 客户端，通过 spawn_blocking 离线程
-    let (_analyzer, limit_ups) = tokio::task::spawn_blocking(move || {
-        let analyzer = MarketAnalyzer::new(None)?;
-        let limit_ups = analyzer.get_limit_up_stocks(business_date)?;
-        Ok::<(MarketAnalyzer, Vec<_>), anyhow::Error>((analyzer, limit_ups))
-    })
-    .await??;
-    info!("今日涨停池共 {} 只", limit_ups.len());
-
     // 2026-08-06: 新闻收集 → AI 产业链分析。拉取主流快讯源今日新闻摘要,
     // 作为 LLM 产业链分析的宏背景 (macro_news)。任一源失败 → 显式 warn,
     // 不阻塞链分析 (聚类/落库照常, 仅 LLM 无新闻背景)。
-    use stock_analysis::data_gateway::{GatewayBatch, GlobalNewsGateway, GlobalNewsProvider};
-    let macro_news = match GlobalNewsGateway::new()
-        .global_news(GlobalNewsProvider::Cailianpress, 20)
-        .await
-    {
-        Ok(GatewayBatch::Available { records, .. }) if !records.is_empty() => {
-            info!("[产业链] 已收集 {} 条快讯进 LLM 背景", records.len());
-            Some(
-                records
-                    .iter()
-                    .take(15)
-                    .map(|r| r.title.clone())
-                    .collect::<Vec<_>>()
-                    .join("; "),
+    use stock_analysis::data_gateway::{GlobalNewsGateway, GlobalNewsProvider};
+    let observed_at = Local::now().fixed_offset();
+    let (prepared, acquisition) = super::chain_acquisition::prepare_with_acquisition(
+        observed_at,
+        |business_date| async move {
+            // The blocking gateway and its audit run once on their existing worker.
+            let observation = tokio::task::spawn_blocking(move || {
+                let analyzer = MarketAnalyzer::new(None)?;
+                analyzer.get_limit_up_observation(business_date)
+            })
+            .await??;
+            Ok(super::chain_acquisition::ChainLimitAcquisition::from_observation(observation))
+        },
+        || async {
+            GlobalNewsGateway::new()
+                .global_news(GlobalNewsProvider::Cailianpress, 20)
+                .await
+        },
+        |business_date, limit_ups, macro_news| async move {
+            stock_analysis::pipeline::chain_analysis::preparation::prepare_chain_analysis(
+                business_date,
+                limit_ups,
+                macro_news,
             )
-        }
-        Ok(GatewayBatch::Available { .. }) => {
-            log::warn!("[产业链] 快讯批次为空, LLM 无新闻背景");
-            None
-        }
-        Ok(GatewayBatch::VerifiedEmpty(evidence)) => {
-            log::warn!("[产业链] 快讯已验证为空: {:?}", evidence.batch_id);
-            None
-        }
-        Err(error) => {
-            log::warn!("[产业链] 快讯收集失败, LLM 无新闻背景: {error}");
-            None
-        }
-    };
-
-    let prepared = stock_analysis::pipeline::chain_analysis::preparation::prepare_chain_analysis(
-        business_date,
-        limit_ups,
-        macro_news,
+            .await
+        },
     )
     .await?;
+    let business_date = acquisition.business_date;
 
     let notifier = std::sync::Arc::new(NotificationService::from_env());
     let save_notifier = notifier.clone();
@@ -206,6 +188,7 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
     let filename = scheduled_filename.unwrap_or(&default_filename);
     deliver_prepared(
         prepared,
+        Some(acquisition),
         move |report| save_notifier.save_report_to_file(report, Some(filename)),
         available,
         before_send,
@@ -217,6 +200,7 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
 
 async fn deliver_prepared<S, G, T>(
     prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    acquisition: Option<super::chain_acquisition::ChainAcquisitionEvidence>,
     save: S,
     available: bool,
     before_send: G,
@@ -233,6 +217,7 @@ where
     let mut envelope = ChainDeliveryEnvelope {
         report_input: prepared.report().as_bytes().to_vec(),
         prepared,
+        acquisition,
         send_attempted: false,
         legacy_result: Ok(()),
     };
@@ -295,6 +280,7 @@ mod tests_chain_delivery {
         let sent = Rc::new(RefCell::new(Vec::new()));
         let envelope = deliver_prepared(
             prepared,
+            None,
             {
                 let events = events.clone();
                 let saved = saved.clone();
@@ -351,10 +337,10 @@ mod tests_chain_delivery {
             },
             {
                 let events = events.clone();
-                move |phase, date, prepared, report_input| {
+                move |phase, date, prepared, report_input, acquisition| {
                     events.borrow_mut().push("observe");
                     if observer_ok {
-                        observe(phase, date, prepared, report_input)
+                        observe(phase, date, prepared, report_input, acquisition)
                     } else {
                         anyhow::bail!("observer failed")
                     }
@@ -401,6 +387,7 @@ mod tests_chain_delivery {
         let envelope = ChainDeliveryEnvelope {
             report_input: prepared.report().as_bytes().to_vec(),
             prepared,
+            acquisition: None,
             send_attempted: true,
             legacy_result: Ok(()),
         };
@@ -413,9 +400,9 @@ mod tests_chain_delivery {
                 events.borrow_mut().push("mark");
                 anyhow::bail!("weak mark failed")
             },
-            |phase, date, prepared, input| {
+            |phase, date, prepared, input, acquisition| {
                 events.borrow_mut().push("observe");
-                observe(phase, date, prepared, input)
+                observe(phase, date, prepared, input, acquisition)
             },
         )
         .unwrap_err();

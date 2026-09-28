@@ -449,6 +449,7 @@ where
         NaiveDate,
         &stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
         &[u8],
+        Option<&super::chain_acquisition::ChainAcquisitionEvidence>,
     ) -> Result<ChainReportInputObservation>,
 {
     let legacy_result = envelope.legacy_result.and_then(|()| {
@@ -456,15 +457,23 @@ where
         Ok(ChainScheduleOutcome::WeakAccepted)
     });
     if envelope.send_attempted {
-        match observer(phase, date, &envelope.prepared, &envelope.report_input) {
+        match observer(
+            phase,
+            date,
+            &envelope.prepared,
+            &envelope.report_input,
+            envelope.acquisition.as_ref(),
+        ) {
             Ok(observation) => log::info!(
-                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} coverage={} foundation_persisted=false",
+                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} coverage={} foundation_persisted=false",
                 observation.phase.as_str(), observation.schedule_date, observation.prepared_business_date,
                 observation.artifact_sha256, observation.artifact_bytes, observation.report_input_sha256,
-                observation.report_input_bytes, observation.prepared_report_equals_input, observation.coverage,
+                observation.report_input_bytes, observation.prepared_report_equals_input,
+                observation.acquisition_sha256.as_deref().unwrap_or("absent"),
+                observation.acquisition_report_binding_sha256.as_deref().unwrap_or("absent"), observation.coverage,
             ),
             Err(_error) => log::warn!(
-                "[chain_shadow_input] phase={} schedule_date={} coverage={} foundation_persisted=false observer_status=incomplete reason=artifact_observation_failed",
+                "[chain_shadow_input] phase={} schedule_date={} coverage={} foundation_persisted=false observer_status=incomplete reason=source_or_artifact_observation_failed",
                 phase.as_str(), date, chain_shadow_input::COVERAGE,
             ),
         }
