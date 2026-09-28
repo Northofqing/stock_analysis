@@ -118,6 +118,24 @@ pub async fn run_chain_analysis_mode_with_send_guard(
     scheduled_filename: Option<&str>,
     before_send: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
+    run_chain_analysis_mode_with_observation(send_notify, scheduled_filename, before_send)
+        .await?
+        .legacy_result
+}
+
+/// Data retained for a scheduled, read-only observation. It grants no delivery authority.
+pub(super) struct ChainDeliveryEnvelope {
+    pub prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    pub send_attempted: bool,
+    pub report_input: Vec<u8>,
+    pub legacy_result: Result<()>,
+}
+
+pub(super) async fn run_chain_analysis_mode_with_observation(
+    send_notify: bool,
+    scheduled_filename: Option<&str>,
+    before_send: impl FnOnce(&str) -> Result<()>,
+) -> Result<ChainDeliveryEnvelope> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
@@ -168,14 +186,16 @@ pub async fn run_chain_analysis_mode_with_send_guard(
         }
     };
 
-    let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(
+    let prepared = stock_analysis::pipeline::chain_analysis::preparation::prepare_chain_analysis(
         business_date,
         limit_ups,
         macro_news,
     )
     .await?;
 
-    let notifier = NotificationService::from_env();
+    let notifier = std::sync::Arc::new(NotificationService::from_env());
+    let save_notifier = notifier.clone();
+    let available = notifier.is_available();
     // 文件名带时段: 9:05 盘前 (business_date=昨日) / 15:30 盘后 (当日) / CLI
     // 各时段独立文件, 避免 9:05 盘前报告覆盖昨日盘后报告 (2026-08-07 接入时间线)。
     let default_filename = format!(
@@ -184,18 +204,50 @@ pub async fn run_chain_analysis_mode_with_send_guard(
         chrono::Local::now().format("%H%M")
     );
     let filename = scheduled_filename.unwrap_or(&default_filename);
-    let path = notifier.save_report_to_file(&report, Some(filename))?;
-    info!("产业链联动分析报告已保存: {}", path);
+    deliver_prepared(
+        prepared,
+        move |report| save_notifier.save_report_to_file(report, Some(filename)),
+        available,
+        before_send,
+        move |report| Box::pin(async move { notifier.send(report).await }),
+        send_notify,
+    )
+    .await
+}
 
+async fn deliver_prepared<S, G, T>(
+    prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    save: S,
+    available: bool,
+    before_send: G,
+    send: T,
+    send_notify: bool,
+) -> Result<ChainDeliveryEnvelope>
+where
+    S: FnOnce(&str) -> Result<String>,
+    G: FnOnce(&str) -> Result<()>,
+    T: for<'a> FnOnce(&'a str) -> futures::future::LocalBoxFuture<'a, Result<bool>>,
+{
+    let path = save(prepared.report())?;
+    info!("产业链联动分析报告已保存: {}", path);
+    let mut envelope = ChainDeliveryEnvelope {
+        report_input: prepared.report().as_bytes().to_vec(),
+        prepared,
+        send_attempted: false,
+        legacy_result: Ok(()),
+    };
     if send_notify {
-        anyhow::ensure!(
-            notifier.is_available(),
-            "产业链联动分析报告没有可用通知渠道"
-        );
-        before_send(&path)?;
-        require_chain_notification_success(notifier.send(&report).await)?;
+        if !available {
+            envelope.legacy_result = Err(anyhow::anyhow!("产业链联动分析报告没有可用通知渠道"));
+        } else if let Err(error) = before_send(&path) {
+            envelope.legacy_result = Err(error);
+        } else {
+            envelope.send_attempted = true;
+            envelope.legacy_result =
+                require_chain_notification_success(send(envelope.prepared.report()).await);
+        }
     }
-    Ok(())
+    Ok(envelope)
 }
 
 fn require_chain_notification_success(result: Result<bool>) -> Result<()> {
@@ -210,7 +262,14 @@ fn require_chain_notification_success(result: Result<bool>) -> Result<()> {
 
 #[cfg(test)]
 mod tests_chain_delivery {
-    use super::require_chain_notification_success;
+    use super::{deliver_prepared, require_chain_notification_success, ChainDeliveryEnvelope};
+    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase};
+    use crate::app::chain_shadow_input::{observe, test_prepared};
+    use chrono::NaiveDate;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     #[test]
     fn chain_send_rejects_weak_failure() {
@@ -220,6 +279,148 @@ mod tests_chain_delivery {
             require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
                 .is_err()
         );
+    }
+
+    async fn scripted_delivery(
+        guard_ok: bool,
+        send_ok: bool,
+        observer_ok: bool,
+    ) -> (Vec<&'static str>, String, Vec<u8>, bool, bool) {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let preparations = Rc::new(Cell::new(0));
+        let prepared = test_prepared(date, preparations.clone()).await;
+        let expected_report = prepared.report().to_owned();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let envelope = deliver_prepared(
+            prepared,
+            {
+                let events = events.clone();
+                let saved = saved.clone();
+                move |report| {
+                    events.borrow_mut().push("save");
+                    saved.borrow_mut().extend_from_slice(report.as_bytes());
+                    Ok("test-report.md".into())
+                }
+            },
+            true,
+            {
+                let events = events.clone();
+                move |_| {
+                    events.borrow_mut().push("guard");
+                    if guard_ok {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("guard failed")
+                    }
+                }
+            },
+            {
+                let events = events.clone();
+                let sent = sent.clone();
+                move |report| {
+                    Box::pin(async move {
+                        events.borrow_mut().push("send");
+                        sent.borrow_mut().extend_from_slice(report.as_bytes());
+                        Ok(send_ok)
+                    })
+                }
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preparations.get(), 1);
+        assert_eq!(&*saved.borrow(), expected_report.as_bytes());
+        let attempted = envelope.send_attempted;
+        assert_eq!(&envelope.report_input, &*saved.borrow());
+        if envelope.send_attempted {
+            assert_eq!(&envelope.report_input, &*sent.borrow());
+        }
+        let result = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            {
+                let events = events.clone();
+                move || {
+                    events.borrow_mut().push("mark");
+                    Ok(())
+                }
+            },
+            {
+                let events = events.clone();
+                move |phase, date, prepared, report_input| {
+                    events.borrow_mut().push("observe");
+                    if observer_ok {
+                        observe(phase, date, prepared, report_input)
+                    } else {
+                        anyhow::bail!("observer failed")
+                    }
+                }
+            },
+        );
+        let events = events.borrow().clone();
+        let sent = sent.borrow().clone();
+        (events, expected_report, sent, attempted, result.is_ok())
+    }
+
+    #[tokio::test]
+    async fn one_preparation_and_exact_order_and_report_bytes() {
+        let (events, report, sent, attempted, success) = scripted_delivery(true, true, true).await;
+        assert_eq!(events, ["save", "guard", "send", "mark", "observe"]);
+        assert_eq!(sent, report.as_bytes());
+        assert!(attempted && success);
+    }
+
+    #[tokio::test]
+    async fn send_failure_is_observed_and_guard_failure_is_not() {
+        let (events, _, _, attempted, success) = scripted_delivery(true, false, true).await;
+        assert_eq!(events, ["save", "guard", "send", "observe"]);
+        assert!(attempted && !success);
+        let (events, _, sent, attempted, success) = scripted_delivery(false, true, true).await;
+        assert_eq!(events, ["save", "guard"]);
+        assert!(sent.is_empty() && !attempted && !success);
+    }
+
+    #[tokio::test]
+    async fn observer_failure_preserves_legacy_success_and_failure() {
+        let (events, _, _, _, success) = scripted_delivery(true, true, false).await;
+        assert_eq!(events, ["save", "guard", "send", "mark", "observe"]);
+        assert!(success);
+        let (events, _, _, _, success) = scripted_delivery(true, false, false).await;
+        assert_eq!(events, ["save", "guard", "send", "observe"]);
+        assert!(!success);
+    }
+
+    #[tokio::test]
+    async fn failed_weak_mark_is_observed_without_changing_its_error() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let envelope = ChainDeliveryEnvelope {
+            report_input: prepared.report().as_bytes().to_vec(),
+            prepared,
+            send_attempted: true,
+            legacy_result: Ok(()),
+        };
+        let events = RefCell::new(Vec::new());
+        let error = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            || {
+                events.borrow_mut().push("mark");
+                anyhow::bail!("weak mark failed")
+            },
+            |phase, date, prepared, input| {
+                events.borrow_mut().push("observe");
+                observe(phase, date, prepared, input)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(&*events.borrow(), &["mark", "observe"]);
+        assert_eq!(error.to_string(), "weak mark failed");
     }
 }
 

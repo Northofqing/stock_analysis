@@ -7,6 +7,7 @@
 
 pub mod bootstrap;
 pub mod chain_schedule;
+mod chain_shadow_input;
 pub mod modes;
 pub mod schedule;
 

@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
-use super::modes::run_chain_analysis_mode_with_send_guard;
+use super::chain_shadow_input::{self, ChainReportInputObservation};
+use super::modes::{run_chain_analysis_mode_with_observation, ChainDeliveryEnvelope};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainPhase {
@@ -417,14 +418,58 @@ pub async fn run_scheduled_chain_analysis(
 
     let filename = scheduled_report_filename(phase, date, Utc::now());
     let mut attempt_no = None;
-    run_chain_analysis_mode_with_send_guard(true, Some(&filename), |report_path| {
+    let envelope = run_chain_analysis_mode_with_observation(true, Some(&filename), |report_path| {
         attempt_no = Some(store.begin_send(phase, date, report_path)?);
         Ok(())
     })
     .await?;
-    let attempt_no = attempt_no.context("产业链发送守卫未执行")?;
-    store.mark_weak_accepted(phase, date, attempt_no)?;
-    Ok(ChainScheduleOutcome::WeakAccepted)
+    finish_scheduled_delivery(
+        envelope,
+        phase,
+        date,
+        || {
+            let attempt_no = attempt_no.context("产业链发送守卫未执行")?;
+            store.mark_weak_accepted(phase, date, attempt_no)
+        },
+        chain_shadow_input::observe,
+    )
+}
+
+pub(super) fn finish_scheduled_delivery<M, O>(
+    envelope: ChainDeliveryEnvelope,
+    phase: ChainPhase,
+    date: NaiveDate,
+    mark: M,
+    observer: O,
+) -> Result<ChainScheduleOutcome>
+where
+    M: FnOnce() -> Result<()>,
+    O: FnOnce(
+        ChainPhase,
+        NaiveDate,
+        &stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+        &[u8],
+    ) -> Result<ChainReportInputObservation>,
+{
+    let legacy_result = envelope.legacy_result.and_then(|()| {
+        mark()?;
+        Ok(ChainScheduleOutcome::WeakAccepted)
+    });
+    if envelope.send_attempted {
+        match observer(phase, date, &envelope.prepared, &envelope.report_input) {
+            Ok(observation) => log::info!(
+                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} coverage={} foundation_persisted=false",
+                observation.phase.as_str(), observation.schedule_date, observation.prepared_business_date,
+                observation.artifact_sha256, observation.artifact_bytes, observation.report_input_sha256,
+                observation.report_input_bytes, observation.prepared_report_equals_input, observation.coverage,
+            ),
+            Err(_error) => log::warn!(
+                "[chain_shadow_input] phase={} schedule_date={} coverage={} foundation_persisted=false observer_status=incomplete reason=artifact_observation_failed",
+                phase.as_str(), date, chain_shadow_input::COVERAGE,
+            ),
+        }
+    }
+    legacy_result
 }
 
 #[cfg(test)]
