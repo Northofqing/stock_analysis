@@ -47,6 +47,12 @@ impl ChainPreopenShadowReport {
             || self.legacy_miss_due != self.foundation_miss_due
             || self.legacy_closed != self.foundation_closed
     }
+
+    /// Compare only the send gate. The caller may have captured the legacy
+    /// state before the physical sender changed it.
+    pub fn has_send_gate_diff(&self) -> bool {
+        self.legacy_due != self.foundation_due
+    }
 }
 
 /// Reads the old store and evaluates the new scheduler against the same clock.
@@ -82,6 +88,28 @@ pub(super) fn observe_chain_schedule_shadow(
         }
     };
 
+    project_chain_schedule_snapshot(
+        phase,
+        calendar_date,
+        observed_at,
+        trading_day,
+        legacy_status,
+        legacy_miss_recorded,
+    )
+}
+
+/// Pure diagnostic projection over the legacy status and clock supplied by a
+/// caller's gate. Foundation starts from no occurrence; this is not admission,
+/// a completion decision, or full shadow parity. No schedule-store read or
+/// Foundation persistence occurs.
+pub fn project_chain_schedule_snapshot(
+    phase: ChainPhase,
+    calendar_date: NaiveDate,
+    observed_at: DateTime<FixedOffset>,
+    trading_day: bool,
+    legacy_status: ChainScheduleStatus,
+    legacy_miss_recorded: bool,
+) -> Result<ChainPreopenShadowReport> {
     let catalog = MachineCatalog::bundled()?;
     let (
         producer_name,

@@ -399,17 +399,85 @@ fn scheduled_report_filename(
     )
 }
 
+/// The status and clock used by the legacy send gate, retained across its
+/// effects so the read-only projection does not inspect a changed store.
+struct ChainSendGateSnapshot {
+    phase: ChainPhase,
+    date: NaiveDate,
+    status: ChainScheduleStatus,
+    observed_at: DateTime<FixedOffset>,
+    trading_day: bool,
+}
+
+impl ChainSendGateSnapshot {
+    fn project(&self) -> Result<stock_analysis::push_foundation::ChainPreopenShadowReport> {
+        // The CLI also compiles `app` as a local module, so its enums are
+        // distinct Rust types from the library's Foundation-facing enums.
+        let phase = match self.phase {
+            ChainPhase::Preopen => stock_analysis::app::chain_schedule::ChainPhase::Preopen,
+            ChainPhase::Postclose => stock_analysis::app::chain_schedule::ChainPhase::Postclose,
+        };
+        let status = match self.status {
+            ChainScheduleStatus::Ready => {
+                stock_analysis::app::chain_schedule::ChainScheduleStatus::Ready
+            }
+            ChainScheduleStatus::Uncertain => {
+                stock_analysis::app::chain_schedule::ChainScheduleStatus::Uncertain
+            }
+            ChainScheduleStatus::Closed => {
+                stock_analysis::app::chain_schedule::ChainScheduleStatus::Closed
+            }
+        };
+        stock_analysis::push_foundation::project_chain_schedule_snapshot(
+            phase,
+            self.date,
+            self.observed_at.clone(),
+            self.trading_day,
+            status,
+            false,
+        )
+    }
+
+    fn observe(&self) {
+        match self.project() {
+            Ok(shadow) => log::info!(
+                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} old_window_open={} old_due={} projected_occurrence={:?} new_status={} new_reason={} new_due={} diff={} scope=send_gate_only identity_scope=legacy_chain_report_calendar_date calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete",
+                self.phase.as_str(), self.date, self.observed_at, self.status,
+                shadow.legacy_window_open, shadow.legacy_due,
+                shadow.foundation_occurrence_id, shadow.foundation_status,
+                shadow.foundation_reason, shadow.foundation_due,
+                shadow.has_send_gate_diff(),
+            ),
+            Err(error) => log::warn!(
+                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} scope=send_gate_only calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete observer_status=failed reason={error:#}",
+                self.phase.as_str(), self.date, self.observed_at, self.status,
+            ),
+        }
+    }
+}
+
 pub async fn run_scheduled_chain_analysis(
     store: &ChainScheduleStore,
     phase: ChainPhase,
     date: NaiveDate,
 ) -> Result<ChainScheduleOutcome> {
-    match store.status(phase, date)? {
+    let status = store.status(phase, date)?;
+    let gate = ChainSendGateSnapshot {
+        phase,
+        date,
+        status,
+        observed_at: Local::now().fixed_offset(),
+        // Both production timer call sites already passed their trading-day
+        // guard. This observer compares the inner send gate only.
+        trading_day: true,
+    };
+    match status {
         ChainScheduleStatus::Closed => {
             log::info!(
                 "[chain_shadow_suppression] phase={} schedule_date={} reason=already_closed coverage=incomplete",
                 phase.as_str(), date
             );
+            gate.observe();
             return Ok(ChainScheduleOutcome::AlreadyClosed);
         }
         ChainScheduleStatus::Uncertain => {
@@ -417,20 +485,23 @@ pub async fn run_scheduled_chain_analysis(
                 "[chain_shadow_suppression] phase={} schedule_date={} reason=uncertain_needs_review coverage=incomplete",
                 phase.as_str(), date
             );
+            gate.observe();
             return Ok(ChainScheduleOutcome::NeedsReview);
         }
         ChainScheduleStatus::Ready => {}
     }
 
-    let observed_now = Local::now().naive_local();
-    if !phase.starts_in_window(date, observed_now) {
+    let observed_now = gate.observed_at.naive_local();
+    let in_window = phase.starts_in_window(date, observed_now);
+    if !in_window {
         log::info!(
             "[chain_shadow_suppression] phase={} schedule_date={} reason=outside_send_window coverage=incomplete",
             phase.as_str(), date
         );
+        gate.observe();
     }
     anyhow::ensure!(
-        phase.starts_in_window(date, observed_now),
+        in_window,
         "产业链 {} {} 已不在新报告发送窗口，禁止窗口外重新采集并发送",
         phase.as_str(),
         date
@@ -442,17 +513,22 @@ pub async fn run_scheduled_chain_analysis(
         attempt_no = Some(store.begin_send(phase, date, report_path)?);
         Ok(())
     })
-    .await?;
-    finish_scheduled_delivery(
-        envelope,
-        phase,
-        date,
-        || {
-            let attempt_no = attempt_no.context("产业链发送守卫未执行")?;
-            store.mark_weak_accepted(phase, date, attempt_no)
-        },
-        chain_shadow_input::observe,
-    )
+    .await;
+    let result = match envelope {
+        Ok(envelope) => finish_scheduled_delivery(
+            envelope,
+            phase,
+            date,
+            || {
+                let attempt_no = attempt_no.context("产业链发送守卫未执行")?;
+                store.mark_weak_accepted(phase, date, attempt_no)
+            },
+            chain_shadow_input::observe,
+        ),
+        Err(error) => Err(error),
+    };
+    gate.observe();
+    result
 }
 
 pub(super) fn finish_scheduled_delivery<M, O>(
@@ -566,6 +642,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_gate_projection_keeps_the_status_used_before_the_legacy_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ChainScheduleStore::new(directory.path().join("chain.sqlite3"));
+        let date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-09-28T09:05:00+08:00").unwrap();
+        let gate = ChainSendGateSnapshot {
+            phase: ChainPhase::Preopen,
+            date,
+            status: store.status(ChainPhase::Preopen, date).unwrap(),
+            observed_at,
+            trading_day: true,
+        };
+        assert_eq!(gate.status, ChainScheduleStatus::Ready);
+        let attempt = store
+            .begin_send(ChainPhase::Preopen, date, "reports/preopen.md")
+            .unwrap();
+        store
+            .mark_weak_accepted(ChainPhase::Preopen, date, attempt)
+            .unwrap();
+
+        let same_gate = gate.project().unwrap();
+        assert!(same_gate.legacy_due && same_gate.foundation_due);
+        assert!(!same_gate.has_send_gate_diff());
+        let library_store =
+            stock_analysis::app::chain_schedule::ChainScheduleStore::new(store.path());
+        let post_send = stock_analysis::push_foundation::observe_chain_preopen_shadow(
+            &library_store,
+            observed_at,
+            true,
+        )
+        .unwrap();
+        assert!(!post_send.legacy_due && post_send.foundation_due);
+        assert!(post_send.has_send_gate_diff());
+    }
+
+    #[test]
+    fn send_gate_projection_covers_both_phases_and_suppression_edges() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        for (phase, open, end) in [
+            (ChainPhase::Preopen, "09:05:00", "09:15:00"),
+            (ChainPhase::Postclose, "15:30:00", "15:35:00"),
+        ] {
+            let at = |time: &str| {
+                DateTime::parse_from_rfc3339(&format!("2026-09-28T{time}+08:00")).unwrap()
+            };
+            let gate = |status, observed_at| ChainSendGateSnapshot {
+                phase,
+                date,
+                status,
+                observed_at,
+                trading_day: true,
+            };
+            let ready = gate(ChainScheduleStatus::Ready, at(open))
+                .project()
+                .unwrap();
+            assert!(ready.legacy_due && ready.foundation_due);
+            for status in [ChainScheduleStatus::Uncertain, ChainScheduleStatus::Closed] {
+                let blocked = gate(status, at(open)).project().unwrap();
+                assert!(!blocked.legacy_due && blocked.foundation_due);
+                assert!(blocked.has_send_gate_diff());
+            }
+            let expired = gate(ChainScheduleStatus::Ready, at(end)).project().unwrap();
+            assert!(!expired.legacy_due && !expired.foundation_due);
+            assert!(!expired.has_send_gate_diff());
+        }
+    }
 
     #[test]
     fn missed_window_is_recorded_once_without_authorizing_a_late_send() {
