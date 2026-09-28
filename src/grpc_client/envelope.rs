@@ -196,6 +196,7 @@ pub(crate) fn parse_external_query_response(
     use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
     let expected_external = match expected_operation {
         Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
+        Operation::MarketAnnouncements => ExternalOperation::MarketAnnouncements,
         Operation::GlobalNews => ExternalOperation::GlobalNews,
         Operation::InstrumentNews => ExternalOperation::InstrumentNews,
         _ => {
@@ -263,6 +264,42 @@ pub(crate) fn parse_external_native_query_response(
 mod tests {
     use super::*;
     use crate::grpc_client::pb::magic::market::v1::AdmissionState;
+
+    #[test]
+    fn market_announcements_external_response_requires_matching_operation() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            AdmissionState as ExternalAdmission, Operation as ExternalOperation,
+            QueryResponse as ExternalResponse,
+        };
+
+        let response = ExternalResponse {
+            request_id: "TEST_CODE_r08".to_owned(),
+            operation: ExternalOperation::MarketAnnouncements as i32,
+            admission: ExternalAdmission::Admitted as i32,
+            selected_provider: "Cninfo".to_owned(),
+            complete: true,
+            ..Default::default()
+        };
+        let accepted = parse_external_query_response(
+            "TEST_CODE_r08",
+            Operation::MarketAnnouncements,
+            "TEST_CODE_authority",
+            response.clone(),
+        )
+        .expect("same method and request identity");
+        assert_eq!(accepted.admission, QueryAdmission::Admitted);
+        assert_eq!(accepted.selected_provider, "Cninfo");
+        assert!(accepted.complete);
+        assert!(matches!(
+            parse_external_query_response(
+                "TEST_CODE_r08",
+                Operation::Announcements,
+                "TEST_CODE_authority",
+                response,
+            ),
+            Err(EnvelopeError::OperationMismatch(..))
+        ));
+    }
 
     #[test]
     fn request_ids_are_unique_and_nonempty() {

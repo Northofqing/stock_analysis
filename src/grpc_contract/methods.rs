@@ -66,6 +66,7 @@ impl ExternalMethod {
     fn try_from_local_compat(operation: LocalOperation) -> Result<Self, UnknownMethod> {
         let external = match operation {
             LocalOperation::SecurityMetadata => ExternalOperation::SecurityMetadata,
+            LocalOperation::MarketAnnouncements => ExternalOperation::MarketAnnouncements,
             LocalOperation::GlobalNews => ExternalOperation::GlobalNews,
             LocalOperation::InstrumentNews => ExternalOperation::InstrumentNews,
             _ => return Err(UnknownMethod),
@@ -158,6 +159,7 @@ mod tests {
     fn grpc_dual_contract_external_method_compatibility_is_closed_before_io() {
         for operation in [
             LocalOperation::SecurityMetadata,
+            LocalOperation::MarketAnnouncements,
             LocalOperation::GlobalNews,
             LocalOperation::InstrumentNews,
         ] {

@@ -19,6 +19,7 @@ use stock_analysis::market_domain::{EvidenceTimestamp, ProviderId, SourceEvidenc
 
 const DIRECT_EXTERNAL_OPERATIONS: &[ExternalOperation] = &[
     ExternalOperation::SecurityMetadata,
+    ExternalOperation::MarketAnnouncements,
     ExternalOperation::GlobalNews,
     ExternalOperation::InstrumentNews,
     ExternalOperation::FuturesDelivery,
@@ -65,6 +66,9 @@ struct Args {
     opening: bool,
     #[arg(long, value_enum)]
     native_operation: Option<NativeOperation>,
+    /// Read-only whole-market R-08 probe through the ordinary client adapter.
+    #[arg(long)]
+    market_announcements_date: Option<String>,
     #[arg(long, default_value = "600396")]
     code: String,
     #[arg(long, default_value = "live")]
@@ -353,6 +357,69 @@ async fn run_native_query(
     Ok(())
 }
 
+async fn run_market_announcements(
+    client: &mut GrpcMarketClient,
+    capabilities: &[ExternalCapability],
+    date: &str,
+    limit: u32,
+) -> anyhow::Result<()> {
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("market announcement date must be YYYY-MM-DD"))?;
+    if !(1..=300).contains(&limit) {
+        anyhow::bail!("market announcement limit must be 1..=300");
+    }
+    if !capability_ready(capabilities, ExternalOperation::MarketAnnouncements) {
+        anyhow::bail!("MarketAnnouncements has no admitted runtime capability");
+    }
+    let result = client
+        .query(
+            Operation::MarketAnnouncements,
+            serde_json::json!({"start":date.to_string(),"end":date.to_string(),"limit":limit}),
+        )
+        .await
+        .map_err(|error| structured_probe_error("MarketAnnouncements failed", error))?;
+    if result.admission != QueryAdmission::Admitted
+        || !result.complete
+        || !result.diagnostic_blocker.is_empty()
+        || result.selected_provider != "Cninfo"
+        || result.batch_id.is_empty()
+        || !result.source().starts_with("grpc-mtls:")
+    {
+        anyhow::bail!("MarketAnnouncements response envelope is not qualified");
+    }
+    let mut records = 0usize;
+    for record in &result.records {
+        if record.schema != "magic.market.announcement"
+            || record.schema_version != 1
+            || record.content_type != "application/json; charset=utf-8"
+        {
+            anyhow::bail!(
+                "MarketAnnouncements record contract mismatch: schema={} version={} content_type={}",
+                record.schema,
+                record.schema_version,
+                record.content_type
+            );
+        }
+        let json: serde_json::Value = serde_json::from_slice(&record.data)
+            .map_err(|_| anyhow::anyhow!("MarketAnnouncements record JSON invalid"))?;
+        records += match json {
+            serde_json::Value::Object(_) => 1,
+            serde_json::Value::Array(rows) if rows.iter().all(serde_json::Value::is_object) => {
+                rows.len()
+            }
+            _ => anyhow::bail!("MarketAnnouncements record shape invalid"),
+        };
+    }
+    if records > limit as usize {
+        anyhow::bail!("MarketAnnouncements exceeded requested limit");
+    }
+    println!(
+        "canary operation=MarketAnnouncements admission=ADMITTED complete=true provider=Cninfo records={records} batch_id={}",
+        result.batch_id
+    );
+    Ok(())
+}
+
 fn capability_ready(capabilities: &[ExternalCapability], operation: ExternalOperation) -> bool {
     capabilities.iter().any(|capability| {
         capability.operation == operation as i32
@@ -416,8 +483,13 @@ fn structured_probe_error(context: &str, error: GrpcError) -> anyhow::Error {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
-    if args.opening == args.native_operation.is_some() {
-        anyhow::bail!("select exactly one of --opening or --native-operation");
+    let selected_modes = u8::from(args.opening)
+        + u8::from(args.native_operation.is_some())
+        + u8::from(args.market_announcements_date.is_some());
+    if selected_modes != 1 {
+        anyhow::bail!(
+            "select exactly one of --opening, --native-operation or --market-announcements-date"
+        );
     }
     let native_spec = args
         .native_operation
@@ -448,6 +520,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("bundle capabilities unavailable: {error}"))?;
     if let Some(spec) = native_spec {
         return run_native_query(&mut client, &capabilities, spec).await;
+    }
+    if let Some(date) = &args.market_announcements_date {
+        return run_market_announcements(&mut client, &capabilities, date, args.limit).await;
     }
     for &(family, operations) in STATIC_OPENING_CAPABILITY_FAMILIES {
         let ready = capability_family_ready(&capabilities, operations);
