@@ -105,7 +105,8 @@ impl ExternalDecoder {
         }
     }
     pub(crate) fn query(self, bytes: &[u8]) -> Result<current::QueryResponse, GrpcError> {
-        super::external_query_transport::admit_external_payload(bytes)?;
+        // Decode first so the durable unary attempt can retain exact response
+        // bytes. The caller rejects forbidden wire fields after capture.
         match self {
             Self::ArchivedA => historical_external::query(bytes),
             Self::Current => decode(bytes),

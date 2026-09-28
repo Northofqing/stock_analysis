@@ -125,7 +125,28 @@ async fn macro_external_global_news_schema_v2_preserves_route_authority_and_rest
         MacroExternalSourceCase::Empty,
         MacroExternalSourceCase::Conflict,
     ] {
-        let (base, server) = spawn_macro_external_shape_loopback(source_case, AUTHORITY).await;
+        let (mut base, server) = spawn_macro_external_shape_loopback(source_case, AUTHORITY).await;
+        // This legacy bearer loopback tests Macro request and restore behavior.
+        // Give it an explicit current test qualification before the data call.
+        let generation = crate::grpc_client::connection_qualification::ConnectionGeneration::new(
+            crate::grpc_client::build_identity::BuildIdentityTrust::bundled().unwrap(),
+        );
+        let health_request_id = "TEST_CODE_MACRO_SHAPE_QUALIFICATION";
+        generation
+            .observe_health(
+                health_request_id,
+                &crate::grpc_client::external_pb::magic::market::v1::HealthResponse {
+                    request_id: health_request_id.to_owned(),
+                    live: true,
+                    ready: true,
+                    build_identity: Some(
+                        crate::grpc_client::build_identity::test_public_build_identity(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("TEST_CODE current Macro shape qualification");
+        base.connection_generation = Some(generation);
         let body_limit = if source_case == MacroExternalSourceCase::Empty {
             30
         } else {
