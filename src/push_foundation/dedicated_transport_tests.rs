@@ -48,6 +48,7 @@ impl P01DedicatedTerminalSource for FakeP01Source {
 
 struct P01Case {
     _root: tempfile::TempDir,
+    draft: InitialIntentDraft,
     snapshot: IntentSnapshot,
     template: TerminalTemplateBinding,
     route: DedicatedConformanceRoute,
@@ -61,6 +62,10 @@ fn p01_case() -> P01Case {
 }
 
 fn p01_case_for(unit_id: &str, subject: SubjectId) -> P01Case {
+    p01_case_for_mode(unit_id, subject, "Scheduled")
+}
+
+fn p01_case_for_mode(unit_id: &str, subject: SubjectId, render_mode: &str) -> P01Case {
     let root = tempfile::tempdir().expect("create W13 P01 store");
     let database = root.path().join("business.sqlite3");
     FoundationSchemaMigration::bundled()
@@ -85,9 +90,14 @@ fn p01_case_for(unit_id: &str, subject: SubjectId) -> P01Case {
         AudienceId::try_new("portfolio-owner".to_owned()).expect("audience"),
     );
     let rendered = b"TEST_CODE_W13_P01_RENDERED".to_vec();
+    let source_binding = serde_json::to_vec(&serde_json::json!({
+        "render_mode": render_mode,
+        "schema_version": "P01_SOURCE_BINDING_V1",
+    }))
+    .expect("serialize P01 source binding");
     let draft = InitialIntentDraft::ready_for_recovery_test(
         identity,
-        b"TEST_CODE_W13_P01_PREPARED".to_vec(),
+        source_binding.clone(),
         rendered.clone(),
         template.sha256().clone(),
         raw_digest(b"TEST_CODE_W13_P01_SOURCE_CONTRACT"),
@@ -109,11 +119,7 @@ fn p01_case_for(unit_id: &str, subject: SubjectId) -> P01Case {
         "GLOBAL",
         "p01:2026-08-18",
         attested.source_evidence_fingerprint.as_str(),
-        serde_json::to_vec(&serde_json::json!({
-            "render_mode": "Scheduled",
-            "schema_version": "P01_SOURCE_BINDING_V1",
-        }))
-        .expect("serialize P01 source binding"),
+        source_binding,
         "TEST_CODE_W13_P01_GLOBAL_SUBJECT",
         rendered,
         false,
@@ -158,6 +164,7 @@ fn p01_case_for(unit_id: &str, subject: SubjectId) -> P01Case {
 
     P01Case {
         _root: root,
+        draft,
         snapshot,
         template,
         route,
@@ -630,6 +637,7 @@ impl N02DedicatedTerminalSource for FakeN02Source {
 
 struct N02Case {
     _root: tempfile::TempDir,
+    draft: InitialIntentDraft,
     snapshot: IntentSnapshot,
     route: DedicatedConformanceRoute,
     policy: CompletionPolicy,
@@ -667,12 +675,20 @@ fn n02_case() -> N02Case {
     let rendered = b"TEST_CODE_W13_N02_RENDERED".to_vec();
     let rendered_len = rendered.len();
     let render_sha256 = raw_digest(&rendered);
+    let reservation_sha256 = "a".repeat(64);
+    let prepared = serde_json::to_vec(&serde_json::json!({
+        "business_date": "2026-08-18",
+        "decision_key": "window:09:30",
+        "reservation_sha256": reservation_sha256,
+        "ordered_source_batches": ["TEST_CODE_W13_N02_BATCH"],
+    }))
+    .expect("serialize N02 reservation fixture");
     let draft = InitialIntentDraft::ready_for_recovery_test(
         identity,
-        b"TEST_CODE_W13_N02_PREPARED".to_vec(),
+        prepared.clone(),
         rendered,
         template.sha256().clone(),
-        raw_digest(b"TEST_CODE_W13_N02_SOURCE_CONTRACT"),
+        raw_digest(&prepared),
         UtcMicros::try_new(1_787_027_400_000_000).expect("created at"),
     )
     .expect("valid N02 Ready intent");
@@ -701,7 +717,6 @@ fn n02_case() -> N02Case {
         batch_id: "TEST_CODE_W13_N02_BATCH".to_owned(),
     }];
     let evidence_sha256 = news_flash_evidence_sha256(&sources);
-    let reservation_sha256 = "a".repeat(64);
     let channel = "TEST_CODE_W13_N02_CHANNEL".to_owned();
     let attempt_event = PushDeliveryEvent::new_news_flash_attempt(
         "news_flash_aggregated_v1".to_owned(),
@@ -784,6 +799,7 @@ fn n02_case() -> N02Case {
 
     N02Case {
         _root: root,
+        draft,
         snapshot,
         route,
         policy,
@@ -880,6 +896,504 @@ fn replace_n02_terminal_stage(case: &mut N02Case, stage: NewsFlashTransactionSta
     .expect("valid replacement terminal");
     case.exact_terminal_bytes =
         serde_json::to_vec(&case.terminal.terminal).expect("replacement terminal bytes");
+}
+
+// The legacy terminal is already durable when these tests begin. This port only
+// re-reads the dedicated fixture; it has no dispatch or attempt-writing method.
+struct StoredDedicatedAuthority<'a> {
+    snapshot: IntentSnapshot,
+    route: &'a DedicatedConformanceRoute,
+    source: DedicatedFixtureSource<'a>,
+    descriptor: super::terminal_authority::AuthorityDescriptor,
+    queries: std::cell::Cell<usize>,
+}
+
+enum DedicatedFixtureSource<'a> {
+    P01(&'a FakeP01Source),
+    N02(&'a FakeN02Source),
+}
+
+impl super::terminal_authority::TerminalAuthorityPort for StoredDedicatedAuthority<'_> {
+    fn descriptor(&self) -> &super::terminal_authority::AuthorityDescriptor {
+        &self.descriptor
+    }
+
+    fn requery_terminal(
+        &self,
+        decision_id: &crate::monitor::push_job::DecisionId,
+    ) -> Result<
+        super::terminal_authority::AuthorityQuery,
+        super::terminal_authority::AuthorityQueryFailure,
+    > {
+        use super::terminal_authority::{AuthorityQuery, AuthorityQueryFailure};
+        self.queries.set(self.queries.get() + 1);
+        if &self
+            .snapshot
+            .attested_ready_binding()
+            .map_err(|_| AuthorityQueryFailure)?
+            .decision_id
+            != decision_id
+        {
+            return Err(AuthorityQueryFailure);
+        }
+        let mapped = match self.source {
+            DedicatedFixtureSource::P01(source) => {
+                super::dedicated_transport::inspect_p01_dedicated(
+                    &self.snapshot,
+                    self.route,
+                    source,
+                )
+            }
+            DedicatedFixtureSource::N02(source) => {
+                super::dedicated_transport::inspect_n02_dedicated(
+                    &self.snapshot,
+                    NewsFlashWindow::H0930,
+                    self.route,
+                    source,
+                )
+            }
+        };
+        match mapped {
+            Ok(record) => Ok(AuthorityQuery::Terminal(Box::new(record))),
+            Err(DedicatedConformanceError::TerminalMissing) => Ok(AuthorityQuery::Missing),
+            Err(DedicatedConformanceError::TerminalPendingSeal) => Ok(AuthorityQuery::PendingSeal),
+            Err(_) => Err(AuthorityQueryFailure),
+        }
+    }
+}
+
+struct DedicatedRecoveryBindings<'a> {
+    route: &'a DedicatedConformanceRoute,
+    policy: &'a CompletionPolicy,
+    authority: &'a StoredDedicatedAuthority<'a>,
+}
+
+impl super::reconciler::RecoveryBindingsPort for DedicatedRecoveryBindings<'_> {
+    fn resolve<'a>(
+        &'a self,
+        intent: &super::intent_store::AttestedReadyIntent,
+    ) -> Result<super::reconciler::RecoveryBindings<'a>, super::reconciler::RecoveryBindingError>
+    {
+        assert_eq!(
+            intent.intent_id,
+            self.authority
+                .snapshot
+                .attested_ready_binding()
+                .unwrap()
+                .intent_id
+        );
+        assert_eq!(
+            intent.business_date,
+            self.authority
+                .snapshot
+                .attested_ready_binding()
+                .unwrap()
+                .business_date
+        );
+        Ok(super::reconciler::RecoveryBindings::new(
+            self.route.template(),
+            self.policy,
+            self.authority,
+        ))
+    }
+}
+
+fn conformance_time(value: i64) -> UtcMicros {
+    UtcMicros::try_new(value).unwrap()
+}
+
+fn conformance_dispatch(
+    store: &mut BusinessIntentStore,
+    snapshot: &IntentSnapshot,
+) -> IntentSnapshot {
+    use super::{IntentState, IntentTransitionCommand, LeaseAction, LeaseOwnerId, TransitionActor};
+    use crate::monitor::push_job::ReasonCode;
+    let intent = snapshot.attested_ready_binding().unwrap();
+    let command = IntentTransitionCommand::try_new(
+        intent.intent_id.clone(),
+        IntentState::PendingDispatch,
+        IntentState::AwaitingAuthority,
+        snapshot.version(),
+        TransitionActor::try_new("TEST_CODE_W13_DISPATCH".to_owned()).unwrap(),
+        ReasonCode::IntentDispatchClaimed,
+        conformance_time(1_787_027_401_000_000),
+        LeaseAction::Acquire {
+            owner: LeaseOwnerId::try_new("TEST_CODE_W13_FINALIZER".to_owned()).unwrap(),
+            until: conformance_time(1_787_027_700_000_000),
+        },
+    )
+    .unwrap();
+    store.apply_nonterminal_transition(&command).unwrap();
+    store.inspect(&intent.intent_id).unwrap().unwrap()
+}
+
+fn conformance_recovery_config() -> super::reconciler::RecoveryConfig {
+    super::reconciler::RecoveryConfig::try_new(
+        super::LeaseOwnerId::try_new("TEST_CODE_W13_RECOVERY".to_owned()).unwrap(),
+        super::TransitionActor::try_new("TEST_CODE_W13_RECOVERY".to_owned()).unwrap(),
+        conformance_time(1_787_027_800_000_000),
+        conformance_time(1_787_028_000_000_000),
+        10,
+        5,
+    )
+    .unwrap()
+}
+
+fn conformance_prepare_accepted(
+    store: &mut BusinessIntentStore,
+    awaiting: &IntentSnapshot,
+    route: &DedicatedConformanceRoute,
+    policy: &CompletionPolicy,
+    authority: &StoredDedicatedAuthority<'_>,
+) {
+    use super::business_finalizer::{
+        prepare_accepted_finalization, AcceptedPreparationOutcome, AcceptedPreparationRequest,
+        FinalizerFence,
+    };
+    let intent = awaiting.attested_ready_binding().unwrap();
+    let request = AcceptedPreparationRequest::new(
+        intent.intent_id.clone(),
+        awaiting.version(),
+        super::TransitionActor::try_new("TEST_CODE_W13_FINALIZER".to_owned()).unwrap(),
+        FinalizerFence::new(
+            super::LeaseOwnerId::try_new("TEST_CODE_W13_FINALIZER".to_owned()).unwrap(),
+            awaiting.lease_generation(),
+            awaiting.lease_until().unwrap(),
+        ),
+        conformance_time(1_787_027_405_000_000),
+        conformance_time(1_787_027_406_000_000),
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare_accepted_finalization(store, request, route.template(), policy, authority).unwrap(),
+        AcceptedPreparationOutcome::Pending(_)
+    ));
+    assert_eq!(
+        store.inspect(&intent.intent_id).unwrap().unwrap().state(),
+        super::IntentState::AwaitingFinalizer
+    );
+}
+
+#[test]
+fn w13_p01_shared_sqlite_accepted_terminal_recovers_after_reopen() {
+    use super::IntentState;
+    let case = p01_case();
+    let database = case._root.path().join("business.sqlite3");
+    let source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(
+        case.terminal.clone(),
+    )));
+    let authority = StoredDedicatedAuthority {
+        snapshot: case.snapshot.clone(),
+        route: &case.route,
+        source: DedicatedFixtureSource::P01(&source),
+        descriptor: case.route.authority_descriptor().unwrap(),
+        queries: std::cell::Cell::new(0),
+    };
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let awaiting = conformance_dispatch(&mut store, &case.snapshot);
+    let direct = verify_p01_dedicated(
+        &awaiting,
+        &case.route,
+        &case.policy,
+        &source,
+        conformance_time(1_787_027_405_000_000),
+    )
+    .unwrap();
+    assert!(matches!(
+        direct.view(),
+        DeliveryResultView::TransportAccepted(_)
+    ));
+    let compensation = p01_case_for_mode("MU-p01", SubjectId::Global, "Compensation");
+    let scheduled_envelope: DeliveryEnvelope =
+        serde_json::from_slice(&case.terminal.envelope_canonical).unwrap();
+    let compensation_envelope: DeliveryEnvelope =
+        serde_json::from_slice(&compensation.terminal.envelope_canonical).unwrap();
+    assert_ne!(
+        compensation.terminal.legacy_decision_identity,
+        case.terminal.legacy_decision_identity
+    );
+    assert_eq!(
+        compensation_envelope.schedule_occurrence_identity,
+        scheduled_envelope.schedule_occurrence_identity
+    );
+    assert_eq!(
+        compensation_envelope.rendered_content_sha256,
+        scheduled_envelope.rendered_content_sha256
+    );
+    let compensation_source = source_for(P01DedicatedTerminalQuery::Terminal(Box::new(
+        compensation.terminal.clone(),
+    )));
+    assert!(matches!(
+        verify_p01_dedicated(
+            &compensation.snapshot,
+            &compensation.route,
+            &compensation.policy,
+            &compensation_source,
+            conformance_time(1_787_027_405_000_000)
+        )
+        .unwrap()
+        .view(),
+        DeliveryResultView::TransportAccepted(_)
+    ));
+    assert_eq!(
+        verify_p01_dedicated(
+            &awaiting,
+            &case.route,
+            &case.policy,
+            &compensation_source,
+            conformance_time(1_787_027_405_000_000)
+        ),
+        Err(DedicatedConformanceError::P01BindingMismatch {
+            field: "source_evidence_fingerprint",
+        })
+    );
+    let intent = awaiting.attested_ready_binding().unwrap();
+    conformance_prepare_accepted(&mut store, &awaiting, &case.route, &case.policy, &authority);
+    let bindings = DedicatedRecoveryBindings {
+        route: &case.route,
+        policy: &case.policy,
+        authority: &authority,
+    };
+    drop(store);
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let report =
+        super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+            .unwrap();
+    assert_eq!(report.entries().len(), 1);
+    let completed = store.inspect(&intent.intent_id).unwrap().unwrap();
+    assert_eq!(completed.state(), IntentState::Completed);
+    assert!(matches!(
+        store.record_initial(&case.draft).unwrap(),
+        InitialIntentOutcome::ExistingIdentical(_)
+    ));
+    assert_eq!(completed.business_date(), "2026-08-18");
+    assert_eq!(completed.rendered_sha256(), case.snapshot.rendered_sha256());
+    let chain = store.inspect_transition_chain(&intent.intent_id).unwrap();
+    let receipt = chain.last().unwrap();
+    assert_eq!(
+        receipt.terminal_ref_id(),
+        Some(case.terminal.ref_id.as_str())
+    );
+    let mapped =
+        super::dedicated_transport::inspect_p01_dedicated(&case.snapshot, &case.route, &source)
+            .unwrap();
+    assert_eq!(
+        receipt.terminal_binding_sha256(),
+        Some(&mapped.binding_sha256)
+    );
+    assert_eq!(mapped.evidence_sha256, case.evidence_sha256);
+    assert_eq!(mapped.unit_id.as_str(), "MU-p01");
+    assert_eq!(
+        mapped.rendered_sha256,
+        *completed.rendered_sha256().unwrap()
+    );
+    assert_eq!(
+        receipt.terminal_disposition(),
+        Some(crate::monitor::push_job::TerminalDisposition::Accepted)
+    );
+    assert_eq!(
+        source
+            .queried_dates
+            .borrow()
+            .iter()
+            .all(|date| date == "2026-08-18"),
+        true
+    );
+    assert!(authority.queries.get() >= 2);
+    let version = completed.version();
+    let second =
+        super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+            .unwrap();
+    assert!(second.entries().is_empty());
+    assert_eq!(
+        store.inspect(&intent.intent_id).unwrap().unwrap().version(),
+        version
+    );
+    assert_eq!(
+        store
+            .inspect_transition_chain(&intent.intent_id)
+            .unwrap()
+            .len(),
+        chain.len()
+    );
+}
+
+#[test]
+fn w13_n02_shared_sqlite_accepted_terminal_recovers_after_reopen() {
+    use super::IntentState;
+    let case = n02_case();
+    let database = case._root.path().join("business.sqlite3");
+    let source = n02_source(&case, 0);
+    let authority = StoredDedicatedAuthority {
+        snapshot: case.snapshot.clone(),
+        route: &case.route,
+        source: DedicatedFixtureSource::N02(&source),
+        descriptor: case.route.authority_descriptor().unwrap(),
+        queries: std::cell::Cell::new(0),
+    };
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let awaiting = conformance_dispatch(&mut store, &case.snapshot);
+    let direct = verify_n02_dedicated(
+        &awaiting,
+        NewsFlashWindow::H0930,
+        &case.route,
+        &case.policy,
+        &source,
+        conformance_time(1_787_027_405_000_000),
+    )
+    .unwrap();
+    let DeliveryResultView::TransportAccepted(verified) = direct.view() else {
+        panic!("expected accepted N02 terminal");
+    };
+    assert_eq!(
+        verified.evidence_sha256(),
+        &raw_digest(&case.exact_terminal_bytes)
+    );
+    let intent = awaiting.attested_ready_binding().unwrap();
+    conformance_prepare_accepted(&mut store, &awaiting, &case.route, &case.policy, &authority);
+    let bindings = DedicatedRecoveryBindings {
+        route: &case.route,
+        policy: &case.policy,
+        authority: &authority,
+    };
+    drop(store);
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+        .unwrap();
+    let completed = store.inspect(&intent.intent_id).unwrap().unwrap();
+    assert_eq!(completed.state(), IntentState::Completed);
+    assert!(matches!(
+        store.record_initial(&case.draft).unwrap(),
+        InitialIntentOutcome::ExistingIdentical(_)
+    ));
+    assert_eq!(completed.business_date(), "2026-08-18");
+    assert_eq!(completed.rendered_sha256(), case.snapshot.rendered_sha256());
+    let chain = store.inspect_transition_chain(&intent.intent_id).unwrap();
+    let receipt = chain.last().unwrap();
+    assert_eq!(
+        receipt.terminal_ref_id(),
+        Some(case.terminal.terminal.id.as_str())
+    );
+    let mapped = super::dedicated_transport::inspect_n02_dedicated(
+        &case.snapshot,
+        NewsFlashWindow::H0930,
+        &case.route,
+        &source,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt.terminal_binding_sha256(),
+        Some(&mapped.binding_sha256)
+    );
+    assert_eq!(
+        mapped.evidence_sha256,
+        raw_digest(&case.exact_terminal_bytes)
+    );
+    assert_eq!(mapped.unit_id.as_str(), "MU-news-flash-aggregate");
+    assert_eq!(
+        mapped.rendered_sha256,
+        *completed.rendered_sha256().unwrap()
+    );
+    assert_eq!(
+        receipt.terminal_disposition(),
+        Some(crate::monitor::push_job::TerminalDisposition::Accepted)
+    );
+    assert!(source
+        .queried
+        .borrow()
+        .iter()
+        .all(|(date, window)| date == "2026-08-18" && *window == NewsFlashWindow::H0930));
+    assert!(authority.queries.get() >= 2);
+    let version = completed.version();
+    super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+        .unwrap();
+    assert_eq!(
+        store.inspect(&intent.intent_id).unwrap().unwrap().version(),
+        version
+    );
+    assert_eq!(
+        store
+            .inspect_transition_chain(&intent.intent_id)
+            .unwrap()
+            .len(),
+        chain.len()
+    );
+    let NewsFlashWindowTerminalQuery::Terminal(stored) = &source.result else {
+        panic!("N02 authority fixture changed during recovery");
+    };
+    assert_eq!(stored.attempt.id, case.terminal.attempt.id);
+    assert_eq!(stored.terminal.id, case.terminal.terminal.id);
+}
+
+#[test]
+fn w13_n02_shared_sqlite_nonaccepted_terminal_never_completes() {
+    use super::IntentState;
+    for (stage, expected) in [
+        (
+            NewsFlashTransactionStage::Uncertain,
+            IntentState::ResolutionRequired,
+        ),
+        (
+            NewsFlashTransactionStage::DefinitivelyRejected,
+            IntentState::AwaitingAuthority,
+        ),
+    ] {
+        let mut case = n02_case();
+        replace_n02_terminal_stage(&mut case, stage);
+        let database = case._root.path().join("business.sqlite3");
+        let source = n02_source(&case, 0);
+        let authority = StoredDedicatedAuthority {
+            snapshot: case.snapshot.clone(),
+            route: &case.route,
+            source: DedicatedFixtureSource::N02(&source),
+            descriptor: case.route.authority_descriptor().unwrap(),
+            queries: std::cell::Cell::new(0),
+        };
+        let mut store = BusinessIntentStore::open(&database).unwrap();
+        let awaiting = conformance_dispatch(&mut store, &case.snapshot);
+        let direct = verify_n02_dedicated(
+            &awaiting,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &case.policy,
+            &source,
+            conformance_time(1_787_027_405_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            direct.completion_eligibility(),
+            CompletionEligibility::Never
+        );
+        let intent = awaiting.attested_ready_binding().unwrap();
+        let bindings = DedicatedRecoveryBindings {
+            route: &case.route,
+            policy: &case.policy,
+            authority: &authority,
+        };
+        drop(store);
+        let mut store = BusinessIntentStore::open(&database).unwrap();
+        super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+            .unwrap();
+        let current = store.inspect(&intent.intent_id).unwrap().unwrap();
+        assert_eq!(current.state(), expected);
+        assert!(store
+            .inspect_transition_chain(&intent.intent_id)
+            .unwrap()
+            .iter()
+            .all(|receipt| receipt.to_state() != IntentState::Completed));
+        let version = current.version();
+        super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+            .unwrap();
+        assert_eq!(
+            store.inspect(&intent.intent_id).unwrap().unwrap().version(),
+            version
+        );
+        assert!(source
+            .queried
+            .borrow()
+            .iter()
+            .all(|(date, window)| date == "2026-08-18" && *window == NewsFlashWindow::H0930));
+    }
 }
 
 #[test]
