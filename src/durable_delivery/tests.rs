@@ -7819,7 +7819,8 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
     prepare_reserved(&fixture, &candidate, &append);
     drop(fixture.coordinator.take());
 
-    let mut connection = Connection::open(&fixture.database_path).expect("open isolated v9 fixture");
+    let mut connection =
+        Connection::open(&fixture.database_path).expect("open isolated v9 fixture");
     let authority_tables = [
         "delivery_decisions",
         "immutable_audit_outbox",
@@ -7877,19 +7878,22 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
             ],
         )
         .expect("valid producer edge can be recorded later");
-    assert!(connection
-        .execute(
-            insert,
-            params![
-                "c".repeat(64),
-                candidate.decision_identity,
-                "p01-scheduled",
-                "p01:2026-08-18",
-                "Origin",
-                "2026-08-18T03:00:01Z"
-            ],
-        )
-        .is_err(), "one immutable tuple cannot be recorded under two observation IDs");
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![
+                    "c".repeat(64),
+                    candidate.decision_identity,
+                    "p01-scheduled",
+                    "p01:2026-08-18",
+                    "Origin",
+                    "2026-08-18T03:00:01Z"
+                ],
+            )
+            .is_err(),
+        "one immutable tuple cannot be recorded under two observation IDs"
+    );
     assert!(connection
         .execute(
             "UPDATE delivery_correlation_observations SET role='Resume'",
@@ -8022,6 +8026,458 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
             )
             .is_err(),
         "a BLOB producer ID cannot satisfy text validation"
+    );
+}
+
+fn m0_p01_origin_envelope(label: &str, business_date: &str, render_mode: &str) -> DeliveryEnvelope {
+    DeliveryEnvelope::new(
+        business_date,
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "GLOBAL",
+        format!("p01:{business_date}"),
+        format!("TEST_CODE_M0_SOURCE_{label}"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "P01_SOURCE_BINDING_V1",
+            "render_mode": render_mode,
+        }))
+        .expect("serialize P01 source binding"),
+        format!("TEST_CODE_M0_SUBJECT_{label}"),
+        format!("TEST_CODE_M0_RENDERED_{label}").into_bytes(),
+        true,
+        None,
+    )
+    .expect("construct P01 origin envelope")
+}
+
+#[test]
+fn m0_correlation_p01_origin_identity_and_invalid_input_fail_before_prepare() {
+    let observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-18")
+            .expect("typed P01 origin");
+    assert_eq!(
+        observation.identity_for_decision(&"0".repeat(64)),
+        "e5c9454f53641a7d13fed11e7d1290085f266ffe48f7a4c3e99fe9614646eaf1",
+        "versioned length-delimited identity is a pinned wire vector"
+    );
+    assert_eq!(
+        P01OriginProducer::try_from("p01-compensation").unwrap(),
+        P01OriginProducer::Compensation
+    );
+    assert!(P01OriginProducer::try_from("unknown-producer").is_err());
+    for occurrence in ["p01:2026-8-18", "p01:2026-02-30", "p01:2026-08-18x"] {
+        assert!(
+            CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, occurrence).is_err(),
+            "noncanonical P01 occurrence {occurrence} must fail"
+        );
+    }
+
+    let fixture = Fixture::new("M0_CORRELATION_INVALID_P01_ORIGIN");
+    let candidate = m0_p01_origin_envelope("INVALID", "2026-08-18", "Scheduled");
+    let mismatched_date =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-19")
+            .unwrap();
+    assert!(fixture
+        .coordinator
+        .prepare_with_origin_observation(&candidate, 1, now(), &mismatched_date)
+        .is_err());
+    let mut wrong_kind = candidate.clone();
+    wrong_kind.push_kind = PushKind::TomorrowWatch;
+    assert!(fixture
+        .coordinator
+        .prepare_with_origin_observation(&wrong_kind, 1, now(), &observation)
+        .is_err());
+    let mut wrong_sub_kind = candidate.clone();
+    wrong_sub_kind.sub_kind = DeliverySubKind::FactorIC;
+    assert!(fixture
+        .coordinator
+        .prepare_with_origin_observation(&wrong_sub_kind, 1, now(), &observation)
+        .is_err());
+    let mut wrong_occurrence = candidate.clone();
+    wrong_occurrence.schedule_occurrence_identity = "p01:2026-08-17".to_owned();
+    assert!(fixture
+        .coordinator
+        .prepare_with_origin_observation(&wrong_occurrence, 1, now(), &observation)
+        .is_err());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        0
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0
+    );
+}
+
+#[test]
+fn m0_correlation_origin_prepare_retry_retains_first_time_and_authority() {
+    let fixture = Fixture::new("M0_CORRELATION_ORIGIN_RETRY");
+    let candidate = m0_p01_origin_envelope("RETRY", "2026-08-18", "Scheduled");
+    let observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-18")
+            .unwrap();
+    let first = Utc.with_ymd_and_hms(2026, 8, 18, 3, 0, 0).single().unwrap()
+        + chrono::Duration::milliseconds(789);
+    let prepared = fixture
+        .coordinator
+        .prepare_with_origin_observation(&candidate, 1, first, &observation)
+        .expect("new P01 origin is atomic with prepare");
+    assert_eq!(prepared.state, DecisionState::Reserved);
+    assert_eq!(prepared.decision_identity, candidate.decision_identity);
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let edge: (String, i64, String, String, String, String, String) = connection
+        .query_row(
+            "SELECT observation_identity,identity_version,decision_identity,
+                    producer_id,occurrence_identity,role,observed_at
+             FROM delivery_correlation_observations",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        edge.0,
+        observation.identity_for_decision(&candidate.decision_identity)
+    );
+    assert_eq!(edge.1, 1);
+    assert_eq!(edge.2, candidate.decision_identity);
+    assert_eq!(edge.3, "p01-scheduled");
+    assert_eq!(edge.4, "p01:2026-08-18");
+    assert_eq!(edge.5, "Origin");
+    assert_eq!(edge.6, "2026-08-18T03:00:00.789Z");
+    let stored_envelope: (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT envelope_canonical,envelope_sha256 FROM delivery_decisions
+             WHERE decision_identity=?1",
+            [&candidate.decision_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_envelope.0, candidate.canonical_bytes().unwrap());
+    assert_eq!(stored_envelope.1, candidate.canonical_sha256().unwrap());
+    let authority_tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "business_date_once_claims",
+        "delivery_attempts",
+        "sink_results",
+    ];
+    let before_retry = authority_snapshot(&connection, &authority_tables);
+    drop(connection);
+    let repeated = fixture
+        .coordinator
+        .prepare_with_origin_observation(
+            &candidate,
+            1,
+            first + chrono::Duration::days(1),
+            &observation,
+        )
+        .expect("exact retry checks the existing edge");
+    assert_eq!(repeated, prepared);
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before_retry
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT observed_at FROM delivery_correlation_observations",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        edge.6,
+        "an exact retry must retain the first observation time"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        1
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempts"),
+        0
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn m0_correlation_legacy_is_unrecorded_and_controlled_producers_share_occurrence() {
+    let fixture = Fixture::new("M0_CORRELATION_LEGACY_AND_CARDINALITY");
+    let business_date = "2026-08-18";
+    let scheduled = m0_p01_origin_envelope("SCHEDULED", business_date, "Scheduled");
+    let compensation = m0_p01_origin_envelope("COMPENSATION", business_date, "Compensation");
+    assert_ne!(scheduled.decision_identity, compensation.decision_identity);
+    let scheduled_observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-18")
+            .unwrap();
+    let compensation_observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Compensation, "p01:2026-08-18")
+            .unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 18, 3, 0, 0).single().unwrap();
+
+    fixture
+        .coordinator
+        .prepare(&scheduled, 1, at)
+        .expect("legacy prepare stays unrecorded");
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0
+    );
+    let authority_tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "business_date_once_claims",
+        "delivery_attempts",
+        "sink_results",
+    ];
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let before_exact_existing = authority_snapshot(&connection, &authority_tables);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER test_code_m0_reject_existing_correlation_insert
+             BEFORE INSERT ON delivery_correlation_observations
+             BEGIN SELECT RAISE(ABORT,'TEST_CODE_M0_EXISTING_INSERT_FAILURE'); END;",
+        )
+        .expect("install isolated exact-existing insert fault");
+    drop(connection);
+    assert!(matches!(
+        fixture.coordinator.prepare_with_origin_observation(
+            &scheduled,
+            1,
+            at + chrono::Duration::seconds(1),
+            &scheduled_observation,
+        ),
+        Err(DurableDeliveryError::Sqlite(_))
+    ));
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before_exact_existing
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0
+    );
+    connection
+        .execute_batch("DROP TRIGGER test_code_m0_reject_existing_correlation_insert")
+        .unwrap();
+    drop(connection);
+    fixture
+        .coordinator
+        .prepare_with_origin_observation(
+            &scheduled,
+            1,
+            at + chrono::Duration::seconds(1),
+            &scheduled_observation,
+        )
+        .expect("an exact existing legacy decision gains only its origin edge");
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before_exact_existing,
+        "adding correlation to an exact existing envelope changes no authority row"
+    );
+    drop(connection);
+
+    fixture
+        .coordinator
+        .prepare_with_origin_observation(
+            &compensation,
+            1,
+            at + chrono::Duration::seconds(2),
+            &compensation_observation,
+        )
+        .expect("controlled second decision can record its own origin");
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT decision_identity,producer_id,occurrence_identity
+             FROM delivery_correlation_observations ORDER BY producer_id DESC",
+        )
+        .unwrap();
+    let edges = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        edges,
+        vec![
+            (
+                scheduled.decision_identity,
+                "p01-scheduled".to_owned(),
+                "p01:2026-08-18".to_owned(),
+            ),
+            (
+                compensation.decision_identity,
+                "p01-compensation".to_owned(),
+                "p01:2026-08-18".to_owned(),
+            ),
+        ],
+        "one occurrence can have controlled distinct decision edges"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempts"),
+        0
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn m0_correlation_identity_conflict_and_stored_tuple_collision_fail_closed() {
+    let fixture = Fixture::new("M0_CORRELATION_CONFLICTS");
+    let candidate = m0_p01_origin_envelope("CONFLICT", "2026-08-18", "Scheduled");
+    let observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-18")
+            .unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 18, 3, 0, 0).single().unwrap();
+    fixture.coordinator.prepare(&candidate, 1, at).unwrap();
+
+    let mut conflicting_envelope = candidate.clone();
+    conflicting_envelope
+        .replace_content_preserving_identity(b"TEST_CODE_M0_CONFLICTING_CONTENT".to_vec());
+    assert!(matches!(
+        fixture.coordinator.prepare_with_origin_observation(
+            &conflicting_envelope,
+            1,
+            at + chrono::Duration::seconds(1),
+            &observation,
+        ),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0,
+        "the existing conflict audit path must not create an origin edge"
+    );
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox
+             WHERE audit_kind='DecisionIdentityConflict'"
+        ),
+        1
+    );
+
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO delivery_correlation_observations
+             (observation_identity,identity_version,decision_identity,producer_id,
+              occurrence_identity,role,observed_at)
+             VALUES (?1,1,?2,'p01-compensation','p01:2026-08-18','Origin',
+                     '2026-08-18T03:00:00.000Z')",
+            params![
+                observation.identity_for_decision(&candidate.decision_identity),
+                candidate.decision_identity,
+            ],
+        )
+        .expect("inject valid-shaped but mismatched tuple on isolated fixture");
+    let authority_tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "business_date_once_claims",
+        "delivery_attempts",
+        "sink_results",
+    ];
+    let before = authority_snapshot(&connection, &authority_tables);
+    drop(connection);
+    assert!(matches!(
+        fixture.coordinator.prepare_with_origin_observation(
+            &candidate,
+            1,
+            at + chrono::Duration::seconds(2),
+            &observation,
+        ),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("correlation observation identity conflict")
+    ));
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    assert_eq!(authority_snapshot(&connection, &authority_tables), before);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempts"),
+        0
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn m0_correlation_sidecar_insert_failure_rolls_back_prepare_authority() {
+    let fixture = Fixture::new("M0_CORRELATION_INSERT_ROLLBACK");
+    let candidate = m0_p01_origin_envelope("ROLLBACK", "2026-08-18", "Scheduled");
+    let observation =
+        CorrelationObservationV1::p01_origin(P01OriginProducer::Scheduled, "p01:2026-08-18")
+            .unwrap();
+    let authority_tables = [
+        "delivery_decisions",
+        "delivery_state_events",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "daily_budget_reservations",
+        "business_date_once_claims",
+        "delivery_attempts",
+        "sink_results",
+    ];
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let before = authority_snapshot(&connection, &authority_tables);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER test_code_m0_reject_correlation_insert
+             BEFORE INSERT ON delivery_correlation_observations
+             BEGIN SELECT RAISE(ABORT,'TEST_CODE_M0_CORRELATION_INSERT_FAILURE'); END;",
+        )
+        .expect("install isolated insert fault");
+    drop(connection);
+
+    let at = Utc.with_ymd_and_hms(2026, 8, 18, 3, 0, 0).single().unwrap();
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare_with_origin_observation(&candidate, 1, at, &observation),
+        Err(DurableDeliveryError::Sqlite(_))
+    ));
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before,
+        "sidecar failure must roll back decision, reservations, and audit rows"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0
+    );
+    connection
+        .execute_batch("DROP TRIGGER test_code_m0_reject_correlation_insert")
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        fixture
+            .coordinator
+            .prepare_with_origin_observation(&candidate, 1, at, &observation)
+            .expect("fresh prepare succeeds after the one-time injected fault")
+            .state,
+        DecisionState::Reserved
     );
 }
 
@@ -10413,7 +10869,10 @@ fn w12_terminal_read_model_distinguishes_missing_pending_and_accepted() {
         sha256_hex(terminal.evidence_bytes()),
         terminal.evidence_sha256()
     );
-    assert_eq!(terminal.durable_schema_version(), super::schema::SCHEMA_VERSION);
+    assert_eq!(
+        terminal.durable_schema_version(),
+        super::schema::SCHEMA_VERSION
+    );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     let exact: serde_json::Value =
         serde_json::from_slice(terminal.evidence_bytes()).expect("exact typed result JSON");

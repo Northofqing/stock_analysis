@@ -1,3 +1,6 @@
+use super::correlation::{
+    CorrelationObservationV1, OBSERVATION_IDENTITY_VERSION, OBSERVATION_ROLE_ORIGIN,
+};
 use super::model::{
     compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
     AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
@@ -2884,6 +2887,35 @@ impl DurableDeliveryCoordinator {
         authoritative_sink_count: usize,
         admission_at: DateTime<Utc>,
     ) -> Result<PrepareOutcome> {
+        self.prepare_internal(envelope, authoritative_sink_count, admission_at, None)
+    }
+
+    /// Record the first P01 Origin edge in the same transaction as prepare.
+    /// This entrypoint has no production caller until the producer binding is
+    /// validated and wired by the monitor.
+    pub(crate) fn prepare_with_origin_observation(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        observation: &CorrelationObservationV1,
+    ) -> Result<PrepareOutcome> {
+        observation.validate_for_envelope(envelope)?;
+        self.prepare_internal(
+            envelope,
+            authoritative_sink_count,
+            admission_at,
+            Some(observation),
+        )
+    }
+
+    fn prepare_internal(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        origin_observation: Option<&CorrelationObservationV1>,
+    ) -> Result<PrepareOutcome> {
         enum PrepareTransactionOutcome {
             Existing(Box<PrepareOutcome>),
             IdentityConflict,
@@ -2899,6 +2931,14 @@ impl DurableDeliveryCoordinator {
                     envelope.validate()?;
                     let hydration =
                         load_schedule_hydration(transaction, &envelope.decision_identity)?;
+                    if let Some(observation) = origin_observation {
+                        insert_or_verify_origin_observation(
+                            transaction,
+                            envelope,
+                            observation,
+                            admission_at,
+                        )?;
+                    }
                     return Ok(PrepareTransactionOutcome::Existing(Box::new(
                         outcome_from_stored(&existing, &hydration),
                     )));
@@ -2959,6 +2999,14 @@ impl DurableDeliveryCoordinator {
                 freeze_pre_sink_denial(transaction, envelope, &policy, denial, admission_at)?;
             } else {
                 self.reserve_generation(transaction, envelope, &policy, 1, admission_at)?;
+            }
+            if let Some(observation) = origin_observation {
+                insert_or_verify_origin_observation(
+                    transaction,
+                    envelope,
+                    observation,
+                    admission_at,
+                )?;
             }
             Ok(PrepareTransactionOutcome::Inserted)
         })?;
@@ -9570,6 +9618,74 @@ fn domain_sha256_hex(domain: &str, payload: &[u8]) -> String {
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn insert_or_verify_origin_observation(
+    transaction: &Transaction<'_>,
+    envelope: &DeliveryEnvelope,
+    observation: &CorrelationObservationV1,
+    admission_at: DateTime<Utc>,
+) -> Result<()> {
+    let observation_identity = observation.identity_for_decision(&envelope.decision_identity);
+    let existing: Option<(i64, String, String, String, String, String)> = transaction
+        .query_row(
+            "SELECT identity_version,decision_identity,producer_id,
+                    occurrence_identity,role,observed_at
+             FROM delivery_correlation_observations WHERE observation_identity=?1",
+            [&observation_identity],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((version, decision, producer, occurrence, role, first_observed_at)) = existing {
+        if version != OBSERVATION_IDENTITY_VERSION
+            || decision != envelope.decision_identity
+            || producer != observation.producer_id()
+            || occurrence != observation.occurrence_identity()
+            || role != OBSERVATION_ROLE_ORIGIN
+        {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "correlation observation identity conflict for {observation_identity}"
+            )));
+        }
+        if timestamp(parse_timestamp(&first_observed_at)?) != first_observed_at {
+            return Err(DurableDeliveryError::InvalidConfiguration(format!(
+                "noncanonical correlation observation timestamp for {observation_identity}"
+            )));
+        }
+        return Ok(());
+    }
+
+    let observed_at = timestamp(admission_at);
+    if timestamp(parse_timestamp(&observed_at)?) != observed_at {
+        return Err(DurableDeliveryError::InvalidConfiguration(
+            "noncanonical P01 origin observation timestamp".to_owned(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO delivery_correlation_observations
+         (observation_identity,identity_version,decision_identity,producer_id,
+          occurrence_identity,role,observed_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            observation_identity,
+            OBSERVATION_IDENTITY_VERSION,
+            envelope.decision_identity,
+            observation.producer_id(),
+            observation.occurrence_identity(),
+            OBSERVATION_ROLE_ORIGIN,
+            observed_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
