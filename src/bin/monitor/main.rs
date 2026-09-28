@@ -2551,7 +2551,7 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// 纸面账本: economic engine 重建成功即账本一致; summary 缺 / 未来 / >4 天
 
-/// → 保守 Err (旧事实不得用于重开交易门).
+/// → 保守 Err (旧事实不得用于账户指标和常规 paper 风控上下文).
 
 fn current_day_pnl_pct(
     snapshot_at: chrono::DateTime<chrono::FixedOffset>,
@@ -2562,6 +2562,30 @@ fn current_day_pnl_pct(
     (snapshot_at.with_timezone(&china_offset).date_naive()
         == evaluated_at.with_timezone(&china_offset).date_naive())
     .then_some(pnl_pct)
+}
+
+fn account_mode_net_pnl(
+    net: &stock_analysis::performance::economic_position::NetMetrics,
+    cycle_open_fill_id: i64,
+) -> Result<f64, String> {
+    use stock_analysis::performance::economic_position::NetMetrics;
+
+    match net {
+        NetMetrics::Available { net_pnl, .. } => Ok(*net_pnl),
+        NetMetrics::Unavailable { reason } => {
+            let mut safe_reason = String::new();
+            for ch in reason.chars() {
+                let ch = if ch.is_control() { ' ' } else { ch };
+                if safe_reason.len() + ch.len_utf8() > 160 {
+                    break;
+                }
+                safe_reason.push(ch);
+            }
+            Err(format!(
+                "BR-103 economic cycle {cycle_open_fill_id} net PnL unavailable: {safe_reason}"
+            ))
+        }
+    }
 }
 
 fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, String> {
@@ -2600,7 +2624,7 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
 
     // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
     // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
-    // 账本重建失败 → Err (不允许放行交易门).
+    // 账本重建或闭环仓位净值不可用 → Err (账户指标与常规 paper 风控上下文不完整).
     let as_of = observed_at.date_naive();
     let report =
         stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
@@ -2609,20 +2633,14 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
         .closed_positions
         .iter()
         .map(|position| {
-            let pnl = match &position.net {
-                stock_analysis::performance::economic_position::NetMetrics::Available {
-                    net_pnl,
-                    ..
-                } => *net_pnl,
-                _ => position.gross_pnl,
-            };
-            (
+            let pnl = account_mode_net_pnl(&position.net, position.cycle_open_fill_id)?;
+            Ok((
                 position.closed_at,
                 format!("economic-cycle-{}", position.cycle_open_fill_id),
                 pnl,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let consecutive_stop_loss_n = count_consecutive_realized_losses(&realized)?;
 
     Ok(AccountModeMetricsBatch {
@@ -2676,6 +2694,67 @@ fn count_consecutive_realized_losses(
 #[cfg(test)]
 mod account_mode_metric_tests {
     use super::*;
+    use stock_analysis::monitor::data_mode::{DataHealth, DataMode};
+    use stock_analysis::performance::economic_position::{
+        CostBasisKind, NetMetrics, NetOutcomeClass,
+    };
+    use stock_analysis::risk::action_gate::AccountMode;
+
+    #[test]
+    fn br103_consecutive_losses_use_net_pnl_even_when_gross_is_positive() {
+        let gross_pnl = 4.0;
+        let net = NetMetrics::Available {
+            basis_id: "TEST_CODE_cost_basis".to_string(),
+            kind: CostBasisKind::Observed,
+            total_adverse_cost: 6.0,
+            net_pnl: -2.0,
+            return_on_buy_notional: -0.02,
+            outcome: NetOutcomeClass::Loss,
+        };
+        let pnl = account_mode_net_pnl(&net, 42).unwrap();
+        assert!(gross_pnl > 0.0);
+        assert_eq!(pnl, -2.0);
+
+        let closed_at = chrono::NaiveDate::from_ymd_opt(2026, 9, 29)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap();
+        assert_eq!(
+            count_consecutive_realized_losses(&[(closed_at, "economic-cycle-42".into(), pnl)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(count_consecutive_realized_losses(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn br103_unavailable_net_pnl_makes_banner_incomplete() {
+        let gross_pnl = 4.0;
+        let net = NetMetrics::Unavailable {
+            reason: format!("missing cost evidence\n{}", "证".repeat(100)),
+        };
+        let error = account_mode_net_pnl(&net, 42).unwrap_err();
+        assert!(gross_pnl > 0.0);
+        assert!(error.contains("cycle 42"), "{error}");
+        assert!(error.contains("missing cost evidence"), "{error}");
+        assert!(!error.contains('\n'), "{error}");
+        let prefix = "BR-103 economic cycle 42 net PnL unavailable: ";
+        assert!(error.len() <= prefix.len() + 160, "{error}");
+
+        let batch = AccountModeMetricsBatch::incomplete();
+        let banner = build_banner(
+            &batch,
+            AccountMode::ReduceOnly,
+            &DataHealth {
+                mode: DataMode::Full,
+                missing: Vec::new(),
+                prev_mode: None,
+                eta: None,
+            },
+        );
+        assert!(!banner.account_metrics_complete);
+        assert!(banner.account_fact.is_none());
+    }
 
     #[test]
     fn br108_consecutive_losses_use_latest_distinct_realized_sales() {
