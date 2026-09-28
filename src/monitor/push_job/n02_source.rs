@@ -72,6 +72,50 @@ pub struct N02SourceChainV1<'a> {
     rendered_raw_sha256: Sha256Digest,
 }
 
+/// The small, immutable proof handle retained after canonical facts move into
+/// PreparationCapture. Record bytes remain borrowed from the original selected
+/// projection; only refs, times, hashes and the legacy binding are cloned.
+#[derive(Debug)]
+pub(crate) struct N02SelectedProofV1<'a> {
+    binding: N02ReservationBindingV1,
+    records: Vec<&'a NewsFlashRecordEvidenceV1>,
+    source_refs: Vec<SourceRef>,
+    source_times: Vec<SourceTime>,
+    facts_len: usize,
+    facts_sha256: Sha256Digest,
+    rendered_raw_sha256: Sha256Digest,
+}
+
+impl N02SelectedProofV1<'_> {
+    pub(crate) fn binding(&self) -> &N02ReservationBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) fn records(&self) -> &[&NewsFlashRecordEvidenceV1] {
+        &self.records
+    }
+
+    pub(crate) fn source_refs(&self) -> &[SourceRef] {
+        &self.source_refs
+    }
+
+    pub(crate) fn source_times(&self) -> &[SourceTime] {
+        &self.source_times
+    }
+
+    pub(crate) fn facts_len(&self) -> usize {
+        self.facts_len
+    }
+
+    pub(crate) fn facts_sha256(&self) -> &Sha256Digest {
+        &self.facts_sha256
+    }
+
+    pub(crate) fn rendered_raw_sha256(&self) -> &Sha256Digest {
+        &self.rendered_raw_sha256
+    }
+}
+
 impl<'a> N02SourceChainV1<'a> {
     pub fn try_capture(
         binding: N02ReservationBindingV1,
@@ -234,6 +278,21 @@ impl<'a> N02SourceChainV1<'a> {
             Vec::new(),
         )
         .map_err(N02SourceError::Foundation)
+    }
+
+    pub(crate) fn into_captured_facts_with_proof(
+        self,
+    ) -> Result<(CapturedFacts, N02SelectedProofV1<'a>), N02SourceError> {
+        let proof = N02SelectedProofV1 {
+            binding: self.binding.clone(),
+            records: self.records.clone(),
+            source_refs: self.source_refs.clone(),
+            source_times: self.source_times.clone(),
+            facts_len: self.canonical_facts.len(),
+            facts_sha256: self.canonical_facts.sha256().clone(),
+            rendered_raw_sha256: self.rendered_raw_sha256.clone(),
+        };
+        Ok((self.into_captured_facts()?, proof))
     }
 }
 

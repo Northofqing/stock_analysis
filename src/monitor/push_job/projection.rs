@@ -7,10 +7,10 @@ use super::facts::{model_output_ref_value, source_ref_value};
 use super::identity::{subject_value, validate_text};
 use super::{
     derive_intent_id, AudienceId, CompletionOwnerId, CompletionPolicyId, CompletionPolicyVersion,
-    DecisionId, ExactBytes, IntentId, IntentIdentityMaterial, Namespace, OccurrenceId,
-    PreparedFacts, PreparedFactsSnapshot, PushJobError, ReasonCode, Result, RunContext,
-    Sha256Digest, SourceContractId, SourceContractVersion, SourceRef, SubjectId, TemplateId,
-    TemplateVersion, UnitId, UtcMicros,
+    DecisionId, ExactBytes, IntentId, IntentIdentityMaterial, ModelOutputRef, Namespace,
+    OccurrenceId, PreparedFacts, PreparedFactsSnapshot, PushJobError, ReasonCode, Result,
+    RunContext, Sha256Digest, SourceContractId, SourceContractVersion, SourceRef, SubjectId,
+    TemplateId, TemplateVersion, UnitId, UtcMicros,
 };
 
 macro_rules! monitor_kinds {
@@ -559,14 +559,26 @@ struct SemanticProjectionCore {
 }
 
 fn evidence_fingerprint(facts: &PreparedFacts) -> Sha256Digest {
+    evidence_fingerprint_from_parts(facts.source_refs(), facts.model_output_refs())
+}
+
+/// The N02 replay path has no model output refs. Reuse the normal fingerprint
+/// encoding so a stored source list cannot invent a different Foundation hash.
+pub(crate) fn n02_replay_evidence_fingerprint(source_refs: &[SourceRef]) -> Sha256Digest {
+    evidence_fingerprint_from_parts(source_refs, &[])
+}
+
+fn evidence_fingerprint_from_parts(
+    source_refs: &[SourceRef],
+    model_output_refs: &[ModelOutputRef],
+) -> Sha256Digest {
     canonical_digest(
         "EvidenceFingerprint/v1",
         &BTreeMap::from([
             (
                 "model_output_refs",
                 CanonicalValue::Array(
-                    facts
-                        .model_output_refs()
+                    model_output_refs
                         .iter()
                         .map(model_output_ref_value)
                         .collect(),
@@ -574,7 +586,7 @@ fn evidence_fingerprint(facts: &PreparedFacts) -> Sha256Digest {
             ),
             (
                 "source_refs",
-                CanonicalValue::Array(facts.source_refs().iter().map(source_ref_value).collect()),
+                CanonicalValue::Array(source_refs.iter().map(source_ref_value).collect()),
             ),
         ]),
     )
@@ -1335,4 +1347,37 @@ pub(crate) fn n02_prepared_push_fixture(
         rendered_sha256: rendered_bytes.sha256().clone(),
         rendered_bytes,
     }
+}
+
+/// Test-only PreparedPush snapshot linked to facts captured by the normal
+/// PreparationCapture state. The production projector remains unregistered.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn n02_prepared_push_from_facts_fixture(
+    namespace: Namespace,
+    unit_id: UnitId,
+    occurrence_material: super::OccurrenceIdentityMaterial,
+    completion_owner: CompletionOwnerId,
+    source_contract_id: SourceContractId,
+    subject: SubjectId,
+    audience: AudienceId,
+    rendered: Vec<u8>,
+    facts: &PreparedFactsSnapshot,
+) -> PreparedPush {
+    assert_eq!(facts.facts().source_contract_id(), &source_contract_id);
+    let mut prepared = n02_prepared_push_fixture(
+        namespace,
+        unit_id,
+        occurrence_material,
+        completion_owner,
+        source_contract_id,
+        subject,
+        audience,
+        rendered,
+    );
+    prepared.run_context_sha256 = facts.facts().run_context_sha256().clone();
+    prepared.prepared_facts_sha256 = facts.facts().canonical_sha256();
+    prepared.source_binding =
+        SourceBinding::from_facts(facts.facts(), evidence_fingerprint(facts.facts()));
+    prepared
 }

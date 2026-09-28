@@ -855,7 +855,7 @@ pub(super) fn capture_capability_fixture() -> Result<PreparationCapture> {
 /// Test-only catalog binding for the development N02 source contract. This
 /// exercises the normal capture transition without registering a producer.
 #[cfg(test)]
-pub(super) fn n02_source_capture_fixture() -> Result<PreparationCapture> {
+pub(crate) fn n02_source_capture_fixture() -> Result<PreparationCapture> {
     let run_id = RunId::try_new("TEST_CODE_N02_SOURCE_RUN".to_owned())?;
     let source_contract_id =
         SourceContractId::try_new(super::n02_source::N02_SOURCE_CONTRACT_ID.to_owned())?;
@@ -865,7 +865,7 @@ pub(super) fn n02_source_capture_fixture() -> Result<PreparationCapture> {
     let schedule_id = ScheduleId::try_new("TEST_CODE_N02_SOURCE_SCHEDULE".to_owned())?;
     let factory = RunContextFactory::new(CatalogRunBinding {
         namespace: Namespace::test(run_id.clone()),
-        unit_id: UnitId::try_new("TEST_CODE_N02_SOURCE_UNIT".to_owned())?,
+        unit_id: UnitId::try_new("MU-news-flash-aggregate".to_owned())?,
         trigger: RegisteredTrigger::Scheduled(schedule_id.clone()),
         occurrence_family: occurrence_family.clone(),
         activation_generation: 1,

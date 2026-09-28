@@ -83,7 +83,7 @@ impl SourceRef {
     }
 }
 
-pub(super) fn source_ref_value(source_ref: &SourceRef) -> CanonicalValue {
+pub(crate) fn source_ref_value(source_ref: &SourceRef) -> CanonicalValue {
     CanonicalValue::Object(BTreeMap::from([
         (
             "content_sha256",
@@ -467,25 +467,77 @@ impl PreparedFacts {
 }
 
 fn prepared_facts_fields(facts: &PreparedFacts) -> BTreeMap<&'static str, CanonicalValue> {
+    prepared_facts_fields_from_parts(
+        &facts.run_context_sha256,
+        &facts.source_contract_id,
+        &facts.source_contract_version,
+        &facts.source_refs,
+        facts.canonical_facts.len(),
+        &facts.facts_sha256,
+        &facts.provider_observed_at,
+        facts.verified_empty,
+        &facts.model_output_refs,
+    )
+}
+
+/// Recompute the normal PreparedFacts/v1 digest after restart from the source
+/// proof. This returns only a digest and grants no capture or catalog binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn n02_replay_prepared_facts_sha256(
+    run_context_sha256: &Sha256Digest,
+    source_contract_id: &SourceContractId,
+    source_contract_version: &SourceContractVersion,
+    source_refs: &[SourceRef],
+    canonical_facts_len: usize,
+    canonical_facts_sha256: &Sha256Digest,
+    provider_observed_at: &[SourceTime],
+) -> Sha256Digest {
+    canonical_digest(
+        "PreparedFacts/v1",
+        &prepared_facts_fields_from_parts(
+            run_context_sha256,
+            source_contract_id,
+            source_contract_version,
+            source_refs,
+            canonical_facts_len,
+            canonical_facts_sha256,
+            provider_observed_at,
+            false,
+            &[],
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_facts_fields_from_parts(
+    run_context_sha256: &Sha256Digest,
+    source_contract_id: &SourceContractId,
+    source_contract_version: &SourceContractVersion,
+    source_refs: &[SourceRef],
+    canonical_facts_len: usize,
+    canonical_facts_sha256: &Sha256Digest,
+    provider_observed_at: &[SourceTime],
+    verified_empty: bool,
+    model_output_refs: &[ModelOutputRef],
+) -> BTreeMap<&'static str, CanonicalValue> {
     BTreeMap::from([
         (
             "canonical_facts",
             CanonicalValue::Object(BTreeMap::from([
                 (
                     "length",
-                    CanonicalValue::Unsigned(facts.canonical_facts.len() as u64),
+                    CanonicalValue::Unsigned(canonical_facts_len as u64),
                 ),
                 (
                     "sha256",
-                    CanonicalValue::String(facts.facts_sha256.as_str().to_owned()),
+                    CanonicalValue::String(canonical_facts_sha256.as_str().to_owned()),
                 ),
             ])),
         ),
         (
             "model_output_refs",
             CanonicalValue::Array(
-                facts
-                    .model_output_refs
+                model_output_refs
                     .iter()
                     .map(model_output_ref_value)
                     .collect(),
@@ -493,35 +545,29 @@ fn prepared_facts_fields(facts: &PreparedFacts) -> BTreeMap<&'static str, Canoni
         ),
         (
             "provider_observed_at",
-            CanonicalValue::Array(
-                facts
-                    .provider_observed_at
-                    .iter()
-                    .map(source_time_value)
-                    .collect(),
-            ),
+            CanonicalValue::Array(provider_observed_at.iter().map(source_time_value).collect()),
         ),
         (
             "run_context_sha256",
-            CanonicalValue::String(facts.run_context_sha256.as_str().to_owned()),
+            CanonicalValue::String(run_context_sha256.as_str().to_owned()),
         ),
         (
             "source_contract_id",
-            CanonicalValue::String(facts.source_contract_id.as_str().to_owned()),
+            CanonicalValue::String(source_contract_id.as_str().to_owned()),
         ),
         (
             "source_contract_version",
-            CanonicalValue::String(facts.source_contract_version.as_str().to_owned()),
+            CanonicalValue::String(source_contract_version.as_str().to_owned()),
         ),
         (
             "source_refs",
-            CanonicalValue::Array(facts.source_refs.iter().map(source_ref_value).collect()),
+            CanonicalValue::Array(source_refs.iter().map(source_ref_value).collect()),
         ),
-        ("verified_empty", CanonicalValue::Bool(facts.verified_empty)),
+        ("verified_empty", CanonicalValue::Bool(verified_empty)),
     ])
 }
 
-fn source_time_value(source_time: &SourceTime) -> CanonicalValue {
+pub(crate) fn source_time_value(source_time: &SourceTime) -> CanonicalValue {
     CanonicalValue::Object(BTreeMap::from([
         (
             "kind",

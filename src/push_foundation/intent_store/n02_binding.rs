@@ -12,6 +12,7 @@ use chrono::NaiveDate;
 use serde_json::Value;
 
 const DOMAIN: &str = "N02PreparedPush/v1";
+mod v2;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum N02BindingError {
@@ -292,6 +293,9 @@ pub(crate) struct AttestedN02Intent {
 impl IntentSnapshot {
     pub(crate) fn attested_n02_binding(&self) -> Result<AttestedN02Intent> {
         let ready = self.attested_ready_binding()?;
+        if self.source_contract_id == crate::monitor::push_job::N02_SOURCE_CONTRACT_ID {
+            return v2::attest_source_v2(self, ready);
+        }
         let bytes = self
             .prepared_push_bytes
             .as_deref()

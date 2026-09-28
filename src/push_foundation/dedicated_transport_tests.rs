@@ -2127,6 +2127,51 @@ fn w13_n02_old_opaque_rejects_before_source_lookup() {
 }
 
 #[test]
+fn n02_v2_contract_rejects_legacy_v1_before_authority_query() {
+    let case = n02_case();
+    let identity = InitialIntentIdentity::new(
+        Namespace::test(
+            crate::monitor::push_job::RunId::try_new("TEST_CODE_N02_V2_REJECTION".into()).unwrap(),
+        ),
+        UnitId::try_new("MU-news-flash-aggregate".into()).unwrap(),
+        OccurrenceIdentityMaterial::new(
+            BusinessDate::parse("2026-08-18").unwrap(),
+            OccurrenceFamily::try_new("news-flash-window".into()).unwrap(),
+            OccurrenceKey::try_new("09:30".into()).unwrap(),
+        ),
+        CompletionOwnerId::try_new("news-flash-accepted-window".into()).unwrap(),
+        SourceContractId::try_new(crate::monitor::push_job::N02_SOURCE_CONTRACT_ID.into()).unwrap(),
+        SubjectId::Global,
+        AudienceId::try_new("portfolio-owner".into()).unwrap(),
+    );
+    let draft = super::intent_store::n02_test_support::ready_default(
+        identity,
+        case.snapshot.rendered_bytes().unwrap().to_vec(),
+        case.route.template().sha256().clone(),
+        raw_digest(b"TEST_CODE_N02_V2_CONTRACT"),
+        conformance_time(1_787_027_400_000_000),
+    );
+    let database = case._root.path().join("business.sqlite3");
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let row = store.record_initial(&draft).unwrap().snapshot().clone();
+    assert!(row.attested_ready_binding().is_ok());
+    let source = n02_source(&case, 0);
+    assert_eq!(
+        super::dedicated_transport::inspect_n02_dedicated(
+            &row,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &source,
+        ),
+        Err(DedicatedConformanceError::InvalidN02Binding)
+    );
+    assert!(source.queried.borrow().is_empty());
+    let after = store.inspect(draft.intent_id()).unwrap().unwrap();
+    assert_eq!(after.state(), row.state());
+    assert_eq!(after.version(), row.version());
+}
+
+#[test]
 fn w13_n02_shared_sqlite_coherent_mismatch_records_only_blocked_recovery_transitions() {
     for variant in ["reservation", "order", "window", "raw_render", "opaque"] {
         let order_sources = if variant == "order" {
