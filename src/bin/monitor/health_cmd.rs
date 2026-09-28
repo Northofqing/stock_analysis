@@ -9,9 +9,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const SNAPSHOT_VERSION: u8 = 2;
+const HEARTBEAT_VERSION: u8 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 4_096;
 const MAX_SNAPSHOT_AGE: Duration = Duration::minutes(10);
 const MAX_CLOCK_LEAD: Duration = Duration::seconds(5);
+// Process-liveness reporting policy, not an availability SLA.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const MAX_HEARTBEAT_AGE: Duration = Duration::minutes(10);
 
 pub fn new_boot_id() -> String {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -67,6 +71,14 @@ struct HealthSnapshot {
     missing_capabilities: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProcessHeartbeat {
+    version: u8,
+    boot_id: String,
+    observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthReport {
     status: &'static str,
@@ -90,6 +102,12 @@ fn snapshot_path(root: &Path, test_mode: bool) -> PathBuf {
     root.join("data")
         .join(if test_mode { "test/health" } else { "health" })
         .join("monitor-banner-v2.json")
+}
+
+fn heartbeat_path(root: &Path, test_mode: bool) -> PathBuf {
+    root.join("data")
+        .join(if test_mode { "test/health" } else { "health" })
+        .join("heartbeat.json")
 }
 
 fn lease_path(root: &Path, test_mode: bool) -> PathBuf {
@@ -225,14 +243,59 @@ fn write_banner_snapshot_at(
 
 fn write_snapshot_at(path: &Path, snapshot: &HealthSnapshot) -> Result<(), String> {
     validate_snapshot(snapshot).map_err(str::to_owned)?;
-    let parent = path.parent().ok_or("health snapshot path has no parent")?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("create health directory: {error}"))?;
     let bytes = serde_json::to_vec(snapshot)
         .map_err(|error| format!("serialize health snapshot: {error}"))?;
+    atomic_replace_bytes(path, &bytes, "health snapshot")
+}
+
+pub fn write_process_heartbeat(
+    test_mode: bool,
+    boot_id: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<(), String> {
+    let root = stock_analysis::production_root::root_for_mode(test_mode);
+    write_heartbeat_at(&heartbeat_path(root, test_mode), boot_id, observed_at)
+}
+
+fn write_heartbeat_at(
+    path: &Path,
+    boot_id: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<(), String> {
+    let heartbeat = ProcessHeartbeat {
+        version: HEARTBEAT_VERSION,
+        boot_id: boot_id.to_owned(),
+        observed_at,
+    };
+    validate_heartbeat_shape(&heartbeat).map_err(str::to_owned)?;
+    let bytes = serde_json::to_vec(&heartbeat)
+        .map_err(|error| format!("serialize process heartbeat: {error}"))?;
+    atomic_replace_bytes(path, &bytes, "process heartbeat")
+}
+
+fn atomic_replace_bytes(path: &Path, bytes: &[u8], kind: &str) -> Result<(), String> {
+    atomic_replace_bytes_with(path, bytes, kind, || Ok(()))
+}
+
+fn atomic_replace_bytes_with(
+    path: &Path,
+    bytes: &[u8],
+    kind: &str,
+    before_rename: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return Err(format!("{kind} exceeds size limit"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{kind} path has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("create health directory: {error}"))?;
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temp = parent.join(format!(
-        ".monitor-banner-{}-{}.tmp",
+        ".monitor-health-{}-{}-{}.tmp",
         std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -244,17 +307,68 @@ fn write_snapshot_at(path: &Path, snapshot: &HealthSnapshot) -> Result<(), Strin
     let result = (|| {
         let mut file = options
             .open(&temp)
-            .map_err(|error| format!("create health snapshot temp: {error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("write health snapshot: {error}"))?;
+            .map_err(|error| format!("create {kind} temp: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {kind}: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("sync health snapshot: {error}"))?;
-        std::fs::rename(&temp, path).map_err(|error| format!("replace health snapshot: {error}"))
+            .map_err(|error| format!("sync {kind}: {error}"))?;
+        before_rename()?;
+        std::fs::rename(&temp, path).map_err(|error| format!("replace {kind}: {error}"))?;
+        // A failure here is a durability error: rename already replaced the destination.
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync health directory after replacing {kind}: {error}"))?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+fn valid_heartbeat_boot_id(value: &str) -> bool {
+    value.len() <= 96
+        && value.split(':').count() == 3
+        && value
+            .split(':')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn validate_heartbeat_shape(heartbeat: &ProcessHeartbeat) -> Result<(), &'static str> {
+    if heartbeat.version != HEARTBEAT_VERSION
+        || !valid_heartbeat_boot_id(&heartbeat.boot_id)
+        || heartbeat.observed_at.timestamp() < 0
+    {
+        return Err("process_heartbeat_invalid");
+    }
+    Ok(())
+}
+
+fn validate_heartbeat_at(
+    heartbeat: &ProcessHeartbeat,
+    now: DateTime<Utc>,
+) -> Result<(), &'static str> {
+    validate_heartbeat_shape(heartbeat)?;
+    if heartbeat.observed_at > now + MAX_CLOCK_LEAD {
+        return Err("process_heartbeat_invalid");
+    }
+    Ok(())
+}
+
+fn read_heartbeat_at(path: &Path, now: DateTime<Utc>) -> Result<ProcessHeartbeat, &'static str> {
+    let file = std::fs::File::open(path).map_err(|_| "process_heartbeat_unavailable")?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "process_heartbeat_unavailable")?;
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return Err("process_heartbeat_invalid");
+    }
+    let heartbeat: ProcessHeartbeat =
+        serde_json::from_slice(&bytes).map_err(|_| "process_heartbeat_invalid")?;
+    validate_heartbeat_at(&heartbeat, now)?;
+    Ok(heartbeat)
 }
 
 fn validate_snapshot(snapshot: &HealthSnapshot) -> Result<(), &'static str> {
@@ -857,5 +971,109 @@ mod tests {
             report_at(root.path(), false, Utc::now()).reason_code,
             Some("health_snapshot_process_mismatch")
         );
+    }
+
+    #[test]
+    fn process_heartbeat_roundtrips_and_isolates_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let production = heartbeat_path(root.path(), false);
+        let test = heartbeat_path(root.path(), true);
+        assert_eq!(production, root.path().join("data/health/heartbeat.json"));
+        assert_eq!(test, root.path().join("data/test/health/heartbeat.json"));
+        write_heartbeat_at(&production, "123:456:1", now).unwrap();
+        assert_eq!(
+            read_heartbeat_at(&production, now).unwrap(),
+            ProcessHeartbeat {
+                version: HEARTBEAT_VERSION,
+                boot_id: "123:456:1".to_owned(),
+                observed_at: now,
+            }
+        );
+        assert_eq!(
+            read_heartbeat_at(&test, now).unwrap_err(),
+            "process_heartbeat_unavailable"
+        );
+        write_heartbeat_at(&test, "789:1000:2", now).unwrap();
+        assert_eq!(read_heartbeat_at(&test, now).unwrap().boot_id, "789:1000:2");
+        assert_eq!(
+            read_heartbeat_at(&production, now).unwrap().boot_id,
+            "123:456:1"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&production).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn process_heartbeat_rejects_bad_schema_identity_and_time() {
+        let root = tempfile::tempdir().unwrap();
+        let path = heartbeat_path(root.path(), false);
+        let now = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(write_heartbeat_at(&path, "123::1", now).is_err());
+        assert!(!path.exists());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for payload in [
+            r#"{"version":2,"boot_id":"123:456:1","observed_at":"2026-09-29T00:00:00Z"}"#,
+            r#"{"version":1,"boot_id":"123:456:1","observed_at":"2026-09-29T00:00:00Z","account_mode":"Normal"}"#,
+            r#"{"version":1,"boot_id":"123::1","observed_at":"2026-09-29T00:00:00Z"}"#,
+            r#"{"version":1,"boot_id":"123:456:1","observed_at":"invalid"}"#,
+            r#"{"version":1,"boot_id":"123:456:1","observed_at":"1969-12-31T23:59:59Z"}"#,
+            r#"{"version":1,"boot_id":"123:456:1","observed_at":"2026-09-29T00:00:06Z"}"#,
+        ] {
+            std::fs::write(&path, payload).unwrap();
+            assert_eq!(
+                read_heartbeat_at(&path, now).unwrap_err(),
+                "process_heartbeat_invalid",
+                "{payload}"
+            );
+        }
+        std::fs::write(&path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_heartbeat_at(&path, now).unwrap_err(),
+            "process_heartbeat_invalid"
+        );
+        // Old observations remain structurally readable for Task 3's stale result.
+        write_heartbeat_at(
+            &path,
+            "123:456:1",
+            now - MAX_HEARTBEAT_AGE - Duration::seconds(1),
+        )
+        .unwrap();
+        assert!(read_heartbeat_at(&path, now).is_ok());
+        assert_eq!(HEARTBEAT_INTERVAL.as_secs(), 60);
+    }
+
+    #[test]
+    fn process_heartbeat_pre_rename_failure_preserves_prior_file_and_cleans_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let path = heartbeat_path(root.path(), false);
+        let now = Utc::now();
+        write_heartbeat_at(&path, "123:456:1", now).unwrap();
+        let prior = std::fs::read(&path).unwrap();
+        let replacement = serde_json::to_vec(&ProcessHeartbeat {
+            version: HEARTBEAT_VERSION,
+            boot_id: "123:456:2".to_owned(),
+            observed_at: now + Duration::seconds(1),
+        })
+        .unwrap();
+        let error = atomic_replace_bytes_with(&path, &replacement, "process heartbeat", || {
+            Err("injected failure before rename".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(error, "injected failure before rename");
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec!["heartbeat.json"]);
     }
 }
