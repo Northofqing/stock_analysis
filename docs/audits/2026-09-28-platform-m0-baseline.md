@@ -74,3 +74,4 @@
 4. 等 VM 回复 D14、D17/D20 的唯一 owner、合同身份及可用字段；MarketAnnouncements 的本地接线已由真实 RPC 验证，但生产路径仍需部署后复核。
 5. 按 [费用 ADR](../adr/0001-versioned-a-share-fee-schedule.md) 实施新口径，保持 v1 账本与历史回执可重放；未完成前，不把现有 paper 净收益称为现行 A 股费用口径。
 6. [B06 来源裁决](2026-09-28-b06-source-rulings.md)已把 T-14/T-15 定为保持禁用、T-19 定为 Starved；后续清理旧定时入口和目录状态时须保持这些语义。
+7. [B07 首批 Unit 任务卡](../push-system/2026-09-28-m1-first-units.md)已拆 owner、共同故障矩阵与初步顺序；每卡在物理切换前仍要核当前制品和真实源事实。
