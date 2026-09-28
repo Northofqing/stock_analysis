@@ -1,4 +1,9 @@
-"""Build a read-only M0 catalog matrix and unattributed durable-delivery counts."""
+"""Build an M0 matrix from a caller-supplied, isolated stable SQLite snapshot.
+
+The queries are logically read-only. SQLite may still create WAL sidecar files
+with mode=ro/query_only; a live production WAL database requires a separately
+controlled snapshot before it is passed here.
+"""
 
 import datetime as dt
 import hashlib
@@ -110,6 +115,11 @@ def _catalog_rows(root: Path) -> tuple[list[dict], str, str]:
                 "finalizer": "Unknown",
             }
         )
+    emitted_producers = [
+        producer["id"] for row in rows for producer in row["producers"]
+    ]
+    if len(emitted_producers) != 102 or set(emitted_producers) != set(producer_ids):
+        raise ValueError("migration unit rows do not cover all 102 producers exactly once")
     return rows, catalog_hash, delta_hash
 
 
@@ -170,7 +180,12 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> list[dict]:
 
 
 def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> dict:
-    """Return catalog status and separate kind counts without attributing delivery to Units."""
+    """Return logically read-only counts from an isolated stable v9 snapshot.
+
+    The caller must supply a fixture or controlled snapshot, not a live
+    production WAL path. WAL sidecar creation is possible despite mode=ro and
+    query_only. Kind counts never attribute delivery to Units.
+    """
     if _date(from_date) > _date(to_date):
         raise ValueError("from_date must not exceed to_date")
     units, catalog_hash, delta_hash = _catalog_rows(root.resolve())

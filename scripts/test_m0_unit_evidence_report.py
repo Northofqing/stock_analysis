@@ -161,7 +161,7 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing durable-delivery columns"):
             self.report()
 
-    def test_read_only_query_does_not_expose_ids_or_change_database(self):
+    def test_rollback_journal_fixture_does_not_expose_ids_or_change_database(self):
         self.decision("SECRET_ACCOUNT_DECISION", "NewsAiAnalysis")
         self.result("SECRET_RESULT_ID", "SECRET_ACCOUNT_DECISION")
         before = self.db.read_bytes()
@@ -179,6 +179,22 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             str(self.db),
         ):
             self.assertNotIn(secret, output)
+
+    def test_wal_read_only_connection_can_create_sidecars(self):
+        self.decision("SECRET_WAL_DECISION", "DataMode")
+        self.result("SECRET_WAL_RESULT", "SECRET_WAL_DECISION")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
+        before = self.db.read_bytes()
+        self.assertFalse(self.db.with_name(self.db.name + "-wal").exists())
+        self.assertFalse(self.db.with_name(self.db.name + "-shm").exists())
+
+        report = self.report()
+
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertTrue(self.db.with_name(self.db.name + "-wal").exists())
+        self.assertTrue(self.db.with_name(self.db.name + "-shm").exists())
+        self.assertEqual(report["unattributed_kind_candidates"][0]["decisions"], 1)
 
 
 if __name__ == "__main__":
