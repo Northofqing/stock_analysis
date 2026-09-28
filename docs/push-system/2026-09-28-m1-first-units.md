@@ -4,6 +4,8 @@
 
 2026-09-28 定向 `cargo test --locked --offline --lib push_foundation::readiness_probe_tests::` 7/7 通过，仅证明冻结 v1 目录的 readiness inventory、分母和缺事实归类逻辑；它不证明生产 readiness 或任何 Unit 的真实 receipt。
 
+2026-09-28 `eff7ce6d` 修复定时分析入口：将 `build_stock_list` 已取得的宏观背景和涨停代码集合传入 `AnalysisPipeline`，与手动单次入口保持相同的分析输入。该修复只覆盖 `MU-cli-single` / `MU-cli-summary` 的定时来源上下文；独立 completion identity、durable receipt 和物理 owner 迁移仍未完成。
+
 ## 共同验收门
 
 每个 Unit 先保存同一份 `PreparedFacts`，shadow 比较 occurrence、业务日、主体、事实来源、规则/模板版本、抑制原因及 exact payload bytes，不重拉 provider、不再调用 LLM、不写 cursor、不触碰 sink。新 owner 的 intent、跨 business/durable DB finalizer、reconciler、activation manifest、readiness、Draining 回退必须在该 Unit 故障矩阵中闭合。
