@@ -5299,20 +5299,7 @@ pub async fn ensure_magiclaw_daemon(
         return Ok(DaemonReadySource::Reused);
     }
 
-    let mut cmd = tokio::process::Command::new(magiclaw_bin);
-    let magiclaw_db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| {
-        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())
-    });
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("MAGICLAW_API_ADDR", api_addr)
-        .env("MAGICLAW_DB_PATH", magiclaw_db_path);
-
-    if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
-        cmd.env("WECHAT_CHANNEL_DIR", dir);
-    }
-
+    let mut cmd = magiclaw_daemon_command(magiclaw_bin, api_addr)?;
     let mut child = cmd.spawn().map_err(|e| {
         format!(
             "启动 magiclaw daemon 失败(magiclaw: {}): {}",
@@ -5368,6 +5355,37 @@ pub async fn ensure_magiclaw_daemon(
     }
 
     Err(format!("daemon 启动后健康检查超时: {} (等待30s)", api_addr))
+}
+
+fn magiclaw_daemon_command(
+    magiclaw_bin: &str,
+    api_addr: &str,
+) -> Result<tokio::process::Command, String> {
+    let mut cmd = tokio::process::Command::new(magiclaw_bin);
+    let magiclaw_db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| {
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())
+    });
+    let magiclaw_db_path = std::path::Path::new(&magiclaw_db_path);
+    let magiclaw_db_path = if magiclaw_db_path.is_absolute() {
+        magiclaw_db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("解析 MAGICLAW_DB_PATH 失败: 无法读取 monitor 工作目录: {e}"))?
+            .join(magiclaw_db_path)
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("MAGICLAW_API_ADDR", api_addr)
+        .env("MAGICLAW_DB_PATH", magiclaw_db_path);
+
+    if let Some(home) = resolve_magiclaw_home(magiclaw_bin) {
+        cmd.current_dir(home);
+    }
+    if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
+        cmd.env("WECHAT_CHANNEL_DIR", dir);
+    }
+    Ok(cmd)
 }
 
 pub fn tail_lines(s: &str, n: usize) -> String {
@@ -7867,6 +7885,35 @@ mod tests {
         assert!(!transaction.contains("push_wechat(text)"));
         assert!(!transaction.contains("sink_router().route"));
         assert!(!transaction.contains("publish_news_flash_delivery("));
+    }
+
+    #[test]
+    #[serial_test::serial(notify_env)]
+    fn daemon_command_loads_magiclaw_home_and_keeps_monitor_relative_database() {
+        let _env =
+            crate::TestEnvGuard::capture(&["MAGICLAW_HOME", "MAGICLAW_DB_PATH", "DATABASE_PATH"]);
+        let home = notify_temp_dir("daemon_home");
+        std::fs::write(home.join(".env"), "TEST_CODE=1\n").unwrap();
+        std::env::set_var("MAGICLAW_HOME", &home);
+        std::env::set_var("MAGICLAW_DB_PATH", "./data/test_magiclaw.db");
+
+        let command = magiclaw_daemon_command("/TEST_CODE/bin/magiclaw", "127.0.0.1:8080")
+            .expect("configure daemon launch");
+        assert_eq!(command.as_std().get_current_dir(), Some(home.as_path()));
+        let db_path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key == &std::ffi::OsStr::new("MAGICLAW_DB_PATH"))
+            .and_then(|(_, value)| value)
+            .expect("daemon database path");
+        assert_eq!(
+            std::path::Path::new(db_path),
+            std::env::current_dir()
+                .unwrap()
+                .join("./data/test_magiclaw.db")
+        );
+
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
