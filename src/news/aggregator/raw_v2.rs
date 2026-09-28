@@ -1120,6 +1120,7 @@ fn classify_gateway_error(error: &GatewayError) -> (&'static str, &'static str, 
 mod tests {
     use super::*;
     use crate::market_domain::{ProviderId, SourceEvidence};
+    use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TypedFixturePort {
@@ -1133,6 +1134,28 @@ mod tests {
     struct EastmoneyRequestSinaEvidencePort;
 
     struct OverLimitFixturePort;
+
+    struct EastmoneySourcePreconditionPort {
+        failure: GatewayError,
+    }
+
+    #[async_trait]
+    impl RawGlobalNewsPort for EastmoneySourcePreconditionPort {
+        async fn fetch(
+            &self,
+            provider: GlobalNewsProvider,
+            _limit: u32,
+        ) -> Result<GatewayBatch<GlobalNewsRecord>, GatewayError> {
+            if provider == GlobalNewsProvider::Eastmoney {
+                Err(self.failure.clone())
+            } else {
+                Ok(GatewayBatch::VerifiedEmpty(evidence(
+                    provider,
+                    provider.feed_name(),
+                )))
+            }
+        }
+    }
 
     #[async_trait]
     impl RawGlobalNewsPort for TypedFixturePort {
@@ -1350,6 +1373,70 @@ mod tests {
                 true,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn eastmoney_source_precondition_failure_keeps_wire_reason_and_fails_closed() {
+        use crate::grpc_client::errors::{GrpcError, StatusErrorContext};
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            AdmissionState as ExternalAdmission, ErrorDetail as ExternalErrorDetail,
+            Operation as ExternalOperation,
+        };
+        use crate::grpc_client::pb::magic::market::v1::{
+            AdmissionState as LocalAdmission, Operation,
+        };
+        use crate::grpc_contract::methods::{ContractProfile, MethodIdentity};
+
+        let request_id = "TEST_CODE_EASTMONEY_SOURCE_PRECONDITION";
+        let wire = ExternalErrorDetail {
+            request_id: request_id.to_owned(),
+            operation: ExternalOperation::GlobalNews as i32,
+            provider: "Eastmoney".to_owned(),
+            reason_code: "source_precondition_failed".to_owned(),
+            retryable: false,
+            admission: ExternalAdmission::Unadmitted as i32,
+            ..Default::default()
+        };
+        let method = MethodIdentity::from_client_operation(
+            ContractProfile::ExternalV1,
+            Operation::GlobalNews,
+        )
+        .expect("ExternalV1 GlobalNews method");
+        let error = GrpcError::from_status(
+            tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                "source precondition failed",
+                wire.encode_to_vec().into(),
+            ),
+            StatusErrorContext::data(method, request_id),
+        );
+        assert_eq!(error.details().admission, Some(LocalAdmission::Unadmitted));
+        assert_eq!(error.details().reason_code.as_deref(), Some("source_precondition_failed"));
+
+        let failure = crate::data_gateway::grpc_source::map_external_query_error(
+            Operation::GlobalNews,
+            &error,
+        );
+        assert_eq!(failure.provider(), Some(ProviderId::Eastmoney));
+        assert_eq!(failure.reason_code(), "source_precondition_failed");
+        assert!(!failure.retryable());
+
+        let batch = fetch_raw_global_news_batch_with(
+            &EastmoneySourcePreconditionPort { failure },
+            1,
+        )
+        .await
+        .expect("typed acquisition returns all terminal attempts");
+        let projection = project_news_flash_events(&batch);
+        assert!(projection.events().is_empty());
+        let source_failure = projection
+            .failures()
+            .iter()
+            .find(|failure| failure.provider() == GlobalNewsProvider::Eastmoney)
+            .expect("Eastmoney must remain unavailable");
+        assert_eq!(source_failure.reason_code(), "source_precondition_failed");
+        assert_eq!(source_failure.diagnostic_code(), "source_precondition_failed");
+        assert!(!source_failure.retryable());
     }
 
     #[tokio::test]

@@ -310,6 +310,7 @@ enum KnownReasonCode {
     ProviderUnavailable,
     ExternalQueryRejected,
     ProviderResponseInvalid,
+    SourcePreconditionFailed,
 }
 
 impl KnownReasonCode {
@@ -337,6 +338,7 @@ impl KnownReasonCode {
             "provider_unavailable" => Self::ProviderUnavailable,
             "external_query_rejected" => Self::ExternalQueryRejected,
             "provider_response_invalid" => Self::ProviderResponseInvalid,
+            "source_precondition_failed" => Self::SourcePreconditionFailed,
             _ => return None,
         })
     }
@@ -365,6 +367,7 @@ impl KnownReasonCode {
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ExternalQueryRejected => "external_query_rejected",
             Self::ProviderResponseInvalid => "provider_response_invalid",
+            Self::SourcePreconditionFailed => "source_precondition_failed",
         }
     }
 }
