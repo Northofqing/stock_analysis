@@ -1,4 +1,5 @@
 use super::*;
+use crate::grpc_client::build_identity::BuildIdentityTrust;
 use crate::grpc_client::client::external_control_loopback_fixture::{
     ExternalControlObservation, ExternalMtlsMacroFixture, ObservedHealthTrailer,
 };
@@ -9,6 +10,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     AdmissionState, CanonicalPayload, CapabilitiesResponse, Capability, ErrorDetail, Operation,
     ProviderAttemptDetail, QueryResponse,
 };
+use crate::grpc_client::historical_external::DESCRIPTOR_SHA256 as FROZEN_A_DESCRIPTOR_SHA256;
 use crate::grpc_client::provider_attempts::ProviderAttempts;
 use crate::grpc_client::retry::RetryDecision;
 use crate::push_foundation::intent_store::chain_post_close::macro_stage::{
@@ -350,7 +352,7 @@ fn mutated_v2_bytes(bytes: &[u8], case: RealV2Tamper) -> Vec<u8> {
         ),
         RealV2Tamper::Descriptor => replace_once(
             bytes,
-            crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+            FROZEN_A_DESCRIPTOR_SHA256,
             "0ba0fa3b2fa450e74bdcc8cb5f163348a6ca90df3f3626d1d8f2ec27137f5edb",
             case.label(),
         ),
@@ -579,7 +581,6 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
     };
     use crate::grpc_client::external_query_transport::{
         wire_error, ExternalQueryMethod, ExternalWireEvidenceV1,
-        EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
     };
 
     let mut business = V2BusinessFixture::new();
@@ -616,7 +617,8 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
             )
             .unwrap_or_else(|error| {
                 panic!("TEST_CODE {} prepare client bundle: {error:?}", case.label())
-            });
+            })
+            .with_test_build_trust(BuildIdentityTrust::test_historical_a());
 
             let mut local = business
                 .store
@@ -742,7 +744,7 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
                 material: "external-unary-response-evidence-v1".to_owned(),
                 profile: "ExternalV1".to_owned(),
                 method: ExternalQueryMethod::GlobalNews,
-                client_descriptor_sha256: EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256.to_owned(),
+                client_descriptor_sha256: FROZEN_A_DESCRIPTOR_SHA256.to_owned(),
                 evidence: case.evidence(),
             };
             let completion = ExternalMacroAttemptCompletion::Unary(MacroAttemptCompletion {
@@ -797,14 +799,14 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
                         "material": "external-unary-response-evidence-v1",
                         "profile": "ExternalV1",
                         "method": "OPERATION_GLOBAL_NEWS",
-                        "client_descriptor_sha256": EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                        "client_descriptor_sha256": FROZEN_A_DESCRIPTOR_SHA256,
                         "evidence": case.evidence_json(),
                     },
                     "wire_identity": {
                         "profile": "ExternalV1",
                         "method": "OPERATION_GLOBAL_NEWS",
                         "request_id": checkpoint.data.id,
-                        "client_descriptor_sha256": EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                        "client_descriptor_sha256": FROZEN_A_DESCRIPTOR_SHA256,
                     },
                 }),
                 "{} exact committed RawResult V3",
@@ -833,13 +835,13 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
             assert_eq!(error.capability(), "GrpcExternalV1");
             assert_eq!(error.provider(), None);
             assert_eq!(error.audit_outcome(), "partial");
-            assert_eq!(error.reason_code(), "internal");
+            assert_eq!(error.reason_code(), "external_response_wire_invalid");
             assert!(!error.retryable());
             assert_eq!(error.message(), "ExternalV1 GlobalNews 查询失败");
             let native = source.final_bytes().unwrap().to_vec();
             assert_eq!(
                 native,
-                r#"{"error":{"audit_outcome":"partial","capability":"GrpcExternalV1","message":"ExternalV1 GlobalNews 查询失败","provider":null,"reason_code":"internal","retryable":false},"kind":"Error","version":1}"#.as_bytes()
+                r#"{"error":{"audit_outcome":"partial","capability":"GrpcExternalV1","message":"ExternalV1 GlobalNews 查询失败","provider":null,"reason_code":"external_response_wire_invalid","retryable":false},"kind":"Error","version":1}"#.as_bytes()
             );
             let receipt = source.audit_receipt().unwrap().clone();
             let plan_bytes = recovered.plan_bytes().to_vec();
@@ -864,7 +866,7 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
                 (audit.request_count, audit.accepted_count, audit.rejected_count),
                 (1, 0, 1)
             );
-            assert_eq!(audit.reason_code, "internal");
+            assert_eq!(audit.reason_code, "external_response_wire_invalid");
             assert!(!audit.retryable);
             read_acquisition_in_transaction(&transaction, &baseline.receipt).unwrap();
             transaction.commit().unwrap();
@@ -928,7 +930,7 @@ async fn run_valid_failure_writer_reopen_case(case: ValidFailureWriterCase) {
             assert_eq!(reopened_error.capability(), "GrpcExternalV1");
             assert_eq!(reopened_error.provider(), None);
             assert_eq!(reopened_error.audit_outcome(), "partial");
-            assert_eq!(reopened_error.reason_code(), "internal");
+            assert_eq!(reopened_error.reason_code(), "external_response_wire_invalid");
             assert!(!reopened_error.retryable());
             assert_eq!(reopened_error.message(), "ExternalV1 GlobalNews 查询失败");
             drop(reopened);
@@ -1054,7 +1056,7 @@ async fn single_user_external_macro_real_v2_tamper_rejects_before_any_resend() {
             );
             assert_eq!(
                 legal_json["external_wire"]["client_descriptor_sha256"],
-                crate::grpc_client::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+                FROZEN_A_DESCRIPTOR_SHA256
             );
             assert_eq!(
                 legal_json["external_wire"]["evidence"]["Payload"]["protobuf_payload"],
@@ -1803,7 +1805,8 @@ async fn run_historical_provider_attempts_case(case: HistoricalProviderAttemptsC
             let prepared = crate::grpc_client::client::GrpcMarketClient::prepare_client_bundle(
                 external.bundle_path(),
             )
-            .expect("TEST_CODE historical attempts prepare bundle");
+            .expect("TEST_CODE historical attempts prepare bundle")
+            .with_test_build_trust(BuildIdentityTrust::test_historical_a());
 
             let mut local = business
                 .store

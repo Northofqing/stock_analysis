@@ -332,8 +332,8 @@ pub(super) async fn assert_task6_durable_b(mode: u8) {
             let mut running = Box::pin(macro_driver::drive(&mut local, lease, &source_a, &clock_a, Rc::new(Cell::new(false)), &search));
             loop {
                 tokio::select! {
-                    result = &mut running => panic!("A returned before retry checkpoint: {:?}; health={}, caps={}, data={}, statuses={}", result.err(), a.snapshot().health_requests.len(), a.snapshot().capabilities_calls, a.snapshot().data_calls, a.snapshot().data_statuses.len()),
-                    _ = tokio::task::yield_now() => {},
+                    result = &mut running => panic!("A returned before retry checkpoint: {:?}; health={}, caps={}, data={}, statuses={}", result.err().map(|error| format!("{error:#}")), a.snapshot().health_requests.len(), a.snapshot().capabilities_calls, a.snapshot().data_calls, a.snapshot().data_statuses.len()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {},
                 }
                 if a.snapshot().data_statuses.is_empty() { continue; }
                 let (recovered, run) = control_unknown_commit_tests::inspect_at(&database, &baseline.config, &baseline.intent);
