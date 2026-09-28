@@ -33,4 +33,6 @@
 
 `selection::process_bootstrap` 在启动时计算 activation gate；`activation_gate` 在 `now < effective_from` 时返回 `activation_not_effective`。因此必须等新文件的未来生效时刻到达后再重启 monitor，不能先重启、事后仅等时钟越过生效点。等待期间旧 PID 继续提供服务。
 
+18:00 UTC 后，`/private/tmp/stock-analysis-rollout-20260929-activation.json` 中的预览 `effective_from=2026-09-28T18:00:00Z` 已过；该文件的 `reviewed_by` 也是占位值。它只能供比对旧候选哈希，不能直接安装。实际切换需在候选源码和二进制重新放回运行根并核对哈希后，使用真实复核人和新的未来生效时刻生成 activation，再按上述顺序重启。
+
 如启动失败，先停止新实例，保持同一运行根和数据库；只回退二进制与匹配源码/activation，并核对已发生的写入和 Uncertain，不能覆盖生产 DB 或盲重发。VM 身份如变化，须与本地 bundle 同步切换，不做单侧回退。
