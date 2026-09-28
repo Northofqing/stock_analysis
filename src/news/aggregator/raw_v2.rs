@@ -848,6 +848,60 @@ pub fn project_news_flash_events(batch: &RawNewsAggregationBatch) -> NewsFlashSo
     projection
 }
 
+/// Test-process ingress for one normalized TEST_CODE record. The registered
+/// provider and ordinary projector still decide admission; other providers
+/// remain explicitly unavailable, never fabricated as verified empty.
+#[doc(hidden)]
+pub fn test_project_news_flash_record(
+    _capability: &NewsFlashProjectionTestCapability,
+    provider: GlobalNewsProvider,
+    record: GlobalNewsRecord,
+    evidence: BatchEvidence,
+) -> NewsFlashSourceProjection {
+    assert!(
+        crate::risk::env_guard::runtime_is_test_process()
+            && crate::risk::env_guard::current_env() == crate::risk::env_guard::TradingEnv::Test,
+        "TEST_CODE projection ingress requires a test process and namespace"
+    );
+    assert!(
+        record.item_id.starts_with("TEST_CODE")
+            && record.evidence.batch_id().starts_with("TEST_CODE")
+            && evidence.batch_id.starts_with("TEST_CODE"),
+        "test projection record and batch identities must start with TEST_CODE"
+    );
+    let attempted_at = record.observed_at;
+    let mut selected = Some((record, evidence));
+    let attempts = REGISTERED_PROVIDERS
+        .into_iter()
+        .map(|registered| RawGlobalNewsFeedAttempt {
+            registration: RegisteredGlobalNewsFeed::for_provider(registered),
+            attempted_at,
+            terminal: if registered == provider {
+                let (record, evidence) = selected
+                    .take()
+                    .expect("registered TEST_CODE provider occurs once");
+                RawGlobalNewsTerminal::Available {
+                    records: vec![record],
+                    evidence,
+                }
+            } else {
+                RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
+                    failed_stage: "test_fixture",
+                    diagnostic_code: "test_fixture_not_acquired",
+                    reason_code: "test_fixture_not_acquired",
+                    retryable: false,
+                    available_evidence: None,
+                    source_record_count: 0,
+                })
+            },
+        })
+        .collect();
+    project_news_flash_events(&RawNewsAggregationBatch {
+        attempts,
+        observed_at: attempted_at,
+    })
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum TestRawGlobalNewsTerminal {
