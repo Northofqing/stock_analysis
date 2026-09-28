@@ -53,7 +53,9 @@ fn save_prediction_on(
     score: f64,
     detail: Option<&str>,
 ) -> Result<NaiveDate, String> {
-    crate::calendar::verified_a_share_trading_day(today)?;
+    if !crate::calendar::verified_a_share_trading_day(today)? {
+        return Err(format!("预测生成日期不是已核验 A 股交易日: {today}"));
+    }
     let target = crate::calendar::verified_next_a_share_trading_day(today)?;
     db.save_prediction_legacy(
         &today.format("%Y-%m-%d").to_string(),

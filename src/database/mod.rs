@@ -4434,7 +4434,8 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
 
     /// Read recorded, verified prediction signal samples for the inclusive last
     /// `trading_days` checked-in A-share trading dates ending at `as_of`.
-    /// A prediction row does not prove its push was delivered.
+    /// Frozen target dates after `as_of` are excluded even if a result was
+    /// prematurely recorded. A prediction row does not prove its push was delivered.
     pub fn get_verified_prediction_sample_hit_rate(
         &self,
         as_of: NaiveDate,
@@ -4466,9 +4467,11 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         }
         let rows = diesel::sql_query(
             "SELECT pred_date, hit FROM prediction_tracker \
-             WHERE hit IS NOT NULL AND pred_date >= ?1 AND pred_date <= ?2",
+             WHERE hit IS NOT NULL AND pred_date >= ?1 AND pred_date <= ?2 \
+             AND target_date <= ?3",
         )
         .bind::<diesel::sql_types::Text, _>(window_start.format("%Y-%m-%d").to_string())
+        .bind::<diesel::sql_types::Text, _>(as_of.format("%Y-%m-%d").to_string())
         .bind::<diesel::sql_types::Text, _>(as_of.format("%Y-%m-%d").to_string())
         .load::<RecordedOutcome>(&mut *conn)?;
         let mut samples = 0_i64;

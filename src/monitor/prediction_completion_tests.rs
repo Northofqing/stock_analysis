@@ -9,12 +9,11 @@ fn private_db() -> (tempfile::TempDir, DatabaseManager) {
 }
 
 #[test]
-fn legacy_t1_uses_verified_calendar_and_fails_before_write_without_next_year() {
+fn legacy_t1_requires_trading_start_and_available_verified_target_before_write() {
     let (_dir, db) = private_db();
     for (today, target, code) in [
         ("2026-08-28", "2026-08-31", "TEST_CODE_t1_weekend"),
         ("2026-09-30", "2026-10-08", "TEST_CODE_t1_holiday"),
-        ("2026-10-04", "2026-10-08", "TEST_CODE_t1_closed_day"),
     ] {
         let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
         let projected = save_prediction_on(&db, today, None, Some(code), "up", 75., None)
@@ -26,6 +25,18 @@ fn legacy_t1_uses_verified_calendar_and_fails_before_write_without_next_year() {
         assert_eq!(row.target_date, target);
     }
     let before = db.count_predictions().unwrap();
+    for (closed, code) in [
+        ("2026-10-04", "TEST_CODE_t1_weekend_start"),
+        ("2026-10-07", "TEST_CODE_t1_holiday_start"),
+    ] {
+        let closed = NaiveDate::parse_from_str(closed, "%Y-%m-%d").unwrap();
+        assert!(
+            save_prediction_on(&db, closed, None, Some(code), "up", 75., None)
+                .unwrap_err()
+                .contains("不是已核验 A 股交易日")
+        );
+        assert_eq!(db.count_predictions().unwrap(), before);
+    }
     assert!(save_prediction_on(
         &db,
         NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
@@ -64,18 +75,20 @@ fn completed_shanghai_session_uses_close_boundary_and_verified_calendar() {
 }
 
 #[test]
-fn hit_rate_window_includes_only_last_n_verified_trading_dates() {
+fn hit_rate_window_counts_only_due_rows_on_verified_trading_dates() {
     let (_dir, db) = private_db();
-    for (index, pred_date, hit) in [
-        (0, "2026-09-30", false),
-        (1, "2026-10-07", true), // closure inside the natural-date range
-        (2, "2026-10-08", true),
-        (3, "2026-10-09", false),
-        (4, "2026-10-10", true), // weekend inside the natural-date range
-        (5, "2026-10-12", true), // after as_of
+    for (index, pred_date, target_date, hit) in [
+        (0, "2026-09-30", "2026-10-08", false),
+        (1, "2026-10-07", "2026-10-08", true), // closure inside natural-date range
+        (2, "2026-10-08", "2026-10-09", true),
+        (3, "2026-10-09", "2026-10-12", false),
+        (4, "2026-10-09", "2026-10-13", true), // premature result must not look ahead
+        (5, "2026-10-10", "2026-10-12", true), // weekend inside natural-date range
+        (6, "2026-10-12", "2026-10-13", true), // current signal has no due target
+        (7, "2026-10-13", "2026-10-14", true), // after as_of
     ] {
         let code = format!("TEST_CODE_window_{index}");
-        db.save_prediction_legacy(pred_date, "2026-10-13", None, Some(&code), "up", 75., None)
+        db.save_prediction_legacy(pred_date, target_date, None, Some(&code), "up", 75., None)
             .unwrap();
         let id = db.get_prediction_by_code_date(&code, pred_date).unwrap().id;
         assert_eq!(
@@ -84,31 +97,34 @@ fn hit_rate_window_includes_only_last_n_verified_trading_dates() {
             1
         );
     }
-    let as_of = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-    let one = db
+    let as_of = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+    assert!(db
         .get_verified_prediction_sample_hit_rate(as_of, 1)
-        .unwrap();
-    assert_eq!(
-        (one.window_start.to_string(), one.samples, one.hits),
-        ("2026-10-09".to_string(), 1, 0)
-    );
-    assert_eq!(one.rate, 0.);
+        .is_err());
     let two = db
         .get_verified_prediction_sample_hit_rate(as_of, 2)
         .unwrap();
     assert_eq!(
         (two.window_start.to_string(), two.samples, two.hits),
-        ("2026-10-08".to_string(), 2, 1)
+        ("2026-10-09".to_string(), 1, 0)
     );
-    assert_eq!(two.rate, 0.5);
+    assert_eq!(two.rate, 0.);
     let three = db
         .get_verified_prediction_sample_hit_rate(as_of, 3)
         .unwrap();
     assert_eq!(
         (three.window_start.to_string(), three.samples, three.hits),
+        ("2026-10-08".to_string(), 2, 1)
+    );
+    assert_eq!(three.rate, 0.5);
+    let four = db
+        .get_verified_prediction_sample_hit_rate(as_of, 4)
+        .unwrap();
+    assert_eq!(
+        (four.window_start.to_string(), four.samples, four.hits),
         ("2026-09-30".to_string(), 3, 1)
     );
-    assert!((three.rate - 1. / 3.).abs() < f64::EPSILON);
+    assert!((four.rate - 1. / 3.).abs() < f64::EPSILON);
     assert!(db
         .get_verified_prediction_sample_hit_rate(as_of, 0)
         .is_err());
