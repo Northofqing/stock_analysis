@@ -31,3 +31,4 @@ pub(crate) mod send_report_tests;
 pub use config::{NotificationChannel, NotificationConfig, SmtpConfig};
 pub use send_report::{NotificationAttempt, NotificationCompletion, NotificationSendReport};
 pub use service::{send_daily_report, AnalysisResult, NotificationService};
+pub use wechat::{WechatHttpBodyObservation, WechatHttpBodySummary};

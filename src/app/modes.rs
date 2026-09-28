@@ -130,6 +130,7 @@ pub(super) struct ChainDeliveryEnvelope {
     pub send_attempted: bool,
     pub report_input: Vec<u8>,
     pub notification_report: Option<stock_analysis::notification::NotificationSendReport>,
+    pub wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
     pub suppression: Option<ChainSendSuppression>,
     pub legacy_result: Result<()>,
 }
@@ -154,13 +155,18 @@ impl ChainSendSuppression {
 struct ChainSendResult {
     weak_success: bool,
     notification_report: Option<stock_analysis::notification::NotificationSendReport>,
+    wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
 }
 
 impl ChainSendResult {
-    fn from_report(report: stock_analysis::notification::NotificationSendReport) -> Self {
+    fn from_report(
+        report: stock_analysis::notification::NotificationSendReport,
+        wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
+    ) -> Self {
         Self {
             weak_success: report.has_success(),
             notification_report: Some(report),
+            wechat_http_body,
         }
     }
 
@@ -169,6 +175,7 @@ impl ChainSendResult {
         Self {
             weak_success,
             notification_report: None,
+            wechat_http_body: None,
         }
     }
 }
@@ -235,8 +242,14 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
         before_send,
         move |report| {
             Box::pin(async move {
+                let mut wechat_observation =
+                    stock_analysis::notification::WechatHttpBodyObservation::default();
+                let result = notifier
+                    .send_report_observing_wechat(report, &mut wechat_observation)
+                    .await;
                 Ok(ChainSendResult::from_report(
-                    notifier.send_report(report).await,
+                    result,
+                    wechat_observation.finish(),
                 ))
             })
         },
@@ -267,6 +280,7 @@ where
         acquisition,
         send_attempted: false,
         notification_report: None,
+        wechat_http_body: None,
         suppression: (!send_notify).then_some(ChainSendSuppression::NotificationDisabled),
         legacy_result: Ok(()),
     };
@@ -282,6 +296,7 @@ where
             envelope.legacy_result = match send(envelope.prepared.report()).await {
                 Ok(sent) => {
                     envelope.notification_report = sent.notification_report;
+                    envelope.wechat_http_body = sent.wechat_http_body;
                     require_chain_notification_success(Ok(sent.weak_success))
                 }
                 Err(error) => require_chain_notification_success(Err(error)),
@@ -384,6 +399,7 @@ mod tests_chain_delivery {
             (!guard_ok).then_some(ChainSendSuppression::BeforeSendRejected)
         );
         assert!(envelope.notification_report.is_none());
+        assert!(envelope.wechat_http_body.is_none());
         assert_eq!(&envelope.report_input, &*saved.borrow());
         if envelope.send_attempted {
             assert_eq!(&envelope.report_input, &*sent.borrow());
@@ -454,6 +470,7 @@ mod tests_chain_delivery {
             acquisition: None,
             send_attempted: true,
             notification_report: None,
+            wechat_http_body: None,
             suppression: None,
             legacy_result: Ok(()),
         };
@@ -498,6 +515,7 @@ mod tests_chain_delivery {
             assert_eq!(envelope.suppression, Some(expected));
             assert!(!envelope.send_attempted);
             assert!(envelope.notification_report.is_none());
+            assert!(envelope.wechat_http_body.is_none());
             assert_eq!(envelope.legacy_result.is_ok(), !send_notify);
         }
     }
@@ -523,6 +541,7 @@ mod tests_chain_delivery {
                     let notifier = stock_analysis::notification::NotificationService::new(config);
                     Ok(ChainSendResult::from_report(
                         notifier.send_report(report).await,
+                        None,
                     ))
                 })
             },
@@ -532,6 +551,7 @@ mod tests_chain_delivery {
         .unwrap();
         assert!(envelope.send_attempted);
         assert!(envelope.suppression.is_none());
+        assert!(envelope.wechat_http_body.is_none());
         let report = envelope.notification_report.unwrap();
         assert_eq!(report.attempts().len(), 1);
         assert_eq!(

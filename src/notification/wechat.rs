@@ -3,12 +3,97 @@
 use anyhow::{Context, Result};
 use log::{error, info};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::service::NotificationService;
+
+const BODY_SEQUENCE_DOMAIN: &[u8] = b"stock_analysis.wechat_http_entity_body_sequence.v1\0";
+
+/// The exact JSON entity bodies taken from the Reqwest requests submitted by
+/// one WeChat send. This does not observe HTTP headers, framing, TLS, or receipt.
+pub struct WechatHttpBodyObservation {
+    request_count: usize,
+    total_body_bytes: usize,
+    complete: bool,
+    sequence_hasher: Sha256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WechatHttpBodySummary {
+    request_count: usize,
+    total_body_bytes: usize,
+    sequence_sha256: String,
+}
+
+impl WechatHttpBodySummary {
+    pub const fn request_count(&self) -> usize {
+        self.request_count
+    }
+
+    pub const fn total_body_bytes(&self) -> usize {
+        self.total_body_bytes
+    }
+
+    pub fn sequence_sha256(&self) -> &str {
+        &self.sequence_sha256
+    }
+}
+
+impl Default for WechatHttpBodyObservation {
+    fn default() -> Self {
+        let mut sequence_hasher = Sha256::new();
+        sequence_hasher.update(BODY_SEQUENCE_DOMAIN);
+        Self {
+            request_count: 0,
+            total_body_bytes: 0,
+            complete: true,
+            sequence_hasher,
+        }
+    }
+}
+
+impl WechatHttpBodyObservation {
+    fn observe_request(&mut self, request: &reqwest::Request) {
+        let Some(count) = self.request_count.checked_add(1) else {
+            self.complete = false;
+            return;
+        };
+        self.request_count = count;
+        let Some(body) = request.body().and_then(reqwest::Body::as_bytes) else {
+            self.complete = false;
+            return;
+        };
+        let Some(total) = self.total_body_bytes.checked_add(body.len()) else {
+            self.complete = false;
+            return;
+        };
+        self.total_body_bytes = total;
+        self.sequence_hasher
+            .update((body.len() as u64).to_be_bytes());
+        self.sequence_hasher.update(body);
+    }
+
+    /// None means no WeChat request was built or at least one body was opaque.
+    pub fn finish(self) -> Option<WechatHttpBodySummary> {
+        (self.complete && self.request_count > 0).then(|| WechatHttpBodySummary {
+            request_count: self.request_count,
+            total_body_bytes: self.total_body_bytes,
+            sequence_sha256: format!("{:x}", self.sequence_hasher.finalize()),
+        })
+    }
+}
 
 impl NotificationService {
     /// 发送到企业微信
     pub async fn send_to_wechat(&self, content: &str) -> Result<bool> {
+        self.send_to_wechat_with_observation(content, None).await
+    }
+
+    pub(super) async fn send_to_wechat_with_observation(
+        &self,
+        content: &str,
+        observation: Option<&mut WechatHttpBodyObservation>,
+    ) -> Result<bool> {
         let url = self
             .config
             .wechat_webhook_url
@@ -20,14 +105,21 @@ impl NotificationService {
 
         if content_bytes > max_bytes {
             info!("消息内容超长({}字节)，将分批发送", content_bytes);
-            return self.send_wechat_chunked(url, content, max_bytes).await;
+            return self
+                .send_wechat_chunked(url, content, max_bytes, observation)
+                .await;
         }
 
-        self.send_wechat_message(url, content).await
+        self.send_wechat_message(url, content, observation).await
     }
 
     /// 发送单条企业微信消息
-    pub(super) async fn send_wechat_message(&self, url: &str, content: &str) -> Result<bool> {
+    pub(super) async fn send_wechat_message(
+        &self,
+        url: &str,
+        content: &str,
+        observation: Option<&mut WechatHttpBodyObservation>,
+    ) -> Result<bool> {
         let payload = json!({
             "msgtype": "markdown",
             "markdown": {
@@ -35,7 +127,11 @@ impl NotificationService {
             }
         });
 
-        let response = self.client.post(url).json(&payload).send().await?;
+        let request = self.client.post(url).json(&payload).build()?;
+        if let Some(observation) = observation {
+            observation.observe_request(&request);
+        }
+        let response = self.client.execute(request).await?;
 
         if response.status().is_success() {
             let result: serde_json::Value = response.json().await?;
@@ -58,6 +154,7 @@ impl NotificationService {
         url: &str,
         content: &str,
         max_bytes: usize,
+        mut observation: Option<&mut WechatHttpBodyObservation>,
     ) -> Result<bool> {
         let chunks = self.chunk_by_sections(content, max_bytes);
         let total_chunks = chunks.len();
@@ -74,7 +171,10 @@ impl NotificationService {
 
             let chunk_with_marker = format!("{}{}", chunk, page_marker);
 
-            if self.send_wechat_message(url, &chunk_with_marker).await? {
+            if self
+                .send_wechat_message(url, &chunk_with_marker, observation.as_deref_mut())
+                .await?
+            {
                 success_count += 1;
                 info!("企业微信第 {}/{} 批发送成功", i + 1, total_chunks);
             } else {

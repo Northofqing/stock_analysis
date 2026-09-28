@@ -3,6 +3,8 @@ use super::{
     NotificationService,
 };
 use crate::monitor::push_job::WeakOutcomeKind;
+use crate::notification::WechatHttpBodyObservation;
+use sha2::{Digest, Sha256};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -239,6 +241,26 @@ fn feishu_payload(request: &[u8]) -> serde_json::Value {
     serde_json::from_slice(&request[body_start..]).expect("Feishu request body must be JSON")
 }
 
+fn received_http_body(request: &[u8]) -> &[u8] {
+    let body_start = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("captured request must contain an HTTP body");
+    &request[body_start..]
+}
+
+fn received_wechat_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"stock_analysis.wechat_http_entity_body_sequence.v1\0");
+    for request in requests {
+        let body = received_http_body(request);
+        hasher.update((body.len() as u64).to_be_bytes());
+        hasher.update(body);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn feishu_payload_content(request: &[u8]) -> String {
     let payload = feishu_payload(request);
     let content = match payload.get("msg_type").and_then(serde_json::Value::as_str) {
@@ -412,6 +434,85 @@ async fn wechat_partial_chunks_remain_one_unknown_target_for_false_and_error() {
         &[(NotificationChannel::Wechat, 0, WeakOutcomeKind::Unknown)],
     );
     assert_eq!(later_error.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn wechat_observation_matches_the_same_single_request_body_received_on_loopback() {
+    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"errcode":0}"#)]);
+    let service = test_service(
+        NotificationConfig {
+            wechat_webhook_url: Some(fixture.url()),
+            wechat_max_bytes: 4_000,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Wechat],
+    );
+    let mut observation = WechatHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_wechat("TEST_CODE one request", &mut observation)
+        .await;
+    assert!(report.has_success());
+    let requests = fixture.finish();
+    let summary = observation.finish().expect("built WeChat request body");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(summary.request_count(), 1);
+    assert_eq!(
+        summary.total_body_bytes(),
+        received_http_body(&requests[0]).len()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_wechat_body_sequence_sha256(&requests)
+    );
+}
+
+#[tokio::test]
+async fn wechat_observation_keeps_both_sent_chunk_bodies_after_later_failure() {
+    let content = format!("TEST_CODE {}\n---\n{}", "A".repeat(120), "B".repeat(120));
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"errcode":0}"#),
+        ScriptedResponse::Http("TEST_CODE_INVALID_JSON"),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            wechat_webhook_url: Some(fixture.url()),
+            wechat_max_bytes: 220,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Wechat],
+    );
+    let mut observation = WechatHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_wechat(&content, &mut observation)
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Wechat, 0, WeakOutcomeKind::Unknown)],
+    );
+    let requests = fixture.finish();
+    let summary = observation
+        .finish()
+        .expect("both built WeChat chunk bodies");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(summary.request_count(), 2);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_wechat_body_sequence_sha256(&requests)
+    );
+    for (index, request) in requests.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(received_http_body(request)).unwrap();
+        assert!(body["markdown"]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("({}/2)", index + 1)));
+    }
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ use reqwest::Client;
 
 use super::config::{NotificationChannel, NotificationConfig};
 use super::send_report::{NotificationAttempt, NotificationSendReport};
+use super::wechat::WechatHttpBodyObservation;
 use crate::monitor::push_job::WeakOutcomeKind;
 
 /// 股票分析结果（与 `pipeline::AnalysisResult` 共用同一类型，避免重复定义）。
@@ -154,6 +155,24 @@ impl NotificationService {
 
     /// Send through every configured target and retain invocation-local weak outcomes.
     pub async fn send_report(&self, content: &str) -> NotificationSendReport {
+        self.send_report_inner(content, None).await
+    }
+
+    /// Observe only WeChat's exact built HTTP entity bodies within this send.
+    /// The observer has no transport authority and cannot change weak outcomes.
+    pub async fn send_report_observing_wechat(
+        &self,
+        content: &str,
+        observation: &mut WechatHttpBodyObservation,
+    ) -> NotificationSendReport {
+        self.send_report_inner(content, Some(observation)).await
+    }
+
+    async fn send_report_inner(
+        &self,
+        content: &str,
+        mut wechat_observation: Option<&mut WechatHttpBodyObservation>,
+    ) -> NotificationSendReport {
         if !self.is_available() {
             warn!("通知服务不可用，跳过推送");
             return NotificationSendReport::default();
@@ -169,9 +188,15 @@ impl NotificationService {
 
         for channel in &self.available_channels {
             match channel {
-                NotificationChannel::Wechat => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_wechat(content).await)
-                }
+                NotificationChannel::Wechat => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_wechat_with_observation(
+                        content,
+                        wechat_observation.as_deref_mut(),
+                    )
+                    .await,
+                ),
                 NotificationChannel::Feishu => {
                     observe_attempt(&mut attempts, *channel, self.send_to_feishu(content).await)
                 }
