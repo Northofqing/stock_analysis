@@ -74,66 +74,111 @@ pub fn a_share_fill_cost_ledger_v2(
     })
 }
 
-/// One qualified executed fill for the explicit fee-policy scenario adapter.
-/// The caller must supply instrument classification from a verified source.
+/// A research assumption for quoting one dated fill. This type does not prove
+/// that an exchange accepted a fill or that its instrument class is sourced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QualifiedFillV2 {
+pub struct DatedResearchFillV2 {
     pub fill_id: i64,
-    pub instrument: QualifiedInstrument,
+    pub assumed_instrument: QualifiedInstrument,
     pub side: FillSide,
     pub notional_micro_cny: i64,
-    pub executed_at_utc: DateTime<Utc>,
+    pub assumed_executed_at_utc: DateTime<Utc>,
 }
 
-/// Project a single immutable policy instance over dated fills for research.
-/// The resulting basis and each evidence ID bind the policy descriptor; this
-/// does not write PaperLedgerV1 or attest a broker receipt.
-pub fn a_share_fill_cost_ledger_with_policy_v2(
+/// Complete modeled components and coverage for one assumed research fill.
+/// `quote_id` identifies this calculation, not a source-backed fill or fee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeledFillFeeQuoteV2 {
+    pub fill_id: i64,
+    pub assumed_executed_at_utc: DateTime<Utc>,
+    pub quote_id: String,
+    pub fee: AShareFillFeeV2,
+}
+
+/// Quotes cannot be converted to a `FillCostLedger` without a same-source
+/// typed fill binding for the economic position engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeledFeeQuoteSetV2 {
+    pub policy_instance_id: String,
+    pub quotes: Vec<ModeledFillFeeQuoteV2>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ModeledFeeQuoteErrorV2 {
+    #[error("research fill id must be positive: {0}")]
+    InvalidFillId(i64),
+    #[error("research fill id is duplicated: {0}")]
+    DuplicateFillId(i64),
+    #[error("requested fee coverage is unavailable: {0}")]
+    CoverageUnavailable(AShareFeeV2Error),
+    #[error("research fill {fill_id} fee unavailable: {source}")]
+    Fill {
+        fill_id: i64,
+        #[source]
+        source: AShareFeeV2Error,
+    },
+}
+
+/// Quote one immutable policy against dated research assumptions. The full
+/// micro-CNY components, date bracket and coverage remain in each result.
+/// No source row or actual execution is attested by this calculation.
+pub fn a_share_fee_quotes_with_policy_v2(
     policy: &AShareFeePolicyV2,
-    fills: &[QualifiedFillV2],
+    fills: &[DatedResearchFillV2],
     required_coverage: FeeCoverageRequirement,
-) -> Result<FillCostLedger, String> {
-    let basis_id = policy.instance_id();
+) -> Result<ModeledFeeQuoteSetV2, ModeledFeeQuoteErrorV2> {
+    if required_coverage == FeeCoverageRequirement::CompleteTradingCost {
+        return Err(ModeledFeeQuoteErrorV2::CoverageUnavailable(
+            AShareFeeV2Error::UnsupportedCoverage,
+        ));
+    }
+    let policy_instance_id = policy.instance_id();
     let mut seen = HashSet::with_capacity(fills.len());
-    let mut costs = Vec::with_capacity(fills.len());
+    let mut quotes = Vec::with_capacity(fills.len());
     for fill in fills {
-        if fill.fill_id <= 0 || !seen.insert(fill.fill_id) {
-            return Err("fee-policy v2 fill identities must be positive and unique".to_owned());
+        if fill.fill_id <= 0 {
+            return Err(ModeledFeeQuoteErrorV2::InvalidFillId(fill.fill_id));
         }
-        let trade_date = shanghai_execution_date(fill.executed_at_utc);
+        if !seen.insert(fill.fill_id) {
+            return Err(ModeledFeeQuoteErrorV2::DuplicateFillId(fill.fill_id));
+        }
+        let trade_date = shanghai_execution_date(fill.assumed_executed_at_utc);
         let fee = a_share_stock_fill_fee_with_policy_v2(
             policy,
-            fill.instrument,
+            fill.assumed_instrument,
             fill.side,
             fill.notional_micro_cny,
             trade_date,
             required_coverage,
         )
-        .map_err(|error| format!("fill {}: {error}", fill.fill_id))?;
+        .map_err(|source| ModeledFeeQuoteErrorV2::Fill {
+            fill_id: fill.fill_id,
+            source,
+        })?;
         let side = match fill.side {
             FillSide::Buy => "Buy",
             FillSide::Sell => "Sell",
         };
         let material = format!(
-            "fee-policy-v2-fill-evidence/v1\npolicy={basis_id}\nfill_id={}\nside={side}\nnotional_micro_cny={}\nexecuted_at_utc={}\nfee_micro_cny={}\n",
+            "fee-policy-v2-research-quote/v1\npolicy={policy_instance_id}\nfill_id={}\nside={side}\nnotional_micro_cny={}\nassumed_executed_at_utc={}\nfee_micro_cny={}\n",
             fill.fill_id,
             fill.notional_micro_cny,
-            fill.executed_at_utc.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            fill.assumed_executed_at_utc.to_rfc3339_opts(SecondsFormat::Nanos, true),
             fee.total_micro_cny,
         );
-        costs.push(FillCostEvidence {
+        quotes.push(ModeledFillFeeQuoteV2 {
             fill_id: fill.fill_id,
-            adverse_cost: fee.total_micro_cny as f64 / 1_000_000.0,
-            evidence_id: format!(
-                "fee-policy-v2:sha256:{}",
+            assumed_executed_at_utc: fill.assumed_executed_at_utc,
+            quote_id: format!(
+                "fee-policy-v2-quote:sha256:{}",
                 hex::encode(Sha256::digest(material))
             ),
+            fee,
         });
     }
-    Ok(FillCostLedger {
-        basis_id,
-        kind: CostBasisKind::Scenario,
-        costs,
+    Ok(ModeledFeeQuoteSetV2 {
+        policy_instance_id,
+        quotes,
     })
 }
 
@@ -232,32 +277,39 @@ mod tests {
     }
 
     #[test]
-    fn explicit_v2_ledger_binds_policy_and_shanghai_execution_cutover() {
+    fn explicit_v2_quote_retains_components_and_policy_identity() {
         let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
         let instrument = qualified_main_a();
-        let before = QualifiedFillV2 {
+        let before = DatedResearchFillV2 {
             fill_id: 1,
-            instrument,
+            assumed_instrument: instrument,
             side: FillSide::Sell,
             notional_micro_cny: 1_000_000_000,
-            executed_at_utc: executed_at("2023-08-27T15:59:59Z"),
+            assumed_executed_at_utc: executed_at("2023-08-25T02:00:00Z"),
         };
-        let after = QualifiedFillV2 {
+        let after = DatedResearchFillV2 {
             fill_id: 2,
-            executed_at_utc: executed_at("2023-08-27T16:00:00Z"),
+            assumed_executed_at_utc: executed_at("2023-08-28T02:00:00Z"),
             ..before
         };
-        let ledger = a_share_fill_cost_ledger_with_policy_v2(
+        let quotes = a_share_fee_quotes_with_policy_v2(
             &policy,
             &[before, after],
             FeeCoverageRequirement::ModeledComponentsOnly,
         )
         .expect("dated modeled fees");
-        assert_eq!(ledger.basis_id, policy.instance_id());
-        assert_eq!(ledger.kind, CostBasisKind::Scenario);
-        assert_eq!(ledger.costs[0].adverse_cost, 6.0);
-        assert_eq!(ledger.costs[1].adverse_cost, 5.5);
-        assert_ne!(ledger.costs[0].evidence_id, ledger.costs[1].evidence_id);
+        assert_eq!(quotes.policy_instance_id, policy.instance_id());
+        assert_eq!(quotes.quotes[0].fee.total_micro_cny, 6_000_000);
+        assert_eq!(quotes.quotes[0].fee.stamp_tax_micro_cny, 1_000_000);
+        assert_eq!(quotes.quotes[1].fee.total_micro_cny, 5_500_000);
+        assert_eq!(quotes.quotes[1].fee.stamp_tax_micro_cny, 500_000);
+        assert_eq!(quotes.quotes[1].fee.trade_date.to_string(), "2023-08-28");
+        assert_eq!(
+            quotes.quotes[1].fee.stamp_tax_bracket,
+            StampTaxBracketV2::SellerHalfPerThousand
+        );
+        assert_eq!(quotes.quotes[0].fee.coverage, FeeCoverage::initial_model());
+        assert_ne!(quotes.quotes[0].quote_id, quotes.quotes[1].quote_id);
 
         let revised = AShareFeePolicyV2::new(
             instrument,
@@ -267,59 +319,90 @@ mod tests {
             "TEST_CODE_revised_source",
         )
         .unwrap();
-        let revised_ledger = a_share_fill_cost_ledger_with_policy_v2(
+        let revised_quotes = a_share_fee_quotes_with_policy_v2(
             &revised,
             &[before, after],
             FeeCoverageRequirement::ModeledComponentsOnly,
         )
         .unwrap();
-        assert_ne!(ledger.basis_id, revised_ledger.basis_id);
-        assert_ne!(
-            ledger.costs[0].evidence_id,
-            revised_ledger.costs[0].evidence_id
-        );
+        assert_ne!(quotes.policy_instance_id, revised_quotes.policy_instance_id);
+        assert_ne!(quotes.quotes[0].quote_id, revised_quotes.quotes[0].quote_id);
     }
 
     #[test]
-    fn explicit_v2_ledger_rejects_duplicates_scope_and_complete_cost_claim() {
+    fn explicit_v2_quote_rejects_duplicates_scope_and_complete_cost_claim() {
         let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
-        let fill = QualifiedFillV2 {
+        let fill = DatedResearchFillV2 {
             fill_id: 10,
-            instrument: qualified_main_a(),
+            assumed_instrument: qualified_main_a(),
             side: FillSide::Buy,
             notional_micro_cny: 1_000_000_000,
-            executed_at_utc: executed_at("2026-09-28T03:00:00Z"),
+            assumed_executed_at_utc: executed_at("2026-09-28T03:00:00Z"),
         };
-        assert!(a_share_fill_cost_ledger_with_policy_v2(
-            &policy,
-            &[fill, fill],
-            FeeCoverageRequirement::ModeledComponentsOnly,
-        )
-        .unwrap_err()
-        .contains("unique"));
+        assert_eq!(
+            a_share_fee_quotes_with_policy_v2(
+                &policy,
+                &[fill, fill],
+                FeeCoverageRequirement::ModeledComponentsOnly,
+            )
+            .unwrap_err(),
+            ModeledFeeQuoteErrorV2::DuplicateFillId(10)
+        );
         let star = QualifiedInstrument::new(
             FeeMarket::Shanghai,
             FeeSecurityKind::AShareStock,
             FeeListingSegment::ShanghaiStarA,
         )
         .unwrap();
-        assert!(a_share_fill_cost_ledger_with_policy_v2(
-            &policy,
-            &[QualifiedFillV2 {
-                instrument: star,
-                ..fill
-            }],
-            FeeCoverageRequirement::ModeledComponentsOnly,
-        )
-        .unwrap_err()
-        .contains("scope"));
-        assert!(a_share_fill_cost_ledger_with_policy_v2(
-            &policy,
-            &[fill],
-            FeeCoverageRequirement::CompleteTradingCost,
-        )
-        .unwrap_err()
-        .contains("complete trading cost"));
+        assert_eq!(
+            a_share_fee_quotes_with_policy_v2(
+                &policy,
+                &[DatedResearchFillV2 {
+                    assumed_instrument: star,
+                    ..fill
+                }],
+                FeeCoverageRequirement::ModeledComponentsOnly,
+            )
+            .unwrap_err(),
+            ModeledFeeQuoteErrorV2::Fill {
+                fill_id: 10,
+                source: AShareFeeV2Error::ScopeMismatch,
+            }
+        );
+        assert_eq!(
+            a_share_fee_quotes_with_policy_v2(
+                &policy,
+                &[fill],
+                FeeCoverageRequirement::CompleteTradingCost,
+            )
+            .unwrap_err(),
+            ModeledFeeQuoteErrorV2::CoverageUnavailable(AShareFeeV2Error::UnsupportedCoverage,)
+        );
+        assert_eq!(
+            a_share_fee_quotes_with_policy_v2(
+                &policy,
+                &[],
+                FeeCoverageRequirement::CompleteTradingCost,
+            )
+            .unwrap_err(),
+            ModeledFeeQuoteErrorV2::CoverageUnavailable(AShareFeeV2Error::UnsupportedCoverage,)
+        );
+        let before_schedule = DatedResearchFillV2 {
+            assumed_executed_at_utc: executed_at("2008-09-18T02:00:00Z"),
+            ..fill
+        };
+        assert_eq!(
+            a_share_fee_quotes_with_policy_v2(
+                &policy,
+                &[before_schedule],
+                FeeCoverageRequirement::ModeledComponentsOnly,
+            )
+            .unwrap_err(),
+            ModeledFeeQuoteErrorV2::Fill {
+                fill_id: 10,
+                source: AShareFeeV2Error::UnsupportedTradeDate,
+            }
+        );
     }
 
     #[test]
