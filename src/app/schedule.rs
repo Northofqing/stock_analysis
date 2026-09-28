@@ -3,6 +3,7 @@
 use anyhow::Result;
 use chrono::{Datelike, Local};
 use log::{error, info, warn};
+use std::collections::HashSet;
 use stock_analysis::config;
 use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
 
@@ -227,20 +228,21 @@ async fn execute_once(args: &Args) {
     // 重新装配股票列表。
     info!("本次定时任务类型: 个股分析（重新装配股票列表）");
     let args_clone = args.clone();
-    let stock_codes = match crate::app::build_stock_list(&args_clone).await {
-        Ok((codes, _limit_up, _macro_ctx)) => codes,
-        Err(e) => {
-            error!("装配股票列表失败: {}", e);
-            return;
-        }
-    };
+    let (stock_codes, limit_up_codes, macro_context) =
+        match crate::app::build_stock_list(&args_clone).await {
+            Ok(facts) => facts,
+            Err(e) => {
+                error!("装配股票列表失败: {}", e);
+                return;
+            }
+        };
 
     info!("本次待分析股票（共 {} 只）", stock_codes.len());
 
     // 产业链分析已整合到 AnalysisPipeline::run() 内部：
     // 在 send_summary_notification 之前自动拉取涨停数据并执行联动分析，
     // 有涨停数据才做分析，分析结果并入主报告头部。
-    execute_analysis(&stock_codes, &config).await;
+    execute_analysis(&stock_codes, &config, limit_up_codes, &macro_context).await;
 }
 
 /// 覆盖式重新读取 `.env`，使运行中对配置文件的修改即时生效。
@@ -251,9 +253,21 @@ fn reload_env() {
     }
 }
 
-async fn execute_analysis(stock_codes: &[String], config: &PipelineConfig) {
+async fn execute_analysis(
+    stock_codes: &[String],
+    config: &PipelineConfig,
+    limit_up_codes: HashSet<String>,
+    macro_context: &str,
+) {
     match AnalysisPipeline::new(config.clone()) {
-        Ok(pipeline) => match pipeline.run(stock_codes, None).await {
+        Ok(pipeline) => match pipeline
+            .with_limit_up_codes(limit_up_codes)
+            .run(
+                stock_codes,
+                (!macro_context.is_empty()).then(|| macro_context.to_owned()),
+            )
+            .await
+        {
             Ok(outcome) => {
                 outcome.log_completion();
                 if let Err(error) = outcome.ensure_cli_success() {
