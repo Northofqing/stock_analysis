@@ -315,6 +315,8 @@ mod tests {
                 themes: Default::default(),
                 quote_evidence: Some(evidence("quote")),
                 statistics_evidence: Some(evidence("statistics")),
+                p5_files: Vec::new(),
+                p5_candidate_refs: Vec::new(),
             },
         )
     }

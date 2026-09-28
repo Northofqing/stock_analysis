@@ -4604,61 +4604,7 @@ fn load_p5_source_items_from_dir(
     )>,
     String,
 > {
-    use std::fs;
-    use std::io::ErrorKind;
-    use stock_analysis::opportunity::candidate_panel::CandidateSource;
-    let path = base_dir.join(format!("{source_name}.jsonl"));
-    let source = match source_name {
-        "stock_pick" => CandidateSource::StockPick,
-        "optimal_close" => CandidateSource::OptimalClose,
-        "volume_watchlist" => CandidateSource::VolumeWatchlist,
-        "volume_real_trade" => CandidateSource::VolumeRealTrade,
-        _ => return Err(format!("未知 P5 候选来源: {source_name}")),
-    };
-    let mut items = Vec::new();
-    let raw = match fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!("读取 P5 候选源 {} 失败: {error}", path.display()));
-        }
-    };
-    for (line_index, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        #[derive(serde::Deserialize)]
-        struct P5Item {
-            code: String,
-            name: String,
-        }
-        let item = serde_json::from_str::<P5Item>(line).map_err(|error| {
-            format!(
-                "P5 候选源 {path} 第 {} 行 JSON 非法: {error}",
-                line_index + 1,
-                path = path.display()
-            )
-        })?;
-        let code = item.code.trim();
-        let name = item.name.trim();
-        if !valid_source_stock_code(code) {
-            return Err(format!(
-                "P5 候选源 {} 第 {} 行 code 非法: {}",
-                path.display(),
-                line_index + 1,
-                item.code
-            ));
-        }
-        if name.is_empty() {
-            return Err(format!(
-                "P5 候选源 {} 第 {} 行 name 为空",
-                path.display(),
-                line_index + 1
-            ));
-        }
-        items.push((source, code.to_string(), name.to_string()));
-    }
-    Ok(items)
+    p05_file_witness::load_one_from_dir(source_name, base_dir).map(|loaded| loaded.items)
 }
 
 #[derive(Debug)]
@@ -4668,8 +4614,11 @@ struct RealCandidateBatch {
     themes: std::collections::HashMap<String, String>,
     quote_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
     statistics_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
 }
 
+mod p05_file_witness;
 mod p05_source_cohort;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4689,6 +4638,8 @@ struct CandidateSourceContext {
     entries: Vec<stock_analysis::opportunity::candidate_panel::CandidateEntry>,
     themes: std::collections::HashMap<String, String>,
     held_codes: Vec<String>,
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
 }
 
 fn native_candidate_code(code: &str) -> &str {
@@ -4759,6 +4710,8 @@ fn assemble_real_candidate_batch(
     statistics_batch: CandidateStatisticsBatch,
     themes: std::collections::HashMap<String, String>,
     held_codes: &[String],
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
 ) -> Result<RealCandidateBatch, String> {
     use stock_analysis::opportunity::candidate_panel::{
         classify_tier, filter_hard_gates, sort_candidates_by_heat, CandidateSource,
@@ -4824,6 +4777,7 @@ fn assemble_real_candidate_batch(
 
     entries = filter_hard_gates(entries, held_codes);
     entries = sort_candidates_by_heat(entries);
+    let p5_candidate_refs = p05_file_witness::selected_refs(&entries, p5_candidate_refs);
 
     Ok(RealCandidateBatch {
         entries,
@@ -4831,6 +4785,8 @@ fn assemble_real_candidate_batch(
         themes,
         quote_evidence: Some(quote_batch.evidence),
         statistics_evidence: Some(statistics_batch.evidence),
+        p5_files,
+        p5_candidate_refs,
     })
 }
 
@@ -4870,16 +4826,13 @@ fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
         themes.insert(code.to_string(), cluster.concept.clone());
     }
 
-    for source in [
-        "stock_pick",
-        "optimal_close",
-        "volume_watchlist",
-        "volume_real_trade",
-    ] {
-        items.extend(load_p5_source_items(source)?);
-    }
+    let p5_sources =
+        p05_file_witness::load_all_from_dir(std::path::Path::new("data/p5_sources"))?;
+    items.extend(p5_sources.items);
 
     let entries = merge_candidates(items);
+    let p5_candidate_refs =
+        p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
     let held_codes = stock_analysis::portfolio::get_positions()
         .map_err(|error| format!("候选台读取持仓失败: {error}"))?
         .into_iter()
@@ -4889,6 +4842,8 @@ fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
         entries,
         themes,
         held_codes,
+        p5_files: p5_sources.witnesses,
+        p5_candidate_refs,
     })
 }
 
@@ -4897,6 +4852,8 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         entries,
         themes,
         held_codes,
+        p5_files,
+        p5_candidate_refs,
     } = crate::blocking_market_data::run_blocking_market_data(
         "BR-099 candidate source context",
         load_candidate_source_context,
@@ -4909,6 +4866,8 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
             themes,
             quote_evidence: None,
             statistics_evidence: None,
+            p5_files,
+            p5_candidate_refs,
         });
     }
 
@@ -4948,7 +4907,15 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         statistics_batch.evidence.observed_at,
         statistics_batch.evidence.batch_id
     );
-    assemble_real_candidate_batch(entries, quote_batch, statistics_batch, themes, &held_codes)
+    assemble_real_candidate_batch(
+        entries,
+        quote_batch,
+        statistics_batch,
+        themes,
+        &held_codes,
+        p5_files,
+        p5_candidate_refs,
+    )
 }
 
 /// v16.4+v13.6.2+v14.2: 真实数据集成 — 从候选台取 top 1 candidate
@@ -19676,6 +19643,8 @@ mod tests {
             statistics_batch,
             std::collections::HashMap::new(),
             &["TEST_CODE_600001".to_string()],
+            Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
