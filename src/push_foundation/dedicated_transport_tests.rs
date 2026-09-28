@@ -891,8 +891,9 @@ fn replace_n02_terminal_stage(case: &mut N02Case, stage: NewsFlashTransactionSta
         serde_json::to_vec(&case.terminal.terminal).expect("replacement terminal bytes");
 }
 
-// The legacy terminal is already durable when these tests begin. This port only
-// re-reads the dedicated fixture; it has no dispatch or attempt-writing method.
+// These in-memory fixtures stand in for an already durable legacy terminal. Only
+// the Foundation SQLite store is persisted and reopened by these tests; this
+// port has no dispatch or attempt-writing method.
 struct StoredDedicatedAuthority<'a> {
     snapshot: IntentSnapshot,
     route: &'a DedicatedConformanceRoute,
