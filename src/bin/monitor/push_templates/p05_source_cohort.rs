@@ -1,5 +1,7 @@
 //! P-05 candidate cohort observation. Original candidate-source identity is not
 //! retained by `RealCandidateBatch`, so this contract is always unqualified.
+//! The production sender does not call it, and no occurrence or terminal
+//! delivery result is bound here.
 
 use super::{candidate_prediction_target_date, RealCandidateBatch};
 use chrono::NaiveDate;
@@ -91,6 +93,7 @@ struct CanonicalStrong<'a> {
     evidence: &'a [String],
     current_price: f64,
     change_pct: f64,
+    raw_heat_score: Option<f64>,
     sample_score: f64,
 }
 
@@ -169,11 +172,14 @@ fn strong_row<'a>(
         evidence: &entry.evidence,
         current_price: price,
         change_pct,
+        raw_heat_score: entry.heat_score,
         sample_score: score,
     })
 }
 
-/// Observe the ordered Strong rows from the exact batch and rendered board.
+/// Observe ordered Strong rows from the supplied batch and supplied render.
+/// The render is checked against the formatter for those supplied entries;
+/// this function is not wired to the production sender or its occurrence.
 /// Quote/statistics provenance alone cannot qualify the original P5 file and
 /// chain records; callers must reject `require_qualified_origin()` until an
 /// independently validated origin witness is retained and bound.
@@ -334,9 +340,24 @@ mod tests {
         assert_eq!(facts["ordered_strong"][0]["code"], "TEST_CODE_600001");
         assert_eq!(facts["ordered_strong"][1]["board_ordinal"], 3);
         assert_eq!(facts["ordered_strong"][1]["code"], "TEST_CODE_600003");
+        assert!(facts["ordered_strong"][0]["raw_heat_score"].is_null());
         assert_eq!(facts["ordered_strong"][0]["sample_score"], 50.0);
         assert_eq!(first.observation_sha256().len(), 64);
         assert!(first.require_qualified_origin().is_err());
+    }
+
+    #[test]
+    fn missing_and_explicit_default_heat_score_have_distinct_observations() {
+        let (date, mut batch) = fixture();
+        let rendered = format_candidate_board(&batch.entries);
+        let missing = observe_p05_candidate_cohort_v2(date, &batch, &rendered).unwrap();
+        batch.entries[0].heat_score = Some(50.0);
+        assert_eq!(rendered, format_candidate_board(&batch.entries));
+        let explicit = observe_p05_candidate_cohort_v2(date, &batch, &rendered).unwrap();
+        assert_ne!(missing.observation_sha256(), explicit.observation_sha256());
+        let facts: serde_json::Value = serde_json::from_slice(explicit.canonical_bytes()).unwrap();
+        assert_eq!(facts["ordered_strong"][0]["raw_heat_score"], 50.0);
+        assert_eq!(facts["ordered_strong"][0]["sample_score"], 50.0);
     }
 
     #[test]
