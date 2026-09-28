@@ -19,6 +19,8 @@
 
 全库按 `delivery_decisions.state` 聚合：`Delivered=841`、`RejectedDurable=3987`、`ManualResolvedRejected=6`、`UncertainManualReview=78`。78 条未裁定项中 73 条为 2026-09-24 的 `DataMode`，其余为 2026-08-24 的 WatchlistTracking 1 条、2026-08-25 的 CloseCall 3 条和 2026-09-10 的 T0Advice 1 条。已有不确定状态保留原样，需外部处置证据及人工裁定；本次代码发布不改变它们。
 
+进一步按 `delivery_attempts`、`sink_results` 只读聚合：78 条各有一次 attempt 和一次 `Uncertain` sink result，库内没有同决策的 `Accepted`/`Rejected` result；这些 `Uncertain` result 的 channel、provider、message ID、platform message ID 和 delivery audit ref 均为空。因此数据库自身无法判定外部是否已送达。M2 清账必须先取得目标渠道的独立处置证据，再走人工裁定；重启、日期已过或随后同类消息成功都不构成自动重发或拒绝旧决策的证据。
+
 重跑命令（在生产运行根执行）：
 
 ```sh
