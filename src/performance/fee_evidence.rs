@@ -10,7 +10,9 @@
 
 use crate::performance::economic_position::{CostBasisKind, FillCostEvidence, FillCostLedger};
 use crate::strategy::lot;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 pub use super::fee_policy::{
     a_share_stock_fill_fee_with_policy_v2, shanghai_execution_date, AShareFeePolicyV2,
@@ -67,6 +69,69 @@ pub fn a_share_fill_cost_ledger_v2(
         .collect::<Result<Vec<_>, String>>()?;
     Ok(FillCostLedger {
         basis_id: A_SHARE_FEE_SCHEDULE_V2.to_owned(),
+        kind: CostBasisKind::Scenario,
+        costs,
+    })
+}
+
+/// One qualified executed fill for the explicit fee-policy scenario adapter.
+/// The caller must supply instrument classification from a verified source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualifiedFillV2 {
+    pub fill_id: i64,
+    pub instrument: QualifiedInstrument,
+    pub side: FillSide,
+    pub notional_micro_cny: i64,
+    pub executed_at_utc: DateTime<Utc>,
+}
+
+/// Project a single immutable policy instance over dated fills for research.
+/// The resulting basis and each evidence ID bind the policy descriptor; this
+/// does not write PaperLedgerV1 or attest a broker receipt.
+pub fn a_share_fill_cost_ledger_with_policy_v2(
+    policy: &AShareFeePolicyV2,
+    fills: &[QualifiedFillV2],
+    required_coverage: FeeCoverageRequirement,
+) -> Result<FillCostLedger, String> {
+    let basis_id = policy.instance_id();
+    let mut seen = HashSet::with_capacity(fills.len());
+    let mut costs = Vec::with_capacity(fills.len());
+    for fill in fills {
+        if fill.fill_id <= 0 || !seen.insert(fill.fill_id) {
+            return Err("fee-policy v2 fill identities must be positive and unique".to_owned());
+        }
+        let trade_date = shanghai_execution_date(fill.executed_at_utc);
+        let fee = a_share_stock_fill_fee_with_policy_v2(
+            policy,
+            fill.instrument,
+            fill.side,
+            fill.notional_micro_cny,
+            trade_date,
+            required_coverage,
+        )
+        .map_err(|error| format!("fill {}: {error}", fill.fill_id))?;
+        let side = match fill.side {
+            FillSide::Buy => "Buy",
+            FillSide::Sell => "Sell",
+        };
+        let material = format!(
+            "fee-policy-v2-fill-evidence/v1\npolicy={basis_id}\nfill_id={}\nside={side}\nnotional_micro_cny={}\nexecuted_at_utc={}\nfee_micro_cny={}\n",
+            fill.fill_id,
+            fill.notional_micro_cny,
+            fill.executed_at_utc.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            fee.total_micro_cny,
+        );
+        costs.push(FillCostEvidence {
+            fill_id: fill.fill_id,
+            adverse_cost: fee.total_micro_cny as f64 / 1_000_000.0,
+            evidence_id: format!(
+                "fee-policy-v2:sha256:{}",
+                hex::encode(Sha256::digest(material))
+            ),
+        });
+    }
+    Ok(FillCostLedger {
+        basis_id,
         kind: CostBasisKind::Scenario,
         costs,
     })
@@ -150,6 +215,112 @@ pub fn lot_rate_fill_cost_ledger(fills: &[(i64, FillSide, f64)]) -> Result<FillC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qualified_main_a() -> QualifiedInstrument {
+        QualifiedInstrument::new(
+            FeeMarket::Shanghai,
+            FeeSecurityKind::AShareStock,
+            FeeListingSegment::ShanghaiMainA,
+        )
+        .expect("supported modeled instrument")
+    }
+
+    fn executed_at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn explicit_v2_ledger_binds_policy_and_shanghai_execution_cutover() {
+        let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
+        let instrument = qualified_main_a();
+        let before = QualifiedFillV2 {
+            fill_id: 1,
+            instrument,
+            side: FillSide::Sell,
+            notional_micro_cny: 1_000_000_000,
+            executed_at_utc: executed_at("2023-08-27T15:59:59Z"),
+        };
+        let after = QualifiedFillV2 {
+            fill_id: 2,
+            executed_at_utc: executed_at("2023-08-27T16:00:00Z"),
+            ..before
+        };
+        let ledger = a_share_fill_cost_ledger_with_policy_v2(
+            &policy,
+            &[before, after],
+            FeeCoverageRequirement::ModeledComponentsOnly,
+        )
+        .expect("dated modeled fees");
+        assert_eq!(ledger.basis_id, policy.instance_id());
+        assert_eq!(ledger.kind, CostBasisKind::Scenario);
+        assert_eq!(ledger.costs[0].adverse_cost, 6.0);
+        assert_eq!(ledger.costs[1].adverse_cost, 5.5);
+        assert_ne!(ledger.costs[0].evidence_id, ledger.costs[1].evidence_id);
+
+        let revised = AShareFeePolicyV2::new(
+            instrument,
+            FeeRate::new(3, 10_000).unwrap(),
+            5_000_000,
+            FeeCoverage::initial_model(),
+            "TEST_CODE_revised_source",
+        )
+        .unwrap();
+        let revised_ledger = a_share_fill_cost_ledger_with_policy_v2(
+            &revised,
+            &[before, after],
+            FeeCoverageRequirement::ModeledComponentsOnly,
+        )
+        .unwrap();
+        assert_ne!(ledger.basis_id, revised_ledger.basis_id);
+        assert_ne!(
+            ledger.costs[0].evidence_id,
+            revised_ledger.costs[0].evidence_id
+        );
+    }
+
+    #[test]
+    fn explicit_v2_ledger_rejects_duplicates_scope_and_complete_cost_claim() {
+        let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
+        let fill = QualifiedFillV2 {
+            fill_id: 10,
+            instrument: qualified_main_a(),
+            side: FillSide::Buy,
+            notional_micro_cny: 1_000_000_000,
+            executed_at_utc: executed_at("2026-09-28T03:00:00Z"),
+        };
+        assert!(a_share_fill_cost_ledger_with_policy_v2(
+            &policy,
+            &[fill, fill],
+            FeeCoverageRequirement::ModeledComponentsOnly,
+        )
+        .unwrap_err()
+        .contains("unique"));
+        let star = QualifiedInstrument::new(
+            FeeMarket::Shanghai,
+            FeeSecurityKind::AShareStock,
+            FeeListingSegment::ShanghaiStarA,
+        )
+        .unwrap();
+        assert!(a_share_fill_cost_ledger_with_policy_v2(
+            &policy,
+            &[QualifiedFillV2 {
+                instrument: star,
+                ..fill
+            }],
+            FeeCoverageRequirement::ModeledComponentsOnly,
+        )
+        .unwrap_err()
+        .contains("scope"));
+        assert!(a_share_fill_cost_ledger_with_policy_v2(
+            &policy,
+            &[fill],
+            FeeCoverageRequirement::CompleteTradingCost,
+        )
+        .unwrap_err()
+        .contains("complete trading cost"));
+    }
 
     #[test]
     fn v2_trade_date_cutovers_preserve_legacy_fee_model() {
