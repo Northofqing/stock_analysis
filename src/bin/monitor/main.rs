@@ -9327,7 +9327,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 }
             }
             // Compare policies after the legacy send and missed-window paths.
-            let postclose_shadow_at = chrono::Local::now().fixed_offset();
+            let postclose_shadow_at = chrono::Utc::now()
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
             let postclose_shadow_now = postclose_shadow_at.naive_local();
             if postclose_shadow_now.time() >= chrono::NaiveTime::from_hms_opt(15, 29, 0).unwrap()
                 && postclose_shadow_now.time() < chrono::NaiveTime::from_hms_opt(15, 36, 0).unwrap()
