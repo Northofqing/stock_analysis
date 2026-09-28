@@ -5,12 +5,13 @@ use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
-use super::chain_acquisition::ChainAcquisitionEvidence;
+use super::chain_acquisition::{ChainAcquisitionEvidence, ChainSelectedNewsSourceRefV1};
 use super::chain_schedule::ChainPhase;
 
 pub(super) const COVERAGE: &str = "incomplete";
 pub(super) const REPORT_INPUTS: &str = "prepared_report_utf8_only";
-pub(super) const ACQUISITION_INPUTS: &str = "limit_up_global_news_and_report_utf8";
+pub(super) const ACQUISITION_INPUTS: &str =
+    "limit_up_metadata_selected_news_titles_utf8_and_report_utf8";
 
 #[derive(Debug)]
 pub(super) struct ChainReportInputObservation {
@@ -24,6 +25,9 @@ pub(super) struct ChainReportInputObservation {
     pub prepared_report_equals_input: bool,
     pub acquisition_sha256: Option<String>,
     pub acquisition_report_binding_sha256: Option<String>,
+    pub selected_news_source_ref: Option<ChainSelectedNewsSourceRefV1>,
+    pub prepared_macro_source_status:
+        stock_analysis::pipeline::chain_analysis::preparation::SourceStatus,
     pub coverage: &'static str,
     pub covered_inputs: &'static str,
 }
@@ -38,6 +42,10 @@ pub(super) fn observe(
     acquisition: Option<&ChainAcquisitionEvidence>,
 ) -> Result<ChainReportInputObservation> {
     let artifact = prepared.to_artifact_bytes()?;
+    let selected_news_source_ref = acquisition
+        .map(|retained| retained.selected_news_source_ref(prepared))
+        .transpose()?
+        .flatten();
     let acquisition_sha256 = acquisition
         .map(|retained| {
             anyhow::ensure!(
@@ -72,6 +80,8 @@ pub(super) fn observe(
         prepared_report_equals_input: prepared.report().as_bytes() == report_input,
         acquisition_sha256,
         acquisition_report_binding_sha256,
+        selected_news_source_ref,
+        prepared_macro_source_status: prepared.macro_source().status().clone(),
         coverage: COVERAGE,
         covered_inputs: if acquisition.is_some() {
             ACQUISITION_INPUTS
@@ -85,6 +95,15 @@ pub(super) fn observe(
 pub(super) async fn test_prepared(
     date: NaiveDate,
     preparations: std::rc::Rc<std::cell::Cell<usize>>,
+) -> PreparedChainAnalysis {
+    test_prepared_with_macro(date, preparations, None).await
+}
+
+#[cfg(test)]
+pub(super) async fn test_prepared_with_macro(
+    date: NaiveDate,
+    preparations: std::rc::Rc<std::cell::Cell<usize>>,
+    macro_input: Option<String>,
 ) -> PreparedChainAnalysis {
     use stock_analysis::pipeline::chain_analysis::preparation::{
         prepare_chain_analysis_with_io, ChainPreparationIo,
@@ -108,7 +127,7 @@ pub(super) async fn test_prepared(
             panic!("empty scripted pool must not request concepts")
         }
     }
-    prepare_chain_analysis_with_io(date, Vec::new(), None, &mut ScriptedIo(preparations))
+    prepare_chain_analysis_with_io(date, Vec::new(), macro_input, &mut ScriptedIo(preparations))
         .await
         .unwrap()
 }

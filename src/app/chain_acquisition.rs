@@ -3,14 +3,17 @@
 
 use std::future::Future;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use stock_analysis::data_gateway::{BatchEvidence, GatewayBatch, GatewayError, GlobalNewsRecord};
+use stock_analysis::data_gateway::{
+    BatchEvidence, GatewayBatch, GatewayError, GlobalNewsProvider, GlobalNewsRecord,
+};
 use stock_analysis::database::data_acquisition_audit::DataAcquisitionAuditReceipt;
 use stock_analysis::market_analyzer::{LimitUpObservation, LimitUpObservationStatus};
 use stock_analysis::market_data::TopStock;
+use stock_analysis::market_domain::{EvidenceTimestamp, ProviderId};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
 #[derive(Clone)]
@@ -79,6 +82,8 @@ pub(super) enum ChainNewsEvidence {
         evidence: BatchEvidence,
         record_count: usize,
         selected_count: usize,
+        selected_input_sha256: String,
+        selected_input_bytes: usize,
     },
     VerifiedEmpty(BatchEvidence),
     InvalidAvailableEmpty(BatchEvidence),
@@ -98,7 +103,96 @@ pub(super) struct ChainAcquisitionEvidence {
     pub(super) news: ChainNewsEvidence,
 }
 
+/// Diagnostic reference to the selected UTF-8 titles saved as `macro_input`.
+/// Its content digest is not a hash of the provider's raw batch and grants no
+/// Foundation source admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ChainSelectedNewsSourceRefV1 {
+    pub(super) ref_sha256: String,
+    pub(super) provider: ProviderId,
+    pub(super) source: String,
+    pub(super) batch_id_sha256: String,
+    pub(super) provider_observed_at: String,
+    pub(super) source_at: String,
+    pub(super) content_sha256: String,
+    pub(super) content_bytes: usize,
+}
+
 impl ChainAcquisitionEvidence {
+    pub(super) fn selected_news_source_ref(
+        &self,
+        prepared: &PreparedChainAnalysis,
+    ) -> Result<Option<ChainSelectedNewsSourceRefV1>> {
+        let ChainNewsEvidence::Available {
+            evidence,
+            record_count,
+            selected_count,
+            selected_input_sha256,
+            selected_input_bytes,
+        } = &self.news
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            prepared.business_date() == self.business_date,
+            "产业链新闻来源业务日期与准备对象不一致"
+        );
+        anyhow::ensure!(
+            *selected_count > 0 && *selected_count <= 15 && *selected_count <= *record_count,
+            "产业链新闻已选条数无效"
+        );
+        let saved = prepared
+            .macro_input()
+            .context("产业链新闻已选输入未保存在准备对象中")?;
+        anyhow::ensure!(!saved.trim().is_empty(), "产业链新闻已选输入为空");
+        anyhow::ensure!(
+            saved.len() == *selected_input_bytes
+                && format!("{:x}", Sha256::digest(saved.as_bytes())) == *selected_input_sha256,
+            "产业链新闻已选输入与同次采集不一致"
+        );
+        anyhow::ensure!(
+            evidence.provider == GlobalNewsProvider::Cailianpress.provider_id()
+                && evidence.source == GlobalNewsProvider::Cailianpress.source()
+                && !evidence.batch_id.trim().is_empty()
+                && !evidence.observed_at.trim().is_empty(),
+            "产业链新闻批次身份或时间不完整"
+        );
+        let source_at = evidence
+            .source_at
+            .as_deref()
+            .filter(|at| !at.trim().is_empty())
+            .context("产业链新闻来源时间缺失")?;
+        let source_time =
+            EvidenceTimestamp::parse_instant(source_at).context("产业链新闻来源时间无效")?;
+        let observed_time = EvidenceTimestamp::parse_instant(&evidence.observed_at)
+            .context("产业链新闻观察时间无效")?;
+        anyhow::ensure!(
+            source_time <= observed_time,
+            "产业链新闻来源时间晚于观察时间"
+        );
+        let ref_bytes = serde_json::to_vec(&json!({
+            "schema": "chain-selected-news-source-ref-v1",
+            "content_scope": "selected_titles_utf8",
+            "provider": evidence.provider,
+            "source": evidence.source,
+            "batch_id": evidence.batch_id,
+            "source_at": evidence.source_at,
+            "provider_observed_at": evidence.observed_at,
+            "content_sha256": selected_input_sha256,
+            "content_bytes": selected_input_bytes,
+        }))?;
+        Ok(Some(ChainSelectedNewsSourceRefV1 {
+            ref_sha256: format!("{:x}", Sha256::digest(ref_bytes)),
+            provider: evidence.provider,
+            source: evidence.source.clone(),
+            batch_id_sha256: format!("{:x}", Sha256::digest(evidence.batch_id.as_bytes())),
+            provider_observed_at: evidence.observed_at.clone(),
+            source_at: source_at.to_owned(),
+            content_sha256: selected_input_sha256.clone(),
+            content_bytes: *selected_input_bytes,
+        }))
+    }
+
     /// Versioned diagnostic identity of the retained source observations.
     /// Report/artifact identity is bound separately by the post-send observer.
     pub(super) fn sha256(&self) -> Result<String> {
@@ -118,11 +212,15 @@ impl ChainAcquisitionEvidence {
                 evidence,
                 record_count,
                 selected_count,
+                selected_input_sha256,
+                selected_input_bytes,
             } => json!({
                 "status": "available",
                 "evidence": evidence_identity(evidence),
                 "record_count": record_count,
                 "selected_count": selected_count,
+                "selected_input_sha256": selected_input_sha256,
+                "selected_input_bytes": selected_input_bytes,
             }),
             ChainNewsEvidence::VerifiedEmpty(evidence) => json!({
                 "status": "verified_empty",
@@ -148,7 +246,7 @@ impl ChainAcquisitionEvidence {
             }),
         };
         let bytes = serde_json::to_vec(&json!({
-            "schema": "chain-acquisition-evidence-v1",
+            "schema": "chain-acquisition-evidence-v2",
             "observed_at": self.observed_at,
             "business_date": self.business_date,
             "limit_up": {
@@ -209,12 +307,16 @@ fn macro_news_input(
                 .map(|record| record.title.clone())
                 .collect::<Vec<_>>()
                 .join("; ");
+            let selected_input_sha256 = format!("{:x}", Sha256::digest(input.as_bytes()));
+            let selected_input_bytes = input.len();
             (
                 Some(input),
                 ChainNewsEvidence::Available {
                     evidence,
                     record_count: records.len(),
                     selected_count,
+                    selected_input_sha256,
+                    selected_input_bytes,
                 },
             )
         }
@@ -277,7 +379,9 @@ where
 mod tests {
     use super::*;
     use crate::app::chain_schedule::ChainPhase;
-    use crate::app::chain_shadow_input::{observe, test_prepared, ACQUISITION_INPUTS};
+    use crate::app::chain_shadow_input::{
+        observe, test_prepared, test_prepared_with_macro, ACQUISITION_INPUTS,
+    };
     use chrono::Utc;
     use std::{
         cell::{Cell, RefCell},
@@ -407,10 +511,13 @@ mod tests {
                     prepare_calls.set(prepare_calls.get() + 1);
                     assert_eq!(stocks.len(), 1);
                     assert_eq!(stocks[0].code, "600000");
-                    *prepared_macro.borrow_mut() = macro_news;
+                    *prepared_macro.borrow_mut() = macro_news.clone();
                     // The real preparation's effects are exercised elsewhere. This
                     // scripted callback proves the acquisition path invokes it once.
-                    Ok(test_prepared(business_date, Rc::new(Cell::new(0))).await)
+                    Ok(
+                        test_prepared_with_macro(business_date, Rc::new(Cell::new(0)), macro_news)
+                            .await,
+                    )
                 }
             },
         )
@@ -476,6 +583,7 @@ mod tests {
                 evidence,
                 record_count,
                 selected_count,
+                ..
             } => {
                 assert_eq!(evidence, &news_batch);
                 assert_eq!((*record_count, *selected_count), (17, 15));
@@ -507,6 +615,22 @@ mod tests {
             64
         );
         assert_eq!(prepared.limit_up_source().status(), &SourceStatus::Unknown);
+        assert_eq!(prepared.macro_input(), Some(selected.as_str()));
+        let source_ref = observed.selected_news_source_ref.unwrap();
+        assert_eq!(source_ref.provider_observed_at, news_batch.observed_at);
+        assert_eq!(
+            Some(source_ref.source_at.as_str()),
+            news_batch.source_at.as_deref()
+        );
+        assert_eq!(source_ref.provider, ProviderId::Cailianpress);
+        assert_eq!(source_ref.source, "cls-v1");
+        assert_eq!(source_ref.batch_id_sha256.len(), 64);
+        assert_eq!(source_ref.content_bytes, selected.len());
+        assert_eq!(
+            source_ref.content_sha256,
+            format!("{:x}", Sha256::digest(selected.as_bytes()))
+        );
+        assert_eq!(source_ref.ref_sha256.len(), 64);
     }
 
     #[tokio::test]
@@ -533,6 +657,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_news_source_ref_replays_and_refuses_changed_or_missing_saved_input() {
+        let evidence = batch(
+            ProviderId::Cailianpress,
+            "cls-v1",
+            "TEST_CODE_news_v9",
+            "2026-09-28T07:00:02Z",
+        );
+        let (prepared, mut retained, selected) = scripted(
+            "TEST_CODE_pool_v3",
+            Ok(GatewayBatch::Available {
+                records: (0..2).map(news_record).collect(),
+                evidence,
+            }),
+        )
+        .await;
+        let selected = selected.unwrap();
+        let artifact = prepared.to_artifact_bytes().unwrap();
+        let replayed = PreparedChainAnalysis::from_artifact_bytes(&artifact).unwrap();
+        let original_ref = retained
+            .selected_news_source_ref(&prepared)
+            .unwrap()
+            .unwrap();
+        let replayed_ref = retained
+            .selected_news_source_ref(&replayed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original_ref, replayed_ref);
+        assert_eq!(replayed.macro_input(), Some(selected.as_str()));
+
+        let changed = test_prepared_with_macro(
+            retained.business_date,
+            Rc::new(Cell::new(0)),
+            Some("TEST_CODE_changed_title".to_owned()),
+        )
+        .await;
+        let changed =
+            PreparedChainAnalysis::from_artifact_bytes(&changed.to_artifact_bytes().unwrap())
+                .unwrap();
+        assert!(retained.selected_news_source_ref(&changed).is_err());
+
+        let missing = test_prepared(retained.business_date, Rc::new(Cell::new(0))).await;
+        let missing =
+            PreparedChainAnalysis::from_artifact_bytes(&missing.to_artifact_bytes().unwrap())
+                .unwrap();
+        assert!(retained.selected_news_source_ref(&missing).is_err());
+
+        if let ChainNewsEvidence::Available { evidence, .. } = &mut retained.news {
+            evidence.source_at = None;
+        }
+        assert!(retained.selected_news_source_ref(&prepared).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_news_source_ref_accepts_gateway_instant_time_format() {
+        let evidence = batch(
+            ProviderId::Cailianpress,
+            "cls-v1",
+            "TEST_CODE_news_epoch_batch",
+            "1785799979",
+        );
+        let (prepared, retained, _) = scripted(
+            "TEST_CODE_pool_v3",
+            Ok(GatewayBatch::Available {
+                records: vec![news_record(0)],
+                evidence,
+            }),
+        )
+        .await;
+        let source_ref = retained
+            .selected_news_source_ref(&prepared)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_ref.source_at, "1785799979");
+        assert_eq!(source_ref.provider_observed_at, "1785799979");
+    }
+
+    #[tokio::test]
     async fn empty_invalid_and_failed_news_keep_distinct_status_without_macro_text() {
         let evidence = batch(
             ProviderId::Cailianpress,
@@ -540,15 +741,19 @@ mod tests {
             "TEST_CODE_news_empty",
             "2026-09-28T07:00:02Z",
         );
-        let (_, verified, macro_news) = scripted(
+        let (verified_prepared, verified, macro_news) = scripted(
             "TEST_CODE_pool_v3",
             Ok(GatewayBatch::VerifiedEmpty(evidence.clone())),
         )
         .await;
         assert!(macro_news.is_none());
         assert!(matches!(verified.news, ChainNewsEvidence::VerifiedEmpty(_)));
+        assert!(verified
+            .selected_news_source_ref(&verified_prepared)
+            .unwrap()
+            .is_none());
 
-        let (_, invalid, macro_news) = scripted(
+        let (invalid_prepared, invalid, macro_news) = scripted(
             "TEST_CODE_pool_v3",
             Ok(GatewayBatch::Available {
                 records: Vec::new(),
@@ -561,8 +766,12 @@ mod tests {
             invalid.news,
             ChainNewsEvidence::InvalidAvailableEmpty(_)
         ));
+        assert!(invalid
+            .selected_news_source_ref(&invalid_prepared)
+            .unwrap()
+            .is_none());
 
-        let (_, failed, macro_news) = scripted(
+        let (failed_prepared, failed, macro_news) = scripted(
             "TEST_CODE_pool_v3",
             Err(GatewayError::unavailable(
                 "GlobalNews-CLS",
@@ -580,6 +789,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(failed
+            .selected_news_source_ref(&failed_prepared)
+            .unwrap()
+            .is_none());
         assert_ne!(verified.sha256().unwrap(), invalid.sha256().unwrap());
         assert_ne!(verified.sha256().unwrap(), failed.sha256().unwrap());
     }
