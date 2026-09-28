@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const SNAPSHOT_VERSION: u8 = 1;
+const SNAPSHOT_VERSION: u8 = 2;
 const MAX_SNAPSHOT_BYTES: u64 = 4_096;
 const MAX_SNAPSHOT_AGE: Duration = Duration::minutes(10);
 const MAX_CLOCK_LEAD: Duration = Duration::seconds(5);
@@ -59,6 +59,8 @@ struct HealthSnapshot {
     version: u8,
     boot_id: String,
     observed_at: DateTime<Utc>,
+    account_evaluated_at: Option<DateTime<Utc>>,
+    data_evaluated_at: Option<DateTime<Utc>>,
     account_mode: String,
     data_mode: String,
     account_metrics_complete: bool,
@@ -72,6 +74,11 @@ struct HealthReport {
     monitor_running: bool,
     snapshot_fresh: bool,
     observed_at: Option<DateTime<Utc>>,
+    observed_age_seconds: Option<i64>,
+    account_evaluated_at: Option<DateTime<Utc>>,
+    account_age_seconds: Option<i64>,
+    data_evaluated_at: Option<DateTime<Utc>>,
+    data_age_seconds: Option<i64>,
     account_mode: Option<String>,
     data_mode: Option<String>,
     account_metrics_complete: Option<bool>,
@@ -82,7 +89,7 @@ struct HealthReport {
 fn snapshot_path(root: &Path, test_mode: bool) -> PathBuf {
     root.join("data")
         .join(if test_mode { "test/health" } else { "health" })
-        .join("monitor-banner-v1.json")
+        .join("monitor-banner-v2.json")
 }
 
 fn lease_path(root: &Path, test_mode: bool) -> PathBuf {
@@ -92,16 +99,67 @@ fn lease_path(root: &Path, test_mode: bool) -> PathBuf {
         .join("monitor-delivery.lock")
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EvaluationTimes {
+    account_evaluated_at: Option<DateTime<Utc>>,
+    data_evaluated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EvaluationUpdate {
+    AccountAndData {
+        account_at: DateTime<Utc>,
+        data_at: DateTime<Utc>,
+    },
+    Data(DateTime<Utc>),
+    Synthetic,
+}
+
+impl EvaluationTimes {
+    pub fn apply(&mut self, update: EvaluationUpdate) {
+        match update {
+            EvaluationUpdate::AccountAndData {
+                account_at,
+                data_at,
+            } => {
+                self.account_evaluated_at = Some(account_at);
+                self.data_evaluated_at = Some(data_at);
+            }
+            EvaluationUpdate::Data(at) => self.data_evaluated_at = Some(at),
+            EvaluationUpdate::Synthetic => *self = Self::default(),
+        }
+    }
+}
+
 pub fn write_banner_snapshot(
     test_mode: bool,
     boot_id: &str,
     banner: &crate::push_templates::BannerCtx,
+    times: EvaluationTimes,
 ) -> Result<(), String> {
     let root = stock_analysis::production_root::root_for_mode(test_mode);
+    write_banner_snapshot_at(
+        &snapshot_path(root, test_mode),
+        boot_id,
+        banner,
+        times,
+        Utc::now(),
+    )
+}
+
+fn write_banner_snapshot_at(
+    path: &Path,
+    boot_id: &str,
+    banner: &crate::push_templates::BannerCtx,
+    times: EvaluationTimes,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let snapshot = HealthSnapshot {
         version: SNAPSHOT_VERSION,
         boot_id: boot_id.to_owned(),
-        observed_at: Utc::now(),
+        observed_at: now,
+        account_evaluated_at: times.account_evaluated_at,
+        data_evaluated_at: times.data_evaluated_at,
         account_mode: banner.account_mode.label().to_owned(),
         data_mode: banner.data_mode.label().to_owned(),
         account_metrics_complete: banner.account_metrics_complete,
@@ -111,7 +169,7 @@ pub fn write_banner_snapshot(
             .map(|note| note.split('/').map(str::to_owned).collect())
             .unwrap_or_default(),
     };
-    write_snapshot_at(&snapshot_path(root, test_mode), &snapshot)
+    write_snapshot_at(path, &snapshot)
 }
 
 fn write_snapshot_at(path: &Path, snapshot: &HealthSnapshot) -> Result<(), String> {
@@ -226,6 +284,11 @@ fn report_at(root: &Path, test_mode: bool, now: DateTime<Utc>) -> HealthReport {
     )
 }
 
+fn fresh_at(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(at);
+    age >= -MAX_CLOCK_LEAD && age <= MAX_SNAPSHOT_AGE
+}
+
 fn report_from(
     snapshot: Result<HealthSnapshot, &'static str>,
     lease_identity: Option<String>,
@@ -237,6 +300,11 @@ fn report_from(
         monitor_running: lease_identity.is_some(),
         snapshot_fresh: false,
         observed_at: None,
+        observed_age_seconds: None,
+        account_evaluated_at: None,
+        account_age_seconds: None,
+        data_evaluated_at: None,
+        data_age_seconds: None,
         account_mode: None,
         data_mode: None,
         account_metrics_complete: None,
@@ -251,6 +319,18 @@ fn report_from(
         }
     };
     report.observed_at = Some(snapshot.observed_at);
+    report.observed_age_seconds = Some(
+        now.signed_duration_since(snapshot.observed_at)
+            .num_seconds(),
+    );
+    report.account_evaluated_at = snapshot.account_evaluated_at;
+    report.account_age_seconds = snapshot
+        .account_evaluated_at
+        .map(|at| now.signed_duration_since(at).num_seconds());
+    report.data_evaluated_at = snapshot.data_evaluated_at;
+    report.data_age_seconds = snapshot
+        .data_evaluated_at
+        .map(|at| now.signed_duration_since(at).num_seconds());
     report.account_mode = Some(snapshot.account_mode.clone());
     report.data_mode = Some(snapshot.data_mode.clone());
     report.account_metrics_complete = Some(snapshot.account_metrics_complete);
@@ -264,6 +344,14 @@ fn report_from(
             report.reason_code = Some("monitor_not_running");
         } else if lease_identity.as_deref() != Some(snapshot.boot_id.as_str()) {
             report.reason_code = Some("health_snapshot_process_mismatch");
+        } else if snapshot.account_evaluated_at.is_none() {
+            report.reason_code = Some("account_evaluation_missing");
+        } else if !fresh_at(snapshot.account_evaluated_at.unwrap(), now) {
+            report.reason_code = Some("account_evaluation_stale");
+        } else if snapshot.data_evaluated_at.is_none() {
+            report.reason_code = Some("data_evaluation_missing");
+        } else if !fresh_at(snapshot.data_evaluated_at.unwrap(), now) {
+            report.reason_code = Some("data_evaluation_stale");
         } else if snapshot.account_mode != "Normal"
             || snapshot.data_mode != "Full"
             || !snapshot.account_metrics_complete
@@ -286,25 +374,34 @@ pub fn run(command: HealthCommand) -> i32 {
             Err(_) => return 2,
         }
     } else {
-        println!(
-            "status={} reason={} monitor_running={} snapshot_fresh={} observed_at={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={}",
-            report.status,
-            report.reason_code.unwrap_or("none"),
-            report.monitor_running,
-            report.snapshot_fresh,
-            report.observed_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
-            report.account_mode.as_deref().unwrap_or("missing"),
-            report.data_mode.as_deref().unwrap_or("missing"),
-            report.account_metrics_complete.map_or_else(|| "missing".to_owned(), |value| value.to_string()),
-            if report.missing_capabilities.is_empty() { "none".to_owned() } else { report.missing_capabilities.join(",") },
-            report.coverage,
-        );
+        println!("{}", render_text(&report));
     }
     if report.status == "ok" {
         0
     } else {
         1
     }
+}
+
+fn render_text(report: &HealthReport) -> String {
+    format!(
+            "status={} reason={} monitor_running={} snapshot_fresh={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={}",
+            report.status,
+            report.reason_code.unwrap_or("none"),
+            report.monitor_running,
+            report.snapshot_fresh,
+            report.observed_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
+            report.observed_age_seconds.map_or_else(|| "missing".to_owned(), |age| age.to_string()),
+            report.account_evaluated_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
+            report.account_age_seconds.map_or_else(|| "missing".to_owned(), |age| age.to_string()),
+            report.data_evaluated_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
+            report.data_age_seconds.map_or_else(|| "missing".to_owned(), |age| age.to_string()),
+            report.account_mode.as_deref().unwrap_or("missing"),
+            report.data_mode.as_deref().unwrap_or("missing"),
+            report.account_metrics_complete.map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+            if report.missing_capabilities.is_empty() { "none".to_owned() } else { report.missing_capabilities.join(",") },
+            report.coverage,
+        )
 }
 
 #[cfg(test)]
@@ -316,6 +413,8 @@ mod tests {
             version: SNAPSHOT_VERSION,
             boot_id: "123:456:1".to_owned(),
             observed_at: at,
+            account_evaluated_at: Some(at),
+            data_evaluated_at: Some(at),
             account_mode: "Normal".to_owned(),
             data_mode: "Full".to_owned(),
             account_metrics_complete: true,
@@ -401,6 +500,24 @@ mod tests {
             report_from(Ok(degraded), Some("123:456:1".to_owned()), now).reason_code,
             Some("banner_unhealthy")
         );
+        let mut frozen = snapshot(now);
+        frozen.account_mode = "Frozen".to_owned();
+        assert_eq!(
+            report_from(Ok(frozen), Some("123:456:1".to_owned()), now).reason_code,
+            Some("banner_unhealthy")
+        );
+        let mut unsafe_data = snapshot(now);
+        unsafe_data.data_mode = "Unsafe".to_owned();
+        assert_eq!(
+            report_from(Ok(unsafe_data), Some("123:456:1".to_owned()), now).reason_code,
+            Some("banner_unhealthy")
+        );
+        let mut incomplete = snapshot(now);
+        incomplete.account_metrics_complete = false;
+        assert_eq!(
+            report_from(Ok(incomplete), Some("123:456:1".to_owned()), now).reason_code,
+            Some("banner_unhealthy")
+        );
     }
 
     #[test]
@@ -418,6 +535,161 @@ mod tests {
             read_snapshot_at(&path).unwrap_err(),
             "health_snapshot_invalid"
         );
+    }
+
+    #[test]
+    fn successive_writes_keep_each_evaluation_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let path = snapshot_path(root.path(), false);
+        let t0 = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let banner = crate::push_templates::BannerCtx {
+            account_mode: crate::push_templates::AccountMode::Normal,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
+            account_metrics_complete: true,
+            account_fact: None,
+            data_mode: crate::push_templates::DataMode::Full,
+            data_missing_note: None,
+        };
+        let mut times = EvaluationTimes::default();
+        times.apply(EvaluationUpdate::AccountAndData {
+            account_at: t0,
+            data_at: t0,
+        });
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, t0).unwrap();
+        let t1 = t0 + Duration::minutes(1);
+        times.apply(EvaluationUpdate::Data(t1));
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, t1).unwrap();
+        let saved = read_snapshot_at(&path).unwrap();
+        assert_eq!(saved.observed_at, t1);
+        assert_eq!(saved.account_evaluated_at, Some(t0));
+        assert_eq!(saved.data_evaluated_at, Some(t1));
+        let hour_later = t0 + Duration::hours(1);
+        times.apply(EvaluationUpdate::Data(hour_later));
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
+        let report = report_from(
+            read_snapshot_at(&path),
+            Some("123:456:1".into()),
+            hour_later,
+        );
+        assert_eq!(report.reason_code, Some("account_evaluation_stale"));
+        // A second rendering of the same account batch carries its original time.
+        times.apply(EvaluationUpdate::AccountAndData {
+            account_at: t0,
+            data_at: hour_later,
+        });
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
+        assert_eq!(
+            read_snapshot_at(&path).unwrap().account_evaluated_at,
+            Some(t0)
+        );
+        times.apply(EvaluationUpdate::AccountAndData {
+            account_at: hour_later,
+            data_at: hour_later,
+        });
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
+        assert_eq!(
+            report_from(
+                read_snapshot_at(&path),
+                Some("123:456:1".into()),
+                hour_later
+            )
+            .status,
+            "ok"
+        );
+        times.apply(EvaluationUpdate::Synthetic);
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
+        assert_eq!(read_snapshot_at(&path).unwrap().account_evaluated_at, None);
+        assert_eq!(read_snapshot_at(&path).unwrap().data_evaluated_at, None);
+    }
+
+    #[test]
+    fn health_rejects_old_version_and_missing_or_stale_evaluations() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let old = root.path().join("data/health/monitor-banner-v1.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            read_snapshot_at(&snapshot_path(root.path(), false)).unwrap_err(),
+            "health_snapshot_unavailable"
+        );
+        let mut legacy = snapshot(now);
+        legacy.version = 1;
+        let path = snapshot_path(root.path(), false);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            read_snapshot_at(&path).unwrap_err(),
+            "health_snapshot_invalid"
+        );
+
+        let mut item = snapshot(now);
+        for (account, data, reason) in [
+            (None, Some(now), "account_evaluation_missing"),
+            (
+                Some(now - Duration::minutes(11)),
+                Some(now),
+                "account_evaluation_stale",
+            ),
+            (
+                Some(now + Duration::seconds(6)),
+                Some(now),
+                "account_evaluation_stale",
+            ),
+            (Some(now), None, "data_evaluation_missing"),
+            (
+                Some(now),
+                Some(now - Duration::minutes(11)),
+                "data_evaluation_stale",
+            ),
+            (
+                Some(now),
+                Some(now + Duration::seconds(6)),
+                "data_evaluation_stale",
+            ),
+        ] {
+            item.account_evaluated_at = account;
+            item.data_evaluated_at = data;
+            assert_eq!(
+                report_from(Ok(item.clone()), Some(item.boot_id.clone()), now).reason_code,
+                Some(reason)
+            );
+        }
+        item = snapshot(now + Duration::seconds(6));
+        assert_eq!(
+            report_from(Ok(item), Some("123:456:1".into()), now).reason_code,
+            Some("health_snapshot_stale")
+        );
+    }
+
+    #[test]
+    fn text_and_json_expose_matching_evidence() {
+        let now = Utc::now();
+        let report = report_from(
+            Ok(snapshot(now - Duration::seconds(3))),
+            Some("123:456:1".into()),
+            now,
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        let text = render_text(&report);
+        for key in ["observed_at", "account_evaluated_at", "data_evaluated_at"] {
+            let expected = DateTime::parse_from_rfc3339(value[key].as_str().unwrap())
+                .unwrap()
+                .to_rfc3339();
+            assert!(text.contains(&format!("{key}={expected}")), "{text}");
+        }
+        for key in [
+            "observed_age_seconds",
+            "account_age_seconds",
+            "data_age_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{key}={}", value[key].as_i64().unwrap())),
+                "{text}"
+            );
+        }
     }
 
     #[test]

@@ -1592,8 +1592,8 @@ pub static LATEST_BANNER: Lazy<std::sync::Mutex<Option<push_templates::BannerCtx
 // main and therefore cannot publish a production operational health snapshot.
 static HEALTH_SNAPSHOT_OWNER: Lazy<std::sync::Mutex<Option<(bool, String)>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
-static HEALTH_SNAPSHOT_WRITE_LOCK: Lazy<std::sync::Mutex<()>> =
-    Lazy::new(|| std::sync::Mutex::new(()));
+static HEALTH_SNAPSHOT_WRITE_LOCK: Lazy<std::sync::Mutex<health_cmd::EvaluationTimes>> =
+    Lazy::new(|| std::sync::Mutex::new(health_cmd::EvaluationTimes::default()));
 
 /// Read the latest fully evaluated banner.
 ///
@@ -1882,10 +1882,14 @@ mod tests_account_banner_values {
     }
 }
 
-fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
-    let _write_guard = HEALTH_SNAPSHOT_WRITE_LOCK
+fn store_banner(
+    banner: push_templates::BannerCtx,
+    evaluation: health_cmd::EvaluationUpdate,
+) -> Result<(), String> {
+    let mut times = HEALTH_SNAPSHOT_WRITE_LOCK
         .lock()
         .map_err(|_| "health snapshot write lock poisoned".to_string())?;
+    times.apply(evaluation);
     *LATEST_BANNER
         .lock()
         .map_err(|_| "latest banner lock poisoned".to_string())? = Some(banner.clone());
@@ -1897,7 +1901,8 @@ fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
         }
     };
     if let Some((test_mode, boot_id)) = owner {
-        if let Err(error) = health_cmd::write_banner_snapshot(test_mode, &boot_id, &banner) {
+        if let Err(error) = health_cmd::write_banner_snapshot(test_mode, &boot_id, &banner, *times)
+        {
             log::error!("[health] operational banner snapshot unavailable: {error}");
         }
     }
@@ -2320,11 +2325,19 @@ pub async fn refresh_banner_state() -> Result<(), String> {
         .to_thresholds();
     let account_mode =
         stock_analysis::risk::account_mode::evaluate(&batch.metrics, prev_mode, &thresholds).mode;
+    let account_at = chrono::Utc::now();
     let data_health = evaluated_data_health()?;
+    let data_at = chrono::Utc::now();
     if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(&batch, account_mode, &data_health))?;
+    store_banner(
+        build_banner(&batch, account_mode, &data_health),
+        health_cmd::EvaluationUpdate::AccountAndData {
+            account_at,
+            data_at,
+        },
+    )?;
     Ok(())
 }
 
@@ -2340,8 +2353,10 @@ async fn refresh_banner_state_with_metrics(
     batch: &AccountModeMetricsBatch,
 
     lib_mode: stock_analysis::risk::action_gate::AccountMode,
+    account_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let data_health = evaluated_data_health()?;
+    let data_at = chrono::Utc::now();
     // BR-147: this is the only banner path the live monitor and `--review`
     // actually take. Without refreshing the note here the cached slot stays
     // None for the whole process, so a persisted valuation is rendered as
@@ -2349,7 +2364,13 @@ async fn refresh_banner_state_with_metrics(
     if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(batch, lib_mode, &data_health))
+    store_banner(
+        build_banner(batch, lib_mode, &data_health),
+        health_cmd::EvaluationUpdate::AccountAndData {
+            account_at,
+            data_at,
+        },
+    )
 }
 
 /// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
@@ -2440,8 +2461,10 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         now_local,
     );
     let evaluated_mode = evaluation.mode;
+    let account_at = chrono::Utc::now();
 
-    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode, account_at).await
+    {
         log::error!("[AccountMode-hook] banner evaluation failed: {error}");
         return false;
     }
@@ -2490,7 +2513,8 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
 
     // Refresh once more after the orchestration so the shared state remains
     // aligned even when a reset transition was persisted during this call.
-    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode, account_at).await
+    {
         log::error!("[AccountMode-hook] final banner refresh failed: {error}");
         return false;
     }
@@ -2774,6 +2798,7 @@ async fn evaluate_data_mode_hook() {
     };
 
     let health = dm_evaluate(&input, prev);
+    let data_at = chrono::Utc::now();
     let unsafe_action = match DATA_MODE_UNSAFE_REMINDER.lock() {
         Ok(state) => match state.action(health.mode, &health.missing, std::time::Instant::now()) {
             Ok(action) => action,
@@ -2825,7 +2850,7 @@ async fn evaluate_data_mode_hook() {
     let Some(banner) = banner else {
         return;
     };
-    if let Err(error) = store_banner(banner.clone()) {
+    if let Err(error) = store_banner(banner.clone(), health_cmd::EvaluationUpdate::Data(data_at)) {
         log::error!("[DataMode-hook] banner store failed: {error}");
         return;
     }
@@ -7024,7 +7049,7 @@ async fn e2e_all_templates_run(
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     };
-    store_banner(banner_e2e.clone())
+    store_banner(banner_e2e.clone(), health_cmd::EvaluationUpdate::Synthetic)
         .map_err(|error| format!("BR-196 TEST_CODE governance banner commit failed: {error}"))?;
     let smoke_context = br196_test_delivery::GovernanceSmokeContext::for_review_date(review_date)?;
     let mut smoke = push_e2e_14x_templates(&today_str, &hhmm, &smoke_context).await?;
