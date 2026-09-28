@@ -4438,6 +4438,155 @@ async fn quiesce_background_tasks(
         })?
 }
 
+// Own the timer until service supervision takes it. An ordinary startup return
+// aborts it before the monitor lease can be dropped.
+struct OperationalHeartbeatTask(Option<tokio::task::JoinHandle<()>>);
+
+impl OperationalHeartbeatTask {
+    fn take(&mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("resident heartbeat task was started")
+    }
+}
+
+impl Drop for OperationalHeartbeatTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+fn record_operational_heartbeat_result(result: Result<(), String>, consecutive_failures: &mut u64) {
+    match result {
+        Ok(()) => *consecutive_failures = 0,
+        Err(error) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures == 1 || *consecutive_failures % 10 == 0 {
+                log::error!(
+                    "[health][operational_heartbeat] write_failed consecutive_failures={} error={}",
+                    consecutive_failures,
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn operational_heartbeat_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn run_operational_heartbeat_scheduler<Now, Write>(
+    mut interval: tokio::time::Interval,
+    mut now: Now,
+    mut write: Write,
+    mut consecutive_failures: u64,
+) where
+    Now: FnMut() -> chrono::DateTime<chrono::Utc>,
+    Write: FnMut(chrono::DateTime<chrono::Utc>) -> Result<(), String>,
+{
+    loop {
+        interval.tick().await;
+        record_operational_heartbeat_result(write(now()), &mut consecutive_failures);
+    }
+}
+
+#[cfg(test)]
+mod operational_heartbeat_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(start_paused = true)]
+    async fn operational_heartbeat_advances_while_evaluation_waits_or_fails_and_write_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data/test/health/heartbeat.json");
+        let boot_id = "123:456:1";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::clone(&calls);
+        let write_path = path.clone();
+        let anchor = chrono::Utc::now();
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let tick_clock = Arc::clone(&clock_calls);
+        let interval = operational_heartbeat_interval(std::time::Duration::from_secs(60));
+        let task = tokio::spawn(run_operational_heartbeat_scheduler(
+            interval,
+            move || {
+                anchor
+                    + chrono::Duration::seconds(
+                        60 * (tick_clock.fetch_add(1, Ordering::SeqCst) as i64 + 1),
+                    )
+            },
+            move |now| {
+                let call = write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 2 {
+                    return Err("injected_write_failure".to_owned());
+                }
+                health_cmd::write_heartbeat_at(&write_path, boot_id, now)
+            },
+            0,
+        ));
+        let pending_evaluation = tokio::spawn(std::future::pending::<()>());
+        let failed_evaluation = tokio::spawn(async { Err::<(), _>("injected_evaluation_failure") });
+        assert_eq!(
+            failed_evaluation.await.unwrap(),
+            Err("injected_evaluation_failure")
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let first: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(first["boot_id"], boot_id);
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            first,
+            "failed replacement preserves the previous heartbeat"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let latest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(latest["boot_id"], boot_id);
+        assert!(latest["observed_at"].as_str().unwrap() > first["observed_at"].as_str().unwrap());
+        assert!(!pending_evaluation.is_finished());
+
+        pending_evaluation.abort();
+        task.abort();
+        task.await.unwrap_err();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operational_heartbeat_startup_guard_aborts_before_supervision() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let interval = operational_heartbeat_interval(std::time::Duration::from_secs(60));
+        let guard =
+            OperationalHeartbeatTask(Some(tokio::spawn(run_operational_heartbeat_scheduler(
+                interval,
+                chrono::Utc::now,
+                move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                0,
+            ))));
+        drop(guard);
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 async fn shutdown_jsonl_writer(
     bus: &stock_analysis::event::EventBus,
     handle: &mut Option<JsonlWriterTask>,
@@ -4910,6 +5059,32 @@ async fn main() {
             Err(_) => log::error!("[health] snapshot owner lock poisoned"),
         }
     }
+    // The startup health check and webhook can await indefinitely. Start
+    // process liveness before either, but only for the leased resident entry.
+    let mut operational_heartbeat = if selection_cli.requires_service_enablement() {
+        let boot_id = _monitor_instance_lease
+            .as_ref()
+            .expect("resident monitor holds the singleton lease")
+            .boot_id
+            .clone();
+        let mut consecutive_failures = 0;
+        record_operational_heartbeat_result(
+            health_cmd::write_process_heartbeat(test_mode, &boot_id, chrono::Utc::now()),
+            &mut consecutive_failures,
+        );
+        let interval = operational_heartbeat_interval(health_cmd::HEARTBEAT_INTERVAL);
+        Some(OperationalHeartbeatTask(Some(tokio::spawn(
+            run_operational_heartbeat_scheduler(
+                interval,
+                chrono::Utc::now,
+                move |now| health_cmd::write_process_heartbeat(test_mode, &boot_id, now),
+                consecutive_failures,
+            ),
+        ))))
+    } else {
+        None
+    };
+
     // BR-241: reject an invalid P-01 compensation command after acquiring the
     // production singleton lease, but before audit/sink initialization or the
     // global durable startup barrier can resume an unrelated PushKind.
@@ -5867,6 +6042,13 @@ async fn main() {
         let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
         let background_tasks = vec![
+            (
+                "operational_heartbeat",
+                operational_heartbeat
+                    .as_mut()
+                    .expect("resident heartbeat task was started")
+                    .take(),
+            ),
             ("dryrun_reporter", dryrun_reporter),
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),

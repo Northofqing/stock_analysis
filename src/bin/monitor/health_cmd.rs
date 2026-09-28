@@ -257,7 +257,7 @@ pub fn write_process_heartbeat(
     write_heartbeat_at(&heartbeat_path(root, test_mode), boot_id, observed_at)
 }
 
-fn write_heartbeat_at(
+pub(crate) fn write_heartbeat_at(
     path: &Path,
     boot_id: &str,
     observed_at: DateTime<Utc>,
