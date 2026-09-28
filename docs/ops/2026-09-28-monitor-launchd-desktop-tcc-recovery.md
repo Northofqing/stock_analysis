@@ -1,12 +1,22 @@
 # monitor 的 launchd / Desktop TCC 故障交接（2026-09-28）
 
-## 当前状态（11:55 CST）
+## 初次迁移状态（11:55 CST）
 
 Desktop 外运行根切换已完成。`com.northofqing.grpc-market-server`（PID 56417）与 `com.stockanalysis.monitor`（PID 59028）均由 `gui/501` launchd 管理，`runs=1`，程序和工作目录都在 `/Users/zhangzhen/.local/share/stock-analysis-runtime`。本地桥接于 11:54:58 监听 `127.0.0.1:18082`，非 fixture 模式；monitor 于 11:53:59 完成新根主库初始化，11:55:04 记录“gRPC 桥已连接”。旧 Desktop `stock_analysis.db` 与 `durable_delivery.sqlite3` 已无进程占用。当前运行版本是新根构建出的 monitor SHA-256 `2704c32f505f168c6f61dacce879c9db282df9eb3990622f3d8d96b36eeb6219`；后续仓库源码修改尚未部署。
 
 停旧实例后，完整 `rsync -a --delete --checksum data/` 至新根退出 0；新根主库和持久投递库的 `PRAGMA quick_check` 均为 `ok`。从新根生成的 activation 已在 11:25 CST 生效并提交为 `57f53aa8`，预期配置哈希为 `ba4087dbd9d76d377a3804cd56738e91dd40e177dc131c3e5056650be660b158`。本地桥接只读探针的 Health/Capabilities 通过，午间 RealtimeQuotes 返回 `no_verified_batch`；不能据此宣称行情数据已完整恢复，开盘后仍需复验。上游 VM 的 R-08 `Planned` 已验证，`Confirmed` 仍不可用；Eastmoney GlobalNews 的 `source_precondition_failed` 已定位为 `bank.eastmoney.com` 文章域名未列入资格集合，详见[上游交接](../../grpc_handoffs/2026-09-28-eastmoney-globalnews-source-precondition-vm-handoff.md)。
 
 启动耗时的原因已定位：主库 `data_acquisition_audit` 与链各约 343 万行，数据库初始化先在采集审计模块、再在 benchmark manifest 模块各验证一次完整哈希链。本次桥接启动约 9 分钟，monitor 约 4 分钟；不能只以 launchd PID 存在判定就绪。monitor 比桥接先完成初始化期间，部分 LocalBridge 请求按 `no_verified_batch` fail closed 并留有失败记录；桥接就绪后 monitor 自动重连。后续应优化重复全量校验的启动成本并核对这些欠账的正常重试，不应绕过链完整性检查。
+
+## Eastmoney gRPC 身份更新（19:12 CST）
+
+VM Codex 在隔离分支提交 `4e4995f8d3f2c7cd504d1dec0f238e6d4b4fc02c`，精确接纳真实滚动页上的 `bank.eastmoney.com` 与 `forex.eastmoney.com` 文章域名。VM 运行 exe SHA-256 为 `517e0b4c31bb42330f4bc2a0395e3af385a164212414a65775bed40c9eb87ae3`，Health 的服务版本、提交、descriptor `0c4485545dbfd0979a7d5ea206c840f39fd504ed62fb7eef92f1940bdc9c2f41` 与 exe 哈希匹配，公开 bundle 版本 `2026-09-28.2`，清单 9/9 通过。VM 连续四次 `limit=20` 真实新闻请求均为 `ADMITTED` 且含外汇频道记录；本机独立的 20 条请求也成功。详见[上游交接](../../grpc_handoffs/2026-09-28-eastmoney-globalnews-source-precondition-vm-handoff.md)。VM 修复未推送 GitHub。
+
+本机只同步六个公开 bundle 文件到生产运行根，保留原认证资料，清单 9/9 通过。从该 Desktop 外运行根执行 `STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT` 定向 release 构建，monitor SHA-256 为 `a2589f0115d6f3ee89bf11d7714c7bd4bce58f6d3e5bcbc12b06831ffc5b8b34`，探针为 `3341470560daf9ee52fb0c046b74f91d93d01396f3c9b61252cc18cfc745e98e`。源码和配置输入未改，旧 activation 的预期哈希 `ba4087dbd9d76d377a3804cd56738e91dd40e177dc131c3e5056650be660b158` 仍有效，未重发。探针 `--opening` 验证 Health 身份匹配、四家 GlobalNews 真实记录和九条静态路由 `9/9` ready；R-08 定向探针仍为四条 `Planned`、`confirmed_delivery=false`。
+
+19:10 对 `gui/501/com.stockanalysis.monitor` 执行单实例 kickstart，新 PID `17089`，cwd 和打开的主库、持久投递库均位于生产运行根；本地桥接 PID `56417` 未重启。19:12:03 主库初始化完成，19:12:06 记录本地 gRPC 桥连接，19:12:10 的 monitor `GlobalNews-Eastmoney` 生产审计为 `outcome=available`、`accepted=20`、`rejected=0`，19:12:22 OpeningReadiness 记录了 Eastmoney 静态路由。先前 monitor 与 VM 身份不一致时的 `external_transport_unavailable` 审计属于切换窗口，不能当作新进程失败。全局 DataMode 和其他业务源仍需各自验收。
+
+本机旧 monitor、探针和六个旧公开文件备份在生产根的 `rollback-eastmoney-20260928/`。该备份绑定原 VM 提交 `69c6ef19` 与 exe SHA-256 `b22766603c8371a8ad4685c38872f7536ddc36519d4321ecfd3f8f72feea8dac`；如需回退，必须让 VM 也恢复到这一身份，再恢复本机 bundle 和二进制并单实例重启。只回退一侧会因编译期身份校验继续 fail closed，不能覆盖生产数据库或重放历史投递。
 
 ## 故障与根因（切换前）
 
@@ -42,6 +52,6 @@ Desktop 外运行根切换已完成。`com.northofqing.grpc-market-server`（PID
 
 - 新真实目录为 `/Users/zhangzhen/.local/share/stock-analysis-runtime`，权限 0700；原样复制同版 `src/config/contracts/Cargo` 输入、公开 `client-bundle`、本机 `.env`、MagicLaw 与报告。新 `.env` 只更新 gRPC bundle、MagicLaw bin/home 路径并移除源码不读取的 `WECHAT_SEND_SCRIPT`；两份 `.env` 及私钥为 0600。公开 bundle 清单 9/9 匹配，MagicLaw 二进制与旧版 SHA-256 同为 `16024d290ee302ffe1872db1e8b26e95d0b5f43f451510a1da38910300fcf213`。
 - 从新目录 `cargo build --locked --offline --release -j 2 --bin monitor --bin grpc_bundle_probe` 成功；新 monitor SHA-256 `2704c32f505f168c6f61dacce879c9db282df9eb3990622f3d8d96b36eeb6219`，probe SHA-256 `c2a3f86b3e5749036e2752ea01cceb89f1eff064e2aa7b0a631e0a60ba6cc2d9`。另构建 `selection_activation_prepare` 成功。构建期源码与本仓 `src/` 字节一致；待停旧后生成新 activation，不能使用原文件的旧 hash。
-- 新 probe 的 R-08 真实查询退出 0：Health identity matched，2026-09 四条 `Planned` 均 `ADMITTED`，`confirmed_delivery=false`。`--opening` 退出 0，九条静态路由中八条 ready；Eastmoney `Unadmitted` 的真实原因现为 `source_precondition_failed`，本仓诊断修复见 `d9f80181`，上游故障未关闭。
+- 当时新 probe 的 R-08 真实查询退出 0：Health identity matched，2026-09 四条 `Planned` 均 `ADMITTED`，`confirmed_delivery=false`。`--opening` 退出 0，九条静态路由中八条 ready；当时 Eastmoney `Unadmitted` 的真实原因是 `source_precondition_failed`，本仓诊断修复见 `d9f80181`，上游故障彼时未关闭；19:12 的关闭证据见上文。
 - 临时 shadow LaunchAgent 使用新二进制、新工作目录与日志、`--test --push-dry-run`、无 KeepAlive；已运行一次并以 exit code 0 退出。日志确认 `bound root mode=test` 为新目录、核心库在独立 `TEST_CODE` 临时目录、`external_process_attempted=0` 和 `receipt_audit_appended=0`，随后已 bootout。证明 launchd 可从 Desktop 外进入程序并完成隔离 dry-run；不代表生产主库已迁移。
 - 限速预拷在读取活动 `stock_analysis.db` 时返回 `unexpected end of file`，目标未生成该主库；跳过主库及其 WAL/SHM 后其余数据预拷退出 0。**目标 `data/` 尚非一致生产快照**。正式切换必须在旧 PID 退出、其他写者核清后完整无排除同步并检查数据库；不得因 shadow 成功提前启动第二个生产进程。
