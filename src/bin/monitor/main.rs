@@ -5015,8 +5015,27 @@ fn parse_br194_terminal_replay_command(
     }))
 }
 
+/// Monotonic timings for diagnosing startup cost. A stage result is an
+/// observation, never a checkpoint that permits skipping integrity work.
+fn log_startup_profile(
+    stage: &'static str,
+    stage_started: std::time::Instant,
+    process_started: std::time::Instant,
+    status: &'static str,
+) {
+    log::info!(
+        "[startup-profile] pid={} stage={} status={} elapsed_ms={} since_process_start_ms={}",
+        std::process::id(),
+        stage,
+        status,
+        stage_started.elapsed().as_millis(),
+        process_started.elapsed().as_millis()
+    );
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    let process_started = std::time::Instant::now();
     let process_stock_list = std::env::var("STOCK_LIST").ok();
     dotenvy::dotenv().ok();
 
@@ -5251,32 +5270,66 @@ async fn main() {
     }
     // BR-144/145: prove the delivery audit chain is readable and writable
     // before warming any sink. A failed preflight blocks ordinary pushes.
+    let audit_preflight_started = std::time::Instant::now();
     let audit_preflight =
         tokio::task::spawn_blocking(stock_analysis::event::preflight_runtime_delivery_audit).await;
     match audit_preflight {
-        Ok(Ok(receipt)) => log::info!(
-            "[AuditDegraded][BR-144] delivery audit preflight healthy: year={} previous_hash={:?}",
-            receipt.year,
-            receipt.previous_hash
-        ),
+        Ok(Ok(receipt)) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "ok",
+            );
+            log::info!(
+                "[AuditDegraded][BR-144] delivery audit preflight healthy: year={} previous_hash={:?}",
+                receipt.year,
+                receipt.previous_hash
+            );
+        }
         Ok(Err(error)) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "failed",
+            );
             log::error!(
                 "[event_bus.jsonl] initialization failed [AuditDegraded][BR-144] delivery audit preflight: {error}"
             );
             std::process::exit(2);
         }
         Err(error) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "worker_failed",
+            );
             log::error!("[AuditDegraded][BR-144] delivery audit preflight worker failed: {error}");
             std::process::exit(2);
         }
     }
+    let artifact_bind_started = std::time::Instant::now();
     if let Err(error) = durable_delivery_runtime::eager_bind_runtime_artifacts() {
+        log_startup_profile(
+            "durable_artifact_bind",
+            artifact_bind_started,
+            process_started,
+            "failed",
+        );
         log::error!(
             "[DurableDelivery][BR-192] eager artifact capability binding failed before sink initialization: {error}"
         );
         log::logger().flush();
         std::process::exit(2);
     }
+    log_startup_profile(
+        "durable_artifact_bind",
+        artifact_bind_started,
+        process_started,
+        "ok",
+    );
 
     // 修复 F20 (2026-06-29 codex review): 启动 banner 显示当前 LaunchStage
 
@@ -5349,6 +5402,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let jsonl_writer_started = std::time::Instant::now();
     let mut jsonl_writer_handle = Some(
         match stock_analysis::event::JsonlWriter::spawn(
             event_receiver,
@@ -5359,11 +5413,23 @@ async fn main() {
         {
             Ok(handle) => handle,
             Err(error) => {
+                log_startup_profile(
+                    "jsonl_writer_init",
+                    jsonl_writer_started,
+                    process_started,
+                    "failed",
+                );
                 log::error!("[event_bus.jsonl] initialization failed: {error}");
                 log::logger().flush();
                 std::process::exit(2);
             }
         },
+    );
+    log_startup_profile(
+        "jsonl_writer_init",
+        jsonl_writer_started,
+        process_started,
+        "ok",
     );
     log::info!(
         "[event_bus.jsonl] mode=enabled retention_days=1827 isolated_test={}",
@@ -5529,9 +5595,24 @@ async fn main() {
         }
     }
 
+    let core_database_started = std::time::Instant::now();
     let core_database_path = match install_mode_owned_core_database(test_mode) {
-        Ok(path) => path,
+        Ok(path) => {
+            log_startup_profile(
+                "core_database_bind",
+                core_database_started,
+                process_started,
+                "ok",
+            );
+            path
+        }
         Err(error) => {
+            log_startup_profile(
+                "core_database_bind",
+                core_database_started,
+                process_started,
+                "failed",
+            );
             log::error!("[DB init][BR-051][BR-183] {error}");
             exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
@@ -5547,8 +5628,15 @@ async fn main() {
     // exclusive single-kind command, so it deliberately skips this global
     // barrier and uses the P-01 stored-envelope reconcile seam instead.
     if p01_compensation.is_none() {
+        let reconcile_started = std::time::Instant::now();
         match durable_delivery_runtime::ensure_startup_reconciled().await {
             Ok(evidence) => {
+                log_startup_profile(
+                    "durable_reconcile",
+                    reconcile_started,
+                    process_started,
+                    "ok",
+                );
                 log::info!(
                     "[DurableDelivery][BR-192] startup fixed point reached progress={} resumed_sink_calls={} foreign_lease_boundaries={} manual_review_boundaries={} schedule_hydrations={}",
                     evidence.progress_count,
@@ -5571,6 +5659,12 @@ async fn main() {
                 }
             }
             Err(error) => {
+                log_startup_profile(
+                    "durable_reconcile",
+                    reconcile_started,
+                    process_started,
+                    "failed",
+                );
                 log::error!("[DurableDelivery][BR-192] producer activation blocked: {error}");
                 exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
             }
@@ -5676,9 +5770,21 @@ async fn main() {
 
     stock_analysis::strategy::v16_4::register_all();
 
+    let health_check_started = std::time::Instant::now();
     let startup_health = health::health_check().await;
+    log_startup_profile(
+        "startup_health_check",
+        health_check_started,
+        process_started,
+        if startup_health.all_ok() {
+            "ok"
+        } else {
+            "degraded"
+        },
+    );
     if !startup_health.all_ok() {
         log::error!("[health] 启动健康检查失败: {:?}", startup_health);
+        let health_alert_started = std::time::Instant::now();
         match webhook_alert::on_health_fail(&startup_health).await {
             Ok(webhook_alert::WebhookDelivery::Delivered) => {
                 log::info!("[health] 失败告警已投递")
@@ -5691,6 +5797,12 @@ async fn main() {
             }
             Err(error) => log::error!("[health] 失败告警投递失败: {}", error),
         }
+        log_startup_profile(
+            "startup_health_alert",
+            health_alert_started,
+            process_started,
+            "completed",
+        );
     }
 
     // BR-164: 盘中/盘后共用同一完整批次路由，不保留消费端旧源或第二套协议。
