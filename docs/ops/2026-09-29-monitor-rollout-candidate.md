@@ -27,4 +27,6 @@
 
 `selection_activation_prepare print-activation` 明确要求**人工 review 后**才写入 `config/selection/selection_activation.v1.json`。当前候选的 `reviewed_by=codex-platform-production-20260929` 仅用于预览，不能代替人审。完成复核后应重新生成实际 reviewer、未来 `effective_from` 的文件，核对新 hash 与字节，再同步到仓库和生产运行根。切换前再次核对 launchd PID、数据库/投递锁与 Uncertain 水位；78 条既有 Uncertain 保持隔离，不能因本次重启自动裁定。按单实例顺序重启 monitor，桥接保持原 PID；等待 DB 初始化及 gRPC 重连。新 PID、binary hash、activation、实际公告批次、来源健康和投递/账本状态必须逐项验收。
 
+`selection::process_bootstrap` 在启动时计算 activation gate；`activation_gate` 在 `now < effective_from` 时返回 `activation_not_effective`。因此必须等新文件的未来生效时刻到达后再重启 monitor，不能先重启、事后仅等时钟越过生效点。等待期间旧 PID 继续提供服务。
+
 如启动失败，先停止新实例，保持同一运行根和数据库；只回退二进制与匹配源码/activation，并核对已发生的写入和 Uncertain，不能覆盖生产 DB 或盲重发。VM 身份如变化，须与本地 bundle 同步切换，不做单侧回退。
