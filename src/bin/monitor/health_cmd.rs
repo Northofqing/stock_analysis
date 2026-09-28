@@ -1,7 +1,7 @@
 //! Read-only operational health command backed by the live banner owner.
 //!
-//! This first v19 slice reports account/data banner health. Breakers, error
-//! counts, and per-source recovery are deliberately outside its coverage.
+//! This v19 slice reports banner account/data health and leased-process liveness.
+//! Breakers, error counts, and per-source recovery are outside its coverage.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,11 @@ struct HealthReport {
     reason_code: Option<&'static str>,
     monitor_running: bool,
     snapshot_fresh: bool,
+    heartbeat_fresh: bool,
+    heartbeat_status: &'static str,
+    heartbeat_reason_code: Option<&'static str>,
+    heartbeat_observed_at: Option<DateTime<Utc>>,
+    heartbeat_age_seconds: Option<i64>,
     observed_at: Option<DateTime<Utc>>,
     observed_age_seconds: Option<i64>,
     account_evaluated_at: Option<DateTime<Utc>>,
@@ -444,6 +449,7 @@ fn monitor_lease_identity(path: &Path) -> Option<String> {
 fn report_at(root: &Path, test_mode: bool, now: DateTime<Utc>) -> HealthReport {
     report_from(
         read_snapshot_at(&snapshot_path(root, test_mode)),
+        read_heartbeat_at(&heartbeat_path(root, test_mode), now),
         monitor_lease_identity(&lease_path(root, test_mode)),
         now,
     )
@@ -456,6 +462,7 @@ fn fresh_at(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 
 fn report_from(
     snapshot: Result<HealthSnapshot, &'static str>,
+    heartbeat: Result<ProcessHeartbeat, &'static str>,
     lease_identity: Option<String>,
     now: DateTime<Utc>,
 ) -> HealthReport {
@@ -464,6 +471,11 @@ fn report_from(
         reason_code: None,
         monitor_running: lease_identity.is_some(),
         snapshot_fresh: false,
+        heartbeat_fresh: false,
+        heartbeat_status: "unhealthy",
+        heartbeat_reason_code: None,
+        heartbeat_observed_at: None,
+        heartbeat_age_seconds: None,
         observed_at: None,
         observed_age_seconds: None,
         account_evaluated_at: None,
@@ -474,8 +486,30 @@ fn report_from(
         data_mode: None,
         account_metrics_complete: None,
         missing_capabilities: Vec::new(),
-        coverage: "banner_account_data_only",
+        coverage: "banner_account_data_and_process_liveness_only",
     };
+    match heartbeat {
+        Err(reason) => report.heartbeat_reason_code = Some(reason),
+        Ok(heartbeat) => {
+            let age = now.signed_duration_since(heartbeat.observed_at);
+            report.heartbeat_observed_at = Some(heartbeat.observed_at);
+            report.heartbeat_age_seconds = Some(age.num_seconds());
+            if age < -MAX_CLOCK_LEAD {
+                report.heartbeat_reason_code = Some("process_heartbeat_invalid");
+            } else if age > MAX_HEARTBEAT_AGE {
+                report.heartbeat_reason_code = Some("process_heartbeat_stale");
+            } else {
+                report.heartbeat_fresh = true;
+                if lease_identity.is_none() {
+                    report.heartbeat_reason_code = Some("process_heartbeat_monitor_not_running");
+                } else if lease_identity.as_deref() != Some(heartbeat.boot_id.as_str()) {
+                    report.heartbeat_reason_code = Some("process_heartbeat_process_mismatch");
+                } else {
+                    report.heartbeat_status = "ok";
+                }
+            }
+        }
+    }
     let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
         Err(reason) => {
@@ -523,6 +557,8 @@ fn report_from(
             || !snapshot.missing_capabilities.is_empty()
         {
             report.reason_code = Some("banner_unhealthy");
+        } else if let Some(reason) = report.heartbeat_reason_code {
+            report.reason_code = Some(reason);
         } else {
             report.status = "ok";
         }
@@ -550,11 +586,16 @@ pub fn run(command: HealthCommand) -> i32 {
 
 fn render_text(report: &HealthReport) -> String {
     format!(
-            "status={} reason={} monitor_running={} snapshot_fresh={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={}",
+            "status={} reason={} monitor_running={} snapshot_fresh={} heartbeat_fresh={} heartbeat_status={} heartbeat_reason_code={} heartbeat_observed_at={} heartbeat_age_seconds={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={}",
             report.status,
             report.reason_code.unwrap_or("none"),
             report.monitor_running,
             report.snapshot_fresh,
+            report.heartbeat_fresh,
+            report.heartbeat_status,
+            report.heartbeat_reason_code.unwrap_or("none"),
+            report.heartbeat_observed_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
+            report.heartbeat_age_seconds.map_or_else(|| "missing".to_owned(), |age| age.to_string()),
             report.observed_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
             report.observed_age_seconds.map_or_else(|| "missing".to_owned(), |age| age.to_string()),
             report.account_evaluated_at.map_or_else(|| "missing".to_owned(), |at| at.to_rfc3339()),
@@ -572,6 +613,14 @@ fn render_text(report: &HealthReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn heartbeat(at: DateTime<Utc>) -> ProcessHeartbeat {
+        ProcessHeartbeat {
+            version: HEARTBEAT_VERSION,
+            boot_id: "123:456:1".to_owned(),
+            observed_at: at,
+        }
+    }
 
     fn snapshot(at: DateTime<Utc>) -> HealthSnapshot {
         HealthSnapshot {
@@ -619,12 +668,20 @@ mod tests {
         let path = snapshot_path(root.path(), false);
         write_snapshot_at(&path, &snapshot(now)).unwrap();
         assert_eq!(read_snapshot_at(&path).unwrap().observed_at, now);
-        let report = report_from(read_snapshot_at(&path), Some("123:456:1".to_owned()), now);
+        let report = report_from(
+            read_snapshot_at(&path),
+            Ok(heartbeat(now)),
+            Some("123:456:1".to_owned()),
+            now,
+        );
         assert_eq!(report.status, "ok");
         assert!(report.reason_code.is_none());
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["coverage"], "banner_account_data_only");
+        assert_eq!(
+            parsed["coverage"],
+            "banner_account_data_and_process_liveness_only"
+        );
         assert_eq!(parsed["account_mode"], "Normal");
         assert!(parsed.get("today_pnl").is_none());
     }
@@ -635,6 +692,7 @@ mod tests {
         assert_eq!(
             report_from(
                 Err("health_snapshot_unavailable"),
+                Ok(heartbeat(now)),
                 Some("123:456:1".to_owned()),
                 now
             )
@@ -644,6 +702,7 @@ mod tests {
         assert_eq!(
             report_from(
                 Ok(snapshot(now - Duration::minutes(11))),
+                Ok(heartbeat(now)),
                 Some("123:456:1".to_owned()),
                 now
             )
@@ -651,36 +710,66 @@ mod tests {
             Some("health_snapshot_stale")
         );
         assert_eq!(
-            report_from(Ok(snapshot(now)), None, now).reason_code,
+            report_from(Ok(snapshot(now)), Ok(heartbeat(now)), None, now).reason_code,
             Some("monitor_not_running")
         );
         assert_eq!(
-            report_from(Ok(snapshot(now)), Some("123:456:2".to_owned()), now).reason_code,
+            report_from(
+                Ok(snapshot(now)),
+                Ok(heartbeat(now)),
+                Some("123:456:2".to_owned()),
+                now
+            )
+            .reason_code,
             Some("health_snapshot_process_mismatch")
         );
         let mut degraded = snapshot(now);
         degraded.data_mode = "Degraded".to_owned();
         degraded.missing_capabilities = vec!["Quote".to_owned()];
         assert_eq!(
-            report_from(Ok(degraded), Some("123:456:1".to_owned()), now).reason_code,
+            report_from(
+                Ok(degraded),
+                Ok(heartbeat(now)),
+                Some("123:456:1".to_owned()),
+                now
+            )
+            .reason_code,
             Some("banner_unhealthy")
         );
         let mut frozen = snapshot(now);
         frozen.account_mode = "Frozen".to_owned();
         assert_eq!(
-            report_from(Ok(frozen), Some("123:456:1".to_owned()), now).reason_code,
+            report_from(
+                Ok(frozen),
+                Ok(heartbeat(now)),
+                Some("123:456:1".to_owned()),
+                now
+            )
+            .reason_code,
             Some("banner_unhealthy")
         );
         let mut unsafe_data = snapshot(now);
         unsafe_data.data_mode = "Unsafe".to_owned();
         assert_eq!(
-            report_from(Ok(unsafe_data), Some("123:456:1".to_owned()), now).reason_code,
+            report_from(
+                Ok(unsafe_data),
+                Ok(heartbeat(now)),
+                Some("123:456:1".to_owned()),
+                now
+            )
+            .reason_code,
             Some("banner_unhealthy")
         );
         let mut incomplete = snapshot(now);
         incomplete.account_metrics_complete = false;
         assert_eq!(
-            report_from(Ok(incomplete), Some("123:456:1".to_owned()), now).reason_code,
+            report_from(
+                Ok(incomplete),
+                Ok(heartbeat(now)),
+                Some("123:456:1".to_owned()),
+                now
+            )
+            .reason_code,
             Some("banner_unhealthy")
         );
     }
@@ -736,6 +825,7 @@ mod tests {
         write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
         let report = report_from(
             read_snapshot_at(&path),
+            Ok(heartbeat(hour_later)),
             Some("123:456:1".into()),
             hour_later,
         );
@@ -758,6 +848,7 @@ mod tests {
         assert_eq!(
             report_from(
                 read_snapshot_at(&path),
+                Ok(heartbeat(hour_later)),
                 Some("123:456:1".into()),
                 hour_later
             )
@@ -908,13 +999,19 @@ mod tests {
             item.account_evaluated_at = account;
             item.data_evaluated_at = data;
             assert_eq!(
-                report_from(Ok(item.clone()), Some(item.boot_id.clone()), now).reason_code,
+                report_from(
+                    Ok(item.clone()),
+                    Ok(heartbeat(now)),
+                    Some(item.boot_id.clone()),
+                    now
+                )
+                .reason_code,
                 Some(reason)
             );
         }
         item = snapshot(now + Duration::seconds(6));
         assert_eq!(
-            report_from(Ok(item), Some("123:456:1".into()), now).reason_code,
+            report_from(Ok(item), Ok(heartbeat(now)), Some("123:456:1".into()), now).reason_code,
             Some("health_snapshot_stale")
         );
     }
@@ -924,12 +1021,18 @@ mod tests {
         let now = Utc::now();
         let report = report_from(
             Ok(snapshot(now - Duration::seconds(3))),
+            Ok(heartbeat(now - Duration::seconds(3))),
             Some("123:456:1".into()),
             now,
         );
         let value = serde_json::to_value(&report).unwrap();
         let text = render_text(&report);
-        for key in ["observed_at", "account_evaluated_at", "data_evaluated_at"] {
+        for key in [
+            "observed_at",
+            "account_evaluated_at",
+            "data_evaluated_at",
+            "heartbeat_observed_at",
+        ] {
             let expected = DateTime::parse_from_rfc3339(value[key].as_str().unwrap())
                 .unwrap()
                 .to_rfc3339();
@@ -939,12 +1042,22 @@ mod tests {
             "observed_age_seconds",
             "account_age_seconds",
             "data_age_seconds",
+            "heartbeat_age_seconds",
         ] {
             assert!(
                 text.contains(&format!("{key}={}", value[key].as_i64().unwrap())),
                 "{text}"
             );
         }
+        for key in ["status", "heartbeat_status", "coverage"] {
+            assert!(
+                text.contains(&format!("{key}={}", value[key].as_str().unwrap())),
+                "{text}"
+            );
+        }
+        assert!(text.contains("heartbeat_fresh=true"));
+        assert!(text.contains("heartbeat_reason_code=none"));
+        assert_eq!(value["heartbeat_reason_code"], serde_json::Value::Null);
     }
 
     #[test]
@@ -959,17 +1072,130 @@ mod tests {
         let mut current = snapshot(Utc::now());
         current.boot_id = lease.boot_id.clone();
         write_snapshot_at(&snapshot_path(root.path(), false), &current).unwrap();
+        write_heartbeat_at(
+            &heartbeat_path(root.path(), false),
+            &lease.boot_id,
+            Utc::now(),
+        )
+        .unwrap();
         assert_eq!(report_at(root.path(), false, Utc::now()).status, "ok");
         drop(lease);
+        let stopped = report_at(root.path(), false, Utc::now());
+        assert_eq!(stopped.reason_code, Some("monitor_not_running"));
         assert_eq!(
-            report_at(root.path(), false, Utc::now()).reason_code,
-            Some("monitor_not_running")
+            stopped.heartbeat_reason_code,
+            Some("process_heartbeat_monitor_not_running")
         );
         let replacement = crate::acquire_monitor_instance_lease_at(&lease_file).unwrap();
         assert_ne!(replacement.boot_id, current.boot_id);
+        let turned = report_at(root.path(), false, Utc::now());
+        assert_eq!(turned.reason_code, Some("health_snapshot_process_mismatch"));
         assert_eq!(
-            report_at(root.path(), false, Utc::now()).reason_code,
-            Some("health_snapshot_process_mismatch")
+            turned.heartbeat_reason_code,
+            Some("process_heartbeat_process_mismatch")
+        );
+        current.boot_id = replacement.boot_id.clone();
+        write_snapshot_at(&snapshot_path(root.path(), false), &current).unwrap();
+        let old_heartbeat = report_at(root.path(), false, Utc::now());
+        assert_eq!(
+            old_heartbeat.reason_code,
+            Some("process_heartbeat_process_mismatch")
+        );
+        write_heartbeat_at(
+            &heartbeat_path(root.path(), false),
+            &replacement.boot_id,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(report_at(root.path(), false, Utc::now()).status, "ok");
+    }
+
+    #[test]
+    fn heartbeat_failures_are_visible_and_gate_an_otherwise_healthy_report() {
+        let root = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let banner_path = snapshot_path(root.path(), false);
+        let heartbeat_path = heartbeat_path(root.path(), false);
+        write_snapshot_at(&banner_path, &snapshot(now)).unwrap();
+        let report = |banner| {
+            report_from(
+                banner,
+                read_heartbeat_at(&heartbeat_path, now),
+                Some("123:456:1".to_owned()),
+                now,
+            )
+        };
+        let missing = report(read_snapshot_at(&banner_path));
+        assert_eq!(missing.reason_code, Some("process_heartbeat_unavailable"));
+        assert_eq!(missing.heartbeat_reason_code, missing.reason_code);
+        assert_eq!(missing.heartbeat_status, "unhealthy");
+        assert!(!missing.heartbeat_fresh);
+        let missing_json = serde_json::to_value(&missing).unwrap();
+        let missing_text = render_text(&missing);
+        assert_eq!(
+            missing_json["heartbeat_reason_code"],
+            "process_heartbeat_unavailable"
+        );
+        assert_eq!(missing_json["heartbeat_fresh"], false);
+        assert!(missing_text.contains("heartbeat_reason_code=process_heartbeat_unavailable"));
+        assert!(missing_text.contains("heartbeat_fresh=false"));
+        assert!(missing_text.contains("heartbeat_observed_at=missing"));
+
+        std::fs::write(&heartbeat_path, b"{bad json}").unwrap();
+        let invalid = report(read_snapshot_at(&banner_path));
+        assert_eq!(invalid.reason_code, Some("process_heartbeat_invalid"));
+        assert_eq!(invalid.heartbeat_observed_at, None);
+        write_heartbeat_at(
+            &heartbeat_path,
+            "123:456:1",
+            now - MAX_HEARTBEAT_AGE - Duration::seconds(1),
+        )
+        .unwrap();
+        let stale = report(read_snapshot_at(&banner_path));
+        assert_eq!(stale.reason_code, Some("process_heartbeat_stale"));
+        assert_eq!(stale.heartbeat_age_seconds, Some(601));
+        assert!(!stale.heartbeat_fresh);
+
+        write_heartbeat_at(
+            &heartbeat_path,
+            "123:456:1",
+            now + MAX_CLOCK_LEAD + Duration::seconds(1),
+        )
+        .unwrap();
+        let future = report(read_snapshot_at(&banner_path));
+        assert_eq!(future.reason_code, Some("process_heartbeat_invalid"));
+        assert!(!future.heartbeat_fresh);
+
+        write_heartbeat_at(&heartbeat_path, "123:456:2", now).unwrap();
+        let wrong_boot = report(read_snapshot_at(&banner_path));
+        assert_eq!(
+            wrong_boot.reason_code,
+            Some("process_heartbeat_process_mismatch")
+        );
+        assert!(wrong_boot.heartbeat_fresh);
+        assert_eq!(wrong_boot.heartbeat_status, "unhealthy");
+
+        write_heartbeat_at(&heartbeat_path, "123:456:1", now).unwrap();
+        let current = report(read_snapshot_at(&banner_path));
+        assert_eq!(current.status, "ok");
+        assert_eq!(current.heartbeat_status, "ok");
+        assert!(current.heartbeat_fresh);
+        assert_eq!(current.heartbeat_reason_code, None);
+
+        std::fs::remove_file(&heartbeat_path).unwrap();
+        let invalid_banner = report(Err("health_snapshot_invalid"));
+        assert_eq!(invalid_banner.reason_code, Some("health_snapshot_invalid"));
+        assert_eq!(
+            invalid_banner.heartbeat_reason_code,
+            Some("process_heartbeat_unavailable")
+        );
+        let stale_banner = report(Ok(snapshot(now - Duration::minutes(11))));
+        assert_eq!(stale_banner.reason_code, Some("health_snapshot_stale"));
+        assert_eq!(
+            stale_banner.heartbeat_reason_code,
+            Some("process_heartbeat_unavailable")
         );
     }
 
