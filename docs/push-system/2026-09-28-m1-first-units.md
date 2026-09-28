@@ -2,6 +2,8 @@
 
 状态：执行顺序草案。身份取自冻结的 [65-kind / 52-Unit v1 目录](push-capability-catalog.v1.json)，当前源码另有 `NewsAiAnalysis` 的 [v2 增量](push-current-kind-delta.v2.json)。每张卡在变更 physical owner 前须核本轮源码、部署和真实回执；不能把此表视为已激活。
 
+2026-09-28 定向 `cargo test --locked --offline --lib push_foundation::readiness_probe_tests::` 7/7 通过，仅证明冻结 v1 目录的 readiness inventory、分母和缺事实归类逻辑；它不证明生产 readiness 或任何 Unit 的真实 receipt。
+
 ## 共同验收门
 
 每个 Unit 先保存同一份 `PreparedFacts`，shadow 比较 occurrence、业务日、主体、事实来源、规则/模板版本、抑制原因及 exact payload bytes，不重拉 provider、不再调用 LLM、不写 cursor、不触碰 sink。新 owner 的 intent、跨 business/durable DB finalizer、reconciler、activation manifest、readiness、Draining 回退必须在该 Unit 故障矩阵中闭合。
