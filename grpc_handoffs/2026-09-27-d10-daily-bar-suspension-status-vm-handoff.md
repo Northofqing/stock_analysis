@@ -6,6 +6,8 @@
 
 ## 本地已核实的事实漏斗
 
+2026-09-28 本仓新增 `5fd99ff2`：预测起始日和目标日都要求独立资格表中的 `Trading`，缺行按 `Unknown` 保持 pending；旧默认 `is_suspended=0` 不再自动放行。8 项相关 lib 测试通过。这是**未部署的本地防误结算门禁**，没有上游状态写入适配；资格表暂沿用既有 `(code,date)` 键，仍待 VM 合同后补齐交易所、资产类别身份，不可当作 D10 已关闭。
+
 | 环节 | 当前实现 | 结论 |
 | --- | --- | --- |
 | gRPC 日线视图 | `src/data_gateway/grpc_source/convert.rs::historical_bars` 接受 `code/date/OHLCV/amount/pct_chg/settled`，没有停复牌字段或逐日覆盖证据；转换时将 `KlineData.is_suspended` 固定为 `false`。 | 此 `false` 是本地默认值，不是源证明的 Trading。`settled=true` 仅是价格结算状态，不能代替交易状态。 |
@@ -42,4 +44,4 @@ VM 应在交付的版本化请求示例上执行以下案例，保存脱敏原�
 2. 将状态和覆盖证据在 Gateway admission 中与证券/日期绑定；选择明确的三态持久化及历史行迁移策略，使未知状态不再借 SQLite 默认 0 冒充 Trading。随后更新 `NewStockDaily`、写入/UPSERT、`StockDaily` 读库和预测精确 close 查询；已显式停牌的旧行不能被后续无状态批次冲掉。
 3. 用隔离库验证：起始日和目标日均须有资格化 Trading 与精确当日 close 才可结算；停牌目标日即使有旧 close 仍 pending；缺状态/部分覆盖/旧合同仍 pending；复牌首日仅在权威 Trading 与精确当日 close 均成立时结算；重复写入保持状态和证据一致。按实际影响扩大到相关定向测试与本地真实 RPC，不凭测试 fixture 宣称生产完成。
 
-当前交接只记录上游缺口和验收条件，**没有修改本地写入、数据库迁移或生产部署**。
+当前交接记录上游缺口和验收条件。本地已新增资格表与预测读门，**没有上游状态的生产写入，也没有部署该源码**。

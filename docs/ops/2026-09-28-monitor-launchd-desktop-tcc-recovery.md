@@ -1,8 +1,16 @@
 # monitor 的 launchd / Desktop TCC 故障交接（2026-09-28）
 
-## 当前状态与根因
+## 当前状态（11:55 CST）
 
-2026-09-28 09:12 CST 的临时单实例是 Terminal 启动的新版 monitor（当时 PID 23247）；`gui/501/com.stockanalysis.monitor` 已 bootout。执行切换前必须重新核对 PID 和 job 状态，不能把该 PID 当成持续有效值。交易时段保持现状，不再试启第二个生产实例。
+Desktop 外运行根切换已完成。`com.northofqing.grpc-market-server`（PID 56417）与 `com.stockanalysis.monitor`（PID 59028）均由 `gui/501` launchd 管理，`runs=1`，程序和工作目录都在 `/Users/zhangzhen/.local/share/stock-analysis-runtime`。本地桥接于 11:54:58 监听 `127.0.0.1:18082`，非 fixture 模式；monitor 于 11:53:59 完成新根主库初始化，11:55:04 记录“gRPC 桥已连接”。旧 Desktop `stock_analysis.db` 与 `durable_delivery.sqlite3` 已无进程占用。当前运行版本是新根构建出的 monitor SHA-256 `2704c32f505f168c6f61dacce879c9db282df9eb3990622f3d8d96b36eeb6219`；后续仓库源码修改尚未部署。
+
+停旧实例后，完整 `rsync -a --delete --checksum data/` 至新根退出 0；新根主库和持久投递库的 `PRAGMA quick_check` 均为 `ok`。从新根生成的 activation 已在 11:25 CST 生效并提交为 `57f53aa8`，预期配置哈希为 `ba4087dbd9d76d377a3804cd56738e91dd40e177dc131c3e5056650be660b158`。本地桥接只读探针的 Health/Capabilities 通过，午间 RealtimeQuotes 返回 `no_verified_batch`；不能据此宣称行情数据已完整恢复，开盘后仍需复验。上游 VM 的 R-08 `Planned` 已验证，`Confirmed` 仍不可用；Eastmoney GlobalNews 的 `source_precondition_failed` 已定位为 `bank.eastmoney.com` 文章域名未列入资格集合，详见[上游交接](../../grpc_handoffs/2026-09-28-eastmoney-globalnews-source-precondition-vm-handoff.md)。
+
+启动耗时的原因已定位：主库 `data_acquisition_audit` 与链各约 343 万行，数据库初始化先在采集审计模块、再在 benchmark manifest 模块各验证一次完整哈希链。本次桥接启动约 9 分钟，monitor 约 4 分钟；不能只以 launchd PID 存在判定就绪。monitor 比桥接先完成初始化期间，部分 LocalBridge 请求按 `no_verified_batch` fail closed 并留有失败记录；桥接就绪后 monitor 自动重连。后续应优化重复全量校验的启动成本并核对这些欠账的正常重试，不应绕过链完整性检查。
+
+## 故障与根因（切换前）
+
+2026-09-28 09:12 CST 的临时单实例是 Terminal 启动的新版 monitor（当时 PID 23247）；当时 `gui/501/com.stockanalysis.monitor` 已 bootout。该实例已于盘中午休停下，并由上述新运行根的 launchd 实例接替。
 
 原 plist 位于 `~/Library/LaunchAgents/com.stockanalysis.monitor.plist`，`ProgramArguments`、`WorkingDirectory` 和 stdout/stderr 均指向 `~/Desktop/Quant/stock_analysis`，`KeepAlive=true`、`ThrottleInterval=60`。多次 launchd 启动旧、新二进制都在进入 `main` 前停住；`/private/tmp/monitor_2026-09-28_091239_n503.sample.txt` 中 PID 22805 的 668 次采样全部停在 dyld `__open`，物理占用仅 56 KiB。独立 `/bin/sh` LaunchAgent 探针报 `getcwd: cannot access parent directories: Operation not permitted`。这不是 gRPC 或 monitor 业务循环错误。
 
@@ -24,13 +32,13 @@
 4. 旧 monitor 运行期间可以预拷静态文件与数据，但预拷的活动 SQLite 文件不能作为一致快照。盘后先停止旧 PID，并确认它及相关数据库写者退出，再最终同步 `data/` 和 WAL/SHM 侧文件；使用 SQLite 备份/完整性检查核实数据库，核对审计水位、文件身份与配置摘要。新旧运行根的单实例锁是不同文件，**不能依赖锁防止两实例重叠**。
 5. 正式切换前，在非 Desktop 构建的制品上用独立标签、无 KeepAlive 的 shadow LaunchAgent 运行 `monitor --test --push-dry-run`，stdout/stderr 放在新根，确认 dyld 已进入程序、测试命名空间隔离、生产目录无写入。关闭 shadow job 后，确认旧 PID 已退出并完成最终同步，安装指向新根 binary、工作目录和日志路径的正式 plist；按仓库部署规则 `launchctl load -w`，只启动一个生产实例。检查新 PID、`cwd`、二进制 SHA、生产 DB/锁/审计根、启动对账、gRPC Health 和实际投递回执；不以进程存在作为完成验收。
 
-**切换阻断项：路径审查未完成。** 已核对的 `selection/activation_gate.rs:165`、`selection/audit.rs:1800` 和 `monitor/notify.rs:3719` 的 `CARGO_MANIFEST_DIR` 使用位于测试代码；`durable_delivery/model.rs:165`、`event/dispatcher.rs:323,1156` 和 `monitor/br196_transport.rs:193` 在可编译运行路径中仍直接使用构建根，分别用于测试命名空间或非生产验收。因此必须从 Desktop 外构建，并在切换前穷举审查其余 `CARGO_MANIFEST_DIR`、硬编码 Desktop、`.env` 外部绝对路径及派生子进程的工作目录。若任何**生产**读写或执行仍解析到 Desktop，迁移验收应停止，先改路径并复验；不能仅凭 production_root 和数据复制宣称迁移完成。
+**切换前路径审查。** 已核对的 `selection/activation_gate.rs:165`、`selection/audit.rs:1800` 和 `monitor/notify.rs:3719` 的 `CARGO_MANIFEST_DIR` 使用位于测试代码；`durable_delivery/model.rs:165`、`event/dispatcher.rs:323,1156` 和 `monitor/br196_transport.rs:193` 在可编译运行路径中仍直接使用构建根，分别用于测试命名空间或非生产验收。源码、配置、`.env`、bundle、MagicLaw 与派生进程工作目录均迁至 Desktop 外；新根 shadow dry-run 与生产实例已实测进入程序并访问新根数据库。后续新增生产路径仍须检查构建根和绝对路径，不能只凭 production_root 推断。
 
 ## 回退边界
 
 若新 launchd 无法启动，先卸载新 job 并确认其 PID 退出。优先用**同一个新运行根和同一份新数据**的 Terminal 启动方式恢复单实例，这样保留切换后已经提交的状态。只有确认新根没有生产写入，或已完成人工数据/投递对账，才能切回旧根的数据库与旧二进制；不得直接覆盖数据库、重放不确定投递或同时启动两根的 monitor。原 Terminal 路径是当前已实测可启动的临时回退路径，原 Desktop launchd plist 仍受 TCC 阻塞，不能把重新 load 旧 plist 视为有效回退。
 
-## 10:53 CST 预检进度（正式切换仍待完成）
+## 10:53 CST 预检记录（随后已完成切换）
 
 - 新真实目录为 `/Users/zhangzhen/.local/share/stock-analysis-runtime`，权限 0700；原样复制同版 `src/config/contracts/Cargo` 输入、公开 `client-bundle`、本机 `.env`、MagicLaw 与报告。新 `.env` 只更新 gRPC bundle、MagicLaw bin/home 路径并移除源码不读取的 `WECHAT_SEND_SCRIPT`；两份 `.env` 及私钥为 0600。公开 bundle 清单 9/9 匹配，MagicLaw 二进制与旧版 SHA-256 同为 `16024d290ee302ffe1872db1e8b26e95d0b5f43f451510a1da38910300fcf213`。
 - 从新目录 `cargo build --locked --offline --release -j 2 --bin monitor --bin grpc_bundle_probe` 成功；新 monitor SHA-256 `2704c32f505f168c6f61dacce879c9db282df9eb3990622f3d8d96b36eeb6219`，probe SHA-256 `c2a3f86b3e5749036e2752ea01cceb89f1eff064e2aa7b0a631e0a60ba6cc2d9`。另构建 `selection_activation_prepare` 成功。构建期源码与本仓 `src/` 字节一致；待停旧后生成新 activation，不能使用原文件的旧 hash。
