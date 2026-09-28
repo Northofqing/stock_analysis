@@ -1873,6 +1873,143 @@ fn paper_ledger_two_buys_partial_sell_and_next_day_mark() {
 }
 
 #[test]
+fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    #[derive(Debug, diesel::QueryableByName)]
+    struct TextValue {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("TEST_CODE_v1_golden_minimum.db");
+    let now = AtomicI64::new(instant().timestamp());
+    let clock = || Utc.timestamp_opt(now.load(Ordering::SeqCst), 0).unwrap();
+    let mut seed = manifest();
+    seed.account_id = "TEST_CODE_V1_GOLDEN_MINIMUM".into();
+    seed.epoch_id = "TEST_CODE_V1_GOLDEN_MINIMUM_EPOCH".into();
+    seed.source_reference = "TEST_CODE_v1_golden_minimum_snapshot".into();
+    let binding = seed.binding().unwrap();
+    let (commands, hashes, old_report) = {
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let ledger = PaperLedger::open(&db, &clock);
+        let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        let buy_one = order(&ledger, &binding, "v1-golden-buy-10", Direction::Buy, 10.0, clock());
+        let bought_one = ledger.apply(PaperCommand::Execute(buy_one.clone())).unwrap();
+        let buy_two = order(&ledger, &binding, "v1-golden-buy-12", Direction::Buy, 12.0, clock());
+        let bought_two = ledger.apply(PaperCommand::Execute(buy_two.clone())).unwrap();
+        now.store(instant().timestamp() + 86400, Ordering::SeqCst);
+        let sell = order(&ledger, &binding, "v1-golden-sell-11", Direction::Sell, 11.0, clock());
+        let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
+        let view = ledger.read(&binding).unwrap();
+        let report = serde_json::to_string(&*view).unwrap();
+        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        assert_eq!(model.value, "lot-rates-v1");
+        assert_eq!(binding.manifest_hash, "1e660132eccbbdeb97f032c4563da29cf6f0c551c59223f430ce97966d8806e6");
+        assert_eq!(seeded.event_hash, "122741b580f8da54f096a8bb0df8da9e4ec242229548f8a02551f92bc5f39770");
+        assert_ne!(bought_one.event_hash, bought_two.event_hash);
+        assert_ne!(bought_two.event_hash, sold.event_hash);
+        assert_eq!(head.value, "6c63fb6457630277f623bb2a16af312c88a416cc473818898e6d8357a2fcaed2");
+        assert_eq!(report, r#"{"cash":98883900000,"lots":[{"lot_id":"fill:v1-golden-buy-12","code":"TEST_CODE_000001","name":"fixture","quantity":100,"basis_price":12000000,"buy_fee_remaining":5000000,"acquired_on":"2026-09-14","sellable_from":"2026-09-15","reported_cost":null}],"marks":{"TEST_CODE_000001":{"code":"TEST_CODE_000001","price":11000000,"observed_at":"2026-09-15T02:00:00Z","source":"TEST_CODE_realtime"}},"fees":16100000,"realized_pnl":88900000,"seed_equity":100000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
+        assert_eq!([bought_one.fee, bought_two.fee, sold.fee], [Money::from_cny(5.0).unwrap(), Money::from_cny(5.0).unwrap(), Money::from_cny(6.10).unwrap()]);
+        assert_eq!(view.cash, Money::from_cny(98_883.90).unwrap());
+        assert_eq!(view.fees, Money::from_cny(16.10).unwrap());
+        assert_eq!(view.realized_pnl, Money::from_cny(88.90).unwrap());
+        assert_eq!(view.lots.len(), 1);
+        assert_eq!(view.lots[0].basis_price, Money::from_cny(12.0).unwrap());
+        assert_eq!(view.lots[0].quantity, 100);
+        assert_eq!(view.lots[0].buy_fee_remaining, Money::from_cny(5.0).unwrap());
+        assert_eq!(FEE_MODEL, "lot-rates-v1");
+        let rejected = diesel::sql_query("UPDATE paper_ledger_account SET fee_model='lot-rates-v2' WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .execute(&mut db.get_conn().unwrap());
+        assert!(rejected.is_err(), "v1 schema must reject a v2 fee identity");
+        ((buy_one, buy_two, sell), [seeded.event_hash, bought_one.event_hash, bought_two.event_hash, sold.event_hash], report)
+    };
+    let db = DatabaseManager::open_isolated_for_test(path).unwrap();
+    let ledger = PaperLedger::open(&db, &clock);
+    for (command, expected) in [(commands.0, &hashes[1]), (commands.1, &hashes[2]), (commands.2, &hashes[3])] {
+        let receipt = ledger.apply(PaperCommand::Execute(command)).unwrap();
+        assert!(receipt.already_applied);
+        assert_eq!(&receipt.event_hash, expected);
+    }
+    let reopened = ledger.read(&binding).unwrap();
+    assert_eq!(reopened.version, 4);
+    assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
+    assert_eq!(reopened.event_hash, hashes[3]);
+}
+
+#[test]
+fn paper_ledger_v1_golden_percentage_fees_replay() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    #[derive(Debug, diesel::QueryableByName)]
+    struct TextValue {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("TEST_CODE_v1_golden_percentage.db");
+    let now = AtomicI64::new(instant().timestamp());
+    let clock = || Utc.timestamp_opt(now.load(Ordering::SeqCst), 0).unwrap();
+    let mut seed = manifest();
+    seed.account_id = "TEST_CODE_V1_GOLDEN_PERCENTAGE".into();
+    seed.epoch_id = "TEST_CODE_V1_GOLDEN_PERCENTAGE_EPOCH".into();
+    seed.source_reference = "TEST_CODE_v1_golden_percentage_snapshot".into();
+    seed.cash = Money::from_cny(1_000_000.0).unwrap();
+    seed.original_total = seed.cash;
+    let binding = seed.binding().unwrap();
+    let (commands, hashes, old_report) = {
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let ledger = PaperLedger::open(&db, &clock);
+        let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        let buy = order(&ledger, &binding, "v1-golden-buy-200", Direction::Buy, 200.0, clock());
+        let bought = ledger.apply(PaperCommand::Execute(buy.clone())).unwrap();
+        now.store(instant().timestamp() + 86400, Ordering::SeqCst);
+        let sell = order(&ledger, &binding, "v1-golden-sell-210", Direction::Sell, 210.0, clock());
+        let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
+        let view = ledger.read(&binding).unwrap();
+        let report = serde_json::to_string(&*view).unwrap();
+        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        assert_eq!(model.value, "lot-rates-v1");
+        assert_eq!(binding.manifest_hash, "9b25b982eb2218fc661995dbe1de70663c3ab45f186159ef782230e8622523dd");
+        assert_eq!(seeded.event_hash, "e5f6c5340a5ec7e96e939491e3a8e63b4451b6ed4e62fb7991997a41a80e3b3f");
+        assert_ne!(bought.event_hash, sold.event_hash);
+        assert_eq!(head.value, "0ce46e10ee317b7d133047c4b178351f87221e259e4f00628c03f5e615b74aa7");
+        assert_eq!(report, r#"{"cash":1000966700000,"lots":[],"marks":{},"fees":33300000,"realized_pnl":966700000,"seed_equity":1000000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
+        assert_eq!(bought.status, LedgerStatus::Filled);
+        assert_eq!(sold.status, LedgerStatus::Filled);
+        assert_eq!(bought.fee, Money::from_cny(6.0).unwrap());
+        assert_eq!(sold.fee, Money::from_cny(27.30).unwrap());
+        assert_eq!(view.cash, Money::from_cny(1_000_966.70).unwrap());
+        assert_eq!(view.fees, Money::from_cny(33.30).unwrap());
+        assert_eq!(view.realized_pnl, Money::from_cny(966.70).unwrap());
+        assert!(view.lots.is_empty());
+        assert_eq!(FEE_MODEL, "lot-rates-v1");
+        ((buy, sell), [seeded.event_hash, bought.event_hash, sold.event_hash], report)
+    };
+    let db = DatabaseManager::open_isolated_for_test(path).unwrap();
+    let ledger = PaperLedger::open(&db, &clock);
+    for (command, expected) in [(commands.0, &hashes[1]), (commands.1, &hashes[2])] {
+        let receipt = ledger.apply(PaperCommand::Execute(command)).unwrap();
+        assert!(receipt.already_applied);
+        assert_eq!(&receipt.event_hash, expected);
+    }
+    let reopened = ledger.read(&binding).unwrap();
+    assert_eq!(reopened.version, 3);
+    assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
+    assert_eq!(reopened.event_hash, hashes[2]);
+}
+
+#[test]
 fn paper_ledger_idempotency_reopens_before_stale_version_or_quote_checks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("TEST_CODE_paper_idempotency.db");
