@@ -360,9 +360,8 @@ def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> 
 
     The caller must supply a fixture or controlled snapshot, not a live
     production WAL path. WAL sidecar creation is possible despite mode=ro and
-    query_only. V10 attribution requires a canonical production P01 binding
-    as well as an Origin edge; synthetic coordinator test envelopes are outside
-    this report's accepted input contract.
+    query_only. V10 attribution checks persisted P01 source metadata and
+    digests alongside the Origin edge. It does not re-run full P01 admission.
     """
     if _date(from_date) > _date(to_date):
         raise ValueError("from_date must not exceed to_date")
@@ -378,8 +377,8 @@ def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> 
         "unattributed_kind_candidates": candidates,
         "scope": (
             "Kind counts are durable sink result candidates, not manual acceptance. "
-            "Only v10 P01 Origin edges bound to canonical production P01 source "
-            "bytes identify an observed producer and Unit for durable candidates. "
+            "Only v10 P01 Origin edges matching persisted source hashes, mode, "
+            "date and occurrence identify an observed producer and Unit candidate. "
             "Neither a correlation edge nor "
             "an Accepted sink result proves external receipt or business finalization."
         ),
