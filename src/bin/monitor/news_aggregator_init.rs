@@ -528,6 +528,11 @@ impl NewsFlashGate {
     ) -> Vec<FlashReservation> {
         self.rollover(now.date_naive());
         let mut out = Vec::new();
+        let mut buffered = 0usize;
+        let mut duplicates = 0usize;
+        let mut capacity_drops = 0usize;
+        let mut audit_failures = 0usize;
+        let mut rejection_reasons = std::collections::BTreeMap::<&str, usize>::new();
 
         for projected in events {
             let e = projected.event();
@@ -562,6 +567,7 @@ impl NewsFlashGate {
                 None
             };
             if let Some(reason) = validation_error {
+                *rejection_reasons.entry(reason).or_default() += 1;
                 // 2026-09-21 (系统评估 §4.3): gate 层丢弃此前仅 log::warn!
                 // + continue, 无审计记录 (~11,300 条/月静默丢弃)。现在把
                 // 拒绝计数与原因写审计: event_bus 的 gate-rejection 审计
@@ -571,6 +577,7 @@ impl NewsFlashGate {
                     reason,
                     &e.event_id,
                 ) {
+                    audit_failures += 1;
                     log::error!(
                         "[NewsFlashGate][BR-137] rejection audit unavailable reason={reason} event_id_sha256={} error={error}",
                         sha256_domain(
@@ -584,9 +591,32 @@ impl NewsFlashGate {
                 );
                 continue;
             }
-            if self.buffer.len() < 200 && self.buffered_ids.insert(e.event_id.clone()) {
+            if self.buffer.len() >= 200 {
+                capacity_drops += 1;
+            } else if self.buffered_ids.insert(e.event_id.clone()) {
                 self.buffer.push(projected.clone());
+                buffered += 1;
+            } else {
+                duplicates += 1;
             }
+        }
+        let validation_rejected = rejection_reasons.values().sum::<usize>();
+        debug_assert_eq!(
+            events.len(),
+            buffered + duplicates + capacity_drops + validation_rejected
+        );
+        if !events.is_empty() {
+            log::info!(
+                "[NewsFlashGate][BR-137] intake business_date={} input={} buffered={} duplicate={} capacity_drop={} validation_rejected={} audit_failed={} reasons={:?} coverage=process_tick_only",
+                now.date_naive(),
+                events.len(),
+                buffered,
+                duplicates,
+                capacity_drops,
+                validation_rejected,
+                audit_failures,
+                rejection_reasons,
+            );
         }
 
         let _critical_concurrency_capacity =
