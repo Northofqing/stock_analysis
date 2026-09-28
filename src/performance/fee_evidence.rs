@@ -1,7 +1,7 @@
 //! 2026-09-21 评估 #1+#2: 模拟盘逐笔成本证据 (派生, 不落库).
 //!
-//! 费率口径与 `src/strategy/lot.rs` 一致: 佣金万三 (最低 5 元, 双边) +
-//! 印花税千一 (仅卖出). 评估 §九 V11 实测口径: 100 股 ¥10 往返 =
+//! 冻结的 `lot-rates-v1` 口径与 `src/strategy/lot.rs` 一致: 佣金万三
+//! (最低 5 元, 双边) + 印花税千一 (仅卖出). 评估 §九 V11 旧模型口径: 100 股 ¥10 往返 =
 //! 买 5 + 卖 5 + 印 1 = ¥11 = 1.1%; ¥322 仓位 = 3.2%.
 //!
 //! 派生值不写回 `paper_trades` (原「加四列」处方已作废, 见
@@ -10,11 +10,104 @@
 
 use crate::performance::economic_position::{CostBasisKind, FillCostEvidence, FillCostLedger};
 use crate::strategy::lot;
+use chrono::NaiveDate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillSide {
     Buy,
     Sell,
+}
+
+/// New research fee schedule. PaperLedgerV1 remains permanently bound to
+/// `lot-rates-v1`; adopting this schedule requires a new ledger generation.
+pub const A_SHARE_FEE_SCHEDULE_V2: &str = "a-share-policy-by-trade-date-v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AShareFillFeeV2 {
+    pub basis_id: &'static str,
+    pub trade_date: NaiveDate,
+    pub commission_micro_cny: i64,
+    pub stamp_tax_micro_cny: i64,
+    pub total_micro_cny: i64,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AShareFeeV2Error {
+    #[error("A-share fee schedule v2 requires positive micro-CNY notional")]
+    InvalidNotional,
+    #[error("A-share fee schedule v2 has no authority before 2008-09-19")]
+    UnsupportedTradeDate,
+    #[error("A-share fee schedule v2 amount overflow")]
+    Overflow,
+}
+
+/// Deterministic model fee for an A-share stock fill. Amounts are micro-CNY;
+/// commission is a model assumption (0.03%, minimum ¥5), not a broker receipt.
+/// Stamp tax is seller-only: 0.1% through 2023-08-27, then 0.05%.
+pub fn a_share_stock_fill_fee_v2(
+    side: FillSide,
+    notional_micro_cny: i64,
+    trade_date: NaiveDate,
+) -> Result<AShareFillFeeV2, AShareFeeV2Error> {
+    if notional_micro_cny <= 0 {
+        return Err(AShareFeeV2Error::InvalidNotional);
+    }
+    if trade_date < NaiveDate::from_ymd_opt(2008, 9, 19).expect("valid cutoff") {
+        return Err(AShareFeeV2Error::UnsupportedTradeDate);
+    }
+    let commission = rounded_rate_micro(notional_micro_cny, 3, 10_000)?.max(5_000_000);
+    let stamp = if matches!(side, FillSide::Sell) {
+        if trade_date < NaiveDate::from_ymd_opt(2023, 8, 28).expect("valid cutoff") {
+            rounded_rate_micro(notional_micro_cny, 1, 1_000)?
+        } else {
+            rounded_rate_micro(notional_micro_cny, 5, 10_000)?
+        }
+    } else {
+        0
+    };
+    Ok(AShareFillFeeV2 {
+        basis_id: A_SHARE_FEE_SCHEDULE_V2,
+        trade_date,
+        commission_micro_cny: commission,
+        stamp_tax_micro_cny: stamp,
+        total_micro_cny: commission
+            .checked_add(stamp)
+            .ok_or(AShareFeeV2Error::Overflow)?,
+    })
+}
+
+fn rounded_rate_micro(
+    amount: i64,
+    numerator: i64,
+    denominator: i64,
+) -> Result<i64, AShareFeeV2Error> {
+    let rounded = (i128::from(amount) * i128::from(numerator) + i128::from(denominator / 2))
+        / i128::from(denominator);
+    i64::try_from(rounded).map_err(|_| AShareFeeV2Error::Overflow)
+}
+
+/// Versioned cost evidence for a research run with dated A-share stock fills.
+/// The v1 ledger constructor remains unchanged for historical replay.
+pub fn a_share_fill_cost_ledger_v2(
+    fills: &[(i64, FillSide, i64, NaiveDate)],
+) -> Result<FillCostLedger, String> {
+    let costs = fills
+        .iter()
+        .map(|(fill_id, side, notional_micro_cny, trade_date)| {
+            let fee = a_share_stock_fill_fee_v2(*side, *notional_micro_cny, *trade_date)
+                .map_err(|error| format!("fill {fill_id}: {error}"))?;
+            Ok(FillCostEvidence {
+                fill_id: *fill_id,
+                adverse_cost: fee.total_micro_cny as f64 / 1_000_000.0,
+                evidence_id: format!("fee-{A_SHARE_FEE_SCHEDULE_V2}:{fill_id}:{}", fee.trade_date),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(FillCostLedger {
+        basis_id: A_SHARE_FEE_SCHEDULE_V2.to_owned(),
+        kind: CostBasisKind::Scenario,
+        costs,
+    })
 }
 
 /// 单边成交不利成本: 佣金 (万三, 最低 ¥5) + 印花税 (仅卖出, 千一).
@@ -95,6 +188,55 @@ pub fn lot_rate_fill_cost_ledger(fills: &[(i64, FillSide, f64)]) -> Result<FillC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_trade_date_cutovers_preserve_legacy_fee_model() {
+        let before_single_side = NaiveDate::from_ymd_opt(2008, 9, 18).unwrap();
+        assert_eq!(
+            a_share_stock_fill_fee_v2(FillSide::Sell, 1_000_000_000, before_single_side),
+            Err(AShareFeeV2Error::UnsupportedTradeDate)
+        );
+        for (date, expected_stamp) in [
+            (NaiveDate::from_ymd_opt(2008, 9, 19).unwrap(), 1_000_000),
+            (NaiveDate::from_ymd_opt(2023, 8, 27).unwrap(), 1_000_000),
+            (NaiveDate::from_ymd_opt(2023, 8, 28).unwrap(), 500_000),
+        ] {
+            let sell = a_share_stock_fill_fee_v2(FillSide::Sell, 1_000_000_000, date).unwrap();
+            let buy = a_share_stock_fill_fee_v2(FillSide::Buy, 1_000_000_000, date).unwrap();
+            assert_eq!(sell.commission_micro_cny, 5_000_000);
+            assert_eq!(sell.stamp_tax_micro_cny, expected_stamp);
+            assert_eq!(buy.stamp_tax_micro_cny, 0);
+        }
+        assert_eq!(fill_adverse_cost(FillSide::Sell, 1_000.0), 6.0);
+    }
+
+    #[test]
+    fn v2_round_trip_and_large_fill_use_micro_cny_half_up() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let buy = a_share_stock_fill_fee_v2(FillSide::Buy, 1_000_000_000, date).unwrap();
+        let sell = a_share_stock_fill_fee_v2(FillSide::Sell, 1_000_000_000, date).unwrap();
+        assert_eq!(sell.basis_id, A_SHARE_FEE_SCHEDULE_V2);
+        assert_eq!(buy.total_micro_cny + sell.total_micro_cny, 10_500_000);
+        let large = a_share_stock_fill_fee_v2(FillSide::Sell, 100_000_000_000, date).unwrap();
+        assert_eq!(large.commission_micro_cny, 30_000_000);
+        assert_eq!(large.stamp_tax_micro_cny, 50_000_000);
+        assert_eq!(
+            a_share_stock_fill_fee_v2(FillSide::Buy, 0, date),
+            Err(AShareFeeV2Error::InvalidNotional)
+        );
+        let ledger = a_share_fill_cost_ledger_v2(&[
+            (1, FillSide::Buy, 1_000_000_000, date),
+            (2, FillSide::Sell, 1_000_000_000, date),
+        ])
+        .unwrap();
+        assert_eq!(ledger.basis_id, A_SHARE_FEE_SCHEDULE_V2);
+        assert_eq!(ledger.kind, CostBasisKind::Scenario);
+        assert_eq!(
+            ledger.costs[0].adverse_cost + ledger.costs[1].adverse_cost,
+            10.5
+        );
+        assert!(ledger.costs[1].evidence_id.contains("2026-09-28"));
+    }
 
     /// 评估 V11: 100 股 ¥10 往返 = 买 5 + 卖 5 + 印 1 = ¥11 = 1.1%.
     #[test]

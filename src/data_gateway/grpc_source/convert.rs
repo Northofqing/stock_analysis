@@ -1470,6 +1470,15 @@ fn parse_market_announcement_records(q: &QueryResult) -> Result<Vec<Value>, Gate
     }
     let mut records = Vec::new();
     for payload in &q.records {
+        if payload.schema != "magic.market.announcement"
+            || payload.schema_version != 1
+            || payload.content_type != "application/json; charset=utf-8"
+        {
+            return Err(err(
+                CAPABILITY,
+                "MarketAnnouncements payload schema/version/content_type is not the published v1 contract",
+            ));
+        }
         let value: Value = serde_json::from_slice(&payload.data)
             .map_err(|error| err(CAPABILITY, format!("records 非 JSON: {error}")))?;
         match value {
@@ -4279,10 +4288,11 @@ mod tests {
             "url": "https://example.com/A1"
         });
         let mut query = mk_q(&row.to_string(), "Cninfo", "cninfo-market");
+        query.records[0].schema = "magic.market.announcement".to_owned();
         let mut second_row = row.clone();
         second_row["announcement_id"] = serde_json::json!("A2");
         query.records.push(CanonicalRecord {
-            schema: "x".to_owned(),
+            schema: "magic.market.announcement".to_owned(),
             schema_version: 1,
             content_type: "application/json; charset=utf-8".to_owned(),
             data: serde_json::json!([second_row]).to_string().into_bytes(),
@@ -4294,6 +4304,13 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].announcement_id, "A1");
         assert_eq!(records[1].announcement_id, "A2");
+
+        query.records[0].schema = "magic.market.market_announcements.batch".to_owned();
+        assert_eq!(
+            market_announcements(&query).unwrap_err().reason_code(),
+            "invalid_evidence"
+        );
+        query.records[0].schema = "magic.market.announcement".to_owned();
 
         query.records.clear();
         assert!(matches!(

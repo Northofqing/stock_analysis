@@ -1435,7 +1435,7 @@ mod tests {
                         source: "cninfo-market".into(),
                         diagnostic_blocker: String::new(),
                         records: vec![CanonicalPayload {
-                            schema: "magic.market.market_announcements.batch".into(),
+                            schema: "magic.market.announcement".into(),
                             schema_version: 1,
                             content_type: "application/json; charset=utf-8".into(),
                             data: b"[]".to_vec(),
@@ -1568,6 +1568,7 @@ mod tests {
         assert_eq!(result.selected_provider, "Cninfo");
         assert_eq!(result.batch_id, "market-announcements-b1");
         assert!(result.complete);
+        assert_eq!(result.records[0].schema, "magic.market.announcement");
     }
 
     #[tokio::test]
