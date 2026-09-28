@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::sync::Arc;
 
 pub const REGISTERED_GLOBAL_NEWS_LIMIT: u32 = 20;
 pub const MAGIC_MARKET_DATA_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
@@ -466,6 +467,7 @@ impl NewsFlashSourceIdentity {
 pub struct NewsFlashProjectedEvent {
     event: MarketEvent,
     source: NewsFlashSourceIdentity,
+    record_evidence: Result<Arc<NewsFlashRecordEvidenceV1>, NewsFlashRecordEvidenceError>,
 }
 
 /// Opaque capability for constructing source-bound projection fixtures from
@@ -495,6 +497,14 @@ impl NewsFlashProjectedEvent {
 
     pub fn source(&self) -> &NewsFlashSourceIdentity {
         &self.source
+    }
+
+    /// Canonical admitted content, or an explicit capture failure. Synthetic
+    /// fixtures have no admitted record and cannot supply content evidence.
+    pub fn record_evidence(
+        &self,
+    ) -> Result<&NewsFlashRecordEvidenceV1, &NewsFlashRecordEvidenceError> {
+        self.record_evidence.as_ref().map(Arc::as_ref)
     }
 
     #[doc(hidden)]
@@ -529,6 +539,7 @@ impl NewsFlashProjectedEvent {
                 batch_id: batch_id.to_owned(),
             },
             event,
+            record_evidence: Err(NewsFlashRecordEvidenceError::MissingAdmittedRecord),
         }
     }
 }
@@ -752,17 +763,30 @@ pub fn project_news_flash_events(batch: &RawNewsAggregationBatch) -> NewsFlashSo
                 let mut provider_failure = None;
                 for record in records {
                     match super::feed::record_to_market_event(registration.provider, record) {
-                        Ok(event) => provider_events.push(NewsFlashProjectedEvent {
-                            source: NewsFlashSourceIdentity {
+                        Ok(event) => {
+                            let source = NewsFlashSourceIdentity {
                                 event_id: event.event_id.clone(),
                                 provider: registration.provider.wire_name().to_owned(),
                                 source: evidence.source.clone(),
                                 published_at: record.published_at,
                                 observed_at: record.observed_at,
                                 batch_id: evidence.batch_id.clone(),
-                            },
-                            event,
-                        }),
+                            };
+                            // Capture errors travel with the legacy event. They do not
+                            // change provider admission or the provider-atomic commit.
+                            let record_evidence = content_evidence::capture_admitted_record(
+                                registration,
+                                record,
+                                evidence,
+                                &source,
+                            )
+                            .map(Arc::new);
+                            provider_events.push(NewsFlashProjectedEvent {
+                                event,
+                                source,
+                                record_evidence,
+                            });
+                        }
                         Err(error) => {
                             provider_failure = Some(NewsFlashSourceFailure {
                                 provider: registration.provider,
@@ -1756,6 +1780,259 @@ mod tests {
         assert_eq!(projection.events().len(), 2);
         assert_eq!(projection.available_feed_count(), 2);
         assert!(projection.failures().is_empty());
+    }
+
+    fn n02_raw_fixture(
+        mut terminal: impl FnMut(GlobalNewsProvider) -> TestRawGlobalNewsTerminal,
+    ) -> RawNewsAggregationBatch {
+        let attempted_at = record(GlobalNewsProvider::Eastmoney).observed_at;
+        let attempts = REGISTERED_PROVIDERS
+            .into_iter()
+            .map(|provider| {
+                RawGlobalNewsFeedAttempt::test_fixture(
+                    "TEST_CODE n02 raw attempt",
+                    RegisteredGlobalNewsFeed::for_provider(provider),
+                    attempted_at,
+                    terminal(provider),
+                )
+            })
+            .collect();
+        RawNewsAggregationBatch::test_fixture("TEST_CODE n02 raw batch", attempts, attempted_at)
+    }
+
+    #[test]
+    fn n02_record_evidence_native_provider_projection_and_arc_clone() {
+        let batch = n02_raw_fixture(|provider| match provider {
+            GlobalNewsProvider::Eastmoney => TestRawGlobalNewsTerminal::Available {
+                records: vec![record(provider)],
+                evidence: evidence(provider, provider.feed_name()),
+            },
+            GlobalNewsProvider::Cailianpress | GlobalNewsProvider::Jin10 => {
+                let (records, evidence) = provider_wire_available(provider);
+                TestRawGlobalNewsTerminal::Available { records, evidence }
+            }
+            GlobalNewsProvider::ThePaper => TestRawGlobalNewsTerminal::VerifiedEmpty {
+                evidence: evidence(provider, provider.feed_name()),
+            },
+        });
+        let projection = project_news_flash_events(&batch);
+        assert_eq!(projection.events().len(), 3);
+        assert_eq!(projection.available_feed_count(), 3);
+        assert_eq!(projection.verified_empty_feed_count(), 1);
+        assert!(projection.failures().is_empty());
+        for (event, attempt) in projection.events().iter().zip(batch.attempts()) {
+            let captured = event.record_evidence().unwrap();
+            let terminal = attempt.terminal();
+            let record = &terminal.records().unwrap()[0];
+            let batch_evidence = terminal.evidence().unwrap();
+            assert_eq!(captured.source(), event.source());
+            assert_eq!(captured.item_id(), record.item_id);
+            assert_eq!(captured.registration(), attempt.registration());
+            assert_eq!(captured.schema(), "NewsFlashAdmittedRecord/v1");
+            assert_eq!(
+                captured.content_sha256(),
+                format!("{:x}", Sha256::digest(captured.canonical_bytes()))
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(captured.canonical_bytes()).unwrap();
+            assert_eq!(
+                json["record"]["evidence"]["source_at"],
+                record.evidence.source_at().unwrap()
+            );
+            assert_eq!(
+                json["record"]["evidence"]["observed_at"],
+                record.evidence.observed_at()
+            );
+            assert_eq!(
+                json["batch_evidence"]["observed_at"],
+                batch_evidence.observed_at
+            );
+            let cloned = event.clone();
+            assert!(Arc::ptr_eq(
+                event.record_evidence.as_ref().unwrap(),
+                cloned.record_evidence.as_ref().unwrap()
+            ));
+            assert_eq!(
+                cloned.record_evidence().unwrap().content_sha256(),
+                captured.content_sha256()
+            );
+        }
+    }
+
+    #[test]
+    fn n02_record_evidence_synthetic_fixture_has_no_admitted_record() {
+        let record = record(GlobalNewsProvider::Eastmoney);
+        let mut event =
+            super::super::feed::record_to_market_event(GlobalNewsProvider::Eastmoney, &record)
+                .unwrap();
+        event.event_id = "TEST_CODE_synthetic_event".into();
+        let capability = NewsFlashProjectionTestCapability::bind().unwrap();
+        let projected = NewsFlashProjectedEvent::test_fixture(
+            &capability,
+            event,
+            "TEST_CODE_provider",
+            "TEST_CODE_source",
+            record.published_at,
+            record.observed_at,
+            "TEST_CODE_batch",
+        );
+        assert_eq!(
+            projected.record_evidence(),
+            Err(&NewsFlashRecordEvidenceError::MissingAdmittedRecord)
+        );
+        assert_eq!(
+            projected.clone().record_evidence(),
+            Err(&NewsFlashRecordEvidenceError::MissingAdmittedRecord)
+        );
+    }
+
+    #[test]
+    fn n02_record_evidence_capture_limit_preserves_legacy_projection() {
+        let project = |oversize| {
+            let batch = n02_raw_fixture(|provider| {
+                if provider == GlobalNewsProvider::Eastmoney {
+                    let mut record = record(provider);
+                    if oversize {
+                        record.summary = Some("a".repeat(MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES));
+                    }
+                    TestRawGlobalNewsTerminal::Available {
+                        records: vec![record],
+                        evidence: evidence(provider, provider.feed_name()),
+                    }
+                } else {
+                    TestRawGlobalNewsTerminal::VerifiedEmpty {
+                        evidence: evidence(provider, provider.feed_name()),
+                    }
+                }
+            });
+            project_news_flash_events(&batch)
+        };
+        let ordinary = project(false);
+        let oversized = project(true);
+        assert_eq!(ordinary.events().len(), 1);
+        assert_eq!(oversized.events().len(), 1);
+        assert_eq!(
+            oversized.available_feed_count(),
+            ordinary.available_feed_count()
+        );
+        assert_eq!(
+            oversized.verified_empty_feed_count(),
+            ordinary.verified_empty_feed_count()
+        );
+        assert!(ordinary.failures().is_empty());
+        assert!(oversized.failures().is_empty());
+        assert!(ordinary.events()[0].record_evidence().is_ok());
+        assert_eq!(
+            oversized.events()[0].record_evidence(),
+            Err(&NewsFlashRecordEvidenceError::CanonicalBytesLimitExceeded)
+        );
+        assert_eq!(
+            oversized.events()[0].source(),
+            ordinary.events()[0].source()
+        );
+        assert_eq!(
+            oversized.events()[0].event().event_id,
+            ordinary.events()[0].event().event_id
+        );
+        assert_eq!(
+            oversized.events()[0].event().full_title,
+            ordinary.events()[0].event().full_title
+        );
+        assert_eq!(
+            ordered_news_flash_evidence_sha256(oversized.events()),
+            ordered_news_flash_evidence_sha256(ordinary.events())
+        );
+    }
+
+    #[test]
+    fn n02_record_evidence_provider_atomic_rejections_preserve_other_provider() {
+        // The second CLS record passes record/batch coherence in the last case,
+        // then fails market projection after the first record has been captured.
+        for (case, expected_code) in [
+            ("batch", "batch_evidence_incomplete"),
+            ("record", "record_evidence_incomplete"),
+            ("projection", "market_event_projection_failed"),
+        ] {
+            let batch = n02_raw_fixture(|provider| match provider {
+                GlobalNewsProvider::Eastmoney => TestRawGlobalNewsTerminal::Available {
+                    records: vec![record(provider)],
+                    evidence: evidence(provider, provider.feed_name()),
+                },
+                GlobalNewsProvider::Cailianpress => {
+                    let first = record(provider);
+                    let mut later = first.clone();
+                    later.item_id = "TEST_CODE_later".into();
+                    let mut batch = evidence(provider, provider.feed_name());
+                    match case {
+                        "batch" => batch.source = "TEST_CODE_wrong_source".into(),
+                        "record" => {
+                            later.evidence = SourceEvidence::new(
+                                provider.provider_id(),
+                                &batch.observed_at,
+                                "TEST_CODE_other_batch",
+                            )
+                            .unwrap()
+                            .with_source_at(provider_source_at_wire(provider))
+                            .unwrap()
+                        }
+                        "projection" => {
+                            later.published_at = later.observed_at + chrono::Duration::seconds(1);
+                            later.evidence = SourceEvidence::new(
+                                provider.provider_id(),
+                                &batch.observed_at,
+                                &batch.batch_id,
+                            )
+                            .unwrap()
+                            .with_source_at(later.published_at.to_rfc3339())
+                            .unwrap();
+                            assert!(validate_news_flash_record(
+                                provider,
+                                &first,
+                                &batch,
+                                crate::risk::env_guard::current_env()
+                            )
+                            .is_ok());
+                            assert!(validate_news_flash_record(
+                                provider,
+                                &later,
+                                &batch,
+                                crate::risk::env_guard::current_env()
+                            )
+                            .is_ok());
+                        }
+                        _ => unreachable!(),
+                    }
+                    TestRawGlobalNewsTerminal::Available {
+                        records: vec![first, later],
+                        evidence: batch,
+                    }
+                }
+                _ => TestRawGlobalNewsTerminal::VerifiedEmpty {
+                    evidence: evidence(provider, provider.feed_name()),
+                },
+            });
+            let projection = project_news_flash_events(&batch);
+            assert_eq!(projection.events().len(), 1, "{case}");
+            assert_eq!(projection.available_feed_count(), 1, "{case}");
+            assert_eq!(projection.verified_empty_feed_count(), 2, "{case}");
+            let surviving = &projection.events()[0];
+            assert_eq!(surviving.source().provider(), "Eastmoney");
+            assert_eq!(
+                surviving.record_evidence().unwrap().source(),
+                surviving.source()
+            );
+            assert_eq!(projection.failures().len(), 1, "{case}");
+            let failure = &projection.failures()[0];
+            assert_eq!(failure.provider(), GlobalNewsProvider::Cailianpress);
+            assert_eq!(failure.diagnostic_code(), expected_code, "{case}");
+            assert_eq!(failure.source_record_count(), 2);
+            if case == "record" {
+                assert_eq!(failure.diagnostic(), "record_batch_mismatch");
+            }
+            if case == "projection" {
+                assert_eq!(failure.record_id(), Some("TEST_CODE_later"));
+            }
+        }
     }
 
     #[tokio::test]

@@ -60,8 +60,6 @@ impl NewsFlashRecordEvidenceV1 {
     }
 }
 
-// Task 5b connects this private entry point to the existing admission path.
-#[allow(dead_code)]
 pub(super) fn capture_admitted_record(
     registration: RegisteredGlobalNewsFeed,
     record: &GlobalNewsRecord,
@@ -379,6 +377,7 @@ mod tests {
             let projected = NewsFlashProjectedEvent {
                 event,
                 source: input.source.clone(),
+                record_evidence: Ok(std::sync::Arc::new(input.capture().unwrap())),
             };
             assert_eq!(ordered_news_flash_evidence_sha256(&[projected]), LEGACY_SHA);
         }
