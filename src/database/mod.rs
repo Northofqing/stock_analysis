@@ -2733,6 +2733,7 @@ impl DatabaseManager {
     fn open_at_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let database_url = path.to_string_lossy().to_string();
         info!("初始化数据库: {}", database_url);
+        let phase_started = std::time::Instant::now();
 
         // WAL is database-wide and requires a lock. Configure it once before
         // r2d2 opens connections concurrently.
@@ -2748,7 +2749,12 @@ impl DatabaseManager {
         }
         configure_sqlite_connection(&mut bootstrap_conn)?;
         drop(bootstrap_conn);
+        info!(
+            "[DB init][timing] phase=bootstrap elapsed_ms={}",
+            phase_started.elapsed().as_millis()
+        );
 
+        let phase_started = std::time::Instant::now();
         let (attribution_pool, attribution_connection_source) =
             match build_attested_sqlite_pool_with_size(&path, 2) {
                 Ok((pool, source)) => (Some(pool), Some(source)),
@@ -2759,12 +2765,27 @@ impl DatabaseManager {
                     (None, None)
                 }
             };
+        info!(
+            "[DB init][timing] phase=attribution_pool elapsed_ms={} available={}",
+            phase_started.elapsed().as_millis(),
+            attribution_pool.is_some()
+        );
+        let phase_started = std::time::Instant::now();
         let pool = build_sqlite_pool(database_url)?;
 
         // 运行迁移
         let mut conn = pool.get()?;
         configure_sqlite_connection(&mut conn)?;
+        info!(
+            "[DB init][timing] phase=operational_pool elapsed_ms={}",
+            phase_started.elapsed().as_millis()
+        );
+        let phase_started = std::time::Instant::now();
         Self::run_migrations(&mut conn)?;
+        info!(
+            "[DB init][timing] phase=migrations elapsed_ms={}",
+            phase_started.elapsed().as_millis()
+        );
 
         info!(
             "SQLite PRAGMAs 已设置: WAL + foreign_keys=ON + synchronous=FULL + busy_timeout=5000"
@@ -3625,21 +3646,41 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
              BEGIN SELECT RAISE(ABORT, 'BR-086 order audit hash chain retention is at least five years'); END",
         )
         .execute(&mut *conn)?;
+        let audit_started = std::time::Instant::now();
         order_audit::initialize_order_audit_chain(&mut *conn)?;
+        info!(
+            "[DB init][timing] phase=order_audit_chain elapsed_ms={}",
+            audit_started.elapsed().as_millis()
+        );
 
         // BR-159: every unified-Gateway acquisition attempt is append-only,
         // hash-chained, and retains provider/batch evidence plus aggregate
         // acceptance counters. Initialization fails on any chain mismatch.
+        let audit_started = std::time::Instant::now();
         data_acquisition_audit::create_schema(&mut *conn)?;
+        info!(
+            "[DB init][timing] phase=data_acquisition_audit elapsed_ms={}",
+            audit_started.elapsed().as_millis()
+        );
         benchmark_segments::create_schema(&mut *conn)?;
         attribution_reports::create_schema(&mut *conn)?;
         attribution_epochs::create_schema(&mut *conn)?;
         // BR-171: exact operator confirmations for >±20% adjacent daily-close
         // moves are immutable, hash-chained and validated at startup.
+        let audit_started = std::time::Instant::now();
         daily_change_confirmation::create_schema(&mut *conn)?;
+        info!(
+            "[DB init][timing] phase=daily_change_confirmation elapsed_ms={}",
+            audit_started.elapsed().as_millis()
+        );
         // BR-172: NewsAI assessments plus exact reservation/sink/delivery/
         // prediction-link events are independently immutable SHA-256 chains.
+        let audit_started = std::time::Instant::now();
         news_ai::create_schema(&mut *conn)?;
+        info!(
+            "[DB init][timing] phase=news_ai_schema elapsed_ms={}",
+            audit_started.elapsed().as_millis()
+        );
 
         // ledger 表（v3 每日净值快照）
         diesel::sql_query(
@@ -3887,7 +3928,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // BR-249: paper-inventory reconstruction failures occur before an
         // order attempt, so they use an independent immutable hash chain.
         // Startup refuses a missing, partial or tampered chain.
+        let audit_started = std::time::Instant::now();
         paper_inventory_failure_audit::create_schema(&mut *conn)?;
+        info!(
+            "[DB init][timing] phase=paper_inventory_failure_audit elapsed_ms={}",
+            audit_started.elapsed().as_millis()
+        );
         // PaperLedgerV1 is an explicit CatalogV2 migration, not an automatic
         // extension authorized by an old generation-1 startup receipt.
         // Private test processes install the extension on owned fixture DBs.
