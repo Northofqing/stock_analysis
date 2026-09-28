@@ -1872,6 +1872,42 @@ fn paper_ledger_two_buys_partial_sell_and_next_day_mark() {
     assert_eq!(view.daily_pnl(), Some(Money::from_cny(-6.10).unwrap()));
 }
 
+#[derive(diesel::QueryableByName)]
+struct GoldenTextValue {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct GoldenCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    value: i64,
+}
+
+fn golden_order_fees(db: &DatabaseManager, account_id: &str, command_id: &str) -> (Money, Money) {
+    let payload = diesel::sql_query(
+        "SELECT payload AS value FROM paper_ledger_event WHERE account_id=? AND command_id=?",
+    )
+    .bind::<diesel::sql_types::Text, _>(account_id)
+    .bind::<diesel::sql_types::Text, _>(command_id)
+    .get_result::<GoldenTextValue>(&mut db.get_conn().unwrap())
+    .unwrap()
+    .value;
+    match serde_json::from_str::<Fact>(&payload).unwrap() {
+        Fact::Order(order) => (order.commission, order.stamp),
+        _ => panic!("golden sale event must be an order"),
+    }
+}
+
+fn golden_filled_trade_count(db: &DatabaseManager) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM paper_trades WHERE status='Filled'",
+    )
+    .get_result::<GoldenCount>(&mut db.get_conn().unwrap())
+    .unwrap()
+    .value
+}
+
 #[test]
 fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -1916,6 +1952,11 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
         assert_eq!(head.value, "6c63fb6457630277f623bb2a16af312c88a416cc473818898e6d8357a2fcaed2");
         assert_eq!(report, r#"{"cash":98883900000,"lots":[{"lot_id":"fill:v1-golden-buy-12","code":"TEST_CODE_000001","name":"fixture","quantity":100,"basis_price":12000000,"buy_fee_remaining":5000000,"acquired_on":"2026-09-14","sellable_from":"2026-09-15","reported_cost":null}],"marks":{"TEST_CODE_000001":{"code":"TEST_CODE_000001","price":11000000,"observed_at":"2026-09-15T02:00:00Z","source":"TEST_CODE_realtime"}},"fees":16100000,"realized_pnl":88900000,"seed_equity":100000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
         assert_eq!([bought_one.fee, bought_two.fee, sold.fee], [Money::from_cny(5.0).unwrap(), Money::from_cny(5.0).unwrap(), Money::from_cny(6.10).unwrap()]);
+        assert_eq!(
+            golden_order_fees(&db, &binding.account_id, "v1-golden-sell-11"),
+            (Money::from_cny(5.0).unwrap(), Money::from_cny(1.10).unwrap())
+        );
+        assert_eq!(golden_filled_trade_count(&db), 3);
         assert_eq!(view.cash, Money::from_cny(98_883.90).unwrap());
         assert_eq!(view.fees, Money::from_cny(16.10).unwrap());
         assert_eq!(view.realized_pnl, Money::from_cny(88.90).unwrap());
@@ -1939,6 +1980,7 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
     }
     let reopened = ledger.read(&binding).unwrap();
     assert_eq!(reopened.version, 4);
+    assert_eq!(golden_filled_trade_count(&db), 3);
     assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
     assert_eq!(reopened.event_hash, hashes[3]);
 }
@@ -1989,6 +2031,11 @@ fn paper_ledger_v1_golden_percentage_fees_replay() {
         assert_eq!(sold.status, LedgerStatus::Filled);
         assert_eq!(bought.fee, Money::from_cny(6.0).unwrap());
         assert_eq!(sold.fee, Money::from_cny(27.30).unwrap());
+        assert_eq!(
+            golden_order_fees(&db, &binding.account_id, "v1-golden-sell-210"),
+            (Money::from_cny(6.30).unwrap(), Money::from_cny(21.0).unwrap())
+        );
+        assert_eq!(golden_filled_trade_count(&db), 2);
         assert_eq!(view.cash, Money::from_cny(1_000_966.70).unwrap());
         assert_eq!(view.fees, Money::from_cny(33.30).unwrap());
         assert_eq!(view.realized_pnl, Money::from_cny(966.70).unwrap());
@@ -2005,6 +2052,7 @@ fn paper_ledger_v1_golden_percentage_fees_replay() {
     }
     let reopened = ledger.read(&binding).unwrap();
     assert_eq!(reopened.version, 3);
+    assert_eq!(golden_filled_trade_count(&db), 2);
     assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
     assert_eq!(reopened.event_hash, hashes[2]);
 }
