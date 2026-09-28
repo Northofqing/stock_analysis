@@ -538,6 +538,13 @@ mod tests {
     }
 
     #[test]
+    fn enabled_legacy_battery_rule_does_not_steal_specific_lithium_news() {
+        let hits = with_repository_rules(|| map_news_to_chains("锂电池产能调整"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chain, "新能源-锂电池");
+    }
+
+    #[test]
     fn test_smart_driving_news() {
         let hits =
             with_repository_rules(|| map_news_to_chains("特斯拉FSD入华获批，端到端智驾加速落地"));
