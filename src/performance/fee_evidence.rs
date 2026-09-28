@@ -12,6 +12,12 @@ use crate::performance::economic_position::{CostBasisKind, FillCostEvidence, Fil
 use crate::strategy::lot;
 use chrono::NaiveDate;
 
+pub use super::fee_policy::{
+    a_share_stock_fill_fee_with_policy_v2, shanghai_execution_date, AShareFeePolicyV2,
+    AShareFeeV2Error, AShareFillFeeV2, ExcludedFeeReason, FeeCoverage, FeeCoverageRequirement,
+    FeeListingSegment, FeeMarket, FeeRate, FeeSecurityKind, QualifiedInstrument, StampTaxBracketV2,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillSide {
     Buy,
@@ -22,71 +28,27 @@ pub enum FillSide {
 /// `lot-rates-v1`; adopting this schedule requires a new ledger generation.
 pub const A_SHARE_FEE_SCHEDULE_V2: &str = "a-share-policy-by-trade-date-v2";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AShareFillFeeV2 {
-    pub basis_id: &'static str,
-    pub trade_date: NaiveDate,
-    pub commission_micro_cny: i64,
-    pub stamp_tax_micro_cny: i64,
-    pub total_micro_cny: i64,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum AShareFeeV2Error {
-    #[error("A-share fee schedule v2 requires positive micro-CNY notional")]
-    InvalidNotional,
-    #[error("A-share fee schedule v2 has no authority before 2008-09-19")]
-    UnsupportedTradeDate,
-    #[error("A-share fee schedule v2 amount overflow")]
-    Overflow,
-}
-
-/// Deterministic model fee for an A-share stock fill. Amounts are micro-CNY;
-/// commission is a model assumption (0.03%, minimum ¥5), not a broker receipt.
-/// Stamp tax is seller-only: 0.1% through 2023-08-27, then 0.05%.
+/// Fixed-assumption compatibility wrapper for old research callers. New work
+/// must pass an explicit policy and qualified instrument through
+/// `a_share_stock_fill_fee_with_policy_v2`.
 pub fn a_share_stock_fill_fee_v2(
     side: FillSide,
     notional_micro_cny: i64,
     trade_date: NaiveDate,
 ) -> Result<AShareFillFeeV2, AShareFeeV2Error> {
-    if notional_micro_cny <= 0 {
-        return Err(AShareFeeV2Error::InvalidNotional);
-    }
-    if trade_date < NaiveDate::from_ymd_opt(2008, 9, 19).expect("valid cutoff") {
-        return Err(AShareFeeV2Error::UnsupportedTradeDate);
-    }
-    let commission = rounded_rate_micro(notional_micro_cny, 3, 10_000)?.max(5_000_000);
-    let stamp = if matches!(side, FillSide::Sell) {
-        if trade_date < NaiveDate::from_ymd_opt(2023, 8, 28).expect("valid cutoff") {
-            rounded_rate_micro(notional_micro_cny, 1, 1_000)?
-        } else {
-            rounded_rate_micro(notional_micro_cny, 5, 10_000)?
-        }
-    } else {
-        0
-    };
-    Ok(AShareFillFeeV2 {
-        basis_id: A_SHARE_FEE_SCHEDULE_V2,
+    let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
+    a_share_stock_fill_fee_with_policy_v2(
+        &policy,
+        policy.scope(),
+        side,
+        notional_micro_cny,
         trade_date,
-        commission_micro_cny: commission,
-        stamp_tax_micro_cny: stamp,
-        total_micro_cny: commission
-            .checked_add(stamp)
-            .ok_or(AShareFeeV2Error::Overflow)?,
-    })
+        FeeCoverageRequirement::ModeledComponentsOnly,
+    )
 }
 
-fn rounded_rate_micro(
-    amount: i64,
-    numerator: i64,
-    denominator: i64,
-) -> Result<i64, AShareFeeV2Error> {
-    let rounded = (i128::from(amount) * i128::from(numerator) + i128::from(denominator / 2))
-        / i128::from(denominator);
-    i64::try_from(rounded).map_err(|_| AShareFeeV2Error::Overflow)
-}
-
-/// Versioned cost evidence for a research run with dated A-share stock fills.
+/// Legacy Scenario adapter: its aggregate `f64` costs and schedule-only ID are
+/// not per-fill authority. Future v2 consumers need the explicit policy result.
 /// The v1 ledger constructor remains unchanged for historical replay.
 pub fn a_share_fill_cost_ledger_v2(
     fills: &[(i64, FillSide, i64, NaiveDate)],

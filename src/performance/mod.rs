@@ -5,6 +5,7 @@ pub mod attribution_epoch;
 pub mod attribution_replay;
 pub mod economic_position;
 pub mod fee_evidence;
+pub mod fee_policy;
 pub mod report;
 pub mod snapshot;
 
