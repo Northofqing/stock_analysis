@@ -1021,6 +1021,7 @@ mod tests {
         assert!(!path.exists());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         for payload in [
+            r#"{"version":1,"boot_id":"123:456:1","observed_at":"#,
             r#"{"version":2,"boot_id":"123:456:1","observed_at":"2026-09-29T00:00:00Z"}"#,
             r#"{"version":1,"boot_id":"123:456:1","observed_at":"2026-09-29T00:00:00Z","account_mode":"Normal"}"#,
             r#"{"version":1,"boot_id":"123::1","observed_at":"2026-09-29T00:00:00Z"}"#,

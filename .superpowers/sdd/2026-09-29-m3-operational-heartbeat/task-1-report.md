@@ -10,6 +10,7 @@
 ## Verification and self-review
 
 - `cargo test --locked --offline --bin monitor health_cmd::tests` — passed, 12 tests; 855 filtered out. Repeated after the final validation split as `cargo test --locked --offline --bin monitor health_cmd::tests 2>&1 | tail -n 20` — passed, 12 tests. Existing compiler warnings remain unrelated to this task.
+- Review follow-up: added a genuinely truncated JSON payload to the heartbeat rejection test. Reran `cargo test --locked --offline --bin monitor health_cmd::tests` — passed, 12 tests; 855 filtered out. The same unrelated compiler warnings remain.
 - `git diff --check` — passed after the final source edit.
 - `rustfmt --edition 2021 src/bin/monitor/health_cmd.rs` — applied only to the changed file. Initial repository-wide `cargo fmt --check` showed pre-existing formatting differences in other files, so no other file was reformatted.
 - Self-review: the existing banner schema, destination path, read-side reason semantics, and private file mode remain intact. The only banner write behavior added is payload-bound enforcement and parent-directory sync. Tests cover roundtrip, schema/identity/time/size rejection, root isolation, private mode, and a deterministic failure after temp-file sync but before rename, with prior bytes and temp cleanup checked. No production root, provider, webhook, deployment, or monitor loop was touched.
