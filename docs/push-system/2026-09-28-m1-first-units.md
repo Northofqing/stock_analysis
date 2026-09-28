@@ -6,6 +6,8 @@
 
 2026-09-28 `eff7ce6d` 修复定时分析入口：将 `build_stock_list` 已取得的宏观背景和涨停代码集合传入 `AnalysisPipeline`，与手动单次入口保持相同的分析输入。该修复只覆盖 `MU-cli-single` / `MU-cli-summary` 的定时来源上下文；独立 completion identity、durable receipt 和物理 owner 迁移仍未完成。
 
+2026-09-29 重核当前源码：`pipeline/completion.rs` 已用 `StockAnalysisOutcome`、`SummaryCompletion` 将保存与 BestEffort 通知分开，`AnalysisNotification::Unknown` 保留发送开始后的未知结果；`app/modes.rs` 与 `app/schedule.rs` 均检查 `ensure_cli_success()`。`summary_notify.rs` 和单票发送会区别全部弱接受、部分弱接受、全部失败及无渠道。这关闭了“发送失败仍按 CLI 成功返回”的局部代码缺口，但弱接受没有持久 `TransportAccepted` authority，重启后也没有独立通知 cursor。
+
 ## 共同验收门
 
 每个 Unit 先保存同一份 `PreparedFacts`，shadow 比较 occurrence、业务日、主体、事实来源、规则/模板版本、抑制原因及 exact payload bytes，不重拉 provider、不再调用 LLM、不写 cursor、不触碰 sink。新 owner 的 intent、跨 business/durable DB finalizer、reconciler、activation manifest、readiness、Draining 回退必须在该 Unit 故障矩阵中闭合。
@@ -17,7 +19,7 @@
 | 波次 | Unit 与 producer | 旧 completion owner / 明确缺口 | 首个可验收切片 |
 | --- | --- | --- | --- |
 | 0 | Foundation 及 `MU-p01` conformance | P01 已有 durable business-date claim；先证明状态机可接现有意图与恢复。 | `P01/N02` 的已完成事实、崩溃点、异步渠道接收逐一与新 adapter 对齐；本波不切换新的物理发送。 |
-| 1 | `MU-cli-single`、`MU-cli-summary`、`MU-cli-chain` | enum 外 CLI，`Option<AnalysisResult>` / `run()` 返回值 / `Result<()>` 只是本地执行结果；无持久通知 cursor。 | 先确认每个 invocation 与目标渠道的独立 completion identity。单票、汇总、产业链三种 payload 不互当完成；CLI dry-run 与正式发送严格隔离。必要时先拆三张独立 activation 卡。 |
+| 1 | `MU-cli-single`、`MU-cli-summary`、`MU-cli-chain` | enum 外 CLI 已有本轮保存/通知分离及失败返回，但仅是进程内 BestEffort 观察；无持久通知 cursor 或权威接收回执。`MU-cli-chain` 仍须独立核对。 | 为每个 invocation 与目标渠道建立独立 completion identity。单票、汇总、产业链三种 payload 不互当完成；CLI dry-run 与正式发送严格隔离。必要时拆三张 activation 卡。 |
 | 2 | `MU-chain-preopen`、`MU-chain-post-close` | `CHAIN_PREOPEN_LAST` / `CHAIN_POST_LAST` 是进程内 calendar-date cursor，timer 无交易日 guard。 | 以 verified business date、窗口和同一报告 snapshot 建 occurrence；跨零点和重启不可重发，同分钟文件覆盖不能改变已准备 payload。与 CLI chain 共享事实，不共享错误 completion。 |
 | 3 | `MU-attribution-daily`、`MU-g5b-attribution` | `ATTRIBUTION_LAST_RUN` / `G5B_LAST_RUN` 是进程内日期位；bool/L4 结果不证明外部接收。 | 两个 kind 各自有 report revision、完成 receipt 和失败重试；报告生成成功后 sink 失败不能推进日期。若共同依赖同一次 attribution 计算，仅采集一次事实。 |
 | 4 | `MU-snapshot-stale` | startup 与 timer 共用 `SnapshotReminderGate` 内存态。 | 两入口用同一 business occurrence；缺 confirmed snapshot、超时及启动竞态只产生一个 intent；重启后不由 `LAST` 复位造成双发。 |
