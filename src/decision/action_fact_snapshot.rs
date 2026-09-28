@@ -1,9 +1,10 @@
-//! Immutable, per-candidate action-fact assessments and investment identity.
+//! Immutable snapshot of unverified action-fact claims.
 //!
-//! This module only checks that a supplied assessment is complete and internally
-//! fail-closed. It does not qualify a source, verify evidence or authorize an
-//! order. A source adapter must establish those properties before asserting
-//! `FactState::Admitted`; no production action path consumes this type yet.
+//! `freeze` checks that caller-supplied assessments cover the declared universe
+//! and are internally fail-closed. It does not qualify sources, verify evidence
+//! or authorize orders. Its ID identifies these claims only; the final
+//! `InvestmentDecisionId` needs a verified fact envelope and full decision
+//! record in a later contract. No production action path consumes this type.
 
 use crate::market_domain::{AssetClass, Exchange, InstrumentId};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -11,9 +12,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SCHEMA: &str = "INVESTMENT_DECISION_V1";
-const ID_PREFIX: &str = "investment-decision-v1:";
+const SCHEMA: &str = "UNVERIFIED_ACTION_FACT_SNAPSHOT_V1";
+const ID_PREFIX: &str = "unverified-action-fact-snapshot-v1:";
+const FACT_GATE_DENIED_REASON: &str = "fact_gate_denied";
 
+/// Caller-asserted state, not a source-admission result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactState {
@@ -37,42 +40,43 @@ impl FactState {
     }
 }
 
-/// Content-bound reference supplied by a future source-admission adapter.
-/// A hash and version here are identifiers, not proof of source qualification.
+/// Caller-supplied reference. The version and digest are identifiers, not proof
+/// that the referenced bytes meet any source, time or coverage contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct FactReference {
+pub struct UnverifiedFactReference {
     pub dataset_version: String,
     pub evidence_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct FactAssessment {
+pub struct UnverifiedFactAssessment {
     pub requirement: String,
-    pub state: FactState,
-    pub evidence: Vec<FactReference>,
+    pub claimed_state: FactState,
+    pub evidence: Vec<UnverifiedFactReference>,
     /// Stable machine codes; conflicting and unqualified causes can coexist.
     pub reason_codes: Vec<String>,
 }
 
+/// A proposed outcome retained for audit; neither variant authorizes an order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum CandidateDisposition {
-    Pass,
-    Reject { reason_codes: Vec<String> },
+pub enum ProposedDisposition {
+    WouldPass,
+    WouldReject { reason_codes: Vec<String> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct CandidateAssessment {
+pub struct UnverifiedCandidateAssessment {
     pub instrument: InstrumentId,
-    pub facts: Vec<FactAssessment>,
-    pub disposition: CandidateDisposition,
+    pub facts: Vec<UnverifiedFactAssessment>,
+    pub proposed_disposition: ProposedDisposition,
 }
 
 /// Separate universe and assessments make missing candidate dispositions
 /// detectable. Required batch-wide facts must be represented for each affected
 /// candidate in this first contract version.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActionFactSnapshotInput {
+pub struct UnverifiedActionFactSnapshotInput {
     pub strategy_version: String,
     pub model_version: String,
     pub config_version: String,
@@ -82,28 +86,30 @@ pub struct ActionFactSnapshotInput {
     pub calendar_version: String,
     pub universe: Vec<InstrumentId>,
     pub required_facts: Vec<String>,
-    pub candidates: Vec<CandidateAssessment>,
+    pub candidates: Vec<UnverifiedCandidateAssessment>,
 }
 
+/// Identity of unverified claims. It is not an investment decision identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct InvestmentDecisionId(String);
+pub struct ActionFactSnapshotId(String);
 
-impl InvestmentDecisionId {
+impl ActionFactSnapshotId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// A validated, immutable assessment with one versioned canonical preimage.
+/// An immutable, shape-validated collection of unverified source assessments.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActionFactSnapshot {
-    id: InvestmentDecisionId,
-    input: ActionFactSnapshotInput,
+pub struct UnverifiedActionFactSnapshot {
+    id: ActionFactSnapshotId,
+    input: UnverifiedActionFactSnapshotInput,
     canonical: Vec<u8>,
 }
 
-impl ActionFactSnapshot {
-    pub fn freeze(mut input: ActionFactSnapshotInput) -> Result<Self, SnapshotError> {
+impl UnverifiedActionFactSnapshot {
+    /// Freeze complete claims without creating an admission or order capability.
+    pub fn freeze(mut input: UnverifiedActionFactSnapshotInput) -> Result<Self, SnapshotError> {
         for (name, value) in [
             ("strategy_version", &input.strategy_version),
             ("model_version", &input.model_version),
@@ -172,20 +178,28 @@ impl ActionFactSnapshot {
                 }
                 validate_fact(fact)?;
             }
-            match &mut candidate.disposition {
-                CandidateDisposition::Pass
-                    if candidate
-                        .facts
-                        .iter()
-                        .any(|fact| fact.state != FactState::Admitted) =>
-                {
+            let has_non_admitted = candidate
+                .facts
+                .iter()
+                .any(|fact| fact.claimed_state != FactState::Admitted);
+            match &mut candidate.proposed_disposition {
+                ProposedDisposition::WouldPass if has_non_admitted => {
                     return Err(SnapshotError::NonAdmittedPass);
                 }
-                CandidateDisposition::Pass => {}
-                CandidateDisposition::Reject { reason_codes } => {
+                ProposedDisposition::WouldPass => {}
+                ProposedDisposition::WouldReject { reason_codes } => {
                     normalize_reasons(reason_codes)?;
                     if reason_codes.is_empty() {
                         return Err(SnapshotError::Missing("rejection reason"));
+                    }
+                    let has_gate_reason = reason_codes
+                        .iter()
+                        .any(|reason| reason == FACT_GATE_DENIED_REASON);
+                    if has_non_admitted && !has_gate_reason {
+                        return Err(SnapshotError::MissingFactGateReason);
+                    }
+                    if !has_non_admitted && has_gate_reason {
+                        return Err(SnapshotError::SpuriousFactGateReason);
                     }
                 }
             }
@@ -205,7 +219,7 @@ impl ActionFactSnapshot {
             candidates: &input.candidates,
         })
         .map_err(|error| SnapshotError::Encoding(error.to_string()))?;
-        let id = InvestmentDecisionId(format!(
+        let id = ActionFactSnapshotId(format!(
             "{ID_PREFIX}{}",
             hex::encode(Sha256::digest(&canonical))
         ));
@@ -216,11 +230,11 @@ impl ActionFactSnapshot {
         })
     }
 
-    pub fn decision_id(&self) -> &InvestmentDecisionId {
+    pub fn snapshot_id(&self) -> &ActionFactSnapshotId {
         &self.id
     }
 
-    pub fn frozen_input(&self) -> &ActionFactSnapshotInput {
+    pub fn frozen_claims(&self) -> &UnverifiedActionFactSnapshotInput {
         &self.input
     }
 
@@ -237,8 +251,12 @@ pub enum SnapshotError {
     Missing(&'static str),
     #[error("duplicate {0}")]
     Duplicate(&'static str),
-    #[error("a candidate with a non-admitted required fact cannot pass")]
+    #[error("a candidate with a non-admitted required fact cannot propose a pass")]
     NonAdmittedPass,
+    #[error("non-admitted candidate rejection must include fact_gate_denied")]
+    MissingFactGateReason,
+    #[error("fact_gate_denied requires a non-admitted required fact")]
+    SpuriousFactGateReason,
     #[error("canonical encoding failed: {0}")]
     Encoding(String),
 }
@@ -255,7 +273,7 @@ struct CanonicalPreimage<'a> {
     calendar_version: &'a str,
     universe: &'a [InstrumentId],
     required_facts: &'a [String],
-    candidates: &'a [CandidateAssessment],
+    candidates: &'a [UnverifiedCandidateAssessment],
 }
 
 fn validate_token(value: &str) -> Result<(), ()> {
@@ -281,7 +299,7 @@ fn normalize_reasons(reasons: &mut Vec<String>) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn validate_fact(fact: &mut FactAssessment) -> Result<(), SnapshotError> {
+fn validate_fact(fact: &mut UnverifiedFactAssessment) -> Result<(), SnapshotError> {
     normalize_reasons(&mut fact.reason_codes)?;
     for reference in &fact.evidence {
         validate_token(&reference.dataset_version)
@@ -301,7 +319,7 @@ fn validate_fact(fact: &mut FactAssessment) -> Result<(), SnapshotError> {
     if fact.evidence.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(SnapshotError::Duplicate("fact evidence"));
     }
-    match fact.state {
+    match fact.claimed_state {
         FactState::Admitted if fact.evidence.len() != 1 || !fact.reason_codes.is_empty() => {
             Err(SnapshotError::Invalid("admitted fact evidence"))
         }
@@ -345,11 +363,11 @@ mod tests {
         InstrumentId::new(Exchange::Shanghai, code, AssetClass::Equity).unwrap()
     }
 
-    fn admitted(requirement: &str, version: &str) -> FactAssessment {
-        FactAssessment {
+    fn admitted(requirement: &str, version: &str) -> UnverifiedFactAssessment {
+        UnverifiedFactAssessment {
             requirement: requirement.to_owned(),
-            state: FactState::Admitted,
-            evidence: vec![FactReference {
+            claimed_state: FactState::Admitted,
+            evidence: vec![UnverifiedFactReference {
                 dataset_version: version.to_owned(),
                 evidence_sha256: "a".repeat(64),
             }],
@@ -357,10 +375,10 @@ mod tests {
         }
     }
 
-    fn input() -> ActionFactSnapshotInput {
+    fn input() -> UnverifiedActionFactSnapshotInput {
         let first = instrument("600001");
         let second = instrument("600002");
-        ActionFactSnapshotInput {
+        UnverifiedActionFactSnapshotInput {
             strategy_version: "strategy-v1".to_owned(),
             model_version: "model-v1".to_owned(),
             config_version: "config-v1".to_owned(),
@@ -371,34 +389,34 @@ mod tests {
             universe: vec![second.clone(), first.clone()],
             required_facts: vec!["price_band".to_owned(), "lifecycle".to_owned()],
             candidates: vec![
-                CandidateAssessment {
+                UnverifiedCandidateAssessment {
                     instrument: second,
                     facts: vec![
                         admitted("price_band", "band-v1"),
                         admitted("lifecycle", "life-v1"),
                     ],
-                    disposition: CandidateDisposition::Reject {
+                    proposed_disposition: ProposedDisposition::WouldReject {
                         reason_codes: vec!["risk_veto".to_owned(), "liquidity_low".to_owned()],
                     },
                 },
-                CandidateAssessment {
+                UnverifiedCandidateAssessment {
                     instrument: first,
                     facts: vec![
                         admitted("price_band", "band-v1"),
                         admitted("lifecycle", "life-v1"),
                     ],
-                    disposition: CandidateDisposition::Pass,
+                    proposed_disposition: ProposedDisposition::WouldPass,
                 },
             ],
         }
     }
 
     #[test]
-    fn investment_id_golden_is_order_independent_and_namespaced() {
-        let snapshot = ActionFactSnapshot::freeze(input()).unwrap();
+    fn snapshot_id_golden_is_order_independent_and_namespaced() {
+        let snapshot = UnverifiedActionFactSnapshot::freeze(input()).unwrap();
         assert_eq!(
-            snapshot.decision_id().as_str(),
-            "investment-decision-v1:71559f0ebb5e5a79c3ded96ae3d32c8a0441017fc280f5a3d6c7a79abd8a9316"
+            snapshot.snapshot_id().as_str(),
+            "unverified-action-fact-snapshot-v1:995b94993dbf39154dd07b32751ea22bd5b29aeb8f501ce3356f16826c5ad91c"
         );
         let mut reordered = input();
         reordered.universe.reverse();
@@ -406,38 +424,59 @@ mod tests {
         reordered.candidates.reverse();
         for candidate in &mut reordered.candidates {
             candidate.facts.reverse();
-            if let CandidateDisposition::Reject { reason_codes } = &mut candidate.disposition {
+            if let ProposedDisposition::WouldReject { reason_codes } =
+                &mut candidate.proposed_disposition
+            {
                 reason_codes.reverse();
             }
         }
-        let same = ActionFactSnapshot::freeze(reordered).unwrap();
-        assert_eq!(same.decision_id(), snapshot.decision_id());
+        let same = UnverifiedActionFactSnapshot::freeze(reordered).unwrap();
+        assert_eq!(same.snapshot_id(), snapshot.snapshot_id());
         assert_eq!(same.canonical_bytes(), snapshot.canonical_bytes());
-        assert_eq!(snapshot.frozen_input().universe[0].code(), "600001");
+        assert_eq!(snapshot.frozen_claims().universe[0].code(), "600001");
+    }
+
+    #[test]
+    fn fabricated_admitted_claims_only_yield_an_unverified_snapshot_reference() {
+        let mut forged = input();
+        forged.candidates[1].facts[0].evidence[0].evidence_sha256 = "0".repeat(64);
+        let snapshot = UnverifiedActionFactSnapshot::freeze(forged).unwrap();
+        let id: &ActionFactSnapshotId = snapshot.snapshot_id();
+        assert!(id
+            .as_str()
+            .starts_with("unverified-action-fact-snapshot-v1:"));
+        assert!(matches!(
+            &snapshot.frozen_claims().candidates[0].proposed_disposition,
+            ProposedDisposition::WouldPass
+        ));
     }
 
     #[test]
     fn fact_revision_cutoff_and_disposition_each_change_identity() {
-        let original = ActionFactSnapshot::freeze(input()).unwrap();
+        let original = UnverifiedActionFactSnapshot::freeze(input()).unwrap();
         let mut revision = input();
         revision.candidates[0].facts[0].evidence[0].dataset_version = "band-v2".to_owned();
         assert_ne!(
-            ActionFactSnapshot::freeze(revision).unwrap().decision_id(),
-            original.decision_id()
+            UnverifiedActionFactSnapshot::freeze(revision)
+                .unwrap()
+                .snapshot_id(),
+            original.snapshot_id()
         );
         let mut cutoff = input();
         cutoff.as_of += Duration::seconds(1);
         assert_ne!(
-            ActionFactSnapshot::freeze(cutoff).unwrap().decision_id(),
-            original.decision_id()
+            UnverifiedActionFactSnapshot::freeze(cutoff)
+                .unwrap()
+                .snapshot_id(),
+            original.snapshot_id()
         );
         let mut disposition = input();
-        disposition.candidates[0].disposition = CandidateDisposition::Pass;
+        disposition.candidates[0].proposed_disposition = ProposedDisposition::WouldPass;
         assert_ne!(
-            ActionFactSnapshot::freeze(disposition)
+            UnverifiedActionFactSnapshot::freeze(disposition)
                 .unwrap()
-                .decision_id(),
-            original.decision_id()
+                .snapshot_id(),
+            original.snapshot_id()
         );
     }
 
@@ -446,7 +485,7 @@ mod tests {
         let mut missing_candidate = input();
         missing_candidate.candidates.pop();
         assert_eq!(
-            ActionFactSnapshot::freeze(missing_candidate),
+            UnverifiedActionFactSnapshot::freeze(missing_candidate),
             Err(SnapshotError::Missing("candidate disposition"))
         );
         let mut duplicate_candidate = input();
@@ -454,7 +493,7 @@ mod tests {
             .candidates
             .push(duplicate_candidate.candidates[0].clone());
         assert_eq!(
-            ActionFactSnapshot::freeze(duplicate_candidate),
+            UnverifiedActionFactSnapshot::freeze(duplicate_candidate),
             Err(SnapshotError::Duplicate("candidate disposition"))
         );
         let mut duplicate_universe = input();
@@ -462,19 +501,19 @@ mod tests {
             .universe
             .push(duplicate_universe.universe[0].clone());
         assert_eq!(
-            ActionFactSnapshot::freeze(duplicate_universe),
+            UnverifiedActionFactSnapshot::freeze(duplicate_universe),
             Err(SnapshotError::Duplicate("universe instrument"))
         );
         let mut missing_fact = input();
         missing_fact.candidates[0].facts.pop();
         assert_eq!(
-            ActionFactSnapshot::freeze(missing_fact),
+            UnverifiedActionFactSnapshot::freeze(missing_fact),
             Err(SnapshotError::Missing("candidate required fact"))
         );
         let mut duplicate_fact = input();
         duplicate_fact.candidates[0].facts[0] = duplicate_fact.candidates[0].facts[1].clone();
         assert_eq!(
-            ActionFactSnapshot::freeze(duplicate_fact),
+            UnverifiedActionFactSnapshot::freeze(duplicate_fact),
             Err(SnapshotError::Invalid("candidate required fact coverage"))
         );
     }
@@ -489,7 +528,7 @@ mod tests {
         ] {
             let mut assessed = input();
             let fact = &mut assessed.candidates[1].facts[0];
-            fact.state = state;
+            fact.claimed_state = state;
             fact.reason_codes = vec![
                 "source_unqualified".to_owned(),
                 "identity_conflict".to_owned(),
@@ -498,19 +537,32 @@ mod tests {
                 fact.evidence.clear();
             }
             assert_eq!(
-                ActionFactSnapshot::freeze(assessed.clone()),
+                UnverifiedActionFactSnapshot::freeze(assessed.clone()),
                 Err(SnapshotError::NonAdmittedPass)
             );
-            assessed.candidates[1].disposition = CandidateDisposition::Reject {
-                reason_codes: vec!["fact_gate_denied".to_owned()],
+            assessed.candidates[1].proposed_disposition = ProposedDisposition::WouldReject {
+                reason_codes: vec!["risk_veto".to_owned()],
             };
-            let frozen = ActionFactSnapshot::freeze(assessed).unwrap();
-            let frozen_fact = frozen.frozen_input().candidates[0]
+            assert_eq!(
+                UnverifiedActionFactSnapshot::freeze(assessed.clone()),
+                Err(SnapshotError::MissingFactGateReason)
+            );
+            assessed.candidates[1].proposed_disposition = ProposedDisposition::WouldReject {
+                reason_codes: vec!["risk_veto".to_owned(), "fact_gate_denied".to_owned()],
+            };
+            let frozen = UnverifiedActionFactSnapshot::freeze(assessed).unwrap();
+            assert_eq!(
+                frozen.frozen_claims().candidates[0].proposed_disposition,
+                ProposedDisposition::WouldReject {
+                    reason_codes: vec!["fact_gate_denied".to_owned(), "risk_veto".to_owned()]
+                }
+            );
+            let frozen_fact = frozen.frozen_claims().candidates[0]
                 .facts
                 .iter()
                 .find(|fact| fact.requirement == "price_band")
                 .unwrap();
-            assert_eq!(frozen_fact.state, state);
+            assert_eq!(frozen_fact.claimed_state, state);
             assert_eq!(
                 frozen_fact.reason_codes,
                 ["identity_conflict", "source_unqualified"]
@@ -519,15 +571,23 @@ mod tests {
         let mut false_admission = input();
         false_admission.candidates[0].facts[0].evidence.clear();
         assert_eq!(
-            ActionFactSnapshot::freeze(false_admission),
+            UnverifiedActionFactSnapshot::freeze(false_admission),
             Err(SnapshotError::Invalid("admitted fact evidence"))
         );
         let mut false_missing = input();
-        false_missing.candidates[0].facts[0].state = FactState::Missing;
+        false_missing.candidates[0].facts[0].claimed_state = FactState::Missing;
         false_missing.candidates[0].facts[0].reason_codes = vec!["no_value".to_owned()];
         assert_eq!(
-            ActionFactSnapshot::freeze(false_missing),
+            UnverifiedActionFactSnapshot::freeze(false_missing),
             Err(SnapshotError::Invalid("missing fact assessment"))
+        );
+        let mut false_rejection = input();
+        false_rejection.candidates[0].proposed_disposition = ProposedDisposition::WouldReject {
+            reason_codes: vec!["fact_gate_denied".to_owned()],
+        };
+        assert_eq!(
+            UnverifiedActionFactSnapshot::freeze(false_rejection),
+            Err(SnapshotError::SpuriousFactGateReason)
         );
     }
 }
