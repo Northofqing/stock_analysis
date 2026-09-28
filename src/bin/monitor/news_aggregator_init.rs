@@ -189,6 +189,46 @@ pub struct FlashReservation {
     decision: Option<FlashDecision>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum N02CaptureError {
+    Binding(stock_analysis::push_foundation::N02BindingError),
+    SelectedCount(usize),
+    EvidenceDigestMismatch,
+    SourceMismatch {
+        index: usize,
+    },
+    RecordEvidence {
+        index: usize,
+        error: raw_v2::NewsFlashRecordEvidenceError,
+    },
+    RegistrationMismatch {
+        index: usize,
+    },
+    ProjectionMismatch {
+        index: usize,
+        field: &'static str,
+    },
+}
+
+/// One process-local view of the selected records while the reservation token
+/// remains alive. Only the small legacy binding is owned; canonical bytes stay
+/// borrowed from the selected projected objects.
+#[derive(Debug)]
+struct N02ReservationCapture<'a> {
+    binding: stock_analysis::push_foundation::N02ReservationBindingV1,
+    records: Vec<&'a raw_v2::NewsFlashRecordEvidenceV1>,
+}
+
+impl N02ReservationCapture<'_> {
+    fn binding(&self) -> &stock_analysis::push_foundation::N02ReservationBindingV1 {
+        &self.binding
+    }
+
+    fn records(&self) -> &[&raw_v2::NewsFlashRecordEvidenceV1] {
+        &self.records
+    }
+}
+
 impl FlashReservation {
     pub const fn token_id(&self) -> u64 {
         self.token_id
@@ -280,6 +320,99 @@ impl FlashReservation {
             material,
             text.as_bytes(),
         )
+    }
+
+    /// Validate the same selected objects as the legacy reservation without
+    /// reading a provider, changing gate state, or cloning canonical content.
+    fn n02_capture(&self) -> Result<N02ReservationCapture<'_>, N02CaptureError> {
+        use stock_analysis::news::aggregator::raw_v2::{
+            ordered_news_flash_evidence_sha256, RegisteredGlobalNewsFeed,
+        };
+        use stock_analysis::signal::market_event::{Direction, EventType};
+
+        let binding = self
+            .foundation_n02_binding()
+            .map_err(N02CaptureError::Binding)?;
+        let count = self.selected_projected.len();
+        if !(1..=3).contains(&count) {
+            return Err(N02CaptureError::SelectedCount(count));
+        }
+        if ordered_news_flash_evidence_sha256(&self.selected_projected) != self.evidence_sha256 {
+            return Err(N02CaptureError::EvidenceDigestMismatch);
+        }
+        if self.sources.len() != count || binding.material().sources.len() != count {
+            return Err(N02CaptureError::SelectedCount(count));
+        }
+
+        let mut records = Vec::with_capacity(count);
+        for (index, selected) in self.selected_projected.iter().enumerate() {
+            let source = selected.source();
+            let audit = &binding.material().sources[index];
+            if source != &self.sources[index]
+                || source.event_id() != audit.event_id
+                || source.provider() != audit.provider
+                || source.source() != audit.source
+                || source.published_at().fixed_offset() != audit.published_at
+                || source.observed_at().fixed_offset() != audit.observed_at
+                || source.batch_id() != audit.batch_id
+            {
+                return Err(N02CaptureError::SourceMismatch { index });
+            }
+
+            let evidence =
+                selected
+                    .record_evidence()
+                    .map_err(|error| N02CaptureError::RecordEvidence {
+                        index,
+                        error: *error,
+                    })?;
+            if evidence.source() != source {
+                return Err(N02CaptureError::SourceMismatch { index });
+            }
+            let registration = evidence.registration();
+            if registration != RegisteredGlobalNewsFeed::for_provider(registration.provider)
+                || registration.provider.wire_name() != source.provider()
+                || registration.source_contract != source.source()
+            {
+                return Err(N02CaptureError::RegistrationMismatch { index });
+            }
+
+            let event = selected.event();
+            let mut event_hasher = Sha256::new();
+            event_hasher.update(b"BR166_GLOBAL_NEWS_EVENT_V1\0");
+            event_hasher.update(registration.source_contract.as_bytes());
+            event_hasher.update(b"\0");
+            event_hasher.update(evidence.item_id().as_bytes());
+            let expected_event_id = format!("{:x}", event_hasher.finalize());
+            if evidence.item_id().trim().is_empty()
+                || event.event_id != expected_event_id
+                || source.event_id() != expected_event_id
+            {
+                return Err(N02CaptureError::ProjectionMismatch {
+                    index,
+                    field: "event_id",
+                });
+            }
+            if event.event_type != EventType::Other
+                || event.direction != Direction::Neutral
+                || event.strength != 0
+                || event.certainty != 100
+                || event.stale
+                || event.occurred_at.with_timezone(&chrono::Utc) != source.published_at()
+                || event.provenance.len() != 1
+                || event.provenance[0].provider != source.source()
+                || event.provenance[0].fetched_at.with_timezone(&chrono::Utc)
+                    != source.observed_at()
+            {
+                return Err(N02CaptureError::ProjectionMismatch {
+                    index,
+                    field: "source_only_semantics",
+                });
+            }
+            records.push(evidence);
+        }
+
+        Ok(N02ReservationCapture { binding, records })
     }
 
     fn matches_attempt(&self, attempt: &stock_analysis::event::NewsFlashAttemptReceipt) -> bool {
@@ -1437,6 +1570,393 @@ mod tests {
         let (mut events, _) = projection.into_parts();
         assert_eq!(events.len(), 1);
         events.pop().unwrap()
+    }
+
+    #[test]
+    fn n02_capture_cross_tick_borrows_origin_and_settles_real_accepted_terminal() {
+        let _test_namespace = crate::TestEnvGuard::dry_run_non_quiet();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary A",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary B",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let reservation = gate
+            .reserve(&[b], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        let capture = reservation.n02_capture().unwrap();
+        assert_eq!(capture.records().len(), 2);
+        assert_eq!(capture.records()[0].item_id(), "TEST_CODE_A");
+        assert_eq!(
+            capture.records()[0].source().batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+        assert_eq!(
+            capture.records()[0].source().observed_at(),
+            a.source().observed_at()
+        );
+        assert_eq!(
+            capture.records()[0].content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(capture.records()[1].item_id(), "TEST_CODE_B");
+        assert_eq!(
+            capture.binding().material().sources,
+            reservation.audit_sources()
+        );
+        assert_eq!(
+            capture.binding().material().reservation_sha256,
+            reservation.reservation_identity_sha256()
+        );
+
+        let attempt_at = n02_selected_local_at(day, 9, 32).fixed_offset();
+        let channel = "TEST_CODE_DRY_RUN";
+        let attempt = stock_analysis::event::publish_news_flash_attempt(
+            stock_analysis::event::NewsFlashAttemptAuditInput {
+                push_kind: reservation.push_kind().to_owned(),
+                business_date: day,
+                decision_key: reservation.decision_key().to_owned(),
+                channel: channel.to_owned(),
+                rendered_len: reservation.rendered_len(),
+                reservation_sha256: reservation.reservation_identity_sha256().to_owned(),
+                sources: reservation.audit_sources(),
+                evidence_sha256: reservation.evidence_sha256().to_owned(),
+                render_sha256: reservation.render_sha256().to_owned(),
+                attempt_ordinal: reservation.attempt_ordinal(),
+                observed_at: attempt_at,
+            },
+        )
+        .unwrap();
+        let accepted_at = attempt_at + chrono::Duration::seconds(1);
+        let terminal = stock_analysis::event::publish_news_flash_terminal(
+            &attempt,
+            stock_analysis::event::NewsFlashTerminalAuditInput {
+                disposition: stock_analysis::event::NewsFlashTerminalDisposition::Accepted {
+                    remote_receipt: stock_analysis::event::envelope::NewsFlashRemoteReceipt {
+                        channel: channel.to_owned(),
+                        provider: "TEST_CODE_LOCAL_SINK".to_owned(),
+                        message_id: "TEST_CODE_LOCAL_MESSAGE".to_owned(),
+                        platform_message_id: "TEST_CODE_REMOTE_MESSAGE".to_owned(),
+                        accepted_at,
+                        latency_ms: 7,
+                    },
+                },
+                observed_at: accepted_at,
+                latency_ms: 7,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &terminal,
+            stock_analysis::event::NewsFlashTerminalReceipt::Accepted(_)
+        ));
+        gate.settle(reservation, FlashSettlement::Terminal(Box::new(terminal)))
+            .unwrap();
+        assert_eq!(gate.window_state[0], WindowState::Committed);
+        assert!(gate
+            .reserve(&[], n02_selected_local_at(day, 9, 33), 80, 20)
+            .is_empty());
+    }
+
+    #[test]
+    fn n02_capture_content_only_distinction_keeps_legacy_identity() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let reserve = |summary| {
+            let projected = n02_selected_projected(
+                "TEST_CODE_SAME",
+                "TEST_CODE_TITLE",
+                summary,
+                "TEST_CODE_BATCH",
+                day,
+                1,
+            );
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&[projected], n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let a = reserve("summary A");
+        let b = reserve("summary B");
+        let captured_a = a.n02_capture().unwrap();
+        let captured_b = b.n02_capture().unwrap();
+        assert_eq!(captured_a.binding(), captured_b.binding());
+        assert_eq!(a.decision(), b.decision());
+        assert_eq!(a.evidence_sha256(), b.evidence_sha256());
+        assert_ne!(
+            captured_a.records()[0].content_sha256(),
+            captured_b.records()[0].content_sha256()
+        );
+        assert_ne!(
+            captured_a.records()[0].canonical_bytes(),
+            captured_b.records()[0].canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn n02_capture_errors_leave_rollback_and_uncertain_legacy_settlement() {
+        let (synthetic, _, mut gate) = n02_legacy_identity_reservation("A");
+        assert_eq!(
+            synthetic.n02_capture().unwrap_err(),
+            N02CaptureError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
+            }
+        );
+        let identity = synthetic.reservation_identity_sha256().to_owned();
+        gate.settle(
+            synthetic,
+            FlashSettlement::RolledBack {
+                reason: "TEST_CODE_ROLLBACK".to_owned(),
+            },
+        )
+        .unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let retry = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 32), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(retry.reservation_identity_sha256(), identity);
+        assert_eq!(
+            retry.n02_capture().unwrap_err(),
+            N02CaptureError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
+            }
+        );
+        gate.settle(
+            retry,
+            FlashSettlement::Uncertain {
+                reason: "TEST_CODE_UNKNOWN".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(gate
+            .reserve(&[], n02_selected_local_at(day, 9, 33), 80, 20)
+            .is_empty());
+
+        let oversized = n02_selected_projected(
+            "TEST_CODE_LARGE",
+            "TEST_CODE_TITLE",
+            &"x".repeat(raw_v2::MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES),
+            "TEST_CODE_BATCH",
+            day,
+            1,
+        );
+        let mut oversized_gate = NewsFlashGate::new(day);
+        assert!(oversized_gate
+            .reserve(&[oversized], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let oversized_reservation = oversized_gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            oversized_reservation.n02_capture().unwrap_err(),
+            N02CaptureError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::CanonicalBytesLimitExceeded,
+            }
+        );
+        oversized_gate
+            .settle(
+                oversized_reservation,
+                FlashSettlement::RolledBack {
+                    reason: "TEST_CODE_CAPTURE_REJECTED".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(oversized_gate.window_state[0], WindowState::Eligible);
+    }
+
+    #[test]
+    fn n02_capture_rejects_critical_before_inspecting_missing_record() {
+        let (aggregate, source, _) = n02_legacy_identity_reservation("A");
+        let day = aggregate.business_date();
+        let now = n02_selected_local_at(day, 9, 31);
+        let critical = make_reservation(
+            2,
+            day,
+            "event:TEST_CODE_EVENT_A",
+            Some("TEST_CODE_EVENT_A".to_owned()),
+            None,
+            vec![source],
+            FlashDecision::Critical {
+                event_id: "TEST_CODE_EVENT_A".to_owned(),
+                headline: "TEST_CODE_TITLE_A".to_owned(),
+                source: "TEST_CODE_SOURCE".to_owned(),
+                observed_at: now,
+                source_published_on: day,
+                stale: false,
+                strength: 100,
+                certainty: 100,
+                text: match aggregate.decision() {
+                    FlashDecision::Aggregated { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                },
+            },
+        );
+        assert_eq!(
+            critical.n02_capture().unwrap_err(),
+            N02CaptureError::Binding(
+                stock_analysis::push_foundation::N02BindingError::ReservationMismatch {
+                    field: "push_kind"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn n02_capture_first_duplicate_and_top_three_stay_in_selected_order() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "original",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let changed = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "changed",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        let mut duplicate_gate = NewsFlashGate::new(day);
+        assert!(duplicate_gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let duplicate = duplicate_gate
+            .reserve(
+                &[changed.clone()],
+                n02_selected_local_at(day, 9, 31),
+                80,
+                20,
+            )
+            .pop()
+            .unwrap();
+        let duplicate_capture = duplicate.n02_capture().unwrap();
+        assert_eq!(duplicate_capture.records().len(), 1);
+        assert_eq!(
+            duplicate_capture.records()[0].source().batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+        assert_eq!(
+            duplicate_capture.records()[0].content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_ne!(
+            duplicate_capture.records()[0].content_sha256(),
+            changed.record_evidence().unwrap().content_sha256()
+        );
+
+        let events = ["A", "B", "C", "D"].map(|suffix| {
+            n02_selected_projected(
+                &format!("TEST_CODE_{suffix}"),
+                &format!("TEST_CODE_TITLE_{suffix}"),
+                "summary",
+                &format!("TEST_CODE_BATCH_{suffix}"),
+                day,
+                1,
+            )
+        });
+        let reserve = |ordered: Vec<NewsFlashProjectedEvent>| {
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&ordered, n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let forward = reserve(events.to_vec());
+        let reverse = reserve(events.into_iter().rev().collect());
+        let captured_ids = |reservation: &FlashReservation| {
+            reservation
+                .n02_capture()
+                .unwrap()
+                .records()
+                .iter()
+                .map(|record| record.item_id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            captured_ids(&forward),
+            ["TEST_CODE_A", "TEST_CODE_B", "TEST_CODE_C"]
+        );
+        assert_eq!(
+            captured_ids(&reverse),
+            ["TEST_CODE_D", "TEST_CODE_C", "TEST_CODE_B"]
+        );
+        assert_eq!(
+            forward.n02_capture().unwrap().binding().material().sources,
+            forward.audit_sources()
+        );
+        assert_eq!(
+            reverse.n02_capture().unwrap().binding().material().sources,
+            reverse.audit_sources()
+        );
+    }
+
+    #[test]
+    fn n02_capture_rejects_selected_order_or_count_drift() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary",
+            "TEST_CODE_BATCH_B",
+            day,
+            1,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a, b], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let mut reservation = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert!(reservation.n02_capture().is_ok());
+        reservation.selected_projected.reverse();
+        assert_eq!(
+            reservation.n02_capture().unwrap_err(),
+            N02CaptureError::EvidenceDigestMismatch
+        );
+        reservation.selected_projected.clear();
+        assert_eq!(
+            reservation.n02_capture().unwrap_err(),
+            N02CaptureError::SelectedCount(0)
+        );
     }
 
     #[test]
