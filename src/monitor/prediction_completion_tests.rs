@@ -8,6 +8,118 @@ fn private_db() -> (tempfile::TempDir, DatabaseManager) {
     (dir, db)
 }
 
+#[test]
+fn legacy_t1_uses_verified_calendar_and_fails_before_write_without_next_year() {
+    let (_dir, db) = private_db();
+    for (today, target, code) in [
+        ("2026-08-28", "2026-08-31", "TEST_CODE_t1_weekend"),
+        ("2026-09-30", "2026-10-08", "TEST_CODE_t1_holiday"),
+        ("2026-10-04", "2026-10-08", "TEST_CODE_t1_closed_day"),
+    ] {
+        let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
+        let projected = save_prediction_on(&db, today, None, Some(code), "up", 75., None)
+            .expect("checked-in T+1 must be available");
+        assert_eq!(projected.to_string(), target);
+        let row = db
+            .get_prediction_by_code_date(code, &today.to_string())
+            .unwrap();
+        assert_eq!(row.target_date, target);
+    }
+    let before = db.count_predictions().unwrap();
+    assert!(save_prediction_on(
+        &db,
+        NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+        None,
+        Some("TEST_CODE_t1_missing_next_year"),
+        "up",
+        75.,
+        None,
+    )
+    .unwrap_err()
+    .contains("coverage unavailable"));
+    assert_eq!(db.count_predictions().unwrap(), before);
+}
+
+#[test]
+fn completed_shanghai_session_uses_close_boundary_and_verified_calendar() {
+    let at = |text: &str| text.parse::<DateTime<FixedOffset>>().unwrap();
+    assert_eq!(
+        completed_session_as_of_at(at("2026-10-09T14:59:59+08:00")).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()
+    );
+    assert_eq!(
+        completed_session_as_of_at(at("2026-10-09T15:00:00+08:00")).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 10, 9).unwrap()
+    );
+    assert_eq!(
+        completed_session_as_of_at(at("2026-10-10T08:00:00+08:00")).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 10, 9).unwrap()
+    );
+    assert_eq!(
+        completed_session_as_of_at(at("2026-10-07T08:00:00+08:00")).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()
+    );
+    assert!(completed_session_as_of_at(at("2026-10-09T15:00:00+00:00")).is_err());
+    assert!(completed_session_as_of_at(at("2027-01-04T15:00:00+08:00")).is_err());
+}
+
+#[test]
+fn hit_rate_window_includes_only_last_n_verified_trading_dates() {
+    let (_dir, db) = private_db();
+    for (index, pred_date, hit) in [
+        (0, "2026-09-30", false),
+        (1, "2026-10-07", true), // closure inside the natural-date range
+        (2, "2026-10-08", true),
+        (3, "2026-10-09", false),
+        (4, "2026-10-10", true), // weekend inside the natural-date range
+        (5, "2026-10-12", true), // after as_of
+    ] {
+        let code = format!("TEST_CODE_window_{index}");
+        db.save_prediction_legacy(pred_date, "2026-10-13", None, Some(&code), "up", 75., None)
+            .unwrap();
+        let id = db.get_prediction_by_code_date(&code, pred_date).unwrap().id;
+        assert_eq!(
+            db.update_prediction_result_by_id(id, if hit { 1.0 } else { -1.0 }, hit)
+                .unwrap(),
+            1
+        );
+    }
+    let as_of = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+    let one = db
+        .get_verified_prediction_sample_hit_rate(as_of, 1)
+        .unwrap();
+    assert_eq!(
+        (one.window_start.to_string(), one.samples, one.hits),
+        ("2026-10-09".to_string(), 1, 0)
+    );
+    assert_eq!(one.rate, 0.);
+    let two = db
+        .get_verified_prediction_sample_hit_rate(as_of, 2)
+        .unwrap();
+    assert_eq!(
+        (two.window_start.to_string(), two.samples, two.hits),
+        ("2026-10-08".to_string(), 2, 1)
+    );
+    assert_eq!(two.rate, 0.5);
+    let three = db
+        .get_verified_prediction_sample_hit_rate(as_of, 3)
+        .unwrap();
+    assert_eq!(
+        (three.window_start.to_string(), three.samples, three.hits),
+        ("2026-09-30".to_string(), 3, 1)
+    );
+    assert!((three.rate - 1. / 3.).abs() < f64::EPSILON);
+    assert!(db
+        .get_verified_prediction_sample_hit_rate(as_of, 0)
+        .is_err());
+    assert!(db
+        .get_verified_prediction_sample_hit_rate(NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(), 1)
+        .is_err());
+    assert!(db
+        .get_verified_prediction_sample_hit_rate(NaiveDate::from_ymd_opt(2027, 1, 4).unwrap(), 1)
+        .is_err());
+}
+
 fn close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
     let mut conn = db.get_conn().unwrap();
     diesel::sql_query("INSERT INTO stock_daily (code,date,close) VALUES (?1,?2,?3)")

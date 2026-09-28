@@ -432,6 +432,18 @@ pub struct DatabaseManager {
     selection_schema_authority: Option<Box<global_schema_v1::VerifiedAmendedSelectionSchema>>,
 }
 
+/// Recorded prediction outcomes in a checked-in trading-day window.
+/// These are signal samples, with no delivery-terminal correlation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedPredictionSampleHitRate {
+    pub as_of: NaiveDate,
+    pub window_start: NaiveDate,
+    pub trading_days: usize,
+    pub samples: i64,
+    pub hits: i64,
+    pub rate: f64,
+}
+
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 #[cfg(test)]
@@ -4420,36 +4432,70 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Ok(row.map(|r| (r.name, r.basis)))
     }
 
-    /// 获取近 `days` 天已验证预测的真实命中率。
-    pub fn get_prediction_hit_rate(&self, days: i32) -> Result<f64, Box<dyn std::error::Error>> {
-        if days <= 0 {
-            return Err("命中率窗口 days 必须 > 0".into());
+    /// Read recorded, verified prediction signal samples for the inclusive last
+    /// `trading_days` checked-in A-share trading dates ending at `as_of`.
+    /// A prediction row does not prove its push was delivered.
+    pub fn get_verified_prediction_sample_hit_rate(
+        &self,
+        as_of: NaiveDate,
+        trading_days: usize,
+    ) -> Result<VerifiedPredictionSampleHitRate, Box<dyn std::error::Error>> {
+        if trading_days == 0 {
+            return Err("命中率交易日窗口必须 > 0".into());
         }
-        let mut conn = self.get_conn()?;
-        #[derive(QueryableByName, Debug)]
-        struct HitRate {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            sample_count: i64,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
-            hit_sum: Option<f64>,
+        if !crate::calendar::verified_a_share_trading_day(as_of)? {
+            return Err(format!("as_of 不是已核验 A 股交易日: {as_of}").into());
         }
 
-        let row = diesel::sql_query(
-            "SELECT COUNT(*) AS sample_count, SUM(CAST(hit AS REAL)) AS hit_sum \
-             FROM prediction_tracker \
-             WHERE hit IS NOT NULL AND date(pred_date) >= date('now', '-' || ? || ' days')",
+        let mut dates = std::collections::BTreeSet::new();
+        let mut cursor = as_of;
+        for index in 0..trading_days {
+            dates.insert(cursor.format("%Y-%m-%d").to_string());
+            if index + 1 < trading_days {
+                cursor = crate::calendar::verified_prev_a_share_trading_day(cursor)?;
+            }
+        }
+        let window_start = cursor;
+        let mut conn = self.get_conn()?;
+        #[derive(QueryableByName)]
+        struct RecordedOutcome {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_date: String,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            hit: i32,
+        }
+        let rows = diesel::sql_query(
+            "SELECT pred_date, hit FROM prediction_tracker \
+             WHERE hit IS NOT NULL AND pred_date >= ?1 AND pred_date <= ?2",
         )
-        .bind::<diesel::sql_types::Integer, _>(days)
-        .get_result::<HitRate>(&mut *conn)?;
-        if row.sample_count <= 0 {
-            return Err(format!("近 {days} 天没有已验证预测样本").into());
+        .bind::<diesel::sql_types::Text, _>(window_start.format("%Y-%m-%d").to_string())
+        .bind::<diesel::sql_types::Text, _>(as_of.format("%Y-%m-%d").to_string())
+        .load::<RecordedOutcome>(&mut *conn)?;
+        let mut samples = 0_i64;
+        let mut hits = 0_i64;
+        for row in rows {
+            if !dates.contains(&row.pred_date) {
+                continue;
+            }
+            if !matches!(row.hit, 0 | 1) {
+                return Err(format!("预测样本 hit 超出 0/1: {}", row.hit).into());
+            }
+            samples = samples.checked_add(1).ok_or("预测样本计数溢出")?;
+            hits = hits
+                .checked_add(i64::from(row.hit))
+                .ok_or("预测命中计数溢出")?;
         }
-        let hit_sum = row.hit_sum.ok_or("命中数聚合结果缺失")?;
-        let rate = hit_sum / row.sample_count as f64;
-        if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
-            return Err(format!("命中率超出有效域: {rate}").into());
+        if samples == 0 {
+            return Err(format!("{window_start}..={as_of} 没有已验证预测信号样本").into());
         }
-        Ok(rate)
+        Ok(VerifiedPredictionSampleHitRate {
+            as_of,
+            window_start,
+            trading_days,
+            samples,
+            hits,
+            rate: hits as f64 / samples as f64,
+        })
     }
 
     /// 保存主题签名用于去同质化（重复签名更新 created_at）
@@ -5757,7 +5803,6 @@ mod tests {
             1,
             "result backfill must update one immutable prediction row, not every same-day model"
         );
-        assert!((0.0..=1.0).contains(&db.get_prediction_hit_rate(1).unwrap()));
         assert_eq!(
             db.update_prediction_result(&today, Some("TEST_CODE_MISSING"), 0.5, false)
                 .unwrap(),
@@ -5827,7 +5872,12 @@ mod tests {
         assert!(db.get_pending_predictions("x' OR 1=1 --").is_err());
         assert!(db.count_recent_pushes(&code, 0).is_err());
         assert!(db.count_predictions_by_reason(" ").is_err());
-        assert!(db.get_prediction_hit_rate(0).is_err());
+        assert!(db
+            .get_verified_prediction_sample_hit_rate(
+                NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+                0,
+            )
+            .is_err());
         assert!(db
             .save_prediction(
                 &today,

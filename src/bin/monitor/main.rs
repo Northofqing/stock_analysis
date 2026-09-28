@@ -10278,9 +10278,11 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 log::warn!("[预测] 本轮未完成，继续盘前调度: {error}");
             }
 
-            match prediction::recent_hit_rate(7) {
-                Ok(hit_rate) => log::info!("[预测] 近7天命中率: {:.0}%", hit_rate * 100.0),
-                Err(error) => log::warn!("[预测] 近7天命中率不可用: {}", error),
+            match prediction::hit_rate_summary_at(prediction::shanghai_now(), 7) {
+                Ok(summary) => log::info!("[预测] {summary}"),
+                Err(error) => {
+                    log::warn!("[预测] 近7个已完成交易日已验证信号样本命中率不可用: {error}")
+                }
             }
 
             // 构建实体过滤集合（只关注9只标的）
@@ -12142,12 +12144,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 这里不再调用旧的全量抓取入口，避免重复拉 250 日 K 线、财报和六类工具数据。
             log::info!("[收盘] 多轮 AI 转由 post_session_review_scheduler 统一调度");
 
+            let prediction_summary = prediction::hit_rate_summary_at(prediction::shanghai_now(), 7)
+                .unwrap_or_else(|error| {
+                    format!("近7个已完成交易日已验证信号样本命中率不可用: {error}")
+                });
             log::info!(
                 "[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
                 signal_count,
                 alert_count,
                 scanner.dq_summary(),
-                prediction::hit_rate_summary(7)
+                prediction_summary
             );
 
             // 收盘后继续循环，等待下一个交易日
