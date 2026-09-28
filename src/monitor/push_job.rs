@@ -6,6 +6,7 @@ mod context;
 mod delivery;
 mod facts;
 mod identity;
+mod n02_source;
 mod policy;
 mod projection;
 mod shadow;
@@ -48,6 +49,7 @@ pub use identity::{
     ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId, Sha256Digest,
     SourceContractId, SourceContractVersion, SubjectId, SubjectValue, UnitId, UtcMicros,
 };
+pub use n02_source::{N02SourceChainV1, N02SourceError};
 pub use policy::{
     evaluate_completion, AdvanceEvent, AlreadyTerminalPolicy, CatalogOwnerRef, CompletionDirective,
     CompletionFact, CompletionPolicy, CompletionPolicyId, CompletionPolicyVersion, CursorDirective,

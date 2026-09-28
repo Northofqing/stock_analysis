@@ -29,6 +29,7 @@
 use diesel::RunQueryDsl;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
+use stock_analysis::monitor::push_job::{N02SourceChainV1, N02SourceError};
 use stock_analysis::news::aggregator::projection_v2::{
     NotificationProjectionError, NotificationProjectionState, ReceiptedRawNewsBatch,
 };
@@ -189,46 +190,6 @@ pub struct FlashReservation {
     decision: Option<FlashDecision>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum N02CaptureError {
-    Binding(stock_analysis::push_foundation::N02BindingError),
-    SelectedCount(usize),
-    EvidenceDigestMismatch,
-    SourceMismatch {
-        index: usize,
-    },
-    RecordEvidence {
-        index: usize,
-        error: raw_v2::NewsFlashRecordEvidenceError,
-    },
-    RegistrationMismatch {
-        index: usize,
-    },
-    ProjectionMismatch {
-        index: usize,
-        field: &'static str,
-    },
-}
-
-/// One process-local view of the selected records while the reservation token
-/// remains alive. Only the small legacy binding is owned; canonical bytes stay
-/// borrowed from the selected projected objects.
-#[derive(Debug)]
-struct N02ReservationCapture<'a> {
-    binding: stock_analysis::push_foundation::N02ReservationBindingV1,
-    records: Vec<&'a raw_v2::NewsFlashRecordEvidenceV1>,
-}
-
-impl N02ReservationCapture<'_> {
-    fn binding(&self) -> &stock_analysis::push_foundation::N02ReservationBindingV1 {
-        &self.binding
-    }
-
-    fn records(&self) -> &[&raw_v2::NewsFlashRecordEvidenceV1] {
-        &self.records
-    }
-}
-
 impl FlashReservation {
     pub const fn token_id(&self) -> u64 {
         self.token_id
@@ -324,93 +285,14 @@ impl FlashReservation {
 
     /// Validate the same selected objects as the legacy reservation without
     /// reading a provider, changing gate state, or cloning canonical content.
-    fn n02_capture(&self) -> Result<N02ReservationCapture<'_>, N02CaptureError> {
-        use stock_analysis::news::aggregator::raw_v2::{
-            ordered_news_flash_evidence_sha256, RegisteredGlobalNewsFeed,
-        };
-        use stock_analysis::signal::market_event::{Direction, EventType};
-
+    fn n02_capture(&self) -> Result<N02SourceChainV1<'_>, N02SourceError> {
         let binding = self
             .foundation_n02_binding()
-            .map_err(N02CaptureError::Binding)?;
-        let count = self.selected_projected.len();
-        if !(1..=3).contains(&count) {
-            return Err(N02CaptureError::SelectedCount(count));
-        }
-        if ordered_news_flash_evidence_sha256(&self.selected_projected) != self.evidence_sha256 {
-            return Err(N02CaptureError::EvidenceDigestMismatch);
-        }
-        if self.sources.len() != count || binding.material().sources.len() != count {
-            return Err(N02CaptureError::SelectedCount(count));
-        }
-
-        let mut records = Vec::with_capacity(count);
-        for (index, selected) in self.selected_projected.iter().enumerate() {
-            let source = selected.source();
-            let audit = &binding.material().sources[index];
-            if source != &self.sources[index]
-                || source.event_id() != audit.event_id
-                || source.provider() != audit.provider
-                || source.source() != audit.source
-                || source.published_at().fixed_offset() != audit.published_at
-                || source.observed_at().fixed_offset() != audit.observed_at
-                || source.batch_id() != audit.batch_id
-            {
-                return Err(N02CaptureError::SourceMismatch { index });
-            }
-
-            let evidence =
-                selected
-                    .record_evidence()
-                    .map_err(|error| N02CaptureError::RecordEvidence {
-                        index,
-                        error: *error,
-                    })?;
-            if evidence.source() != source {
-                return Err(N02CaptureError::SourceMismatch { index });
-            }
-            let registration = evidence.registration();
-            if registration != RegisteredGlobalNewsFeed::for_provider(registration.provider)
-                || registration.provider.wire_name() != source.provider()
-                || registration.source_contract != source.source()
-            {
-                return Err(N02CaptureError::RegistrationMismatch { index });
-            }
-
-            let event = selected.event();
-            let expected_event_id = raw_v2::br166_global_news_event_id(
-                registration.provider,
-                evidence.item_id(),
-            );
-            if evidence.item_id().trim().is_empty()
-                || event.event_id != expected_event_id
-                || source.event_id() != expected_event_id
-            {
-                return Err(N02CaptureError::ProjectionMismatch {
-                    index,
-                    field: "event_id",
-                });
-            }
-            if event.event_type != EventType::Other
-                || event.direction != Direction::Neutral
-                || event.strength != 0
-                || event.certainty != 100
-                || event.stale
-                || event.occurred_at.with_timezone(&chrono::Utc) != source.published_at()
-                || event.provenance.len() != 1
-                || event.provenance[0].provider != source.source()
-                || event.provenance[0].fetched_at.with_timezone(&chrono::Utc)
-                    != source.observed_at()
-            {
-                return Err(N02CaptureError::ProjectionMismatch {
-                    index,
-                    field: "source_only_semantics",
-                });
-            }
-            records.push(evidence);
-        }
-
-        Ok(N02ReservationCapture { binding, records })
+            .map_err(N02SourceError::Binding)?;
+        let FlashDecision::Aggregated { text, .. } = self.decision() else {
+            unreachable!("validated N02 binding requires an aggregate decision")
+        };
+        N02SourceChainV1::try_capture(binding, &self.selected_projected, text.as_bytes())
     }
 
     fn matches_attempt(&self, attempt: &stock_analysis::event::NewsFlashAttemptReceipt) -> bool {
@@ -1614,6 +1496,20 @@ mod tests {
             a.record_evidence().unwrap().content_sha256()
         );
         assert_eq!(capture.records()[1].item_id(), "TEST_CODE_B");
+        assert_eq!(capture.source_refs().len(), 2);
+        assert_eq!(capture.source_refs()[0].provider().as_str(), "Eastmoney");
+        assert_eq!(
+            capture.source_refs()[0].external_id().as_str(),
+            "TEST_CODE_A"
+        );
+        assert_eq!(
+            capture.source_refs()[0].content_sha256().as_str(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            capture.source_times()[0].source_ref_id(),
+            capture.source_refs()[0].source_ref_id()
+        );
         assert_eq!(
             capture.binding().material().sources,
             reservation.audit_sources()
@@ -1707,6 +1603,14 @@ mod tests {
             captured_a.records()[0].canonical_bytes(),
             captured_b.records()[0].canonical_bytes()
         );
+        assert_ne!(
+            captured_a.source_refs()[0].source_ref_id(),
+            captured_b.source_refs()[0].source_ref_id()
+        );
+        assert_ne!(
+            captured_a.canonical_facts().sha256(),
+            captured_b.canonical_facts().sha256()
+        );
     }
 
     #[test]
@@ -1714,7 +1618,7 @@ mod tests {
         let (synthetic, _, mut gate) = n02_legacy_identity_reservation("A");
         assert_eq!(
             synthetic.n02_capture().unwrap_err(),
-            N02CaptureError::RecordEvidence {
+            N02SourceError::RecordEvidence {
                 index: 0,
                 error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
             }
@@ -1735,7 +1639,7 @@ mod tests {
         assert_eq!(retry.reservation_identity_sha256(), identity);
         assert_eq!(
             retry.n02_capture().unwrap_err(),
-            N02CaptureError::RecordEvidence {
+            N02SourceError::RecordEvidence {
                 index: 0,
                 error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
             }
@@ -1769,7 +1673,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             oversized_reservation.n02_capture().unwrap_err(),
-            N02CaptureError::RecordEvidence {
+            N02SourceError::RecordEvidence {
                 index: 0,
                 error: NewsFlashRecordEvidenceError::CanonicalBytesLimitExceeded,
             }
@@ -1814,7 +1718,7 @@ mod tests {
         );
         assert_eq!(
             critical.n02_capture().unwrap_err(),
-            N02CaptureError::Binding(
+            N02SourceError::Binding(
                 stock_analysis::push_foundation::N02BindingError::ReservationMismatch {
                     field: "push_kind"
                 }
@@ -1867,6 +1771,10 @@ mod tests {
         assert_ne!(
             duplicate_capture.records()[0].content_sha256(),
             changed.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            duplicate_capture.source_refs()[0].content_sha256().as_str(),
+            a.record_evidence().unwrap().content_sha256()
         );
 
         let events = ["A", "B", "C", "D"].map(|suffix| {
@@ -1948,12 +1856,12 @@ mod tests {
         reservation.selected_projected.reverse();
         assert_eq!(
             reservation.n02_capture().unwrap_err(),
-            N02CaptureError::EvidenceDigestMismatch
+            N02SourceError::EvidenceDigestMismatch
         );
         reservation.selected_projected.clear();
         assert_eq!(
             reservation.n02_capture().unwrap_err(),
-            N02CaptureError::SelectedCount(0)
+            N02SourceError::SelectedCount(0)
         );
     }
 
