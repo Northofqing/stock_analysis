@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 use super::chain_shadow_input::{self, ChainReportInputObservation};
 use super::modes::{run_chain_analysis_mode_with_observation, ChainDeliveryEnvelope};
@@ -404,13 +405,32 @@ pub async fn run_scheduled_chain_analysis(
     date: NaiveDate,
 ) -> Result<ChainScheduleOutcome> {
     match store.status(phase, date)? {
-        ChainScheduleStatus::Closed => return Ok(ChainScheduleOutcome::AlreadyClosed),
-        ChainScheduleStatus::Uncertain => return Ok(ChainScheduleOutcome::NeedsReview),
+        ChainScheduleStatus::Closed => {
+            log::info!(
+                "[chain_shadow_suppression] phase={} schedule_date={} reason=already_closed coverage=incomplete",
+                phase.as_str(), date
+            );
+            return Ok(ChainScheduleOutcome::AlreadyClosed);
+        }
+        ChainScheduleStatus::Uncertain => {
+            log::info!(
+                "[chain_shadow_suppression] phase={} schedule_date={} reason=uncertain_needs_review coverage=incomplete",
+                phase.as_str(), date
+            );
+            return Ok(ChainScheduleOutcome::NeedsReview);
+        }
         ChainScheduleStatus::Ready => {}
     }
 
+    let observed_now = Local::now().naive_local();
+    if !phase.starts_in_window(date, observed_now) {
+        log::info!(
+            "[chain_shadow_suppression] phase={} schedule_date={} reason=outside_send_window coverage=incomplete",
+            phase.as_str(), date
+        );
+    }
     anyhow::ensure!(
-        phase.starts_in_window(date, Local::now().naive_local()),
+        phase.starts_in_window(date, observed_now),
         "产业链 {} {} 已不在新报告发送窗口，禁止窗口外重新采集并发送",
         phase.as_str(),
         date
@@ -456,6 +476,37 @@ where
         mark()?;
         Ok(ChainScheduleOutcome::WeakAccepted)
     });
+    if let Some(reason) = envelope.suppression {
+        log::info!(
+            "[chain_shadow_suppression] phase={} schedule_date={} reason={} coverage=incomplete",
+            phase.as_str(),
+            date,
+            reason.as_str()
+        );
+    }
+    if let Some(report) = envelope.notification_report.as_ref() {
+        let attempted_targets = report.attempts().len();
+        let visible_targets = report
+            .attempts()
+            .iter()
+            .take(16)
+            .map(|attempt| {
+                format!(
+                    "{}:{}:{:?}",
+                    attempt.channel().name(),
+                    attempt.target_index(),
+                    attempt.outcome()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        log::info!(
+            "[chain_shadow_channel_attempts] phase={} schedule_date={} report_input_sha256={:x} targets={} accepted={} unknown={} completion={:?} first_targets={} omitted_targets={} channel_wire_bytes=unobserved coverage=incomplete",
+            phase.as_str(), date, Sha256::digest(&envelope.report_input), attempted_targets,
+            report.accepted_count(), report.unknown_count(),
+            report.completion(), visible_targets, attempted_targets.saturating_sub(16)
+        );
+    }
     if envelope.send_attempted {
         match observer(
             phase,
