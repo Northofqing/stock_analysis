@@ -1,0 +1,31 @@
+# monitor 的 launchd / Desktop TCC 故障交接（2026-09-28）
+
+## 当前状态与根因
+
+2026-09-28 09:12 CST 的临时单实例是 Terminal 启动的新版 monitor（当时 PID 23247）；`gui/501/com.stockanalysis.monitor` 已 bootout。执行切换前必须重新核对 PID 和 job 状态，不能把该 PID 当成持续有效值。交易时段保持现状，不再试启第二个生产实例。
+
+原 plist 位于 `~/Library/LaunchAgents/com.stockanalysis.monitor.plist`，`ProgramArguments`、`WorkingDirectory` 和 stdout/stderr 均指向 `~/Desktop/Quant/stock_analysis`，`KeepAlive=true`、`ThrottleInterval=60`。多次 launchd 启动旧、新二进制都在进入 `main` 前停住；`/private/tmp/monitor_2026-09-28_091239_n503.sample.txt` 中 PID 22805 的 668 次采样全部停在 dyld `__open`，物理占用仅 56 KiB。独立 `/bin/sh` LaunchAgent 探针报 `getcwd: cannot access parent directories: Operation not permitted`。这不是 gRPC 或 monitor 业务循环错误。
+
+`/usr/bin/log show --style compact --info --start '2026-09-28 09:11:00' --end '2026-09-28 09:13:00' --predicate 'process == "tccd" AND eventMessage CONTAINS[c] "/Users/zhangzhen/Desktop/Quant/stock_analysis/target/release/monitor"'` 的关键证据：
+
+- 09:12:09.614：请求 `kTCCServiceSystemPolicyDesktopFolder`，访问者为 launchd 子进程 PID 22805。
+- 09:12:09.611、09:12:09.838：`SecStaticCodeCheckValidity ... status: -67050`，随后 `Failed to match existing code requirement`；日志列出两个 `cdhash`，但不据此推断哪个属于当前文件。
+- 09:12:09.839：`Auth Right: Unknown (None)`，随后 `Delaying prompt`。09:07 重启用户 tccd 后，普通 Desktop 访问恢复，此 launchd 请求仍重现。
+
+本机 `codesign -dv` 显示 monitor 未签名，`security find-identity -p codesigning -v` 显示 0 个有效身份。结论是当前 launchd 进程没有匹配的 Desktop TCC 授权，后台提示未完成；普通 POSIX 文件权限和文件存在性不足以解决它。Apple 文档确认 [Desktop 属于受保护文件夹](https://support.apple.com/en-gb/guide/mac-help/-mchld5a35146/mac)，[代码签名要求用于判断跨版本代码身份](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
+
+## 盘后迁移到 Desktop 外的运行根
+
+推荐真实目录 `/Users/zhangzhen/.local/share/stock-analysis-runtime`，不得用指回 Desktop 的符号链接。先保留旧 plist、二进制及数据快照，并记录 SHA-256。仓库整体约 135 GiB；运行所需 `data/` 约 22 GiB，不能把整个仓库直接视作部署包。
+
+1. 在 Desktop 外准备同一版本的构建源和运行根：`src/`、`config/`、`Cargo.toml`、`Cargo.lock`、`build.rs`、`contracts/`、Cargo 构建所需文件、经 manifest 校验的公开 `client-bundle/` 文件、release `monitor`、`.env`、`data/`、`reports/`、新 `logs/`。`config/selection/selection_activation.v1.json` 必须随同版配置复制。根和凭据目录限本机用户访问，`.env` 与密钥文件为 0600；不把凭据提交到 Git。初次迁移先完整保留 `data/` 的生产 DB、WAL、审计、投递、锁和证据，不凭文件名猜测哪些历史记录可删。
+2. 从 Desktop 外的源码目录构建，并在构建时设置 `STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT=/Users/zhangzhen/.local/share/stock-analysis-runtime`。`src/production_root.rs` 将生产 DB、审计和锁绑定到这个**编译期**绝对路径；改运行时环境或 plist 的 `WorkingDirectory` 不会改该身份。构建目录也应在 Desktop 外，因为 `root_for_mode(true)` 使用编译时的 `CARGO_MANIFEST_DIR`，否则 shadow `--test` 仍会访问 Desktop。源码与配置应保持真实目录、同版字节；activation 会扫描 `src/`、`config/`、Cargo 清单和 `build.rs`。
+3. 新 `.env` 中的 `GRPC_MARKET_CLIENT_BUNDLE` 当前指向 Desktop：将其认证文件完整移至受限的非 Desktop 目录，更新路径并验证 mTLS/Health。MagicLaw 的默认 binary/home 也在 `$HOME/Desktop/magiclaw`（`src/bin/monitor/notify.rs`）；盘后同时准备非 Desktop 的 MagicLaw binary/home 与凭据，设置并验证 `MAGICLAW_BIN`、`MAGICLAW_HOME`，否则推送服务重启时仍会触碰受保护路径。`WECHAT_SEND_SCRIPT` 为死配置，不把它当作实际推送路径。
+4. 旧 monitor 运行期间可以预拷静态文件与数据，但预拷的活动 SQLite 文件不能作为一致快照。盘后先停止旧 PID，并确认它及相关数据库写者退出，再最终同步 `data/` 和 WAL/SHM 侧文件；使用 SQLite 备份/完整性检查核实数据库，核对审计水位、文件身份与配置摘要。新旧运行根的单实例锁是不同文件，**不能依赖锁防止两实例重叠**。
+5. 正式切换前，在非 Desktop 构建的制品上用独立标签、无 KeepAlive 的 shadow LaunchAgent 运行 `monitor --test --push-dry-run`，stdout/stderr 放在新根，确认 dyld 已进入程序、测试命名空间隔离、生产目录无写入。关闭 shadow job 后，确认旧 PID 已退出并完成最终同步，安装指向新根 binary、工作目录和日志路径的正式 plist；按仓库部署规则 `launchctl load -w`，只启动一个生产实例。检查新 PID、`cwd`、二进制 SHA、生产 DB/锁/审计根、启动对账、gRPC Health 和实际投递回执；不以进程存在作为完成验收。
+
+**切换阻断项：路径审查未完成。** 已核对的 `selection/activation_gate.rs:165`、`selection/audit.rs:1800` 和 `monitor/notify.rs:3719` 的 `CARGO_MANIFEST_DIR` 使用位于测试代码；`durable_delivery/model.rs:165`、`event/dispatcher.rs:323,1156` 和 `monitor/br196_transport.rs:193` 在可编译运行路径中仍直接使用构建根，分别用于测试命名空间或非生产验收。因此必须从 Desktop 外构建，并在切换前穷举审查其余 `CARGO_MANIFEST_DIR`、硬编码 Desktop、`.env` 外部绝对路径及派生子进程的工作目录。若任何**生产**读写或执行仍解析到 Desktop，迁移验收应停止，先改路径并复验；不能仅凭 production_root 和数据复制宣称迁移完成。
+
+## 回退边界
+
+若新 launchd 无法启动，先卸载新 job 并确认其 PID 退出。优先用**同一个新运行根和同一份新数据**的 Terminal 启动方式恢复单实例，这样保留切换后已经提交的状态。只有确认新根没有生产写入，或已完成人工数据/投递对账，才能切回旧根的数据库与旧二进制；不得直接覆盖数据库、重放不确定投递或同时启动两根的 monitor。原 Terminal 路径是当前已实测可启动的临时回退路径，原 Desktop launchd plist 仍受 TCC 阻塞，不能把重新 load 旧 plist 视为有效回退。
