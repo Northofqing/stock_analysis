@@ -29,7 +29,7 @@
 | --- | --- | --- |
 | #1 模拟盘逐笔成本 | 部分修复，费率口径待升级 | `src/performance/fee_evidence.rs`、`src/trading/paper_sell.rs` 已按 FIFO 分摊买费并输出净收益；但 2026 年模型仍按卖出印花税千一，现行口径为万分之五。`lot-rates-v1` 与旧事件不能原地改写，见 [费用 ADR](../adr/0001-versioned-a-share-fee-schedule.md)。 |
 | #2 回填/回测同成本 | 部分修复 | `position_tracker.rs` 使用 `fee_evidence`；`edc0f144` 去掉 `strategy/core.rs` realistic 包装层已不起作用的买卖费调整（基础 `buy`/`sell` 原本已收费，旧代码未造成实际二次扣费）。旧 v1 口径下 100 股 10 元零滑点往返净现金 `-11` 元与 `fee_evidence` 一致，定向 8 个 realistic/qualified 测试通过。尚未形成共享 FillModel、按成交日的现行税率 parity 或生产证据。 |
-| #3 DB 初始化/测试隔离 | 代码已修，测试稳态待核 | `DatabaseManager::init` 在非测试模式尊重显式路径，测试模式拒绝显式路径并提供隔离入口；仍需定向验证原 flaky 家族。 |
+| #3 DB 初始化/测试隔离 | 代码已修，原 flaky 家族稳态待核 | `DatabaseManager::init` 在非测试模式尊重显式路径，测试模式拒绝显式路径并提供隔离入口。2026-09-29 定向 `database::tests::explicit_test_database_paths_are_isolated_instead_of_remapped` 1/1 通过，证明显式路径不能被共享单例吞掉，两个独立测试库的写入互不串扰；尚未覆盖原 23–28 个顺序相关 flaky 用例的并行稳态。 |
 | #4 NewsAI counted binding | 代码已修，生产送达待核 | `notify.rs` 的 `NewsAiAnalysis` 走 counted 准入和专用审计；补机器目录及真实 receipt。 |
 | #5 NewsAI 批次重复身份 | v3 路径已修，旧记录待核 | `news_ai.rs` 有 `NewsAiIdentityV3` 和恢复 envelope；旧版本兼容/重复计数及生产结果待核。 |
 | #6 Gateway 错误归类 | 关键已知码已修，穷举未完成 | `raw_v2.rs::classify_gateway_error` 已单列 route exhausted/stopped、source precondition、external transport 等，仍保留未知码 fallback；需从当前失败样本验证原始 retryable 保真。 |
