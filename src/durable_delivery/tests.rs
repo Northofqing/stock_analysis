@@ -7879,6 +7879,19 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
         .expect("valid producer edge can be recorded later");
     assert!(connection
         .execute(
+            insert,
+            params![
+                "c".repeat(64),
+                candidate.decision_identity,
+                "p01-scheduled",
+                "p01:2026-08-18",
+                "Origin",
+                "2026-08-18T03:00:01Z"
+            ],
+        )
+        .is_err(), "one immutable tuple cannot be recorded under two observation IDs");
+    assert!(connection
+        .execute(
             "UPDATE delivery_correlation_observations SET role='Resume'",
             []
         )
@@ -7925,6 +7938,91 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
             ],
         )
         .is_err());
+
+    let hidden_suffix_cases = [
+        (
+            "observation identity",
+            format!("{}\0SECRET", "d".repeat(64)),
+            "p01-scheduled",
+            "p01:2026-08-18",
+            "Resume",
+            "2026-08-18T03:00:00Z",
+        ),
+        (
+            "producer",
+            "e".repeat(64),
+            "p01-scheduled\0SECRET",
+            "p01:2026-08-18",
+            "Resume",
+            "2026-08-18T03:00:00Z",
+        ),
+        (
+            "occurrence",
+            "f".repeat(64),
+            "p01-scheduled",
+            "p01:2026-08-18\0SECRET",
+            "Resume",
+            "2026-08-18T03:00:00Z",
+        ),
+        (
+            "timestamp",
+            "g".repeat(64),
+            "p01-scheduled",
+            "p01:2026-08-18",
+            "Resume",
+            "2026-08-18T03:00:00Z\0SECRET",
+        ),
+    ];
+    for (field, id, producer, occurrence, role, observed_at) in hidden_suffix_cases {
+        assert!(
+            connection
+                .execute(
+                    insert,
+                    params![
+                        id,
+                        candidate.decision_identity,
+                        producer,
+                        occurrence,
+                        role,
+                        observed_at
+                    ],
+                )
+                .is_err(),
+            "embedded NUL in {field} must be rejected"
+        );
+    }
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![
+                    b"hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh".to_vec(),
+                    candidate.decision_identity,
+                    "p01-scheduled",
+                    "p01:2026-08-18",
+                    "Resume",
+                    "2026-08-18T03:00:00Z"
+                ],
+            )
+            .is_err(),
+        "a BLOB with valid-looking bytes is not a text observation identity"
+    );
+    assert!(
+        connection
+            .execute(
+                insert,
+                params![
+                    "h".repeat(64),
+                    candidate.decision_identity,
+                    b"p01-scheduled".to_vec(),
+                    "p01:2026-08-18",
+                    "Resume",
+                    "2026-08-18T03:00:00Z"
+                ],
+            )
+            .is_err(),
+        "a BLOB producer ID cannot satisfy text validation"
+    );
 }
 
 #[test]

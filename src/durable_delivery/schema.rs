@@ -338,18 +338,31 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
         -- intentionally have no inferred producer observation after v9 -> v10.
         CREATE TABLE IF NOT EXISTS delivery_correlation_observations(
           observation_identity TEXT NOT NULL PRIMARY KEY
-            CHECK(length(observation_identity)=64
+            CHECK(typeof(observation_identity)='text'
+              AND instr(observation_identity,char(0))=0
+              AND length(CAST(observation_identity AS BLOB))=64
               AND observation_identity NOT GLOB '*[^0-9a-f]*'),
           identity_version INTEGER NOT NULL CHECK(identity_version=1),
-          decision_identity TEXT NOT NULL REFERENCES delivery_decisions(decision_identity),
+          decision_identity TEXT NOT NULL REFERENCES delivery_decisions(decision_identity)
+            CHECK(typeof(decision_identity)='text'
+              AND instr(decision_identity,char(0))=0),
           producer_id TEXT NOT NULL
-            CHECK(length(producer_id) BETWEEN 1 AND 96
+            CHECK(typeof(producer_id)='text'
+              AND instr(producer_id,char(0))=0
+              AND length(CAST(producer_id AS BLOB)) BETWEEN 1 AND 96
               AND producer_id NOT GLOB '*[^a-z0-9-]*'),
           occurrence_identity TEXT NOT NULL
-            CHECK(length(occurrence_identity) BETWEEN 1 AND 160
+            CHECK(typeof(occurrence_identity)='text'
+              AND instr(occurrence_identity,char(0))=0
+              AND length(CAST(occurrence_identity AS BLOB)) BETWEEN 1 AND 160
               AND occurrence_identity NOT GLOB '*[^a-z0-9:_-]*'),
-          role TEXT NOT NULL CHECK(role IN ('Origin','Resume','Recovery')),
-          observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 20 AND 35)
+          role TEXT NOT NULL CHECK(typeof(role)='text'
+            AND instr(role,char(0))=0
+            AND role IN ('Origin','Resume','Recovery')),
+          observed_at TEXT NOT NULL CHECK(typeof(observed_at)='text'
+            AND instr(observed_at,char(0))=0
+            AND length(CAST(observed_at AS BLOB)) BETWEEN 20 AND 35),
+          UNIQUE(decision_identity,producer_id,occurrence_identity,role,identity_version)
         );
 
         CREATE INDEX IF NOT EXISTS idx_delivery_correlation_decision_order
