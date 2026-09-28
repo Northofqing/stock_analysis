@@ -4670,6 +4670,8 @@ struct RealCandidateBatch {
     statistics_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
 }
 
+mod p05_source_cohort;
+
 #[derive(Debug, Clone, PartialEq)]
 struct CandidateStatisticsRow {
     code: String,
