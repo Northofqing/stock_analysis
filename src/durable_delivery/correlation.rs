@@ -10,13 +10,13 @@ pub(crate) const OBSERVATION_ROLE_ORIGIN: &str = "Origin";
 /// The only producer labels accepted by the first correlation slice.
 /// The monitor must separately verify catalog membership at its own call site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum P01OriginProducer {
+pub enum P01OriginProducer {
     Scheduled,
     Compensation,
 }
 
 impl P01OriginProducer {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Scheduled => "p01-scheduled",
             Self::Compensation => "p01-compensation",

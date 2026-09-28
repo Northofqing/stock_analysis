@@ -1,5 +1,6 @@
 use super::correlation::{
-    CorrelationObservationV1, OBSERVATION_IDENTITY_VERSION, OBSERVATION_ROLE_ORIGIN,
+    CorrelationObservationV1, P01OriginProducer, OBSERVATION_IDENTITY_VERSION,
+    OBSERVATION_ROLE_ORIGIN,
 };
 use super::model::{
     compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
@@ -2890,9 +2891,32 @@ impl DurableDeliveryCoordinator {
         self.prepare_internal(envelope, authoritative_sink_count, admission_at, None)
     }
 
+    /// The monitor verifies producer catalog membership and the full P01 input
+    /// binding. This public boundary verifies immutable source metadata needed
+    /// to keep an Origin consistent with that single rendered decision; it is
+    /// not a substitute for the monitor's full P01 source validation.
+    pub fn prepare_p01_origin(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        producer: P01OriginProducer,
+    ) -> Result<PrepareOutcome> {
+        validate_public_p01_origin_source(envelope, producer)?;
+        let observation = CorrelationObservationV1::p01_origin(
+            producer,
+            envelope.schedule_occurrence_identity.clone(),
+        )?;
+        self.prepare_with_origin_observation(
+            envelope,
+            authoritative_sink_count,
+            admission_at,
+            &observation,
+        )
+    }
+
     /// Record the first P01 Origin edge in the same transaction as prepare.
-    /// This entrypoint has no production caller until the producer binding is
-    /// validated and wired by the monitor.
+    /// The crate-only test seam intentionally accepts a synthetic source binding.
     pub(crate) fn prepare_with_origin_observation(
         &self,
         envelope: &DeliveryEnvelope,
@@ -8413,6 +8437,57 @@ fn p01_source_binding_mode(
         ));
     }
     Ok(mode.map(str::to_owned))
+}
+
+fn validate_public_p01_origin_source(
+    envelope: &DeliveryEnvelope,
+    producer: P01OriginProducer,
+) -> Result<()> {
+    let invalid = || {
+        DurableDeliveryError::InvalidEnvelope(
+            "P01 Origin producer/source binding mismatch".to_owned(),
+        )
+    };
+    let source_sha256 = sha256_hex(&envelope.source_binding_canonical);
+    let rendered_sha256 = sha256_hex(&envelope.rendered_content);
+    let expected_mode = match producer {
+        P01OriginProducer::Scheduled => "Scheduled",
+        P01OriginProducer::Compensation => "Compensation",
+    };
+    if envelope.push_kind != PushKind::PreopenNewsHot
+        || envelope.sub_kind != super::model::DeliverySubKind::None
+        || envelope.cooldown_scope != super::model::CooldownScope::Global
+        || envelope.scope_key != "GLOBAL"
+        || envelope.schedule_occurrence_identity != format!("p01:{}", envelope.business_date)
+        || envelope.source_binding_sha256 != source_sha256
+        || envelope.source_evidence_fingerprint != source_sha256
+        || envelope.rendered_content_sha256 != rendered_sha256
+        || envelope.retry_authorized
+        || envelope.task_binding.is_some()
+    {
+        return Err(invalid());
+    }
+    let actual_mode =
+        p01_source_binding_mode(envelope.push_kind, &envelope.source_binding_canonical)?;
+    let source: serde_json::Value =
+        serde_json::from_slice(&envelope.source_binding_canonical).map_err(|_| invalid())?;
+    if actual_mode.as_deref() != Some(expected_mode)
+        || source
+            .get("business_date")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.business_date.as_str())
+        || source
+            .get("schedule_occurrence_identity")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.schedule_occurrence_identity.as_str())
+        || source
+            .get("rendered_content_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(rendered_sha256.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn replay_push_kind(review_task: &str) -> Result<super::model::PushKind> {

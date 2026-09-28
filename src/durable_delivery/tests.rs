@@ -4,6 +4,7 @@ use super::coordinator::{
     DatabaseOperationTestPhase, DeliveredPrecommitTestFault, OpenFileDescriptionProof,
     OperationPostvalidationTestFault, ProcessDescriptorSnapshotTestFault,
 };
+use super::correlation::CorrelationObservationV1;
 use super::model::sha256_hex;
 use super::*;
 use chrono::{DateTime, TimeZone, Utc};
@@ -8048,6 +8049,119 @@ fn m0_p01_origin_envelope(label: &str, business_date: &str, render_mode: &str) -
         None,
     )
     .expect("construct P01 origin envelope")
+}
+
+fn m0_p01_public_origin_envelope(
+    label: &str,
+    render_mode: &str,
+    source_date: &str,
+    source_occurrence: &str,
+) -> DeliveryEnvelope {
+    let business_date = "2026-08-18";
+    let rendered = format!("TEST_CODE_M0_PUBLIC_RENDERED_{label}").into_bytes();
+    let source = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "P01_SOURCE_BINDING_V1",
+        "render_mode": render_mode,
+        "business_date": source_date,
+        "schedule_occurrence_identity": source_occurrence,
+        "rendered_content_sha256": sha256_hex(&rendered),
+    }))
+    .unwrap();
+    let source_sha256 = sha256_hex(&source);
+    DeliveryEnvelope::new(
+        business_date,
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "GLOBAL",
+        format!("p01:{business_date}"),
+        source_sha256,
+        source,
+        format!("TEST_CODE_M0_PUBLIC_SUBJECT_{label}"),
+        rendered,
+        false,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn m0_p01_public_prepare_rejects_source_mode_date_occurrence_and_sha_mismatch() {
+    let fixture = Fixture::new("M0_PUBLIC_P01_ORIGIN_SOURCE_VALIDATION");
+    for (label, mode, source_date, source_occurrence) in [
+        ("WRONG_MODE", "Compensation", "2026-08-18", "p01:2026-08-18"),
+        ("WRONG_DATE", "Scheduled", "2026-08-17", "p01:2026-08-18"),
+        (
+            "WRONG_OCCURRENCE",
+            "Scheduled",
+            "2026-08-18",
+            "p01:2026-08-17",
+        ),
+    ] {
+        let candidate = m0_p01_public_origin_envelope(label, mode, source_date, source_occurrence);
+        assert!(
+            fixture
+                .coordinator
+                .prepare_p01_origin(&candidate, 1, now(), P01OriginProducer::Scheduled)
+                .is_err(),
+            "label={label}"
+        );
+    }
+    let valid = m0_p01_public_origin_envelope("VALID", "Scheduled", "2026-08-18", "p01:2026-08-18");
+    let mut forged_source_sha = valid.clone();
+    forged_source_sha.source_evidence_fingerprint = "0".repeat(64);
+    assert!(fixture
+        .coordinator
+        .prepare_p01_origin(&forged_source_sha, 1, now(), P01OriginProducer::Scheduled)
+        .is_err());
+    let mut forged_scope = valid.clone();
+    forged_scope.scope_key = "TEST_CODE_NOT_GLOBAL".to_owned();
+    assert!(fixture
+        .coordinator
+        .prepare_p01_origin(&forged_scope, 1, now(), P01OriginProducer::Scheduled)
+        .is_err());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        0
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        0
+    );
+    fixture
+        .coordinator
+        .prepare_p01_origin(&valid, 1, now(), P01OriginProducer::Scheduled)
+        .expect("public P01 entry accepts exact scheduled source metadata");
+    assert!(
+        fixture
+            .coordinator
+            .prepare_p01_origin(&valid, 1, now(), P01OriginProducer::Compensation)
+            .is_err(),
+        "one immutable Scheduled decision cannot acquire a Compensation Origin"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        1
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        1
+    );
+
+    let compensation_fixture = Fixture::new("M0_PUBLIC_P01_COMPENSATION_SOURCE_VALIDATION");
+    let compensation = m0_p01_public_origin_envelope(
+        "COMPENSATION",
+        "Compensation",
+        "2026-08-18",
+        "p01:2026-08-18",
+    );
+    compensation_fixture
+        .coordinator
+        .prepare_p01_origin(&compensation, 1, now(), P01OriginProducer::Compensation)
+        .expect("public P01 entry accepts exact compensation source metadata");
+    assert_eq!(
+        compensation_fixture.query_i64("SELECT COUNT(*) FROM delivery_correlation_observations"),
+        1
+    );
 }
 
 #[test]

@@ -11,7 +11,7 @@ mod model;
 mod schema;
 
 pub use coordinator::DurableDeliveryCoordinator;
-pub(crate) use correlation::{CorrelationObservationV1, P01OriginProducer};
+pub use correlation::P01OriginProducer;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,
