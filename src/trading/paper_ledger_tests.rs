@@ -1965,10 +1965,13 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
         assert_eq!(view.lots[0].quantity, 100);
         assert_eq!(view.lots[0].buy_fee_remaining, Money::from_cny(5.0).unwrap());
         assert_eq!(FEE_MODEL, "lot-rates-v1");
-        let rejected = diesel::sql_query("UPDATE paper_ledger_account SET fee_model='lot-rates-v2' WHERE account_id=?")
+        let rejected = diesel::sql_query("INSERT INTO paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes,money_model,fee_model) SELECT 'TEST_CODE_V1_GOLDEN_REJECT_V2','TEST_CODE_V1_GOLDEN_REJECT_V2_EPOCH',manifest_hash,manifest_bytes,money_model,'lot-rates-v2' FROM paper_ledger_account WHERE account_id=?")
             .bind::<diesel::sql_types::Text, _>(&binding.account_id)
             .execute(&mut db.get_conn().unwrap());
-        assert!(rejected.is_err(), "v1 schema must reject a v2 fee identity");
+        assert!(
+            matches!(&rejected, Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, info)) if info.message().contains("fee_model")),
+            "v1 fee_model CHECK must reject a v2 identity: {rejected:?}"
+        );
         ((buy_one, buy_two, sell), [seeded.event_hash, bought_one.event_hash, bought_two.event_hash, sold.event_hash], report)
     };
     let db = DatabaseManager::open_isolated_for_test(path).unwrap();
