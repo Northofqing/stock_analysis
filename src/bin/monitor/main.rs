@@ -1889,10 +1889,14 @@ fn store_banner(
     let mut times = HEALTH_SNAPSHOT_WRITE_LOCK
         .lock()
         .map_err(|_| "health snapshot write lock poisoned".to_string())?;
-    times.apply(evaluation);
-    *LATEST_BANNER
-        .lock()
-        .map_err(|_| "latest banner lock poisoned".to_string())? = Some(banner.clone());
+    let banner = {
+        let mut latest = LATEST_BANNER
+            .lock()
+            .map_err(|_| "latest banner lock poisoned".to_string())?;
+        let merged = times.merge_banner(latest.as_ref(), banner, evaluation);
+        *latest = Some(merged.clone());
+        merged
+    };
     let owner = match HEALTH_SNAPSHOT_OWNER.lock() {
         Ok(owner) => owner.clone(),
         Err(_) => {

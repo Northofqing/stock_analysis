@@ -116,18 +116,69 @@ pub enum EvaluationUpdate {
 }
 
 impl EvaluationTimes {
-    pub fn apply(&mut self, update: EvaluationUpdate) {
+    fn accepts(current: Option<DateTime<Utc>>, incoming: DateTime<Utc>) -> bool {
+        current.is_none_or(|at| incoming >= at)
+    }
+
+    pub fn apply(&mut self, update: EvaluationUpdate) -> (bool, bool) {
         match update {
             EvaluationUpdate::AccountAndData {
                 account_at,
                 data_at,
             } => {
-                self.account_evaluated_at = Some(account_at);
-                self.data_evaluated_at = Some(data_at);
+                let account = Self::accepts(self.account_evaluated_at, account_at);
+                let data = Self::accepts(self.data_evaluated_at, data_at);
+                if account {
+                    self.account_evaluated_at = Some(account_at);
+                }
+                if data {
+                    self.data_evaluated_at = Some(data_at);
+                }
+                (account, data)
             }
-            EvaluationUpdate::Data(at) => self.data_evaluated_at = Some(at),
-            EvaluationUpdate::Synthetic => *self = Self::default(),
+            EvaluationUpdate::Data(at) => {
+                let data = Self::accepts(self.data_evaluated_at, at);
+                if data {
+                    self.data_evaluated_at = Some(at);
+                }
+                (false, data)
+            }
+            EvaluationUpdate::Synthetic => {
+                *self = Self::default();
+                (true, true)
+            }
         }
+    }
+
+    /// Called under the banner write lock. Each owner contributes its values
+    /// only when its evaluation time is accepted, so evidence and mode cannot
+    /// come from different evaluation batches.
+    pub fn merge_banner(
+        &mut self,
+        current: Option<&crate::push_templates::BannerCtx>,
+        incoming: crate::push_templates::BannerCtx,
+        update: EvaluationUpdate,
+    ) -> crate::push_templates::BannerCtx {
+        let (account, data) = self.apply(update);
+        if matches!(update, EvaluationUpdate::Synthetic) {
+            return incoming;
+        }
+        let Some(current) = current else {
+            return incoming;
+        };
+        let mut merged = current.clone();
+        if account {
+            merged.account_mode = incoming.account_mode;
+            merged.total_pos = incoming.total_pos;
+            merged.today_pnl = incoming.today_pnl;
+            merged.account_metrics_complete = incoming.account_metrics_complete;
+            merged.account_fact = incoming.account_fact;
+        }
+        if data {
+            merged.data_mode = incoming.data_mode;
+            merged.data_missing_note = incoming.data_missing_note;
+        }
+        merged
     }
 }
 
@@ -603,6 +654,96 @@ mod tests {
         write_banner_snapshot_at(&path, "123:456:1", &banner, times, hour_later).unwrap();
         assert_eq!(read_snapshot_at(&path).unwrap().account_evaluated_at, None);
         assert_eq!(read_snapshot_at(&path).unwrap().data_evaluated_at, None);
+    }
+
+    #[test]
+    fn out_of_order_evaluations_keep_each_owners_values_with_its_time() {
+        use crate::push_templates::{AccountMode, BannerCtx, DataMode};
+        let root = tempfile::tempdir().unwrap();
+        let path = snapshot_path(root.path(), false);
+        let t0 = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + Duration::minutes(1);
+        let t2 = t0 + Duration::minutes(2);
+        let t3 = t0 + Duration::minutes(3);
+        let t4 = t0 + Duration::minutes(4);
+        let t5 = t0 + Duration::minutes(5);
+        let old = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
+            account_metrics_complete: true,
+            account_fact: None,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let mut newer = old.clone();
+        newer.account_mode = AccountMode::Frozen;
+        newer.total_pos = Some(8);
+        newer.data_mode = DataMode::Degraded;
+        newer.data_missing_note = Some("Quote".to_owned());
+        let mut times = EvaluationTimes::default();
+        let mut banner = times.merge_banner(
+            None,
+            old.clone(),
+            EvaluationUpdate::AccountAndData {
+                account_at: t0,
+                data_at: t0,
+            },
+        );
+        banner = times.merge_banner(
+            Some(&banner),
+            newer,
+            EvaluationUpdate::AccountAndData {
+                account_at: t3,
+                data_at: t1,
+            },
+        );
+        banner = times.merge_banner(
+            Some(&banner),
+            old.clone(),
+            EvaluationUpdate::AccountAndData {
+                account_at: t0,
+                data_at: t0,
+            },
+        );
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, t3).unwrap();
+        let saved = read_snapshot_at(&path).unwrap();
+        assert_eq!(saved.account_evaluated_at, Some(t3));
+        assert_eq!(saved.data_evaluated_at, Some(t1));
+        assert_eq!(saved.account_mode, "Frozen");
+        assert_eq!(saved.data_mode, "Degraded");
+        assert_eq!(banner.total_pos, Some(8));
+
+        // DataMode started from the old banner before the newer account commit.
+        let mut stale_read = old.clone();
+        stale_read.data_mode = DataMode::Unsafe;
+        banner = times.merge_banner(Some(&banner), stale_read, EvaluationUpdate::Data(t4));
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, t4).unwrap();
+        let saved = read_snapshot_at(&path).unwrap();
+        assert_eq!(saved.account_evaluated_at, Some(t3));
+        assert_eq!(saved.data_evaluated_at, Some(t4));
+        assert_eq!(saved.account_mode, "Frozen");
+        assert_eq!(saved.data_mode, "Unsafe");
+        assert_eq!(banner.total_pos, Some(8));
+
+        // A newer account evaluation may bring an older data result; data stays Unsafe.
+        banner = times.merge_banner(
+            Some(&banner),
+            old,
+            EvaluationUpdate::AccountAndData {
+                account_at: t5,
+                data_at: t2,
+            },
+        );
+        write_banner_snapshot_at(&path, "123:456:1", &banner, times, t5).unwrap();
+        let saved = read_snapshot_at(&path).unwrap();
+        assert_eq!(saved.account_evaluated_at, Some(t5));
+        assert_eq!(saved.data_evaluated_at, Some(t4));
+        assert_eq!(saved.account_mode, "Normal");
+        assert_eq!(saved.data_mode, "Unsafe");
+        assert_eq!(banner.total_pos, Some(0));
     }
 
     #[test]
