@@ -29,3 +29,11 @@
 ## 回退边界
 
 若新 launchd 无法启动，先卸载新 job 并确认其 PID 退出。优先用**同一个新运行根和同一份新数据**的 Terminal 启动方式恢复单实例，这样保留切换后已经提交的状态。只有确认新根没有生产写入，或已完成人工数据/投递对账，才能切回旧根的数据库与旧二进制；不得直接覆盖数据库、重放不确定投递或同时启动两根的 monitor。原 Terminal 路径是当前已实测可启动的临时回退路径，原 Desktop launchd plist 仍受 TCC 阻塞，不能把重新 load 旧 plist 视为有效回退。
+
+## 10:53 CST 预检进度（正式切换仍待完成）
+
+- 新真实目录为 `/Users/zhangzhen/.local/share/stock-analysis-runtime`，权限 0700；原样复制同版 `src/config/contracts/Cargo` 输入、公开 `client-bundle`、本机 `.env`、MagicLaw 与报告。新 `.env` 只更新 gRPC bundle、MagicLaw bin/home 路径并移除源码不读取的 `WECHAT_SEND_SCRIPT`；两份 `.env` 及私钥为 0600。公开 bundle 清单 9/9 匹配，MagicLaw 二进制与旧版 SHA-256 同为 `16024d290ee302ffe1872db1e8b26e95d0b5f43f451510a1da38910300fcf213`。
+- 从新目录 `cargo build --locked --offline --release -j 2 --bin monitor --bin grpc_bundle_probe` 成功；新 monitor SHA-256 `2704c32f505f168c6f61dacce879c9db282df9eb3990622f3d8d96b36eeb6219`，probe SHA-256 `c2a3f86b3e5749036e2752ea01cceb89f1eff064e2aa7b0a631e0a60ba6cc2d9`。另构建 `selection_activation_prepare` 成功。构建期源码与本仓 `src/` 字节一致；待停旧后生成新 activation，不能使用原文件的旧 hash。
+- 新 probe 的 R-08 真实查询退出 0：Health identity matched，2026-09 四条 `Planned` 均 `ADMITTED`，`confirmed_delivery=false`。`--opening` 退出 0，九条静态路由中八条 ready；Eastmoney `Unadmitted` 的真实原因现为 `source_precondition_failed`，本仓诊断修复见 `d9f80181`，上游故障未关闭。
+- 临时 shadow LaunchAgent 使用新二进制、新工作目录与日志、`--test --push-dry-run`、无 KeepAlive；已运行一次并以 exit code 0 退出。日志确认 `bound root mode=test` 为新目录、核心库在独立 `TEST_CODE` 临时目录、`external_process_attempted=0` 和 `receipt_audit_appended=0`，随后已 bootout。证明 launchd 可从 Desktop 外进入程序并完成隔离 dry-run；不代表生产主库已迁移。
+- 限速预拷在读取活动 `stock_analysis.db` 时返回 `unexpected end of file`，目标未生成该主库；跳过主库及其 WAL/SHM 后其余数据预拷退出 0。**目标 `data/` 尚非一致生产快照**。正式切换必须在旧 PID 退出、其他写者核清后完整无排除同步并检查数据库；不得因 shadow 成功提前启动第二个生产进程。
