@@ -32,6 +32,15 @@ REQUIRED_COLUMNS = {
         "late_after_fence",
     },
 }
+CORRELATION_COLUMNS = {
+    "observation_identity",
+    "identity_version",
+    "decision_identity",
+    "producer_id",
+    "occurrence_identity",
+    "role",
+    "observed_at",
+}
 
 
 def _date(value: str) -> dt.date:
@@ -123,14 +132,14 @@ def _catalog_rows(root: Path) -> tuple[list[dict], str, str]:
     return rows, catalog_hash, delta_hash
 
 
-def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> list[dict]:
+def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> tuple[int, list[dict]]:
     uri = durable_db.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as connection:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version != 9:
+            if version not in (9, 10):
                 raise ValueError(f"unsupported durable-delivery schema version {version}")
             for table, required in REQUIRED_COLUMNS.items():
                 table_type = connection.execute(
@@ -141,6 +150,21 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> list[dict]:
                 }
                 if table_type != ("table",) or not required <= columns:
                     raise ValueError(f"missing durable-delivery columns in {table}")
+            if version == 10:
+                table = "delivery_correlation_observations"
+                table_type = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE name=?", (table,)
+                ).fetchone()
+                columns = {
+                    row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if table_type != ("table",) or not CORRELATION_COLUMNS <= columns:
+                    raise ValueError("missing durable-delivery columns in correlation sidecar")
+                observed = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if observed:
+                    raise ValueError(
+                        "v10 correlation observations require a Unit attribution report"
+                    )
             rows = connection.execute(
                 """
                 SELECT d.business_date, d.push_kind, d.state,
@@ -166,7 +190,7 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> list[dict]:
             ).fetchall()
         finally:
             connection.rollback()
-    return [
+    return version, [
         {
             "business_date": day,
             "push_kind": kind,
@@ -180,7 +204,7 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str) -> list[dict]:
 
 
 def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> dict:
-    """Return logically read-only counts from an isolated stable v9 snapshot.
+    """Return logically read-only counts from an isolated stable v9 or empty-v10 snapshot.
 
     The caller must supply a fixture or controlled snapshot, not a live
     production WAL path. WAL sidecar creation is possible despite mode=ro and
@@ -189,11 +213,11 @@ def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> 
     if _date(from_date) > _date(to_date):
         raise ValueError("from_date must not exceed to_date")
     units, catalog_hash, delta_hash = _catalog_rows(root.resolve())
-    candidates = _kind_counts(durable_db, from_date, to_date)
+    schema_version, candidates = _kind_counts(durable_db, from_date, to_date)
     return {
         "catalog_sha256": catalog_hash,
         "delta_sha256": delta_hash,
-        "schema_version": 9,
+        "schema_version": schema_version,
         "from_date": from_date,
         "to_date": to_date,
         "units": units,
@@ -201,6 +225,7 @@ def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> 
         "scope": (
             "Kind counts are durable sink result candidates, not manual acceptance. "
             "They do not identify a producer or Unit, prove external receipt, "
-            "or prove business finalization."
+            "or prove business finalization. V10 is accepted only when its "
+            "correlation sidecar is empty."
         ),
     }

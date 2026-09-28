@@ -1,4 +1,4 @@
-"""Focused query-shape tests; this fixture is not the full production v9 schema."""
+"""Focused query-shape tests; fixtures are not the full production schema."""
 
 import json
 from contextlib import closing
@@ -158,6 +158,47 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
                 );
                 """
             )
+        with self.assertRaisesRegex(ValueError, "missing durable-delivery columns"):
+            self.report()
+
+    def test_v10_empty_sidecar_is_unattributed_and_nonempty_sidecar_fails_closed(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executescript(
+                """
+                PRAGMA user_version=10;
+                CREATE TABLE delivery_correlation_observations (
+                    observation_identity TEXT,
+                    identity_version INTEGER,
+                    decision_identity TEXT,
+                    producer_id TEXT,
+                    occurrence_identity TEXT,
+                    role TEXT,
+                    observed_at TEXT
+                );
+                """
+            )
+        report = self.report()
+        self.assertEqual(report["schema_version"], 10)
+        self.assertTrue(all(unit["correlation"] == "NotRecorded" for unit in report["units"]))
+
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "INSERT INTO delivery_correlation_observations VALUES (?,?,?,?,?,?,?)",
+                (
+                    "SECRET_OBSERVATION",
+                    1,
+                    "SECRET_DECISION",
+                    "p01-scheduled",
+                    "p01:2026-09-28",
+                    "Origin",
+                    "2026-09-28T03:00:00Z",
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "require a Unit attribution report"):
+            self.report()
+
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("DROP TABLE delivery_correlation_observations")
         with self.assertRaisesRegex(ValueError, "missing durable-delivery columns"):
             self.report()
 
