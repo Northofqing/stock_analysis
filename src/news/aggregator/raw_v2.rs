@@ -5,6 +5,11 @@
 //! BR-244 exposes one narrower SourceOnly NewsFlash projection that consumes
 //! the same opaque tick, never mints a receipt and never changes impact facts.
 
+mod content_evidence;
+pub use content_evidence::{
+    NewsFlashRecordEvidenceError, NewsFlashRecordEvidenceV1, MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES,
+};
+
 use crate::data_gateway::global_news::{
     parse_global_news_observed_at, parse_global_news_provider_time,
     validate_global_news_batch_evidence,
