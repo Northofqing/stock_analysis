@@ -7655,13 +7655,13 @@ fn p01_schema_v7_to_v9_replays_only_policy_catalog_and_preserves_delivery_author
         .pragma_update(None, "user_version", 7_i64)
         .expect("restore schema-v7 marker");
 
-    initialize_test_schema(&mut connection).expect("migrate schema v7 to v9");
+    initialize_test_schema(&mut connection).expect("migrate schema v7 to v10");
 
     assert_eq!(
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        9
+        super::schema::SCHEMA_VERSION
     );
     assert_eq!(
         count(
@@ -7762,13 +7762,13 @@ fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows(
         .pragma_update(None, "user_version", 8_i64)
         .expect("restore schema-v8 marker");
 
-    initialize_test_schema(&mut connection).expect("migrate schema v8 to v9");
+    initialize_test_schema(&mut connection).expect("migrate schema v8 to v10");
 
     assert_eq!(
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        9
+        super::schema::SCHEMA_VERSION
     );
     let migrated_policy = connection
         .query_row(
@@ -7803,6 +7803,128 @@ fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows(
         before,
         "schema-v9 policy replay must preserve every authority-table value"
     );
+}
+
+#[test]
+fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_authority() {
+    let mut fixture = Fixture::new("M0_CORRELATION_SCHEMA_V10");
+    let append = MemoryAppendPort::default();
+    let candidate = envelope(
+        "M0_CORRELATION_SCHEMA_V10",
+        PushKind::PreopenNewsHot,
+        DeliverySubKind::None,
+        "2026-08-18",
+        false,
+    );
+    prepare_reserved(&fixture, &candidate, &append);
+    drop(fixture.coordinator.take());
+
+    let mut connection = Connection::open(&fixture.database_path).expect("open isolated v9 fixture");
+    let authority_tables = [
+        "delivery_decisions",
+        "immutable_audit_outbox",
+        "cooldown_reservations",
+        "business_date_once_claims",
+        "delivery_state_events",
+        "delivery_policy_catalog",
+    ];
+    let before = authority_snapshot(&connection, &authority_tables);
+    connection
+        .execute_batch("DROP TABLE delivery_correlation_observations;")
+        .expect("remove only v10 sidecar to reconstruct v9 fixture");
+    connection
+        .pragma_update(None, "user_version", 9_i64)
+        .expect("mark isolated fixture as v9");
+
+    initialize_test_schema(&mut connection).expect("migrate populated v9 fixture to v10");
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        super::schema::SCHEMA_VERSION
+    );
+    assert_eq!(
+        authority_snapshot(&connection, &authority_tables),
+        before,
+        "correlation migration must not rewrite delivery authority"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_correlation_observations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "historical decisions have no inferred producer observation"
+    );
+
+    let observation_id = "a".repeat(64);
+    let insert = "INSERT INTO delivery_correlation_observations
+        (observation_identity,identity_version,decision_identity,producer_id,
+         occurrence_identity,role,observed_at) VALUES (?1,1,?2,?3,?4,?5,?6)";
+    connection
+        .execute(
+            insert,
+            params![
+                observation_id,
+                candidate.decision_identity,
+                "p01-scheduled",
+                "p01:2026-08-18",
+                "Origin",
+                "2026-08-18T03:00:00Z"
+            ],
+        )
+        .expect("valid producer edge can be recorded later");
+    assert!(connection
+        .execute(
+            "UPDATE delivery_correlation_observations SET role='Resume'",
+            []
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM delivery_correlation_observations", [])
+        .is_err());
+    assert!(connection
+        .execute(
+            insert,
+            params![
+                "b".repeat(64),
+                candidate.decision_identity,
+                "P01 free text",
+                "p01:2026-08-18",
+                "Origin",
+                "2026-08-18T03:00:00Z"
+            ],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            insert,
+            params![
+                "b".repeat(64),
+                "missing-decision",
+                "p01-scheduled",
+                "p01:2026-08-18",
+                "Origin",
+                "2026-08-18T03:00:00Z"
+            ],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            insert,
+            params![
+                Option::<String>::None,
+                candidate.decision_identity,
+                "p01-scheduled",
+                "p01:2026-08-18",
+                "Origin",
+                "2026-08-18T03:00:00Z"
+            ],
+        )
+        .is_err());
 }
 
 #[test]
@@ -10193,7 +10315,7 @@ fn w12_terminal_read_model_distinguishes_missing_pending_and_accepted() {
         sha256_hex(terminal.evidence_bytes()),
         terminal.evidence_sha256()
     );
-    assert_eq!(terminal.durable_schema_version(), 9);
+    assert_eq!(terminal.durable_schema_version(), super::schema::SCHEMA_VERSION);
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     let exact: serde_json::Value =
         serde_json::from_slice(terminal.evidence_bytes()).expect("exact typed result JSON");
