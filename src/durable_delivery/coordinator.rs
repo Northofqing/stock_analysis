@@ -1,3 +1,7 @@
+use super::correlation::{
+    CorrelationObservationV1, P01OriginProducer, OBSERVATION_IDENTITY_VERSION,
+    OBSERVATION_ROLE_ORIGIN,
+};
 use super::model::{
     compiled_policy_catalog, has_non_ascii_whitespace, sha256_hex, stable_identity,
     AcceptedSinkResultCanonical, AuthoritativeDeliveryRequest, AuthoritativeSink,
@@ -2884,6 +2888,58 @@ impl DurableDeliveryCoordinator {
         authoritative_sink_count: usize,
         admission_at: DateTime<Utc>,
     ) -> Result<PrepareOutcome> {
+        self.prepare_internal(envelope, authoritative_sink_count, admission_at, None)
+    }
+
+    /// The monitor verifies producer catalog membership and the full P01 input
+    /// binding. This public boundary verifies immutable source metadata needed
+    /// to keep an Origin consistent with that single rendered decision; it is
+    /// not a substitute for the monitor's full P01 source validation.
+    pub fn prepare_p01_origin(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        producer: P01OriginProducer,
+    ) -> Result<PrepareOutcome> {
+        validate_public_p01_origin_source(envelope, producer)?;
+        let observation = CorrelationObservationV1::p01_origin(
+            producer,
+            envelope.schedule_occurrence_identity.clone(),
+        )?;
+        self.prepare_with_origin_observation(
+            envelope,
+            authoritative_sink_count,
+            admission_at,
+            &observation,
+        )
+    }
+
+    /// Record the first P01 Origin edge in the same transaction as prepare.
+    /// The crate-only test seam intentionally accepts a synthetic source binding.
+    pub(crate) fn prepare_with_origin_observation(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        observation: &CorrelationObservationV1,
+    ) -> Result<PrepareOutcome> {
+        observation.validate_for_envelope(envelope)?;
+        self.prepare_internal(
+            envelope,
+            authoritative_sink_count,
+            admission_at,
+            Some(observation),
+        )
+    }
+
+    fn prepare_internal(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        origin_observation: Option<&CorrelationObservationV1>,
+    ) -> Result<PrepareOutcome> {
         enum PrepareTransactionOutcome {
             Existing(Box<PrepareOutcome>),
             IdentityConflict,
@@ -2899,6 +2955,14 @@ impl DurableDeliveryCoordinator {
                     envelope.validate()?;
                     let hydration =
                         load_schedule_hydration(transaction, &envelope.decision_identity)?;
+                    if let Some(observation) = origin_observation {
+                        insert_or_verify_origin_observation(
+                            transaction,
+                            envelope,
+                            observation,
+                            admission_at,
+                        )?;
+                    }
                     return Ok(PrepareTransactionOutcome::Existing(Box::new(
                         outcome_from_stored(&existing, &hydration),
                     )));
@@ -2959,6 +3023,14 @@ impl DurableDeliveryCoordinator {
                 freeze_pre_sink_denial(transaction, envelope, &policy, denial, admission_at)?;
             } else {
                 self.reserve_generation(transaction, envelope, &policy, 1, admission_at)?;
+            }
+            if let Some(observation) = origin_observation {
+                insert_or_verify_origin_observation(
+                    transaction,
+                    envelope,
+                    observation,
+                    admission_at,
+                )?;
             }
             Ok(PrepareTransactionOutcome::Inserted)
         })?;
@@ -8367,6 +8439,57 @@ fn p01_source_binding_mode(
     Ok(mode.map(str::to_owned))
 }
 
+fn validate_public_p01_origin_source(
+    envelope: &DeliveryEnvelope,
+    producer: P01OriginProducer,
+) -> Result<()> {
+    let invalid = || {
+        DurableDeliveryError::InvalidEnvelope(
+            "P01 Origin producer/source binding mismatch".to_owned(),
+        )
+    };
+    let source_sha256 = sha256_hex(&envelope.source_binding_canonical);
+    let rendered_sha256 = sha256_hex(&envelope.rendered_content);
+    let expected_mode = match producer {
+        P01OriginProducer::Scheduled => "Scheduled",
+        P01OriginProducer::Compensation => "Compensation",
+    };
+    if envelope.push_kind != PushKind::PreopenNewsHot
+        || envelope.sub_kind != super::model::DeliverySubKind::None
+        || envelope.cooldown_scope != super::model::CooldownScope::Global
+        || envelope.scope_key != "GLOBAL"
+        || envelope.schedule_occurrence_identity != format!("p01:{}", envelope.business_date)
+        || envelope.source_binding_sha256 != source_sha256
+        || envelope.source_evidence_fingerprint != source_sha256
+        || envelope.rendered_content_sha256 != rendered_sha256
+        || envelope.retry_authorized
+        || envelope.task_binding.is_some()
+    {
+        return Err(invalid());
+    }
+    let actual_mode =
+        p01_source_binding_mode(envelope.push_kind, &envelope.source_binding_canonical)?;
+    let source: serde_json::Value =
+        serde_json::from_slice(&envelope.source_binding_canonical).map_err(|_| invalid())?;
+    if actual_mode.as_deref() != Some(expected_mode)
+        || source
+            .get("business_date")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.business_date.as_str())
+        || source
+            .get("schedule_occurrence_identity")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.schedule_occurrence_identity.as_str())
+        || source
+            .get("rendered_content_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(rendered_sha256.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn replay_push_kind(review_task: &str) -> Result<super::model::PushKind> {
     match review_task {
         "R-04" => Ok(super::model::PushKind::ReviewLhb),
@@ -9570,6 +9693,74 @@ fn domain_sha256_hex(domain: &str, payload: &[u8]) -> String {
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn insert_or_verify_origin_observation(
+    transaction: &Transaction<'_>,
+    envelope: &DeliveryEnvelope,
+    observation: &CorrelationObservationV1,
+    admission_at: DateTime<Utc>,
+) -> Result<()> {
+    let observation_identity = observation.identity_for_decision(&envelope.decision_identity);
+    let existing: Option<(i64, String, String, String, String, String)> = transaction
+        .query_row(
+            "SELECT identity_version,decision_identity,producer_id,
+                    occurrence_identity,role,observed_at
+             FROM delivery_correlation_observations WHERE observation_identity=?1",
+            [&observation_identity],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((version, decision, producer, occurrence, role, first_observed_at)) = existing {
+        if version != OBSERVATION_IDENTITY_VERSION
+            || decision != envelope.decision_identity
+            || producer != observation.producer_id()
+            || occurrence != observation.occurrence_identity()
+            || role != OBSERVATION_ROLE_ORIGIN
+        {
+            return Err(DurableDeliveryError::PolicyMismatch(format!(
+                "correlation observation identity conflict for {observation_identity}"
+            )));
+        }
+        if timestamp(parse_timestamp(&first_observed_at)?) != first_observed_at {
+            return Err(DurableDeliveryError::InvalidConfiguration(format!(
+                "noncanonical correlation observation timestamp for {observation_identity}"
+            )));
+        }
+        return Ok(());
+    }
+
+    let observed_at = timestamp(admission_at);
+    if timestamp(parse_timestamp(&observed_at)?) != observed_at {
+        return Err(DurableDeliveryError::InvalidConfiguration(
+            "noncanonical P01 origin observation timestamp".to_owned(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO delivery_correlation_observations
+         (observation_identity,identity_version,decision_identity,producer_id,
+          occurrence_identity,role,observed_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            observation_identity,
+            OBSERVATION_IDENTITY_VERSION,
+            envelope.decision_identity,
+            observation.producer_id(),
+            observation.occurrence_identity(),
+            OBSERVATION_ROLE_ORIGIN,
+            observed_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {

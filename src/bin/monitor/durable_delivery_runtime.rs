@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use stock_analysis::durable_delivery::{
     AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkPort,
     AuthoritativeSinkResult, CoordinatorConfig, DecisionState, DeliveryEnvelope, DeliverySubKind,
-    DurableDeliveryCoordinator, ImmutableAppendPort, PushKind as DurablePushKind,
-    ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput, ScheduleHydration,
-    ScheduleHydrationState, TaskBinding,
+    DurableDeliveryCoordinator, ImmutableAppendPort, P01OriginProducer,
+    PushKind as DurablePushKind, ReviewTerminalReplayCompletionState, ReviewTerminalReplayInput,
+    ScheduleHydration, ScheduleHydrationState, TaskBinding,
 };
 use stock_analysis::event::DurableDeliveryImmutableAppend;
 use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
@@ -1363,6 +1363,63 @@ pub async fn deliver_counted_binding(
     }
 }
 
+/// Only a capability minted by RuntimeP01Port::push reaches this route.
+/// Generic counted delivery and startup recovery continue using prepare().
+pub(crate) async fn deliver_p01_origin_binding(
+    binding: CountedDeliveryBinding,
+    text: String,
+    origin: crate::p01::P01OriginDispatch,
+) -> PushOutcome {
+    if validate_p01_origin_binding(&binding, &text, &origin).is_err() {
+        return PushOutcome::Denied("p01_origin_binding_invalid".to_owned());
+    }
+    if !p01_compensation_binding_is_authorized(&binding, PushKind::PreopenNewsHot, &text) {
+        if let Err(error) = ensure_startup_reconciled().await {
+            return PushOutcome::Denied(format!("durable delivery admission frozen: {error}"));
+        }
+    }
+    let envelope = match envelope_from_binding(binding, PushKind::PreopenNewsHot, &text, None) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return PushOutcome::Denied(format!("durable delivery envelope rejected: {error}"));
+        }
+    };
+    match deliver_envelope_with_p01_origin(envelope, Some(origin.producer())).await {
+        Ok(evidence) => outcome_from_state(evidence.state),
+        Err(error) => PushOutcome::SinkError(error),
+    }
+}
+
+fn validate_p01_origin_binding(
+    binding: &CountedDeliveryBinding,
+    text: &str,
+    origin: &crate::p01::P01OriginDispatch,
+) -> Result<(), &'static str> {
+    const INVALID: &str = "p01_origin_binding_invalid";
+    binding.validate_p01_text(text).map_err(|_| INVALID)?;
+    let canonical: P01CanonicalSourceBinding =
+        serde_json::from_slice(binding.source_binding_canonical()).map_err(|_| INVALID)?;
+    let (expected_mode, expected_producer) = match origin.mode() {
+        crate::p01::P01RenderMode::Scheduled => ("Scheduled", P01OriginProducer::Scheduled),
+        crate::p01::P01RenderMode::Compensation => {
+            ("Compensation", P01OriginProducer::Compensation)
+        }
+    };
+    let business_date = origin.business_date().format("%Y-%m-%d").to_string();
+    let occurrence_identity = format!("p01:{business_date}");
+    if origin.producer() != expected_producer
+        || binding.business_date() != origin.business_date()
+        || binding.schedule_occurrence_identity() != occurrence_identity
+        || origin.occurrence_identity() != occurrence_identity
+        || canonical.render_mode != expected_mode
+        || canonical.business_date != business_date
+        || canonical.schedule_occurrence_identity != occurrence_identity
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 fn news_ai_sink_rejection_outcome(
     decision_identity: &str,
     rejection: &stock_analysis::durable_delivery::TypedRejection,
@@ -1406,6 +1463,13 @@ pub async fn deliver_presented_envelope(
 }
 
 async fn deliver_envelope(envelope: DeliveryEnvelope) -> Result<DurableDispatchEvidence, String> {
+    deliver_envelope_with_p01_origin(envelope, None).await
+}
+
+async fn deliver_envelope_with_p01_origin(
+    envelope: DeliveryEnvelope,
+    origin: Option<P01OriginProducer>,
+) -> Result<DurableDispatchEvidence, String> {
     // BR-241 compensation is intentionally single-kind: its own exact claim
     // preflight/resume is authoritative and must not first resume unrelated
     // pending PushKinds through the global startup barrier.
@@ -1413,9 +1477,11 @@ async fn deliver_envelope(envelope: DeliveryEnvelope) -> Result<DurableDispatchE
         ensure_startup_reconciled().await?;
     }
     let state = runtime_state()?;
-    tokio::task::spawn_blocking(move || deliver_envelope_blocking(state.as_ref(), envelope))
-        .await
-        .map_err(|error| format!("BR-192 counted delivery join failed: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        deliver_envelope_blocking_with_p01_origin(state.as_ref(), envelope, origin)
+    })
+    .await
+    .map_err(|error| format!("BR-192 counted delivery join failed: {error}"))?
 }
 
 /// Read the durable owner of an exact BusinessDateOnce occurrence.
@@ -2163,6 +2229,14 @@ fn deliver_envelope_blocking(
     state: &RuntimeState,
     envelope: DeliveryEnvelope,
 ) -> Result<DurableDispatchEvidence, String> {
+    deliver_envelope_blocking_with_p01_origin(state, envelope, None)
+}
+
+fn deliver_envelope_blocking_with_p01_origin(
+    state: &RuntimeState,
+    envelope: DeliveryEnvelope,
+    origin: Option<P01OriginProducer>,
+) -> Result<DurableDispatchEvidence, String> {
     // BR-239: coordinator reconciliation consumes one process-global immutable
     // audit outbox. Keep the complete durable transition atomic within this
     // monitor while leaving provider/source acquisition outside this function.
@@ -2170,6 +2244,13 @@ fn deliver_envelope_blocking(
         .counted_delivery_critical_section
         .lock()
         .map_err(|_| "BR-239 counted delivery critical-section mutex poisoned".to_owned())?;
+
+    if origin.is_some()
+        && (envelope.push_kind != DurablePushKind::PreopenNewsHot
+            || envelope.sub_kind != DeliverySubKind::None)
+    {
+        return Err("P01 origin cannot prepare another durable kind".to_owned());
+    }
 
     // DataMode cards are periodic observations of one status fact. Once the
     // first card owns a v2 occurrence, later ticks (and a restarted process)
@@ -2196,9 +2277,13 @@ fn deliver_envelope_blocking(
     }
 
     let decision_identity = envelope.decision_identity.clone();
-    state
-        .coordinator
-        .prepare(&envelope, 1, Utc::now())
+    let preparation = match origin {
+        Some(producer) => state
+            .coordinator
+            .prepare_p01_origin(&envelope, 1, Utc::now(), producer),
+        None => state.coordinator.prepare(&envelope, 1, Utc::now()),
+    };
+    preparation
         .map_err(|error| format!("prepare counted decision {decision_identity}: {error}"))?;
     advance_prepared_envelope(state, envelope)
 }
@@ -3325,6 +3410,37 @@ mod tests {
         p01_binding_from_bytes(input.context.business_date, canonical)
     }
 
+    fn m0_p01_origin_binding(
+        mode: crate::p01::P01RenderMode,
+        text: &str,
+    ) -> (CountedDeliveryBinding, crate::p01::P01OriginDispatch) {
+        let input = crate::p01::P01InputBinding::complete_test_input();
+        let canonical = input
+            .canonical_source_bytes(mode, text)
+            .expect("valid TEST_CODE P01 source bytes");
+        let binding = p01_binding_from_bytes(input.context.business_date, canonical);
+        let origin = crate::p01::P01OriginDispatch::from_binding_for_test(mode, &binding, text);
+        (binding, origin)
+    }
+
+    fn m0_p01_count(connection: &rusqlite::Connection, table: &str) -> i64 {
+        assert!(matches!(
+            table,
+            "delivery_decisions"
+                | "delivery_correlation_observations"
+                | "cooldown_reservations"
+                | "business_date_once_claims"
+                | "immutable_audit_outbox"
+                | "delivery_attempts"
+                | "sink_results"
+        ));
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("read isolated TEST_CODE P01 table count")
+    }
+
     fn p01_binding_from_bytes(
         business_date: NaiveDate,
         canonical: Vec<u8>,
@@ -3834,6 +3950,190 @@ mod tests {
         let text = "TEST_CODE_P01_EXACT_RENDERED_TEXT";
         let binding = exact_p01_binding(text);
         assert_eq!(binding.validate_p01_text(text), Ok(()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn m0_p01_origin_new_binding_delivers_both_modes_and_exact_retry_sends_once() {
+        let text = "TEST_CODE_M0_P01_ORIGIN_EXACT_RENDERED_TEXT";
+        for (mode, expected_producer) in [
+            (crate::p01::P01RenderMode::Scheduled, "p01-scheduled"),
+            (crate::p01::P01RenderMode::Compensation, "p01-compensation"),
+        ] {
+            let _guard = crate::TestEnvGuard::dry_run_non_quiet();
+            let (binding, origin) = m0_p01_origin_binding(mode, text);
+            assert_eq!(validate_p01_origin_binding(&binding, text, &origin), Ok(()));
+            let first = deliver_p01_origin_binding(binding.clone(), text.to_owned(), origin).await;
+            assert_eq!(first, PushOutcome::Pushed, "mode={mode:?}");
+
+            let state = runtime_state().expect("read isolated TEST_CODE P01 runtime");
+            let database_path = match &state.namespace {
+                RuntimeNamespace::Test { test_code } => std::path::PathBuf::from("data/test")
+                    .join(test_code)
+                    .join("durable_delivery.sqlite3"),
+                RuntimeNamespace::Production => panic!("P01 test must use TEST_CODE namespace"),
+            };
+            let connection = rusqlite::Connection::open(database_path).unwrap();
+            let (producer, occurrence, observed_at): (String, String, String) = connection
+                .query_row(
+                    "SELECT producer_id,occurrence_identity,observed_at
+                     FROM delivery_correlation_observations",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("one persisted P01 Origin edge");
+            assert_eq!(producer, expected_producer);
+            assert_eq!(occurrence, "p01:2026-08-18");
+            assert_eq!(m0_p01_count(&connection, "delivery_decisions"), 1);
+            assert_eq!(m0_p01_count(&connection, "sink_results"), 1);
+            drop(connection);
+
+            let retry_origin =
+                crate::p01::P01OriginDispatch::from_binding_for_test(mode, &binding, text);
+            let retry = deliver_p01_origin_binding(binding, text.to_owned(), retry_origin).await;
+            assert_eq!(retry, PushOutcome::Pushed, "exact retry mode={mode:?}");
+            let connection = rusqlite::Connection::open(match &state.namespace {
+                RuntimeNamespace::Test { test_code } => std::path::PathBuf::from("data/test")
+                    .join(test_code)
+                    .join("durable_delivery.sqlite3"),
+                RuntimeNamespace::Production => unreachable!(),
+            })
+            .unwrap();
+            let retry_observed_at: String = connection
+                .query_row(
+                    "SELECT observed_at FROM delivery_correlation_observations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retry_observed_at, observed_at);
+            assert_eq!(
+                m0_p01_count(&connection, "delivery_correlation_observations"),
+                1
+            );
+            assert_eq!(m0_p01_count(&connection, "delivery_attempts"), 1);
+            assert_eq!(m0_p01_count(&connection, "sink_results"), 1);
+        }
+    }
+
+    #[test]
+    fn m0_p01_origin_rejects_mismatched_mode_and_wrong_kind_before_prepare() {
+        let text = "TEST_CODE_M0_P01_REJECTED_RENDERED_TEXT";
+        let (scheduled, scheduled_origin) =
+            m0_p01_origin_binding(crate::p01::P01RenderMode::Scheduled, text);
+        let (compensation, _) =
+            m0_p01_origin_binding(crate::p01::P01RenderMode::Compensation, text);
+        assert!(validate_p01_origin_binding(&compensation, text, &scheduled_origin).is_err());
+        assert!(validate_p01_origin_binding(
+            &scheduled,
+            "TEST_CODE_FORGED_TEXT",
+            &scheduled_origin
+        )
+        .is_err());
+
+        let test_code = format!(
+            "TEST_CODE_M0_P01_REJECT_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let (namespace, state) = replay_state(&test_code);
+        let wrong_kind = DeliveryEnvelope::new(
+            "2026-08-18",
+            DurablePushKind::IndustryChain,
+            DeliverySubKind::None,
+            "GLOBAL",
+            "p01:2026-08-18",
+            scheduled.source_evidence_fingerprint(),
+            scheduled.source_binding_canonical().to_vec(),
+            scheduled.delivery_subject_hash(),
+            text.as_bytes().to_vec(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(deliver_envelope_blocking_with_p01_origin(
+            state.as_ref(),
+            wrong_kind,
+            Some(scheduled_origin.producer())
+        )
+        .is_err());
+        let connection =
+            rusqlite::Connection::open(namespace.path().join("durable_delivery.sqlite3")).unwrap();
+        assert_eq!(m0_p01_count(&connection, "delivery_decisions"), 0);
+        assert_eq!(
+            m0_p01_count(&connection, "delivery_correlation_observations"),
+            0
+        );
+        assert_eq!(m0_p01_count(&connection, "sink_results"), 0);
+    }
+
+    #[test]
+    fn m0_p01_origin_insert_fault_rolls_back_and_legacy_replay_remains_unattributed() {
+        let test_code = format!(
+            "TEST_CODE_M0_P01_FAULT_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let (namespace, state) = replay_state(&test_code);
+        let text = "TEST_CODE_M0_P01_FAULT_RENDERED_TEXT";
+        let (binding, origin) = m0_p01_origin_binding(crate::p01::P01RenderMode::Scheduled, text);
+        let envelope =
+            envelope_from_binding(binding, PushKind::PreopenNewsHot, text, None).unwrap();
+        let connection =
+            rusqlite::Connection::open(namespace.path().join("durable_delivery.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER test_code_m0_reject_p01_origin
+                 BEFORE INSERT ON delivery_correlation_observations
+                 BEGIN SELECT RAISE(ABORT,'TEST_CODE_M0_P01_ORIGIN_INSERT_FAULT'); END;",
+            )
+            .unwrap();
+        assert!(deliver_envelope_blocking_with_p01_origin(
+            state.as_ref(),
+            envelope.clone(),
+            Some(origin.producer())
+        )
+        .is_err());
+        for table in [
+            "delivery_decisions",
+            "delivery_correlation_observations",
+            "cooldown_reservations",
+            "business_date_once_claims",
+            "immutable_audit_outbox",
+            "delivery_attempts",
+            "sink_results",
+        ] {
+            assert_eq!(m0_p01_count(&connection, table), 0, "table={table}");
+        }
+        connection
+            .execute_batch("DROP TRIGGER test_code_m0_reject_p01_origin")
+            .unwrap();
+
+        state
+            .coordinator
+            .prepare(&envelope, 1, Utc::now())
+            .expect("legacy prepare retains its old un-attributed contract");
+        reconcile_startup_blocking(state.as_ref()).expect("legacy startup replay settles decision");
+        assert_eq!(
+            m0_p01_count(&connection, "delivery_correlation_observations"),
+            0
+        );
+        assert_eq!(m0_p01_count(&connection, "sink_results"), 1);
+        assert_eq!(m0_p01_count(&connection, "delivery_attempts"), 1);
+
+        let exact_new_intake = deliver_envelope_blocking_with_p01_origin(
+            state.as_ref(),
+            envelope,
+            Some(origin.producer()),
+        )
+        .expect("real new intake may attach one Origin to its exact existing owner");
+        assert_eq!(exact_new_intake.state, DecisionState::Delivered);
+        assert_eq!(
+            m0_p01_count(&connection, "delivery_correlation_observations"),
+            1
+        );
+        assert_eq!(m0_p01_count(&connection, "sink_results"), 1);
+        assert_eq!(m0_p01_count(&connection, "delivery_attempts"), 1);
     }
 
     #[test]

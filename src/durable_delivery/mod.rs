@@ -6,10 +6,12 @@
 //! all-or-nothing follow-up after every counted caller has migrated.
 
 mod coordinator;
+mod correlation;
 mod model;
 mod schema;
 
 pub use coordinator::DurableDeliveryCoordinator;
+pub use correlation::P01OriginProducer;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,

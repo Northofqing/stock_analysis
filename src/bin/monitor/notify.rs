@@ -3043,6 +3043,28 @@ pub async fn push_counted_with_binding(
     sub_kind: Option<DailyReportSubKind>,
     binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
 ) -> PushOutcome {
+    push_counted_with_binding_inner(token, text, sub_kind, binding, None).await
+}
+
+pub(crate) async fn push_p01_origin_with_binding(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+    origin: crate::p01::P01OriginDispatch,
+) -> PushOutcome {
+    if token.descriptor().push_kind != PushKind::PreopenNewsHot {
+        return PushOutcome::Denied("p01_origin_presentation_kind_invalid".to_owned());
+    }
+    push_counted_with_binding_inner(token, text, None, binding, Some(origin)).await
+}
+
+async fn push_counted_with_binding_inner(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    text: &str,
+    sub_kind: Option<DailyReportSubKind>,
+    binding: crate::durable_delivery_runtime::CountedDeliveryBinding,
+    origin: Option<crate::p01::P01OriginDispatch>,
+) -> PushOutcome {
     use crate::v14_adapter::V14Gate;
 
     let kind = token.descriptor().push_kind;
@@ -3072,13 +3094,25 @@ pub async fn push_counted_with_binding(
         governance_event.event_id,
         binding.schedule_occurrence_identity()
     );
-    crate::durable_delivery_runtime::deliver_counted_binding(
-        binding,
-        kind,
-        text.to_owned(),
-        sub_kind,
-    )
-    .await
+    match origin {
+        Some(origin) => {
+            crate::durable_delivery_runtime::deliver_p01_origin_binding(
+                binding,
+                text.to_owned(),
+                origin,
+            )
+            .await
+        }
+        None => {
+            crate::durable_delivery_runtime::deliver_counted_binding(
+                binding,
+                kind,
+                text.to_owned(),
+                sub_kind,
+            )
+            .await
+        }
+    }
 }
 
 /// BR-194 sole counted SourceOnly entry. The profile is derived from the
