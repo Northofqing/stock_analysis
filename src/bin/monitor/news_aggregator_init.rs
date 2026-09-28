@@ -378,12 +378,10 @@ impl FlashReservation {
             }
 
             let event = selected.event();
-            let mut event_hasher = Sha256::new();
-            event_hasher.update(b"BR166_GLOBAL_NEWS_EVENT_V1\0");
-            event_hasher.update(registration.source_contract.as_bytes());
-            event_hasher.update(b"\0");
-            event_hasher.update(evidence.item_id().as_bytes());
-            let expected_event_id = format!("{:x}", event_hasher.finalize());
+            let expected_event_id = raw_v2::br166_global_news_event_id(
+                registration.provider,
+                evidence.item_id(),
+            );
             if evidence.item_id().trim().is_empty()
                 || event.event_id != expected_event_id
                 || source.event_id() != expected_event_id

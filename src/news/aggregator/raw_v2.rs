@@ -30,6 +30,17 @@ use std::sync::Arc;
 pub const REGISTERED_GLOBAL_NEWS_LIMIT: u32 = 20;
 pub const MAGIC_MARKET_DATA_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 
+/// BR-166's stable event identity for an admitted provider/item pair. This is
+/// a pure value function; it grants no source admission or ingress receipt.
+pub fn br166_global_news_event_id(provider: GlobalNewsProvider, item_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"BR166_GLOBAL_NEWS_EVENT_V1\0");
+    hasher.update(provider.source().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(item_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 const REGISTERED_PROVIDERS: [GlobalNewsProvider; 4] = [
     GlobalNewsProvider::Eastmoney,
     GlobalNewsProvider::Cailianpress,
@@ -1205,6 +1216,18 @@ mod tests {
     use crate::market_domain::{ProviderId, SourceEvidence};
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn br166_shared_event_id_pins_original_provider_item_vector() {
+        assert_eq!(
+            br166_global_news_event_id(GlobalNewsProvider::Eastmoney, "TEST_CODE_ITEM"),
+            "1572f77c3b14ac7e545782b486a8fd727207ac10f7f9adb0156b0672c7169d8b"
+        );
+        assert_ne!(
+            br166_global_news_event_id(GlobalNewsProvider::Cailianpress, "TEST_CODE_ITEM"),
+            br166_global_news_event_id(GlobalNewsProvider::Eastmoney, "TEST_CODE_ITEM")
+        );
+    }
 
     struct TypedFixturePort {
         calls: AtomicUsize,
