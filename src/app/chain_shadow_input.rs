@@ -8,8 +8,9 @@ use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis
 use super::chain_acquisition::ChainAcquisitionEvidence;
 use super::chain_schedule::ChainPhase;
 
-pub(super) const COVERAGE: &str = "prepared_report_utf8_only";
-pub(super) const ACQUISITION_COVERAGE: &str = "partial_limit_up_global_news_and_report_utf8";
+pub(super) const COVERAGE: &str = "incomplete";
+pub(super) const REPORT_INPUTS: &str = "prepared_report_utf8_only";
+pub(super) const ACQUISITION_INPUTS: &str = "limit_up_global_news_and_report_utf8";
 
 #[derive(Debug)]
 pub(super) struct ChainReportInputObservation {
@@ -24,6 +25,7 @@ pub(super) struct ChainReportInputObservation {
     pub acquisition_sha256: Option<String>,
     pub acquisition_report_binding_sha256: Option<String>,
     pub coverage: &'static str,
+    pub covered_inputs: &'static str,
 }
 
 /// `report_input` is the UTF-8 report supplied to the legacy sender, not a
@@ -70,10 +72,11 @@ pub(super) fn observe(
         prepared_report_equals_input: prepared.report().as_bytes() == report_input,
         acquisition_sha256,
         acquisition_report_binding_sha256,
-        coverage: if acquisition.is_some() {
-            ACQUISITION_COVERAGE
+        coverage: COVERAGE,
+        covered_inputs: if acquisition.is_some() {
+            ACQUISITION_INPUTS
         } else {
-            COVERAGE
+            REPORT_INPUTS
         },
     })
 }
@@ -127,7 +130,8 @@ mod tests {
         assert_eq!(observed.schedule_date, schedule_date);
         assert_eq!(observed.prepared_business_date, business_date);
         assert!(observed.prepared_report_equals_input);
-        assert_eq!(observed.coverage, "prepared_report_utf8_only");
+        assert_eq!(observed.coverage, "incomplete");
+        assert_eq!(observed.covered_inputs, REPORT_INPUTS);
         assert_eq!(observed.report_input_bytes, input.len());
         assert_eq!(
             observed.artifact_bytes,

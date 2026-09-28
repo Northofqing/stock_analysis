@@ -277,7 +277,7 @@ where
 mod tests {
     use super::*;
     use crate::app::chain_schedule::ChainPhase;
-    use crate::app::chain_shadow_input::{observe, test_prepared, ACQUISITION_COVERAGE};
+    use crate::app::chain_shadow_input::{observe, test_prepared, ACQUISITION_INPUTS};
     use chrono::Utc;
     use std::{
         cell::{Cell, RefCell},
@@ -495,7 +495,8 @@ mod tests {
         .unwrap();
         assert_eq!(observed.prepared_business_date, retained.business_date);
         assert_eq!(observed.schedule_date, retained.observed_at.date_naive());
-        assert_eq!(observed.coverage, ACQUISITION_COVERAGE);
+        assert_eq!(observed.coverage, "incomplete");
+        assert_eq!(observed.covered_inputs, ACQUISITION_INPUTS);
         assert_eq!(observed.acquisition_sha256.as_deref().unwrap().len(), 64);
         assert_eq!(
             observed
