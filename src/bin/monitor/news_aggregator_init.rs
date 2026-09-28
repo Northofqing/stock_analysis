@@ -251,6 +251,36 @@ impl FlashReservation {
             .collect()
     }
 
+    /// Bind the already rendered aggregate reservation without changing gate ownership.
+    pub fn foundation_n02_binding(
+        &self,
+    ) -> Result<
+        stock_analysis::push_foundation::N02ReservationBindingV1,
+        stock_analysis::push_foundation::N02BindingError,
+    > {
+        use stock_analysis::push_foundation::{N02BindingError, N02ReservationMaterial};
+
+        let FlashDecision::Aggregated { text, .. } = self.decision() else {
+            return Err(N02BindingError::ReservationMismatch { field: "push_kind" });
+        };
+        let material = N02ReservationMaterial {
+            business_date: self.business_date(),
+            window: self.window().unwrap_or_default().to_owned(),
+            push_kind: self.push_kind().to_owned(),
+            decision_key: self.decision_key().to_owned(),
+            event_id: self.event_id().map(str::to_owned),
+            reservation_sha256: self.reservation_identity_sha256().to_owned(),
+            sources: self.audit_sources(),
+            evidence_sha256: self.evidence_sha256().to_owned(),
+            news_flash_render_sha256: self.render_sha256().to_owned(),
+            rendered_len: self.rendered_len() as u64,
+        };
+        stock_analysis::push_foundation::N02ReservationBindingV1::try_from_reservation_material(
+            material,
+            text.as_bytes(),
+        )
+    }
+
     fn matches_attempt(&self, attempt: &stock_analysis::event::NewsFlashAttemptReceipt) -> bool {
         let input = attempt.input();
         let expected_attempt_identity =
@@ -1325,6 +1355,7 @@ mod tests {
     ) -> (
         FlashReservation,
         stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent,
+        NewsFlashGate,
     ) {
         let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
         let local_at = |hour, minute| {
@@ -1376,7 +1407,7 @@ mod tests {
             .is_empty());
         let mut reservations = gate.reserve(&[], local_at(9, 31), 80, 20);
         assert_eq!(reservations.len(), 1);
-        (reservations.pop().unwrap(), source)
+        (reservations.pop().unwrap(), source, gate)
     }
 
     #[test]
@@ -1396,7 +1427,7 @@ mod tests {
             ),
         ];
         for (suffix, evidence, identity) in expected {
-            let (reservation, projected) = n02_legacy_identity_reservation(suffix);
+            let (reservation, projected, _) = n02_legacy_identity_reservation(suffix);
             let text = match reservation.decision() {
                 FlashDecision::Aggregated { window, text } => {
                     assert_eq!(window, "09:30");
@@ -1456,6 +1487,159 @@ mod tests {
             assert_eq!(reservation.evidence_sha256(), evidence);
             assert_eq!(reservation.reservation_identity_sha256(), identity);
         }
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_real_reservation_and_bytes() {
+        let (reservation, _, _) = n02_legacy_identity_reservation("A");
+        let text = match reservation.decision() {
+            FlashDecision::Aggregated { text, .. } => text,
+            _ => unreachable!(),
+        };
+        let binding = reservation.foundation_n02_binding().unwrap();
+        let material = binding.material();
+        assert_eq!(material.business_date, reservation.business_date());
+        assert_eq!(material.window, reservation.window().unwrap());
+        assert_eq!(material.push_kind, reservation.push_kind());
+        assert_eq!(material.decision_key, reservation.decision_key());
+        assert_eq!(material.event_id.as_deref(), reservation.event_id());
+        assert_eq!(material.sources, reservation.audit_sources());
+        assert_eq!(material.evidence_sha256, reservation.evidence_sha256());
+        assert_eq!(
+            material.reservation_sha256,
+            reservation.reservation_identity_sha256()
+        );
+        assert_eq!(
+            material.news_flash_render_sha256,
+            reservation.render_sha256()
+        );
+        assert_eq!(material.rendered_len, text.as_bytes().len() as u64);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(text.as_bytes())),
+            "5f12437bce75ac811b8279dcfc7f9bed5e2ace0daeb414e1c56342bb98d09f76"
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_same_text_distinct_sources() {
+        let (a, _, _) = n02_legacy_identity_reservation("A");
+        let (b, _, _) = n02_legacy_identity_reservation("B");
+        let a_binding = a.foundation_n02_binding().unwrap();
+        let b_binding = b.foundation_n02_binding().unwrap();
+        assert_eq!(a.decision(), b.decision());
+        assert_eq!(
+            a_binding.material().news_flash_render_sha256,
+            b_binding.material().news_flash_render_sha256
+        );
+        assert_ne!(a_binding.material().sources, b_binding.material().sources);
+        assert_ne!(
+            a_binding.material().evidence_sha256,
+            b_binding.material().evidence_sha256
+        );
+        assert_ne!(
+            a_binding.material().reservation_sha256,
+            b_binding.material().reservation_sha256
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_full_source_order() {
+        let (_, source_a, _) = n02_legacy_identity_reservation("A");
+        let (_, source_b, _) = n02_legacy_identity_reservation("B");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let local_at = |minute| {
+            day.and_hms_opt(9, minute, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+        };
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[source_b, source_a], local_at(0), 80, 20)
+            .is_empty());
+        let reservation = gate.reserve(&[], local_at(31), 80, 20).pop().unwrap();
+        let ordered_sources = reservation.audit_sources();
+        assert_eq!(ordered_sources.len(), 2);
+        assert_eq!(ordered_sources[0].event_id, "TEST_CODE_EVENT_B");
+        assert_eq!(ordered_sources[1].event_id, "TEST_CODE_EVENT_A");
+        assert_eq!(
+            reservation
+                .foundation_n02_binding()
+                .unwrap()
+                .material()
+                .sources,
+            ordered_sources
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_rejects_critical() {
+        let (aggregate, source, _) = n02_legacy_identity_reservation("A");
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 28)
+            .unwrap()
+            .and_hms_opt(9, 31, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap();
+        let critical = make_reservation(
+            2,
+            now.date_naive(),
+            "event:TEST_CODE_EVENT_A",
+            Some("TEST_CODE_EVENT_A".to_owned()),
+            None,
+            vec![source],
+            FlashDecision::Critical {
+                event_id: "TEST_CODE_EVENT_A".to_owned(),
+                headline: "TEST_CODE_TITLE_A".to_owned(),
+                source: "TEST_CODE_SOURCE".to_owned(),
+                observed_at: now,
+                source_published_on: now.date_naive(),
+                stale: false,
+                strength: 100,
+                certainty: 100,
+                text: match aggregate.decision() {
+                    FlashDecision::Aggregated { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                },
+            },
+        );
+        assert!(matches!(
+            critical.foundation_n02_binding(),
+            Err(
+                stock_analysis::push_foundation::N02BindingError::ReservationMismatch {
+                    field: "push_kind"
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn n02_foundation_binding_does_not_consume_reservation() {
+        let (reservation, _, mut gate) = n02_legacy_identity_reservation("A");
+        let binding = reservation.foundation_n02_binding().unwrap();
+        let original_identity = reservation.reservation_identity_sha256().to_owned();
+        assert_eq!(binding.material().reservation_sha256, original_identity);
+        assert_eq!(gate.window_state[0], WindowState::Pending);
+        gate.settle(
+            reservation,
+            FlashSettlement::RolledBack {
+                reason: "TEST_CODE_BINDING_OBSERVED".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(gate.window_state[0], WindowState::Eligible);
+        let retry_at = chrono::NaiveDate::from_ymd_opt(2026, 9, 28)
+            .unwrap()
+            .and_hms_opt(9, 32, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap();
+        let retry = gate.reserve(&[], retry_at, 80, 20);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].reservation_identity_sha256(), original_identity);
     }
 
     fn ev(id_seed: &str, strength: u8, certainty: u8) -> MarketEvent {
