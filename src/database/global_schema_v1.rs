@@ -4427,7 +4427,7 @@ mod tests {
             (
                 "future",
                 STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-                3,
+                REVIEW_CATALOG_GENERATION + 1,
                 "global_schema_unsupported_future_generation",
             ),
         ] {
