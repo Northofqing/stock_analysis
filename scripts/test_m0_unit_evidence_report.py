@@ -1,6 +1,7 @@
 """Focused query-shape tests; fixtures are not the full production schema."""
 
 import json
+import hashlib
 from contextlib import closing
 from pathlib import Path
 import sqlite3
@@ -66,8 +67,9 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             connection.executescript(
                 """
                 PRAGMA user_version=10;
-                ALTER TABLE delivery_decisions ADD COLUMN sub_kind TEXT NOT NULL DEFAULT 'None';
+                ALTER TABLE delivery_decisions ADD COLUMN sub_kind TEXT NOT NULL DEFAULT 'NONE';
                 ALTER TABLE delivery_decisions ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'GLOBAL';
+                ALTER TABLE delivery_decisions ADD COLUMN envelope_sha256 TEXT;
                 CREATE TABLE delivery_correlation_observations (
                     observation_identity TEXT,
                     identity_version INTEGER,
@@ -83,7 +85,32 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
     def observe(self, decision, producer="p01-scheduled", occurrence=f"p01:{DAY}",
                 observed_at="2026-09-28T03:00:00.000Z"):
         identity = _origin_observation_identity(decision, producer, occurrence)
+        mode = {"p01-scheduled": "Scheduled", "p01-compensation": "Compensation"}[producer]
+        source = json.dumps({
+            "schema_version": "P01_SOURCE_BINDING_V1",
+            "business_date": DAY,
+            "schedule_occurrence_identity": occurrence,
+            "render_mode": mode,
+        }, separators=(",", ":")).encode()
+        source_hash = hashlib.sha256(source).hexdigest()
+        envelope = json.dumps({
+            "envelope_version": 1,
+            "decision_identity": decision,
+            "business_date": DAY,
+            "push_kind": "PreopenNewsHot",
+            "sub_kind": "NONE",
+            "scope_key": "GLOBAL",
+            "schedule_occurrence_identity": occurrence,
+            "source_binding_canonical": list(source),
+            "source_binding_sha256": source_hash,
+            "source_evidence_fingerprint": source_hash,
+        }, separators=(",", ":")).encode()
         with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE delivery_decisions SET envelope_canonical=?,envelope_sha256=? "
+                "WHERE decision_identity=?",
+                (envelope, hashlib.sha256(envelope).hexdigest(), decision),
+            )
             connection.execute(
                 "INSERT INTO delivery_correlation_observations VALUES (?,?,?,?,?,?,?)",
                 (identity, 1, decision, producer, occurrence, "Origin", observed_at),
@@ -229,7 +256,6 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
         self.decision("SECRET_UNOBSERVED", "PreopenNewsHot")
         self.result("SECRET_UNOBSERVED_RESULT", "SECRET_UNOBSERVED")
         self.observe(decision)
-        self.observe(decision, producer="p01-compensation")
 
         report = self.report()
         p01 = next(unit for unit in report["units"] if unit["id"] == "MU-p01")
@@ -244,7 +270,7 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             "decisions": 1,
             "accepted_decision_candidates": 1,
             "accepted_result_events": 2,
-            "observed_producer_ids": ["p01-compensation", "p01-scheduled"],
+            "observed_producer_ids": ["p01-scheduled"],
         }])
         self.assertEqual(report["unattributed_kind_candidates"], [{
             "business_date": DAY,
@@ -263,6 +289,27 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             _origin_observation_identity("0" * 64, "p01-scheduled", "p01:2026-08-18"),
             "e5c9454f53641a7d13fed11e7d1290085f266ffe48f7a4c3e99fe9614646eaf1",
         )
+
+    def test_v10_compensation_mode_must_match_the_stored_source(self):
+        self.upgrade_v10()
+        decision = "c" * 64
+        self.decision(decision, "PreopenNewsHot")
+        self.observe(decision, producer="p01-compensation")
+        p01 = next(unit for unit in self.report()["units"] if unit["id"] == "MU-p01")
+        self.assertEqual(
+            p01["correlated_durable_candidates"][0]["observed_producer_ids"],
+            ["p01-compensation"],
+        )
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE delivery_correlation_observations SET producer_id='p01-scheduled'"
+            )
+            connection.execute(
+                "UPDATE delivery_correlation_observations SET observation_identity=?",
+                (_origin_observation_identity(decision, "p01-scheduled", f"p01:{DAY}"),),
+            )
+        with self.assertRaisesRegex(ValueError, "invalid v10"):
+            self.report()
 
     def test_v10_rejects_forged_or_misbound_origin(self):
         self.upgrade_v10()
@@ -299,6 +346,25 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             connection.execute(
                 "UPDATE delivery_decisions SET push_kind='DataMode' WHERE decision_identity=?",
                 (decision,),
+            )
+        with self.assertRaisesRegex(ValueError, "invalid v10"):
+            self.report()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE delivery_decisions SET push_kind='PreopenNewsHot' "
+                "WHERE decision_identity=?",
+                (decision,),
+            )
+            envelope = json.loads(connection.execute(
+                "SELECT envelope_canonical FROM delivery_decisions WHERE decision_identity=?",
+                (decision,),
+            ).fetchone()[0])
+            envelope["schedule_occurrence_identity"] = "p01:2026-09-27"
+            canonical = json.dumps(envelope, separators=(",", ":")).encode()
+            connection.execute(
+                "UPDATE delivery_decisions SET envelope_canonical=?,envelope_sha256=? "
+                "WHERE decision_identity=?",
+                (canonical, hashlib.sha256(canonical).hexdigest(), decision),
             )
         with self.assertRaisesRegex(ValueError, "invalid v10"):
             self.report()

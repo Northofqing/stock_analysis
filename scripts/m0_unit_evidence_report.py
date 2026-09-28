@@ -146,6 +146,47 @@ def _origin_observation_identity(decision: str, producer: str, occurrence: str) 
     return digest.hexdigest()
 
 
+def _p01_envelope_matches_origin(
+    canonical: bytes, canonical_sha256: str, decision: str, producer: str,
+    occurrence: str, day: str,
+) -> bool:
+    if (not isinstance(canonical, bytes)
+            or not isinstance(canonical_sha256, str)
+            or hashlib.sha256(canonical).hexdigest() != canonical_sha256):
+        return False
+    try:
+        envelope = json.loads(canonical)
+        source_octets = envelope["source_binding_canonical"]
+        if (not isinstance(source_octets, list)
+                or not source_octets
+                or any(type(octet) is not int or not 0 <= octet <= 255
+                       for octet in source_octets)):
+            return False
+        source_bytes = bytes(source_octets)
+        source = json.loads(source_bytes)
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+        return False
+    mode = {"p01-scheduled": "Scheduled", "p01-compensation": "Compensation"}[producer]
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    return (
+        isinstance(envelope, dict)
+        and isinstance(source, dict)
+        and envelope.get("envelope_version") == 1
+        and envelope.get("decision_identity") == decision
+        and envelope.get("business_date") == day
+        and envelope.get("push_kind") == "PreopenNewsHot"
+        and envelope.get("sub_kind") == "NONE"
+        and envelope.get("scope_key") == "GLOBAL"
+        and envelope.get("schedule_occurrence_identity") == occurrence
+        and envelope.get("source_binding_sha256") == source_sha256
+        and envelope.get("source_evidence_fingerprint") == source_sha256
+        and source.get("schema_version") == "P01_SOURCE_BINDING_V1"
+        and source.get("business_date") == day
+        and source.get("schedule_occurrence_identity") == occurrence
+        and source.get("render_mode") == mode
+    )
+
+
 def _correlated_candidates(connection, units, from_date, to_date):
     orphan = connection.execute(
         """
@@ -165,6 +206,7 @@ def _correlated_candidates(connection, units, from_date, to_date):
         SELECT c.observation_identity,c.identity_version,c.decision_identity,
                c.producer_id,c.occurrence_identity,c.role,c.observed_at,
                d.business_date,d.push_kind,d.sub_kind,d.scope_key,d.state,
+               d.envelope_canonical,d.envelope_sha256,
                COALESCE(s.accepted_events,0)
         FROM delivery_correlation_observations AS c
         JOIN delivery_decisions AS d ON d.decision_identity=c.decision_identity
@@ -182,7 +224,8 @@ def _correlated_candidates(connection, units, from_date, to_date):
     )
     decisions = {}
     for (identity, version, decision, producer, occurrence, role, observed_at,
-         day, kind, sub_kind, scope_key, state, accepted_events) in rows:
+         day, kind, sub_kind, scope_key, state, envelope_canonical,
+         envelope_sha256, accepted_events) in rows:
         if (not all(isinstance(value, str) for value in
                     (identity, decision, producer, occurrence, role, observed_at,
                      day, kind, sub_kind, scope_key, state))
@@ -190,10 +233,13 @@ def _correlated_candidates(connection, units, from_date, to_date):
                 or version != 1 or role != "Origin"
                 or producer not in ("p01-scheduled", "p01-compensation")
                 or by_producer.get(producer) != ("MU-p01", ["PreopenNewsHot"])
-                or kind != "PreopenNewsHot" or sub_kind != "None"
+                or kind != "PreopenNewsHot" or sub_kind != "NONE"
                 or scope_key != "GLOBAL" or occurrence != f"p01:{day}"
                 or _origin_observation_identity(decision, producer, occurrence) != identity
-                or not UTC_MILLIS.fullmatch(observed_at)):
+                or not UTC_MILLIS.fullmatch(observed_at)
+                or not _p01_envelope_matches_origin(
+                    envelope_canonical, envelope_sha256, decision, producer, occurrence, day
+                )):
             raise ValueError("invalid v10 P01 Origin correlation observation")
         try:
             _date(day)
@@ -251,7 +297,7 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str, units: list[dic
                 if table_type != ("table",) or not required <= columns:
                     raise ValueError(f"missing durable-delivery columns in {table}")
             if version == 10:
-                for column in ("sub_kind", "scope_key"):
+                for column in ("sub_kind", "scope_key", "envelope_canonical", "envelope_sha256"):
                     if column not in {
                         row[1] for row in connection.execute("PRAGMA table_info(delivery_decisions)")
                     }:
