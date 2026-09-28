@@ -511,12 +511,27 @@ where
         }) {
             match envelope.wechat_http_body.as_ref() {
                 Some(body) => log::info!(
-                    "[chain_shadow_wechat_body] phase={} schedule_date={} report_input_sha256={:x} scope=wechat_http_entity_body built_requests={} built_body_bytes={} sequence_sha256={} full_http_wire=unobserved other_channels=unobserved coverage=incomplete",
+                    "[chain_shadow_wechat_body] phase={} schedule_date={} report_input_sha256={:x} scope=wechat_http_entity_body built_requests={} built_body_bytes={} sequence_sha256={} full_http_wire=unobserved non_wechat_feishu_channels=unobserved coverage=incomplete",
                     phase.as_str(), date, Sha256::digest(&envelope.report_input),
                     body.request_count(), body.total_body_bytes(), body.sequence_sha256()
                 ),
                 None => log::warn!(
                     "[chain_shadow_wechat_body] phase={} schedule_date={} scope=wechat_http_entity_body status=unobserved reason=no_built_or_readable_request_body coverage=incomplete",
+                    phase.as_str(), date
+                ),
+            }
+        }
+        if report.attempts().iter().any(|attempt| {
+            attempt.channel() == stock_analysis::notification::NotificationChannel::Feishu
+        }) {
+            match envelope.feishu_http_body.as_ref() {
+                Some(body) => log::info!(
+                    "[chain_shadow_feishu_body] phase={} schedule_date={} report_input_sha256={:x} scope=feishu_http_entity_body built_requests={} built_body_bytes={} sequence_sha256={} headers=unobserved framing=unobserved tls=unobserved non_wechat_feishu_channels=unobserved coverage=incomplete",
+                    phase.as_str(), date, Sha256::digest(&envelope.report_input),
+                    body.request_count(), body.total_body_bytes(), body.sequence_sha256()
+                ),
+                None => log::warn!(
+                    "[chain_shadow_feishu_body] phase={} schedule_date={} scope=feishu_http_entity_body status=unobserved reason=no_built_or_readable_request_body coverage=incomplete",
                     phase.as_str(), date
                 ),
             }

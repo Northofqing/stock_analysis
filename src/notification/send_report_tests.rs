@@ -3,7 +3,7 @@ use super::{
     NotificationService,
 };
 use crate::monitor::push_job::WeakOutcomeKind;
-use crate::notification::WechatHttpBodyObservation;
+use crate::notification::{FeishuHttpBodyObservation, WechatHttpBodyObservation};
 use sha2::{Digest, Sha256};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -250,15 +250,29 @@ fn received_http_body(request: &[u8]) -> &[u8] {
     &request[body_start..]
 }
 
-fn received_wechat_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+fn received_body_sequence_sha256(requests: &[Vec<u8>], domain: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"stock_analysis.wechat_http_entity_body_sequence.v1\0");
+    hasher.update(domain);
     for request in requests {
         let body = received_http_body(request);
         hasher.update((body.len() as u64).to_be_bytes());
         hasher.update(body);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn received_wechat_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+    received_body_sequence_sha256(
+        requests,
+        b"stock_analysis.wechat_http_entity_body_sequence.v1\0",
+    )
+}
+
+fn received_feishu_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+    received_body_sequence_sha256(
+        requests,
+        b"stock_analysis.feishu_http_entity_body_sequence.v1\0",
+    )
 }
 
 fn feishu_payload_content(request: &[u8]) -> String {
@@ -556,6 +570,105 @@ async fn feishu_fallback_is_internal_to_one_observed_target() {
         &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
     );
     assert_eq!(fallback_success.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn feishu_observation_matches_card_and_text_fallback_bodies_received_on_loopback() {
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"code":1}"#),
+        ScriptedResponse::Http(r#"{"code":0}"#),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: 20_000,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+    let mut wechat_observation = WechatHttpBodyObservation::default();
+    let mut feishu_observation = FeishuHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_http_bodies(
+            "TEST_CODE card fallback",
+            &mut wechat_observation,
+            &mut feishu_observation,
+        )
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
+    );
+    assert!(wechat_observation.finish().is_none());
+    let requests = fixture.finish();
+    let summary = feishu_observation.finish().expect("both Feishu bodies");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(feishu_payload(&requests[0])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[1])["msg_type"], "text");
+    assert_eq!(summary.request_count(), 2);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_feishu_body_sequence_sha256(&requests)
+    );
+}
+
+#[tokio::test]
+async fn feishu_observation_keeps_prior_chunk_and_fallback_bodies_after_parse_failure() {
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"code":0}"#),
+        ScriptedResponse::Http(r#"{"code":1}"#),
+        ScriptedResponse::Http("TEST_CODE_INVALID_JSON"),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: 512,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+    let content = format!("TEST_CODE {}\n### \n", "A".repeat(600));
+    let mut wechat_observation = WechatHttpBodyObservation::default();
+    let mut feishu_observation = FeishuHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_http_bodies(
+            &content,
+            &mut wechat_observation,
+            &mut feishu_observation,
+        )
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Unknown)],
+    );
+    assert!(wechat_observation.finish().is_none());
+    let requests = fixture.finish();
+    let summary = feishu_observation
+        .finish()
+        .expect("all built Feishu bodies before the parse failure");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(feishu_payload(&requests[0])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[1])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[2])["msg_type"], "text");
+    assert_eq!(summary.request_count(), 3);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_feishu_body_sequence_sha256(&requests)
+    );
 }
 
 #[tokio::test]

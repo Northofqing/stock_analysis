@@ -20,6 +20,7 @@
 pub mod config;
 pub mod email;
 pub mod feishu;
+mod http_body_observation;
 pub mod report;
 pub mod send_report;
 pub mod service;
@@ -29,6 +30,7 @@ pub mod wechat;
 pub(crate) mod send_report_tests;
 
 pub use config::{NotificationChannel, NotificationConfig, SmtpConfig};
+pub use feishu::{FeishuHttpBodyObservation, FeishuHttpBodySummary};
 pub use send_report::{NotificationAttempt, NotificationCompletion, NotificationSendReport};
 pub use service::{send_daily_report, AnalysisResult, NotificationService};
 pub use wechat::{WechatHttpBodyObservation, WechatHttpBodySummary};

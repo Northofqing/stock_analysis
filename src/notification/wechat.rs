@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use log::{error, info};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
+use super::http_body_observation::{HttpBodyObservation, HttpBodySummary};
 use super::service::NotificationService;
 
 const BODY_SEQUENCE_DOMAIN: &[u8] = b"stock_analysis.wechat_http_entity_body_sequence.v1\0";
@@ -12,74 +12,46 @@ const BODY_SEQUENCE_DOMAIN: &[u8] = b"stock_analysis.wechat_http_entity_body_seq
 /// The exact JSON entity bodies taken from the Reqwest requests submitted by
 /// one WeChat send. This does not observe HTTP headers, framing, TLS, or receipt.
 pub struct WechatHttpBodyObservation {
-    request_count: usize,
-    total_body_bytes: usize,
-    complete: bool,
-    sequence_hasher: Sha256,
+    inner: HttpBodyObservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WechatHttpBodySummary {
-    request_count: usize,
-    total_body_bytes: usize,
-    sequence_sha256: String,
+    inner: HttpBodySummary,
 }
 
 impl WechatHttpBodySummary {
     pub const fn request_count(&self) -> usize {
-        self.request_count
+        self.inner.request_count()
     }
 
     pub const fn total_body_bytes(&self) -> usize {
-        self.total_body_bytes
+        self.inner.total_body_bytes()
     }
 
     pub fn sequence_sha256(&self) -> &str {
-        &self.sequence_sha256
+        self.inner.sequence_sha256()
     }
 }
 
 impl Default for WechatHttpBodyObservation {
     fn default() -> Self {
-        let mut sequence_hasher = Sha256::new();
-        sequence_hasher.update(BODY_SEQUENCE_DOMAIN);
         Self {
-            request_count: 0,
-            total_body_bytes: 0,
-            complete: true,
-            sequence_hasher,
+            inner: HttpBodyObservation::new(BODY_SEQUENCE_DOMAIN),
         }
     }
 }
 
 impl WechatHttpBodyObservation {
     fn observe_request(&mut self, request: &reqwest::Request) {
-        let Some(count) = self.request_count.checked_add(1) else {
-            self.complete = false;
-            return;
-        };
-        self.request_count = count;
-        let Some(body) = request.body().and_then(reqwest::Body::as_bytes) else {
-            self.complete = false;
-            return;
-        };
-        let Some(total) = self.total_body_bytes.checked_add(body.len()) else {
-            self.complete = false;
-            return;
-        };
-        self.total_body_bytes = total;
-        self.sequence_hasher
-            .update((body.len() as u64).to_be_bytes());
-        self.sequence_hasher.update(body);
+        self.inner.observe_request(request);
     }
 
     /// None means no WeChat request was built or at least one body was opaque.
     pub fn finish(self) -> Option<WechatHttpBodySummary> {
-        (self.complete && self.request_count > 0).then(|| WechatHttpBodySummary {
-            request_count: self.request_count,
-            total_body_bytes: self.total_body_bytes,
-            sequence_sha256: format!("{:x}", self.sequence_hasher.finalize()),
-        })
+        self.inner
+            .finish()
+            .map(|inner| WechatHttpBodySummary { inner })
     }
 }
 

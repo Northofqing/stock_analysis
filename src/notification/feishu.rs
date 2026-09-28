@@ -6,7 +6,56 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
 
+use super::http_body_observation::{HttpBodyObservation, HttpBodySummary};
 use super::service::NotificationService;
+
+const BODY_SEQUENCE_DOMAIN: &[u8] = b"stock_analysis.feishu_http_entity_body_sequence.v1\0";
+
+/// The built Feishu card and fallback text entity bodies from one send.
+/// This does not observe HTTP headers, framing, TLS, or remote receipt.
+pub struct FeishuHttpBodyObservation {
+    inner: HttpBodyObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeishuHttpBodySummary {
+    inner: HttpBodySummary,
+}
+
+impl FeishuHttpBodySummary {
+    pub const fn request_count(&self) -> usize {
+        self.inner.request_count()
+    }
+
+    pub const fn total_body_bytes(&self) -> usize {
+        self.inner.total_body_bytes()
+    }
+
+    pub fn sequence_sha256(&self) -> &str {
+        self.inner.sequence_sha256()
+    }
+}
+
+impl Default for FeishuHttpBodyObservation {
+    fn default() -> Self {
+        Self {
+            inner: HttpBodyObservation::new(BODY_SEQUENCE_DOMAIN),
+        }
+    }
+}
+
+impl FeishuHttpBodyObservation {
+    fn observe_request(&mut self, request: &reqwest::Request) {
+        self.inner.observe_request(request);
+    }
+
+    /// None means no Feishu request was built or at least one body was opaque.
+    pub fn finish(self) -> Option<FeishuHttpBodySummary> {
+        self.inner
+            .finish()
+            .map(|inner| FeishuHttpBodySummary { inner })
+    }
+}
 
 static RE_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap());
 static RE_MULTI_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
@@ -116,6 +165,14 @@ fn plan_feishu_messages(content: &str, max_bytes: usize) -> Result<Vec<String>> 
 impl NotificationService {
     /// 发送到飞书
     pub async fn send_to_feishu(&self, content: &str) -> Result<bool> {
+        self.send_to_feishu_with_observation(content, None).await
+    }
+
+    pub(super) async fn send_to_feishu_with_observation(
+        &self,
+        content: &str,
+        observation: Option<&mut FeishuHttpBodyObservation>,
+    ) -> Result<bool> {
         let url = self
             .config
             .feishu_webhook_url
@@ -131,13 +188,20 @@ impl NotificationService {
 
         if formatted.len() > max_bytes {
             info!("飞书消息内容超长，将分批发送");
-            return self.send_feishu_chunked(url, &formatted, max_bytes).await;
+            return self
+                .send_feishu_chunked(url, &formatted, max_bytes, observation)
+                .await;
         }
 
-        self.send_feishu_message(url, &formatted).await
+        self.send_feishu_message(url, &formatted, observation).await
     }
 
-    pub(super) async fn send_feishu_message(&self, url: &str, content: &str) -> Result<bool> {
+    pub(super) async fn send_feishu_message(
+        &self,
+        url: &str,
+        content: &str,
+        mut observation: Option<&mut FeishuHttpBodyObservation>,
+    ) -> Result<bool> {
         // 优先使用交互卡片
         let card_payload = json!({
             "msg_type": "interactive",
@@ -159,7 +223,11 @@ impl NotificationService {
             }
         });
 
-        let response = self.client.post(url).json(&card_payload).send().await?;
+        let request = self.client.post(url).json(&card_payload).build()?;
+        if let Some(observation) = observation.as_deref_mut() {
+            observation.observe_request(&request);
+        }
+        let response = self.client.execute(request).await?;
 
         if response.status().is_success() {
             let result: serde_json::Value = response.json().await?;
@@ -177,7 +245,11 @@ impl NotificationService {
             }
         });
 
-        let response = self.client.post(url).json(&text_payload).send().await?;
+        let request = self.client.post(url).json(&text_payload).build()?;
+        if let Some(observation) = observation {
+            observation.observe_request(&request);
+        }
+        let response = self.client.execute(request).await?;
         let status = response.status();
         let body: serde_json::Value = response.json().await?;
         Ok(status.is_success() && feishu_business_accepted(&body)?)
@@ -188,13 +260,17 @@ impl NotificationService {
         url: &str,
         content: &str,
         max_bytes: usize,
+        mut observation: Option<&mut FeishuHttpBodyObservation>,
     ) -> Result<bool> {
         let messages = plan_feishu_messages(content, max_bytes)?;
         let total = messages.len();
         let mut success = 0;
 
         for (i, message) in messages.iter().enumerate() {
-            if self.send_feishu_message(url, message).await? {
+            if self
+                .send_feishu_message(url, message, observation.as_deref_mut())
+                .await?
+            {
                 success += 1;
             }
 
