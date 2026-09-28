@@ -5744,27 +5744,6 @@ mod tests {
         );
 
         assert_converter_contract!(
-            "futures_delivery",
-            futures_delivery,
-            "Tdx",
-            ProviderId::Tdx,
-            "TEST_CODE_source",
-            serde_json::json!([{
-                "contract_code": "TEST_CODE_IF2608",
-                "product_code": "TEST_CODE_IF",
-                "last_trading_date": null,
-                "delivery_date": "2026-08-21",
-                "notice_url": "https://example.com/TEST_CODE_FD"
-            }]),
-            |records| {
-                assert_eq!(records[0].contract_code, "TEST_CODE_IF2608");
-            },
-            |invalid| {
-                invalid[0]["delivery_date"] = serde_json::json!("bad-date");
-            }
-        );
-
-        assert_converter_contract!(
             "market_statistics",
             market_statistics,
             "Tdx",

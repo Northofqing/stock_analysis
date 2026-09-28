@@ -141,7 +141,7 @@ pub fn build_external_native_query_request(
                 .ok_or(ExternalContractError::InvalidParameters)?;
             (
                 "magic.market.futures_delivery.request",
-                1,
+                2,
                 "Cffex".to_owned(),
                 serde_json::json!({"year": year, "month": month}),
             )
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(request.preferred_provider, "Cffex");
         let payload = request.payload.expect("versioned delivery payload");
         assert_eq!(payload.schema, "magic.market.futures_delivery.request");
-        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.schema_version, 2);
         assert_eq!(
             serde_json::from_slice::<Value>(&payload.data).unwrap(),
             json!({"year": 2026, "month": 9})

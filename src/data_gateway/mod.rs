@@ -87,6 +87,7 @@ pub use exchange_calendar_authority::{
 };
 pub use futures_delivery::{
     cffex_futures_delivery_live_supported, FuturesDeliveryFact, FuturesDeliveryGateway,
+    FuturesDeliveryPlannedFact,
 };
 pub use general_web_research::{
     GeneralWebResearchBatch, GeneralWebResearchBatchEvidence, GeneralWebResearchError,

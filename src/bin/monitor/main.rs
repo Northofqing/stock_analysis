@@ -4924,7 +4924,7 @@ async fn main() {
         log::info!("[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=supported");
     } else {
         log::warn!(
-            "[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=unavailable reason_code=futures_delivery_contract_unavailable_v1; upstream product is published but local request/coverage contract is not verified; EventCalendar sink remains blocked"
+            "[R-08][BR-165][BR-199] component=cffex_futures_delivery capability=unavailable reason_code=cffex_confirmed_delivery_authority_unavailable_v2; upstream only supplies a planned calendar without month-specific confirmation; EventCalendar sink remains blocked"
         );
     }
     if test_mode {
@@ -12912,7 +12912,7 @@ mod tests_post_session_review_scheduler {
 
         assert!(!production.contains("producer activation disabled=no_producer"));
         assert!(production.contains(
-            "component=cffex_futures_delivery capability=unsupported; EventCalendar delivery remains retryable and sink-blocked"
+            "component=cffex_futures_delivery capability=unavailable reason_code=cffex_confirmed_delivery_authority_unavailable_v2; upstream only supplies a planned calendar without month-specific confirmation; EventCalendar sink remains blocked"
         ));
         assert!(production.contains("durable_delivery_runtime::ensure_startup_reconciled().await"));
         let runner = production

@@ -30,6 +30,38 @@ const TEST_TLS_SERVER_NAME: &str = "macro.test.invalid";
 const TEST_RECORD_DATA: &[u8] = br#"{"item_id":"TEST_CODE_EXTERNAL_NEWS_001","title":"TEST_CODE external data title","summary":"TEST_CODE external data summary","content":"TEST_CODE external data content","publisher":"TEST_CODE Eastmoney publisher","url":"https://example.com/TEST_CODE_EXTERNAL_NEWS_001","published_at":"2026-09-14T15:30:00+08:00","instruments":[{"exchange":"Shanghai","code":"TEST_CODE_600001","asset_class":"Equity"}],"topics":["TEST_CODE_external_topic"],"language":"zh-CN","evidence":{"provider":"Eastmoney","source_at":"2026-09-14 15:30","observed_at":"2026-09-14T15:31:00+08:00","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}}"#;
 const TEST_AUCTION_RECORD_DATA: &[u8] = r#"{"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"name":"贵州茅台","requested_stage":"live","auction_phase":"matching","data_status":"live","auction_price":null,"pre_close_price":1316.01,"auction_pct":null,"auction_volume_shares":0.0,"auction_amount":0.0,"auction_unmatched":-321.0,"auction_turnover_pct":null,"auction_volume_ratio":null,"auction_yesterday_ratio_pct":null,"float_market_cap":1653000000000.0,"last_price":null,"open_price":null,"evidence":{"provider":"Tonghuashun","source_at":null,"observed_at":"unix-ms:1788956044416","batch_id":"TEST_CODE_HITHINK_AUCTION_BATCH"}}"#.as_bytes();
 const TEST_RELEASE_RECORD_DATA: &[u8] = r#"{"event_id":"202607250001","indicator_id":950,"country":"中国","name":"规模以上工业企业利润","period":"6月","scheduled_at":"2026-07-25T09:30:00+08:00","released_at":"2026-07-25T09:30:01+08:00","previous":"-9.1","consensus":null,"actual":"0","revised":null,"unit":"%","importance":3,"impact":"1","evidence":{"provider":"Jin10","source_at":"2026-07-25 09:30:01","observed_at":"1784943002.000000000","batch_id":"TEST_CODE_JIN10_RELEASE_BATCH"}}"#.as_bytes();
+const TEST_CFFEX_DELIVERY_BATCH: &str = "cffex-equity-index-planned-delivery-2026-v2:09";
+const TEST_CFFEX_DELIVERY_OBSERVED_AT: &str = "1790478510.469882800";
+const TEST_CFFEX_HOLIDAY_URL: &str =
+    "https://www.gov.cn/gongbao/2025/issue_12406/material/gwygb202532.pdf";
+
+fn test_futures_delivery_record_data(product: &str, contract_code: &str) -> Vec<u8> {
+    let rule_url = match product {
+        "If" => "https://www.cffex.com.cn/cn/hs300.html",
+        "Ih" => "https://www.cffex.com.cn/cn/sz50gzqh.html",
+        "Ic" => "https://www.cffex.com.cn/cn/zz500.html",
+        "Im" => "https://www.cffex.com.cn/zz1000/",
+        _ => unreachable!("closed CFFEX fixture products"),
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "product": product,
+        "contract_code": contract_code,
+        "last_trading_date": "2026-09-18",
+        "delivery_date": "2026-09-18",
+        "method": "Cash",
+        "schedule_status": "Planned",
+        "date_basis": "CffexRuleAndPublishedHolidays",
+        "rule_url": rule_url,
+        "holiday_calendar_url": TEST_CFFEX_HOLIDAY_URL,
+        "evidence": {
+            "provider": "Cffex",
+            "source_at": null,
+            "observed_at": TEST_CFFEX_DELIVERY_OBSERVED_AT,
+            "batch_id": TEST_CFFEX_DELIVERY_BATCH
+        }
+    }))
+    .expect("TEST_CODE CFFEX delivery record JSON")
+}
 
 fn test_schedule_record_data(release_date: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -85,6 +117,7 @@ enum ExternalCapabilitiesBehavior {
     Auction,
     ReleaseObservations,
     ReleaseSchedule,
+    FuturesDelivery,
 }
 
 #[derive(Default)]
@@ -275,6 +308,18 @@ impl SystemService for ExternalQueryWireService {
                     runtime_available: true,
                     provider: "Fred".to_owned(),
                     exact_scope: "TEST_CODE_FRED_DATE_RANGE".to_owned(),
+                    blocker: String::new(),
+                    diagnostic_available: true,
+                }],
+            },
+            ExternalCapabilitiesBehavior::FuturesDelivery => CapabilitiesResponse {
+                request_id,
+                capabilities: vec![Capability {
+                    operation: Operation::FuturesDelivery as i32,
+                    repository_admission: AdmissionState::Admitted as i32,
+                    runtime_available: true,
+                    provider: "Cffex".to_owned(),
+                    exact_scope: "TEST_CODE_CFFEX_DELIVERY_2026_09".to_owned(),
                     blocker: String::new(),
                     diagnostic_available: true,
                 }],
@@ -520,6 +565,46 @@ impl ExternalQueryWireService {
                 diagnostic_blocker: String::new(),
             }));
         }
+        if operation == Operation::FuturesDelivery {
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE CFFEX payload missing"))?;
+            let body: serde_json::Value = serde_json::from_slice(&payload.data)
+                .map_err(|_| Status::invalid_argument("TEST_CODE CFFEX request JSON invalid"))?;
+            if payload.schema != "magic.market.futures_delivery.request"
+                || payload.schema_version != 2
+                || requested_provider != "Cffex"
+                || body != serde_json::json!({"year": 2026, "month": 9})
+            {
+                return Err(Status::invalid_argument("TEST_CODE CFFEX request contract"));
+            }
+            return Ok(Response::new(QueryResponse {
+                request_id,
+                operation: operation as i32,
+                admission: AdmissionState::Admitted as i32,
+                selected_provider: "Cffex".to_owned(),
+                batch_id: TEST_CFFEX_DELIVERY_BATCH.to_owned(),
+                complete: true,
+                observed_at: TEST_CFFEX_DELIVERY_OBSERVED_AT.to_owned(),
+                source_at: String::new(),
+                records: [
+                    ("If", "IF2609"),
+                    ("Ih", "IH2609"),
+                    ("Ic", "IC2609"),
+                    ("Im", "IM2609"),
+                ]
+                .into_iter()
+                .map(|(product, contract_code)| CanonicalPayload {
+                    schema: "magic.market.futures_delivery_event".to_owned(),
+                    schema_version: 2,
+                    content_type: "application/json; charset=utf-8".to_owned(),
+                    data: test_futures_delivery_record_data(product, contract_code),
+                })
+                .collect(),
+                diagnostic_blocker: String::new(),
+            }));
+        }
         Ok(Response::new(QueryResponse {
             request_id,
             operation: operation as i32,
@@ -615,6 +700,13 @@ macro_rules! external_query_wire_service {
                 self.respond(request, "economic_release_schedule", Operation::EconomicReleaseSchedule).await
             }
 
+            async fn futures_delivery(
+                &self,
+                request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                self.respond(request, "futures_delivery", Operation::FuturesDelivery).await
+            }
+
             $(async fn $method(
                 &self,
                 request: Request<QueryRequest>,
@@ -650,7 +742,6 @@ external_query_wire_service!(
     global_indices,
     foreign_exchange,
     economic_calendar,
-    futures_delivery,
     reference_rates,
     official_fx_fixings,
     economic_series,
@@ -918,6 +1009,15 @@ impl ExternalQueryWireFixture {
             ExternalQueryWireRoute::Generated,
             ExternalQueryWireReply::Success,
             ExternalCapabilitiesBehavior::ReleaseSchedule,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_qualified_futures_delivery() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::Success,
+            ExternalCapabilitiesBehavior::FuturesDelivery,
         )
         .await
     }

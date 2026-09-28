@@ -25,12 +25,12 @@ use crate::data_gateway::outcome_daily_bars::{OutcomeTransportFailure, RawOutcom
 use crate::data_gateway::{
     board_ranking::BoardRankingFact, BlockTradeReview, BoardDirectoryFact, BoardFlowFact,
     BoardKind, BoardMembershipRecord, DragonTigerStockReview, EconomicReleaseFact,
-    EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, GatewayBatch, GatewayError,
-    GeneralWebResearchBatch, GeneralWebResearchProvider, GlobalIndexFact, GlobalNewsProvider,
-    GlobalNewsRecord, ImplementedCorporateAction, InstrumentFundFlowFact, IntradayShapeFact,
-    MarketMinutePoint, MarketMoneyFlow, MarketOrderBook, MarketSecurityMetadata,
-    NorthboundDailyFact, ProviderTopNFact, RealtimeIndexQuote, RealtimeMarketQuote,
-    ResearchReportFact, SinaInstrumentNewsRecord, T0Batch, UpperLimitRecord,
+    EventAnnouncement, ForeignExchangeFact, FuturesDeliveryFact, FuturesDeliveryPlannedFact,
+    GatewayBatch, GatewayError, GeneralWebResearchBatch, GeneralWebResearchProvider,
+    GlobalIndexFact, GlobalNewsProvider, GlobalNewsRecord, ImplementedCorporateAction,
+    InstrumentFundFlowFact, IntradayShapeFact, MarketMinutePoint, MarketMoneyFlow, MarketOrderBook,
+    MarketSecurityMetadata, NorthboundDailyFact, ProviderTopNFact, RealtimeIndexQuote,
+    RealtimeMarketQuote, ResearchReportFact, SinaInstrumentNewsRecord, T0Batch, UpperLimitRecord,
 };
 use crate::data_provider::{consensus::ConsensusData, KlineData};
 pub(crate) use crate::grpc_client::client::board_attempt::{
@@ -1110,6 +1110,7 @@ fn reason_code_static(s: &str) -> &'static str {
         "exact_batch_join_accepted",
         "database_failure",
         "external_source_field_conflict",
+        "external_response_wire_invalid",
         "external_acquisition_authority_missing",
         "provider_authentication_rejected",
         "provider_rate_limited",
@@ -2143,10 +2144,15 @@ fn require_valid_requested_codes(
     requested: &[String],
 ) -> Result<(), GatewayError> {
     let unique = requested.iter().map(String::as_str).collect::<HashSet<_>>();
-    if requested.is_empty() || unique.len() != requested.len() {
+    if requested.is_empty()
+        || unique.len() != requested.len()
+        || requested
+            .iter()
+            .any(|code| code.trim().is_empty() || code != code.trim())
+    {
         return Err(GatewayError::invalid_request(
             capability,
-            "live request requires a non-empty unique instrument set",
+            "live request requires non-empty unique instrument codes",
         ));
     }
     Ok(())
@@ -3687,14 +3693,14 @@ impl GrpcSource {
             "unavailable",
             crate::data_gateway::futures_delivery::FUTURES_DELIVERY_CONTRACT_UNAVAILABLE_V1,
             false,
-            "futures delivery request/coverage contract is unavailable; raw source bypass is disabled",
+            "raw FuturesDelivery bypass is disabled; use the explicit planned-calendar Gateway, while confirmed delivery remains unavailable",
         ))
     }
 
-    pub(super) async fn futures_delivery_2026_async(
+    pub(super) async fn futures_delivery_planned_2026_async(
         &self,
         request: crate::data_gateway::futures_delivery::FuturesDeliveryRequest,
-    ) -> Result<GatewayBatch<FuturesDeliveryFact>, GatewayError> {
+    ) -> Result<GatewayBatch<FuturesDeliveryPlannedFact>, GatewayError> {
         let response = self
             .query_external_native_op(ExternalOperation::FuturesDelivery, request.params())
             .await?;
@@ -4817,6 +4823,21 @@ mod tests {
     }
 
     #[test]
+    fn external_response_wire_failure_keeps_its_reason_at_gateway() {
+        let error = GrpcError::FailedPrecondition {
+            details: Box::new(crate::grpc_client::errors::ErrorDetail {
+                code: "external_response_wire_invalid".to_owned(),
+                reason_code: Some("external_response_wire_invalid".to_owned()),
+                retryable: Some(false),
+                ..Default::default()
+            }),
+        };
+        let mapped = map_external_query_error_named("FuturesDelivery", &error);
+        assert_eq!(mapped.reason_code(), "external_response_wire_invalid");
+        assert!(!mapped.retryable());
+    }
+
+    #[test]
     fn benchmark_transport_ownership_is_explicit_not_reason_derived() {
         let same_error = GatewayError::classified(
             "GrpcBridge",
@@ -5398,6 +5419,25 @@ mod tests {
             )
             .expect_err("missing, extra or duplicate live identities fail closed");
             assert_eq!(error.reason_code(), "invalid_evidence");
+            assert!(!error.retryable());
+        }
+    }
+
+    #[test]
+    fn br238_live_wrappers_reject_blank_requested_instrument_codes() {
+        let capability = "RealtimeMarketQuotes";
+        require_valid_requested_codes(capability, &["600519".to_owned()])
+            .expect("one non-empty requested instrument is valid");
+        for requested in [
+            vec![String::new()],
+            vec![" ".to_owned()],
+            vec!["600519".to_owned(), "\t".to_owned()],
+            vec![" 600519".to_owned()],
+            vec!["600519 ".to_owned()],
+        ] {
+            let error = require_valid_requested_codes(capability, &requested)
+                .expect_err("blank identity cannot authorize a live quote request");
+            assert_eq!(error.reason_code(), "invalid_request");
             assert!(!error.retryable());
         }
     }

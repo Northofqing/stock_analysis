@@ -19,8 +19,10 @@ pub(crate) const EXTERNAL_QUERY_DECODE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES: usize =
     EXTERNAL_QUERY_DECODE_LIMIT_BYTES + 5;
 const EXTERNAL_WIRE_MATERIAL: &str = "external-unary-response-evidence-v1";
+// The 2026-09-27.1 public bundle compiles to this descriptor. Historical
+// 2026-09-17.1 records keep their separate, frozen decoder and digest.
 pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
-    "5ba0fa3b2fa450e74bdcc8cb5f163348a6ca90df3f3626d1d8f2ec27137f5edb";
+    "59158661146ff429f092c49584601147080b9e631e941e4acb2d96fe7a22bf7b";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ExternalQueryMethod {

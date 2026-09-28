@@ -1,6 +1,7 @@
 //! Secret-safe opening-readiness and selected native-query probe for the authenticated bundle.
 
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,11 +15,13 @@ use stock_analysis::grpc_client::external_pb::magic::market::v1::{
     Operation as ExternalOperation,
 };
 use stock_analysis::grpc_client::pb::magic::market::v1::{AdmissionState, Operation};
+use stock_analysis::market_domain::{EvidenceTimestamp, ProviderId, SourceEvidence};
 
 const DIRECT_EXTERNAL_OPERATIONS: &[ExternalOperation] = &[
     ExternalOperation::SecurityMetadata,
     ExternalOperation::GlobalNews,
     ExternalOperation::InstrumentNews,
+    ExternalOperation::FuturesDelivery,
     ExternalOperation::CurrentAuctionObservations,
     ExternalOperation::EconomicReleaseObservations,
     ExternalOperation::EconomicReleaseSchedule,
@@ -74,10 +77,15 @@ struct Args {
     start: Option<String>,
     #[arg(long)]
     end: Option<String>,
+    #[arg(long)]
+    year: Option<u32>,
+    #[arg(long)]
+    month: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeOperation {
+    FuturesDelivery,
     CurrentAuctionObservations,
     EconomicReleaseObservations,
     EconomicReleaseSchedule,
@@ -89,11 +97,53 @@ struct NativeQuerySpec {
     provider: &'static str,
     record_provider: &'static str,
     record_schema: &'static str,
+    record_version: u32,
     record_source_at: bool,
+    delivery_scope: Option<(u32, u32)>,
+}
+
+const CFFEX_HOLIDAY_URL: &str =
+    "https://www.gov.cn/gongbao/2025/issue_12406/material/gwygb202532.pdf";
+const CFFEX_2026_PLANNED_DAYS: [u32; 12] = [16, 24, 20, 17, 15, 22, 17, 21, 18, 16, 20, 18];
+
+fn cffex_rule_url(product: &str) -> Option<(&'static str, &'static str)> {
+    match product {
+        "If" => Some(("IF", "https://www.cffex.com.cn/cn/hs300.html")),
+        "Ih" => Some(("IH", "https://www.cffex.com.cn/cn/sz50gzqh.html")),
+        "Ic" => Some(("IC", "https://www.cffex.com.cn/cn/zz500.html")),
+        "Im" => Some(("IM", "https://www.cffex.com.cn/zz1000/")),
+        _ => None,
+    }
+}
+
+fn futures_delivery_scope(args: &Args) -> anyhow::Result<(u32, u32)> {
+    let year = args
+        .year
+        .ok_or_else(|| anyhow::anyhow!("--year is required"))?;
+    let month = args
+        .month
+        .ok_or_else(|| anyhow::anyhow!("--month is required"))?;
+    if year != 2026 || !(1..=12).contains(&month) {
+        anyhow::bail!("FuturesDelivery probe only supports a 2026 contract month");
+    }
+    Ok((year, month))
 }
 
 fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<NativeQuerySpec> {
     let spec = match selection {
+        NativeOperation::FuturesDelivery => {
+            let (year, month) = futures_delivery_scope(args)?;
+            NativeQuerySpec {
+                operation: ExternalOperation::FuturesDelivery,
+                params: serde_json::json!({"year": year, "month": month}),
+                provider: "Cffex",
+                record_provider: "Cffex",
+                record_schema: "magic.market.futures_delivery_event",
+                record_version: 2,
+                record_source_at: false,
+                delivery_scope: Some((year, month)),
+            }
+        }
         NativeOperation::CurrentAuctionObservations => {
             if !matches!(args.stage.as_str(), "live" | "final") {
                 anyhow::bail!("auction stage must be live or final");
@@ -108,7 +158,9 @@ fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<
                 provider: "HithinkFinance",
                 record_provider: "Tonghuashun",
                 record_schema: "magic.market.current_auction_observation",
+                record_version: 1,
                 record_source_at: false,
+                delivery_scope: None,
             }
         }
         NativeOperation::EconomicReleaseObservations => {
@@ -127,7 +179,9 @@ fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<
                 provider: "Jin10",
                 record_provider: "Jin10",
                 record_schema: "magic.market.economic_release_observation",
+                record_version: 1,
                 record_source_at: true,
+                delivery_scope: None,
             }
         }
         NativeOperation::EconomicReleaseSchedule => {
@@ -155,20 +209,76 @@ fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<
                 provider: "Fred",
                 record_provider: "Fred",
                 record_schema: "magic.market.economic_release_schedule_entry",
+                record_version: 1,
                 record_source_at: false,
+                delivery_scope: None,
             }
         }
     };
     Ok(spec)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FuturesDeliveryProbeRecord {
+    product: String,
+    contract_code: String,
+    last_trading_date: Option<chrono::NaiveDate>,
+    delivery_date: chrono::NaiveDate,
+    method: String,
+    schedule_status: String,
+    date_basis: String,
+    rule_url: String,
+    holiday_calendar_url: String,
+    evidence: SourceEvidence,
+}
+
+// This is a planned-calendar probe, not confirmation that delivery occurred.
+fn validate_futures_delivery(result: &QueryResult, year: u32, month: u32) -> anyhow::Result<()> {
+    if result.records.len() != 4
+        || result.batch_id != format!("cffex-equity-index-planned-delivery-2026-v2:{month:02}")
+    {
+        anyhow::bail!("CFFEX monthly delivery batch must cover four products");
+    }
+    let batch_at = EvidenceTimestamp::parse_instant(&result.observed_at)
+        .map_err(|_| anyhow::anyhow!("CFFEX batch observation time is invalid"))?;
+    let suffix = format!("{:02}{month:02}", year % 100);
+    let expected_date =
+        chrono::NaiveDate::from_ymd_opt(2026, month, CFFEX_2026_PLANNED_DAYS[month as usize - 1])
+            .ok_or_else(|| anyhow::anyhow!("CFFEX planned date invalid"))?;
+    let mut products = BTreeSet::new();
+    for payload in &result.records {
+        let record: FuturesDeliveryProbeRecord = serde_json::from_slice(&payload.data)
+            .map_err(|_| anyhow::anyhow!("CFFEX delivery record contract is invalid"))?;
+        let (product_code, rule_url) = cffex_rule_url(&record.product)
+            .ok_or_else(|| anyhow::anyhow!("CFFEX delivery product is outside IF/IH/IC/IM"))?;
+        let record_at = EvidenceTimestamp::parse_instant(record.evidence.observed_at())
+            .map_err(|_| anyhow::anyhow!("CFFEX record observation time is invalid"))?;
+        if !products.insert(product_code)
+            || record.contract_code != format!("{product_code}{suffix}")
+            || record.delivery_date != expected_date
+            || record.last_trading_date != Some(record.delivery_date)
+            || record.method != "Cash"
+            || record.schedule_status != "Planned"
+            || record.date_basis != "CffexRuleAndPublishedHolidays"
+            || record.rule_url != rule_url
+            || record.holiday_calendar_url != CFFEX_HOLIDAY_URL
+            || record.evidence.provider() != ProviderId::Cffex
+            || record.evidence.source_at().is_some()
+            || record.evidence.batch_id() != result.batch_id
+            || record_at != batch_at
+        {
+            anyhow::bail!("CFFEX delivery scope or evidence conflicts with request");
+        }
+    }
+    Ok(())
+}
+
 async fn run_native_query(
     client: &mut GrpcMarketClient,
     capabilities: &[ExternalCapability],
-    args: &Args,
-    selection: NativeOperation,
+    spec: NativeQuerySpec,
 ) -> anyhow::Result<()> {
-    let spec = native_query_spec(args, selection)?;
     if !capability_ready(capabilities, spec.operation) {
         anyhow::bail!("selected native operation has no admitted runtime capability");
     }
@@ -193,7 +303,7 @@ async fn run_native_query(
     }
     for record in &result.records {
         if record.schema != spec.record_schema
-            || record.schema_version != 1
+            || record.schema_version != spec.record_version
             || record.content_type != "application/json; charset=utf-8"
         {
             anyhow::bail!("native record schema/version/content type conflicts with contract");
@@ -226,6 +336,9 @@ async fn run_native_query(
             anyhow::bail!("native record evidence conflicts with contract");
         }
     }
+    if let Some((year, month)) = spec.delivery_scope {
+        validate_futures_delivery(&result, year, month)?;
+    }
     println!(
         "native operation={:?} provider={} admission=ADMITTED complete=true records={} schema={} batch_id_present=true observed_at_present=true source_at_present={} evidence_shape=ok",
         spec.operation,
@@ -234,6 +347,9 @@ async fn run_native_query(
         spec.record_schema,
         !result.source_at.is_empty(),
     );
+    if spec.delivery_scope.is_some() {
+        println!("r08_schedule_status=planned confirmed_delivery=false");
+    }
     Ok(())
 }
 
@@ -303,6 +419,10 @@ async fn main() -> anyhow::Result<()> {
     if args.opening == args.native_operation.is_some() {
         anyhow::bail!("select exactly one of --opening or --native-operation");
     }
+    let native_spec = args
+        .native_operation
+        .map(|selection| native_query_spec(&args, selection))
+        .transpose()?;
     let bundle = canonical_bundle_path(&args.bundle)?;
 
     let mut client = GrpcMarketClient::connect_client_bundle(&bundle)
@@ -326,8 +446,8 @@ async fn main() -> anyhow::Result<()> {
         .get_external_capabilities()
         .await
         .map_err(|error| anyhow::anyhow!("bundle capabilities unavailable: {error}"))?;
-    if let Some(selection) = args.native_operation {
-        return run_native_query(&mut client, &capabilities, &args, selection).await;
+    if let Some(spec) = native_spec {
+        return run_native_query(&mut client, &capabilities, spec).await;
     }
     for &(family, operations) in STATIC_OPENING_CAPABILITY_FAMILIES {
         let ready = capability_family_ready(&capabilities, operations);
@@ -761,6 +881,7 @@ mod tests {
         assert!(external_contract_ready(ExternalOperation::SecurityMetadata));
         assert!(external_contract_ready(ExternalOperation::GlobalNews));
         assert!(external_contract_ready(ExternalOperation::InstrumentNews));
+        assert!(external_contract_ready(ExternalOperation::FuturesDelivery));
         assert!(external_contract_ready(
             ExternalOperation::CurrentAuctionObservations
         ));
@@ -780,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn native_probe_cli_selects_three_published_requests() {
+    fn native_probe_cli_selects_published_requests() {
         let auction = Args::try_parse_from([
             "probe",
             "--bundle",
@@ -847,6 +968,124 @@ mod tests {
                 "start":"2026-09-13","end":"2026-10-13","limit":20
             })
         );
+
+        let delivery = Args::try_parse_from([
+            "probe",
+            "--bundle",
+            "/tmp/TEST_CODE_bundle",
+            "--native-operation",
+            "futures-delivery",
+            "--year",
+            "2026",
+            "--month",
+            "9",
+        ])
+        .expect("CFFEX probe args");
+        let delivery_spec =
+            native_query_spec(&delivery, delivery.native_operation.unwrap()).unwrap();
+        assert_eq!(delivery_spec.operation, ExternalOperation::FuturesDelivery);
+        assert_eq!(
+            delivery_spec.params,
+            serde_json::json!({"year":2026,"month":9})
+        );
+        assert_eq!(delivery_spec.delivery_scope, Some((2026, 9)));
+    }
+
+    #[test]
+    fn futures_delivery_probe_rejects_invalid_scope_before_transport() {
+        for args in [
+            vec!["--year", "2026"],
+            vec!["--month", "9"],
+            vec!["--year", "2027", "--month", "9"],
+            vec!["--year", "2026", "--month", "0"],
+            vec!["--year", "2026", "--month", "13"],
+        ] {
+            let mut cli = vec![
+                "probe",
+                "--bundle",
+                "/tmp/TEST_CODE_bundle",
+                "--native-operation",
+                "futures-delivery",
+            ];
+            cli.extend(args);
+            let parsed = Args::try_parse_from(cli).unwrap();
+            assert!(native_query_spec(&parsed, NativeOperation::FuturesDelivery).is_err());
+        }
+    }
+
+    fn cffex_probe_response() -> QueryResult {
+        let records = ["If", "Ih", "Ic", "Im"]
+            .into_iter()
+            .map(|product| {
+                let code = product.to_ascii_uppercase();
+                let (_, rule_url) = cffex_rule_url(product).unwrap();
+                stock_analysis::grpc_client::envelope::CanonicalRecord {
+                    schema: "magic.market.futures_delivery_event".to_owned(),
+                    schema_version: 2,
+                    content_type: "application/json; charset=utf-8".to_owned(),
+                    data: serde_json::to_vec(&serde_json::json!({
+                        "product":product,
+                        "contract_code":format!("{code}2609"),
+                        "last_trading_date":"2026-09-18",
+                        "delivery_date":"2026-09-18",
+                        "method":"Cash",
+                        "schedule_status":"Planned",
+                        "date_basis":"CffexRuleAndPublishedHolidays",
+                        "rule_url":rule_url,
+                        "holiday_calendar_url":CFFEX_HOLIDAY_URL,
+                        "evidence":{
+                            "provider":"Cffex",
+                            "source_at":null,
+                            "observed_at":"2026-09-27T08:00:00+08:00",
+                            "batch_id":"cffex-equity-index-planned-delivery-2026-v2:09"
+                        }
+                    }))
+                    .unwrap(),
+                }
+            })
+            .collect();
+        QueryResult {
+            admission: QueryAdmission::Admitted,
+            selected_provider: "Cffex".to_owned(),
+            batch_id: "cffex-equity-index-planned-delivery-2026-v2:09".to_owned(),
+            complete: true,
+            observed_at: "2026-09-27T08:00:00+08:00".to_owned(),
+            source_at: String::new(),
+            records,
+            provenance:
+                stock_analysis::grpc_client::envelope::AcquisitionProvenance::ExternalMtlsAuthority(
+                    "grpc-mtls:TEST_CODE_cffex".to_owned(),
+                ),
+            diagnostic_blocker: String::new(),
+        }
+    }
+
+    #[test]
+    fn futures_delivery_probe_requires_exact_monthly_four_product_evidence() {
+        let accepted = cffex_probe_response();
+        validate_futures_delivery(&accepted, 2026, 9).unwrap();
+
+        let mut empty = cffex_probe_response();
+        empty.records.clear();
+        assert!(validate_futures_delivery(&empty, 2026, 9).is_err());
+
+        let mut duplicate = cffex_probe_response();
+        duplicate.records[3].data = duplicate.records[0].data.clone();
+        assert!(validate_futures_delivery(&duplicate, 2026, 9).is_err());
+
+        let mut wrong_month = accepted;
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&wrong_month.records[0].data).unwrap();
+        record["delivery_date"] = serde_json::json!("2026-10-16");
+        wrong_month.records[0].data = serde_json::to_vec(&record).unwrap();
+        assert!(validate_futures_delivery(&wrong_month, 2026, 9).is_err());
+
+        let mut older_observation = cffex_probe_response();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&older_observation.records[0].data).unwrap();
+        record["evidence"]["observed_at"] = serde_json::json!("2026-09-27T07:59:59+08:00");
+        older_observation.records[0].data = serde_json::to_vec(&record).unwrap();
+        assert!(validate_futures_delivery(&older_observation, 2026, 9).is_err());
     }
 
     #[test]
