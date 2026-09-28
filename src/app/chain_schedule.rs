@@ -399,8 +399,9 @@ fn scheduled_report_filename(
     )
 }
 
-/// The status and clock used by the legacy send gate, retained across its
-/// effects so the read-only projection does not inspect a changed store.
+/// Retain the legacy gate status and sample its clock before any send effects.
+/// Closed and Uncertain return before the old window check, so their clocks
+/// serve only the read-only projection; no changed store is inspected later.
 struct ChainSendGateSnapshot {
     phase: ChainPhase,
     date: NaiveDate,
