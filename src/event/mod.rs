@@ -13,6 +13,7 @@ pub mod durable_delivery_append;
 pub mod envelope;
 pub mod history;
 pub mod jsonl_writer;
+pub mod news_flash_identity;
 pub mod push_record;
 pub mod replay;
 
@@ -32,6 +33,9 @@ pub use history::{
     RateStats, Window,
 };
 pub use jsonl_writer::{JsonlError, JsonlWriter};
+pub use news_flash_identity::{
+    news_flash_render_sha256, news_flash_reservation_sha256, NewsFlashReservationIdentityFields,
+};
 pub use push_record::{
     PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError,
 };

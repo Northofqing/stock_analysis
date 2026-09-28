@@ -798,23 +798,18 @@ fn make_reservation(
             crate::notify::PushKind::NewsFlashAggregated.stable_template_id()
         }
     };
-    let render_sha256 = sha256_domain("stock_analysis.news_flash_render.v1", text.as_bytes());
-    let business_date = day.to_string();
-    let mut reservation_hasher = Sha256::new();
-    reservation_hasher.update(b"stock_analysis.news_flash_reservation.v2");
-    for value in [
-        push_kind.as_str(),
-        business_date.as_str(),
-        decision_key,
-        event_id.as_deref().unwrap_or("<absent>"),
-        window.as_deref().unwrap_or("<absent>"),
-        evidence_sha256.as_str(),
-        render_sha256.as_str(),
-    ] {
-        reservation_hasher.update((value.len() as u64).to_be_bytes());
-        reservation_hasher.update(value.as_bytes());
-    }
-    let reservation_identity_sha256 = format!("{:x}", reservation_hasher.finalize());
+    let render_sha256 = stock_analysis::event::news_flash_render_sha256(text.as_bytes());
+    let reservation_identity_sha256 = stock_analysis::event::news_flash_reservation_sha256(
+        &stock_analysis::event::NewsFlashReservationIdentityFields {
+            push_kind: &push_kind,
+            business_date: day,
+            decision_key,
+            event_id: event_id.as_deref(),
+            window: window.as_deref(),
+            evidence_sha256: &evidence_sha256,
+            render_sha256: &render_sha256,
+        },
+    );
     let sources = projected
         .into_iter()
         .map(|event| event.source().clone())
@@ -1324,6 +1319,144 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use stock_analysis::signal::market_event::{Direction, EventType};
+
+    fn n02_legacy_identity_reservation(
+        suffix: &str,
+    ) -> (
+        FlashReservation,
+        stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent,
+    ) {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let local_at = |hour, minute| {
+            day.and_hms_opt(hour, minute, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+        };
+        let published_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T00:01:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut event = MarketEvent::new(
+            EventType::Policy,
+            "TEST_CODE_TITLE_A".to_owned(),
+            None,
+            Direction::Bull,
+            0,
+            100,
+        );
+        event.event_id = format!("TEST_CODE_EVENT_{suffix}");
+        event.occurred_at = published_at.with_timezone(&chrono::Local);
+        event
+            .provenance
+            .push(stock_analysis::signal::market_event::SourceRef {
+                provider: "TEST_CODE_PROVIDER".to_owned(),
+                url: None,
+                fetched_at: observed_at.with_timezone(&chrono::Local),
+            });
+        let capability =
+            stock_analysis::news::aggregator::raw_v2::NewsFlashProjectionTestCapability::bind()
+                .unwrap();
+        let source =
+            stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent::test_fixture(
+                &capability,
+                event,
+                "TEST_CODE_PROVIDER",
+                "TEST_CODE_SOURCE",
+                published_at,
+                observed_at,
+                &format!("TEST_CODE_BATCH_{suffix}"),
+            );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[source.clone()], local_at(9, 0), 80, 20)
+            .is_empty());
+        let mut reservations = gate.reserve(&[], local_at(9, 31), 80, 20);
+        assert_eq!(reservations.len(), 1);
+        (reservations.pop().unwrap(), source)
+    }
+
+    #[test]
+    fn n02_legacy_identity_real_gate_vectors() {
+        let expected_text =
+            "📰 新闻时段聚合 (09:30) Top3:\n1. [政策] TEST_CODE_TITLE_A (强度0 确定性100)\n";
+        let expected = [
+            (
+                "A",
+                "23ed3f279f099164d2fb8c9d577c21b3c1d37d0197f250bf8e94e048d33131e6",
+                "eba6d8e675bcfa34f1823268099f2244856cf9ab0df9d67e5245d28d8916b05f",
+            ),
+            (
+                "B",
+                "9e27d4895f5e794cc2b862e7ef9fe4d0fdab4c83b59ddff5bcbb9d514f97bb90",
+                "774799317c09db050295597009fe1695320178654b8f6b2ec628ed4a5c1f8507",
+            ),
+        ];
+        for (suffix, evidence, identity) in expected {
+            let (reservation, projected) = n02_legacy_identity_reservation(suffix);
+            let text = match reservation.decision() {
+                FlashDecision::Aggregated { window, text } => {
+                    assert_eq!(window, "09:30");
+                    text
+                }
+                FlashDecision::Critical { .. } => panic!("expected aggregate"),
+            };
+            assert_eq!(text, expected_text);
+            assert_eq!(text.len(), 91);
+            let raw_render = format!("{:x}", Sha256::digest(text.as_bytes()));
+            assert_eq!(
+                raw_render,
+                "5f12437bce75ac811b8279dcfc7f9bed5e2ace0daeb414e1c56342bb98d09f76"
+            );
+            assert_eq!(
+                reservation.render_sha256(),
+                "c212620d768a5e70d91f2254dc0007b5a1cfa932220c81acfa3f19989613ce6f"
+            );
+            assert_ne!(raw_render, reservation.render_sha256());
+            assert_eq!(reservation.rendered_len(), 91);
+            assert_eq!(reservation.push_kind(), "news_flash_aggregated_v1");
+            assert_eq!(
+                reservation.business_date(),
+                chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap()
+            );
+            assert_eq!(reservation.decision_key(), "window:09:30");
+            assert_eq!(reservation.event_id(), None);
+            assert_eq!(reservation.window(), Some("09:30"));
+            assert_eq!(reservation.attempt_ordinal(), 1);
+            let published_at =
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00+00:00").unwrap();
+            let observed_at =
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T00:01:00+00:00").unwrap();
+            assert_eq!(
+                reservation.audit_sources(),
+                vec![stock_analysis::event::NewsFlashAuditSource {
+                    event_id: format!("TEST_CODE_EVENT_{suffix}"),
+                    provider: "TEST_CODE_PROVIDER".to_owned(),
+                    source: "TEST_CODE_SOURCE".to_owned(),
+                    published_at,
+                    observed_at,
+                    batch_id: format!("TEST_CODE_BATCH_{suffix}"),
+                }]
+            );
+            assert_eq!(
+                stock_analysis::news::aggregator::raw_v2::ordered_news_flash_evidence_sha256(&[
+                    projected
+                ]),
+                evidence
+            );
+            assert_eq!(
+                stock_analysis::event::envelope::news_flash_evidence_sha256(
+                    &reservation.audit_sources()
+                ),
+                evidence
+            );
+            assert_eq!(reservation.evidence_sha256(), evidence);
+            assert_eq!(reservation.reservation_identity_sha256(), identity);
+        }
+    }
 
     fn ev(id_seed: &str, strength: u8, certainty: u8) -> MarketEvent {
         let mut e = MarketEvent::new(
