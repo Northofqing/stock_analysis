@@ -22,6 +22,7 @@ mod activation_readiness;
 mod activation_store;
 mod activation_transaction;
 mod business_finalizer;
+mod chain_post_close_shadow;
 mod chain_preopen_shadow;
 mod dedicated_transport;
 pub(crate) mod finalization_metrics;
@@ -49,6 +50,7 @@ pub use activation::{
 };
 pub use activation_facts::{ActivationReconciliation, RawActivationFacts, UnitActivationFacts};
 pub use activation_store::{inspect_raw_activation_facts, ActivationInspectError};
+pub use chain_post_close_shadow::{observe_chain_post_close_shadow, ChainPostCloseShadowReport};
 pub use chain_preopen_shadow::{observe_chain_preopen_shadow, ChainPreopenShadowReport};
 pub use intent_store::{
     BusinessIntentStore, InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity,

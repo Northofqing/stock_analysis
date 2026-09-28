@@ -36,7 +36,9 @@ use stock_analysis::calendar::{self, current_session, is_market_active, MarketSe
 use stock_analysis::app::chain_schedule::{
     run_scheduled_chain_analysis, ChainPhase, ChainScheduleOutcome, ChainScheduleStore,
 };
-use stock_analysis::push_foundation::observe_chain_preopen_shadow;
+use stock_analysis::push_foundation::{
+    observe_chain_post_close_shadow, observe_chain_preopen_shadow,
+};
 
 use stock_analysis::monitor::detector::{
     AlertCategory, AlertDetail, AlertEvent, AlertLevel, Detector, DetectorConfig, StockSnapshot,
@@ -9321,6 +9323,44 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     Ok(None) => {},
                     Err(error) => log::error!(
                         "[产业链][盘后15:30] 错过窗口记录失败 date={}: {error}", chain_today
+                    ),
+                }
+            }
+            // Compare policies after the legacy send and missed-window paths.
+            let postclose_shadow_at = chrono::Local::now().fixed_offset();
+            let postclose_shadow_now = postclose_shadow_at.naive_local();
+            if postclose_shadow_now.time() >= chrono::NaiveTime::from_hms_opt(15, 29, 0).unwrap()
+                && postclose_shadow_now.time() < chrono::NaiveTime::from_hms_opt(15, 36, 0).unwrap()
+            {
+                match observe_chain_post_close_shadow(
+                    &ChainScheduleStore::production(),
+                    postclose_shadow_at.clone(),
+                    calendar::is_trading_day(postclose_shadow_now.date()),
+                ) {
+                    Ok(shadow) => log::info!(
+                        "[chain-postclose-shadow] date={} observed_at={} old_occurrence={} new_occurrence={:?} old_status={:?} new_status={} new_reason={} old_window_open={} new_window_open={} old_due={} new_due={} old_miss_due={} new_miss_due={} old_miss_recorded={} old_closed={} new_closed={} diff={} foundation_persisted=false",
+                        shadow.calendar_date,
+                        shadow.observed_at,
+                        shadow.legacy_occurrence_key,
+                        shadow.foundation_occurrence_id,
+                        shadow.legacy_status,
+                        shadow.foundation_status,
+                        shadow.foundation_reason,
+                        shadow.legacy_window_open,
+                        shadow.foundation_window_open,
+                        shadow.legacy_due,
+                        shadow.foundation_due,
+                        shadow.legacy_miss_due,
+                        shadow.foundation_miss_due,
+                        shadow.legacy_miss_recorded,
+                        shadow.legacy_closed,
+                        shadow.foundation_closed,
+                        shadow.has_decision_diff(),
+                    ),
+                    Err(error) => log::warn!(
+                        "[chain-postclose-shadow] read-only comparison unavailable date={} observed_at={}: {error:#}",
+                        postclose_shadow_now.date(),
+                        postclose_shadow_at,
                     ),
                 }
             }
