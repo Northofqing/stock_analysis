@@ -38,6 +38,33 @@ pub fn build_external_query_request(
                 serde_json::json!({"instruments": instruments}),
             )
         }
+        Operation::MarketAnnouncements => {
+            ensure_only_keys(&params, &["start", "end", "limit"])?;
+            let start = parse_iso_date(
+                params
+                    .get("start")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            let end = parse_iso_date(
+                params
+                    .get("end")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| (1..=300).contains(limit))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            if start > end {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            (
+                "magic.market.market_announcements.request",
+                1,
+                String::new(),
+                serde_json::json!({"start": start.to_string(), "end": end.to_string(), "limit": limit}),
+            )
+        }
         Operation::GlobalNews => {
             ensure_only_keys(&params, &["provider", "limit"])?;
             let provider = params
@@ -533,6 +560,42 @@ mod tests {
         assert_eq!(payload.schema_version, 2);
         assert_eq!(data, json!({"limit": 20}));
         assert!(!request.allow_unadmitted);
+    }
+
+    #[test]
+    fn market_announcements_v1_binds_whole_market_date_and_limit() {
+        let request = build_external_query_request(
+            Operation::MarketAnnouncements,
+            json!({"start":"2026-09-28","end":"2026-09-28","limit":300}),
+        )
+        .expect("published whole-market discovery contract");
+        assert!(request.preferred_provider.is_empty());
+        let payload = request
+            .payload
+            .expect("market announcement request payload");
+        assert_eq!(payload.schema, "magic.market.market_announcements.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"start":"2026-09-28","end":"2026-09-28","limit":300})
+        );
+        assert!(!request.allow_unadmitted);
+    }
+
+    #[test]
+    fn market_announcements_v1_rejects_ambiguous_or_unbounded_requests() {
+        for params in [
+            json!({}),
+            json!({"start":"2026-09-28","end":"2026-09-27","limit":300}),
+            json!({"start":"2026-09-28","end":"2026-09-28","limit":0}),
+            json!({"start":"2026-09-28","end":"2026-09-28","limit":301}),
+            json!({"start":"2026-09-28","end":"2026-09-28","limit":300,"instrument":{}}),
+        ] {
+            assert_eq!(
+                build_external_query_request(Operation::MarketAnnouncements, params).unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
     }
 
     #[test]

@@ -627,7 +627,7 @@ impl BacktestEngine {
         shares: f64,
         date: DateTime<Local>,
     ) -> Result<u64> {
-        use crate::strategy::lot::{min_commission, round_lot};
+        use crate::strategy::lot::round_lot;
         // 1. 涨跌停
         crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -638,20 +638,8 @@ impl BacktestEngine {
                 "买入股数 {shares} 取整后为 0，不足 1 手 (100 股)"
             ));
         }
-        // 3. 实际买入（用整百股后的数量）
+        // 3. 实际买入（用整百股后的数量）。buy() 已按 lot::min_commission 扣费。
         self.buy(code, name, price, rounded as f64, date)?;
-        // 4. 强制覆盖佣金为含 5 元保底（A 股标准）
-        //    引擎内部的 buy 已经按 commission_rate 算过，但没保底
-        //    我们在最后一次 trade 上把 commission 调整
-        if let Some(last_trade) = self.state.trades.last_mut() {
-            let amount = last_trade.amount;
-            let min_c = min_commission(amount);
-            let diff = min_c - last_trade.commission;
-            if diff > 0.0 {
-                last_trade.commission = min_c;
-                self.state.cash -= diff; // 补扣差额
-            }
-        }
         Ok(rounded)
     }
 
@@ -665,7 +653,7 @@ impl BacktestEngine {
         price: f64,
         date: DateTime<Local>,
     ) -> Result<u64> {
-        use crate::strategy::lot::{min_commission, round_lot, stamp_tax};
+        use crate::strategy::lot::round_lot;
         // 1. 涨跌停
         crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -694,19 +682,7 @@ impl BacktestEngine {
         }
         // 4. 卖出
         self.sell(code, rounded as f64, price, date)?;
-        // 5. 调整佣金 + 印花税
-        if let Some(last_trade) = self.state.trades.last_mut() {
-            let amount = last_trade.amount;
-            let min_c = min_commission(amount);
-            let commission_diff = min_c - last_trade.commission;
-            if commission_diff > 0.0 {
-                last_trade.commission = min_c;
-                self.state.cash -= commission_diff;
-            }
-            // 印花税：sell() 已按 stamp_tax_rate 算过，这里校验
-            // 实际已是引擎内 calc, 不重复加
-            let _ = stamp_tax(amount); // 抑制 unused 警告
-        }
+        // sell() 已一次性扣除最低佣金和卖出印花税。
         Ok(rounded)
     }
 
@@ -1720,7 +1696,11 @@ mod tests {
             engine.try_buy_validated("TEST_CODE_600000", "浦发银行", 10.0, 11.5, 100.0, date);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("涨停价") || msg.contains("高于"), "msg={msg}");
+        assert!(
+            msg.contains("price rejected by qualified range")
+                && msg.contains("outside [9000000, 11000000]"),
+            "msg={msg}"
+        );
         assert_eq!(engine.get_positions().len(), 0, "被拒后不应建仓");
     }
 
@@ -1827,6 +1807,38 @@ mod tests {
         let result =
             engine.try_sell_realistic("TEST_CODE_600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
         assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn flat_price_round_trip_matches_paper_fee_evidence() {
+        let config = BacktestConfig {
+            initial_capital: 10_000.0,
+            slippage_rate: 0.0,
+            ..BacktestConfig::default()
+        };
+        let mut engine = BacktestEngine::new(config);
+        let buy_date = Local::now();
+        let starting_cash = engine.state.cash;
+
+        engine
+            .try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
+            .unwrap();
+        engine
+            .try_sell_realistic(
+                "TEST_CODE_600000",
+                "浦发银行",
+                10.0,
+                100.0,
+                10.0,
+                buy_date + chrono::Duration::days(1),
+            )
+            .unwrap();
+
+        let backtest_pnl = engine.state.cash - starting_cash;
+        let paper_pnl =
+            1_000.0 * crate::performance::fee_evidence::net_return_pct(10.0, 10.0, 100) / 100.0;
+        assert!((backtest_pnl + 11.0).abs() < 1e-9);
+        assert!((backtest_pnl - paper_pnl).abs() < 1e-9);
     }
 
     #[test]

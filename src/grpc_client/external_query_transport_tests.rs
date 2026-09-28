@@ -31,6 +31,29 @@ fn r08_futures_delivery_uses_external_method_identity_and_exact_rpc_path() {
     ));
 }
 
+#[test]
+fn market_announcements_uses_external_method_identity_and_exact_rpc_path() {
+    let method = ExternalQueryMethod::from_local_operation(
+        crate::grpc_client::pb::magic::market::v1::Operation::MarketAnnouncements,
+    )
+    .expect("published whole-market operation is routed");
+    assert_eq!(method, ExternalQueryMethod::MarketAnnouncements);
+    assert!(method.matches_binding(
+        "/magic.market.v1.MarketDataService/MarketAnnouncements",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "MarketAnnouncements",
+        )),
+    ));
+    assert!(!method.matches_binding(
+        "/magic.market.v1.MarketDataService/Announcements",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "Announcements",
+        )),
+    ));
+}
+
 struct TestBody {
     frames: VecDeque<Result<Frame<Bytes>, tonic::Status>>,
     done: bool,

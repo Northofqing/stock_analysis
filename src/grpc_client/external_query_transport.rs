@@ -19,8 +19,8 @@ pub(crate) const EXTERNAL_QUERY_DECODE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES: usize =
     EXTERNAL_QUERY_DECODE_LIMIT_BYTES + 5;
 const EXTERNAL_WIRE_MATERIAL: &str = "external-unary-response-evidence-v1";
-// The 2026-09-27.1 public bundle compiles to this descriptor. Historical
-// 2026-09-17.1 records keep their separate, frozen decoder and digest.
+// The 2026-09-28.2 public bundle compiles to this client descriptor. The VM
+// build identity's server contract digest is a distinct release identity.
 pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
     "59158661146ff429f092c49584601147080b9e631e941e4acb2d96fe7a22bf7b";
 
@@ -30,6 +30,8 @@ pub(crate) enum ExternalQueryMethod {
     FuturesDelivery,
     #[serde(rename = "OPERATION_SECURITY_METADATA")]
     SecurityMetadata,
+    #[serde(rename = "OPERATION_MARKET_ANNOUNCEMENTS")]
+    MarketAnnouncements,
     #[serde(rename = "OPERATION_GLOBAL_NEWS")]
     GlobalNews,
     #[serde(rename = "OPERATION_INSTRUMENT_NEWS")]
@@ -49,6 +51,7 @@ impl ExternalQueryMethod {
         match self {
             Self::FuturesDelivery => "FuturesDelivery",
             Self::SecurityMetadata => "SecurityMetadata",
+            Self::MarketAnnouncements => "MarketAnnouncements",
             Self::GlobalNews => "GlobalNews",
             Self::InstrumentNews => "InstrumentNews",
             Self::CurrentAuctionObservations => "CurrentAuctionObservations",
@@ -61,6 +64,7 @@ impl ExternalQueryMethod {
         match self {
             Self::FuturesDelivery => "/magic.market.v1.MarketDataService/FuturesDelivery",
             Self::SecurityMetadata => "/magic.market.v1.MarketDataService/SecurityMetadata",
+            Self::MarketAnnouncements => "/magic.market.v1.MarketDataService/MarketAnnouncements",
             Self::GlobalNews => "/magic.market.v1.MarketDataService/GlobalNews",
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
             Self::CurrentAuctionObservations => {
@@ -89,6 +93,7 @@ impl ExternalQueryMethod {
         use crate::grpc_client::pb::magic::market::v1::Operation;
         match operation {
             Operation::SecurityMetadata => Some(Self::SecurityMetadata),
+            Operation::MarketAnnouncements => Some(Self::MarketAnnouncements),
             Operation::GlobalNews => Some(Self::GlobalNews),
             Operation::InstrumentNews => Some(Self::InstrumentNews),
             _ => None,
@@ -316,6 +321,9 @@ impl ExternalQueryTransport {
         let response = match method {
             ExternalQueryMethod::FuturesDelivery => self.client.futures_delivery(request).await,
             ExternalQueryMethod::SecurityMetadata => self.client.security_metadata(request).await,
+            ExternalQueryMethod::MarketAnnouncements => {
+                self.client.market_announcements(request).await
+            }
             ExternalQueryMethod::GlobalNews => self.client.global_news(request).await,
             ExternalQueryMethod::InstrumentNews => self.client.instrument_news(request).await,
             ExternalQueryMethod::CurrentAuctionObservations => {
