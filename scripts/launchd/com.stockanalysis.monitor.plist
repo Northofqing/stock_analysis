@@ -6,10 +6,10 @@
     <string>com.stockanalysis.monitor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/zhangzhen/Desktop/Quant/stock_analysis/target/monitor-deploy-20260914-scan.9AjKKD/release/monitor</string>
+        <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/target/release/monitor</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/zhangzhen/Desktop/Quant/stock_analysis</string>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -22,8 +22,8 @@
     <key>Umask</key>
     <integer>63</integer>
     <key>StandardOutPath</key>
-    <string>/Users/zhangzhen/Desktop/Quant/stock_analysis/logs/monitor-launchd-20260916.stdout.log</string>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/monitor-launchd.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/zhangzhen/Desktop/Quant/stock_analysis/logs/monitor-launchd-20260916.stderr.log</string>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/monitor-launchd.stderr.log</string>
 </dict>
 </plist>
