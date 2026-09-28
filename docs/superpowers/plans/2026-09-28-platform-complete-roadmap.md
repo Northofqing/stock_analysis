@@ -153,3 +153,16 @@ M0 约 46 小时是**初始估算**，不含生产观察与外部等待。每项
 ## 8. 更新触发器
 
 发生 Unit 数量/owner、v18 Decision/Fill owner、Gate P 目标、生产运行根、上游来源能力、用户产品方向或策略基准变化时，更新本计划的基线、依赖与估算。每次里程碑完成只将有 fresh evidence 的行标为完成；尚未核验的行保留 `待核实`。
+
+## 9. 2026-09-28 执行进度
+
+| 工作 | 当前状态 | 证据与下一道门 |
+| --- | --- | --- |
+| M0 B01–B04 | 部分完成 | [当晚事实基线](../../audits/2026-09-28-platform-m0-baseline.md)记录源码、launchd 制品、bundle、目录差异、旧审计复核及部分 route 日志；`scripts/push_catalog_drift.py` 可重跑 65→66 kind 差分。仍缺完整运行窗、真实推送 receipt 与新源码部署层对账。 |
+| M0 B05–B07 | B05 粗分解；其余待实施 | 最近启动的 DB 打开/迁移粗窗约 99 秒，尚需阶段 profile 才能决定安全优化；T-14/T-15、T-19 需源事实和产品裁决；首批 Unit 仍需逐 owner 任务卡与 failure matrix。 |
+| R-08 全市场公告 | Code Ready，生产未验 | `edc0f144` 完成客户端请求/方法/transport/响应映射，`4a868f91` 约束真实记录 schema；定向 7/7、transport 8/8、method 3/3 通过，只读 mTLS 实连 2026-09-28 `ADMITTED/complete/Cninfo/300`（上游 total 744）。生产 monitor 未换版，缺其真实接收/投递及观察窗。 |
+| 模拟费用现行口径 | 纯函数 Code Ready，账本未切换 | [ADR-0001](../../adr/0001-versioned-a-share-fee-schedule.md)冻结旧 `lot-rates-v1`；`4a868f91` 加按成交日的 v2 微元费用与独立研究证据，边界测试 2/2。PaperLedger 新 generation、回测共享计算、旧持仓 cutover 和生产对账未完成。 |
+| D14、D17/D20 上游数据 | 等 VM 交付 | 已把 TDX 被拒原始批次、公司行动及权威停复牌事实交虚拟机 Codex；Hithink 正常批次或日线缺口不能替代原始证据。仅收到服务健康反馈，尚无新合同、提交或对应 RPC 样本。 |
+| M1–M8 | 未取得本轮退出证据 | 现有局部代码和设计不等于 Foundation、52 Unit、v18/v19/Gate P/v20 或前瞻观察达标。按第 3–4 节前置逐阶段推进，生产晋级与自然观察不能由本轮源码测试替代。 |
+
+当前代码提交不执行 release 部署、模拟账本 seed、推送物理 owner 迁移或业务数据写入。下一开发批次按 B05–B07 和公告生产证据继续，费用 v2 在冻结 v1 回放 fixture 后才进入账本 generation。

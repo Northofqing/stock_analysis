@@ -64,6 +64,10 @@
 
 ## 5. 下一批工作
 
+### B05 启动耗时粗分解
+
+生产 `monitor-launchd.stderr.log` 的最近一次 19:10 启动显示：19:10:24 开始 `DatabaseManager::open_at_path`，19:12:03 打印 SQLite PRAGMAs，约 **99 秒**；19:12:04 DurableDelivery 到达 startup fixed point，`progress=0`、`manual_review_boundaries=78`、`schedule_hydrations=16`。因此当次主要可见延迟位于 DB 打开与 `run_migrations` 之间，不是已记录的 DurableDelivery 1 秒固定点。`open_at_path` 在此区间依次运行 WAL/连接配置、attribution attested pool、普通 pool 与 `run_migrations`；迁移函数会调用多个要求启动时链校验的审计 schema。现有日志没有这四段独立耗时，**不能**凭代码调用顺序认定某条链是瓶颈。下一步在隔离副本/下一同版启动增加各段单调计时，再决定是否可以复用完整性检查点。此轮未重启 monitor 或操作生产 DB。
+
 1. B02：当前源码 enum/catalog/Unit 差分已有脚本与 v2 增量；继续补生产部署、真实回执、enum 外路径和物理 owner 对账，不由静态目录推断生产送达。
 2. B03：为上述 `部分修复/待核` 项补最小相关测试和生产只读证据；已修且证据充分的项停止重复开发。
 3. B04/B05：核对启动链完整性验证耗时、桥接就绪前欠账重试以及当晚各 route 的具体请求错误。日志样本要用时间窗口和 request_id，避免仅按末尾 4 MB 做因果判断。
