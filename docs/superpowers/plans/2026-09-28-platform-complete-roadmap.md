@@ -159,7 +159,7 @@ M0 约 46 小时是**初始估算**，不含生产观察与外部等待。每项
 | 工作 | 当前状态 | 证据与下一道门 |
 | --- | --- | --- |
 | M0 B01–B04 | 部分完成 | [当晚事实基线](../../audits/2026-09-28-platform-m0-baseline.md)记录源码、launchd 制品、bundle、目录差异、旧审计复核及部分 route 日志；`scripts/push_catalog_drift.py` 可重跑 65→66 kind 差分。仍缺完整运行窗、真实推送 receipt 与新源码部署层对账。 |
-| M0 B05–B07 | 初稿齐备，运行验证待补 | 最近启动的 DB 打开/迁移粗窗约 99 秒，已加阶段耗时日志但未取得新运行样本；[B06 裁决](../../audits/2026-09-28-b06-source-rulings.md)保持 T-14/T-15 禁用、T-19 Starved；[B07 首批 Unit 卡](../../push-system/2026-09-28-m1-first-units.md)列出 owner、故障矩阵和顺序，仍待每项 fresh runtime facts。 |
+| M0 B05–B07 | 初稿齐备，运行验证待补 | 最近启动的 DB 打开/迁移粗窗约 99 秒，已加阶段耗时日志但未取得新运行样本；[B06 裁决](../../audits/2026-09-28-b06-source-rulings.md)保持 T-14/T-15 禁用、T-19 Starved，T-14/T-15 无来源定时入口已加显式跳过；[B07 首批 Unit 卡](../../push-system/2026-09-28-m1-first-units.md)列出 owner、故障矩阵和顺序，仍待每项 fresh runtime facts。 |
 | R-08 全市场公告 | Code Ready，生产未验 | `edc0f144` 完成客户端请求/方法/transport/响应映射，`4a868f91` 约束真实记录 schema；定向 7/7、transport 8/8、method 3/3 通过，只读 mTLS 实连 2026-09-28 `ADMITTED/complete/Cninfo/300`（上游 total 744）。生产 monitor 未换版，缺其真实接收/投递及观察窗。 |
 | 模拟费用现行口径 | 纯函数 Code Ready，账本未切换 | [ADR-0001](../../adr/0001-versioned-a-share-fee-schedule.md)冻结旧 `lot-rates-v1`；`4a868f91` 加按成交日的 v2 微元费用与独立研究证据，边界测试 2/2。PaperLedger 新 generation、回测共享计算、旧持仓 cutover 和生产对账未完成。 |
 | D14、D17/D20 上游数据 | 等 VM 交付 | 已把 TDX 被拒原始批次、公司行动及权威停复牌事实交虚拟机 Codex；Hithink 正常批次或日线缺口不能替代原始证据。仅收到服务健康反馈，尚无新合同、提交或对应 RPC 样本。 |
