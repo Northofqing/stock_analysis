@@ -5708,6 +5708,10 @@ pub fn register_trade_event_source(source: Box<dyn TradeEventSource>) -> Result<
         .map_err(|_| "BR-087 TradeEventSource already registered".to_string())
 }
 
+pub fn trade_event_source_registered() -> bool {
+    TRADE_EVENT_SOURCE.get().is_some()
+}
+
 pub fn fetch_pending_trade_events() -> Result<Vec<TradeEvent>, String> {
     TRADE_EVENT_SOURCE
         .get()

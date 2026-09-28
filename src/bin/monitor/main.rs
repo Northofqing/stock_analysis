@@ -10005,6 +10005,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
             let mut last_post_fixed_fill = std::time::Instant::now();
 
+            if !push_templates::trade_event_source_registered() {
+                log::info!("[T-14/T-15] disabled=no_registered_trade_event_source");
+            }
+
             // v46: T-16 ST 涨跌幅变更 (开盘 9:30 一次/票/日)
 
             let mut st_price_pushed = false;
@@ -11584,7 +11588,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                         //   - 真实 intent: broker 委托/成交回报 event
 
-                        if last_post_fixed_order.elapsed().as_secs() >= 900 {
+                        if push_templates::trade_event_source_registered()
+                            && last_post_fixed_order.elapsed().as_secs() >= 900
+                        {
                             let hhmm = chrono::Local::now().format("%H:%M").to_string();
                             match current_banner_for("T-14 trade pipeline") {
                                 Some(banner) => {
@@ -11600,7 +11606,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
 
-                        if last_post_fixed_fill.elapsed().as_secs() >= 300 {
+                        if push_templates::trade_event_source_registered()
+                            && last_post_fixed_fill.elapsed().as_secs() >= 300
+                        {
                             let hhmm = chrono::Local::now().format("%H:%M").to_string();
                             match current_banner_for("T-15 trade pipeline") {
                                 Some(banner) => {
