@@ -27,8 +27,8 @@
 
 | 原项 | 2026-09-28 第一轮状态 | 当前证据与剩余验收 |
 | --- | --- | --- |
-| #1 模拟盘逐笔成本 | 代码已修，生产口径待核 | `src/performance/fee_evidence.rs`、`src/trading/paper_sell.rs` 已按 FIFO 分摊买费并输出净收益；需与当日卡片及坏价裁定对账。 |
-| #2 回填/回测同成本 | 部分修复 | `position_tracker.rs` 使用 `fee_evidence`；隔离工作树的 `strategy/core.rs` 已去掉 realistic 包装层重复买卖费调整，100 股 10 元零滑点往返净现金 `-11` 元与 `fee_evidence` 一致，定向 8 个 realistic/qualified 测试通过。尚未形成共享 FillModel、全部价量/印花税配置 parity 或生产证据。 |
+| #1 模拟盘逐笔成本 | 部分修复，费率口径待升级 | `src/performance/fee_evidence.rs`、`src/trading/paper_sell.rs` 已按 FIFO 分摊买费并输出净收益；但 2026 年模型仍按卖出印花税千一，现行口径为万分之五。`lot-rates-v1` 与旧事件不能原地改写，见 [费用 ADR](../adr/0001-versioned-a-share-fee-schedule.md)。 |
+| #2 回填/回测同成本 | 部分修复 | `position_tracker.rs` 使用 `fee_evidence`；`edc0f144` 去掉 `strategy/core.rs` realistic 包装层已不起作用的买卖费调整（基础 `buy`/`sell` 原本已收费，旧代码未造成实际二次扣费）。旧 v1 口径下 100 股 10 元零滑点往返净现金 `-11` 元与 `fee_evidence` 一致，定向 8 个 realistic/qualified 测试通过。尚未形成共享 FillModel、按成交日的现行税率 parity 或生产证据。 |
 | #3 DB 初始化/测试隔离 | 代码已修，测试稳态待核 | `DatabaseManager::init` 在非测试模式尊重显式路径，测试模式拒绝显式路径并提供隔离入口；仍需定向验证原 flaky 家族。 |
 | #4 NewsAI counted binding | 代码已修，生产送达待核 | `notify.rs` 的 `NewsAiAnalysis` 走 counted 准入和专用审计；补机器目录及真实 receipt。 |
 | #5 NewsAI 批次重复身份 | v3 路径已修，旧记录待核 | `news_ai.rs` 有 `NewsAiIdentityV3` 和恢复 envelope；旧版本兼容/重复计数及生产结果待核。 |
@@ -48,7 +48,7 @@
 
 | Route | 末尾样本 | 解释边界 |
 | --- | --- | --- |
-| `R-08-announcements` | 初采尾窗 102 次 `invalid_request`，21:50:41 CST 最后一次；稍后仍重复。本地下游请求为 `{"start":"2026-09-28","end":"2026-09-28","limit":300}`。VM 用相同参数直接调已部署服务返回 `ADMITTED/complete/300`；本机代码的 ExternalV1 adapter 在发 RPC 前把该 operation 判 `Unimplemented`，故原 `invalid_request` 是本机合同接线缺口。 | 本机需按公开 schema 补 `external_v1` builder、方法映射及 transport 路径，并用同版 bundle 与真实 RPC 复验；之前的日志不证明服务端故障或无公告。 |
+| `R-08-announcements` | 初采尾窗 102 次 `invalid_request`，21:50:41 CST 最后一次；稍后仍重复。本地下游请求为 `{"start":"2026-09-28","end":"2026-09-28","limit":300}`。VM 用相同参数直接调已部署服务返回 `ADMITTED/complete/300`；本机旧 ExternalV1 adapter 在发 RPC 前把该 operation 判 `Unimplemented`，故原 `invalid_request` 是本机合同接线缺口。 | `edc0f144` 已完成本地修复与实连，详见下节；仍缺生产 monitor 同版部署后的接收及投递回执。旧日志不证明服务端故障或无公告。 |
 | `BlockTrades` | 54 次 `no_verified_batch`；21:50:41 旁路日志见 `The operation was cancelled`。 | 尚不能判定服务端、桥接还是调用并发取消；先保留 request_id/同源 trace。 |
 | `R-08-global-indices` | 17 次 `invalid_evidence`，最近 19:21:52 CST。 | 需要拆原始字段/客户端 converter 规则；不能直接归咎 VM。 |
 | `R-08-global-fx` | 17 次 `no_verified_batch`，最近 19:22:00 CST。 | 先核当次来源可用性及覆盖，不能用空结果替代。 |
@@ -56,9 +56,16 @@
 
 另两组既有上游合同缺口（普通 HistoricalBars 异常日线发现、D17/D20 权威交易/停复牌事实）已交 VM gRPC Codex。VM 第一轮核查只证明 300005 的 HithinkFinance 已准入 63 条及 688277 日线断档，尚不能证明被拒 TDX 原始批次或逐日权威停复牌；已补发精确 TDX 请求及证据要求请其继续开发。下游保持 fail closed，收到服务端代码、公开 bundle 和真实 RPC 回执后再做消费端同版接线。
 
+### 22:36 后本地 R-08 客户端修复验证
+
+`edc0f144` 已补 ExternalV1 请求、方法身份、transport 路由及响应 operation 映射，增加只读 `grpc_bundle_probe --market-announcements-date`。旧冻结 descriptor pin 保持公开 bundle `2026-09-28.2` 的客户端值。定向 `market_announcements` 7/7、external transport 8/8、method 3/3 通过，bin 编译及修改文件 rustfmt 检查通过；首次 loopback 测试受沙箱端口权限影响，授权后同一测试通过。实连使用运行根现有 mTLS bundle、未读写业务库：VM Health `live=true/ready=true`，`MarketAnnouncements` 于 2026-09-28 单日、`limit=300` 返回 `ADMITTED`、`complete=true`、`provider=Cninfo`、300 条，batch id 报告 `total=744`。实际单条记录 schema 为 `magic.market.announcement`，已据此校正探针；旧测试桩使用 `magic.market.market_announcements.batch`。消费端现在对该 schema/version/content type 加严格验证并更新 fixture，单独提交和测试见后续 Git 记录。
+
+**证据层级：** 这是新源码的 Code Ready 与真实上游只读请求证据；运行中的生产 monitor 仍是原 binary，未重新部署、activation 或取得运行日接收/投递回执，不能标记 Production Verified。
+
 ## 5. 下一批工作
 
 1. B02：当前源码 enum/catalog/Unit 差分已有脚本与 v2 增量；继续补生产部署、真实回执、enum 外路径和物理 owner 对账，不由静态目录推断生产送达。
 2. B03：为上述 `部分修复/待核` 项补最小相关测试和生产只读证据；已修且证据充分的项停止重复开发。
 3. B04/B05：核对启动链完整性验证耗时、桥接就绪前欠账重试以及当晚各 route 的具体请求错误。日志样本要用时间窗口和 request_id，避免仅按末尾 4 MB 做因果判断。
-4. 等 VM 回复 D14、D17/D20、MarketAnnouncements 的唯一 owner、合同身份及可用字段；本仓只消费有来源证明的同版结果。
+4. 等 VM 回复 D14、D17/D20 的唯一 owner、合同身份及可用字段；MarketAnnouncements 的本地接线已由真实 RPC 验证，但生产路径仍需部署后复核。
+5. 按 [费用 ADR](../adr/0001-versioned-a-share-fee-schedule.md) 实施新口径，保持 v1 账本与历史回执可重放；未完成前，不把现有 paper 净收益称为现行 A 股费用口径。
