@@ -1286,3 +1286,53 @@ pub(crate) fn w16_prepared_push_fixture_for_identity(
         rendered_sha256,
     }
 }
+
+/// TEST_CODE codec fixture only; does not register a production N02 source contract.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn n02_prepared_push_fixture(
+    namespace: Namespace,
+    unit_id: UnitId,
+    occurrence_material: super::OccurrenceIdentityMaterial,
+    completion_owner: CompletionOwnerId,
+    source_contract_id: SourceContractId,
+    subject: SubjectId,
+    audience: AudienceId,
+    rendered: Vec<u8>,
+) -> PreparedPush {
+    let occurrence = super::derive_occurrence_id(&occurrence_material);
+    let intent_id = derive_intent_id(&IntentIdentityMaterial::new(
+        namespace,
+        unit_id.clone(),
+        completion_owner,
+        source_contract_id.clone(),
+        occurrence.clone(),
+        subject.clone(),
+        audience,
+    ));
+    let rendered_bytes = ExactBytes::new(rendered);
+    PreparedPush {
+        decision_id: derive_decision_id(&intent_id),
+        intent_id,
+        unit_id,
+        occurrence,
+        subject,
+        run_context_sha256: super::raw_digest(b"TEST_CODE context"),
+        prepared_facts_sha256: super::raw_digest(b"TEST_CODE facts"),
+        semantic_projection_sha256: super::raw_digest(b"TEST_CODE projection"),
+        source_binding: SourceBinding {
+            source_contract_id: source_contract_id.clone(),
+            source_contract_version: SourceContractVersion::try_new("TEST_CODE-v1".into()).unwrap(),
+            source_refs: vec![SourceRef::new(
+                super::SourceRefId::try_new("TEST_CODE-ref".into()).unwrap(),
+                super::SourceProvider::try_new("TEST_CODE-provider".into()).unwrap(),
+                super::ExternalId::try_new("TEST_CODE-event".into()).unwrap(),
+                source_contract_id,
+                super::raw_digest(b"TEST_CODE source"),
+            )],
+            evidence_fingerprint: super::raw_digest(b"TEST_CODE evidence"),
+        },
+        rendered_sha256: rendered_bytes.sha256().clone(),
+        rendered_bytes,
+    }
+}

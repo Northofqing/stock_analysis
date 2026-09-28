@@ -55,7 +55,8 @@ pub use chain_preopen_shadow::{observe_chain_preopen_shadow, ChainPreopenShadowR
 pub use intent_store::{
     BusinessIntentStore, InitialDecisionKind, InitialIntentDraft, InitialIntentIdentity,
     InitialIntentOutcome, IntentSnapshot, IntentState, IntentStoreError, IntentTransitionCommand,
-    LeaseAction, LeaseOwnerId, TransitionActor, TransitionOutcome, TransitionReceipt,
+    LeaseAction, LeaseOwnerId, N02BindingError, N02ReservationBindingV1, N02ReservationMaterial,
+    TransitionActor, TransitionOutcome, TransitionReceipt,
 };
 #[cfg(test)]
 pub(crate) use intent_store::{InitialCommitFault, TransitionFault};
