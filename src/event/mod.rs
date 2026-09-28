@@ -2822,8 +2822,8 @@ mod delivery_observation_tests {
 }
 
 /// 2026-09-21 (系统评估 §4.3): NewsFlashGate 拒绝计数与原因落审计。
-/// 写入 event_bus 审计域的轻量记录; 失败仅 warn (审计路径不可影响
-/// fail-closed 主链)。幂等: 同 event_id 同 reason 重复写无妨 (追加式)。
+/// 写入 event_bus 审计域的轻量记录; 调用方须显式报告写入失败，
+/// 但审计路径不可影响 gate 的 fail-closed 拒绝。相同 event_id/reason 可重复追加。
 pub fn record_gate_rejection(gate: &str, reason: &str, event_id: &str) -> Result<(), String> {
     let record = serde_json::json!({
         "schema": "gate-rejection-v1",
@@ -2840,8 +2840,13 @@ pub fn record_gate_rejection(gate: &str, reason: &str, event_id: &str) -> Result
     } else {
         std::path::PathBuf::from("data/event_bus_gate_rejections.jsonl")
     };
+    append_gate_rejection_line(&path, &line)
+}
+
+fn append_gate_rejection_line(path: &std::path::Path, line: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("gate rejection audit directory: {error}"))?;
     }
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -2851,4 +2856,29 @@ pub fn record_gate_rejection(gate: &str, reason: &str, event_id: &str) -> Result
         .map_err(|error| format!("gate rejection audit open: {error}"))?;
     writeln!(file, "{line}").map_err(|error| format!("gate rejection audit write: {error}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod gate_rejection_audit_tests {
+    use super::append_gate_rejection_line;
+
+    #[test]
+    fn reports_unavailable_audit_directory_and_writes_valid_line() {
+        let temp = tempfile::tempdir().expect("isolated audit directory");
+        let blocking_file = temp.path().join("blocked");
+        std::fs::write(&blocking_file, b"not a directory").expect("create blocking file");
+        let error = append_gate_rejection_line(&blocking_file.join("gate.jsonl"), "{}")
+            .expect_err("parent creation failure must be observable");
+        assert!(
+            error.starts_with("gate rejection audit directory:"),
+            "{error}"
+        );
+
+        let path = temp.path().join("valid").join("gate.jsonl");
+        append_gate_rejection_line(&path, "{\"reason\":\"stale\"}").expect("append audit line");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read audit line"),
+            "{\"reason\":\"stale\"}\n"
+        );
+    }
 }

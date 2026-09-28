@@ -566,11 +566,19 @@ impl NewsFlashGate {
                 // + continue, 无审计记录 (~11,300 条/月静默丢弃)。现在把
                 // 拒绝计数与原因写审计: event_bus 的 gate-rejection 审计
                 // 域, 失败可见性不改变 fail-closed 语义。
-                let _ = stock_analysis::event::record_gate_rejection(
+                if let Err(error) = stock_analysis::event::record_gate_rejection(
                     "news_flash_gate",
                     reason,
                     &e.event_id,
-                );
+                ) {
+                    log::error!(
+                        "[NewsFlashGate][BR-137] rejection audit unavailable reason={reason} event_id_sha256={} error={error}",
+                        sha256_domain(
+                            "stock_analysis.news_flash.rejection_event_id.v1",
+                            e.event_id.as_bytes(),
+                        )
+                    );
+                }
                 log::warn!(
                     "[NewsFlashGate][BR-137] source event rejected before critical and aggregate governance: {reason}"
                 );
