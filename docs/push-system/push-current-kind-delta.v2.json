@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "role": "current-source-kind-delta",
+  "status": "PROVISIONAL",
+  "historical_catalog_sha256": "0aa6a2fd87ee9c235073cad3beef44229437f3fe62987b0db510ad36a93aace3",
+  "mappings": [
+    {
+      "kind": "NewsAiAnalysis",
+      "replaces_producer_kind": "NewsToIdea",
+      "producer_id": "news-ai-same-tick",
+      "migration_unit_id": "MU-news-ai",
+      "source_status": "ACTIVE",
+      "production_status": "UNVERIFIED",
+      "evidence": [
+        {
+          "path": "src/bin/monitor/notify.rs",
+          "fragment": "let kind = PushKind::NewsAiAnalysis;"
+        },
+        {
+          "path": "src/bin/monitor/durable_delivery_runtime.rs",
+          "fragment": "K::NewsAiAnalysis => (D::NewsAiAnalysis, DeliverySubKind::None)"
+        },
+        {
+          "path": "src/durable_delivery/model.rs",
+          "fragment": "NewsAiAnalysis,"
+        }
+      ],
+      "note": "2026-09-22 NewsAI 卡取得独立 counted kind；原 NewsToIdea 仍供 D-01 使用。此映射只补当前源码身份，不表示 Foundation 接管或真实渠道送达。"
+    }
+  ]
+}
