@@ -12,6 +12,9 @@ use std::fmt;
 const SCHEMA: &str = "NewsFlashAdmittedRecord/v1";
 pub const MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES: usize = 1_048_576;
 
+mod replay;
+pub(crate) use replay::{replay_n02_admitted_record, NewsFlashRecordReplayError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewsFlashRecordEvidenceError {
     MissingAdmittedRecord,

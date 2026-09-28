@@ -6,6 +6,7 @@
 //! the same opaque tick, never mints a receipt and never changes impact facts.
 
 mod content_evidence;
+pub(crate) use content_evidence::{replay_n02_admitted_record, NewsFlashRecordReplayError};
 pub use content_evidence::{
     NewsFlashRecordEvidenceError, NewsFlashRecordEvidenceV1, MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES,
 };
@@ -1899,6 +1900,16 @@ mod tests {
         assert!(projection.failures().is_empty());
         for (event, attempt) in projection.events().iter().zip(batch.attempts()) {
             let captured = event.record_evidence().unwrap();
+            let replayed = replay_n02_admitted_record(captured.canonical_bytes()).unwrap();
+            assert_eq!(replayed.event().event_id, event.event().event_id);
+            assert_eq!(replayed.event().simhash, event.event().simhash);
+            assert_eq!(replayed.event().full_title, event.event().full_title);
+            assert_eq!(replayed.event().subject, event.event().subject);
+            assert_eq!(replayed.source(), event.source());
+            assert_eq!(
+                replayed.record_evidence().unwrap().canonical_bytes(),
+                captured.canonical_bytes()
+            );
             let terminal = attempt.terminal();
             let record = &terminal.records().unwrap()[0];
             let batch_evidence = terminal.evidence().unwrap();
@@ -1934,6 +1945,42 @@ mod tests {
                 captured.content_sha256()
             );
         }
+    }
+
+    #[test]
+    fn n02_admitted_record_replay_rejects_noncanonical_and_false_source_bytes() {
+        let record = record(GlobalNewsProvider::Eastmoney);
+        let projection = test_project_news_flash_record(
+            &NewsFlashProjectionTestCapability::bind().unwrap(),
+            GlobalNewsProvider::Eastmoney,
+            record,
+            evidence(GlobalNewsProvider::Eastmoney, "eastmoney_global_news"),
+        );
+        let admitted = projection.events()[0].record_evidence().unwrap();
+        let original = admitted.canonical_bytes();
+        let mut spaced = b" ".to_vec();
+        spaced.extend_from_slice(original);
+        assert_eq!(
+            replay_n02_admitted_record(&spaced).unwrap_err(),
+            NewsFlashRecordReplayError::NonCanonical
+        );
+        assert_eq!(
+            replay_n02_admitted_record(&vec![b'x'; MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES + 1])
+                .unwrap_err(),
+            NewsFlashRecordReplayError::TooLarge
+        );
+        let mut source: serde_json::Value = serde_json::from_slice(original).unwrap();
+        source["source_identity"]["batch_id"] = "TEST_CODE_FALSE_BATCH".into();
+        assert_eq!(
+            replay_n02_admitted_record(&serde_json::to_vec(&source).unwrap()).unwrap_err(),
+            NewsFlashRecordReplayError::InvalidField("source_identity")
+        );
+        let mut registration: serde_json::Value = serde_json::from_slice(original).unwrap();
+        registration["registration"]["source_contract"] = "TEST_CODE_FALSE_SOURCE".into();
+        assert_eq!(
+            replay_n02_admitted_record(&serde_json::to_vec(&registration).unwrap()).unwrap_err(),
+            NewsFlashRecordReplayError::InvalidField("registration")
+        );
     }
 
     #[test]
