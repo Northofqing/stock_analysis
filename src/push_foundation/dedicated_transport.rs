@@ -60,6 +60,8 @@ pub(crate) enum DedicatedConformanceError {
     P01ChannelMismatch,
     #[error("N02 dedicated authority does not match field {field}")]
     N02BindingMismatch { field: &'static str },
+    #[error("N02 prepared binding is invalid")]
+    InvalidN02Binding,
     #[error("N02 dedicated terminal disposition is invalid")]
     InvalidN02Disposition,
     #[error("N02 dedicated accepted receipt channel is invalid")]
@@ -311,9 +313,13 @@ pub(crate) fn inspect_n02_dedicated(
     route: &DedicatedConformanceRoute,
     source: &dyn N02DedicatedTerminalSource,
 ) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
-    let attested = snapshot
-        .attested_ready_binding()
-        .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
+    let binding = snapshot
+        .attested_n02_binding()
+        .map_err(|_| DedicatedConformanceError::InvalidN02Binding)?;
+    let attested = &binding.ready;
+    if window != binding.reservation.window() {
+        return Err(DedicatedConformanceError::N02BindingMismatch { field: "window" });
+    }
     if attested.unit_id.as_str() != N02_UNIT_ID {
         return Err(DedicatedConformanceError::N02BindingMismatch { field: "unit_id" });
     }
@@ -325,13 +331,8 @@ pub(crate) fn inspect_n02_dedicated(
     {
         return Err(DedicatedConformanceError::InvalidRoute);
     }
-    let rendered_len = snapshot
-        .rendered_bytes()
-        .ok_or(DedicatedConformanceError::InvalidBusinessIntent)?
-        .len();
-
     let source_record = match source
-        .requery_n02(&attested.business_date, window)
+        .requery_n02(&attested.business_date, binding.reservation.window())
         .map_err(|_| DedicatedConformanceError::SourceUnavailable)?
     {
         NewsFlashWindowTerminalQuery::Missing => {
@@ -342,16 +343,16 @@ pub(crate) fn inspect_n02_dedicated(
         }
         NewsFlashWindowTerminalQuery::Terminal(record) => *record,
     };
-    map_n02_terminal(&attested, rendered_len, window, route, source_record)
+    map_n02_terminal(attested, &binding.reservation, route, source_record)
 }
 
 fn map_n02_terminal(
     attested: &super::intent_store::AttestedReadyIntent,
-    rendered_len: usize,
-    window: NewsFlashWindow,
+    reservation: &super::intent_store::N02ReservationBindingV1,
     route: &DedicatedConformanceRoute,
     source: NewsFlashWindowTerminalRecord,
 ) -> Result<AuthorityTerminalRecord, DedicatedConformanceError> {
+    let material = reservation.material();
     let attempt_bytes = canonical_n02_envelope(&source.attempt)?;
     let terminal_bytes = canonical_n02_envelope(&source.terminal)?;
     let attempt = PushRecord::try_from_authoritative(&source.attempt).map_err(|_| {
@@ -376,7 +377,7 @@ fn map_n02_terminal(
     let expected_date =
         chrono::NaiveDate::parse_from_str(attested.business_date.as_str(), "%Y-%m-%d")
             .map_err(|_| DedicatedConformanceError::InvalidBusinessIntent)?;
-    let expected_key = window.decision_key();
+    let expected_key = &material.decision_key;
     check_n02(
         "business_date",
         attempt.news_flash_business_date == Some(expected_date)
@@ -402,7 +403,10 @@ fn map_n02_terminal(
     }
     check_n02(
         "reservation_sha256",
-        attempt.news_flash_reservation_sha256 == terminal.news_flash_reservation_sha256,
+        attempt.news_flash_reservation_sha256.as_deref()
+            == Some(material.reservation_sha256.as_str())
+            && terminal.news_flash_reservation_sha256.as_deref()
+                == Some(material.reservation_sha256.as_str()),
     )?;
     check_n02(
         "attempt_ordinal",
@@ -426,7 +430,8 @@ fn map_n02_terminal(
     )?;
     check_n02(
         "ordered_sources",
-        attempt.news_flash_sources == terminal.news_flash_sources,
+        attempt.news_flash_sources.as_deref() == Some(material.sources.as_slice())
+            && terminal.news_flash_sources.as_deref() == Some(material.sources.as_slice()),
     )?;
     let sources = terminal.news_flash_sources.as_deref().ok_or(
         DedicatedConformanceError::N02BindingMismatch {
@@ -435,19 +440,20 @@ fn map_n02_terminal(
     )?;
     check_n02(
         "source_evidence_sha256",
-        terminal.news_flash_evidence_sha256.as_deref()
-            == Some(news_flash_evidence_sha256(sources).as_str())
+        terminal.news_flash_evidence_sha256.as_deref() == Some(material.evidence_sha256.as_str())
+            && material.evidence_sha256 == news_flash_evidence_sha256(sources)
             && attempt.news_flash_evidence_sha256 == terminal.news_flash_evidence_sha256,
     )?;
     check_n02(
         "render_sha256",
         attempt.news_flash_render_sha256 == terminal.news_flash_render_sha256
             && terminal.news_flash_render_sha256.as_deref()
-                == Some(attested.rendered_sha256.as_str()),
+                == Some(material.news_flash_render_sha256.as_str()),
     )?;
     check_n02(
         "rendered_len",
-        attempt.rendered_len == rendered_len && terminal.rendered_len == rendered_len,
+        attempt.rendered_len as u64 == material.rendered_len
+            && terminal.rendered_len as u64 == material.rendered_len,
     )?;
     check_n02(
         "channel",

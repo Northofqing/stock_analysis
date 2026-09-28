@@ -649,6 +649,40 @@ struct N02Case {
 }
 
 fn n02_case() -> N02Case {
+    n02_case_with(
+        "2026-08-18",
+        NewsFlashWindow::H0930,
+        b"TEST_CODE_W13_N02_RENDERED".to_vec(),
+        None,
+        false,
+    )
+}
+
+fn n02_case_with(
+    date: &str,
+    window: NewsFlashWindow,
+    rendered: Vec<u8>,
+    source_override: Option<Vec<NewsFlashAuditSource>>,
+    raw_audit_render: bool,
+) -> N02Case {
+    n02_case_with_mode(
+        date,
+        window,
+        rendered,
+        source_override,
+        raw_audit_render,
+        false,
+    )
+}
+
+fn n02_case_with_mode(
+    date: &str,
+    window: NewsFlashWindow,
+    rendered: Vec<u8>,
+    source_override: Option<Vec<NewsFlashAuditSource>>,
+    raw_audit_render: bool,
+    opaque: bool,
+) -> N02Case {
     let root = tempfile::tempdir().expect("create W13 N02 store");
     let database = root.path().join("business.sqlite3");
     FoundationSchemaMigration::bundled()
@@ -663,44 +697,31 @@ fn n02_case() -> N02Case {
         Namespace::Production,
         UnitId::try_new("MU-news-flash-aggregate".to_owned()).expect("unit"),
         OccurrenceIdentityMaterial::new(
-            BusinessDate::parse("2026-08-18").expect("business date"),
+            BusinessDate::parse(date).expect("business date"),
             OccurrenceFamily::try_new("news-flash-window".to_owned()).expect("family"),
-            OccurrenceKey::try_new("09:30".to_owned()).expect("key"),
+            OccurrenceKey::try_new(window.label().to_owned()).expect("key"),
         ),
         CompletionOwnerId::try_new("news-flash-accepted-window".to_owned()).expect("owner"),
         SourceContractId::try_new("news-flash-authority-v5".to_owned()).expect("source contract"),
         SubjectId::Global,
         AudienceId::try_new("portfolio-owner".to_owned()).expect("audience"),
     );
-    let rendered = b"TEST_CODE_W13_N02_RENDERED".to_vec();
     let rendered_len = rendered.len();
-    let render_sha256 = raw_digest(&rendered);
-    let reservation_sha256 = "a".repeat(64);
-    let draft = InitialIntentDraft::ready_for_recovery_test(
-        identity,
-        b"TEST_CODE_W13_N02_PREPARED".to_vec(),
-        rendered,
-        template.sha256().clone(),
-        raw_digest(b"TEST_CODE_W13_N02_SOURCE_CONTRACT"),
-        UtcMicros::try_new(1_787_027_400_000_000).expect("created at"),
-    )
-    .expect("valid N02 Ready intent");
-    let mut store = BusinessIntentStore::open(&database).expect("open Foundation store");
-    let snapshot = match store.record_initial(&draft).expect("record N02 intent") {
-        InitialIntentOutcome::Inserted(snapshot) => snapshot,
-        other => panic!("expected inserted N02 intent, got {other:?}"),
-    };
-
     let source_published_at =
-        chrono::DateTime::parse_from_rfc3339("2026-08-18T01:20:00+08:00").expect("published time");
+        chrono::DateTime::parse_from_rfc3339(&format!("{date}T01:20:00+08:00"))
+            .expect("published time");
     let source_observed_at =
-        chrono::DateTime::parse_from_rfc3339("2026-08-18T01:21:00+08:00").expect("observed time");
+        chrono::DateTime::parse_from_rfc3339(&format!("{date}T01:21:00+08:00"))
+            .expect("observed time");
     let attempt_observed_at =
-        chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:01+08:00").expect("attempt time");
+        chrono::DateTime::parse_from_rfc3339(&format!("{date}T09:30:01+08:00"))
+            .expect("attempt time");
     let receipt_accepted_at =
-        chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:03+08:00").expect("accepted time");
+        chrono::DateTime::parse_from_rfc3339(&format!("{date}T09:30:03+08:00"))
+            .expect("accepted time");
     let terminal_observed_at =
-        chrono::DateTime::parse_from_rfc3339("2026-08-18T09:30:04+08:00").expect("terminal time");
+        chrono::DateTime::parse_from_rfc3339(&format!("{date}T09:30:04+08:00"))
+            .expect("terminal time");
     let sources = vec![NewsFlashAuditSource {
         event_id: "TEST_CODE_W13_N02_EVENT".to_owned(),
         provider: "TEST_CODE_W13_N02_SOURCE_PROVIDER".to_owned(),
@@ -709,14 +730,49 @@ fn n02_case() -> N02Case {
         observed_at: source_observed_at,
         batch_id: "TEST_CODE_W13_N02_BATCH".to_owned(),
     }];
+    let sources = source_override.unwrap_or(sources);
+    let binding = super::intent_store::n02_test_support::reservation(
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+        window,
+        &rendered,
+        sources.clone(),
+    );
+    let render_sha256 = if raw_audit_render {
+        raw_digest(&rendered).as_str().to_owned()
+    } else {
+        binding.material().news_flash_render_sha256.clone()
+    };
+    let reservation_sha256 = binding.material().reservation_sha256.clone();
+    let draft = if opaque {
+        InitialIntentDraft::ready_for_recovery_test(
+            identity,
+            b"TEST_CODE_OLD_OPAQUE_N02".to_vec(),
+            rendered,
+            template.sha256().clone(),
+            raw_digest(b"TEST_CODE_W13_N02_SOURCE_CONTRACT"),
+            UtcMicros::try_new(1_787_027_400_000_000).unwrap(),
+        )
+        .unwrap()
+    } else {
+        super::intent_store::n02_test_support::ready(
+            identity,
+            rendered,
+            &binding,
+            template.sha256().clone(),
+            raw_digest(b"TEST_CODE_W13_N02_SOURCE_CONTRACT"),
+            UtcMicros::try_new(1_787_027_400_000_000).unwrap(),
+        )
+    };
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let snapshot = store.record_initial(&draft).unwrap().snapshot().clone();
     let evidence_sha256 = news_flash_evidence_sha256(&sources);
     let channel = "TEST_CODE_W13_N02_CHANNEL".to_owned();
     let attempt_event = PushDeliveryEvent::new_news_flash_attempt(
         "news_flash_aggregated_v1".to_owned(),
-        "window:09:30".to_owned(),
+        window.decision_key(),
         channel.clone(),
         rendered_len,
-        chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
         reservation_sha256.clone(),
         sources.clone(),
         evidence_sha256.clone(),
@@ -745,11 +801,11 @@ fn n02_case() -> N02Case {
     let terminal_event = PushDeliveryEvent::new_news_flash_terminal(
         NewsFlashTransactionStage::Accepted,
         "news_flash_aggregated_v1".to_owned(),
-        "window:09:30".to_owned(),
+        window.decision_key(),
         channel.clone(),
         rendered_len,
         3,
-        chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
         reservation_sha256,
         sources,
         evidence_sha256,
@@ -1124,15 +1180,13 @@ fn w13_shared_sqlite_date_and_window_material_derive_distinct_intents() {
             SubjectId::Global,
             AudienceId::try_new("portfolio-owner".to_owned()).unwrap(),
         );
-        let draft = InitialIntentDraft::ready_for_recovery_test(
+        let draft = super::intent_store::n02_test_support::ready_default(
             identity,
-            format!("TEST_CODE_W13_N02_PREPARED_{date}_{window}").into_bytes(),
             n02.snapshot.rendered_bytes().unwrap().to_vec(),
             n02.route.template().sha256().clone(),
             raw_digest(b"TEST_CODE_W13_N02_SOURCE_CONTRACT"),
             conformance_time(1_787_027_400_000_000),
-        )
-        .unwrap();
+        );
         let InitialIntentOutcome::Inserted(snapshot) = n02_store.record_initial(&draft).unwrap()
         else {
             panic!("different N02 date/window material must insert a different intent");
@@ -1323,13 +1377,31 @@ fn w13_n02_shared_sqlite_accepted_terminal_recovers_after_reopen() {
     );
     let intent = awaiting.attested_ready_binding().unwrap();
     conformance_prepare_accepted(&mut store, &awaiting, &case.route, &case.policy, &authority);
+    drop(store);
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let persisted = store.inspect(&intent.intent_id).unwrap().unwrap();
+    assert_eq!(
+        persisted.prepared_push_bytes(),
+        case.snapshot.prepared_push_bytes()
+    );
+    assert_eq!(persisted.rendered_bytes(), case.snapshot.rendered_bytes());
+    assert_eq!(
+        persisted.attested_n02_binding().unwrap().reservation,
+        case.snapshot.attested_n02_binding().unwrap().reservation
+    );
+    // Foundation SQLite is reopened; legacy authority remains a read-only in-memory stand-in.
+    let authority = StoredDedicatedAuthority {
+        snapshot: persisted,
+        route: &case.route,
+        source: DedicatedFixtureSource::N02(&source),
+        descriptor: case.route.authority_descriptor().unwrap(),
+        queries: std::cell::Cell::new(0),
+    };
     let bindings = DedicatedRecoveryBindings {
         route: &case.route,
         policy: &case.policy,
         authority: &authority,
     };
-    drop(store);
-    let mut store = BusinessIntentStore::open(&database).unwrap();
     super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
         .unwrap();
     let completed = store.inspect(&intent.intent_id).unwrap().unwrap();
@@ -1375,7 +1447,7 @@ fn w13_n02_shared_sqlite_accepted_terminal_recovers_after_reopen() {
         .borrow()
         .iter()
         .all(|(date, window)| date == "2026-08-18" && *window == NewsFlashWindow::H0930));
-    assert!(authority.queries.get() >= 2);
+    assert!(authority.queries.get() >= 1);
     let version = completed.version();
     super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
         .unwrap();
@@ -1864,5 +1936,365 @@ fn w13_n02_dedicated_fails_closed_on_exact_binding_corruption() {
     assert_ne!(
         verified.evidence_sha256(),
         &raw_digest(&case.exact_terminal_bytes)
+    );
+}
+
+// Exact Task 1 real-gate A/B vectors. This library fixture exercises the adapter;
+// news_aggregator_init::tests::n02_legacy_identity_real_gate_vectors establishes gate origin.
+fn golden_n02_case(suffix: &str) -> N02Case {
+    let sources = vec![NewsFlashAuditSource {
+        event_id: format!("TEST_CODE_EVENT_{suffix}"),
+        provider: "TEST_CODE_PROVIDER".into(),
+        source: "TEST_CODE_SOURCE".into(),
+        published_at: chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00+00:00").unwrap(),
+        observed_at: chrono::DateTime::parse_from_rfc3339("2026-09-28T00:01:00+00:00").unwrap(),
+        batch_id: format!("TEST_CODE_BATCH_{suffix}"),
+    }];
+    n02_case_with(
+        "2026-09-28",
+        NewsFlashWindow::H0930,
+        "📰 新闻时段聚合 (09:30) Top3:\n1. [政策] TEST_CODE_TITLE_A (强度0 确定性100)\n"
+            .as_bytes()
+            .to_vec(),
+        Some(sources),
+        false,
+    )
+}
+
+fn assert_n02_pair_valid(case: &N02Case) {
+    crate::event::PushRecord::try_from_authoritative(&case.terminal.attempt).unwrap();
+    crate::event::PushRecord::try_from_authoritative(&case.terminal.terminal).unwrap();
+}
+
+#[test]
+fn w13_n02_same_date_render_alternate_real_reservation_is_rejected() {
+    let a = golden_n02_case("A");
+    let b = golden_n02_case("B");
+    assert_eq!(a.snapshot.rendered_bytes(), b.snapshot.rendered_bytes());
+    for (case, sha) in [
+        (
+            &a,
+            "eba6d8e675bcfa34f1823268099f2244856cf9ab0df9d67e5245d28d8916b05f",
+        ),
+        (
+            &b,
+            "774799317c09db050295597009fe1695320178654b8f6b2ec628ed4a5c1f8507",
+        ),
+    ] {
+        assert_eq!(
+            case.snapshot
+                .attested_n02_binding()
+                .unwrap()
+                .reservation
+                .material()
+                .reservation_sha256,
+            sha
+        );
+        assert_n02_pair_valid(case);
+        super::dedicated_transport::inspect_n02_dedicated(
+            &case.snapshot,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &n02_source(case, 0),
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        super::dedicated_transport::inspect_n02_dedicated(
+            &a.snapshot,
+            NewsFlashWindow::H0930,
+            &a.route,
+            &n02_source(&b, 0)
+        ),
+        Err(DedicatedConformanceError::N02BindingMismatch {
+            field: "reservation_sha256"
+        })
+    ));
+}
+
+#[test]
+fn w13_n02_coherent_ordered_source_substitution_is_rejected() {
+    // Faithful source-order fixture: identical display fields produce identical lines.
+    // This is not an additional execution of the monitor gate.
+    let mut sources = super::intent_store::n02_test_support::sources();
+    let mut second = sources[0].clone();
+    second.event_id = "TEST_CODE_N02_SECOND".into();
+    second.batch_id = "TEST_CODE_N02_SECOND_BATCH".into();
+    sources.push(second);
+    let rendered = "📰 新闻时段聚合 (09:30) Top3:\n1. [政策] SAME (强度0 确定性100)\n2. [政策] SAME (强度0 确定性100)\n".as_bytes().to_vec();
+    let a = n02_case_with(
+        "2026-08-18",
+        NewsFlashWindow::H0930,
+        rendered.clone(),
+        Some(sources.clone()),
+        false,
+    );
+    sources.reverse();
+    let b = n02_case_with(
+        "2026-08-18",
+        NewsFlashWindow::H0930,
+        rendered,
+        Some(sources),
+        false,
+    );
+    assert_n02_pair_valid(&b);
+    super::dedicated_transport::inspect_n02_dedicated(
+        &b.snapshot,
+        NewsFlashWindow::H0930,
+        &b.route,
+        &n02_source(&b, 0),
+    )
+    .unwrap();
+    assert!(super::dedicated_transport::inspect_n02_dedicated(
+        &a.snapshot,
+        NewsFlashWindow::H0930,
+        &a.route,
+        &n02_source(&b, 0)
+    )
+    .is_err());
+}
+
+#[test]
+fn w13_n02_direct_wrong_window_rejects_before_lookup() {
+    let a = n02_case();
+    let b = n02_case_with(
+        "2026-08-18",
+        NewsFlashWindow::H1130,
+        a.snapshot.rendered_bytes().unwrap().to_vec(),
+        None,
+        false,
+    );
+    assert_n02_pair_valid(&b);
+    let source = n02_source(&b, 0);
+    assert_eq!(
+        super::dedicated_transport::inspect_n02_dedicated(
+            &a.snapshot,
+            NewsFlashWindow::H1130,
+            &a.route,
+            &source
+        ),
+        Err(DedicatedConformanceError::N02BindingMismatch { field: "window" })
+    );
+    assert!(source.queried.borrow().is_empty());
+}
+
+#[test]
+fn w13_n02_raw_audit_render_cannot_replace_legacy_domain_digest() {
+    let case = n02_case_with(
+        "2026-08-18",
+        NewsFlashWindow::H0930,
+        b"TEST_CODE_W13_N02_RENDERED".to_vec(),
+        None,
+        true,
+    );
+    assert_n02_pair_valid(&case);
+    assert_eq!(
+        super::dedicated_transport::inspect_n02_dedicated(
+            &case.snapshot,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &n02_source(&case, 0)
+        ),
+        Err(DedicatedConformanceError::N02BindingMismatch {
+            field: "render_sha256"
+        })
+    );
+}
+
+#[test]
+fn w13_n02_old_opaque_rejects_before_source_lookup() {
+    let case = n02_case_with_mode(
+        "2026-08-18",
+        NewsFlashWindow::H0930,
+        b"TEST_CODE_W13_N02_RENDERED".to_vec(),
+        None,
+        false,
+        true,
+    );
+    assert_n02_pair_valid(&case);
+    let source = n02_source(&case, 0);
+    assert!(case.snapshot.attested_ready_binding().is_ok());
+    assert_eq!(
+        super::dedicated_transport::inspect_n02_dedicated(
+            &case.snapshot,
+            NewsFlashWindow::H0930,
+            &case.route,
+            &source
+        ),
+        Err(DedicatedConformanceError::InvalidN02Binding)
+    );
+    assert!(source.queried.borrow().is_empty());
+}
+
+#[test]
+fn w13_n02_shared_sqlite_coherent_mismatch_records_only_blocked_recovery_transitions() {
+    for variant in ["reservation", "order", "window", "raw_render", "opaque"] {
+        let order_sources = if variant == "order" {
+            let mut sources = super::intent_store::n02_test_support::sources();
+            let mut other = sources[0].clone();
+            other.event_id = "TEST_CODE_OTHER_ORDER".into();
+            other.batch_id = "TEST_CODE_OTHER_ORDER_BATCH".into();
+            sources.push(other);
+            Some(sources)
+        } else {
+            None
+        };
+        let case = n02_case_with_mode(
+            "2026-08-18",
+            NewsFlashWindow::H0930,
+            b"TEST_CODE_W13_N02_RENDERED".to_vec(),
+            order_sources,
+            false,
+            variant == "opaque",
+        );
+        let mut sources = case
+            .snapshot
+            .attested_n02_binding()
+            .ok()
+            .map(|a| a.reservation.material().sources.clone())
+            .unwrap_or_else(super::intent_store::n02_test_support::sources);
+        if variant == "reservation" {
+            sources[0].event_id = "TEST_CODE_ALTERNATE_EVENT".into();
+        }
+        if variant == "order" {
+            sources.reverse();
+        }
+        let alternate = n02_case_with(
+            "2026-08-18",
+            if variant == "window" {
+                NewsFlashWindow::H1130
+            } else {
+                NewsFlashWindow::H0930
+            },
+            case.snapshot.rendered_bytes().unwrap().to_vec(),
+            Some(sources),
+            variant == "raw_render",
+        );
+        assert_n02_pair_valid(&alternate);
+        let source = n02_source(&alternate, 0);
+        let database = case._root.path().join("business.sqlite3");
+        let mut store = BusinessIntentStore::open(&database).unwrap();
+        let awaiting = conformance_dispatch(&mut store, &case.snapshot);
+        let intent = awaiting.attested_ready_binding().unwrap().intent_id;
+        let count = store.inspect_transition_chain(&intent).unwrap().len();
+        assert!(
+            super::dedicated_transport::inspect_n02_dedicated(
+                &awaiting,
+                NewsFlashWindow::H0930,
+                &case.route,
+                &source
+            )
+            .is_err(),
+            "{variant}"
+        );
+        assert_eq!(
+            store.inspect(&intent).unwrap().unwrap().version(),
+            awaiting.version(),
+            "inspection must not mutate {variant}"
+        );
+        drop(store);
+        let mut store = BusinessIntentStore::open(&database).unwrap();
+        let persisted = store.inspect(&intent).unwrap().unwrap();
+        let authority = StoredDedicatedAuthority {
+            snapshot: persisted,
+            route: &case.route,
+            source: DedicatedFixtureSource::N02(&source),
+            descriptor: case.route.authority_descriptor().unwrap(),
+            queries: std::cell::Cell::new(0),
+        };
+        let bindings = DedicatedRecoveryBindings {
+            route: &case.route,
+            policy: &case.policy,
+            authority: &authority,
+        };
+        let report = super::reconciler::reconcile_startup(
+            &mut store,
+            &conformance_recovery_config(),
+            &bindings,
+        )
+        .unwrap();
+        assert_eq!(
+            report.entry(intent.as_str()).unwrap().boundary(),
+            super::reconciler::RecoveryBoundary::AuthorityBlocked,
+            "{variant}"
+        );
+        let after = store.inspect(&intent).unwrap().unwrap();
+        assert_eq!(after.state(), super::IntentState::AwaitingAuthority);
+        // Existing recovery first takes the expired lease, then records the blocked query.
+        // Neither transition qualifies Accepted finalization or stores a terminal receipt.
+        assert_eq!(after.version(), awaiting.version() + 2, "{variant}");
+        let chain = store.inspect_transition_chain(&intent).unwrap();
+        assert_eq!(chain.len(), count + 2, "{variant}");
+        for (receipt, reason) in chain[count..].iter().zip([
+            crate::monitor::push_job::ReasonCode::IntentDispatchClaimed,
+            crate::monitor::push_job::ReasonCode::FinalizerTerminalRefInvalid,
+        ]) {
+            assert_eq!(receipt.reason(), reason, "{variant}");
+            assert_eq!(receipt.from_state(), super::IntentState::AwaitingAuthority);
+            assert_eq!(receipt.to_state(), super::IntentState::AwaitingAuthority);
+            assert!(receipt.terminal_ref_id().is_none());
+            assert!(receipt.terminal_disposition().is_none());
+            assert!(receipt.terminal_binding_sha256().is_none());
+        }
+        super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+            .unwrap();
+        assert_eq!(
+            store.inspect(&intent).unwrap().unwrap().version(),
+            after.version(),
+            "repeat {variant}"
+        );
+        assert_eq!(
+            store.inspect_transition_chain(&intent).unwrap().len(),
+            chain.len(),
+            "repeat {variant}"
+        );
+    }
+}
+
+#[test]
+fn w13_n02_shared_sqlite_awaiting_authority_recovers_after_reopen() {
+    let case = n02_case();
+    let source = n02_source(&case, 0); // Read-only in-memory stand-in for durable legacy audit.
+    let database = case._root.path().join("business.sqlite3");
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let awaiting = conformance_dispatch(&mut store, &case.snapshot);
+    let intent = awaiting.attested_ready_binding().unwrap().intent_id;
+    drop(store);
+    let mut store = BusinessIntentStore::open(&database).unwrap();
+    let authority = StoredDedicatedAuthority {
+        snapshot: store.inspect(&intent).unwrap().unwrap(),
+        route: &case.route,
+        source: DedicatedFixtureSource::N02(&source),
+        descriptor: case.route.authority_descriptor().unwrap(),
+        queries: std::cell::Cell::new(0),
+    };
+    let bindings = DedicatedRecoveryBindings {
+        route: &case.route,
+        policy: &case.policy,
+        authority: &authority,
+    };
+    super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+        .unwrap();
+    let completed = store.inspect(&intent).unwrap().unwrap();
+    assert_eq!(completed.state(), super::IntentState::Completed);
+    assert_eq!(
+        completed.prepared_push_bytes(),
+        awaiting.prepared_push_bytes()
+    );
+    assert_eq!(completed.rendered_bytes(), awaiting.rendered_bytes());
+    let chain = store.inspect_transition_chain(&intent).unwrap();
+    assert_eq!(
+        chain.last().unwrap().terminal_ref_id(),
+        Some(case.terminal.terminal.id.as_str())
+    );
+    super::reconciler::reconcile_startup(&mut store, &conformance_recovery_config(), &bindings)
+        .unwrap();
+    assert_eq!(
+        store.inspect(&intent).unwrap().unwrap().version(),
+        completed.version()
+    );
+    assert_eq!(
+        store.inspect_transition_chain(&intent).unwrap().len(),
+        chain.len()
     );
 }

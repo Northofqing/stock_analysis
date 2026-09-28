@@ -30,9 +30,7 @@ use crate::durable_delivery::{
     AuthoritativeSinkResult, CoordinatorConfig, DeliveryEnvelope, DeliverySubKind,
     DurableDeliveryCoordinator, ImmutableAppendPort, PushKind, TypedReceipt,
 };
-use crate::event::envelope::{
-    news_flash_evidence_sha256, NewsFlashAuditSource, NewsFlashRemoteReceipt,
-};
+use crate::event::envelope::NewsFlashRemoteReceipt;
 use crate::event::{AuditDispatcher, EventEnvelope, NewsFlashWindow, PushDeliveryEvent};
 use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
@@ -156,15 +154,25 @@ fn seed_business(fixture: &Fixture, kind: DedicatedBusinessKind) {
         AudienceId::try_new("test-owner".to_owned()).unwrap(),
     );
     let (recovery_now, recovery_until) = recovery_times(kind);
-    let draft = InitialIntentDraft::ready_for_recovery_test(
-        identity,
-        format!("TEST_CODE_{kind:?}_PREPARED").into_bytes(),
-        format!("TEST_CODE_{kind:?}_RENDERED").into_bytes(),
-        template.sha256().clone(),
-        raw_digest(format!("TEST_CODE_{kind:?}_SOURCE").as_bytes()),
-        micros(recovery_now - 600_000_000),
-    )
-    .unwrap();
+    let draft = if matches!(kind, DedicatedBusinessKind::N02) {
+        crate::push_foundation::intent_store::n02_test_support::ready_default(
+            identity,
+            format!("TEST_CODE_{kind:?}_RENDERED").into_bytes(),
+            template.sha256().clone(),
+            raw_digest(format!("TEST_CODE_{kind:?}_SOURCE").as_bytes()),
+            micros(recovery_now - 600_000_000),
+        )
+    } else {
+        InitialIntentDraft::ready_for_recovery_test(
+            identity,
+            format!("TEST_CODE_{kind:?}_PREPARED").into_bytes(),
+            format!("TEST_CODE_{kind:?}_RENDERED").into_bytes(),
+            template.sha256().clone(),
+            raw_digest(format!("TEST_CODE_{kind:?}_SOURCE").as_bytes()),
+            micros(recovery_now - 600_000_000),
+        )
+        .unwrap()
+    };
     let mut store = BusinessIntentStore::open(&database).unwrap();
     let initial = store.record_initial(&draft).unwrap().snapshot().clone();
     let intent_id = initial.attested_ready_binding().unwrap().intent_id;
@@ -255,25 +263,19 @@ fn seed_n02(fixture: &Fixture, snapshot: &super::IntentSnapshot) {
         .single()
         .unwrap()
         .fixed_offset();
-    let sources = vec![NewsFlashAuditSource {
-        event_id: "TEST_CODE_W16_PROCESS_EVENT".to_owned(),
-        provider: "TEST_CODE_W16_PROCESS_PROVIDER".to_owned(),
-        source: "TEST_CODE_W16_PROCESS_SOURCE".to_owned(),
-        published_at: at,
-        observed_at: at,
-        batch_id: "TEST_CODE_W16_PROCESS_BATCH".to_owned(),
-    }];
-    let evidence = news_flash_evidence_sha256(&sources);
+    let binding = snapshot.attested_n02_binding().unwrap().reservation;
+    let sources = binding.material().sources.clone();
+    let evidence = binding.material().evidence_sha256.clone();
     let attempt_event = PushDeliveryEvent::new_news_flash_attempt(
         "news_flash_aggregated_v1".to_owned(),
         "window:09:30".to_owned(),
         N02_CHANNEL.to_owned(),
         snapshot.rendered_bytes().unwrap().len(),
         date,
-        "a".repeat(64),
+        binding.material().reservation_sha256.clone(),
         sources.clone(),
         evidence.clone(),
-        snapshot.rendered_sha256().unwrap().as_str().to_owned(),
+        binding.material().news_flash_render_sha256.clone(),
         1,
         at,
     );
@@ -298,10 +300,10 @@ fn seed_n02(fixture: &Fixture, snapshot: &super::IntentSnapshot) {
         snapshot.rendered_bytes().unwrap().len(),
         3,
         date,
-        "a".repeat(64),
+        binding.material().reservation_sha256.clone(),
         sources,
         evidence,
-        snapshot.rendered_sha256().unwrap().as_str().to_owned(),
+        binding.material().news_flash_render_sha256.clone(),
         1,
         at,
         attempt_event

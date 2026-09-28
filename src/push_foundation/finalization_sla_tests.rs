@@ -27,10 +27,7 @@ use crate::durable_delivery::{
     DurableDeliveryCoordinator, ImmutableAppendPort, ManualDisposition, ManualResolutionCommand,
     PushKind, TypedReceipt, TypedRejection, TypedUncertainty,
 };
-use crate::event::envelope::{
-    news_flash_evidence_sha256, NewsFlashAuditSource, NewsFlashRemoteReceipt,
-    NewsFlashTransactionStage,
-};
+use crate::event::envelope::{NewsFlashRemoteReceipt, NewsFlashTransactionStage};
 use crate::event::{AuditDispatcher, EventEnvelope, NewsFlashWindow, PushDeliveryEvent};
 use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
@@ -265,6 +262,19 @@ impl Case {
             ACCEPTED - 10_000_000
         };
         let draft = match kind {
+            InitialDecisionKind::Ready
+                if class == AuthorityClass::N02Dedicated
+                    && family_override.is_none()
+                    && key_override.is_none() =>
+            {
+                crate::push_foundation::intent_store::n02_test_support::ready_default(
+                    identity,
+                    b"SECRET_TEST_RENDERED".to_vec(),
+                    template.sha256().clone(),
+                    raw_digest(b"TEST_CODE_W19_CONTRACT"),
+                    micros(business_created_at),
+                )
+            }
             InitialDecisionKind::Ready => InitialIntentDraft::ready_for_recovery_test(
                 identity,
                 b"SECRET_TEST_PREPARED".to_vec(),
@@ -925,16 +935,15 @@ impl Case {
     }
     fn write_n02(&self, seal: bool) {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
-        let sources = vec![NewsFlashAuditSource {
-            event_id: "TEST_CODE_W19_EVENT".to_owned(),
-            provider: "TEST_CODE_W19_PROVIDER".to_owned(),
-            source: "TEST_CODE_W19_SOURCE".to_owned(),
-            published_at: utc(ACCEPTED - 9_000_000).fixed_offset(),
-            observed_at: utc(ACCEPTED - 8_000_000).fixed_offset(),
-            batch_id: "TEST_CODE_W19_BATCH".to_owned(),
-        }];
-        let evidence = news_flash_evidence_sha256(&sources);
-        let rendered_sha = self.snapshot.rendered_sha256().unwrap().as_str().to_owned();
+        let sources = crate::push_foundation::intent_store::n02_test_support::sources();
+        let binding = crate::push_foundation::intent_store::n02_test_support::reservation(
+            date,
+            NewsFlashWindow::H0930,
+            self.snapshot.rendered_bytes().unwrap(),
+            sources.clone(),
+        );
+        let evidence = binding.material().evidence_sha256.clone();
+        let rendered_sha = binding.material().news_flash_render_sha256.clone();
         let rendered_len = self.snapshot.rendered_bytes().unwrap().len();
         let attempt_at = utc(ACCEPTED - 1_000_000).fixed_offset();
         let attempt_event = PushDeliveryEvent::new_news_flash_attempt(
@@ -943,7 +952,7 @@ impl Case {
             CHANNEL.to_owned(),
             rendered_len,
             date,
-            "a".repeat(64),
+            binding.material().reservation_sha256.clone(),
             sources.clone(),
             evidence.clone(),
             rendered_sha.clone(),
@@ -979,7 +988,7 @@ impl Case {
             rendered_len,
             3,
             date,
-            "a".repeat(64),
+            binding.material().reservation_sha256.clone(),
             sources,
             evidence,
             rendered_sha,
@@ -2224,4 +2233,23 @@ fn noncompleted_history_must_be_consistent_with_current_persisted_authority() {
         failures.is_empty(),
         "persisted non-Completed history conflicts were not rejected: {failures:#?}"
     );
+}
+
+#[test]
+fn n02_valid_occurrence_with_opaque_wrapper_is_invalid_authority() {
+    let case = Case::variant(
+        AuthorityClass::N02Dedicated,
+        accepted_result(ACCEPTED),
+        true,
+        InitialDecisionKind::Ready,
+        Some("news-flash-window"),
+    );
+    let rows = case.rows();
+    let effects = case.effect_counts();
+    assert_eq!(
+        case.query(ACCEPTED + 10_000_000, Duration::from_secs(30)),
+        Err(FinalizationSlaError::SourceInvalid)
+    );
+    assert_eq!(case.rows(), rows);
+    assert_eq!(case.effect_counts(), effects);
 }

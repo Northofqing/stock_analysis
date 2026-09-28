@@ -24,10 +24,7 @@ use crate::durable_delivery::{
     AuthoritativeSinkResult, CoordinatorConfig, DeliveryEnvelope, DeliverySubKind,
     ImmutableAppendPort, PushKind, TypedReceipt, TypedRejection, TypedUncertainty,
 };
-use crate::event::envelope::{
-    news_flash_evidence_sha256, NewsFlashAuditSource, NewsFlashRemoteReceipt,
-    NewsFlashTransactionStage,
-};
+use crate::event::envelope::{NewsFlashRemoteReceipt, NewsFlashTransactionStage};
 use crate::event::{AuditDispatcher, EventEnvelope, NewsFlashWindow, PushDeliveryEvent};
 use crate::monitor::push_job::{
     raw_digest, w09_completion_policy_fixture, AudienceId, AuthorityClass, BusinessDate, ChannelId,
@@ -365,6 +362,15 @@ impl N02Fixture {
     }
 
     fn with_identity(state: N02State, occurrence_family: &str, occurrence_key: &str) -> Self {
+        Self::with_binding_mode(state, occurrence_family, occurrence_key, "wrapped")
+    }
+
+    fn with_binding_mode(
+        state: N02State,
+        occurrence_family: &str,
+        occurrence_key: &str,
+        mode: &str,
+    ) -> Self {
         std::fs::create_dir_all("data/test").unwrap();
         let authority_root = tempfile::Builder::new()
             .prefix("TEST_CODE_W16_N02_")
@@ -414,15 +420,39 @@ impl N02Fixture {
             SubjectId::Global,
             AudienceId::try_new("test-owner".to_owned()).unwrap(),
         );
-        let draft = InitialIntentDraft::ready_for_recovery_test(
-            identity,
-            b"TEST_CODE_W16_N02_PREPARED".to_vec(),
-            b"TEST_CODE_W16_N02_RENDERED".to_vec(),
-            template.sha256().clone(),
-            raw_digest(b"TEST_CODE_W16_N02_SOURCE_CONTRACT"),
-            micros(N02_NOW - 600_000_000),
-        )
-        .unwrap();
+        let draft = if mode != "opaque"
+            && occurrence_family == "news-flash-window"
+            && occurrence_key == "09:30"
+        {
+            let mut sources = crate::push_foundation::intent_store::n02_test_support::sources();
+            if mode == "alternate" {
+                sources[0].event_id = "TEST_CODE_OTHER_RESERVATION".into();
+            }
+            let binding = crate::push_foundation::intent_store::n02_test_support::reservation(
+                chrono::NaiveDate::parse_from_str(BUSINESS_DATE, "%Y-%m-%d").unwrap(),
+                NewsFlashWindow::H0930,
+                b"TEST_CODE_W16_N02_RENDERED",
+                sources,
+            );
+            crate::push_foundation::intent_store::n02_test_support::ready(
+                identity,
+                b"TEST_CODE_W16_N02_RENDERED".to_vec(),
+                &binding,
+                template.sha256().clone(),
+                raw_digest(b"TEST_CODE_W16_N02_SOURCE_CONTRACT"),
+                micros(N02_NOW - 600_000_000),
+            )
+        } else {
+            InitialIntentDraft::ready_for_recovery_test(
+                identity,
+                b"TEST_CODE_W16_N02_PREPARED".to_vec(),
+                b"TEST_CODE_W16_N02_RENDERED".to_vec(),
+                template.sha256().clone(),
+                raw_digest(b"TEST_CODE_W16_N02_SOURCE_CONTRACT"),
+                micros(N02_NOW - 600_000_000),
+            )
+            .unwrap()
+        };
         let mut store = BusinessIntentStore::open(&database).unwrap();
         let initial = store.record_initial(&draft).unwrap().snapshot().clone();
         let intent_id = initial.attested_ready_binding().unwrap().intent_id;
@@ -446,24 +476,19 @@ impl N02Fixture {
             .unwrap();
         let snapshot = store.inspect(&intent_id).unwrap().unwrap();
         let date = chrono::NaiveDate::parse_from_str(BUSINESS_DATE, "%Y-%m-%d").unwrap();
-        let sources = vec![NewsFlashAuditSource {
-            event_id: "TEST_CODE_W16_N02_EVENT".to_owned(),
-            provider: "TEST_CODE_W16_N02_PROVIDER".to_owned(),
-            source: "TEST_CODE_W16_N02_SOURCE".to_owned(),
-            published_at: Utc
-                .timestamp_micros(N02_NOW - 500_000_000)
-                .single()
-                .unwrap()
-                .fixed_offset(),
-            observed_at: Utc
-                .timestamp_micros(N02_NOW - 490_000_000)
-                .single()
-                .unwrap()
-                .fixed_offset(),
-            batch_id: "TEST_CODE_W16_N02_BATCH".to_owned(),
-        }];
-        let evidence = news_flash_evidence_sha256(&sources);
-        let rendered_sha256 = snapshot.rendered_sha256().unwrap().as_str().to_owned();
+        let sources = crate::push_foundation::intent_store::n02_test_support::sources();
+        let binding = crate::push_foundation::intent_store::n02_test_support::reservation(
+            date,
+            if state == N02State::Missing {
+                NewsFlashWindow::H1130
+            } else {
+                NewsFlashWindow::H0930
+            },
+            snapshot.rendered_bytes().unwrap(),
+            sources.clone(),
+        );
+        let evidence = binding.material().evidence_sha256.clone();
+        let rendered_sha256 = binding.material().news_flash_render_sha256.clone();
         let rendered_len = snapshot.rendered_bytes().unwrap().len();
         let attempt_at = Utc
             .timestamp_micros(N02_NOW - 300_000_000)
@@ -481,7 +506,7 @@ impl N02Fixture {
             N02_CHANNEL.to_owned(),
             rendered_len,
             date,
-            "a".repeat(64),
+            binding.material().reservation_sha256.clone(),
             sources.clone(),
             evidence.clone(),
             rendered_sha256.clone(),
@@ -540,7 +565,7 @@ impl N02Fixture {
             rendered_len,
             3,
             date,
-            "a".repeat(64),
+            binding.material().reservation_sha256.clone(),
             sources,
             evidence,
             rendered_sha256,
@@ -624,7 +649,7 @@ impl N02Fixture {
     }
 
     fn add_other_window_intent(&self) -> IntentSnapshot {
-        let draft = InitialIntentDraft::ready_for_recovery_test(
+        let draft = crate::push_foundation::intent_store::n02_test_support::ready_default(
             InitialIntentIdentity::new(
                 Namespace::test(RunId::try_new(self.code.clone()).unwrap()),
                 UnitId::try_new("MU-news-flash-aggregate".to_owned()).unwrap(),
@@ -638,13 +663,11 @@ impl N02Fixture {
                 SubjectId::Global,
                 AudienceId::try_new("test-owner".to_owned()).unwrap(),
             ),
-            b"TEST_CODE_W16_N02_OTHER_PREPARED".to_vec(),
             b"TEST_CODE_W16_N02_OTHER_RENDERED".to_vec(),
             self.template.sha256().clone(),
             raw_digest(b"TEST_CODE_W16_N02_OTHER_SOURCE_CONTRACT"),
             micros(N02_NOW - 700_000_000),
-        )
-        .unwrap();
+        );
         BusinessIntentStore::open(&self.database)
             .unwrap()
             .record_initial(&draft)
@@ -1228,11 +1251,13 @@ fn dedicated_effect_has_independent_source_literal_and_every_source_field_change
         n02_policy.as_bytes()
     );
     let intent = n02.snapshot.attested_ready_binding().unwrap();
-    let prepared = b"TEST_CODE_W16_N02_PREPARED";
+    // The activation schema is unchanged; its immutable snapshot now carries the N02 wrapper.
+    let prepared = n02.snapshot.prepared_push_bytes().unwrap();
+    assert!(prepared.starts_with(b"N02PreparedPush/v1\0"));
     let rendered = b"TEST_CODE_W16_N02_RENDERED";
     let snapshot = serde_json::json!({
         "audience":"test-owner","business_date":BUSINESS_DATE,"completion_owner":"news-flash-accepted-window","created_at":(N02_NOW - 600_000_000).to_string(),
-        "decision_id":intent.decision_id.as_str(),"decision_kind":"Ready","evidence_sha256":raw_digest(prepared).as_str(),"intent_id":intent.intent_id.as_str(),
+        "decision_id":intent.decision_id.as_str(),"decision_kind":"Ready","evidence_sha256":raw_digest(b"TEST_CODE evidence").as_str(),"intent_id":intent.intent_id.as_str(),
         "lease_generation":1,"lease_owner":"w16-n02-recovery","lease_until":N02_UNTIL.to_string(),"namespace":format!("Test:{}",n02.code),
         "occurrence_family":"news-flash-window","occurrence_key":"09:30","payload_sha256":raw_digest(prepared).as_str(),
         "prepared_push_bytes":prepared,"previous_state":"PendingDispatch","reason":"intent.dispatch_claimed","rendered_bytes":rendered,
@@ -1267,5 +1292,39 @@ fn dedicated_effect_has_independent_source_literal_and_every_source_field_change
             n02_bytes,
             "N02 field {index}"
         );
+    }
+}
+
+#[test]
+fn n02_bound_query_and_registration_reject_opaque_and_alternate_reservation() {
+    for mode in ["opaque", "alternate"] {
+        let fixture =
+            N02Fixture::with_binding_mode(N02State::Accepted, "news-flash-window", "09:30", mode);
+        let before = fixture.current();
+        let audit_before = fixture.audit_bytes();
+        for window in [NewsFlashWindow::H0930, NewsFlashWindow::H1130] {
+            let source = ActivationBusinessSource::n02(
+                Arc::clone(&fixture.audit),
+                fixture.template.clone(),
+                ChannelId::try_new(N02_CHANNEL.to_owned()).unwrap(),
+                window,
+                2026,
+            )
+            .unwrap();
+            assert!(source
+                .requery(
+                    &fixture.snapshot,
+                    &fixture
+                        .snapshot
+                        .attested_ready_binding()
+                        .unwrap()
+                        .decision_id
+                )
+                .is_err());
+        }
+        assert!(BusinessEffect::bind_n02_fixture(&fixture.scope(), fixture.effect()).is_err());
+        assert_eq!(fixture.current().version(), before.version());
+        assert_eq!(fixture.current().state(), IntentState::AwaitingAuthority);
+        assert_eq!(fixture.audit_bytes(), audit_before);
     }
 }

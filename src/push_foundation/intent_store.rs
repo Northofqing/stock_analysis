@@ -10,6 +10,8 @@ pub(crate) mod readiness_occurrence;
 mod readiness_occurrence_tests;
 
 pub(crate) mod n02_binding;
+#[cfg(test)]
+pub(crate) mod n02_test_support;
 pub use n02_binding::{N02BindingError, N02ReservationBindingV1, N02ReservationMaterial};
 
 use std::collections::BTreeMap;
