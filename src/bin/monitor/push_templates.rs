@@ -4802,24 +4802,44 @@ fn assemble_real_candidate_batch(
 
 fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
     use stock_analysis::database::DatabaseManager;
-    use stock_analysis::opportunity::candidate_panel::merge_candidates;
 
-    let clusters = DatabaseManager::get().get_p05_latest_chain_clusters_strict()?;
-    let chain = p05_chain_witness::project_same_query(clusters)?;
-    let mut items = chain.items;
-    let themes = chain.themes;
-
+    let chain = p05_chain_witness::project_snapshot_read(
+        DatabaseManager::get().get_p05_latest_chain_snapshot_strict(),
+    )?;
+    log::info!(
+        "[P-05][chain-origin][unqualified] date={} reason_code={} generation_sha256={} ordered_rows_sha256={}",
+        chain.witness.latest_date.as_deref().unwrap_or("absent"),
+        chain.witness.generation.reason_code(),
+        chain
+            .witness
+            .generation
+            .generation_sha256()
+            .unwrap_or("absent"),
+        chain.witness.ordered_rows_sha256,
+    );
     let p5_sources = p05_file_witness::load_all_from_dir(std::path::Path::new("data/p5_sources"))?;
-    items.extend(p5_sources.items);
-
-    let entries = merge_candidates(items);
-    let p5_candidate_refs = p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
-    let chain_candidate_refs = p05_chain_witness::link_candidates(&entries, chain.candidate_refs)?;
     let held_codes = stock_analysis::portfolio::get_positions()
         .map_err(|error| format!("候选台读取持仓失败: {error}"))?
         .into_iter()
         .map(|position| position.code)
         .collect();
+    assemble_candidate_source_context(chain, p5_sources, held_codes)
+}
+
+fn assemble_candidate_source_context(
+    chain: p05_chain_witness::P05ChainProjection,
+    p5_sources: p05_file_witness::P5SourceFiles,
+    held_codes: Vec<String>,
+) -> Result<CandidateSourceContext, String> {
+    use stock_analysis::opportunity::candidate_panel::merge_candidates;
+
+    let mut items = chain.items;
+    let themes = chain.themes;
+    items.extend(p5_sources.items);
+
+    let entries = merge_candidates(items);
+    let p5_candidate_refs = p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
+    let chain_candidate_refs = p05_chain_witness::link_candidates(&entries, chain.candidate_refs)?;
     Ok(CandidateSourceContext {
         entries,
         themes,

@@ -337,7 +337,7 @@ pub(super) fn observe_p05_candidate_cohort_v3(
     // The complete decoded rows came from the same query as the selected
     // rows. Reprojection checks the full digest, selected row columns/hash,
     // latest date, count, schema, and deterministic top-five order.
-    let replay = p05_chain_witness::project_same_query(batch.chain_query.ordered_rows.clone())?;
+    let replay = p05_chain_witness::replay_same_query(&batch.chain_query)?;
     if replay.witness != batch.chain_query {
         return Err("P-05 v3 chain query witness differs from same-query rows".to_string());
     }

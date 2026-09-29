@@ -4,7 +4,9 @@
 use chrono::NaiveDate;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use stock_analysis::database::concepts::ChainDailyRow;
+use stock_analysis::database::concepts::{
+    ChainDailyRow, P05ChainGenerationStatus, P05ChainSnapshotRead, P05ChainSnapshotReadError,
+};
 use stock_analysis::opportunity::candidate_panel::{CandidateEntry, CandidateSource};
 
 type SourceItem = (CandidateSource, String, String);
@@ -19,6 +21,34 @@ pub(super) enum ChainSourceDateRelation {
     Old,
     Future,
     Invalid,
+}
+
+/// A read diagnostic, not a source qualification or a delivery identity.
+/// SuppliedRowsOnly is used by pure reprojections that did not read SQLite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ChainGenerationDiagnostic {
+    SuppliedRowsOnly,
+    NoRows,
+    UnboundLegacyRows,
+    P01BoundUnqualified { generation_sha256: String },
+}
+
+impl ChainGenerationDiagnostic {
+    pub(super) fn reason_code(&self) -> &'static str {
+        match self {
+            Self::SuppliedRowsOnly => "unqualified_chain_supplied_rows_only",
+            Self::NoRows => "unqualified_chain_no_rows",
+            Self::UnboundLegacyRows => "unqualified_chain_unbound_legacy_rows",
+            Self::P01BoundUnqualified { .. } => "unqualified_chain_p01_generation_only",
+        }
+    }
+
+    pub(super) fn generation_sha256(&self) -> Option<&str> {
+        match self {
+            Self::P01BoundUnqualified { generation_sha256 } => Some(generation_sha256),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +71,8 @@ pub(super) struct P05ChainQueryWitness {
     /// Commits to all ordered rows, including those after the selected five.
     pub(super) ordered_rows_sha256: String,
     pub(super) selected_rows: Vec<P05SelectedChainRow>,
+    /// Read with the rows in the same SQLite snapshot. Never admits origin.
+    pub(super) generation: ChainGenerationDiagnostic,
 }
 
 impl P05ChainQueryWitness {
@@ -62,7 +94,7 @@ impl P05ChainQueryWitness {
     }
 
     pub(super) fn require_qualified_origin(&self) -> Result<(), &'static str> {
-        Err("P-05 chain_daily query lacks an authoritative snapshot identity and producer generation version")
+        Err(self.generation.reason_code())
     }
 }
 
@@ -113,6 +145,50 @@ fn digest<T: Serialize>(value: &T) -> Result<String, String> {
 /// Project the exact rows returned by the P-05 ordered latest-date query.
 /// No second database read or inferred source clock is involved.
 pub(super) fn project_same_query(rows: Vec<ChainDailyRow>) -> Result<P05ChainProjection, String> {
+    project_with_diagnostic(rows, ChainGenerationDiagnostic::SuppliedRowsOnly)
+}
+
+/// Projection of the rows and generation status read by one SQLite transaction.
+/// Historical rows and a persisted P-01 binding are both still unqualified.
+pub(super) fn project_same_snapshot(
+    snapshot: P05ChainSnapshotRead,
+) -> Result<P05ChainProjection, String> {
+    let (rows, generation) = snapshot.into_parts();
+    let diagnostic = match generation {
+        P05ChainGenerationStatus::NoRows if rows.is_empty() => ChainGenerationDiagnostic::NoRows,
+        P05ChainGenerationStatus::UnboundLegacyRows if !rows.is_empty() => {
+            ChainGenerationDiagnostic::UnboundLegacyRows
+        }
+        P05ChainGenerationStatus::P01BoundUnqualified(generation) if !rows.is_empty() => {
+            ChainGenerationDiagnostic::P01BoundUnqualified {
+                generation_sha256: generation.generation_sha256().to_owned(),
+            }
+        }
+        _ => return Err("P-05 chain snapshot rows/generation state mismatch".to_string()),
+    };
+    project_with_diagnostic(rows, diagnostic)
+}
+
+/// A corrupt binding or unreadable snapshot never falls back to rows alone.
+pub(super) fn project_snapshot_read(
+    read: Result<P05ChainSnapshotRead, P05ChainSnapshotReadError>,
+) -> Result<P05ChainProjection, String> {
+    let snapshot = read.map_err(|error| format!("P-05 chain snapshot read rejected: {error}"))?;
+    project_same_snapshot(snapshot)
+}
+
+/// Recompute the row witness while retaining the separately supplied status.
+/// This is only a self-consistency check for an unqualified observation.
+pub(super) fn replay_same_query(
+    witness: &P05ChainQueryWitness,
+) -> Result<P05ChainProjection, String> {
+    project_with_diagnostic(witness.ordered_rows.clone(), witness.generation.clone())
+}
+
+fn project_with_diagnostic(
+    rows: Vec<ChainDailyRow>,
+    generation: ChainGenerationDiagnostic,
+) -> Result<P05ChainProjection, String> {
     let latest_date = rows.first().map(|row| row.date.clone());
     // SQLite's default BINARY text order compares UTF-8 bytes, matching Rust's
     // lexicographic String order for this uncollated concept column.
@@ -186,6 +262,7 @@ pub(super) fn project_same_query(rows: Vec<ChainDailyRow>) -> Result<P05ChainPro
             ordered_rows: rows,
             ordered_rows_sha256,
             selected_rows,
+            generation,
         },
         candidate_refs,
     })
@@ -364,5 +441,119 @@ mod tests {
         assert!(project_same_query(rows)
             .unwrap_err()
             .contains("order/identity"));
+    }
+
+    #[test]
+    fn generation_diagnostics_do_not_promote_legacy_or_bound_rows() {
+        let rows = latest_rows();
+        let legacy =
+            project_with_diagnostic(rows.clone(), ChainGenerationDiagnostic::UnboundLegacyRows)
+                .unwrap();
+        let generation_sha256 = "a".repeat(64);
+        let bound = project_with_diagnostic(
+            rows,
+            ChainGenerationDiagnostic::P01BoundUnqualified {
+                generation_sha256: generation_sha256.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy.items, bound.items);
+        assert_eq!(legacy.candidate_refs, bound.candidate_refs);
+        assert_eq!(
+            merge_candidates(legacy.items)[0].tier,
+            stock_analysis::opportunity::candidate_panel::EvidenceTier::Theme
+        );
+        assert_eq!(
+            legacy.witness.require_qualified_origin(),
+            Err("unqualified_chain_unbound_legacy_rows")
+        );
+        assert_eq!(
+            bound.witness.require_qualified_origin(),
+            Err("unqualified_chain_p01_generation_only")
+        );
+        assert_eq!(
+            bound.witness.generation.generation_sha256(),
+            Some(generation_sha256.as_str())
+        );
+        assert_eq!(
+            replay_same_query(&bound.witness).unwrap().witness,
+            bound.witness
+        );
+        let empty = project_with_diagnostic(Vec::new(), ChainGenerationDiagnostic::NoRows).unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(
+            empty.witness.require_qualified_origin(),
+            Err("unqualified_chain_no_rows")
+        );
+    }
+
+    #[test]
+    fn typed_generation_keeps_legacy_candidate_sources_and_p5_only_empty_case() {
+        let files = || super::super::p05_file_witness::P5SourceFiles {
+            items: vec![(
+                CandidateSource::StockPick,
+                "TEST_CODE_000002".to_string(),
+                "P5 candidate".to_string(),
+            )],
+            witnesses: Vec::new(),
+        };
+        let assemble = |projection| {
+            super::super::assemble_candidate_source_context(projection, files(), Vec::new())
+                .unwrap()
+        };
+        let signature = |context: &super::super::CandidateSourceContext| {
+            context
+                .entries
+                .iter()
+                .map(|entry| (entry.code.clone(), entry.sources.clone(), entry.tier))
+                .collect::<Vec<_>>()
+        };
+
+        let baseline = assemble(project_same_query(latest_rows()).unwrap());
+        let legacy = assemble(
+            project_with_diagnostic(latest_rows(), ChainGenerationDiagnostic::UnboundLegacyRows)
+                .unwrap(),
+        );
+        let bound = assemble(
+            project_with_diagnostic(
+                latest_rows(),
+                ChainGenerationDiagnostic::P01BoundUnqualified {
+                    generation_sha256: "a".repeat(64),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(signature(&baseline), signature(&legacy));
+        assert_eq!(signature(&baseline), signature(&bound));
+        assert_eq!(baseline.chain_candidate_refs, legacy.chain_candidate_refs);
+        assert_eq!(baseline.chain_candidate_refs, bound.chain_candidate_refs);
+        assert_eq!(baseline.p5_candidate_refs, legacy.p5_candidate_refs);
+        assert_eq!(baseline.p5_candidate_refs, bound.p5_candidate_refs);
+        assert_eq!(
+            legacy.chain_query.require_qualified_origin(),
+            Err("unqualified_chain_unbound_legacy_rows")
+        );
+        assert_eq!(
+            bound.chain_query.require_qualified_origin(),
+            Err("unqualified_chain_p01_generation_only")
+        );
+
+        let empty_baseline = assemble(project_same_query(Vec::new()).unwrap());
+        let empty_typed = assemble(
+            project_with_diagnostic(Vec::new(), ChainGenerationDiagnostic::NoRows).unwrap(),
+        );
+        assert_eq!(signature(&empty_baseline), signature(&empty_typed));
+        assert_eq!(empty_typed.entries.len(), 1);
+        assert!(empty_typed.chain_candidate_refs.is_empty());
+    }
+
+    #[test]
+    fn invalid_persisted_binding_never_falls_back_to_row_projection() {
+        let error = project_snapshot_read(Err(P05ChainSnapshotReadError::BindingMismatch(
+            "generation_sha256_mismatch",
+        )))
+        .unwrap_err();
+        assert!(error.contains("generation_sha256_mismatch"));
+        assert!(error.contains("snapshot read rejected"));
     }
 }

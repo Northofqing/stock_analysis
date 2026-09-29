@@ -129,6 +129,11 @@ impl P05ChainSnapshotRead {
     pub fn generation(&self) -> &P05ChainGenerationStatus {
         &self.generation
     }
+
+    /// Consume the two facts read under one SQLite snapshot together.
+    pub fn into_parts(self) -> (Vec<ChainDailyRow>, P05ChainGenerationStatus) {
+        (self.rows, self.generation)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
