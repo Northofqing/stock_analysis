@@ -1,6 +1,8 @@
 //! Same-read identity for the four legacy P5 JSONL candidate inputs.
 //! Declared metadata is retained as observed; file mtime is never a source clock.
 
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use stock_analysis::opportunity::candidate_panel::{CandidateEntry, CandidateSource};
 
@@ -23,6 +25,15 @@ pub(super) enum P5FileMetadataState {
     UnqualifiedInvalidGeneratedAt,
     UnqualifiedMissingSelectionVersion,
     UnqualifiedInconsistentMetadata,
+    UnqualifiedDuplicateDeclaredMetadata,
+    UnqualifiedInvalidDeclaredMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum P5RowMetadataState {
+    Parsed,
+    DuplicateKey,
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +44,7 @@ pub(super) struct P5SourceRowWitness {
     pub(super) name: String,
     pub(super) generated_at: Option<String>,
     pub(super) selection_version: Option<String>,
+    pub(super) metadata_state: P5RowMetadataState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +85,57 @@ fn source_for_name(name: &str) -> Result<CandidateSource, String> {
     }
 }
 
-fn declared_string(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key)?.as_str().map(str::to_string)
+#[derive(Default)]
+struct DeclaredRowMetadata {
+    generated_at: Option<String>,
+    selection_version: Option<String>,
+    duplicate_key: bool,
+}
+
+impl<'de> Deserialize<'de> for DeclaredRowMetadata {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MetadataVisitor;
+
+        impl<'de> Visitor<'de> for MetadataVisitor {
+            type Value = DeclaredRowMetadata;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a P5 JSON object with optional metadata")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut metadata = DeclaredRowMetadata::default();
+                let mut saw_generated_at = false;
+                let mut saw_selection_version = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "generated_at" if saw_generated_at => {
+                            metadata.duplicate_key = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "generated_at" => {
+                            saw_generated_at = true;
+                            metadata.generated_at = map.next_value::<Option<String>>()?;
+                        }
+                        "selection_version" if saw_selection_version => {
+                            metadata.duplicate_key = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                        "selection_version" => {
+                            saw_selection_version = true;
+                            metadata.selection_version = map.next_value::<Option<String>>()?;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(metadata)
+            }
+        }
+
+        deserializer.deserialize_map(MetadataVisitor)
+    }
 }
 
 fn file_metadata(
@@ -93,7 +154,17 @@ fn file_metadata(
         .all(|row| row.selection_version == first.selection_version)
         .then(|| first.selection_version.clone())
         .flatten();
-    let state = if rows.iter().any(|row| row.generated_at.is_none()) {
+    let state = if rows
+        .iter()
+        .any(|row| row.metadata_state == P5RowMetadataState::Invalid)
+    {
+        P5FileMetadataState::UnqualifiedInvalidDeclaredMetadata
+    } else if rows
+        .iter()
+        .any(|row| row.metadata_state == P5RowMetadataState::DuplicateKey)
+    {
+        P5FileMetadataState::UnqualifiedDuplicateDeclaredMetadata
+    } else if rows.iter().any(|row| row.generated_at.is_none()) {
         P5FileMetadataState::UnqualifiedMissingGeneratedAt
     } else if rows.iter().any(|row| {
         row.generated_at.as_deref().is_some_and(|value| {
@@ -182,15 +253,22 @@ pub(super) fn load_one_from_dir(
                 line_index + 1
             ));
         }
-        let metadata: serde_json::Value =
-            serde_json::from_str(line).expect("P5Item JSON parsed above");
+        // This visitor reads only two metadata keys and skips every unrelated
+        // field. The legacy P5Item admission above remains authoritative: a
+        // metadata parse error lowers witness qualification, never the item.
+        let (metadata, metadata_state) = match serde_json::from_str::<DeclaredRowMetadata>(line) {
+            Ok(metadata) if metadata.duplicate_key => (metadata, P5RowMetadataState::DuplicateKey),
+            Ok(metadata) => (metadata, P5RowMetadataState::Parsed),
+            Err(_) => (DeclaredRowMetadata::default(), P5RowMetadataState::Invalid),
+        };
         rows.push(P5SourceRowWitness {
             physical_line: line_index + 1,
             raw_line_sha256: hex::encode(Sha256::digest(raw_line)),
             code: code.to_string(),
             name: name.to_string(),
-            generated_at: declared_string(&metadata, "generated_at"),
-            selection_version: declared_string(&metadata, "selection_version"),
+            generated_at: metadata.generated_at,
+            selection_version: metadata.selection_version,
+            metadata_state,
         });
         items.push((source, code.to_string(), name.to_string()));
     }
@@ -410,5 +488,68 @@ mod tests {
         let mut merged = merge_candidates(legacy.items);
         merged[0].sources.clear();
         assert!(link_candidates(&merged, &invalid_time.witnesses).is_err());
+    }
+
+    #[test]
+    fn metadata_scan_ignores_legacy_extreme_extra_number_and_degrades_its_own_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stock_pick.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"code\":\"TEST_CODE_600001\",\"name\":\"甲\",\"chg_pct\":1e9999,\"generated_at\":\"{TIME}\",\"selection_version\":\"{VERSION}\"}}\n"
+            ),
+        )
+        .unwrap();
+        let admitted = load_one_from_dir("stock_pick", dir.path()).unwrap();
+        assert_eq!(admitted.items[0].1, "TEST_CODE_600001");
+        assert_eq!(
+            admitted.witnesses[0].metadata_state,
+            P5FileMetadataState::DeclaredMetadataPresent
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"code\":\"TEST_CODE_600001\",\"name\":\"甲\",\"generated_at\":1e9999,\"selection_version\":\"{VERSION}\"}}\n"
+            ),
+        )
+        .unwrap();
+        let invalid_metadata = load_one_from_dir("stock_pick", dir.path()).unwrap();
+        assert_eq!(invalid_metadata.items, admitted.items);
+        assert_eq!(
+            invalid_metadata.witnesses[0].metadata_state,
+            P5FileMetadataState::UnqualifiedInvalidDeclaredMetadata
+        );
+        assert_eq!(
+            invalid_metadata.witnesses[0].rows[0].metadata_state,
+            P5RowMetadataState::Invalid
+        );
+    }
+
+    #[test]
+    fn duplicate_declared_metadata_keys_cannot_qualify_by_last_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stock_pick.jsonl");
+        for raw in [
+            format!(
+                "{{\"code\":\"TEST_CODE_600001\",\"name\":\"甲\",\"generated_at\":\"{TIME}\",\"generated_at\":\"{TIME}\",\"selection_version\":\"{VERSION}\"}}\n"
+            ),
+            format!(
+                "{{\"code\":\"TEST_CODE_600001\",\"name\":\"甲\",\"generated_at\":\"{TIME}\",\"selection_version\":\"{VERSION}\",\"selection_version\":\"{VERSION}\"}}\n"
+            ),
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            let loaded = load_one_from_dir("stock_pick", dir.path()).unwrap();
+            assert_eq!(loaded.items.len(), 1);
+            assert_eq!(
+                loaded.witnesses[0].metadata_state,
+                P5FileMetadataState::UnqualifiedDuplicateDeclaredMetadata
+            );
+            assert_eq!(
+                loaded.witnesses[0].rows[0].metadata_state,
+                P5RowMetadataState::DuplicateKey
+            );
+        }
     }
 }

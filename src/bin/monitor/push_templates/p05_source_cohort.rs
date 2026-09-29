@@ -1,5 +1,6 @@
-//! P-05 candidate cohort observation. Original candidate-source identity is not
-//! retained by `RealCandidateBatch`, so this contract is always unqualified.
+//! P-05 candidate cohort observation. `RealCandidateBatch` retains P5 JSONL
+//! row witnesses; chain_daily identity and P5 producer authority remain absent,
+//! so this contract is still unqualified.
 //! The production sender does not call it, and no occurrence or terminal
 //! delivery result is bound here.
 
@@ -38,7 +39,7 @@ impl P05CandidateCohortObservationV2 {
     }
 
     pub(super) fn require_qualified_origin(&self) -> Result<(), &'static str> {
-        Err("P-05 v2 origin source identity missing: raw P5 file rows and chain_daily snapshot are not retained")
+        Err("P-05 v2 origin qualification missing: chain_daily snapshot, P5 producer authority, and held-position snapshot are not retained")
     }
 }
 
@@ -180,9 +181,9 @@ fn strong_row<'a>(
 /// Observe ordered Strong rows from the supplied batch and supplied render.
 /// The render is checked against the formatter for those supplied entries;
 /// this function is not wired to the production sender or its occurrence.
-/// Quote/statistics provenance alone cannot qualify the original P5 file and
-/// chain records; callers must reject `require_qualified_origin()` until an
-/// independently validated origin witness is retained and bound.
+/// Quote/statistics provenance and retained P5 file rows do not qualify the
+/// chain, producer, or held-position origins. Callers must reject
+/// `require_qualified_origin()` until those witnesses are bound.
 pub(super) fn observe_p05_candidate_cohort_v2(
     business_date: NaiveDate,
     batch: &RealCandidateBatch,
