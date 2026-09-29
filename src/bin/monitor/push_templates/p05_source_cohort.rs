@@ -1,11 +1,11 @@
 //! P-05 candidate cohort observation. `RealCandidateBatch` retains P5 JSONL
 //! row witnesses and the batch retains chain_daily decoded-column witnesses.
-//! The v2 cohort does not bind those witnesses, and producer authority remains
-//! absent, so this contract is still unqualified.
+//! V2 does not bind those witnesses. V3 binds the chain rows and survivor refs,
+//! but producer and snapshot authority remain absent, so it is unqualified.
 //! The production sender does not call it, and no occurrence or terminal
 //! delivery result is bound here.
 
-use super::{candidate_prediction_target_date, RealCandidateBatch};
+use super::{candidate_prediction_target_date, p05_chain_witness, RealCandidateBatch};
 use chrono::NaiveDate;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -16,6 +16,9 @@ use stock_analysis::opportunity::candidate_panel::{
 
 const SCHEMA: &str = "P05_CANDIDATE_SOURCE_COHORT_V2";
 const MISSING_ORIGIN: &str = "unqualified_missing_raw_candidate_source_identity";
+const SCHEMA_V3: &str = "P05_CANDIDATE_SOURCE_COHORT_V3";
+const MISSING_ORIGIN_V3: &str =
+    "unqualified_missing_chain_snapshot_p5_producer_and_held_position_snapshot";
 
 /// Deterministic observed facts, never a counted delivery binding or a
 /// successful-push denominator. Production source qualification fails closed.
@@ -253,9 +256,162 @@ pub(super) fn observe_p05_candidate_cohort_v2(
     })
 }
 
+/// V3 binds the validated V2 observation to the same-query chain witness and
+/// only the IndustryChain refs that survived candidate hard gates. It remains
+/// an observation; it proves neither query snapshot authority nor delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct P05CandidateCohortObservationV3 {
+    canonical_bytes: Vec<u8>,
+    observation_sha256: String,
+    target_date: NaiveDate,
+}
+
+impl P05CandidateCohortObservationV3 {
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub(super) fn observation_sha256(&self) -> &str {
+        &self.observation_sha256
+    }
+
+    pub(super) fn target_date(&self) -> NaiveDate {
+        self.target_date
+    }
+
+    pub(super) fn require_qualified_origin(&self) -> Result<(), &'static str> {
+        Err("P-05 v3 origin qualification missing: authoritative chain query snapshot, P5 producer authority, and held-position snapshot")
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalChainRow<'a> {
+    ordinal: usize,
+    date: &'a str,
+    concept: &'a str,
+    stocks: &'a str,
+    continuation_count: i32,
+    row_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalChainRef<'a> {
+    code: &'a str,
+    source: &'static str,
+    date: &'a str,
+    concept: &'a str,
+    ordinal: usize,
+    row_sha256: &'a str,
+    ordered_rows_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalChainQuery<'a> {
+    schema: &'a str,
+    latest_date: Option<&'a str>,
+    total_rows: usize,
+    ordered_rows_sha256: &'a str,
+    selected_rows: Vec<CanonicalChainRow<'a>>,
+    survivor_refs: Vec<CanonicalChainRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalCohortV3<'a> {
+    schema: &'static str,
+    origin_qualification: &'static str,
+    business_date: String,
+    target_date: String,
+    /// Exact published V2 bytes, hex encoded so V3 is self-contained.
+    v2_canonical_hex: String,
+    v2_observation_sha256: &'a str,
+    chain_query: CanonicalChainQuery<'a>,
+}
+
+pub(super) fn observe_p05_candidate_cohort_v3(
+    business_date: NaiveDate,
+    batch: &RealCandidateBatch,
+    rendered: &str,
+) -> Result<P05CandidateCohortObservationV3, String> {
+    let v2 = observe_p05_candidate_cohort_v2(business_date, batch, rendered)?;
+
+    // The complete decoded rows came from the same query as the selected
+    // rows. Reprojection checks the full digest, selected row columns/hash,
+    // latest date, count, schema, and deterministic top-five order.
+    let replay = p05_chain_witness::project_same_query(batch.chain_query.ordered_rows.clone())?;
+    if replay.witness != batch.chain_query {
+        return Err("P-05 v3 chain query witness differs from same-query rows".to_string());
+    }
+    let expected_refs = p05_chain_witness::selected_refs(&batch.entries, replay.candidate_refs);
+    if expected_refs != batch.chain_candidate_refs {
+        return Err("P-05 v3 chain survivor refs differ from same-query rows".to_string());
+    }
+    for entry in &batch.entries {
+        if entry.sources.contains(&CandidateSource::IndustryChain)
+            && !expected_refs
+                .iter()
+                .any(|reference| reference.code == entry.code)
+        {
+            return Err(format!(
+                "P-05 v3 surviving IndustryChain candidate {} has no same-query ref",
+                entry.code
+            ));
+        }
+    }
+
+    let query = &batch.chain_query;
+    let canonical = CanonicalCohortV3 {
+        schema: SCHEMA_V3,
+        origin_qualification: MISSING_ORIGIN_V3,
+        business_date: business_date.format("%Y-%m-%d").to_string(),
+        target_date: v2.target_date().format("%Y-%m-%d").to_string(),
+        v2_canonical_hex: hex::encode(v2.canonical_bytes()),
+        v2_observation_sha256: v2.observation_sha256(),
+        chain_query: CanonicalChainQuery {
+            schema: query.schema,
+            latest_date: query.latest_date.as_deref(),
+            total_rows: query.total_rows,
+            ordered_rows_sha256: &query.ordered_rows_sha256,
+            selected_rows: query
+                .selected_rows
+                .iter()
+                .map(|selected| CanonicalChainRow {
+                    ordinal: selected.ordinal,
+                    date: &selected.row.date,
+                    concept: &selected.row.concept,
+                    stocks: &selected.row.stocks,
+                    continuation_count: selected.row.continuation_count,
+                    row_sha256: &selected.row_sha256,
+                })
+                .collect(),
+            survivor_refs: batch
+                .chain_candidate_refs
+                .iter()
+                .map(|reference| CanonicalChainRef {
+                    code: &reference.code,
+                    source: source_name(reference.source),
+                    date: &reference.date,
+                    concept: &reference.concept,
+                    ordinal: reference.ordinal,
+                    row_sha256: &reference.row_sha256,
+                    ordered_rows_sha256: &reference.ordered_rows_sha256,
+                })
+                .collect(),
+        },
+    };
+    let canonical_bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| format!("P-05 v3 canonical source encoding failed: {error}"))?;
+    let observation_sha256 = hex::encode(Sha256::digest(&canonical_bytes));
+    Ok(P05CandidateCohortObservationV3 {
+        canonical_bytes,
+        observation_sha256,
+        target_date: v2.target_date(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stock_analysis::database::concepts::ChainDailyRow;
     use stock_analysis::market_data::TopStock;
     use stock_analysis::market_domain::ProviderId;
     use stock_analysis::opportunity::candidate_panel::CandidateSource;
@@ -330,6 +486,184 @@ mod tests {
     fn observe(date: NaiveDate, batch: &RealCandidateBatch) -> P05CandidateCohortObservationV2 {
         let rendered = format_candidate_board(&batch.entries);
         observe_p05_candidate_cohort_v2(date, batch, &rendered).unwrap()
+    }
+
+    fn chain_rows() -> Vec<ChainDailyRow> {
+        [
+            ("A", "TEST_CODE_600001", 6),
+            ("B", "TEST_CODE_600004", 5),
+            ("C", "TEST_CODE_600005", 4),
+            ("D", "TEST_CODE_600006", 3),
+            ("E", "TEST_CODE_600007", 2),
+            ("F", "TEST_CODE_600008", 1),
+        ]
+        .into_iter()
+        .map(|(concept, code, continuation_count)| ChainDailyRow {
+            date: "2026-09-24".into(),
+            concept: concept.into(),
+            stocks: format!("[\"{code}\"]"),
+            continuation_count,
+        })
+        .collect()
+    }
+
+    fn chain_fixture() -> (NaiveDate, RealCandidateBatch) {
+        let (date, mut batch) = fixture();
+        batch.entries[0]
+            .sources
+            .push(CandidateSource::IndustryChain);
+        let projected = p05_chain_witness::project_same_query(chain_rows()).unwrap();
+        batch.chain_candidate_refs =
+            p05_chain_witness::selected_refs(&batch.entries, projected.candidate_refs);
+        batch.chain_query = projected.witness;
+        (date, batch)
+    }
+
+    fn observe_v3(date: NaiveDate, batch: &RealCandidateBatch) -> P05CandidateCohortObservationV3 {
+        let rendered = format_candidate_board(&batch.entries);
+        observe_p05_candidate_cohort_v3(date, batch, &rendered).unwrap()
+    }
+
+    #[test]
+    fn v3_replay_binds_full_query_selected_rows_and_only_survivor_refs() {
+        let (date, mut batch) = chain_fixture();
+        let rendered = format_candidate_board(&batch.entries);
+        let v2 = observe_p05_candidate_cohort_v2(date, &batch, &rendered).unwrap();
+        let first = observe_v3(date, &batch);
+        assert_eq!(first, observe_v3(date, &batch));
+        assert_eq!(first.target_date(), v2.target_date());
+        assert!(first.require_qualified_origin().is_err());
+        let facts: serde_json::Value = serde_json::from_slice(first.canonical_bytes()).unwrap();
+        assert_eq!(facts["schema"], SCHEMA_V3);
+        assert_eq!(facts["origin_qualification"], MISSING_ORIGIN_V3);
+        assert_eq!(facts["v2_observation_sha256"], v2.observation_sha256());
+        assert_eq!(
+            hex::decode(facts["v2_canonical_hex"].as_str().unwrap()).unwrap(),
+            v2.canonical_bytes()
+        );
+        assert_eq!(facts["chain_query"]["total_rows"], 6);
+        assert_eq!(
+            facts["chain_query"]["selected_rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            facts["chain_query"]["survivor_refs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            facts["chain_query"]["survivor_refs"][0]["code"],
+            "TEST_CODE_600001"
+        );
+        assert_eq!(
+            facts["chain_query"]["survivor_refs"][0]["ordered_rows_sha256"],
+            batch.chain_query.ordered_rows_sha256
+        );
+
+        // Changing only the sixth row changes V3's full-query binding while
+        // the published V2 bytes and the selected five rows stay identical.
+        let selected_before = batch.chain_query.selected_rows.clone();
+        let mut changed_rows = chain_rows();
+        changed_rows[5].stocks = "[\"TEST_CODE_600009\"]".into();
+        let projected = p05_chain_witness::project_same_query(changed_rows).unwrap();
+        batch.chain_candidate_refs =
+            p05_chain_witness::selected_refs(&batch.entries, projected.candidate_refs);
+        batch.chain_query = projected.witness;
+        assert_eq!(batch.chain_query.selected_rows, selected_before);
+        assert_eq!(
+            observe_p05_candidate_cohort_v2(date, &batch, &rendered)
+                .unwrap()
+                .canonical_bytes(),
+            v2.canonical_bytes()
+        );
+        assert_ne!(
+            first.observation_sha256(),
+            observe_v3(date, &batch).observation_sha256()
+        );
+    }
+
+    #[test]
+    fn v3_rejects_tampered_or_misbound_chain_refs_without_changing_v2() {
+        let (date, mut batch) = chain_fixture();
+        let rendered = format_candidate_board(&batch.entries);
+        let v2_bytes = observe_p05_candidate_cohort_v2(date, &batch, &rendered)
+            .unwrap()
+            .canonical_bytes()
+            .to_vec();
+        let original = batch.chain_candidate_refs[0].clone();
+        let mut variants = Vec::new();
+        let mut wrong = original.clone();
+        wrong.ordinal += 1;
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.date = "2026-09-23".into();
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.concept = "B".into();
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.row_sha256 = "0".repeat(64);
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.ordered_rows_sha256 = "0".repeat(64);
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.code = "TEST_CODE_600004".into();
+        variants.push(wrong);
+        let mut wrong = original.clone();
+        wrong.source = CandidateSource::StockPick;
+        variants.push(wrong);
+        for wrong in variants {
+            batch.chain_candidate_refs = vec![wrong];
+            assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
+            assert_eq!(
+                observe_p05_candidate_cohort_v2(date, &batch, &rendered)
+                    .unwrap()
+                    .canonical_bytes(),
+                v2_bytes
+            );
+        }
+        batch.chain_candidate_refs.clear();
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
+    }
+
+    #[test]
+    fn v3_rejects_query_digest_selected_row_or_complete_row_tamper() {
+        let (date, mut batch) = chain_fixture();
+        let rendered = format_candidate_board(&batch.entries);
+        let original = batch.chain_query.clone();
+        batch.chain_query.ordered_rows_sha256 = "0".repeat(64);
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
+        batch.chain_query = original.clone();
+        batch.chain_query.selected_rows[0].row.stocks = "[\"TEST_CODE_600009\"]".into();
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
+        batch.chain_query = original.clone();
+        batch.chain_query.ordered_rows[5].stocks = "[\"TEST_CODE_600009\"]".into();
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
+        batch.chain_query = original;
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_ok());
+    }
+
+    #[test]
+    fn v3_empty_chain_stays_observed_but_unqualified() {
+        let (date, batch) = fixture();
+        let observed = observe_v3(date, &batch);
+        let facts: serde_json::Value = serde_json::from_slice(observed.canonical_bytes()).unwrap();
+        assert_eq!(facts["chain_query"]["total_rows"], 0);
+        assert!(facts["chain_query"]["selected_rows"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(facts["chain_query"]["survivor_refs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(observed.require_qualified_origin().is_err());
     }
 
     #[test]

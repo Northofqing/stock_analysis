@@ -35,6 +35,9 @@ pub(super) struct P05ChainQueryWitness {
     pub(super) schema: &'static str,
     pub(super) latest_date: Option<String>,
     pub(super) total_rows: usize,
+    /// The complete decoded result from this one query. Retaining it lets a
+    /// later observer recompute the full digest without another database read.
+    pub(super) ordered_rows: Vec<ChainDailyRow>,
     /// Commits to all ordered rows, including those after the selected five.
     pub(super) ordered_rows_sha256: String,
     pub(super) selected_rows: Vec<P05SelectedChainRow>,
@@ -180,6 +183,7 @@ pub(super) fn project_same_query(rows: Vec<ChainDailyRow>) -> Result<P05ChainPro
             schema: QUERY_SCHEMA,
             latest_date,
             total_rows: rows.len(),
+            ordered_rows: rows,
             ordered_rows_sha256,
             selected_rows,
         },
