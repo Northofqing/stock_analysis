@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
 use super::chain_acquisition::{
-    ChainAcquisitionEvidence, ChainSelectedNewsSourceRefV1, MissingSelectedNewsSourceTime,
+    ChainAcquisitionEvidence, ChainNewsEvidence, ChainSelectedNewsSourceRefV1,
+    MissingSelectedNewsSourceTime,
 };
 use super::chain_schedule::ChainPhase;
 
@@ -19,7 +20,9 @@ pub(super) const ACQUISITION_INPUTS: &str =
 pub(super) enum SelectedNewsSourceRefStatus {
     Observed,
     NoAcquisition,
-    NewsNotAvailable,
+    VerifiedEmpty,
+    InvalidAvailableEmpty,
+    NewsUnavailable,
     MissingSourceTime,
     Rejected,
 }
@@ -28,8 +31,10 @@ impl SelectedNewsSourceRefStatus {
     pub(super) fn status(self) -> &'static str {
         match self {
             Self::Observed => "observed",
-            Self::NoAcquisition | Self::NewsNotAvailable => "not_applicable",
-            Self::MissingSourceTime => "unobserved",
+            Self::NoAcquisition | Self::VerifiedEmpty => "not_applicable",
+            Self::InvalidAvailableEmpty | Self::NewsUnavailable | Self::MissingSourceTime => {
+                "unobserved"
+            }
             Self::Rejected => "rejected",
         }
     }
@@ -38,7 +43,9 @@ impl SelectedNewsSourceRefStatus {
         match self {
             Self::Observed => "none",
             Self::NoAcquisition => "no_acquisition",
-            Self::NewsNotAvailable => "news_not_available",
+            Self::VerifiedEmpty => "verified_empty",
+            Self::InvalidAvailableEmpty => "invalid_available_empty",
+            Self::NewsUnavailable => "news_unavailable",
             Self::MissingSourceTime => "missing_source_at",
             Self::Rejected => "lineage_validation_failed",
         }
@@ -79,7 +86,21 @@ pub(super) fn observe(
         None => (None, SelectedNewsSourceRefStatus::NoAcquisition),
         Some(retained) => match retained.selected_news_source_ref(prepared) {
             Ok(Some(source_ref)) => (Some(source_ref), SelectedNewsSourceRefStatus::Observed),
-            Ok(None) => (None, SelectedNewsSourceRefStatus::NewsNotAvailable),
+            Ok(None) => (
+                None,
+                match &retained.news {
+                    ChainNewsEvidence::VerifiedEmpty(_) => {
+                        SelectedNewsSourceRefStatus::VerifiedEmpty
+                    }
+                    ChainNewsEvidence::InvalidAvailableEmpty(_) => {
+                        SelectedNewsSourceRefStatus::InvalidAvailableEmpty
+                    }
+                    ChainNewsEvidence::Unavailable { .. } => {
+                        SelectedNewsSourceRefStatus::NewsUnavailable
+                    }
+                    ChainNewsEvidence::Available { .. } => SelectedNewsSourceRefStatus::Rejected,
+                },
+            ),
             Err(error)
                 if error
                     .downcast_ref::<MissingSelectedNewsSourceTime>()

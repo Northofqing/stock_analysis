@@ -810,6 +810,20 @@ mod tests {
             "TEST_CODE_news_empty",
             "2026-09-28T07:00:02Z",
         );
+        let observed_status = |prepared: &PreparedChainAnalysis,
+                               retained: &ChainAcquisitionEvidence| {
+            let observation = observe(
+                ChainPhase::Preopen,
+                retained.business_date,
+                prepared,
+                prepared.report().as_bytes(),
+                Some(retained),
+            )
+            .unwrap();
+            assert!(observation.selected_news_source_ref.is_none());
+            assert!(observation.acquisition_sha256.is_some());
+            observation.selected_news_source_ref_status
+        };
         let (verified_prepared, verified, macro_news) = scripted(
             "TEST_CODE_pool_v3",
             Ok(GatewayBatch::VerifiedEmpty(evidence.clone())),
@@ -821,6 +835,10 @@ mod tests {
             .selected_news_source_ref(&verified_prepared)
             .unwrap()
             .is_none());
+        assert_eq!(
+            observed_status(&verified_prepared, &verified).reason(),
+            "verified_empty"
+        );
 
         let (invalid_prepared, invalid, macro_news) = scripted(
             "TEST_CODE_pool_v3",
@@ -839,6 +857,10 @@ mod tests {
             .selected_news_source_ref(&invalid_prepared)
             .unwrap()
             .is_none());
+        assert_eq!(
+            observed_status(&invalid_prepared, &invalid).reason(),
+            "invalid_available_empty"
+        );
 
         let (failed_prepared, failed, macro_news) = scripted(
             "TEST_CODE_pool_v3",
@@ -862,6 +884,10 @@ mod tests {
             .selected_news_source_ref(&failed_prepared)
             .unwrap()
             .is_none());
+        assert_eq!(
+            observed_status(&failed_prepared, &failed).reason(),
+            "news_unavailable"
+        );
         assert_ne!(verified.sha256().unwrap(), invalid.sha256().unwrap());
         assert_ne!(verified.sha256().unwrap(), failed.sha256().unwrap());
     }
