@@ -231,7 +231,7 @@ impl<'a> StatusErrorContext<'a> {
     }
 }
 
-fn request_id_correlation(value: &str) -> Option<String> {
+pub(crate) fn request_id_correlation(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
