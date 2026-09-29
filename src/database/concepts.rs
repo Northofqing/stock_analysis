@@ -7,6 +7,7 @@
 use chrono::{Duration, Local};
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Text};
+use diesel::sqlite::SqliteConnection;
 use log::warn;
 use std::collections::HashMap;
 
@@ -51,6 +52,19 @@ pub struct ChainDailyRow {
     pub stocks: String,
     #[diesel(sql_type = Integer)]
     pub continuation_count: i32,
+}
+
+/// P-05 uses the same ordering as the exact-date P-01 reader. The primary key
+/// (date, concept) makes this a total order within the latest date.
+fn query_p05_latest_chain_clusters(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ChainDailyRow>, diesel::result::Error> {
+    diesel::sql_query(
+        "SELECT date, concept, stocks, continuation_count FROM chain_daily \
+         WHERE date = (SELECT MAX(date) FROM chain_daily) \
+         ORDER BY continuation_count DESC, concept ASC",
+    )
+    .load(conn)
 }
 
 /// B-002 板块联动归因 (Board hit) 行: 某日某板块的"板块拉升新闻+异动股列表"。
@@ -283,6 +297,16 @@ impl DatabaseManager {
         )
         .load(&mut conn)
         .map_err(|error| format!("查询 chain_daily 失败: {error}"))
+    }
+
+    /// P-05 same-query latest-date rows with a deterministic top-five order.
+    /// Other latest-date callers retain their existing query behavior.
+    pub fn get_p05_latest_chain_clusters_strict(&self) -> Result<Vec<ChainDailyRow>, String> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("获取 P-05 chain_daily 数据库连接失败: {error}"))?;
+        query_p05_latest_chain_clusters(&mut conn)
+            .map_err(|error| format!("查询 P-05 chain_daily 失败: {error}"))
     }
 
     /// BR-241: 严格读取指定证据日的 P-01 主线投影。
@@ -546,6 +570,52 @@ impl DatabaseManager {
 mod tests {
     use super::*;
     use std::{io, path::Path};
+
+    #[test]
+    fn p05_latest_chain_query_uses_latest_date_and_exact_date_tie_order() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query(
+            "CREATE TABLE chain_daily (date TEXT NOT NULL, concept TEXT NOT NULL, \
+             stocks TEXT NOT NULL, continuation_count INTEGER NOT NULL, \
+             PRIMARY KEY (date, concept))",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        assert!(query_p05_latest_chain_clusters(&mut conn)
+            .unwrap()
+            .is_empty());
+
+        for (date, concept, count) in [
+            ("2026-09-23", "older", 99),
+            ("2026-09-24", "己", 1),
+            ("2026-09-24", "乙", 3),
+            ("2026-09-24", "戊", 1),
+            ("2026-09-24", "甲", 3),
+            ("2026-09-24", "丙", 2),
+            ("2026-09-24", "丁", 2),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO chain_daily (date, concept, stocks, continuation_count) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(date)
+            .bind::<Text, _>(concept)
+            .bind::<Text, _>("[\"TEST_CODE_000001\"]")
+            .bind::<Integer, _>(count)
+            .execute(&mut conn)
+            .unwrap();
+        }
+        let rows = query_p05_latest_chain_clusters(&mut conn).unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|row| row.date == "2026-09-24"));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.concept.as_str())
+                .collect::<Vec<_>>(),
+            // SQLite's default BINARY collation compares the UTF-8 bytes.
+            vec!["乙", "甲", "丁", "丙", "己", "戊"]
+        );
+    }
 
     struct ConceptsGuard {
         code: String,

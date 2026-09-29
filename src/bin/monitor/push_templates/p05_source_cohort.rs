@@ -1,6 +1,7 @@
 //! P-05 candidate cohort observation. `RealCandidateBatch` retains P5 JSONL
-//! row witnesses; chain_daily identity and P5 producer authority remain absent,
-//! so this contract is still unqualified.
+//! row witnesses and the batch retains chain_daily decoded-column witnesses.
+//! The v2 cohort does not bind those witnesses, and producer authority remains
+//! absent, so this contract is still unqualified.
 //! The production sender does not call it, and no occurrence or terminal
 //! delivery result is bound here.
 
@@ -181,8 +182,8 @@ fn strong_row<'a>(
 /// Observe ordered Strong rows from the supplied batch and supplied render.
 /// The render is checked against the formatter for those supplied entries;
 /// this function is not wired to the production sender or its occurrence.
-/// Quote/statistics provenance and retained P5 file rows do not qualify the
-/// chain, producer, or held-position origins. Callers must reject
+/// Quote/statistics provenance and retained P5/chain rows do not qualify the
+/// chain snapshot, producer, or held-position origins. Callers must reject
 /// `require_qualified_origin()` until those witnesses are bound.
 pub(super) fn observe_p05_candidate_cohort_v2(
     business_date: NaiveDate,
@@ -318,6 +319,10 @@ mod tests {
                 statistics_evidence: Some(evidence("statistics")),
                 p5_files: Vec::new(),
                 p5_candidate_refs: Vec::new(),
+                chain_query: super::super::p05_chain_witness::project_same_query(Vec::new())
+                    .unwrap()
+                    .witness,
+                chain_candidate_refs: Vec::new(),
             },
         )
     }

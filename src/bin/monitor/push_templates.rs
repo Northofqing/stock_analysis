@@ -4616,8 +4616,11 @@ struct RealCandidateBatch {
     statistics_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
     p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
     p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 }
 
+mod p05_chain_witness;
 mod p05_file_witness;
 mod p05_source_cohort;
 
@@ -4640,6 +4643,8 @@ struct CandidateSourceContext {
     held_codes: Vec<String>,
     p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
     p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 }
 
 fn native_candidate_code(code: &str) -> &str {
@@ -4712,6 +4717,8 @@ fn assemble_real_candidate_batch(
     held_codes: &[String],
     p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
     p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 ) -> Result<RealCandidateBatch, String> {
     use stock_analysis::opportunity::candidate_panel::{
         classify_tier, filter_hard_gates, sort_candidates_by_heat, CandidateSource,
@@ -4778,6 +4785,7 @@ fn assemble_real_candidate_batch(
     entries = filter_hard_gates(entries, held_codes);
     entries = sort_candidates_by_heat(entries);
     let p5_candidate_refs = p05_file_witness::selected_refs(&entries, p5_candidate_refs);
+    let chain_candidate_refs = p05_chain_witness::selected_refs(&entries, chain_candidate_refs);
 
     Ok(RealCandidateBatch {
         entries,
@@ -4787,52 +4795,26 @@ fn assemble_real_candidate_batch(
         statistics_evidence: Some(statistics_batch.evidence),
         p5_files,
         p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
     })
 }
 
 fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
     use stock_analysis::database::DatabaseManager;
-    use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
+    use stock_analysis::opportunity::candidate_panel::merge_candidates;
 
-    let clusters = DatabaseManager::get().get_latest_chain_clusters_strict()?;
-    let mut items: Vec<(CandidateSource, String, String)> = Vec::new();
-    let mut themes = std::collections::HashMap::new();
+    let clusters = DatabaseManager::get().get_p05_latest_chain_clusters_strict()?;
+    let chain = p05_chain_witness::project_same_query(clusters)?;
+    let mut items = chain.items;
+    let themes = chain.themes;
 
-    for (cluster_index, cluster) in clusters.iter().take(5).enumerate() {
-        let codes = serde_json::from_str::<Vec<String>>(&cluster.stocks).map_err(|error| {
-            format!(
-                "chain_daily 第 {} 个主线 {} stocks JSON 非法: {error}",
-                cluster_index + 1,
-                cluster.concept
-            )
-        })?;
-        let Some(code) = codes.first().map(|value| value.trim()) else {
-            continue;
-        };
-        if !valid_source_stock_code(code) {
-            return Err(format!(
-                "chain_daily 主线 {} 头部 code 非法: {code}",
-                cluster.concept
-            ));
-        }
-        if cluster.concept.trim().is_empty() {
-            return Err(format!("chain_daily 主线 {code} concept 为空"));
-        }
-        items.push((
-            CandidateSource::IndustryChain,
-            code.to_string(),
-            cluster.concept.clone(),
-        ));
-        themes.insert(code.to_string(), cluster.concept.clone());
-    }
-
-    let p5_sources =
-        p05_file_witness::load_all_from_dir(std::path::Path::new("data/p5_sources"))?;
+    let p5_sources = p05_file_witness::load_all_from_dir(std::path::Path::new("data/p5_sources"))?;
     items.extend(p5_sources.items);
 
     let entries = merge_candidates(items);
-    let p5_candidate_refs =
-        p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
+    let p5_candidate_refs = p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
+    let chain_candidate_refs = p05_chain_witness::link_candidates(&entries, chain.candidate_refs)?;
     let held_codes = stock_analysis::portfolio::get_positions()
         .map_err(|error| format!("候选台读取持仓失败: {error}"))?
         .into_iter()
@@ -4844,6 +4826,8 @@ fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
         held_codes,
         p5_files: p5_sources.witnesses,
         p5_candidate_refs,
+        chain_query: chain.witness,
+        chain_candidate_refs,
     })
 }
 
@@ -4854,6 +4838,8 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         held_codes,
         p5_files,
         p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
     } = crate::blocking_market_data::run_blocking_market_data(
         "BR-099 candidate source context",
         load_candidate_source_context,
@@ -4868,6 +4854,8 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
             statistics_evidence: None,
             p5_files,
             p5_candidate_refs,
+            chain_query,
+            chain_candidate_refs,
         });
     }
 
@@ -4915,6 +4903,8 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         &held_codes,
         p5_files,
         p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
     )
 }
 
@@ -19644,6 +19634,10 @@ mod tests {
             std::collections::HashMap::new(),
             &["TEST_CODE_600001".to_string()],
             Vec::new(),
+            Vec::new(),
+            p05_chain_witness::project_same_query(Vec::new())
+                .unwrap()
+                .witness,
             Vec::new(),
         )
         .unwrap();
