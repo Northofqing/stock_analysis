@@ -207,8 +207,8 @@ async fn run_probe<C: ProbeClient>(
         Sha256::digest(stock_analysis::grpc_client::pb::FILE_DESCRIPTOR_SET)
     );
     emit(format!(
-        "probe stage=health operation={} live={} ready={} state={} build_identity_digest=unavailable build_identity_qualification=unavailable_local_contract local_client_contract_sha256={client_contract_sha256}",
-        operation.as_str_name(), health.live, health.ready, safe_atom(Some(&health.state)),
+        "probe stage=health operation={} live={} ready={} build_identity_digest=unavailable build_identity_qualification=unavailable_local_contract local_client_contract_sha256={client_contract_sha256}",
+        operation.as_str_name(), health.live, health.ready,
     ));
     let observed = client
         .query_once(operation, payload)
@@ -362,7 +362,8 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("stage=health"));
         assert!(lines[0].contains("live=true ready=false"));
-        assert!(lines[0].contains("state=DEGRADED"));
+        assert!(!lines[0].contains("state="));
+        assert!(!lines[0].contains("DEGRADED"));
         assert!(lines[1].contains("stage=query"));
         assert!(lines[1].contains("result=failed"));
         assert!(lines[1].contains("detail_request_id_match=true"));
