@@ -39,6 +39,8 @@ pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
 const PAPER_LEDGER_CATALOG_GENERATION: i64 = super::paper_ledger_schema_v1::CATALOG_GENERATION;
 const REVIEW_CATALOG_GENERATION: i64 = super::daily_change_review_schema_v1::CATALOG_GENERATION;
+const PAPER_BOOK_OWNER_CATALOG_GENERATION: i64 =
+    super::paper_book_owner_schema_v1::CATALOG_GENERATION;
 
 const PRODUCTION_DATABASE_RELATIVE_PATH: &str = "data/stock_analysis.db";
 const PRODUCTION_LOCK_DIRECTORY_RELATIVE_PATH: &str = "data/locks";
@@ -230,7 +232,7 @@ pub(crate) enum GlobalSchemaV1Error {
     UnsupportedFutureGeneration { actual: i64, supported: i64 },
 
     #[error(
-        "unsupported global schema identity application_id={application_id},user_version={user_version}; expected application_id=1398035265,user_version=1 or explicitly qualified 2 or 3"
+        "unsupported global schema identity application_id={application_id},user_version={user_version}; expected application_id=1398035265,user_version=1 or explicitly qualified 2, 3, or 4"
     )]
     UnsupportedIdentity {
         application_id: i64,
@@ -443,6 +445,9 @@ fn render_selection_v2_migration_diagnostic(
         }
         SelectionSchemaAuthorityDiagnostic::CatalogV3RequalificationRequired => {
             "catalog_v3_requalification_required"
+        }
+        SelectionSchemaAuthorityDiagnostic::CatalogV4RequalificationRequired => {
+            "catalog_v4_requalification_required"
         }
     };
     let nonempty = outcome
@@ -1118,6 +1123,7 @@ pub(crate) enum SelectionSchemaAuthorityDiagnostic {
     /// explicit whole-catalog maintenance receipt before issuing V2 authority.
     CatalogV2RequalificationRequired,
     CatalogV3RequalificationRequired,
+    CatalogV4RequalificationRequired,
 }
 
 #[allow(dead_code)]
@@ -1621,6 +1627,9 @@ fn classify_selection_authority_state(
         | DatabaseHalfDiagnostic::Transitional(e)
         | DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => e,
     };
+    if evidence.identity.user_version == PAPER_BOOK_OWNER_CATALOG_GENERATION {
+        return Ok(SelectionSchemaAuthorityDiagnostic::CatalogV4RequalificationRequired);
+    }
     if evidence.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION {
         return Ok(SelectionSchemaAuthorityDiagnostic::CatalogV2RequalificationRequired);
     }
@@ -2234,6 +2243,7 @@ fn classify_identity(
             STOCK_ANALYSIS_DB_SCHEMA_GENERATION
                 | PAPER_LEDGER_CATALOG_GENERATION
                 | REVIEW_CATALOG_GENERATION
+                | PAPER_BOOK_OWNER_CATALOG_GENERATION
         )
     {
         return Ok(GlobalSchemaIdentity {
@@ -2242,11 +2252,11 @@ fn classify_identity(
         });
     }
     if application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && user_version > REVIEW_CATALOG_GENERATION
+        && user_version > PAPER_BOOK_OWNER_CATALOG_GENERATION
     {
         return Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
             actual: user_version,
-            supported: REVIEW_CATALOG_GENERATION,
+            supported: PAPER_BOOK_OWNER_CATALOG_GENERATION,
         });
     }
     if application_id == 0 && user_version == 0 {
@@ -3668,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_matrix_accepts_only_exact_stsa_generation_one() {
+    fn identity_matrix_accepts_explicit_generations_and_rejects_future() {
         let identity = classify_identity(
             STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
             STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
@@ -3681,6 +3691,15 @@ mod tests {
                 user_version: 1,
             }
         );
+        for generation in [2, 3, 4] {
+            assert_eq!(
+                classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, generation).unwrap(),
+                GlobalSchemaIdentity {
+                    application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+                    user_version: generation,
+                }
+            );
+        }
 
         assert!(matches!(
             classify_identity(0, 0),
@@ -3705,10 +3724,10 @@ mod tests {
             );
         }
         assert!(matches!(
-            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 4),
+            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 5),
             Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
-                actual: 4,
-                supported: 3
+                actual: 5,
+                supported: 4
             })
         ));
     }
@@ -4427,7 +4446,7 @@ mod tests {
             (
                 "future",
                 STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-                REVIEW_CATALOG_GENERATION + 1,
+                PAPER_BOOK_OWNER_CATALOG_GENERATION + 1,
                 "global_schema_unsupported_future_generation",
             ),
         ] {

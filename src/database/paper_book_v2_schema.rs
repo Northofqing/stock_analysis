@@ -4,6 +4,7 @@
 //! isolated unit tests may install it. Verification is read-only and is not a
 //! whole-application catalog or production cutover authority.
 
+use crate::performance::fee_evidence::A_SHARE_FEE_SCHEDULE_V2;
 use crate::performance::fee_policy::AShareFeePolicyV2;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Text};
@@ -14,20 +15,20 @@ const STAGED_SCHEMA: &str = "paper-book-v2-fee-manifest/v1";
 const APPLICATION_ID: i64 = 1_398_035_265;
 const TEST_PARENT_USER_VERSION: i64 = 2;
 
-const STATEMENTS: &[&str] = &[
-    "CREATE TABLE paper_book_v2_fee_manifest (
+pub(crate) const STATEMENTS: &[(&str, &str, &str, &str)] = &[
+    ("table", "paper_book_v2_fee_manifest", "paper_book_v2_fee_manifest", "CREATE TABLE paper_book_v2_fee_manifest (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
         schema_id TEXT NOT NULL CHECK(schema_id='paper-book-v2-fee-manifest/v1'),
         policy_instance_id TEXT NOT NULL,
         descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),
-        descriptor_bytes BLOB NOT NULL CHECK(length(descriptor_bytes)>0))",
-    "CREATE TRIGGER paper_book_v2_fee_manifest_no_update BEFORE UPDATE ON paper_book_v2_fee_manifest
-        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END",
-    "CREATE TRIGGER paper_book_v2_fee_manifest_no_delete BEFORE DELETE ON paper_book_v2_fee_manifest
-        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END",
-    "CREATE TRIGGER paper_book_v2_fee_manifest_no_reinsert BEFORE INSERT ON paper_book_v2_fee_manifest
+        descriptor_bytes BLOB NOT NULL CHECK(length(descriptor_bytes)>0))"),
+    ("trigger", "paper_book_v2_fee_manifest_no_update", "paper_book_v2_fee_manifest", "CREATE TRIGGER paper_book_v2_fee_manifest_no_update BEFORE UPDATE ON paper_book_v2_fee_manifest
+        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END"),
+    ("trigger", "paper_book_v2_fee_manifest_no_delete", "paper_book_v2_fee_manifest", "CREATE TRIGGER paper_book_v2_fee_manifest_no_delete BEFORE DELETE ON paper_book_v2_fee_manifest
+        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END"),
+    ("trigger", "paper_book_v2_fee_manifest_no_reinsert", "paper_book_v2_fee_manifest", "CREATE TRIGGER paper_book_v2_fee_manifest_no_reinsert BEFORE INSERT ON paper_book_v2_fee_manifest
         WHEN EXISTS(SELECT 1 FROM paper_book_v2_fee_manifest)
-        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END",
+        BEGIN SELECT RAISE(ABORT,'immutable V2 fee policy manifest'); END"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -127,9 +128,77 @@ fn objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, StagedPape
     .load(conn)?)
 }
 
-fn create_schema(conn: &mut SqliteConnection) -> Result<(), StagedPaperBookV2Error> {
-    for statement in STATEMENTS {
+pub(crate) fn create_schema(conn: &mut SqliteConnection) -> Result<(), StagedPaperBookV2Error> {
+    for (_, _, _, statement) in STATEMENTS {
         diesel::sql_query(*statement).execute(conn)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn insert_policy_for_isolated_test(
+    conn: &mut SqliteConnection,
+    policy: &AShareFeePolicyV2,
+) -> Result<(), StagedPaperBookV2Error> {
+    diesel::sql_query(
+        "INSERT INTO paper_book_v2_fee_manifest
+         (singleton,schema_id,policy_instance_id,descriptor_sha256,descriptor_bytes)
+         VALUES (1,?,?,?,?)",
+    )
+    .bind::<Text, _>(STAGED_SCHEMA)
+    .bind::<Text, _>(policy.instance_id())
+    .bind::<Text, _>(policy.descriptor_hash())
+    .bind::<Binary, _>(policy.canonical_bytes())
+    .execute(conn)?;
+    Ok(())
+}
+
+/// A V4 historical-reader check only. A V2 writer must additionally bind a
+/// reviewed policy descriptor; a self-consistent database row cannot grant it.
+pub(crate) fn verify_v4_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    verify_manifest_row_on(conn, 4)
+}
+
+/// A complete inactive gen2 staging row may coexist with legacy V1 writes.
+/// This is only a structural check; it never activates a V2 owner or fill.
+pub(crate) fn verify_inactive_staged_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    verify_manifest_row_on(conn, TEST_PARENT_USER_VERSION)
+}
+
+fn verify_manifest_row_on(
+    conn: &mut SqliteConnection,
+    expected_user_version: i64,
+) -> Result<(), StagedPaperBookV2Error> {
+    let identity = database_identity(conn)?;
+    if identity.application_id != APPLICATION_ID || identity.user_version != expected_user_version {
+        return Err(StagedPaperBookV2Error::WrongDatabaseIdentity);
+    }
+    let mut reference = SqliteConnection::establish(":memory:")?;
+    create_schema(&mut reference)?;
+    if objects(conn)? != objects(&mut reference)? {
+        return Err(StagedPaperBookV2Error::CatalogMismatch);
+    }
+    let rows: Vec<FeeManifestRow> = diesel::sql_query(
+        "SELECT schema_id,policy_instance_id,descriptor_sha256,descriptor_bytes
+         FROM paper_book_v2_fee_manifest ORDER BY singleton",
+    )
+    .load(conn)?;
+    if rows.len() != 1 || rows[0].schema_id != STAGED_SCHEMA {
+        return Err(StagedPaperBookV2Error::ManifestMismatch);
+    }
+    let row = &rows[0];
+    let mut hasher = Sha256::new();
+    hasher.update(b"a-share-fee-policy-descriptor/v1\n");
+    hasher.update(&row.descriptor_bytes);
+    let digest = hex::encode(hasher.finalize());
+    if row.descriptor_sha256 != digest
+        || row.policy_instance_id != format!("{A_SHARE_FEE_SCHEDULE_V2}:sha256:{digest}")
+    {
+        return Err(StagedPaperBookV2Error::ManifestMismatch);
     }
     Ok(())
 }
@@ -238,16 +307,7 @@ fn stage_for_isolated_test_with_fault(
         if fail_after_schema {
             return Err(StagedPaperBookV2Error::InjectedFailure);
         }
-        diesel::sql_query(
-            "INSERT INTO paper_book_v2_fee_manifest
-             (singleton,schema_id,policy_instance_id,descriptor_sha256,descriptor_bytes)
-             VALUES (1,?,?,?,?)",
-        )
-        .bind::<Text, _>(STAGED_SCHEMA)
-        .bind::<Text, _>(policy.instance_id())
-        .bind::<Text, _>(policy.descriptor_hash())
-        .bind::<Binary, _>(policy.canonical_bytes())
-        .execute(conn)?;
+        insert_policy_for_isolated_test(conn, policy)?;
         verify_staged_policy(conn, policy)
     })
 }

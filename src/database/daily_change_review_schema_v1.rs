@@ -64,8 +64,8 @@ pub(crate) fn is_present(
     if actual.is_empty() && legacy {
         return Ok(false);
     }
-    let qualified_generation =
-        identity.application_id == 1398035265 && identity.user_version == CATALOG_GENERATION;
+    let qualified_generation = identity.application_id == 1398035265
+        && matches!(identity.user_version, CATALOG_GENERATION | 4);
     #[cfg(test)]
     let qualified_generation =
         qualified_generation || (identity.application_id == 0 && identity.user_version == 0);
