@@ -3,6 +3,8 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
+use stock_analysis::monitor::push_job::WeakOutcomeKind;
+use stock_analysis::notification::{NotificationChannel, NotificationSendReport};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
 use super::chain_acquisition::{
@@ -70,6 +72,96 @@ pub(super) struct ChainReportInputObservation {
         stock_analysis::pipeline::chain_analysis::preparation::SourceStatus,
     pub coverage: &'static str,
     pub covered_inputs: &'static str,
+}
+
+/// A weak, invocation-local binding of one Custom target to the prepared
+/// report and its already observed source/artifact identity. The entity is the
+/// first built Reqwest request; a redirect may change the actual method/body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ChainCustomRequestObservation {
+    pub send_id: String,
+    pub target_index: usize,
+    pub outcome: WeakOutcomeKind,
+    pub artifact_sha256: String,
+    pub acquisition_report_binding_sha256: Option<String>,
+    pub report_input_sha256: String,
+    pub prepared_report_equals_input: bool,
+    pub built_target_sha256: Option<String>,
+    pub built_body_sha256: Option<String>,
+    pub built_body_bytes: Option<usize>,
+    pub built_body_matches_prepared: Option<bool>,
+    pub response_url_sha256: Option<String>,
+    pub response_target_differs: Option<bool>,
+    pub binding_sha256: String,
+}
+
+pub(super) fn observe_custom_requests(
+    prepared: &PreparedChainAnalysis,
+    input: &ChainReportInputObservation,
+    report: &NotificationSendReport,
+) -> Result<Vec<ChainCustomRequestObservation>> {
+    anyhow::ensure!(
+        prepared.business_date() == input.prepared_business_date,
+        "产业链 Custom 请求与准备对象业务日期不一致"
+    );
+    report
+        .attempts()
+        .iter()
+        .filter(|attempt| attempt.channel() == NotificationChannel::Custom)
+        .map(|attempt| {
+            let entity = attempt.request_entity();
+            let built_target_sha256 = entity.map(|entity| entity.target_sha256().to_owned());
+            let built_body_sha256 = entity.map(|entity| entity.body_sha256().to_owned());
+            let built_body_bytes = entity.map(|entity| entity.body_len());
+            let built_body_matches_prepared =
+                entity.map(|entity| entity.matches_custom_content(prepared.report()));
+            let response_url_sha256 = entity
+                .and_then(|entity| entity.response_url_sha256())
+                .map(str::to_owned);
+            let response_target_differs =
+                entity.and_then(|entity| entity.response_target_differs());
+            let outcome = match attempt.outcome() {
+                WeakOutcomeKind::Accepted => "accepted",
+                WeakOutcomeKind::Rejected => "rejected",
+                WeakOutcomeKind::Unknown => "unknown",
+            };
+            let binding = serde_json::to_vec(&serde_json::json!({
+                "schema": "chain-custom-request-observation-v1",
+                "phase": input.phase.as_str(),
+                "schedule_date": input.schedule_date.to_string(),
+                "prepared_business_date": input.prepared_business_date.to_string(),
+                "send_id": report.send_id(),
+                "target_index": attempt.target_index(),
+                "outcome": outcome,
+                "artifact_sha256": &input.artifact_sha256,
+                "acquisition_report_binding_sha256": &input.acquisition_report_binding_sha256,
+                "report_input_sha256": &input.report_input_sha256,
+                "prepared_report_equals_input": input.prepared_report_equals_input,
+                "built_target_sha256": &built_target_sha256,
+                "built_body_sha256": &built_body_sha256,
+                "built_body_bytes": built_body_bytes,
+                "built_body_matches_prepared": built_body_matches_prepared,
+                "response_url_sha256": &response_url_sha256,
+                "response_target_differs": response_target_differs,
+            }))?;
+            Ok(ChainCustomRequestObservation {
+                send_id: report.send_id().to_owned(),
+                target_index: attempt.target_index(),
+                outcome: attempt.outcome(),
+                artifact_sha256: input.artifact_sha256.clone(),
+                acquisition_report_binding_sha256: input.acquisition_report_binding_sha256.clone(),
+                report_input_sha256: input.report_input_sha256.clone(),
+                prepared_report_equals_input: input.prepared_report_equals_input,
+                built_target_sha256,
+                built_body_sha256,
+                built_body_bytes,
+                built_body_matches_prepared,
+                response_url_sha256,
+                response_target_differs,
+                binding_sha256: format!("{:x}", Sha256::digest(binding)),
+            })
+        })
+        .collect()
 }
 
 /// `report_input` is the UTF-8 report supplied to the legacy sender, not a
@@ -201,7 +293,15 @@ pub(super) async fn test_prepared_with_macro(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        io::{Read, Write},
+        net::TcpListener,
+        rc::Rc,
+        thread,
+        time::Duration,
+    };
+    use stock_analysis::notification::{NotificationConfig, NotificationService};
 
     #[tokio::test]
     async fn separates_schedule_and_business_dates_and_labels_digest_scope() {
@@ -249,5 +349,88 @@ mod tests {
         assert!(!altered.prepared_report_equals_input);
         assert_ne!(original.report_input_sha256, altered.report_input_sha256);
         assert_eq!(original.artifact_sha256, altered.artifact_sha256);
+    }
+
+    #[tokio::test]
+    async fn one_custom_send_binds_built_request_to_prepared_artifact_and_input() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let preparations = Rc::new(Cell::new(0));
+        let prepared = test_prepared(date, preparations.clone()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/custom", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let size = stream.read(&mut buffer).unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&buffer[..size]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let body_start = end + 4;
+                    let headers = std::str::from_utf8(&request[..body_start]).unwrap();
+                    let body_len: usize = headers
+                        .split("\r\n")
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim())
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= body_start + body_len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"ok":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        let service = NotificationService::new(NotificationConfig {
+            custom_webhook_urls: vec![url],
+            ..NotificationConfig::default()
+        });
+        let report = service.send_report(prepared.report()).await;
+        let input = observe(
+            ChainPhase::Postclose,
+            date,
+            &prepared,
+            prepared.report().as_bytes(),
+            None,
+        )
+        .unwrap();
+        let requests = observe_custom_requests(&prepared, &input, &report).unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.send_id, report.send_id());
+        assert_eq!(request.artifact_sha256, input.artifact_sha256);
+        assert_eq!(request.report_input_sha256, input.report_input_sha256);
+        assert!(request.prepared_report_equals_input);
+        assert_eq!(request.built_body_matches_prepared, Some(true));
+        assert_eq!(request.response_target_differs, Some(false));
+        assert_eq!(request.binding_sha256.len(), 64);
+
+        let changed_input = observe(
+            ChainPhase::Postclose,
+            date,
+            &prepared,
+            b"changed input",
+            None,
+        )
+        .unwrap();
+        let changed = observe_custom_requests(&prepared, &changed_input, &report).unwrap();
+        assert!(!changed[0].prepared_report_equals_input);
+        assert_ne!(changed[0].binding_sha256, request.binding_sha256);
+        assert_eq!(preparations.get(), 1);
+        assert!(server.join().unwrap().starts_with(b"POST /custom HTTP/1.1"));
     }
 }

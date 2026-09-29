@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) enum ScriptedResponse {
     Http(&'static str),
+    Redirect(&'static str),
     Disconnect,
 }
 
@@ -126,6 +127,17 @@ fn spawn_webhook_fixture_with_lifetime(
                     stream
                         .flush()
                         .map_err(|error| format!("flush fixture response: {error}"))?;
+                }
+                ScriptedResponse::Redirect(location) => {
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream
+                        .set_write_timeout(Some(remaining_until(deadline, "write redirect")?))
+                        .map_err(|error| format!("set redirect write timeout: {error}"))?;
+                    stream
+                        .write_all(response.as_bytes())
+                        .map_err(|error| format!("write fixture redirect: {error}"))?;
                 }
                 ScriptedResponse::Disconnect => {}
             }
@@ -322,8 +334,57 @@ async fn custom_success_and_false_are_distinct_weak_observations() {
         ],
     );
     assert!(report.has_success());
+    assert_eq!(
+        report.attempts()[0]
+            .request_entity()
+            .unwrap()
+            .response_target_differs(),
+        Some(false)
+    );
     assert_eq!(accepted.finish().len(), 1);
     assert_eq!(declined.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn custom_redirect_records_final_response_target_without_claiming_final_body() {
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Redirect("/TEST_CODE_redirected"),
+        ScriptedResponse::Http(r#"{"ok":true}"#),
+    ]);
+    let initial_url = fixture.url();
+    let final_url = initial_url.replace("/TEST_CODE_fixture", "/TEST_CODE_redirected");
+    let service = test_service(
+        NotificationConfig {
+            custom_webhook_urls: vec![initial_url.clone()],
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Custom],
+    );
+
+    let report = service.send_report("TEST_CODE redirect").await;
+
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Custom, 0, WeakOutcomeKind::Accepted)],
+    );
+    let entity = report.attempts()[0].request_entity().unwrap();
+    assert!(entity.matches_custom_content("TEST_CODE redirect"));
+    assert_eq!(entity.response_target_differs(), Some(true));
+    let target_digest = |url: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"stock_analysis.notification_target_url.v1\0");
+        hasher.update(url.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(entity.target_sha256(), target_digest(&initial_url));
+    assert_eq!(
+        entity.response_url_sha256(),
+        Some(target_digest(&final_url).as_str())
+    );
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(b"POST /TEST_CODE_fixture HTTP/1.1"));
+    assert!(requests[1].starts_with(b"GET /TEST_CODE_redirected HTTP/1.1"));
 }
 
 #[tokio::test]
@@ -349,6 +410,11 @@ async fn custom_unknown_results_do_not_stop_later_targets_or_retry() {
         ],
     );
     assert!(!report.has_success());
+    assert!(report.attempts()[2]
+        .request_entity()
+        .unwrap()
+        .response_url_sha256()
+        .is_none());
     assert_eq!(declined.finish().len(), 1);
     assert_eq!(malformed.finish().len(), 1);
     assert_eq!(disconnected.finish().len(), 1);

@@ -619,13 +619,14 @@ where
     // Preparation already happened for every envelope, including a rejected
     // pre-send guard or an unavailable channel. Observe those exact inputs as
     // well, without preparing again or granting the observer send authority.
-    match observer(
+    let input_observation = observer(
         phase,
         date,
         &envelope.prepared,
         &envelope.report_input,
         envelope.acquisition.as_ref(),
-    ) {
+    );
+    match &input_observation {
             Ok(observation) => log::info!(
                 "[chain_shadow_input] phase={} schedule_date={} send_attempted={} suppression_reason={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} selected_news_source_ref_status={} selected_news_source_ref_reason={} selected_news_source_ref_v1={} selected_news_provider={:?} selected_news_source={} selected_news_batch_id_sha256={} selected_news_source_at={} selected_news_provider_observed_at={} selected_news_input_sha256={} selected_news_input_bytes={:?} prepared_macro_source_status={:?} selected_news_content_scope=selected_titles_utf8 provider_raw_batch_sha256=unobserved coverage={} covered_inputs={} foundation_persisted=false",
                 observation.phase.as_str(), observation.schedule_date, envelope.send_attempted,
@@ -654,6 +655,30 @@ where
                 envelope.suppression.map(ChainSendSuppression::as_str).unwrap_or("none"),
                 chain_shadow_input::COVERAGE,
             ),
+    }
+    if let (Ok(input), Some(report)) = (&input_observation, envelope.notification_report.as_ref()) {
+        match chain_shadow_input::observe_custom_requests(&envelope.prepared, input, report) {
+            Ok(requests) => {
+                for request in requests {
+                    log::info!(
+                        "[chain_shadow_custom_request] phase={} schedule_date={} send_id={} target_index={} outcome={:?} artifact_sha256={} acquisition_report_binding_sha256={} report_input_sha256={} prepared_report_equals_input={} built_target_sha256={} built_body_sha256={} built_body_bytes={:?} built_body_matches_prepared={:?} response_url_sha256={} response_target_differs={:?} binding_sha256={} scope=first_built_custom_http_entity redirected_request_body=unobserved full_http_wire=unobserved authority=weak coverage=incomplete",
+                        phase.as_str(), date, request.send_id, request.target_index, request.outcome,
+                        request.artifact_sha256,
+                        request.acquisition_report_binding_sha256.as_deref().unwrap_or("absent"),
+                        request.report_input_sha256, request.prepared_report_equals_input,
+                        request.built_target_sha256.as_deref().unwrap_or("unobserved"),
+                        request.built_body_sha256.as_deref().unwrap_or("unobserved"),
+                        request.built_body_bytes, request.built_body_matches_prepared,
+                        request.response_url_sha256.as_deref().unwrap_or("unobserved"),
+                        request.response_target_differs, request.binding_sha256,
+                    );
+                }
+            }
+            Err(_error) => log::warn!(
+                "[chain_shadow_custom_request] phase={} schedule_date={} observer_status=incomplete reason=request_binding_failed authority=weak coverage=incomplete",
+                phase.as_str(), date,
+            ),
+        }
     }
     legacy_result
 }

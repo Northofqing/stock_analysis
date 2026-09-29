@@ -628,6 +628,9 @@ impl NotificationService {
         let request = request.build()?;
         *request_entity = NotificationRequestEntity::from_built_request(&request);
         let response = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(response.url());
+        }
         let status = response.status();
         let response_body = response.text().await?;
         if !status.is_success() || !custom_business_accepted(&response_body)? {
