@@ -424,6 +424,13 @@ impl<'a> PaperLedger<'a> {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(LedgerError::Cancelled);
             }
+            let binding = match &command {
+                PaperCommand::Seed(seed) => seed.binding()?,
+                PaperCommand::Execute(intent) => intent.binding.clone(),
+                PaperCommand::Mark(batch) => batch.binding.clone(),
+                PaperCommand::Adjudicate(request) => request.binding.clone(),
+            };
+            require_v1_owner_on(conn, &binding)?;
             let at = (self.clock)();
             if cancelled.load(Ordering::SeqCst) {
                 return Err(LedgerError::Cancelled);
@@ -461,10 +468,23 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             let view = load(conn, binding)?;
             view.require_available()?;
             Ok(view)
         })
+    }
+    /// Runtime admission check before fetching quotes or recovering a terminal.
+    /// The locked writer checks the same owner again before any mutation.
+    pub(crate) fn require_active_v1_owner(
+        &self,
+        binding: &AccountBinding,
+    ) -> Result<(), LedgerError> {
+        let mut conn = self
+            .db
+            .get_conn()
+            .map_err(|error| LedgerError::Database(error.to_string()))?;
+        conn.transaction(|conn| require_v1_owner_on(conn, binding))
     }
     /// Recover a committed business terminal without obtaining new market
     /// evidence. This is read-only, validates the same chain and intent as
@@ -480,6 +500,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             load(conn, binding)?;
             let hash = execution::order_intent_hash(binding, signal, price_intent)?;
             replay_command(conn, binding, None, Some((&signal.plan_id, &hash)), None)
@@ -495,6 +516,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             let head = load(conn, binding)?;
             if version < 1 || version > head.version {
                 return Err(LedgerError::InvalidInput(
@@ -519,6 +541,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             load(conn, binding)?.require_available()?;
             let rulings = adjudication::latest_rulings(&events(conn, &binding.account_id)?)?;
             let mut fills = Vec::new();
@@ -576,6 +599,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.immediate_transaction(|conn| {
+            require_v1_owner_on(conn, binding)?;
             if head(conn, binding)?.is_some() { return load(conn,binding); }
             let view = replay(conn,binding)?;
             let bytes = encode(&view.projection)?;
@@ -625,6 +649,47 @@ impl<'a> PaperLedger<'a> {
             .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&hash).bind::<Text,_>(&bytes).bind::<Text,_>(digest(&bytes)).execute(conn)?;
         Ok(receipt(1, hash, &decode(&payload)?, false))
     }
+}
+pub(super) fn require_v1_owner_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<(), LedgerError> {
+    crate::database::paper_book_owner_schema_v1::require_v1_owner_on(
+        conn,
+        &binding.account_id,
+        &binding.epoch_id,
+        &binding.manifest_hash,
+    )
+    .map_err(|error| match error {
+        crate::database::paper_book_owner_schema_v1::PaperBookOwnerError::InactiveOwner => {
+            LedgerError::InactiveEpoch
+        }
+        error => LedgerError::IntegrityFailure(error.to_string()),
+    })
+}
+/// Historical reads retain V1-V3 behavior, but a V4 view must be backed by
+/// the complete owner/catalog namespace in the same read transaction.
+fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    let generation = diesel::sql_query("SELECT user_version AS value FROM pragma_user_version()")
+        .get_result::<IntegerRow>(conn)?
+        .value;
+    let owner_objects = diesel::sql_query(
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_v1*' OR tbl_name GLOB 'paper_book_owner_v1*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_v1*' OR tbl_name GLOB 'paper_book_owner_v1*')) AS value",
+    )
+    .get_result::<IntegerRow>(conn)?
+    .value;
+    let fee_objects = diesel::sql_query(
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')) AS value",
+    )
+    .get_result::<IntegerRow>(conn)?
+    .value;
+    if generation >= 4 || owner_objects != 0 || (generation != 2 && fee_objects != 0) {
+        crate::database::paper_book_owner_schema_v1::verify_catalog_v4_on(conn)
+            .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+    }
+    Ok(())
 }
 fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
     if [

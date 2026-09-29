@@ -425,11 +425,30 @@ pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String
                 sql: sql.replace("IF NOT EXISTS ", ""),
             })
             .collect::<Vec<_>>();
+        if generation == 4 {
+            expected.extend(
+                crate::database::paper_book_owner_schema_v1::V1_GUARD_STATEMENTS
+                    .iter()
+                    .map(|(kind, name, owner, sql)| CatalogObject {
+                        kind: (*kind).into(),
+                        name: (*name).into(),
+                        owner: (*owner).into(),
+                        sql: sql.replace("IF NOT EXISTS ", ""),
+                    }),
+            );
+        }
         expected.sort();
         let supported_generation = match generation {
             2 => true,
             3 => crate::database::daily_change_review_schema_v1::is_present(conn)
                 .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?,
+            4 => {
+                let review = crate::database::daily_change_review_schema_v1::is_present(conn)
+                    .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+                crate::database::paper_book_owner_schema_v1::verify_catalog_v4_on(conn)
+                    .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+                review
+            }
             _ => false,
         };
         if !supported_generation || application != 1398035265 || objects != expected {
@@ -656,7 +675,7 @@ fn legacy_verified_on(
                     "LegacyRaw permits only current raw as-known".into(),
                 ));
             }
-            if catalog.0 == 2
+            if matches!(catalog.0, 2 | 4)
                 && diesel::sql_query("SELECT COUNT(*) AS value FROM paper_ledger_account")
                     .get_result::<IntegerRow>(conn)?
                     .value

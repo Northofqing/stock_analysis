@@ -25,6 +25,7 @@ impl PaperLedger<'_> {
             .get_conn()
             .map_err(|e| LedgerError::Database(e.to_string()))?;
         conn.immediate_transaction(|conn| {
+            require_v1_owner_on(conn, binding)?;
             let effective = effective::verified_on(conn, request)?;
             effective.rows()?;
             let command = command(&effective)?;
