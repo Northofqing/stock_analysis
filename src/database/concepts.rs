@@ -228,6 +228,18 @@ impl DatabaseManager {
         date: chrono::NaiveDate,
         clusters: &[(String, Vec<String>, i32)],
     ) -> Result<(), String> {
+        self.replace_and_read_chain_clusters_for_date_strict(date, clusters)
+            .map(|_| ())
+    }
+
+    /// Replace and verify the exact-date projection inside one SQLite write
+    /// transaction. The returned rows are the committed generation's own
+    /// read-back, not a later query that another producer could overtake.
+    pub fn replace_and_read_chain_clusters_for_date_strict(
+        &self,
+        date: chrono::NaiveDate,
+        clusters: &[(String, Vec<String>, i32)],
+    ) -> Result<Vec<ChainDailyRow>, String> {
         let date = date.format("%Y-%m-%d").to_string();
         let mut concepts = std::collections::HashSet::with_capacity(clusters.len());
         let mut encoded = Vec::with_capacity(clusters.len());
@@ -267,9 +279,32 @@ impl DatabaseManager {
                 .bind::<Integer, _>(*continuation_count)
                 .execute(tx)?;
             }
-            Ok(())
+            let read_back: Vec<ChainDailyRow> = diesel::sql_query(
+                "SELECT date, concept, stocks, continuation_count FROM chain_daily \
+                 WHERE date = ? ORDER BY continuation_count DESC, concept ASC",
+            )
+            .bind::<Text, _>(&date)
+            .load(tx)?;
+            if read_back.len() != encoded.len()
+                || read_back.iter().any(|row| {
+                    row.date != date
+                        || !encoded.iter().any(|(concept, stocks, continuation_count)| {
+                            row.concept == **concept
+                                && row.stocks == *stocks
+                                && row.continuation_count == *continuation_count
+                        })
+                })
+            {
+                return Err(diesel::result::Error::RollbackTransaction);
+            }
+            Ok(read_back)
         })
-        .map_err(|error| format!("P-01 exact-date 主线原子替换失败: {error}"))
+        .map_err(|error| match error {
+            diesel::result::Error::RollbackTransaction => {
+                "P-01 exact-date 主线事务内读回与写入不一致".to_string()
+            }
+            other => format!("P-01 exact-date 主线原子替换失败: {other}"),
+        })
     }
 
     /// 读取最近一个有记录日期的主线簇（含当天）。
@@ -615,6 +650,42 @@ mod tests {
             // SQLite's default BINARY collation compares the UTF-8 bytes.
             vec!["乙", "甲", "丁", "丙", "己", "戊"]
         );
+    }
+
+    #[test]
+    fn p01_replace_readback_mismatch_rolls_back_the_whole_generation() {
+        let isolated = tempfile::tempdir().expect("isolated P-01 generation database");
+        let db = DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_p01_generation.db"),
+        )
+        .expect("open isolated P-01 generation database");
+        let date = chrono::NaiveDate::from_ymd_opt(2198, 11, 17).unwrap();
+        db.save_chain_clusters(
+            "2198-11-17",
+            &[("TEST_CODE_OLD".into(), vec!["TEST_CODE_600099".into()], 1)],
+        )
+        .expect("seed old same-date row");
+        {
+            let mut conn = db.get_conn().unwrap();
+            diesel::sql_query(
+                "CREATE TRIGGER TEST_CODE_mutate_chain_generation AFTER INSERT ON chain_daily \
+                 BEGIN UPDATE chain_daily SET stocks='[\"TEST_CODE_600098\"]' \
+                 WHERE date=NEW.date AND concept=NEW.concept; END",
+            )
+            .execute(&mut conn)
+            .expect("install isolated read-back mutation");
+        }
+        let error = db
+            .replace_and_read_chain_clusters_for_date_strict(
+                date,
+                &[("TEST_CODE_NEW".into(), vec!["TEST_CODE_600001".into()], 2)],
+            )
+            .expect_err("changed projection cannot commit as a producer generation");
+        assert!(error.contains("事务内读回"));
+        let rows = db.get_chain_clusters_for_date_strict(date).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].concept, "TEST_CODE_OLD");
+        assert_eq!(rows[0].stocks, "[\"TEST_CODE_600099\"]");
     }
 
     struct ConceptsGuard {

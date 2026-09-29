@@ -1,7 +1,7 @@
 //! BR-241 exact-date P-01 chain projection from one admitted LimitPools batch.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -16,6 +16,8 @@ use crate::market_domain::{LimitPoolEntry, LimitPoolKind, ProviderId};
 const RECORD_HASH_DOMAIN: &[u8] = b"P01_LIMIT_POOL_RECORD_V1\0";
 const CHAIN_ROW_HASH_DOMAIN: &[u8] = b"P01_CHAIN_ROW_V1\0";
 const PERSISTENCE_RECEIPT_DOMAIN: &[u8] = b"P01_CHAIN_PERSISTENCE_RECEIPT_V1\0";
+const PRODUCER_GENERATION_DOMAIN: &[u8] = b"P01_CHAIN_PRODUCER_GENERATION_V1\0";
+const PRODUCER_GENERATION_SCHEMA: &str = "P01_CHAIN_PRODUCER_GENERATION_V1";
 const P01_LIMIT_POOL_RECORD_LIMIT: usize = 200;
 
 #[derive(Debug, Error)]
@@ -68,6 +70,178 @@ pub struct P01CompletedDayEvidence {
     /// Exact-date rows already verified against the projection before return.
     pub chain_rows: Vec<ChainDailyRow>,
     pub projection: P01ChainProjectionReceipt,
+}
+
+/// Content identity for one P-01 producer result. It is computed from the
+/// supplied gateway batch and exact rows verified by the write transaction. The
+/// identity is not persisted with `chain_daily`; later P-05 readers cannot
+/// treat it as an authoritative generation yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P01ChainProducerGenerationObservation {
+    pub schema: &'static str,
+    pub canonical_bytes: Vec<u8>,
+    pub generation_sha256: String,
+}
+
+impl P01ChainProducerGenerationObservation {
+    pub fn require_persistent_authority(&self) -> Result<(), &'static str> {
+        Err("P-01 producer generation is not persisted with chain_daily")
+    }
+}
+
+#[derive(Serialize)]
+struct ProducerGenerationCanonical<'a> {
+    schema: &'static str,
+    evidence_date: String,
+    provider: ProviderId,
+    source: &'a str,
+    source_at: Option<&'a str>,
+    observed_at: &'a str,
+    batch_id: &'a str,
+    persistence_receipt_sha256: &'a str,
+    ordered_chain_row_hashes: &'a [String],
+}
+
+impl P01CompletedDayEvidence {
+    pub fn producer_generation_observation(
+        &self,
+    ) -> Result<P01ChainProducerGenerationObservation, P01ProjectionError> {
+        let date = self.projection.evidence_date;
+        let date_text = date.format("%Y-%m-%d").to_string();
+        validate_batch_evidence(&self.limit_pool, date, &date_text)?;
+        if self.projection.limit_pool_batch_id != self.limit_pool.evidence().batch_id
+            || self.chain_rows.is_empty()
+            || self.chain_rows.len() != self.projection.ordered_chain_row_hashes.len()
+            || self.chain_rows.iter().any(|row| row.date != date_text)
+        {
+            return Err(P01ProjectionError::terminal(
+                "p01_chain_generation_input_mismatch",
+                "producer batch, date, or row count differs from projection receipt",
+            ));
+        }
+        let mut seen_codes = HashSet::new();
+        let mut record_hashes = Vec::with_capacity(self.limit_pool.records().len());
+        let mut excluded_hashes = Vec::new();
+        let mut classified = false;
+        for record in self.limit_pool.records() {
+            validate_record_evidence(record, &self.limit_pool, date, &date_text)?;
+            let code = record.instrument.code().to_owned();
+            if !seen_codes.insert(code.clone()) {
+                return Err(P01ProjectionError::terminal(
+                    "p01_chain_generation_duplicate_record",
+                    format!("producer batch repeats {code}"),
+                ));
+            }
+            let record_hash = hash_serializable(RECORD_HASH_DOMAIN, record).map_err(|error| {
+                P01ProjectionError::terminal(
+                    "p01_chain_generation_record_hash_failed",
+                    error.to_string(),
+                )
+            })?;
+            record_hashes.push((code, record_hash.clone()));
+            if record.industry.is_some() || record.board_name.is_some() || record.reason.is_some() {
+                classified = true;
+            } else {
+                excluded_hashes.push((record_hash, "p01_chain_classification_missing"));
+            }
+        }
+        record_hashes.sort_by(|left, right| left.0.cmp(&right.0));
+        excluded_hashes.sort();
+        if !classified
+            || record_hashes
+                .into_iter()
+                .map(|(_, hash)| hash)
+                .collect::<Vec<_>>()
+                != self.projection.ordered_limit_pool_record_hashes
+            || excluded_hashes != self.projection.excluded_record_hashes
+        {
+            return Err(P01ProjectionError::terminal(
+                "p01_chain_generation_record_hash_mismatch",
+                "producer records or exclusions differ from projection receipt",
+            ));
+        }
+        for (row, expected_hash) in self
+            .chain_rows
+            .iter()
+            .zip(&self.projection.ordered_chain_row_hashes)
+        {
+            let stocks = serde_json::from_str::<Vec<String>>(&row.stocks).map_err(|error| {
+                P01ProjectionError::terminal(
+                    "p01_chain_generation_stocks_invalid",
+                    format!("producer row {} stocks JSON invalid: {error}", row.concept),
+                )
+            })?;
+            let actual_hash = hash_serializable(
+                CHAIN_ROW_HASH_DOMAIN,
+                &ChainRowCanonical {
+                    date: &row.date,
+                    concept: &row.concept,
+                    stocks: &stocks,
+                    continuation_count: row.continuation_count,
+                },
+            )
+            .map_err(|error| {
+                P01ProjectionError::terminal(
+                    "p01_chain_generation_row_hash_failed",
+                    error.to_string(),
+                )
+            })?;
+            if actual_hash != *expected_hash {
+                return Err(P01ProjectionError::terminal(
+                    "p01_chain_generation_row_hash_mismatch",
+                    format!(
+                        "producer row {} differs from projection receipt",
+                        row.concept
+                    ),
+                ));
+            }
+        }
+        let receipt_hash = hash_serializable(
+            PERSISTENCE_RECEIPT_DOMAIN,
+            &PersistenceReceiptCanonical {
+                evidence_date: &date_text,
+                limit_pool_batch_id: &self.projection.limit_pool_batch_id,
+                ordered_limit_pool_record_hashes: &self.projection.ordered_limit_pool_record_hashes,
+                excluded_record_hashes: &self.projection.excluded_record_hashes,
+                ordered_chain_row_hashes: &self.projection.ordered_chain_row_hashes,
+            },
+        )
+        .map_err(|error| {
+            P01ProjectionError::terminal(
+                "p01_chain_generation_receipt_hash_failed",
+                error.to_string(),
+            )
+        })?;
+        if receipt_hash != self.projection.persistence_receipt_sha256 {
+            return Err(P01ProjectionError::terminal(
+                "p01_chain_generation_receipt_hash_mismatch",
+                "producer persistence receipt is not self-consistent",
+            ));
+        }
+        let evidence = self.limit_pool.evidence();
+        let canonical_bytes = serde_json::to_vec(&ProducerGenerationCanonical {
+            schema: PRODUCER_GENERATION_SCHEMA,
+            evidence_date: date_text,
+            provider: evidence.provider,
+            source: &evidence.source,
+            source_at: evidence.source_at.as_deref(),
+            observed_at: &evidence.observed_at,
+            batch_id: &evidence.batch_id,
+            persistence_receipt_sha256: &self.projection.persistence_receipt_sha256,
+            ordered_chain_row_hashes: &self.projection.ordered_chain_row_hashes,
+        })
+        .map_err(|error| {
+            P01ProjectionError::terminal("p01_chain_generation_encoding_failed", error.to_string())
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(PRODUCER_GENERATION_DOMAIN);
+        digest.update(&canonical_bytes);
+        Ok(P01ChainProducerGenerationObservation {
+            schema: PRODUCER_GENERATION_SCHEMA,
+            canonical_bytes,
+            generation_sha256: hex::encode(digest.finalize()),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -247,14 +421,6 @@ fn persist_p01_chain_artifact(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let database = DatabaseManager::get();
-    database
-        .replace_chain_clusters_for_date_strict(evidence_date, &rows)
-        .map_err(|error| P01ProjectionError::transient("p01_chain_persistence_failed", error))?;
-    let read_back = database
-        .get_chain_clusters_for_date_strict(evidence_date)
-        .map_err(|error| P01ProjectionError::transient("p01_chain_readback_failed", error))?;
-    verify_read_back(&rows, &read_back, &evidence_date_text)?;
     let ordered_chain_rows = rows
         .iter()
         .map(|(concept, stocks, continuation_count)| {
@@ -290,6 +456,14 @@ fn persist_p01_chain_artifact(
         )
     })?;
 
+    // All fallible projection/receipt encoding is complete before this write.
+    // The DAO compares every encoded row in the same transaction and rolls
+    // back on mismatch; a post-commit read cannot turn a committed write into
+    // a retryable projection failure.
+    DatabaseManager::get()
+        .replace_and_read_chain_clusters_for_date_strict(evidence_date, &rows)
+        .map_err(|error| P01ProjectionError::transient("p01_chain_persistence_failed", error))?;
+
     Ok((
         P01ChainProjectionReceipt {
             evidence_date,
@@ -320,11 +494,28 @@ pub fn acquire_and_persist_p01_chain(
             ),
         })?;
     let (projection, chain_rows) = persist_p01_chain_artifact(&limit_pool, evidence_date)?;
-    Ok(P01CompletedDayEvidence {
+    let completed = P01CompletedDayEvidence {
         limit_pool,
         chain_rows,
         projection,
-    })
+    };
+    // The write has committed. Diagnostic observation is deliberately not a
+    // second success condition for persistence, and it grants no P-05 origin
+    // authority until a durable generation is bound to the stored rows.
+    match completed.producer_generation_observation() {
+        Ok(generation) => log::info!(
+            "[P-01][generation][unqualified] schema={} date={} generation_sha256={}",
+            generation.schema,
+            completed.projection.evidence_date,
+            generation.generation_sha256
+        ),
+        Err(error) => log::warn!(
+            "[P-01][generation][unqualified] date={} committed=true observation_failed reason_code={}",
+            completed.projection.evidence_date,
+            error.reason_code()
+        ),
+    }
+    Ok(completed)
 }
 
 fn validate_batch_evidence(
@@ -398,49 +589,6 @@ fn compare_members(left: &ProjectedMember, right: &ProjectedMember) -> Ordering 
         .then_with(|| right.change.total_cmp(&left.change))
         .then_with(|| left.code.cmp(&right.code))
         .then_with(|| left.record_hash.cmp(&right.record_hash))
-}
-
-fn verify_read_back(
-    expected: &[(String, Vec<String>, i32)],
-    actual: &[ChainDailyRow],
-    evidence_date: &str,
-) -> Result<(), P01ProjectionError> {
-    if actual.len() != expected.len() || actual.iter().any(|row| row.date != evidence_date) {
-        return Err(P01ProjectionError::terminal(
-            "p01_chain_readback_mismatch",
-            format!(
-                "exact-date chain read-back cardinality/date mismatch expected={} actual={}",
-                expected.len(),
-                actual.len()
-            ),
-        ));
-    }
-    let expected = expected
-        .iter()
-        .map(|(concept, stocks, continuation_count)| {
-            (concept.as_str(), (stocks.as_slice(), *continuation_count))
-        })
-        .collect::<HashMap<_, _>>();
-    for row in actual {
-        let stocks = serde_json::from_str::<Vec<String>>(&row.stocks).map_err(|error| {
-            P01ProjectionError::terminal(
-                "p01_chain_readback_invalid_json",
-                format!("chain row {} stocks JSON invalid: {error}", row.concept),
-            )
-        })?;
-        match expected.get(row.concept.as_str()) {
-            Some((expected_stocks, expected_count))
-                if *expected_stocks == stocks.as_slice()
-                    && *expected_count == row.continuation_count => {}
-            _ => {
-                return Err(P01ProjectionError::terminal(
-                    "p01_chain_readback_mismatch",
-                    format!("chain row {} differs from projection", row.concept),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn hash_serializable(domain: &[u8], value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -579,6 +727,72 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&rows[0].stocks).expect("stock codes JSON"),
             vec!["TEST_CODE_600001", "TEST_CODE_600002"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn p01_generation_observation_binds_batch_and_verified_projection_rows() {
+        DatabaseManager::init(None).expect("test database init");
+        let evidence_date = NaiveDate::from_ymd_opt(2198, 11, 17).unwrap();
+        let _guard = ChainDateGuard(evidence_date);
+        let batch = complete_limit_pool();
+        let (projection, chain_rows) =
+            super::persist_p01_chain_artifact(&batch, evidence_date).expect("exact projection");
+        let mut completed = super::P01CompletedDayEvidence {
+            limit_pool: batch,
+            chain_rows,
+            projection,
+        };
+        let first = completed.producer_generation_observation().unwrap();
+        assert_eq!(first.schema, "P01_CHAIN_PRODUCER_GENERATION_V1");
+        assert_eq!(first.generation_sha256.len(), 64);
+        assert_eq!(
+            first,
+            completed.producer_generation_observation().unwrap(),
+            "same admitted batch and projection must retain its content identity"
+        );
+        assert!(first.require_persistent_authority().is_err());
+        let canonical: serde_json::Value = serde_json::from_slice(&first.canonical_bytes).unwrap();
+        assert_eq!(canonical["batch_id"], "TEST_CODE_P01_LIMIT_POOL_BATCH");
+        assert_eq!(
+            canonical["ordered_chain_row_hashes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let original_stocks = completed.chain_rows[0].stocks.clone();
+        completed.chain_rows[0].stocks = "[\"TEST_CODE_600098\"]".into();
+        assert_eq!(
+            completed
+                .producer_generation_observation()
+                .unwrap_err()
+                .reason_code(),
+            "p01_chain_generation_row_hash_mismatch"
+        );
+        completed.chain_rows[0].stocks = original_stocks;
+        let original_receipt = completed.projection.persistence_receipt_sha256.clone();
+        completed.projection.persistence_receipt_sha256 = "0".repeat(64);
+        assert_eq!(
+            completed
+                .producer_generation_observation()
+                .unwrap_err()
+                .reason_code(),
+            "p01_chain_generation_receipt_hash_mismatch"
+        );
+        completed.projection.persistence_receipt_sha256 = original_receipt;
+        completed
+            .projection
+            .ordered_limit_pool_record_hashes
+            .clear();
+        assert_eq!(
+            completed
+                .producer_generation_observation()
+                .unwrap_err()
+                .reason_code(),
+            "p01_chain_generation_record_hash_mismatch"
         );
     }
 
