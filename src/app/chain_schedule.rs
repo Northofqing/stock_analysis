@@ -702,15 +702,17 @@ where
                 suppression_reason: envelope.suppression.map(ChainSendSuppression::as_str),
                 send_attempted: envelope.send_attempted,
                 report_observed: envelope.notification_report.is_some(),
+                send_id: envelope.notification_report.as_ref().map(|report| report.send_id()),
                 targets: &targets,
                 mark_attempted,
                 legacy_succeeded: legacy_result.is_ok(),
             },
         ) {
             Ok(decision) => log::info!(
-                "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} scope={} reason={} targets={} coverage=incomplete authority=weak foundation_persisted=false",
+                "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} send_id={} scope={} reason={} targets={} coverage=incomplete authority=weak foundation_persisted=false",
                 phase.as_str(), date, decision.gate_sha256,
-                decision.binding_sha256, decision.scope, decision.reason,
+                decision.binding_sha256, decision.send_id.as_deref().unwrap_or("none"),
+                decision.scope, decision.reason,
                 decision.target_count,
             ),
             Err(error) => log::warn!(

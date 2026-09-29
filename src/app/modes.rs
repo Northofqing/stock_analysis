@@ -518,6 +518,7 @@ mod tests_chain_delivery {
                 suppression_reason: None,
                 send_attempted: true,
                 report_observed: false,
+                send_id: None,
                 targets: &[],
                 mark_attempted: true,
                 legacy_succeeded: true,

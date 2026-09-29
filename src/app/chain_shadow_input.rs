@@ -126,6 +126,7 @@ pub(super) struct ChainPreparedDecision<'a> {
     pub suppression_reason: Option<&'static str>,
     pub send_attempted: bool,
     pub report_observed: bool,
+    pub send_id: Option<&'a str>,
     pub targets: &'a [ChainWeakTargetResult],
     pub mark_attempted: bool,
     pub legacy_succeeded: bool,
@@ -135,6 +136,7 @@ pub(super) struct ChainPreparedDecision<'a> {
 pub(super) struct ChainDecisionObservation {
     pub gate_sha256: String,
     pub binding_sha256: String,
+    pub send_id: Option<String>,
     pub scope: &'static str,
     pub reason: &'static str,
     pub target_count: usize,
@@ -165,6 +167,7 @@ pub(super) fn observe_schedule_only(gate: &ChainGateCapture) -> Result<ChainDeci
     Ok(ChainDecisionObservation {
         gate_sha256,
         binding_sha256,
+        send_id: None,
         scope: "schedule_only",
         reason,
         target_count: 0,
@@ -192,6 +195,11 @@ pub(super) fn observe_prepared_decision(
     anyhow::ensure!(
         decision.send_attempted || !decision.report_observed,
         "chain send report exists without a send attempt"
+    );
+    anyhow::ensure!(
+        decision.report_observed == decision.send_id.is_some()
+            && decision.send_id.is_none_or(|id| !id.is_empty()),
+        "chain send id does not match the observed send report"
     );
     anyhow::ensure!(
         decision
@@ -228,6 +236,7 @@ pub(super) fn observe_prepared_decision(
         "suppression_reason": decision.suppression_reason,
         "send_attempted": decision.send_attempted,
         "report_observed": decision.report_observed,
+        "send_id": decision.send_id,
         "targets": targets,
         "mark_attempted": decision.mark_attempted,
         "legacy_succeeded": decision.legacy_succeeded,
@@ -235,6 +244,7 @@ pub(super) fn observe_prepared_decision(
     Ok(ChainDecisionObservation {
         gate_sha256,
         binding_sha256,
+        send_id: decision.send_id.map(str::to_owned),
         scope: "prepared",
         reason: decision.suppression_reason.unwrap_or("none"),
         target_count: decision.targets.len(),
@@ -518,6 +528,7 @@ mod decision_tests {
             let outside =
                 observe_schedule_only(&gate(phase, ChainScheduleStatus::Ready, expiry)).unwrap();
             assert_eq!(closed.scope, "schedule_only");
+            assert_eq!(closed.send_id, None);
             assert_eq!(closed.reason, "already_closed");
             assert_eq!(uncertain.reason, "uncertain_needs_review");
             assert_eq!(outside.reason, "outside_send_window");
@@ -553,6 +564,7 @@ mod decision_tests {
                     suppression_reason,
                     targets: &[ChainWeakTargetResult],
                     send_attempted,
+                    send_id,
                     mark_attempted,
                     legacy_succeeded| {
             observe_prepared_decision(
@@ -562,19 +574,53 @@ mod decision_tests {
                     suppression_reason,
                     send_attempted,
                     report_observed: send_attempted,
+                    send_id,
                     targets,
                     mark_attempted,
                     legacy_succeeded,
                 },
             )
         };
-        let first = bind(&input, None, &targets, true, false, false).unwrap();
+        let first = bind(
+            &input,
+            None,
+            &targets,
+            true,
+            Some("TEST_CODE_SEND_A"),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(first.scope, "prepared");
         assert_eq!(first.target_count, 2);
+        assert_eq!(first.send_id.as_deref(), Some("TEST_CODE_SEND_A"));
         assert_eq!(first.gate_sha256, gate.sha256().unwrap());
         assert_eq!(
             first,
-            bind(&input, None, &targets, true, false, false).unwrap()
+            bind(
+                &input,
+                None,
+                &targets,
+                true,
+                Some("TEST_CODE_SEND_A"),
+                false,
+                false
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first.binding_sha256,
+            bind(
+                &input,
+                None,
+                &targets,
+                true,
+                Some("TEST_CODE_SEND_B"),
+                false,
+                false
+            )
+            .unwrap()
+            .binding_sha256
         );
         let changed_outcome = [
             target(0, "wechat", WeakOutcomeKind::Unknown),
@@ -582,17 +628,12 @@ mod decision_tests {
         ];
         assert_ne!(
             first.binding_sha256,
-            bind(&input, None, &changed_outcome, true, false, false)
-                .unwrap()
-                .binding_sha256
-        );
-        assert_ne!(
-            first.binding_sha256,
             bind(
                 &input,
-                Some("before_send_rejected"),
-                &[],
-                false,
+                None,
+                &changed_outcome,
+                true,
+                Some("TEST_CODE_SEND_A"),
                 false,
                 false
             )
@@ -601,22 +642,62 @@ mod decision_tests {
         );
         assert_ne!(
             first.binding_sha256,
-            bind(&input, None, &targets, true, true, true)
-                .unwrap()
-                .binding_sha256
+            bind(
+                &input,
+                Some("before_send_rejected"),
+                &[],
+                false,
+                None,
+                false,
+                false
+            )
+            .unwrap()
+            .binding_sha256
+        );
+        assert_ne!(
+            first.binding_sha256,
+            bind(
+                &input,
+                None,
+                &targets,
+                true,
+                Some("TEST_CODE_SEND_A"),
+                true,
+                true
+            )
+            .unwrap()
+            .binding_sha256
         );
         input.acquisition_report_binding_sha256 = Some("TEST_CODE_DIFFERENT_SOURCE".into());
         assert_ne!(
             first.binding_sha256,
-            bind(&input, None, &targets, true, false, false)
-                .unwrap()
-                .binding_sha256
+            bind(
+                &input,
+                None,
+                &targets,
+                true,
+                Some("TEST_CODE_SEND_A"),
+                false,
+                false
+            )
+            .unwrap()
+            .binding_sha256
         );
         let out_of_order = [
             target(1, "custom", WeakOutcomeKind::Unknown),
             target(0, "wechat", WeakOutcomeKind::Accepted),
         ];
-        assert!(bind(&input, None, &out_of_order, true, false, false).is_err());
+        assert!(bind(
+            &input,
+            None,
+            &out_of_order,
+            true,
+            Some("TEST_CODE_SEND_A"),
+            false,
+            false
+        )
+        .is_err());
+        assert!(bind(&input, None, &targets, true, None, false, false).is_err());
         assert_eq!(preparations.get(), 1);
     }
 }
@@ -784,6 +865,29 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.send_id, report.send_id());
+        let gate = ChainGateCapture::new(
+            ChainPhase::Postclose,
+            date,
+            DateTime::parse_from_rfc3339("2026-09-29T15:30:00+08:00").unwrap(),
+            true,
+            ChainScheduleStatus::Ready,
+        );
+        let targets = ChainWeakTargetResult::from_report(&report);
+        let decision = observe_prepared_decision(
+            &gate,
+            ChainPreparedDecision {
+                input: &input,
+                suppression_reason: None,
+                send_attempted: true,
+                report_observed: true,
+                send_id: Some(report.send_id()),
+                targets: &targets,
+                mark_attempted: false,
+                legacy_succeeded: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(decision.send_id.as_deref(), Some(request.send_id.as_str()));
         assert_eq!(request.artifact_sha256, input.artifact_sha256);
         assert_eq!(request.report_input_sha256, input.report_input_sha256);
         assert!(request.prepared_report_equals_input);
