@@ -1292,10 +1292,22 @@ impl AnalysisPipeline {
             ));
             outcome.notification =
                 super::AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-            let delivery = self
-                .notifier
-                .send_report(outcome.report_snapshot.as_ref().expect("just set").report())
-                .await;
+            let sent = super::cli_target_receipt::send_cli_report(
+                &self.notifier,
+                outcome.report_snapshot.as_ref().expect("just set").clone(),
+            )
+            .await;
+            if sent.has_custom_attempts() {
+                let directory = self.cli_target_receipt_dir();
+                if let Err(error) =
+                    super::cli_target_receipt::persist_custom_target_receipts(&sent, &directory)
+                {
+                    let failure = format!("Custom 逐目标弱回执落盘失败: {error:#}");
+                    error!("[{}] {}；不自动重发", code_clone, failure);
+                    outcome.failure = Some(failure);
+                }
+            }
+            let delivery = sent.into_report();
             match delivery.completion() {
                 crate::notification::NotificationCompletion::AllAccepted => {
                     info!("[{}] 单股推送全部渠道弱接受", code_clone)
@@ -1319,6 +1331,14 @@ impl AnalysisPipeline {
         }
 
         Some(result)
+    }
+
+    fn cli_target_receipt_dir(&self) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.test_backtest_output_dir {
+            return directory.join("cli_target_receipts");
+        }
+        std::path::PathBuf::from("reports/cli_target_receipts")
     }
 }
 
@@ -2171,6 +2191,8 @@ mod tests {
                 Ok(None),
             );
             let mut pipeline = test_pipeline(context, false);
+            let receipt_root = tempfile::tempdir().expect("isolated receipt directory");
+            pipeline.test_backtest_output_dir = Some(receipt_root.path().to_path_buf());
             pipeline.test_fetched_data = Some(Ok(analysis_bars()));
             pipeline.config.single_notify = true;
             pipeline.config.send_notification = true;
@@ -2203,6 +2225,18 @@ mod tests {
             let handed_report = snapshot.report().to_owned();
             assert_eq!(outcome.notification.completion(), Some(expected));
             assert_eq!(outcome.ensure_cli_success().is_ok(), cli_ok);
+            let receipt_dir = receipt_root.path().join("cli_target_receipts");
+            let stored = std::fs::read_dir(receipt_dir)
+                .expect("Custom target receipt directory")
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            let receipts: Vec<crate::pipeline::cli_target_receipt::CliTargetWeakReceipt> =
+                serde_json::from_slice(&std::fs::read(stored[0].path()).unwrap()).unwrap();
+            assert_eq!(receipts.len(), responses.len());
+            assert!(receipts
+                .iter()
+                .all(|receipt| receipt.invocation_id == snapshot.identity().invocation().id()));
             let run = crate::pipeline::AnalysisRunReport {
                 results: vec![outcome.analysis.clone().unwrap()],
                 stocks: vec![outcome],

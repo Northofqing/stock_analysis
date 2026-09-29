@@ -135,9 +135,22 @@ pub(super) async fn send_summary_notification_to(
     let snapshot = CliReportSnapshot::new(invocation.summary_notification(), artifacts.report);
     outcome.report_snapshot = Some(snapshot);
     outcome.notification = AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-    let delivery = notifier
-        .send_report(outcome.report_snapshot.as_ref().expect("just set").report())
-        .await;
+    let sent = super::cli_target_receipt::send_cli_report(
+        notifier,
+        outcome.report_snapshot.as_ref().expect("just set").clone(),
+    )
+    .await;
+    if sent.has_custom_attempts() {
+        let directory = output_dir.join("cli_target_receipts");
+        if let Err(error) =
+            super::cli_target_receipt::persist_custom_target_receipts(&sent, &directory)
+        {
+            let failure = format!("Custom 逐目标弱回执落盘失败: {error:#}");
+            error!("{}；不自动重发", failure);
+            outcome.failure = Some(failure);
+        }
+    }
+    let delivery = sent.into_report();
     match delivery.completion() {
         crate::notification::NotificationCompletion::AllAccepted => {
             info!("✓ 股票分析报告全部渠道弱接受")
@@ -325,5 +338,55 @@ mod tests {
         // Chart rendering is intentionally best-effort (for example a CI host may
         // not have a CJK font); mandatory Markdown artifacts must still commit.
         std::fs::remove_dir_all(output_dir).expect("remove isolated summary artifacts");
+    }
+
+    #[tokio::test]
+    async fn summary_receipt_write_failure_keeps_one_physical_send_and_reports_error() {
+        use crate::notification::send_report_tests::{
+            spawn_webhook_fixture, test_service, ScriptedResponse,
+        };
+        use crate::notification::{NotificationChannel, NotificationConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("cli_target_receipts"),
+            b"block directory",
+        )
+        .unwrap();
+        let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"ok":true}"#)]);
+        let notifier = test_service(
+            NotificationConfig {
+                custom_webhook_urls: vec![fixture.url()],
+                ..NotificationConfig::default()
+            },
+            vec![NotificationChannel::Custom],
+        );
+        let invocation = super::CliInvocationIdentity::new(super::super::CliProducer::Direct);
+        let outcome = send_summary_notification_to(
+            &notifier,
+            &[result()],
+            None,
+            None,
+            None,
+            directory.path(),
+            &invocation,
+        )
+        .await;
+        assert_eq!(fixture.finish().len(), 1);
+        assert!(outcome
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("弱回执落盘失败"));
+        assert_eq!(
+            outcome.notification.completion(),
+            Some(crate::notification::NotificationCompletion::AllAccepted)
+        );
+        assert!(crate::pipeline::AnalysisRunReport {
+            summary: outcome,
+            ..Default::default()
+        }
+        .ensure_cli_success()
+        .is_err());
     }
 }
