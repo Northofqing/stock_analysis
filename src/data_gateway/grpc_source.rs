@@ -752,7 +752,8 @@ fn map_current_routed_query_error(op: Operation, error: &GrpcError) -> GatewayEr
     // An explicit, non-retryable server contract refusal is distinct from a
     // temporarily unavailable provider. The frozen durable v1 projection above
     // is unchanged; only current ordinary acquisitions use this typed detail.
-    if error.details().reason_code.as_deref() == Some("unsupported_contract")
+    if matches!(error, GrpcError::Internal { .. })
+        && error.details().reason_code.as_deref() == Some("unsupported_contract")
         && error.details().retryable == Some(false)
     {
         return GatewayError::classified(
@@ -4736,6 +4737,17 @@ mod tests {
         };
         let unproven = map_current_routed_query_error(Operation::MoneyFlows, &contradictory);
         assert_ne!(unproven.audit_outcome(), "unsupported");
+
+        let permission_denied = GrpcError::PermissionDenied {
+            details: Box::new(ErrorDetail {
+                reason_code: Some("unsupported_contract".to_owned()),
+                retryable: Some(false),
+                ..Default::default()
+            }),
+        };
+        let rejected = map_current_routed_query_error(Operation::MoneyFlows, &permission_denied);
+        assert_eq!(rejected.audit_outcome(), "invalid_request");
+        assert_ne!(rejected.reason_code(), "unsupported_contract");
     }
 
     #[test]
