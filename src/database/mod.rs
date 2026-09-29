@@ -2899,6 +2899,32 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // Only a new P-01 exact-date write creates this binding. Historical
+        // chain_daily rows receive no backfill, and every legacy row mutation
+        // invalidates the date's binding before another reader can see it.
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS chain_daily_p01_generation (\
+             date TEXT PRIMARY KEY NOT NULL, \
+             generation_sha256 TEXT NOT NULL CHECK(length(generation_sha256) = 64), \
+             canonical_bytes BLOB NOT NULL CHECK(length(canonical_bytes) > 0), \
+             stored_rows_sha256 TEXT NOT NULL CHECK(length(stored_rows_sha256) = 64))",
+        )
+        .execute(&mut *conn)?;
+        for statement in [
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_insert \
+             AFTER INSERT ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = NEW.date; END",
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_update \
+             AFTER UPDATE ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = NEW.date; \
+             DELETE FROM chain_daily_p01_generation WHERE date = OLD.date; END",
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_delete \
+             AFTER DELETE ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = OLD.date; END",
+        ] {
+            diesel::sql_query(statement).execute(&mut *conn)?;
+        }
+
         // B-002 板块联动归因 (Board hit) 落库表 — 与 chain_daily 并列,
         //       供 NewsCatalyst 推送读取今日 top cluster.
         diesel::sql_query(

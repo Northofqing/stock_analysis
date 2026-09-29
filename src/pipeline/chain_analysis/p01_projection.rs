@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::data_gateway::{GatewayBatch, ReviewDataGateway};
-use crate::database::concepts::{ChainDailyReplaceError, ChainDailyRow};
+use crate::database::concepts::{ChainDailyReplaceError, ChainDailyRow, P01ChainGenerationInput};
 use crate::database::DatabaseManager;
 use crate::market_domain::{LimitPoolEntry, LimitPoolKind, ProviderId};
 
@@ -73,9 +73,10 @@ pub struct P01CompletedDayEvidence {
 }
 
 /// Content identity for one P-01 producer result. It is computed from the
-/// supplied gateway batch and exact rows verified by the write transaction. The
-/// identity is not persisted with `chain_daily`; later P-05 readers cannot
-/// treat it as an authoritative generation yet.
+/// supplied gateway batch and exact rows verified by the write transaction.
+/// This supplied object alone never proves the persisted generation. Readers
+/// must use the transactional P-01 binding seam, which is still unqualified
+/// for P-05 origin admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct P01ChainProducerGenerationObservation {
     pub schema: &'static str,
@@ -85,7 +86,7 @@ pub struct P01ChainProducerGenerationObservation {
 
 impl P01ChainProducerGenerationObservation {
     pub fn require_persistent_authority(&self) -> Result<(), &'static str> {
-        Err("P-01 producer generation is not persisted with chain_daily")
+        Err("supplied P-01 producer generation is not a persisted read-back")
     }
 }
 
@@ -293,6 +294,14 @@ fn persist_p01_chain_artifact(
     batch: &GatewayBatch<LimitPoolEntry>,
     evidence_date: NaiveDate,
 ) -> Result<(P01ChainProjectionReceipt, Vec<ChainDailyRow>), P01ProjectionError> {
+    persist_p01_chain_artifact_with_db(None, batch, evidence_date)
+}
+
+fn persist_p01_chain_artifact_with_db(
+    db: Option<&DatabaseManager>,
+    batch: &GatewayBatch<LimitPoolEntry>,
+    evidence_date: NaiveDate,
+) -> Result<(P01ChainProjectionReceipt, Vec<ChainDailyRow>), P01ProjectionError> {
     let evidence_date_text = evidence_date.format("%Y-%m-%d").to_string();
     validate_batch_evidence(batch, evidence_date, &evidence_date_text)?;
 
@@ -456,25 +465,43 @@ fn persist_p01_chain_artifact(
         )
     })?;
 
-    // All fallible projection/receipt encoding is complete before this write.
+    let projection = P01ChainProjectionReceipt {
+        evidence_date,
+        limit_pool_batch_id: batch.evidence().batch_id.clone(),
+        ordered_limit_pool_record_hashes,
+        excluded_record_hashes,
+        ordered_chain_row_hashes,
+        persistence_receipt_sha256,
+    };
+    // Validate the complete supplied producer generation before the first
+    // write. Its later read authority comes only from the transactional seam.
+    let generation = P01CompletedDayEvidence {
+        limit_pool: batch.clone(),
+        chain_rows: ordered_chain_rows.clone(),
+        projection: projection.clone(),
+    }
+    .producer_generation_observation()?;
+
+    // All fallible projection/receipt/generation encoding is complete before
+    // this write.
     // The DAO compares every encoded row in the same transaction and rolls
     // back on mismatch; a post-commit read cannot turn a committed write into
     // a retryable projection failure.
-    DatabaseManager::get()
-        .replace_and_read_chain_clusters_for_date_strict(evidence_date, &rows)
-        .map_err(map_chain_replace_error)?;
-
-    Ok((
-        P01ChainProjectionReceipt {
-            evidence_date,
-            limit_pool_batch_id: batch.evidence().batch_id.clone(),
-            ordered_limit_pool_record_hashes,
-            excluded_record_hashes,
-            ordered_chain_row_hashes,
-            persistence_receipt_sha256,
+    let db = match db {
+        Some(db) => db,
+        None => DatabaseManager::get(),
+    };
+    db.replace_and_read_chain_clusters_with_p01_generation_strict(
+        evidence_date,
+        &rows,
+        P01ChainGenerationInput {
+            canonical_bytes: &generation.canonical_bytes,
+            generation_sha256: &generation.generation_sha256,
         },
-        ordered_chain_rows,
-    ))
+    )
+    .map_err(map_chain_replace_error)?;
+
+    Ok((projection, ordered_chain_rows))
 }
 
 fn map_chain_replace_error(error: ChainDailyReplaceError) -> P01ProjectionError {
@@ -482,6 +509,9 @@ fn map_chain_replace_error(error: ChainDailyReplaceError) -> P01ProjectionError 
     match error {
         ChainDailyReplaceError::ReadbackMismatch => {
             P01ProjectionError::terminal("p01_chain_readback_mismatch", message)
+        }
+        ChainDailyReplaceError::GenerationReadbackMismatch => {
+            P01ProjectionError::terminal("p01_chain_generation_readback_mismatch", message)
         }
         ChainDailyReplaceError::InvalidInput(_) => {
             P01ProjectionError::terminal("p01_chain_persistence_input_invalid", message)
@@ -514,9 +544,9 @@ pub fn acquire_and_persist_p01_chain(
         chain_rows,
         projection,
     };
-    // The write has committed. Diagnostic observation is deliberately not a
-    // second success condition for persistence, and it grants no P-05 origin
-    // authority until a durable generation is bound to the stored rows.
+    // The write and generation binding have committed. This supplied-object
+    // diagnostic is not a second success condition and cannot grant P-05
+    // origin qualification without the separate read and cohort contracts.
     match completed.producer_generation_observation() {
         Ok(generation) => log::info!(
             "[P-01][generation][unqualified] schema={} date={} generation_sha256={}",
@@ -621,6 +651,7 @@ mod tests {
     use diesel::sql_types::Text;
 
     use crate::data_gateway::{BatchEvidence, GatewayBatch};
+    use crate::database::concepts::{P05ChainGenerationStatus, P05ChainSnapshotReadError};
     use crate::database::DatabaseManager;
     use crate::market_domain::{
         AssetClass, Exchange, InstrumentId, IsoDate, LimitPoolEntry, LimitPoolKind, NonEmptyText,
@@ -809,6 +840,213 @@ mod tests {
                 .reason_code(),
             "p01_chain_generation_record_hash_mismatch"
         );
+    }
+
+    #[test]
+    fn p01_generation_binds_new_rows_but_never_upgrades_legacy_history() {
+        let isolated = tempfile::tempdir().unwrap();
+        let path = isolated.path().join("TEST_CODE_p01_bound_history.db");
+        // Simulate a database that had chain_daily rows before this schema was
+        // installed. Opening it must not mint generation for those rows.
+        {
+            let mut conn =
+                diesel::sqlite::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+            diesel::sql_query(
+                "CREATE TABLE chain_daily (date TEXT NOT NULL, concept TEXT NOT NULL, \
+                 stocks TEXT NOT NULL, continuation_count INTEGER NOT NULL DEFAULT 0, \
+                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                 PRIMARY KEY(date, concept))",
+            )
+            .execute(&mut conn)
+            .unwrap();
+            diesel::sql_query(
+                "INSERT INTO chain_daily(date,concept,stocks,continuation_count) \
+                 VALUES ('2198-11-17','TEST_CODE_LEGACY','[\"TEST_CODE_600099\"]',1)",
+            )
+            .execute(&mut conn)
+            .unwrap();
+        }
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let before = db.get_p05_latest_chain_snapshot_strict().unwrap();
+        assert_eq!(before.rows().len(), 1);
+        assert!(matches!(
+            before.generation(),
+            P05ChainGenerationStatus::UnboundLegacyRows
+        ));
+
+        let date = NaiveDate::from_ymd_opt(2198, 11, 17).unwrap();
+        let mut batch = complete_limit_pool();
+        if let GatewayBatch::Available { records, .. } = &mut batch {
+            // Projection order (three A members, then one B) differs from the
+            // P-05 SQL order (B has the higher continuation count).
+            records[1].streak = Some(PositiveU32::new(1).unwrap());
+            records.push(entry(
+                "TEST_CODE_600003",
+                Some("TEST_CODE_AI_CHAIN"),
+                Some(1),
+            ));
+            records.push(entry(
+                "TEST_CODE_600004",
+                Some("TEST_CODE_OTHER_CHAIN"),
+                Some(3),
+            ));
+        }
+        let (projection, chain_rows) =
+            super::persist_p01_chain_artifact_with_db(Some(&db), &batch, date).unwrap();
+        let supplied = super::P01CompletedDayEvidence {
+            limit_pool: batch,
+            chain_rows,
+            projection,
+        }
+        .producer_generation_observation()
+        .unwrap();
+        let bound = db.get_p05_latest_chain_snapshot_strict().unwrap();
+        assert_eq!(bound.rows().len(), 2);
+        assert_eq!(bound.rows()[0].concept, "TEST_CODE_OTHER_CHAIN");
+        assert_eq!(bound.rows()[1].concept, "TEST_CODE_AI_CHAIN");
+        match bound.generation() {
+            P05ChainGenerationStatus::P01BoundUnqualified(generation) => {
+                assert_eq!(generation.generation_sha256(), supplied.generation_sha256);
+                assert_eq!(generation.canonical_bytes(), supplied.canonical_bytes);
+            }
+            other => panic!("new P-01 rows must have one persisted generation: {other:?}"),
+        }
+        drop(db);
+        let db = DatabaseManager::open_isolated_for_test(path).unwrap();
+        assert!(matches!(
+            db.get_p05_latest_chain_snapshot_strict()
+                .unwrap()
+                .generation(),
+            P05ChainGenerationStatus::P01BoundUnqualified(_)
+        ));
+
+        // A direct legacy row mutation atomically removes the P-01 binding.
+        {
+            let mut conn = db.get_conn().unwrap();
+            diesel::sql_query(
+                "UPDATE chain_daily SET stocks='[\"TEST_CODE_600098\"]' \
+                 WHERE date='2198-11-17' AND concept='TEST_CODE_AI_CHAIN'",
+            )
+            .execute(&mut conn)
+            .unwrap();
+        }
+        assert!(matches!(
+            db.get_p05_latest_chain_snapshot_strict()
+                .unwrap()
+                .generation(),
+            P05ChainGenerationStatus::UnboundLegacyRows
+        ));
+    }
+
+    #[test]
+    fn p01_generation_readback_mismatch_rolls_back_rows_and_binding() {
+        let isolated = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_p01_bound_rollback.db"),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.get_p05_latest_chain_snapshot_strict()
+                .unwrap()
+                .generation(),
+            P05ChainGenerationStatus::NoRows
+        ));
+        let date = NaiveDate::from_ymd_opt(2198, 11, 17).unwrap();
+        db.save_chain_clusters(
+            "2198-11-17",
+            &[("TEST_CODE_OLD".into(), vec!["TEST_CODE_600099".into()], 1)],
+        )
+        .unwrap();
+        {
+            let mut conn = db.get_conn().unwrap();
+            diesel::sql_query(
+                "CREATE TRIGGER TEST_CODE_mutate_p01_generation \
+                 AFTER INSERT ON chain_daily_p01_generation BEGIN \
+                 UPDATE chain_daily_p01_generation SET canonical_bytes=X'00' \
+                 WHERE date=NEW.date; END",
+            )
+            .execute(&mut conn)
+            .unwrap();
+        }
+        let error =
+            super::persist_p01_chain_artifact_with_db(Some(&db), &complete_limit_pool(), date)
+                .expect_err("changed sidecar must roll back the complete date replacement");
+        assert_eq!(
+            error.reason_code(),
+            "p01_chain_generation_readback_mismatch"
+        );
+        assert!(!error.retryable());
+        let after = db.get_p05_latest_chain_snapshot_strict().unwrap();
+        assert_eq!(after.rows().len(), 1);
+        assert_eq!(after.rows()[0].concept, "TEST_CODE_OLD");
+        assert!(matches!(
+            after.generation(),
+            P05ChainGenerationStatus::UnboundLegacyRows
+        ));
+    }
+
+    #[test]
+    fn p01_generation_reader_rejects_corrupt_binding_instead_of_falling_back() {
+        let isolated = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_p01_bound_reader.db"),
+        )
+        .unwrap();
+        let date = NaiveDate::from_ymd_opt(2198, 11, 17).unwrap();
+        super::persist_p01_chain_artifact_with_db(Some(&db), &complete_limit_pool(), date).unwrap();
+        let original_sha = match db
+            .get_p05_latest_chain_snapshot_strict()
+            .unwrap()
+            .generation()
+        {
+            P05ChainGenerationStatus::P01BoundUnqualified(generation) => {
+                generation.generation_sha256().to_owned()
+            }
+            other => panic!("expected bound P-01 generation: {other:?}"),
+        };
+        {
+            let mut conn = db.get_conn().unwrap();
+            diesel::sql_query(
+                "UPDATE chain_daily_p01_generation SET generation_sha256 = ? WHERE date = ?",
+            )
+            .bind::<Text, _>("0".repeat(64))
+            .bind::<Text, _>("2198-11-17")
+            .execute(&mut conn)
+            .unwrap();
+        }
+        assert!(matches!(
+            db.get_p05_latest_chain_snapshot_strict(),
+            Err(P05ChainSnapshotReadError::BindingMismatch(
+                "generation_sha256_mismatch"
+            ))
+        ));
+        {
+            let mut conn = db.get_conn().unwrap();
+            diesel::sql_query(
+                "UPDATE chain_daily_p01_generation SET generation_sha256 = ? WHERE date = ?",
+            )
+            .bind::<Text, _>(&original_sha)
+            .bind::<Text, _>("2198-11-17")
+            .execute(&mut conn)
+            .unwrap();
+            // Even if the invalidation trigger is missing, the read seam must
+            // reject rows that no longer match the persisted generation.
+            diesel::sql_query("DROP TRIGGER chain_daily_p01_generation_update")
+                .execute(&mut conn)
+                .unwrap();
+            diesel::sql_query(
+                "UPDATE chain_daily SET stocks='[ \"TEST_CODE_600001\", \"TEST_CODE_600002\" ]' \
+                 WHERE date='2198-11-17'",
+            )
+            .execute(&mut conn)
+            .unwrap();
+        }
+        assert!(matches!(
+            db.get_p05_latest_chain_snapshot_strict(),
+            Err(P05ChainSnapshotReadError::BindingMismatch(
+                "stored_rows_sha256_mismatch"
+            ))
+        ));
     }
 
     #[test]

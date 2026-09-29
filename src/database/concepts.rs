@@ -6,9 +6,11 @@
 
 use chrono::{Duration, Local};
 use diesel::prelude::*;
-use diesel::sql_types::{Integer, Text};
+use diesel::sql_types::{Binary, Integer, Text};
 use diesel::sqlite::SqliteConnection;
 use log::warn;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::database::DatabaseManager;
@@ -60,8 +62,217 @@ pub enum ChainDailyReplaceError {
     InvalidInput(String),
     #[error("P-01 exact-date 主线事务内读回与写入不一致")]
     ReadbackMismatch,
+    #[error("P-01 exact-date 主线代次事务内读回与写入不一致")]
+    GenerationReadbackMismatch,
     #[error("P-01 exact-date 主线存储失败: {0}")]
     Storage(String),
+}
+
+impl From<diesel::result::Error> for ChainDailyReplaceError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+const P01_GENERATION_SCHEMA: &str = "P01_CHAIN_PRODUCER_GENERATION_V1";
+const P01_GENERATION_DOMAIN: &[u8] = b"P01_CHAIN_PRODUCER_GENERATION_V1\0";
+const P01_CHAIN_ROW_DOMAIN: &[u8] = b"P01_CHAIN_ROW_V1\0";
+const P01_STORED_ROWS_SCHEMA: &str = "P01_CHAIN_DAILY_STORED_ROWS_V1";
+
+/// The producer supplies this identity before the chain rows are written.
+/// The DAO only publishes it after the same transaction verifies both objects.
+pub(crate) struct P01ChainGenerationInput<'a> {
+    pub canonical_bytes: &'a [u8],
+    pub generation_sha256: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedP01ChainGeneration {
+    generation_sha256: String,
+    canonical_bytes: Vec<u8>,
+    persistence_receipt_sha256: String,
+}
+
+impl PersistedP01ChainGeneration {
+    pub fn generation_sha256(&self) -> &str {
+        &self.generation_sha256
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub fn persistence_receipt_sha256(&self) -> &str {
+        &self.persistence_receipt_sha256
+    }
+}
+
+/// A persisted P-01 generation is still not a qualified P-05 origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum P05ChainGenerationStatus {
+    NoRows,
+    UnboundLegacyRows,
+    P01BoundUnqualified(PersistedP01ChainGeneration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P05ChainSnapshotRead {
+    rows: Vec<ChainDailyRow>,
+    generation: P05ChainGenerationStatus,
+}
+
+impl P05ChainSnapshotRead {
+    pub fn rows(&self) -> &[ChainDailyRow] {
+        &self.rows
+    }
+
+    pub fn generation(&self) -> &P05ChainGenerationStatus {
+        &self.generation
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum P05ChainSnapshotReadError {
+    #[error("P-05 chain_daily snapshot storage failed: {0}")]
+    Storage(String),
+    #[error("P-05 chain_daily P-01 generation binding invalid: {0}")]
+    BindingMismatch(&'static str),
+}
+
+impl From<diesel::result::Error> for P05ChainSnapshotReadError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+#[derive(QueryableByName)]
+struct StoredP01GenerationRow {
+    #[diesel(sql_type = Text)]
+    generation_sha256: String,
+    #[diesel(sql_type = Binary)]
+    canonical_bytes: Vec<u8>,
+    #[diesel(sql_type = Text)]
+    stored_rows_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct P01GenerationCanonical {
+    schema: String,
+    evidence_date: String,
+    provider: crate::market_domain::ProviderId,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+    persistence_receipt_sha256: String,
+    ordered_chain_row_hashes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct P01ChainRowCanonical<'a> {
+    date: &'a str,
+    concept: &'a str,
+    stocks: &'a [String],
+    continuation_count: i32,
+}
+
+#[derive(Serialize)]
+struct P01StoredRowCanonical<'a> {
+    date: &'a str,
+    concept: &'a str,
+    stocks: &'a str,
+    continuation_count: i32,
+}
+
+fn exact_stored_rows_sha256(rows: &[ChainDailyRow]) -> Result<String, serde_json::Error> {
+    let mut ordered = rows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right
+            .continuation_count
+            .cmp(&left.continuation_count)
+            .then_with(|| left.concept.cmp(&right.concept))
+    });
+    let canonical = ordered
+        .into_iter()
+        .map(|row| P01StoredRowCanonical {
+            date: &row.date,
+            concept: &row.concept,
+            stocks: &row.stocks,
+            continuation_count: row.continuation_count,
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&(P01_STORED_ROWS_SCHEMA, canonical))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn verify_p01_generation(
+    date: &str,
+    rows: &[ChainDailyRow],
+    stored: &StoredP01GenerationRow,
+) -> Result<PersistedP01ChainGeneration, &'static str> {
+    let mut generation_digest = Sha256::new();
+    generation_digest.update(P01_GENERATION_DOMAIN);
+    generation_digest.update(&stored.canonical_bytes);
+    if hex::encode(generation_digest.finalize()) != stored.generation_sha256 {
+        return Err("generation_sha256_mismatch");
+    }
+    let canonical: P01GenerationCanonical =
+        serde_json::from_slice(&stored.canonical_bytes).map_err(|_| "canonical_invalid")?;
+    if serde_json::to_vec(&canonical).map_err(|_| "canonical_invalid")? != stored.canonical_bytes {
+        return Err("canonical_bytes_invalid");
+    }
+    if canonical.schema != P01_GENERATION_SCHEMA
+        || canonical.evidence_date != date
+        || !matches!(
+            canonical.provider,
+            crate::market_domain::ProviderId::Eastmoney
+                | crate::market_domain::ProviderId::Tonghuashun
+        )
+        || canonical.source_at.as_deref() != Some(date)
+        || canonical.source.trim().is_empty()
+        || canonical.observed_at.trim().is_empty()
+        || canonical.batch_id.trim().is_empty()
+        || canonical.persistence_receipt_sha256.len() != 64
+        || rows.is_empty()
+        || rows.len() != canonical.ordered_chain_row_hashes.len()
+    {
+        return Err("generation_identity_invalid");
+    }
+    if exact_stored_rows_sha256(rows).map_err(|_| "stored_rows_encoding_failed")?
+        != stored.stored_rows_sha256
+    {
+        return Err("stored_rows_sha256_mismatch");
+    }
+    let mut actual_hashes = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.date != date {
+            return Err("row_date_mismatch");
+        }
+        let stocks: Vec<String> =
+            serde_json::from_str(&row.stocks).map_err(|_| "row_stocks_invalid")?;
+        let bytes = serde_json::to_vec(&P01ChainRowCanonical {
+            date: &row.date,
+            concept: &row.concept,
+            stocks: &stocks,
+            continuation_count: row.continuation_count,
+        })
+        .map_err(|_| "row_encoding_failed")?;
+        let mut digest = Sha256::new();
+        digest.update(P01_CHAIN_ROW_DOMAIN);
+        digest.update(bytes);
+        actual_hashes.push(hex::encode(digest.finalize()));
+    }
+    actual_hashes.sort();
+    let mut expected_hashes = canonical.ordered_chain_row_hashes;
+    expected_hashes.sort();
+    if actual_hashes != expected_hashes {
+        return Err("row_hashes_mismatch");
+    }
+    Ok(PersistedP01ChainGeneration {
+        generation_sha256: stored.generation_sha256.clone(),
+        canonical_bytes: stored.canonical_bytes.clone(),
+        persistence_receipt_sha256: canonical.persistence_receipt_sha256,
+    })
 }
 
 /// P-05 uses the same ordering as the exact-date P-01 reader. The primary key
@@ -214,6 +425,11 @@ impl DatabaseManager {
             .get_conn()
             .map_err(|error| format!("主线落库获取连接失败: {error}"))?;
         conn.transaction::<_, diesel::result::Error, _>(|tx| {
+            if !encoded.is_empty() {
+                diesel::sql_query("DELETE FROM chain_daily_p01_generation WHERE date = ?")
+                    .bind::<Text, _>(date)
+                    .execute(tx)?;
+            }
             for (concept, json, cont) in &encoded {
                 diesel::sql_query(
                 "INSERT OR REPLACE INTO chain_daily (date, concept, stocks, continuation_count) VALUES (?, ?, ?, ?)",
@@ -251,6 +467,24 @@ impl DatabaseManager {
         date: chrono::NaiveDate,
         clusters: &[(String, Vec<String>, i32)],
     ) -> Result<Vec<ChainDailyRow>, ChainDailyReplaceError> {
+        self.replace_and_read_chain_clusters_for_date_inner(date, clusters, None)
+    }
+
+    pub(crate) fn replace_and_read_chain_clusters_with_p01_generation_strict(
+        &self,
+        date: chrono::NaiveDate,
+        clusters: &[(String, Vec<String>, i32)],
+        generation: P01ChainGenerationInput<'_>,
+    ) -> Result<Vec<ChainDailyRow>, ChainDailyReplaceError> {
+        self.replace_and_read_chain_clusters_for_date_inner(date, clusters, Some(generation))
+    }
+
+    fn replace_and_read_chain_clusters_for_date_inner(
+        &self,
+        date: chrono::NaiveDate,
+        clusters: &[(String, Vec<String>, i32)],
+        generation: Option<P01ChainGenerationInput<'_>>,
+    ) -> Result<Vec<ChainDailyRow>, ChainDailyReplaceError> {
         let date = date.format("%Y-%m-%d").to_string();
         let mut concepts = std::collections::HashSet::with_capacity(clusters.len());
         let mut encoded = Vec::with_capacity(clusters.len());
@@ -277,10 +511,44 @@ impl DatabaseManager {
             encoded.push((concept, stocks, *continuation_count));
         }
 
+        let expected_generation = generation
+            .map(|generation| {
+                let expected_rows = encoded
+                    .iter()
+                    .map(|(concept, stocks, continuation_count)| ChainDailyRow {
+                        date: date.clone(),
+                        concept: (*concept).clone(),
+                        stocks: stocks.clone(),
+                        continuation_count: *continuation_count,
+                    })
+                    .collect::<Vec<_>>();
+                let stored = StoredP01GenerationRow {
+                    generation_sha256: generation.generation_sha256.to_owned(),
+                    canonical_bytes: generation.canonical_bytes.to_vec(),
+                    stored_rows_sha256: exact_stored_rows_sha256(&expected_rows).map_err(
+                        |error| {
+                            ChainDailyReplaceError::InvalidInput(format!(
+                                "P-01 stored rows encoding failed: {error}"
+                            ))
+                        },
+                    )?,
+                };
+                verify_p01_generation(&date, &expected_rows, &stored).map_err(|reason| {
+                    ChainDailyReplaceError::InvalidInput(format!(
+                        "P-01 generation does not bind projected rows: {reason}"
+                    ))
+                })?;
+                Ok::<_, ChainDailyReplaceError>(stored)
+            })
+            .transpose()?;
+
         let mut conn = self
             .get_conn()
             .map_err(|error| ChainDailyReplaceError::Storage(error.to_string()))?;
-        conn.transaction::<_, diesel::result::Error, _>(|tx| {
+        conn.transaction::<_, ChainDailyReplaceError, _>(|tx| {
+            diesel::sql_query("DELETE FROM chain_daily_p01_generation WHERE date = ?")
+                .bind::<Text, _>(&date)
+                .execute(tx)?;
             diesel::sql_query("DELETE FROM chain_daily WHERE date = ?")
                 .bind::<Text, _>(&date)
                 .execute(tx)?;
@@ -311,13 +579,44 @@ impl DatabaseManager {
                         })
                 })
             {
-                return Err(diesel::result::Error::RollbackTransaction);
+                return Err(ChainDailyReplaceError::ReadbackMismatch);
+            }
+            if let Some(expected) = expected_generation.as_ref() {
+                diesel::sql_query(
+                    "INSERT INTO chain_daily_p01_generation(\
+                     date, generation_sha256, canonical_bytes, stored_rows_sha256) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind::<Text, _>(&date)
+                .bind::<Text, _>(&expected.generation_sha256)
+                .bind::<Binary, _>(&expected.canonical_bytes)
+                .bind::<Text, _>(&expected.stored_rows_sha256)
+                .execute(tx)?;
+                let read_generation = diesel::sql_query(
+                    "SELECT generation_sha256, canonical_bytes, stored_rows_sha256 \
+                     FROM chain_daily_p01_generation \
+                     WHERE date = ?",
+                )
+                .bind::<Text, _>(&date)
+                .get_result::<StoredP01GenerationRow>(tx)
+                .optional()?
+                .ok_or(ChainDailyReplaceError::GenerationReadbackMismatch)?;
+                let final_rows: Vec<ChainDailyRow> = diesel::sql_query(
+                    "SELECT date, concept, stocks, continuation_count FROM chain_daily \
+                     WHERE date = ? ORDER BY continuation_count DESC, concept ASC",
+                )
+                .bind::<Text, _>(&date)
+                .load(tx)?;
+                if read_generation.generation_sha256 != expected.generation_sha256
+                    || read_generation.canonical_bytes != expected.canonical_bytes
+                    || read_generation.stored_rows_sha256 != expected.stored_rows_sha256
+                    || final_rows != read_back
+                    || verify_p01_generation(&date, &final_rows, &read_generation).is_err()
+                {
+                    return Err(ChainDailyReplaceError::GenerationReadbackMismatch);
+                }
             }
             Ok(read_back)
-        })
-        .map_err(|error| match error {
-            diesel::result::Error::RollbackTransaction => ChainDailyReplaceError::ReadbackMismatch,
-            other => ChainDailyReplaceError::Storage(other.to_string()),
         })
     }
 
@@ -356,6 +655,41 @@ impl DatabaseManager {
             .map_err(|error| format!("获取 P-05 chain_daily 数据库连接失败: {error}"))?;
         query_p05_latest_chain_clusters(&mut conn)
             .map_err(|error| format!("查询 P-05 chain_daily 失败: {error}"))
+    }
+
+    /// Read the same latest-date rows and optional P-01 generation in one
+    /// SQLite snapshot. Old `chain_daily` rows remain explicitly unbound.
+    pub fn get_p05_latest_chain_snapshot_strict(
+        &self,
+    ) -> Result<P05ChainSnapshotRead, P05ChainSnapshotReadError> {
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| P05ChainSnapshotReadError::Storage(error.to_string()))?;
+        conn.transaction::<_, P05ChainSnapshotReadError, _>(|tx| {
+            let rows = query_p05_latest_chain_clusters(tx)?;
+            let Some(date) = rows.first().map(|row| row.date.as_str()) else {
+                return Ok(P05ChainSnapshotRead {
+                    rows,
+                    generation: P05ChainGenerationStatus::NoRows,
+                });
+            };
+            let generation = diesel::sql_query(
+                "SELECT generation_sha256, canonical_bytes, stored_rows_sha256 \
+                 FROM chain_daily_p01_generation \
+                 WHERE date = ?",
+            )
+            .bind::<Text, _>(date)
+            .get_result::<StoredP01GenerationRow>(tx)
+            .optional()?;
+            let generation = match generation {
+                Some(stored) => P05ChainGenerationStatus::P01BoundUnqualified(
+                    verify_p01_generation(date, &rows, &stored)
+                        .map_err(P05ChainSnapshotReadError::BindingMismatch)?,
+                ),
+                None => P05ChainGenerationStatus::UnboundLegacyRows,
+            };
+            Ok(P05ChainSnapshotRead { rows, generation })
+        })
     }
 
     /// BR-241: 严格读取指定证据日的 P-01 主线投影。
