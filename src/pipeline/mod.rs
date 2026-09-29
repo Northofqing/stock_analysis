@@ -564,10 +564,11 @@ impl AnalysisPipeline {
             stock_codes.len(),
             stock_codes
         );
-        let stocks: Vec<StockAnalysisOutcome> = stream::iter(stock_codes.iter())
-            .map(|code| {
+        let stocks: Vec<StockAnalysisOutcome> = stream::iter(stock_codes.iter().enumerate())
+            .map(|(input_ordinal, code)| {
                 self.process_stock_in_invocation(
                     code.clone(),
+                    input_ordinal,
                     macro_context.clone(),
                     invocation.clone(),
                 )
@@ -799,7 +800,7 @@ mod tests {
     use super::section_utils::normalize_ai_sections;
     use super::{
         key_stock_priority, preserve_exact_date_limit_up_state, score_to_advice, AnalysisPipeline,
-        AnalysisResult, CliProducer, PipelineConfig,
+        AnalysisResult, CliProducer, CliSubject, PipelineConfig,
     };
     use crate::data_provider::{AdjustType, KlineData};
     use crate::notification::{NotificationConfig, NotificationService};
@@ -959,6 +960,32 @@ mod tests {
         assert_eq!(results.stocks.len(), 1);
         assert!(results.stocks[0].report_snapshot.is_none());
         assert!(results.summary.report_snapshot.is_none());
+
+        pipeline.config.max_workers = 2;
+        let duplicate = pipeline
+            .run(
+                &[
+                    "TEST_CODE_000001".to_string(),
+                    "TEST_CODE_000001".to_string(),
+                ],
+                Some("TEST_CODE_宏观证据".to_string()),
+            )
+            .await
+            .expect("duplicate dry run");
+        let mut ordinals = duplicate
+            .stocks
+            .iter()
+            .map(|stock| match stock.business_identity.subject() {
+                CliSubject::Stock { input_ordinal, .. } => *input_ordinal,
+                _ => panic!("expected stock subject"),
+            })
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, [0, 1]);
+        assert!(duplicate
+            .stocks
+            .iter()
+            .all(|stock| stock.report_snapshot.is_none()));
 
         let report = pipeline.generate_single_report(&result());
         assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));

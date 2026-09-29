@@ -1102,6 +1102,7 @@ impl AnalysisPipeline {
     ) -> super::StockAnalysisOutcome {
         self.process_stock_in_invocation(
             code,
+            0,
             macro_context,
             super::CliInvocationIdentity::new(super::CliProducer::Direct),
         )
@@ -1111,6 +1112,7 @@ impl AnalysisPipeline {
     pub(super) async fn process_stock_in_invocation(
         &self,
         code: String,
+        input_ordinal: usize,
         macro_context: Arc<str>,
         invocation: super::CliInvocationIdentity,
     ) -> super::StockAnalysisOutcome {
@@ -1120,6 +1122,7 @@ impl AnalysisPipeline {
         // 整体超时保护：单只股票最多处理 120 秒，避免任何环节卡死拖垮全局
         let mut outcome = super::StockAnalysisOutcome::new(
             code.clone(),
+            input_ordinal,
             self.config.single_notify && self.config.send_notification && !self.config.dry_run,
             &invocation,
         );
@@ -1284,10 +1287,7 @@ impl AnalysisPipeline {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
             outcome.report_snapshot = Some(super::CliReportSnapshot::new(
-                outcome
-                    .business_identity
-                    .invocation()
-                    .stock_notification(&code),
+                outcome.business_identity.matching_notification(),
                 report,
             ));
             outcome.notification =
@@ -2228,6 +2228,94 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn repeated_input_code_keeps_two_single_sends_and_distinct_occurrences() {
+        use crate::notification::send_report_tests::{
+            spawn_webhook_fixture, test_service, ScriptedResponse,
+        };
+        use crate::notification::{NotificationChannel, NotificationConfig};
+
+        crate::database::DatabaseManager::init(None).expect("test database initialization");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let code = format!("TEST_CODE_DUPLICATE_{suffix}");
+        let output_dir = std::env::temp_dir().join(format!(
+            "stock-analysis-duplicate-{}-{suffix}",
+            std::process::id()
+        ));
+        let _guard = FullPipelineGuard {
+            code: code.clone(),
+            output_dir: output_dir.clone(),
+        };
+        let fixture = spawn_webhook_fixture(vec![
+            ScriptedResponse::Http(r#"{"ok":true}"#),
+            ScriptedResponse::Http(r#"{"ok":true}"#),
+        ]);
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.config.max_workers = 1;
+        pipeline.config.single_notify = true;
+        pipeline.config.send_notification = true;
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.test_backtest_output_dir = Some(output_dir);
+        pipeline.notifier = Arc::new(test_service(
+            NotificationConfig {
+                custom_webhook_urls: vec![fixture.url()],
+                ..Default::default()
+            },
+            vec![NotificationChannel::Custom],
+        ));
+
+        let report = pipeline
+            .run_with_producer(
+                &[code.clone(), code.clone()],
+                Some("TEST_CODE_本地宏观证据".into()),
+                super::super::CliProducer::Default,
+            )
+            .await
+            .expect("duplicate stock run");
+        assert_eq!(report.stocks.len(), 2);
+        let invocation = report.invocation.as_ref().expect("invocation");
+        for (input_ordinal, stock) in report.stocks.iter().enumerate() {
+            assert_eq!(stock.business_identity.invocation(), invocation);
+            assert_eq!(
+                stock.business_identity.subject(),
+                &super::super::CliSubject::Stock {
+                    code: code.clone(),
+                    input_ordinal,
+                }
+            );
+            assert_eq!(
+                stock
+                    .report_snapshot
+                    .as_ref()
+                    .expect("single send")
+                    .identity()
+                    .subject(),
+                stock.business_identity.subject()
+            );
+            assert_eq!(
+                stock.notification.completion(),
+                Some(crate::notification::NotificationCompletion::AllAccepted)
+            );
+        }
+        assert_ne!(
+            report.stocks[0].business_identity,
+            report.stocks[1].business_identity
+        );
+        assert!(report.summary.business_identity.is_none());
+        assert_eq!(fixture.finish().len(), 2);
+    }
+
     #[tokio::test]
     async fn task2_single_stock_no_targets_and_opt_out_are_distinct() {
         crate::database::DatabaseManager::init(None).expect("private test DB");
@@ -2389,13 +2477,32 @@ mod tests {
 
         let results = pipeline
             .run(
-                std::slice::from_ref(&code),
+                &[code.clone(), code.clone()],
                 Some("TEST_CODE_本地宏观证据".to_string()),
             )
             .await
             .expect("resolved full pipeline run");
         let invocation = results.invocation.as_ref().expect("run invocation");
+        assert_eq!(results.stocks.len(), 2);
         assert_eq!(results.stocks[0].business_identity.invocation(), invocation);
+        assert_eq!(results.stocks[1].business_identity.invocation(), invocation);
+        assert_ne!(
+            results.stocks[0].business_identity,
+            results.stocks[1].business_identity
+        );
+        let mut stock_ordinals = results
+            .stocks
+            .iter()
+            .map(|stock| match stock.business_identity.subject() {
+                super::super::CliSubject::Stock {
+                    code: subject_code,
+                    input_ordinal,
+                } if subject_code == &code => *input_ordinal,
+                subject => panic!("unexpected stock subject: {subject:?}"),
+            })
+            .collect::<Vec<_>>();
+        stock_ordinals.sort_unstable();
+        assert_eq!(stock_ordinals, [0, 1]);
         assert_eq!(
             results
                 .summary
@@ -2415,7 +2522,31 @@ mod tests {
                 .invocation(),
             invocation
         );
+        assert_eq!(
+            results
+                .summary
+                .business_identity
+                .as_ref()
+                .unwrap()
+                .subject(),
+            &super::super::CliSubject::Summary
+        );
+        assert_eq!(
+            results
+                .summary
+                .saved_paths
+                .iter()
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("stock_analysis_")
+                })
+                .count(),
+            1
+        );
         assert!(results.stocks[0].report_snapshot.is_none());
+        assert!(results.stocks[1].report_snapshot.is_none());
         assert!(!results.is_complete());
         assert!(results.ensure_cli_success().is_err());
         assert_eq!(
@@ -2423,7 +2554,7 @@ mod tests {
             Some(crate::notification::NotificationCompletion::NoTargets)
         );
         let results = results.results;
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].code, code);
         assert_eq!(
             results[0]

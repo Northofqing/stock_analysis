@@ -44,17 +44,13 @@ impl CliInvocationIdentity {
         self.producer
     }
 
-    pub(super) fn stock_business(&self, code: &str) -> CliBusinessIdentity {
+    pub(super) fn stock_business(&self, code: &str, input_ordinal: usize) -> CliBusinessIdentity {
         CliBusinessIdentity {
             invocation: self.clone(),
-            subject: CliSubject::Stock(code.to_owned()),
-        }
-    }
-
-    pub(super) fn stock_notification(&self, code: &str) -> CliNotificationIdentity {
-        CliNotificationIdentity {
-            invocation: self.clone(),
-            subject: CliSubject::Stock(code.to_owned()),
+            subject: CliSubject::Stock {
+                code: code.to_owned(),
+                input_ordinal,
+            },
         }
     }
 
@@ -75,7 +71,7 @@ impl CliInvocationIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliSubject {
-    Stock(String),
+    Stock { code: String, input_ordinal: usize },
     Summary,
 }
 
@@ -92,6 +88,13 @@ impl CliBusinessIdentity {
 
     pub fn subject(&self) -> &CliSubject {
         &self.subject
+    }
+
+    pub(super) fn matching_notification(&self) -> CliNotificationIdentity {
+        CliNotificationIdentity {
+            invocation: self.invocation.clone(),
+            subject: self.subject.clone(),
+        }
     }
 }
 
@@ -150,39 +153,43 @@ mod tests {
         let second = CliInvocationIdentity::new(CliProducer::Default);
         assert_ne!(first, second);
         assert_eq!(first.producer(), CliProducer::Default);
-        assert_eq!(first.stock_business("TEST_CODE").invocation(), &first);
-        assert_eq!(first.stock_notification("TEST_CODE").invocation(), &first);
+        let first_stock = first.stock_business("TEST_CODE", 0);
+        let first_notification = first_stock.matching_notification();
+        assert_eq!(first_stock.invocation(), &first);
+        assert_eq!(first_notification.invocation(), &first);
         assert_eq!(first.summary_business().invocation(), &first);
         assert_eq!(first.summary_notification().invocation(), &first);
         assert_eq!(
-            first.stock_business("TEST_CODE").subject(),
-            &CliSubject::Stock("TEST_CODE".into())
+            first_stock.subject(),
+            &CliSubject::Stock {
+                code: "TEST_CODE".into(),
+                input_ordinal: 0,
+            }
         );
+        assert_eq!(first_stock.subject(), first_notification.subject());
         assert_eq!(first.summary_notification().subject(), &CliSubject::Summary);
+        assert_ne!(first_notification, first.summary_notification());
+        assert_ne!(first_stock, first.stock_business("TEST_CODE", 1));
         assert_ne!(
-            first.stock_notification("TEST_CODE"),
-            first.summary_notification()
+            first_notification,
+            first.stock_business("TEST_CODE", 1).matching_notification()
         );
-        assert_ne!(
-            first.stock_notification("TEST_CODE"),
-            first.stock_notification("OTHER_CODE")
-        );
-        assert_ne!(
-            first.stock_notification("TEST_CODE"),
-            second.stock_notification("TEST_CODE")
-        );
+        assert_ne!(first_stock, first.stock_business("OTHER_CODE", 0));
+        assert_ne!(first_stock, second.stock_business("TEST_CODE", 0));
         let lhb = CliInvocationIdentity::new(CliProducer::Lhb);
         assert_eq!(lhb.producer(), CliProducer::Lhb);
         assert_ne!(
-            lhb.stock_business("TEST_CODE"),
-            first.stock_business("TEST_CODE")
+            lhb.stock_business("TEST_CODE", 0),
+            first.stock_business("TEST_CODE", 0)
         );
     }
 
     #[test]
     fn snapshot_binds_original_report_bytes_without_claiming_channel_entity() {
         let invocation = CliInvocationIdentity::new(CliProducer::Schedule);
-        let identity = invocation.stock_notification("TEST_CODE");
+        let identity = invocation
+            .stock_business("TEST_CODE", 0)
+            .matching_notification();
         let first = CliReportSnapshot::new(identity.clone(), "测试  \n".into());
         let changed = CliReportSnapshot::new(identity, "测试 \n".into());
         assert_eq!(first.report_bytes().as_bytes(), "测试  \n".as_bytes());

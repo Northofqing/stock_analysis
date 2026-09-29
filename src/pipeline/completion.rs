@@ -59,9 +59,14 @@ pub struct StockAnalysisOutcome {
     pub failure: Option<String>,
 }
 impl StockAnalysisOutcome {
-    pub(super) fn new(code: String, notify: bool, invocation: &CliInvocationIdentity) -> Self {
+    pub(super) fn new(
+        code: String,
+        input_ordinal: usize,
+        notify: bool,
+        invocation: &CliInvocationIdentity,
+    ) -> Self {
         Self {
-            business_identity: invocation.stock_business(&code),
+            business_identity: invocation.stock_business(&code, input_ordinal),
             code,
             analysis: None,
             saved: AnalysisSaveStatus::NotAttempted,
