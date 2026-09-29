@@ -338,9 +338,11 @@ mod tests_chain_delivery {
         deliver_prepared, require_chain_notification_success, ChainDeliveryEnvelope,
         ChainSendResult, ChainSendSuppression,
     };
-    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase};
-    use crate::app::chain_shadow_input::{observe, test_prepared};
-    use chrono::NaiveDate;
+    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase, ChainScheduleStatus};
+    use crate::app::chain_shadow_input::{
+        observe, observe_prepared_decision, test_prepared, ChainGateCapture, ChainPreparedDecision,
+    };
+    use chrono::{DateTime, NaiveDate};
     use sha2::{Digest, Sha256};
     use std::{
         cell::{Cell, RefCell},
@@ -355,6 +357,20 @@ mod tests_chain_delivery {
             require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
                 .is_err()
         );
+    }
+
+    fn ready_gate(phase: ChainPhase, date: NaiveDate) -> ChainGateCapture {
+        let at = match phase {
+            ChainPhase::Preopen => "09:05:00",
+            ChainPhase::Postclose => "15:30:00",
+        };
+        ChainGateCapture::new(
+            phase,
+            date,
+            DateTime::parse_from_rfc3339(&format!("{date}T{at}+08:00")).unwrap(),
+            true,
+            ChainScheduleStatus::Ready,
+        )
     }
 
     async fn scripted_delivery(
@@ -426,6 +442,7 @@ mod tests_chain_delivery {
             envelope,
             ChainPhase::Postclose,
             date,
+            &ready_gate(ChainPhase::Postclose, date),
             {
                 let events = events.clone();
                 move || {
@@ -482,6 +499,66 @@ mod tests_chain_delivery {
     }
 
     #[tokio::test]
+    async fn decision_binding_failure_after_send_cannot_change_mark_or_legacy_result() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let wrong_gate = ready_gate(ChainPhase::Preopen, date);
+        let input = observe(
+            ChainPhase::Postclose,
+            date,
+            &prepared,
+            prepared.report().as_bytes(),
+            None,
+        )
+        .unwrap();
+        assert!(observe_prepared_decision(
+            &wrong_gate,
+            ChainPreparedDecision {
+                input: &input,
+                suppression_reason: None,
+                send_attempted: true,
+                report_observed: false,
+                targets: &[],
+                mark_attempted: true,
+                legacy_succeeded: true,
+            },
+        )
+        .is_err());
+        let envelope = ChainDeliveryEnvelope {
+            report_input: prepared.report().as_bytes().to_vec(),
+            prepared,
+            acquisition: None,
+            send_attempted: true,
+            notification_report: None,
+            wechat_http_body: None,
+            feishu_http_body: None,
+            suppression: None,
+            legacy_result: Ok(()),
+        };
+        let events = RefCell::new(Vec::new());
+        let result = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            &wrong_gate,
+            || {
+                events.borrow_mut().push("mark");
+                Ok(())
+            },
+            |phase, date, prepared, report, acquisition| {
+                events.borrow_mut().push("observe");
+                observe(phase, date, prepared, report, acquisition)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            crate::app::chain_schedule::ChainScheduleOutcome::WeakAccepted
+        );
+        assert_eq!(&*events.borrow(), &["mark", "observe"]);
+    }
+
+    #[tokio::test]
     async fn no_channel_suppression_observes_exact_prepared_bytes_for_both_phases() {
         let business_date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
         let schedule_date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
@@ -509,6 +586,7 @@ mod tests_chain_delivery {
                 envelope,
                 phase,
                 schedule_date,
+                &ready_gate(phase, schedule_date),
                 || panic!("suppressed delivery must not mark weak acceptance"),
                 |observed_phase, observed_date, prepared, input, acquisition| {
                     assert_eq!(observed_phase, phase);
@@ -552,6 +630,7 @@ mod tests_chain_delivery {
             envelope,
             ChainPhase::Postclose,
             date,
+            &ready_gate(ChainPhase::Postclose, date),
             || {
                 events.borrow_mut().push("mark");
                 anyhow::bail!("weak mark failed")

@@ -13,7 +13,10 @@ use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-use super::chain_shadow_input::{self, ChainReportInputObservation};
+use super::chain_shadow_input::{
+    self, ChainGateCapture, ChainPreparedDecision, ChainReportInputObservation,
+    ChainWeakTargetResult,
+};
 use super::modes::{
     run_chain_analysis_mode_with_observation, ChainDeliveryEnvelope, ChainSendSuppression,
 };
@@ -413,6 +416,16 @@ struct ChainSendGateSnapshot {
 }
 
 impl ChainSendGateSnapshot {
+    fn capture(&self) -> ChainGateCapture {
+        ChainGateCapture::new(
+            self.phase,
+            self.date,
+            self.observed_at,
+            self.trading_day,
+            self.status,
+        )
+    }
+
     fn project(&self) -> Result<stock_analysis::push_foundation::ChainPreopenShadowReport> {
         // The CLI also compiles `app` as a local module, so its enums are
         // distinct Rust types from the library's Foundation-facing enums.
@@ -442,18 +455,33 @@ impl ChainSendGateSnapshot {
     }
 
     fn observe(&self) {
+        let captured = self.capture();
+        if captured.schedule_only_reason().is_some() {
+            match chain_shadow_input::observe_schedule_only(&captured) {
+                Ok(decision) => log::info!(
+                    "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} scope={} reason={} targets=0 coverage=incomplete foundation_persisted=false",
+                    self.phase.as_str(), self.date, decision.gate_sha256,
+                    decision.binding_sha256, decision.scope, decision.reason,
+                ),
+                Err(error) => log::warn!(
+                    "[chain_shadow_decision] phase={} schedule_date={} scope=schedule_only observer_status=incomplete reason={error:#} coverage=incomplete",
+                    self.phase.as_str(), self.date,
+                ),
+            }
+        }
+        let gate_sha256 = captured.sha256().unwrap_or_else(|_| "unobserved".into());
         match self.project() {
             Ok(shadow) => log::info!(
-                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} old_window_open={} old_due={} projected_occurrence={:?} new_status={} new_reason={} new_due={} diff={} scope=send_gate_only identity_scope=legacy_chain_report_calendar_date calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete",
+                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} old_window_open={} old_due={} projected_occurrence={:?} new_status={} new_reason={} new_due={} diff={} gate_sha256={} scope=send_gate_only identity_scope=legacy_chain_report_calendar_date calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete",
                 self.phase.as_str(), self.date, self.observed_at, self.status,
                 shadow.legacy_window_open, shadow.legacy_due,
                 shadow.foundation_occurrence_id, shadow.foundation_status,
                 shadow.foundation_reason, shadow.foundation_due,
-                shadow.has_send_gate_diff(),
+                shadow.has_send_gate_diff(), gate_sha256,
             ),
             Err(error) => log::warn!(
-                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} scope=send_gate_only calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete observer_status=failed reason={error:#}",
-                self.phase.as_str(), self.date, self.observed_at, self.status,
+                "[chain_shadow_send_gate] phase={} schedule_date={} observed_at={} old_status={:?} gate_sha256={} scope=send_gate_only calendar_guard=caller_trading_day foundation_state=none foundation_persisted=false coverage=incomplete observer_status=failed reason={error:#}",
+                self.phase.as_str(), self.date, self.observed_at, self.status, gate_sha256,
             ),
         }
     }
@@ -511,6 +539,7 @@ pub async fn run_scheduled_chain_analysis(
     );
 
     let filename = scheduled_report_filename(phase, date, Utc::now());
+    let captured_gate = gate.capture();
     let mut attempt_no = None;
     let envelope = run_chain_analysis_mode_with_observation(true, Some(&filename), |report_path| {
         attempt_no = Some(store.begin_send(phase, date, report_path)?);
@@ -522,6 +551,7 @@ pub async fn run_scheduled_chain_analysis(
             envelope,
             phase,
             date,
+            &captured_gate,
             || {
                 let attempt_no = attempt_no.context("产业链发送守卫未执行")?;
                 store.mark_weak_accepted(phase, date, attempt_no)
@@ -538,6 +568,7 @@ pub(super) fn finish_scheduled_delivery<M, O>(
     envelope: ChainDeliveryEnvelope,
     phase: ChainPhase,
     date: NaiveDate,
+    captured_gate: &ChainGateCapture,
     mark: M,
     observer: O,
 ) -> Result<ChainScheduleOutcome>
@@ -551,7 +582,9 @@ where
         Option<&super::chain_acquisition::ChainAcquisitionEvidence>,
     ) -> Result<ChainReportInputObservation>,
 {
+    let mut mark_attempted = false;
     let legacy_result = envelope.legacy_result.and_then(|()| {
+        mark_attempted = true;
         mark()?;
         Ok(ChainScheduleOutcome::WeakAccepted)
     });
@@ -655,6 +688,36 @@ where
                 envelope.suppression.map(ChainSendSuppression::as_str).unwrap_or("none"),
                 chain_shadow_input::COVERAGE,
             ),
+    }
+    if let Ok(input) = &input_observation {
+        let targets = envelope
+            .notification_report
+            .as_ref()
+            .map(ChainWeakTargetResult::from_report)
+            .unwrap_or_default();
+        match chain_shadow_input::observe_prepared_decision(
+            captured_gate,
+            ChainPreparedDecision {
+                input,
+                suppression_reason: envelope.suppression.map(ChainSendSuppression::as_str),
+                send_attempted: envelope.send_attempted,
+                report_observed: envelope.notification_report.is_some(),
+                targets: &targets,
+                mark_attempted,
+                legacy_succeeded: legacy_result.is_ok(),
+            },
+        ) {
+            Ok(decision) => log::info!(
+                "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} scope={} reason={} targets={} coverage=incomplete authority=weak foundation_persisted=false",
+                phase.as_str(), date, decision.gate_sha256,
+                decision.binding_sha256, decision.scope, decision.reason,
+                decision.target_count,
+            ),
+            Err(error) => log::warn!(
+                "[chain_shadow_decision] phase={} schedule_date={} scope=prepared observer_status=incomplete reason={error:#} coverage=incomplete",
+                phase.as_str(), date,
+            ),
+        }
     }
     if let (Ok(input), Some(report)) = (&input_observation, envelope.notification_report.as_ref()) {
         match chain_shadow_input::observe_custom_requests(&envelope.prepared, input, report) {

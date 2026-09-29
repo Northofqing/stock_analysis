@@ -382,10 +382,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase};
+    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase, ChainScheduleStatus};
     use crate::app::chain_shadow_input::{
-        observe, test_prepared, test_prepared_with_macro, SelectedNewsSourceRefStatus,
-        ACQUISITION_INPUTS,
+        observe, test_prepared, test_prepared_with_macro, ChainGateCapture,
+        SelectedNewsSourceRefStatus, ACQUISITION_INPUTS,
     };
     use crate::app::modes::{ChainDeliveryEnvelope, ChainSendSuppression};
     use chrono::Utc;
@@ -671,6 +671,13 @@ mod tests {
             envelope,
             ChainPhase::Preopen,
             schedule_date,
+            &ChainGateCapture::new(
+                ChainPhase::Preopen,
+                schedule_date,
+                DateTime::parse_from_rfc3339("2026-09-29T09:05:00+08:00").unwrap(),
+                true,
+                ChainScheduleStatus::Ready,
+            ),
             || panic!("suppressed report must not mark weak acceptance"),
             |phase, date, prepared, report_input, acquisition| {
                 assert_eq!(phase, ChainPhase::Preopen);

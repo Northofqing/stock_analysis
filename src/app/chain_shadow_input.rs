@@ -1,7 +1,7 @@
 //! Read-only fingerprint of the scheduled chain report input, not Foundation shadow parity.
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use sha2::{Digest, Sha256};
 use stock_analysis::monitor::push_job::WeakOutcomeKind;
 use stock_analysis::notification::{NotificationChannel, NotificationSendReport};
@@ -11,12 +11,235 @@ use super::chain_acquisition::{
     ChainAcquisitionEvidence, ChainNewsEvidence, ChainSelectedNewsSourceRefV1,
     MissingSelectedNewsSourceTime,
 };
-use super::chain_schedule::ChainPhase;
+use super::chain_schedule::{ChainPhase, ChainScheduleStatus};
 
 pub(super) const COVERAGE: &str = "incomplete";
 pub(super) const REPORT_INPUTS: &str = "prepared_report_utf8_only";
 pub(super) const ACQUISITION_INPUTS: &str =
     "limit_up_metadata_selected_news_titles_utf8_and_report_utf8";
+
+/// Values sampled by the legacy scheduler before any preparation or send. A
+/// later observer receives this copy instead of reopening the schedule store.
+#[derive(Clone, Debug)]
+pub(super) struct ChainGateCapture {
+    phase: ChainPhase,
+    schedule_date: NaiveDate,
+    observed_at: DateTime<FixedOffset>,
+    trading_day: bool,
+    legacy_status: ChainScheduleStatus,
+}
+
+impl ChainGateCapture {
+    pub(super) fn new(
+        phase: ChainPhase,
+        schedule_date: NaiveDate,
+        observed_at: DateTime<FixedOffset>,
+        trading_day: bool,
+        legacy_status: ChainScheduleStatus,
+    ) -> Self {
+        Self {
+            phase,
+            schedule_date,
+            observed_at,
+            trading_day,
+            legacy_status,
+        }
+    }
+
+    fn status_name(&self) -> &'static str {
+        match self.legacy_status {
+            ChainScheduleStatus::Ready => "ready",
+            ChainScheduleStatus::Uncertain => "uncertain",
+            ChainScheduleStatus::Closed => "closed",
+        }
+    }
+
+    pub(super) fn schedule_only_reason(&self) -> Option<&'static str> {
+        match self.legacy_status {
+            ChainScheduleStatus::Closed => Some("already_closed"),
+            ChainScheduleStatus::Uncertain => Some("uncertain_needs_review"),
+            ChainScheduleStatus::Ready if !self.trading_day => Some("nontrading_day"),
+            ChainScheduleStatus::Ready
+                if !self
+                    .phase
+                    .starts_in_window(self.schedule_date, self.observed_at.naive_local()) =>
+            {
+                Some("outside_send_window")
+            }
+            ChainScheduleStatus::Ready => None,
+        }
+    }
+
+    pub(super) fn sha256(&self) -> Result<String> {
+        digest_decision(&serde_json::json!({
+            "schema": "chain-gate-capture-v1",
+            "phase": self.phase.as_str(),
+            "schedule_date": self.schedule_date,
+            "observed_at": self.observed_at.to_rfc3339(),
+            "trading_day": self.trading_day,
+            "legacy_status": self.status_name(),
+        }))
+    }
+}
+
+/// A target-level weak result, in the original send order. Its optional
+/// request hashes describe only the first built HTTP entity where available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ChainWeakTargetResult {
+    channel: String,
+    target_index: usize,
+    outcome: WeakOutcomeKind,
+    built_target_sha256: Option<String>,
+    built_body_sha256: Option<String>,
+}
+
+impl ChainWeakTargetResult {
+    pub(super) fn from_report(report: &NotificationSendReport) -> Vec<Self> {
+        report
+            .attempts()
+            .iter()
+            .map(|attempt| Self {
+                channel: attempt.channel().name().to_owned(),
+                target_index: attempt.target_index(),
+                outcome: attempt.outcome(),
+                built_target_sha256: attempt
+                    .request_entity()
+                    .map(|entity| entity.target_sha256().to_owned()),
+                built_body_sha256: attempt
+                    .request_entity()
+                    .map(|entity| entity.body_sha256().to_owned()),
+            })
+            .collect()
+    }
+
+    fn outcome_name(&self) -> &'static str {
+        match self.outcome {
+            WeakOutcomeKind::Accepted => "weak_accepted",
+            WeakOutcomeKind::Rejected => "weak_rejected",
+            WeakOutcomeKind::Unknown => "unknown",
+        }
+    }
+}
+
+pub(super) struct ChainPreparedDecision<'a> {
+    pub input: &'a ChainReportInputObservation,
+    pub suppression_reason: Option<&'static str>,
+    pub send_attempted: bool,
+    pub report_observed: bool,
+    pub targets: &'a [ChainWeakTargetResult],
+    pub mark_attempted: bool,
+    pub legacy_succeeded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ChainDecisionObservation {
+    pub gate_sha256: String,
+    pub binding_sha256: String,
+    pub scope: &'static str,
+    pub reason: &'static str,
+    pub target_count: usize,
+}
+
+fn digest_decision(value: &serde_json::Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hash = Sha256::new();
+    hash.update(b"stock_analysis.chain_decision_observation.v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Suppressed runs have no report facts. This digest is explicitly limited to
+/// the captured schedule gate; it cannot stand in for a prepared decision.
+pub(super) fn observe_schedule_only(gate: &ChainGateCapture) -> Result<ChainDecisionObservation> {
+    let reason = gate
+        .schedule_only_reason()
+        .ok_or_else(|| anyhow::anyhow!("ready chain gate requires prepared facts"))?;
+    let gate_sha256 = gate.sha256()?;
+    let binding_sha256 = digest_decision(&serde_json::json!({
+        "schema": "chain-decision-observation-v1",
+        "scope": "schedule_only",
+        "gate_sha256": gate_sha256,
+        "reason": reason,
+    }))?;
+    Ok(ChainDecisionObservation {
+        gate_sha256,
+        binding_sha256,
+        scope: "schedule_only",
+        reason,
+        target_count: 0,
+    })
+}
+
+/// Bind only values already retained by this invocation. No provider, store,
+/// clock, reporter or sink is available to this projection.
+pub(super) fn observe_prepared_decision(
+    gate: &ChainGateCapture,
+    decision: ChainPreparedDecision<'_>,
+) -> Result<ChainDecisionObservation> {
+    anyhow::ensure!(
+        gate.schedule_only_reason().is_none(),
+        "suppressed chain gate has no prepared decision"
+    );
+    anyhow::ensure!(
+        decision.input.phase == gate.phase && decision.input.schedule_date == gate.schedule_date,
+        "chain decision gate and prepared input disagree"
+    );
+    anyhow::ensure!(
+        decision.report_observed || decision.targets.is_empty(),
+        "chain targets lack their original send report"
+    );
+    anyhow::ensure!(
+        decision.send_attempted || !decision.report_observed,
+        "chain send report exists without a send attempt"
+    );
+    anyhow::ensure!(
+        decision
+            .targets
+            .iter()
+            .enumerate()
+            .all(|(ordinal, target)| target.target_index == ordinal),
+        "chain target results are not in original send order"
+    );
+    let targets = decision
+        .targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "channel": target.channel,
+                "target_index": target.target_index,
+                "outcome": target.outcome_name(),
+                "built_target_sha256": target.built_target_sha256,
+                "built_body_sha256": target.built_body_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let gate_sha256 = gate.sha256()?;
+    let binding_sha256 = digest_decision(&serde_json::json!({
+        "schema": "chain-decision-observation-v1",
+        "scope": "prepared",
+        "gate_sha256": gate_sha256,
+        "prepared_business_date": decision.input.prepared_business_date,
+        "artifact_sha256": decision.input.artifact_sha256,
+        "report_input_sha256": decision.input.report_input_sha256,
+        "acquisition_report_binding_sha256": decision.input.acquisition_report_binding_sha256,
+        "selected_news_source_ref_sha256": decision.input.selected_news_source_ref.as_ref().map(|source| &source.ref_sha256),
+        "selected_news_source_ref_status": decision.input.selected_news_source_ref_status.reason(),
+        "suppression_reason": decision.suppression_reason,
+        "send_attempted": decision.send_attempted,
+        "report_observed": decision.report_observed,
+        "targets": targets,
+        "mark_attempted": decision.mark_attempted,
+        "legacy_succeeded": decision.legacy_succeeded,
+    }))?;
+    Ok(ChainDecisionObservation {
+        gate_sha256,
+        binding_sha256,
+        scope: "prepared",
+        reason: decision.suppression_reason.unwrap_or("none"),
+        target_count: decision.targets.len(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectedNewsSourceRefStatus {
@@ -247,6 +470,155 @@ pub(super) fn observe(
             REPORT_INPUTS
         },
     })
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    fn gate(phase: ChainPhase, status: ChainScheduleStatus, time: &str) -> ChainGateCapture {
+        ChainGateCapture::new(
+            phase,
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            DateTime::parse_from_rfc3339(&format!("2026-09-29T{time}+08:00")).unwrap(),
+            true,
+            status,
+        )
+    }
+
+    fn target(index: usize, channel: &str, outcome: WeakOutcomeKind) -> ChainWeakTargetResult {
+        ChainWeakTargetResult {
+            channel: channel.into(),
+            target_index: index,
+            outcome,
+            built_target_sha256: None,
+            built_body_sha256: None,
+        }
+    }
+
+    #[test]
+    fn closed_uncertain_and_window_expiry_bind_schedule_only_without_report_facts() {
+        for phase in [ChainPhase::Preopen, ChainPhase::Postclose] {
+            let opening = if phase == ChainPhase::Preopen {
+                "09:05:00"
+            } else {
+                "15:30:00"
+            };
+            let expiry = if phase == ChainPhase::Preopen {
+                "09:15:00"
+            } else {
+                "15:35:00"
+            };
+            let closed =
+                observe_schedule_only(&gate(phase, ChainScheduleStatus::Closed, opening)).unwrap();
+            let uncertain =
+                observe_schedule_only(&gate(phase, ChainScheduleStatus::Uncertain, opening))
+                    .unwrap();
+            let outside =
+                observe_schedule_only(&gate(phase, ChainScheduleStatus::Ready, expiry)).unwrap();
+            assert_eq!(closed.scope, "schedule_only");
+            assert_eq!(closed.reason, "already_closed");
+            assert_eq!(uncertain.reason, "uncertain_needs_review");
+            assert_eq!(outside.reason, "outside_send_window");
+            assert_ne!(closed.binding_sha256, uncertain.binding_sha256);
+            assert_ne!(uncertain.binding_sha256, outside.binding_sha256);
+            assert_eq!(outside.target_count, 0);
+            assert!(
+                observe_schedule_only(&gate(phase, ChainScheduleStatus::Ready, opening)).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_binding_uses_one_prior_session_artifact_and_all_captured_decision_facts() {
+        let business_date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let schedule_date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let preparations = Rc::new(Cell::new(0));
+        let prepared = test_prepared(business_date, preparations.clone()).await;
+        let mut input = observe(
+            ChainPhase::Preopen,
+            schedule_date,
+            &prepared,
+            prepared.report().as_bytes(),
+            None,
+        )
+        .unwrap();
+        let gate = gate(ChainPhase::Preopen, ChainScheduleStatus::Ready, "09:05:00");
+        let targets = [
+            target(0, "wechat", WeakOutcomeKind::Accepted),
+            target(1, "custom", WeakOutcomeKind::Unknown),
+        ];
+        let bind = |input: &ChainReportInputObservation,
+                    suppression_reason,
+                    targets: &[ChainWeakTargetResult],
+                    send_attempted,
+                    mark_attempted,
+                    legacy_succeeded| {
+            observe_prepared_decision(
+                &gate,
+                ChainPreparedDecision {
+                    input,
+                    suppression_reason,
+                    send_attempted,
+                    report_observed: send_attempted,
+                    targets,
+                    mark_attempted,
+                    legacy_succeeded,
+                },
+            )
+        };
+        let first = bind(&input, None, &targets, true, false, false).unwrap();
+        assert_eq!(first.scope, "prepared");
+        assert_eq!(first.target_count, 2);
+        assert_eq!(first.gate_sha256, gate.sha256().unwrap());
+        assert_eq!(
+            first,
+            bind(&input, None, &targets, true, false, false).unwrap()
+        );
+        let changed_outcome = [
+            target(0, "wechat", WeakOutcomeKind::Unknown),
+            target(1, "custom", WeakOutcomeKind::Accepted),
+        ];
+        assert_ne!(
+            first.binding_sha256,
+            bind(&input, None, &changed_outcome, true, false, false)
+                .unwrap()
+                .binding_sha256
+        );
+        assert_ne!(
+            first.binding_sha256,
+            bind(
+                &input,
+                Some("before_send_rejected"),
+                &[],
+                false,
+                false,
+                false
+            )
+            .unwrap()
+            .binding_sha256
+        );
+        assert_ne!(
+            first.binding_sha256,
+            bind(&input, None, &targets, true, true, true)
+                .unwrap()
+                .binding_sha256
+        );
+        input.acquisition_report_binding_sha256 = Some("TEST_CODE_DIFFERENT_SOURCE".into());
+        assert_ne!(
+            first.binding_sha256,
+            bind(&input, None, &targets, true, false, false)
+                .unwrap()
+                .binding_sha256
+        );
+        let out_of_order = [
+            target(1, "custom", WeakOutcomeKind::Unknown),
+            target(0, "wechat", WeakOutcomeKind::Accepted),
+        ];
+        assert!(bind(&input, None, &out_of_order, true, false, false).is_err());
+        assert_eq!(preparations.get(), 1);
+    }
 }
 
 #[cfg(test)]
