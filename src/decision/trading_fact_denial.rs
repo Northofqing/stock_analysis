@@ -2,8 +2,10 @@
 //! authority contract yet. This is a read-only result, never an admission,
 //! `InvestmentDecisionId`, or paper-order capability.
 //!
-//! F0 claims supply evaluation scope and a complete universe only. Claimed
-//! states, evidence digests, and proposed dispositions are deliberately ignored.
+//! F0 supplies evaluation scope and a caller-declared universe. `freeze` first
+//! checks claim shape, coverage, and internal consistency. For accepted input,
+//! claimed states, evidence digests, and proposed dispositions do not determine
+//! the gateway denial or its ID.
 
 use crate::data_gateway::qualified_trading_facts::{
     QualifiedFact, QualifiedTradingFactsGateway, QualifiedTradingFactsRequest, TradingFactField,
@@ -96,8 +98,9 @@ impl DeniedEvaluationId {
     }
 }
 
-/// Complete, read-only evaluation denial. Its private constructor prevents
-/// caller-written assessments from masquerading as gateway results.
+/// Read-only denial covering every candidate in the caller-declared universe.
+/// Its private constructor prevents caller-written assessments from
+/// masquerading as gateway results.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeniedEvaluationReceipt {
     id: DeniedEvaluationId,
@@ -144,8 +147,9 @@ pub enum DenialError {
     Encoding(String),
 }
 
-/// Evaluate a caller's complete F0 scope against the concrete production
-/// gateway. No caller-supplied fact claim participates in the outcome or ID.
+/// Check F0 claim consistency, then evaluate its declared universe against the
+/// concrete production gateway. Accepted claims do not determine the outcome
+/// or ID.
 /// If an authority contract arrives, this denial-only version fails closed
 /// until a separate as-of/versioned admission witness is implemented.
 pub fn evaluate_production_trading_fact_denial(
