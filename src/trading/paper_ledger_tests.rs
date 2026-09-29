@@ -1380,6 +1380,51 @@ fn declare_test_catalog_v2(db: &DatabaseManager) {
 }
 
 #[test]
+fn staged_v2_fee_schema_preserves_v1_effective_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(
+        dir.path().join("TEST_CODE_staged_v2_fee_schema.db"),
+    )
+    .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "v1-before-v2",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(before.rows().unwrap().len(), 1);
+    let view_before = ledger.read(&binding).unwrap();
+
+    let policy =
+        crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+    let staged = crate::database::paper_book_v2_schema::stage_for_isolated_test(
+        &mut db.get_conn().unwrap(),
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(staged.policy_instance_id(), policy.instance_id());
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after.lineage(), before.lineage());
+    assert_eq!(ledger.read(&binding).unwrap(), view_before);
+}
+
+#[test]
 fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_catalog_v3.db"))
