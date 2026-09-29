@@ -12,7 +12,7 @@ use reqwest::Client;
 
 use super::config::{NotificationChannel, NotificationConfig};
 use super::feishu::FeishuHttpBodyObservation;
-use super::send_report::{NotificationAttempt, NotificationSendReport};
+use super::send_report::{NotificationAttempt, NotificationRequestEntity, NotificationSendReport};
 use super::wechat::WechatHttpBodyObservation;
 use crate::monitor::push_job::WeakOutcomeKind;
 
@@ -31,6 +31,15 @@ fn observe_attempt(
     channel: NotificationChannel,
     result: Result<bool>,
 ) {
+    observe_attempt_with_entity(attempts, channel, result, None);
+}
+
+fn observe_attempt_with_entity(
+    attempts: &mut Vec<NotificationAttempt>,
+    channel: NotificationChannel,
+    result: Result<bool>,
+    request_entity: Option<NotificationRequestEntity>,
+) {
     let outcome = match result {
         Ok(true) => WeakOutcomeKind::Accepted,
         Ok(false) => {
@@ -46,7 +55,12 @@ fn observe_attempt(
             WeakOutcomeKind::Unknown
         }
     };
-    attempts.push(NotificationAttempt::new(channel, attempts.len(), outcome));
+    attempts.push(NotificationAttempt::new(
+        channel,
+        attempts.len(),
+        outcome,
+        request_entity,
+    ));
 }
 
 impl NotificationService {
@@ -253,10 +267,15 @@ impl NotificationService {
                 NotificationChannel::Custom => {
                     // 修复 P0-0: Custom 多个 webhook URL 都发送
                     for url in &self.config.custom_webhook_urls {
-                        observe_attempt(
+                        let mut request_entity = None;
+                        let result = self
+                            .send_to_custom_url_observing_entity(url, content, &mut request_entity)
+                            .await;
+                        observe_attempt_with_entity(
                             &mut attempts,
                             *channel,
-                            self.send_to_custom_url(url, content).await,
+                            result,
+                            request_entity,
                         );
                     }
                     if self.config.custom_webhook_urls.is_empty() {
@@ -591,12 +610,24 @@ impl NotificationService {
     }
 
     async fn send_to_custom_url(&self, url: &str, content: &str) -> Result<bool> {
+        self.send_to_custom_url_observing_entity(url, content, &mut None)
+            .await
+    }
+
+    async fn send_to_custom_url_observing_entity(
+        &self,
+        url: &str,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let body = serde_json::json!({ "content": content });
         let mut request = self.client.post(url).json(&body);
         if let Some(token) = self.config.custom_webhook_bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await?;
+        let request = request.build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let response = self.client.execute(request).await?;
         let status = response.status();
         let response_body = response.text().await?;
         if !status.is_success() || !custom_business_accepted(&response_body)? {
