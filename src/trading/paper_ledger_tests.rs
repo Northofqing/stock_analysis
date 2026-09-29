@@ -1479,6 +1479,225 @@ fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
         .is_empty());
 }
 
+fn catalog_v5_cutover_fixture() -> (
+    tempfile::TempDir,
+    DatabaseManager,
+    AccountBinding,
+    crate::trading::paper_book_v2::TestCutoverRequest,
+) {
+    use crate::trading::paper_book_v2::TestCutoverRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v5_cutover.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    ledger.apply(PaperCommand::Execute(order(
+        &ledger, &binding, "nonempty-lot", Direction::Buy, 10.0, instant(),
+    ))).unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy = crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        ).unwrap();
+        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(&mut conn).unwrap();
+    }
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    assert!(!ledger.read(&binding).unwrap().lots.is_empty());
+    let request = TestCutoverRequest {
+        old_binding: binding.clone(),
+        new_epoch_id: "TEST_CODE_EPOCH_V2".into(),
+        cutover_id: "TEST_CODE_CUTOVER_V2".into(),
+        command_id: "TEST_CODE_GENESIS_V2".into(),
+        expected_v1_version: snapshot.version,
+        expected_v1_head_hash: snapshot.event_hash,
+        expected_v1_projection_hash: snapshot.projection_hash,
+        reviewed_fee_policy: crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
+    };
+    (dir, db, binding, request)
+}
+
+#[test]
+fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+    assert!(matches!(read_v2_on(&db, &binding.account_id), Err(LedgerError::InactiveEpoch)));
+    let ledger = PaperLedger::open(&db, &instant);
+    let before = ledger.read(&binding).unwrap();
+    let effective_request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before_fills = ledger.verified_effective_fills(&effective_request).unwrap();
+    let before_bytes = {
+        let mut conn = db.get_conn().unwrap();
+        (events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(),
+         head(&mut conn, &binding).unwrap().unwrap().projection_bytes)
+    };
+    let receipt = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(!receipt.already_applied);
+    assert_eq!(receipt.epoch_id, request.new_epoch_id);
+    let genesis = read_v2_on(&db, &binding.account_id).unwrap();
+    assert_eq!(genesis.epoch_id, receipt.epoch_id);
+    assert_eq!(genesis.manifest_hash, receipt.manifest_hash);
+    assert_eq!(genesis.event_hash, receipt.event_hash);
+    assert_eq!(genesis.v1_head_version, request.expected_v1_version);
+    assert_eq!(genesis.v1_head_hash, request.expected_v1_head_hash);
+    assert_eq!(genesis.projection_bytes, before_bytes.1.as_bytes());
+    assert_eq!(ledger.read(&binding).unwrap(), before);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    let after_fills = ledger.verified_effective_fills(&effective_request).unwrap();
+    assert_eq!(before_fills.rows().unwrap(), after_fills.rows().unwrap());
+    assert_eq!(before_fills.lineage(), after_fills.lineage());
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(), before_bytes.0);
+        assert_eq!(head(&mut conn, &binding).unwrap().unwrap().projection_bytes, before_bytes.1);
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        for sql in [
+            "INSERT INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('TEST_CODE_ACCOUNT',3,'raw','prev','new','new')",
+            "INSERT OR REPLACE INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('TEST_CODE_ACCOUNT',1,'seed-v1','prev','new','new')",
+            "INSERT OR REPLACE INTO paper_ledger_head VALUES ('TEST_CODE_ACCOUNT',9,'new','new','new')",
+            "UPDATE paper_ledger_head SET version=9 WHERE account_id='TEST_CODE_ACCOUNT'",
+            "DELETE FROM paper_ledger_head WHERE account_id='TEST_CODE_ACCOUNT'",
+            "INSERT INTO paper_book_v2_event (account_id,seq,command_id,previous_hash,event_hash,kind,payload) VALUES ('TEST_CODE_ACCOUNT',2,'fill','x','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff','Fill','x')",
+        ] {
+            assert!(diesel::sql_query(sql).execute(&mut conn).is_err(), "{sql}");
+        }
+    }
+    assert!(matches!(ledger.apply(PaperCommand::Execute(order(
+        &ledger, &binding, "after-cutover", Direction::Buy, 10.0, instant(),
+    ))), Err(LedgerError::InactiveEpoch)));
+    let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(repeated.already_applied);
+    assert_eq!(repeated.event_hash, receipt.event_hash);
+    let mut different = request.clone();
+    different.cutover_id = "TEST_CODE_DIFFERENT_CUTOVER".into();
+    assert!(matches!(cutover_for_isolated_test(&db, &different, TestCutoverFault::None), Err(LedgerError::IdentityConflict)));
+}
+
+#[test]
+fn catalog_v5_cutover_replays_adjudicated_v1_without_catalog_recursion() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, binding, mut request) = catalog_v5_cutover_fixture();
+    let ledger = PaperLedger::open(&db, &instant);
+    let fill_id = ledger.effective_fills(&binding).unwrap()[0].paper_trade_id;
+    ledger.adjudicate(ruling_for(&ledger, &binding, fill_id, "TEST_CODE_v5_ruling")).unwrap();
+    let before = ledger.read(&binding).unwrap();
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    request.expected_v1_version = snapshot.version;
+    request.expected_v1_head_hash = snapshot.event_hash;
+    request.expected_v1_projection_hash = snapshot.projection_hash;
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert_eq!(ledger.read(&binding).unwrap(), before);
+}
+
+#[test]
+fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+    for fault in [TestCutoverFault::AfterGenesisWrites, TestCutoverFault::AfterOwnerCas] {
+        assert!(cutover_for_isolated_test(&db, &request, fault).is_err());
+        let mut conn = db.get_conn().unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
+        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+        assert!(diesel::sql_query("UPDATE paper_book_owner_v2 SET active_generation=2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .execute(&mut conn).is_err());
+    }
+    assert_eq!(PaperLedger::open(&db, &instant).read(&binding).unwrap().version, request.expected_v1_version);
+    assert!(matches!(cutover_for_isolated_test(&db, &request, TestCutoverFault::AfterCommitOutcomeUnknown), Err(LedgerError::CommitOutcomeUnknown)));
+    let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(repeated.already_applied);
+}
+
+#[test]
+fn catalog_v5_cutover_rejects_fee_head_and_epoch_claims_without_residue() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    use crate::performance::fee_policy::{AShareFeePolicyV2, FeeRate};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    let mut stale = request.clone();
+    stale.expected_v1_version += 1;
+    assert!(matches!(cutover_for_isolated_test(&db, &stale, TestCutoverFault::None), Err(LedgerError::VersionChanged)));
+    let mut reused = request.clone();
+    reused.new_epoch_id = request.old_binding.epoch_id.clone();
+    assert!(cutover_for_isolated_test(&db, &reused, TestCutoverFault::None).is_err());
+    let mut wrong_fee = request.clone();
+    wrong_fee.reviewed_fee_policy = AShareFeePolicyV2::new(
+        request.reviewed_fee_policy.scope(), FeeRate::new(4,10_000).unwrap(),
+        5_000_000, request.reviewed_fee_policy.coverage(), "TEST_CODE_other_review",
+    ).unwrap();
+    assert!(cutover_for_isolated_test(&db, &wrong_fee, TestCutoverFault::None).is_err());
+    let mut conn = db.get_conn().unwrap();
+    crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+    assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+        .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+}
+
+#[test]
+fn catalog_v5_cutover_reader_rejects_projection_and_v1_anchor_tamper() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    for target in ["v2-projection", "v1-anchor"] {
+        let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+        let mut conn = db.get_conn().unwrap();
+        let (guard, update, statements) = if target == "v2-projection" {
+            ("paper_book_v2_head_no_update",
+             "UPDATE paper_book_v2_head SET projection_bytes=X'00' WHERE account_id='TEST_CODE_ACCOUNT'",
+             crate::database::paper_book_v2_ledger_schema_v1::STATEMENTS)
+        } else {
+            ("paper_book_owner_v2_head_update",
+             "UPDATE paper_ledger_head SET version=version+1 WHERE account_id='TEST_CODE_ACCOUNT'",
+             crate::database::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS)
+        };
+        diesel::sql_query(format!("DROP TRIGGER {guard}")).execute(&mut conn).unwrap();
+        diesel::sql_query(update).execute(&mut conn).unwrap();
+        let restore = statements.iter().find(|(_, name, _, _)| *name == guard).unwrap().3;
+        diesel::sql_query(restore).execute(&mut conn).unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn).unwrap();
+        assert!(crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err(), "{target}");
+        drop(conn);
+        assert!(read_v2_on(&db, &binding.account_id).is_err(), "{target}");
+        assert!(PaperLedger::open(&db, &instant).read(&binding).is_err(), "{target}");
+    }
+}
+
+#[test]
+fn catalog_v5_cutover_reader_rejects_orphan_v2_account() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    let mut conn = db.get_conn().unwrap();
+    conn.batch_execute("PRAGMA foreign_keys=OFF").unwrap();
+    diesel::sql_query("INSERT INTO paper_book_v2_account
+        (account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,
+         v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id)
+        SELECT 'ghost','ghost-epoch','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'ghost',policy_instance_id,'ghost-old',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ghost-cutover'
+        FROM paper_book_v2_fee_manifest WHERE singleton=1")
+        .execute(&mut conn).unwrap();
+    conn.batch_execute("PRAGMA foreign_keys=ON").unwrap();
+    crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn).unwrap();
+    assert!(crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err());
+}
+
 #[test]
 fn catalog_v5_prepared_upgrade_preserves_v1_history_and_writes() {
     let dir = tempfile::tempdir().unwrap();

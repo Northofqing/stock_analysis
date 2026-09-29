@@ -883,6 +883,15 @@ fn replay_through(
     binding: &AccountBinding,
     until: Option<i64>,
 ) -> Result<PaperView, LedgerError> {
+    replay_through_inner(conn, binding, until, false)
+}
+
+fn replay_through_inner(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    until: Option<i64>,
+    catalog_already_verified: bool,
+) -> Result<PaperView, LedgerError> {
     let account = account(conn, &binding.account_id)?.ok_or(LedgerError::NotSeeded)?;
     let manifest: SeedManifest = decode(&account.manifest_bytes)?;
     if account.epoch_id != binding.epoch_id
@@ -933,6 +942,7 @@ fn replay_through(
                 row.seq,
                 &row.previous_hash,
                 ruling,
+                catalog_already_verified,
                 state
                     .as_ref()
                     .ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
@@ -971,7 +981,15 @@ fn head(
     Ok(diesel::sql_query("SELECT version,event_hash,projection_bytes,projection_hash FROM paper_ledger_head WHERE account_id=?").bind::<Text,_>(&binding.account_id).get_result::<HeadRow>(conn).optional()?)
 }
 fn load(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<PaperView, LedgerError> {
-    let view = replay(conn, binding)?;
+    load_inner(conn, binding, false)
+}
+
+fn load_inner(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    catalog_already_verified: bool,
+) -> Result<PaperView, LedgerError> {
+    let view = replay_through_inner(conn, binding, None, catalog_already_verified)?;
     let head = head(conn, binding)?.ok_or_else(|| {
         LedgerError::IntegrityFailure("missing projection; explicit repair required".into())
     })?;
@@ -985,6 +1003,37 @@ fn load(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<PaperVi
         ));
     }
     Ok(view)
+}
+
+/// Replays V1 and compares the exact persisted head and economic projection.
+/// V2 cutover and V2Active read verification use this without reopening a
+/// connection or granting V1 write authority. Its caller must first verify
+/// the catalog on this same connection; that check is omitted from nested
+/// adjudication replay to avoid recursively entering the V2 owner verifier.
+pub(crate) fn verified_v1_snapshot_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<VerifiedV1Snapshot, LedgerError> {
+    let view = load_inner(conn, binding, true)?;
+    view.require_available()?;
+    let equity = view.equity()?;
+    let stored = head(conn, binding)?
+        .ok_or_else(|| LedgerError::IntegrityFailure("missing V1 projection head".into()))?;
+    Ok(VerifiedV1Snapshot {
+        version: view.version,
+        event_hash: view.event_hash,
+        projection_bytes: stored.projection_bytes,
+        projection_hash: stored.projection_hash,
+        equity,
+    })
+}
+
+pub(crate) struct VerifiedV1Snapshot {
+    pub(crate) version: i64,
+    pub(crate) event_hash: String,
+    pub(crate) projection_bytes: String,
+    pub(crate) projection_hash: String,
+    pub(crate) equity: Money,
 }
 
 fn append(

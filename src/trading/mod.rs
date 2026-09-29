@@ -6,6 +6,7 @@
 //! v12 PR3-3.5: 新增 paper_trade 模块, 虚拟腿只写 paper_trades, 零写 stock_position (BR-023).
 
 pub mod order_safety;
+pub(crate) mod paper_book_v2;
 pub mod paper_engine; // v16.3 Commit 4a: 4 铁律接入 paper_trade 卖出
 pub mod paper_ledger;
 pub mod paper_ledger_runtime;

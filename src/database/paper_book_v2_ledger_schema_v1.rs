@@ -38,6 +38,9 @@ pub(crate) const STATEMENTS: &[(&str, &str, &str, &str)] = &[
     ("trigger", "paper_book_v2_account_no_reinsert", "paper_book_v2_account", "CREATE TRIGGER paper_book_v2_account_no_reinsert BEFORE INSERT ON paper_book_v2_account
         WHEN EXISTS(SELECT 1 FROM paper_book_v2_account WHERE account_id=NEW.account_id OR epoch_id=NEW.epoch_id OR cutover_id=NEW.cutover_id)
         BEGIN SELECT RAISE(ABORT,'immutable V2 account'); END"),
+    ("trigger", "paper_book_v2_account_new_epoch", "paper_book_v2_account", "CREATE TRIGGER paper_book_v2_account_new_epoch BEFORE INSERT ON paper_book_v2_account
+        WHEN EXISTS(SELECT 1 FROM paper_ledger_account WHERE epoch_id=NEW.epoch_id)
+        BEGIN SELECT RAISE(ABORT,'V2 epoch must not reuse a V1 epoch'); END"),
     ("trigger", "paper_book_v2_event_no_update", "paper_book_v2_event", "CREATE TRIGGER paper_book_v2_event_no_update BEFORE UPDATE ON paper_book_v2_event
         BEGIN SELECT RAISE(ABORT,'append-only V2 event'); END"),
     ("trigger", "paper_book_v2_event_no_delete", "paper_book_v2_event", "CREATE TRIGGER paper_book_v2_event_no_delete BEFORE DELETE ON paper_book_v2_event

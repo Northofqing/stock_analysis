@@ -358,9 +358,12 @@ pub(super) fn verify_ruling(
     seq: i64,
     previous: &str,
     fact: &AdjudicatedFact,
+    catalog_already_verified: bool,
     before: &Projection,
 ) -> Result<(), LedgerError> {
-    effective::verify_catalog(conn)?;
+    if !catalog_already_verified {
+        effective::verify_catalog(conn)?;
+    }
     let request = &fact.request;
     validate_fact_time(request)?;
     if request.binding != *binding

@@ -7,6 +7,9 @@ use diesel::sql_types::{BigInt, Text};
 
 pub(crate) const CATALOG_GENERATION: i64 = 5;
 const APPLICATION_ID: i64 = 1_398_035_265;
+pub(crate) const OWNER_TRANSITION_GUARD_DDL: &str =
+    "CREATE TRIGGER paper_book_owner_v2_transition BEFORE UPDATE ON paper_book_owner_v2
+        BEGIN SELECT RAISE(ABORT,'owner transition requires isolated verified cutover'); END";
 
 pub(crate) const OWNER_STATEMENTS: &[(&str, &str, &str, &str)] = &[
     ("table", "paper_book_owner_v2", "paper_book_owner_v2", "CREATE TABLE paper_book_owner_v2 (
@@ -28,24 +31,7 @@ pub(crate) const OWNER_STATEMENTS: &[(&str, &str, &str, &str)] = &[
           OR NOT EXISTS(SELECT 1 FROM paper_ledger_account a WHERE a.account_id=NEW.account_id
               AND a.epoch_id=NEW.active_epoch_id AND a.manifest_hash=NEW.active_manifest_hash)
         BEGIN SELECT RAISE(ABORT,'invalid paper book owner insert'); END"),
-    ("trigger", "paper_book_owner_v2_transition", "paper_book_owner_v2", "CREATE TRIGGER paper_book_owner_v2_transition BEFORE UPDATE ON paper_book_owner_v2
-        WHEN NOT (OLD.active_generation=1 AND OLD.owner_revision=1
-          AND NEW.account_id=OLD.account_id AND NEW.active_generation=2 AND NEW.owner_revision=2
-          AND NEW.cutover_id IS NOT NULL AND length(NEW.cutover_id)>0
-          AND NOT EXISTS(SELECT 1 FROM paper_book_owner_v2 other
-              WHERE other.account_id!=OLD.account_id
-                AND (other.active_epoch_id=NEW.active_epoch_id OR other.cutover_id=NEW.cutover_id))
-          AND EXISTS(SELECT 1 FROM paper_book_v2_account a
-              JOIN paper_book_v2_event e ON e.account_id=a.account_id AND e.seq=1 AND e.kind='Genesis'
-              JOIN paper_book_v2_head h ON h.account_id=a.account_id AND h.version=1 AND h.event_hash=e.event_hash
-              JOIN paper_ledger_head old_head ON old_head.account_id=a.account_id
-              WHERE a.account_id=NEW.account_id AND a.epoch_id=NEW.active_epoch_id
-                AND a.manifest_hash=NEW.active_manifest_hash AND a.cutover_id=NEW.cutover_id
-                AND a.v1_epoch_id=OLD.active_epoch_id AND a.v1_manifest_hash=OLD.active_manifest_hash
-                AND a.v1_head_version=old_head.version AND a.v1_head_hash=old_head.event_hash
-                AND a.v1_projection_hash=old_head.projection_hash
-                AND a.fee_policy_instance_id=(SELECT policy_instance_id FROM paper_book_v2_fee_manifest WHERE singleton=1)))
-        BEGIN SELECT RAISE(ABORT,'invalid paper book owner transition'); END"),
+    ("trigger", "paper_book_owner_v2_transition", "paper_book_owner_v2", OWNER_TRANSITION_GUARD_DDL),
 ];
 
 /// Frozen V1 DDL is unchanged. These generation-5 guards replace only the
@@ -172,40 +158,19 @@ pub(crate) fn verify_catalog_v5_structure_on(
     Ok(())
 }
 
-/// Read-only prepared-state proof. V2Active semantics are deliberately absent
-/// until a separately reviewed cutover/replay module extends row verification.
+/// Read-only owner proof. V2Active rows require complete V1 replay and exact
+/// anchor, genesis, and projection verification.
 pub(crate) fn verify_catalog_v5_on(conn: &mut SqliteConnection) -> Result<(), PaperBookOwnerError> {
     verify_catalog_v5_structure_on(conn)?;
-    verify_prepared_rows(conn)
+    crate::trading::paper_book_v2::verify_owner_rows_on(conn)
+        .map_err(|_| PaperBookOwnerError::InactiveOwner)
 }
 
-fn verify_prepared_rows(conn: &mut SqliteConnection) -> Result<(), PaperBookOwnerError> {
-    #[derive(QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = BigInt)]
-        value: i64,
-    }
-    let mismatched = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM paper_ledger_account a LEFT JOIN paper_book_owner_v2 o ON o.account_id=a.account_id
-         WHERE o.account_id IS NULL OR o.active_generation!=1 OR o.owner_revision!=1 OR o.cutover_id IS NOT NULL
-           OR o.active_epoch_id!=a.epoch_id OR o.active_manifest_hash!=a.manifest_hash",
-    ).get_result::<Count>(conn)?.value;
-    let orphan = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM paper_book_owner_v2 o LEFT JOIN paper_ledger_account a ON a.account_id=o.account_id
-         WHERE a.account_id IS NULL OR o.active_generation!=1 OR o.owner_revision!=1 OR o.cutover_id IS NOT NULL
-           OR o.active_epoch_id!=a.epoch_id OR o.active_manifest_hash!=a.manifest_hash",
-    ).get_result::<Count>(conn)?.value;
-    let v2_rows = diesel::sql_query(
-        "SELECT (SELECT COUNT(*) FROM paper_book_v2_account)
-              + (SELECT COUNT(*) FROM paper_book_v2_event)
-              + (SELECT COUNT(*) FROM paper_book_v2_head) AS value",
-    )
-    .get_result::<Count>(conn)?
-    .value;
-    if mismatched != 0 || orphan != 0 || v2_rows != 0 {
-        return Err(PaperBookOwnerError::InactiveOwner);
-    }
-    Ok(())
+#[cfg(test)]
+pub(crate) fn require_isolated_for_test(
+    conn: &mut SqliteConnection,
+) -> Result<(), PaperBookOwnerError> {
+    super::paper_book_owner_schema_v1::require_isolated(conn)
 }
 
 pub(crate) fn require_v1_owner_on(
@@ -487,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn dormant_owner_transition_fences_every_raw_v1_write_shape() {
+    fn raw_transition_is_blocked_even_with_staged_genesis() {
         let mut conn = v4();
         install_catalog_v5_for_isolated_test(&mut conn).unwrap();
         conn.batch_execute("INSERT INTO paper_book_v2_account
@@ -504,44 +469,31 @@ mod tests {
                'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','Genesis','genesis-payload');
             INSERT INTO paper_book_v2_head VALUES
               ('acct-a',1,'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-               'projection-v2','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
-            UPDATE paper_book_owner_v2 SET active_generation=2,active_epoch_id='epoch-v2',
-              active_manifest_hash='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-              owner_revision=2,cutover_id='cutover-test' WHERE account_id='acct-a'")
+               'projection-v2','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')")
             .unwrap();
+        for keyword in ["UPDATE", "UPDATE OR REPLACE"] {
+            let sql = format!("{keyword} paper_book_owner_v2 SET active_generation=2,active_epoch_id='epoch-v2',
+              active_manifest_hash='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+              owner_revision=2,cutover_id='cutover-test' WHERE account_id='acct-a'");
+            assert!(diesel::sql_query(sql).execute(&mut conn).is_err());
+        }
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS value FROM paper_book_owner_v2 WHERE active_generation=1"
+            ),
+            1
+        );
         verify_catalog_v5_structure_on(&mut conn).unwrap();
         assert!(matches!(
             verify_catalog_v5_on(&mut conn),
             Err(PaperBookOwnerError::InactiveOwner)
         ));
-        for sql in [
-            "INSERT INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('acct-a',2,'next','prev','next','next')",
-            "INSERT OR REPLACE INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('acct-a',1,'seed','prev','new','new')",
-            "INSERT OR REPLACE INTO paper_ledger_account VALUES ('acct-a','epoch-a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','new','micro-cny-half-up-v1','lot-rates-v1')",
-            "INSERT OR REPLACE INTO paper_ledger_head VALUES ('acct-a',2,'new','new','new')",
-            "UPDATE paper_ledger_head SET version=2 WHERE account_id='acct-a'",
-            "DELETE FROM paper_ledger_head WHERE account_id='acct-a'",
-        ] {
-            assert!(diesel::sql_query(sql).execute(&mut conn).is_err(), "{sql}");
-        }
-        assert_eq!(
-            count(
-                &mut conn,
-                "SELECT COUNT(*) AS value FROM paper_ledger_event WHERE account_id='acct-a'"
-            ),
-            1
-        );
-        assert_eq!(
-            value(
-                &mut conn,
-                "SELECT projection_bytes AS value FROM paper_ledger_head WHERE account_id='acct-a'"
-            ),
-            "projection-old-bytes"
-        );
+        assert_eq!(value(&mut conn, "SELECT payload AS value FROM paper_ledger_event WHERE account_id='acct-a' AND seq=1"), "event-old-bytes");
     }
 
     #[test]
-    fn update_or_replace_cannot_steal_another_accounts_owner_epoch() {
+    fn v2_epoch_cannot_reuse_any_v1_epoch() {
         let mut conn = v3();
         conn.batch_execute(
             "INSERT INTO paper_ledger_account VALUES
@@ -560,27 +512,28 @@ mod tests {
         )
         .unwrap();
         install_catalog_v5_for_isolated_test(&mut conn).unwrap();
-        conn.batch_execute("INSERT INTO paper_book_v2_account
-            (account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,
-             v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id)
-            SELECT 'acct-a','epoch-b','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-                   'manifest-v2',policy_instance_id,'epoch-a',
-                   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                   1,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-                   'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','cutover-conflict'
-            FROM paper_book_v2_fee_manifest WHERE singleton=1;
-            INSERT INTO paper_book_v2_event VALUES
-              ('acct-a',1,'genesis-v2','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','Genesis','genesis-payload');
-            INSERT INTO paper_book_v2_head VALUES
-              ('acct-a',1,'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-               'projection-v2','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')")
-            .unwrap();
-        assert!(diesel::sql_query("UPDATE OR REPLACE paper_book_owner_v2
-            SET active_generation=2,active_epoch_id='epoch-b',
-                active_manifest_hash='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-                owner_revision=2,cutover_id='cutover-conflict' WHERE account_id='acct-a'")
-            .execute(&mut conn).is_err());
+        for epoch in ["epoch-a", "epoch-b"] {
+            let sql = "INSERT INTO paper_book_v2_account
+                (account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,
+                 v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id)
+                SELECT 'acct-a',?,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                       'manifest-v2',policy_instance_id,'epoch-a',
+                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                       1,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                       'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','cutover-conflict'
+                FROM paper_book_v2_fee_manifest WHERE singleton=1";
+            assert!(diesel::sql_query(sql)
+                .bind::<Text, _>(epoch)
+                .execute(&mut conn)
+                .is_err());
+        }
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) AS value FROM paper_book_v2_account"
+            ),
+            0
+        );
         assert_eq!(
             count(
                 &mut conn,
@@ -588,7 +541,7 @@ mod tests {
             ),
             2
         );
-        assert_eq!(value(&mut conn, "SELECT account_id AS value FROM paper_book_owner_v2 WHERE active_epoch_id='epoch-b'"), "acct-b");
+        verify_catalog_v5_on(&mut conn).unwrap();
     }
 
     #[test]
