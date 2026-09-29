@@ -749,6 +749,25 @@ fn map_current_routed_query_error(op: Operation, error: &GrpcError) -> GatewayEr
     if op == Operation::OutcomeDailyBars {
         return legacy;
     }
+    // An explicit, non-retryable server contract refusal is distinct from a
+    // temporarily unavailable provider. The frozen durable v1 projection above
+    // is unchanged; only current ordinary acquisitions use this typed detail.
+    if error.details().reason_code.as_deref() == Some("unsupported_contract")
+        && error.details().retryable == Some(false)
+    {
+        return GatewayError::classified(
+            legacy.capability(),
+            error
+                .details()
+                .provider
+                .as_deref()
+                .and_then(|name| convert::parse_provider(name).ok()),
+            "unsupported",
+            "unsupported_contract",
+            false,
+            legacy.message(),
+        );
+    }
     GatewayError::classified(
         legacy.capability(),
         error
@@ -4678,6 +4697,45 @@ mod tests {
         assert_eq!(g.audit_outcome(), "unavailable");
         assert!(g.retryable());
         assert!(g.message().contains("BoardConstituents"));
+    }
+
+    #[test]
+    fn current_money_flow_keeps_typed_unsupported_contract_without_retry() {
+        let detail = ErrorDetail {
+            code: "internal".to_owned(),
+            provider: Some("Eastmoney".to_owned()),
+            reason_code: Some("unsupported_contract".to_owned()),
+            retryable: Some(false),
+            ..Default::default()
+        };
+        let error = GrpcError::Internal {
+            details: Box::new(detail.clone()),
+        };
+        let current = map_current_routed_query_error(Operation::MoneyFlows, &error);
+        assert_eq!(current.provider(), Some(ProviderId::Eastmoney));
+        assert_eq!(current.audit_outcome(), "unsupported");
+        assert_eq!(current.reason_code(), "unsupported_contract");
+        assert!(!current.retryable());
+
+        let legacy = map_legacy_durable_query_error(Operation::MoneyFlows, &error);
+        assert_eq!(legacy.audit_outcome(), "unavailable");
+        assert_eq!(legacy.reason_code(), "internal");
+
+        let missing_detail = GrpcError::Internal {
+            details: Box::default(),
+        };
+        let unproven = map_current_routed_query_error(Operation::MoneyFlows, &missing_detail);
+        assert_eq!(unproven.reason_code(), "no_verified_batch");
+        assert_eq!(unproven.audit_outcome(), "unavailable");
+
+        let contradictory = GrpcError::Internal {
+            details: Box::new(ErrorDetail {
+                retryable: Some(true),
+                ..detail
+            }),
+        };
+        let unproven = map_current_routed_query_error(Operation::MoneyFlows, &contradictory);
+        assert_ne!(unproven.audit_outcome(), "unsupported");
     }
 
     #[test]
