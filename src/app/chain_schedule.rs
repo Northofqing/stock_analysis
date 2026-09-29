@@ -623,12 +623,14 @@ where
             envelope.acquisition.as_ref(),
         ) {
             Ok(observation) => log::info!(
-                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} selected_news_source_ref_v1={} selected_news_provider={:?} selected_news_source={} selected_news_batch_id_sha256={} selected_news_source_at={} selected_news_provider_observed_at={} selected_news_input_sha256={} selected_news_input_bytes={:?} prepared_macro_source_status={:?} selected_news_content_scope=selected_titles_utf8 provider_raw_batch_sha256=unobserved coverage={} covered_inputs={} foundation_persisted=false",
+                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} selected_news_source_ref_status={} selected_news_source_ref_reason={} selected_news_source_ref_v1={} selected_news_provider={:?} selected_news_source={} selected_news_batch_id_sha256={} selected_news_source_at={} selected_news_provider_observed_at={} selected_news_input_sha256={} selected_news_input_bytes={:?} prepared_macro_source_status={:?} selected_news_content_scope=selected_titles_utf8 provider_raw_batch_sha256=unobserved coverage={} covered_inputs={} foundation_persisted=false",
                 observation.phase.as_str(), observation.schedule_date, observation.prepared_business_date,
                 observation.artifact_sha256, observation.artifact_bytes, observation.report_input_sha256,
                 observation.report_input_bytes, observation.prepared_report_equals_input,
                 observation.acquisition_sha256.as_deref().unwrap_or("absent"),
                 observation.acquisition_report_binding_sha256.as_deref().unwrap_or("absent"),
+                observation.selected_news_source_ref_status.status(),
+                observation.selected_news_source_ref_status.reason(),
                 observation.selected_news_source_ref.as_ref().map(|source| source.ref_sha256.as_str()).unwrap_or("absent"),
                 observation.selected_news_source_ref.as_ref().map(|source| source.provider),
                 observation.selected_news_source_ref.as_ref().map(|source| source.source.as_str()).unwrap_or("absent"),

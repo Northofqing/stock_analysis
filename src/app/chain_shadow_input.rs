@@ -5,13 +5,45 @@ use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
-use super::chain_acquisition::{ChainAcquisitionEvidence, ChainSelectedNewsSourceRefV1};
+use super::chain_acquisition::{
+    ChainAcquisitionEvidence, ChainSelectedNewsSourceRefV1, MissingSelectedNewsSourceTime,
+};
 use super::chain_schedule::ChainPhase;
 
 pub(super) const COVERAGE: &str = "incomplete";
 pub(super) const REPORT_INPUTS: &str = "prepared_report_utf8_only";
 pub(super) const ACQUISITION_INPUTS: &str =
     "limit_up_metadata_selected_news_titles_utf8_and_report_utf8";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelectedNewsSourceRefStatus {
+    Observed,
+    NoAcquisition,
+    NewsNotAvailable,
+    MissingSourceTime,
+    Rejected,
+}
+
+impl SelectedNewsSourceRefStatus {
+    pub(super) fn status(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::NoAcquisition | Self::NewsNotAvailable => "not_applicable",
+            Self::MissingSourceTime => "unobserved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::Observed => "none",
+            Self::NoAcquisition => "no_acquisition",
+            Self::NewsNotAvailable => "news_not_available",
+            Self::MissingSourceTime => "missing_source_at",
+            Self::Rejected => "lineage_validation_failed",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct ChainReportInputObservation {
@@ -26,6 +58,7 @@ pub(super) struct ChainReportInputObservation {
     pub acquisition_sha256: Option<String>,
     pub acquisition_report_binding_sha256: Option<String>,
     pub selected_news_source_ref: Option<ChainSelectedNewsSourceRefV1>,
+    pub selected_news_source_ref_status: SelectedNewsSourceRefStatus,
     pub prepared_macro_source_status:
         stock_analysis::pipeline::chain_analysis::preparation::SourceStatus,
     pub coverage: &'static str,
@@ -42,10 +75,21 @@ pub(super) fn observe(
     acquisition: Option<&ChainAcquisitionEvidence>,
 ) -> Result<ChainReportInputObservation> {
     let artifact = prepared.to_artifact_bytes()?;
-    let selected_news_source_ref = acquisition
-        .map(|retained| retained.selected_news_source_ref(prepared))
-        .transpose()?
-        .flatten();
+    let (selected_news_source_ref, selected_news_source_ref_status) = match acquisition {
+        None => (None, SelectedNewsSourceRefStatus::NoAcquisition),
+        Some(retained) => match retained.selected_news_source_ref(prepared) {
+            Ok(Some(source_ref)) => (Some(source_ref), SelectedNewsSourceRefStatus::Observed),
+            Ok(None) => (None, SelectedNewsSourceRefStatus::NewsNotAvailable),
+            Err(error)
+                if error
+                    .downcast_ref::<MissingSelectedNewsSourceTime>()
+                    .is_some() =>
+            {
+                (None, SelectedNewsSourceRefStatus::MissingSourceTime)
+            }
+            Err(_) => (None, SelectedNewsSourceRefStatus::Rejected),
+        },
+    };
     let acquisition_sha256 = acquisition
         .map(|retained| {
             anyhow::ensure!(
@@ -81,6 +125,7 @@ pub(super) fn observe(
         acquisition_sha256,
         acquisition_report_binding_sha256,
         selected_news_source_ref,
+        selected_news_source_ref_status,
         prepared_macro_source_status: prepared.macro_source().status().clone(),
         coverage: COVERAGE,
         covered_inputs: if acquisition.is_some() {

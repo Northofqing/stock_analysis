@@ -118,6 +118,10 @@ pub(super) struct ChainSelectedNewsSourceRefV1 {
     pub(super) content_bytes: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("产业链新闻来源时间缺失")]
+pub(super) struct MissingSelectedNewsSourceTime;
+
 impl ChainAcquisitionEvidence {
     pub(super) fn selected_news_source_ref(
         &self,
@@ -161,7 +165,7 @@ impl ChainAcquisitionEvidence {
             .source_at
             .as_deref()
             .filter(|at| !at.trim().is_empty())
-            .context("产业链新闻来源时间缺失")?;
+            .ok_or(MissingSelectedNewsSourceTime)?;
         let source_time =
             EvidenceTimestamp::parse_instant(source_at).context("产业链新闻来源时间无效")?;
         let observed_time = EvidenceTimestamp::parse_instant(&evidence.observed_at)
@@ -380,7 +384,8 @@ mod tests {
     use super::*;
     use crate::app::chain_schedule::ChainPhase;
     use crate::app::chain_shadow_input::{
-        observe, test_prepared, test_prepared_with_macro, ACQUISITION_INPUTS,
+        observe, test_prepared, test_prepared_with_macro, SelectedNewsSourceRefStatus,
+        ACQUISITION_INPUTS,
     };
     use chrono::Utc;
     use std::{
@@ -696,6 +701,22 @@ mod tests {
             PreparedChainAnalysis::from_artifact_bytes(&changed.to_artifact_bytes().unwrap())
                 .unwrap();
         assert!(retained.selected_news_source_ref(&changed).is_err());
+        let changed_observation = observe(
+            ChainPhase::Preopen,
+            retained.business_date,
+            &changed,
+            changed.report().as_bytes(),
+            Some(&retained),
+        )
+        .unwrap();
+        assert_eq!(
+            changed_observation.selected_news_source_ref_status,
+            SelectedNewsSourceRefStatus::Rejected
+        );
+        assert!(changed_observation.selected_news_source_ref.is_none());
+        assert!(changed_observation
+            .acquisition_report_binding_sha256
+            .is_some());
 
         let missing = test_prepared(retained.business_date, Rc::new(Cell::new(0))).await;
         let missing =
@@ -706,6 +727,54 @@ mod tests {
         if let ChainNewsEvidence::Available { evidence, .. } = &mut retained.news {
             evidence.source_at = None;
         }
+        assert!(retained.selected_news_source_ref(&prepared).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_news_source_time_keeps_existing_input_digests() {
+        let mut evidence = batch(
+            ProviderId::Cailianpress,
+            "cls-v1",
+            "TEST_CODE_news_without_source_time",
+            "2026-09-28T07:00:02Z",
+        );
+        evidence.source_at = None;
+        let (prepared, retained, _) = scripted(
+            "TEST_CODE_pool_v3",
+            Ok(GatewayBatch::Available {
+                records: vec![news_record(0)],
+                evidence,
+            }),
+        )
+        .await;
+        let observation = observe(
+            ChainPhase::Preopen,
+            retained.business_date,
+            &prepared,
+            prepared.report().as_bytes(),
+            Some(&retained),
+        )
+        .unwrap();
+        assert_eq!(
+            observation.selected_news_source_ref_status,
+            SelectedNewsSourceRefStatus::MissingSourceTime
+        );
+        assert_eq!(
+            observation.selected_news_source_ref_status.status(),
+            "unobserved"
+        );
+        assert_eq!(
+            observation.selected_news_source_ref_status.reason(),
+            "missing_source_at"
+        );
+        assert!(observation.selected_news_source_ref.is_none());
+        assert_eq!(
+            observation.acquisition_sha256,
+            Some(retained.sha256().unwrap())
+        );
+        assert_eq!(observation.artifact_sha256.len(), 64);
+        assert_eq!(observation.report_input_sha256.len(), 64);
+        assert!(observation.acquisition_report_binding_sha256.is_some());
         assert!(retained.selected_news_source_ref(&prepared).is_err());
     }
 
