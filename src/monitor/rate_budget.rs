@@ -1,7 +1,7 @@
 //! 请求预算与退避熔断。
 //!
 //! 功能：
-//! - RateBudget: 滑动窗口请求计数，防止超频
+//! - RateBudget: 按需重置的固定窗口请求计数，防止超频
 //! - BackoffStrategy: 多级退避（切换Host/降级频率/熔断）
 //! - CircuitBreaker: 熔断器（连续失败N次→断开→冷却后恢复）
 //!
@@ -12,16 +12,15 @@
 
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-// 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex — `window_start: Instant`
-// 是纳秒级时间戳读取, lock 持有 < 50ns. 改 tokio Mutex 得不偿失.
+// 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex 保护短时同步预算状态。
 use std::sync::Mutex;
 use std::time::Instant;
 
 // ============================================================================
-// 滑动窗口请求预算
+// 固定窗口请求预算
 // ============================================================================
 
-/// 滑动窗口请求预算器。
+/// 按需重置的固定窗口请求预算器。窗口边界可能连续放行两轮配额。
 ///
 /// 线程安全：使用 AtomicU32 暴露计数，Mutex 串行化窗口重置和配额消耗。
 pub struct RateBudget {
@@ -56,6 +55,9 @@ impl RateBudget {
 
     /// 尝试消耗一次请求配额。返回 true 表示允许，false 表示超限。
     pub fn try_acquire(&self) -> bool {
+        if self.window_secs == 0 {
+            return false;
+        }
         let Ok(mut start) = self.window_start.lock() else {
             warn!("[RateBudget] 预算窗口锁已损坏，拒绝请求");
             return false;
@@ -440,6 +442,7 @@ mod tests {
         let ready = Arc::new(Barrier::new(WORKERS + 1));
         let finish = Arc::new(Barrier::new(WORKERS + 1));
         let accepted = Arc::new(AtomicU32::new(0));
+        let mut accepted_per_round = Vec::with_capacity(ROUNDS);
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
                 let budget = Arc::clone(&budget);
@@ -465,9 +468,22 @@ mod tests {
                 start.wait();
                 ready.wait();
                 finish.wait();
-                assert_eq!(accepted.load(Ordering::Relaxed), 1);
+                accepted_per_round.push(accepted.load(Ordering::Relaxed));
             }
         });
+        assert_eq!(accepted_per_round.len(), ROUNDS);
+        assert!(
+            accepted_per_round.iter().all(|count| *count == 1),
+            "each round must admit exactly one request: {accepted_per_round:?}"
+        );
+    }
+
+    #[test]
+    fn zero_length_window_denies_requests() {
+        let budget = RateBudget::with_window(1, 0);
+        assert!(!budget.try_acquire());
+        assert!(!budget.try_acquire());
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
