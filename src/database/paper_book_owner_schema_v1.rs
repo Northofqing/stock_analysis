@@ -108,9 +108,9 @@ pub(crate) const V1_GUARD_STATEMENTS: &[(&str, &str, &str, &str)] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PaperBookOwnerError {
-    #[error("paper book owner requires CatalogV4 or an unchanged legacy V1 catalog")]
+    #[error("paper book owner requires CatalogV4/V5 or an unchanged legacy V1 catalog")]
     WrongDatabaseIdentity,
-    #[error("paper book V4 owner or fee namespace is missing, altered, or has extra objects")]
+    #[error("paper book owner or fee namespace is missing, altered, or has extra objects")]
     CatalogMismatch,
     #[error("paper book V1 account owner does not match the bound epoch and manifest")]
     InactiveOwner,
@@ -173,13 +173,11 @@ fn owner_objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, Pape
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM main.sqlite_master
-         WHERE (name GLOB 'paper_book_owner_v1_*' OR name='paper_book_owner_v1'
-             OR tbl_name='paper_book_owner_v1') AND sql IS NOT NULL
+         WHERE (name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*') AND sql IS NOT NULL
          UNION ALL
          SELECT 'temp' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM temp.sqlite_master
-         WHERE (name GLOB 'paper_book_owner_v1_*' OR name='paper_book_owner_v1'
-             OR tbl_name='paper_book_owner_v1') AND sql IS NOT NULL
+         WHERE (name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*') AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .load(conn)?)
@@ -254,6 +252,16 @@ pub(crate) fn require_v1_owner_on(
     manifest_hash: &str,
 ) -> Result<(), PaperBookOwnerError> {
     let found = identity(conn)?;
+    if found.application_id == APPLICATION_ID
+        && found.user_version == super::paper_book_owner_schema_v2::CATALOG_GENERATION
+    {
+        return super::paper_book_owner_schema_v2::require_v1_owner_on(
+            conn,
+            account_id,
+            epoch_id,
+            manifest_hash,
+        );
+    }
     if found.application_id == APPLICATION_ID && matches!(found.user_version, 1 | 2 | 3) {
         let fee_namespace_ok = if !has_v2_objects(conn)? {
             true
@@ -295,7 +303,7 @@ pub(crate) fn require_v1_owner_on(
 }
 
 #[cfg(test)]
-fn require_isolated(conn: &mut SqliteConnection) -> Result<(), PaperBookOwnerError> {
+pub(super) fn require_isolated(conn: &mut SqliteConnection) -> Result<(), PaperBookOwnerError> {
     #[derive(QueryableByName)]
     struct MainFile {
         #[diesel(sql_type = Text)]

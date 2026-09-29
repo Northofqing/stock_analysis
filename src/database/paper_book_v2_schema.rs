@@ -128,6 +128,20 @@ fn objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, StagedPape
     .load(conn)?)
 }
 
+fn fee_objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, StagedPaperBookV2Error> {
+    Ok(diesel::sql_query(
+        "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
+         FROM main.sqlite_master
+         WHERE (name GLOB 'paper_book_v2_fee_manifest*' OR tbl_name='paper_book_v2_fee_manifest') AND sql IS NOT NULL
+         UNION ALL
+         SELECT 'temp' AS namespace,type AS kind,name,tbl_name AS table_name,sql
+         FROM temp.sqlite_master
+         WHERE (name GLOB 'paper_book_v2_fee_manifest*' OR tbl_name='paper_book_v2_fee_manifest') AND sql IS NOT NULL
+         ORDER BY namespace,kind,name,table_name,sql",
+    )
+    .load(conn)?)
+}
+
 pub(crate) fn create_schema(conn: &mut SqliteConnection) -> Result<(), StagedPaperBookV2Error> {
     for (_, _, _, statement) in STATEMENTS {
         diesel::sql_query(*statement).execute(conn)?;
@@ -161,6 +175,14 @@ pub(crate) fn verify_v4_manifest_on(
     verify_manifest_row_on(conn, 4)
 }
 
+/// CatalogV5 adds other paper_book_v2_* tables. Verify the frozen fee namespace
+/// and row without treating those new tables as part of this policy manifest.
+pub(crate) fn verify_v5_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    verify_manifest_row_on(conn, 5)
+}
+
 /// A complete inactive gen2 staging row may coexist with legacy V1 writes.
 /// This is only a structural check; it never activates a V2 owner or fill.
 pub(crate) fn verify_inactive_staged_manifest_on(
@@ -179,7 +201,12 @@ fn verify_manifest_row_on(
     }
     let mut reference = SqliteConnection::establish(":memory:")?;
     create_schema(&mut reference)?;
-    if objects(conn)? != objects(&mut reference)? {
+    let matches_reference = if expected_user_version == 5 {
+        fee_objects(conn)? == fee_objects(&mut reference)?
+    } else {
+        objects(conn)? == objects(&mut reference)?
+    };
+    if !matches_reference {
         return Err(StagedPaperBookV2Error::CatalogMismatch);
     }
     let rows: Vec<FeeManifestRow> = diesel::sql_query(

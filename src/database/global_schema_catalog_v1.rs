@@ -160,6 +160,8 @@ const PAPER_LEDGER_CATALOG_GENERATION: i64 = super::paper_ledger_schema_v1::CATA
 const REVIEW_CATALOG_GENERATION: i64 = super::daily_change_review_schema_v1::CATALOG_GENERATION;
 const PAPER_BOOK_OWNER_CATALOG_GENERATION: i64 =
     super::paper_book_owner_schema_v1::CATALOG_GENERATION;
+const PAPER_BOOK_PREPARED_CATALOG_GENERATION: i64 =
+    super::paper_book_owner_schema_v2::CATALOG_GENERATION;
 const SQLITE_MINIMUM_LIBVERSION_NUMBER: i32 = 3_035_000;
 const SQLITE_NEXT_MAJOR_LIBVERSION_NUMBER: i32 = 4_000_000;
 
@@ -1119,6 +1121,7 @@ pub(crate) struct SameRuntimeCatalogReferences {
     paper_v2: PaperLedgerCatalogV2References,
     review_v3: DailyChangeReviewCatalogV3References,
     owner_v4: PaperBookOwnerCatalogV4References,
+    owner_v5: PaperBookOwnerCatalogV5References,
 }
 
 /// Explicit extension generation; the three frozen v1 references stay intact.
@@ -1138,6 +1141,13 @@ struct DailyChangeReviewCatalogV3References {
 
 #[derive(Debug)]
 struct PaperBookOwnerCatalogV4References {
+    legacy: CatalogReferenceState,
+    transitional: CatalogReferenceState,
+    amended: CatalogReferenceState,
+}
+
+#[derive(Debug)]
+struct PaperBookOwnerCatalogV5References {
     legacy: CatalogReferenceState,
     transitional: CatalogReferenceState,
     amended: CatalogReferenceState,
@@ -1238,11 +1248,11 @@ pub(crate) fn classify_database_half(
             .collect(),
     )?;
     if actual.identity.application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && actual.identity.user_version > PAPER_BOOK_OWNER_CATALOG_GENERATION
+        && actual.identity.user_version > PAPER_BOOK_PREPARED_CATALOG_GENERATION
     {
         return Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
             actual: actual.identity.user_version,
-            supported: PAPER_BOOK_OWNER_CATALOG_GENERATION,
+            supported: PAPER_BOOK_PREPARED_CATALOG_GENERATION,
         });
     }
     validate_catalog_safety(
@@ -1294,7 +1304,14 @@ pub(crate) fn classify_database_half(
     let paper_v2 = actual.identity.user_version == PAPER_LEDGER_CATALOG_GENERATION;
     let review_v3 = actual.identity.user_version == REVIEW_CATALOG_GENERATION;
     let owner_v4 = actual.identity.user_version == PAPER_BOOK_OWNER_CATALOG_GENERATION;
-    let (legacy_reference, transitional_reference, amended_reference) = if owner_v4 {
+    let owner_v5 = actual.identity.user_version == PAPER_BOOK_PREPARED_CATALOG_GENERATION;
+    let (legacy_reference, transitional_reference, amended_reference) = if owner_v5 {
+        (
+            &references.owner_v5.legacy,
+            &references.owner_v5.transitional,
+            &references.owner_v5.amended,
+        )
+    } else if owner_v4 {
         (
             &references.owner_v4.legacy,
             &references.owner_v4.transitional,
@@ -1372,10 +1389,12 @@ pub(crate) fn classify_database_half(
             ),
         });
     };
-    if paper_v2 || review_v3 || owner_v4 {
+    if paper_v2 || review_v3 || owner_v4 || owner_v5 {
         expected_identity = DatabaseSchemaIdentity {
             application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-            user_version: if owner_v4 {
+            user_version: if owner_v5 {
+                PAPER_BOOK_PREPARED_CATALOG_GENERATION
+            } else if owner_v4 {
                 PAPER_BOOK_OWNER_CATALOG_GENERATION
             } else if review_v3 {
                 REVIEW_CATALOG_GENERATION
@@ -1421,7 +1440,14 @@ pub(crate) fn classify_database_half(
         mode: actual.mode,
         identity: actual.identity,
         runtime: actual.runtime.clone(),
-        whole_application_catalog_sha256: if owner_v4 {
+        whole_application_catalog_sha256: if owner_v5 {
+            WholeApplicationSchemaCatalogSha256(catalog_digest(
+                b"stock_analysis.global_schema_catalog.v5.paper_book_prepared.v1",
+                actual.mode,
+                &actual.runtime,
+                &actual.objects,
+            ))
+        } else if owner_v4 {
             WholeApplicationSchemaCatalogSha256(catalog_digest(
                 b"stock_analysis.global_schema_catalog.v4.paper_book_owner.v1",
                 actual.mode,
@@ -1700,10 +1726,29 @@ fn build_same_runtime_catalog_state_with_extensions(
     review_v3: bool,
     owner_v4: bool,
 ) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
+    build_same_runtime_catalog_state_with_owner_v5(
+        mode, phase, paper_v2, review_v3, owner_v4, false,
+    )
+}
+
+fn build_same_runtime_catalog_state_with_owner_v5(
+    mode: GlobalSchemaCatalogMode,
+    phase: Option<SelectionCatalogDdlPhase>,
+    paper_v2: bool,
+    review_v3: bool,
+    owner_v4: bool,
+    owner_v5: bool,
+) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
     if owner_v4 && !(paper_v2 && review_v3) {
         return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
             catalog: "paper-book-owner-v1",
             detail: "CatalogV4 must include CatalogV2 and CatalogV3".into(),
+        });
+    }
+    if owner_v5 && (!paper_v2 || !review_v3 || owner_v4) {
+        return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
+            catalog: "paper-book-owner-v2",
+            detail: "CatalogV5 requires V2 fee and V3 review, without the V4 owner".into(),
         });
     }
     let label = phase.map_or("legacy", SelectionCatalogDdlPhase::label);
@@ -1786,17 +1831,21 @@ fn build_same_runtime_catalog_state_with_extensions(
             expected_registry.push(entry);
         }
     }
-    if owner_v4 {
+    if owner_v4 || owner_v5 {
+        let owner_statements = if owner_v5 {
+            super::paper_book_owner_schema_v2::OWNER_STATEMENTS
+        } else {
+            super::paper_book_owner_schema_v1::STATEMENTS
+        };
+        let guard_statements = if owner_v5 {
+            super::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS
+        } else {
+            super::paper_book_owner_schema_v1::V1_GUARD_STATEMENTS
+        };
         for (catalog, statements) in [
             ("paper-book-v2-fee", super::paper_book_v2_schema::STATEMENTS),
-            (
-                "paper-book-owner-v1",
-                super::paper_book_owner_schema_v1::STATEMENTS,
-            ),
-            (
-                "paper-book-owner-v1-guard",
-                super::paper_book_owner_schema_v1::V1_GUARD_STATEMENTS,
-            ),
+            ("paper-book-owner", owner_statements),
+            ("paper-book-owner-guard", guard_statements),
         ] {
             for (i, (kind, name, table, sql)) in statements.iter().enumerate() {
                 let entry = FrozenCatalogRegistryEntry {
@@ -1824,6 +1873,34 @@ fn build_same_runtime_catalog_state_with_extensions(
                 }
                 expected_registry.push(entry);
             }
+        }
+    }
+    if owner_v5 {
+        for (i, (kind, name, table, sql)) in super::paper_book_v2_ledger_schema_v1::STATEMENTS
+            .iter()
+            .enumerate()
+        {
+            let catalog = "paper-book-v2-ledger";
+            let entry = FrozenCatalogRegistryEntry {
+                identity: CatalogObjectIdentity {
+                    kind: parse_catalog_object_kind(catalog, kind)?,
+                    name: (*name).into(),
+                    table_name: (*table).into(),
+                },
+                ddl_id: format!("{catalog}:{name}"),
+                source_line: i + 1,
+            };
+            connection.execute_batch(sql).map_err(|error| {
+                sqlite_reference_build_error("execute-paper-book-v5", Some(&entry.ddl_id), error)
+            })?;
+            capture_exact_catalog_object(&connection, &entry.identity, &entry.ddl_id, catalog)?;
+            if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
+                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch {
+                    catalog,
+                    detail: "duplicate DDL identity".into(),
+                });
+            }
+            expected_registry.push(entry);
         }
     }
     let built = OwnerBuiltCatalogState {
@@ -2268,6 +2345,8 @@ fn capture_managed_index_geometry(
             super::paper_book_v2_schema::STATEMENTS
                 .iter()
                 .chain(super::paper_book_owner_schema_v1::STATEMENTS.iter())
+                .chain(super::paper_book_v2_ledger_schema_v1::STATEMENTS.iter())
+                .chain(super::paper_book_owner_schema_v2::OWNER_STATEMENTS.iter())
                 .filter(|(kind, _, _, _)| *kind == "table")
                 .map(|(_, name, _, _)| (*name).to_owned()),
         )
@@ -2473,6 +2552,36 @@ fn issue_same_runtime_catalog_references(
     {
         return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
     }
+    let (prepared_runtime, prepared_legacy) =
+        build_same_runtime_catalog_state_with_owner_v5(built.mode, None, true, true, false, true)?;
+    let (prepared_transitional_runtime, prepared_transitional) =
+        build_same_runtime_catalog_state_with_owner_v5(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Transitional),
+            true,
+            true,
+            false,
+            true,
+        )?;
+    let (prepared_amended_runtime, prepared_amended) =
+        build_same_runtime_catalog_state_with_owner_v5(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Final),
+            true,
+            true,
+            false,
+            true,
+        )?;
+    if [
+        prepared_runtime,
+        prepared_transitional_runtime,
+        prepared_amended_runtime,
+    ]
+    .iter()
+    .any(|runtime| runtime != &built.runtime)
+    {
+        return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
+    }
     Ok(SameRuntimeCatalogReferences {
         mode: built.mode,
         runtime: built.runtime,
@@ -2493,6 +2602,11 @@ fn issue_same_runtime_catalog_references(
             legacy: owner_legacy.reference,
             transitional: owner_transitional.reference,
             amended: owner_amended.reference,
+        },
+        owner_v5: PaperBookOwnerCatalogV5References {
+            legacy: prepared_legacy.reference,
+            transitional: prepared_transitional.reference,
+            amended: prepared_amended.reference,
         },
     })
 }
@@ -2689,6 +2803,8 @@ fn validate_catalog_safety(
         .chain(super::daily_change_review_schema_v1::STATEMENTS.iter())
         .chain(super::paper_book_v2_schema::STATEMENTS.iter())
         .chain(super::paper_book_owner_schema_v1::STATEMENTS.iter())
+        .chain(super::paper_book_v2_ledger_schema_v1::STATEMENTS.iter())
+        .chain(super::paper_book_owner_schema_v2::OWNER_STATEMENTS.iter())
         .filter(|(kind, _, _, _)| *kind == "table")
         .map(|(_, name, _, _)| *name)
         .collect::<BTreeSet<_>>();
@@ -3541,12 +3657,12 @@ mod tests {
     fn future_generation_and_incomplete_final_payload_fail_closed() {
         let references = same_runtime_references(GlobalSchemaCatalogMode::Test);
         let mut actual = snapshot_for_state(&references, DatabaseHalfState::Amended);
-        actual.identity.user_version = 5;
+        actual.identity.user_version = 6;
         assert!(matches!(
             classify_database_half(&actual, &references),
             Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
-                actual: 5,
-                supported: 4,
+                actual: 6,
+                supported: 5,
             })
         ));
 
@@ -3987,6 +4103,63 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn catalog_v5_exact_identity_accepts_prepared_namespace_and_rejects_unknown_objects() {
+        let mode = GlobalSchemaCatalogMode::Test;
+        let refs = same_runtime_references(mode);
+        let authority = SelectionCatalogCaptureAuthority::for_test_code();
+        let conn = Connection::open_in_memory().unwrap();
+        let mut ids = BTreeSet::new();
+        execute_legacy_catalog_ddl(
+            &conn,
+            &legacy_catalog_registry_entries_v1().unwrap(),
+            &legacy_catalog_ddl_entries_v1().unwrap(),
+            "TEST_CODE_v5",
+            &mut ids,
+        )
+        .unwrap();
+        execute_selection_catalog_ddl(&conn, mode, SelectionCatalogDdlPhase::Final, &mut ids)
+            .unwrap();
+        for statements in [
+            super::super::paper_ledger_schema_v1::STATEMENTS,
+            super::super::daily_change_review_schema_v1::STATEMENTS,
+            super::super::paper_book_v2_schema::STATEMENTS,
+            super::super::paper_book_v2_ledger_schema_v1::STATEMENTS,
+            super::super::paper_book_owner_schema_v2::OWNER_STATEMENTS,
+            super::super::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS,
+        ] {
+            for (_, _, _, sql) in statements {
+                conn.execute_batch(sql).unwrap();
+            }
+        }
+        conn.execute_batch("PRAGMA application_id=1398035265; PRAGMA user_version=5")
+            .unwrap();
+        let v5 = capture_catalog_snapshot(&authority, &conn, mode).unwrap();
+        let diagnostic =
+            classify_database_half(&v5, &refs).expect("exact prepared CatalogV5 reference");
+        let v5_hash = match diagnostic {
+            DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => e.whole_application_catalog_sha256,
+            _ => panic!("expected amended database-half diagnostic"),
+        };
+        assert_eq!(v5_hash.as_str().len(), 64);
+        conn.execute_batch("CREATE TABLE paper_book_v2_shadow(value TEXT)")
+            .unwrap();
+        assert!(classify_database_half(
+            &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+            &refs,
+        )
+        .is_err());
+        conn.execute_batch(
+            "DROP TABLE paper_book_v2_shadow; DROP TRIGGER paper_book_owner_v2_event_insert",
+        )
+        .unwrap();
+        assert!(classify_database_half(
+            &capture_catalog_snapshot(&authority, &conn, mode).unwrap(),
+            &refs,
+        )
+        .is_err());
     }
 
     fn snapshot_for_state(

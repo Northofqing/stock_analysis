@@ -667,15 +667,15 @@ pub(super) fn require_v1_owner_on(
         error => LedgerError::IntegrityFailure(error.to_string()),
     })
 }
-/// Historical reads retain V1-V3 behavior, but a V4 view must be backed by
-/// the complete owner/catalog namespace in the same read transaction.
+/// Historical reads retain V1-V3 behavior; V4/V5 views require the complete
+/// owner/catalog namespace in the same read transaction.
 fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
     let generation = diesel::sql_query("SELECT user_version AS value FROM pragma_user_version()")
         .get_result::<IntegerRow>(conn)?
         .value;
     let owner_objects = diesel::sql_query(
-        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_v1*' OR tbl_name GLOB 'paper_book_owner_v1*')
-              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_v1*' OR tbl_name GLOB 'paper_book_owner_v1*')) AS value",
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')) AS value",
     )
     .get_result::<IntegerRow>(conn)?
     .value;
@@ -685,7 +685,10 @@ fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerEr
     )
     .get_result::<IntegerRow>(conn)?
     .value;
-    if generation >= 4 || owner_objects != 0 || (generation != 2 && fee_objects != 0) {
+    if generation == 5 {
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(conn)
+            .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+    } else if generation >= 4 || owner_objects != 0 || (generation != 2 && fee_objects != 0) {
         crate::database::paper_book_owner_schema_v1::verify_catalog_v4_on(conn)
             .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
     }

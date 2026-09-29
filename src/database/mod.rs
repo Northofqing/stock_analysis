@@ -2635,6 +2635,8 @@ mod lhb;
 pub mod news_ai;
 pub mod order_audit;
 pub(crate) mod paper_book_owner_schema_v1;
+pub(crate) mod paper_book_owner_schema_v2;
+pub(crate) mod paper_book_v2_ledger_schema_v1;
 pub(crate) mod paper_book_v2_schema;
 pub(crate) mod paper_inventory_failure_audit;
 pub(crate) mod paper_ledger_schema_v1;

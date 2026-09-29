@@ -1480,6 +1480,101 @@ fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
 }
 
 #[test]
+fn catalog_v5_prepared_upgrade_preserves_v1_history_and_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v5_v1_history.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed.clone())).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "before-v5",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+    let before_view = ledger.read(&binding).unwrap();
+    let (before_events, before_projection) = {
+        let mut conn = db.get_conn().unwrap();
+        (
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+        )
+    };
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn,
+            &crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
+        )
+        .unwrap();
+        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(
+            &mut conn,
+        )
+        .unwrap();
+    }
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after.lineage(), before.lineage());
+    assert_ne!(
+        after.snapshot_input_hash().unwrap(),
+        before.snapshot_input_hash().unwrap()
+    );
+    assert_eq!(ledger.read(&binding).unwrap(), before_view);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            before_events
+        );
+        assert_eq!(
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+            before_projection
+        );
+    }
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "after-v5",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .expect("V1Active account still writes");
+    let mut unowned_seed = seed;
+    unowned_seed.account_id = "TEST_CODE_V5_UNOWNED".into();
+    unowned_seed.epoch_id = "TEST_CODE_V5_UNOWNED_EPOCH".into();
+    assert!(matches!(
+        ledger.apply(PaperCommand::Seed(unowned_seed)),
+        Err(LedgerError::InactiveEpoch)
+    ));
+}
+
+#[test]
 fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_v1_history.db"))
