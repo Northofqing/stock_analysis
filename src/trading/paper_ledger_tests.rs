@@ -1609,7 +1609,7 @@ fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
     use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
     let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
     for fault in [TestCutoverFault::AfterGenesisWrites, TestCutoverFault::AfterOwnerCas] {
-        assert!(cutover_for_isolated_test(&db, &request, fault).is_err());
+        assert!(matches!(cutover_for_isolated_test(&db, &request, fault), Err(LedgerError::Database(_))));
         let mut conn = db.get_conn().unwrap();
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
         assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
@@ -1623,6 +1623,27 @@ fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
     assert!(matches!(cutover_for_isolated_test(&db, &request, TestCutoverFault::AfterCommitOutcomeUnknown), Err(LedgerError::CommitOutcomeUnknown)));
     let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
     assert!(repeated.already_applied);
+}
+
+#[test]
+fn catalog_v5_cutover_reports_real_commit_failure_as_unknown_and_retries_same_identity() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    assert!(matches!(
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::DeferredForeignKeyOnCommit),
+        Err(LedgerError::CommitOutcomeUnknown)
+    ));
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
+        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+    }
+    let retried = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(!retried.already_applied);
+    assert!(cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap().already_applied);
 }
 
 #[test]

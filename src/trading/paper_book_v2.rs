@@ -6,6 +6,8 @@ use crate::trading::paper_ledger::{
     verified_v1_snapshot_on, AccountBinding, LedgerError, Money, VerifiedV1Snapshot,
 };
 use diesel::prelude::*;
+#[cfg(test)]
+use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -500,6 +502,7 @@ pub(crate) enum TestCutoverFault {
     None,
     AfterGenesisWrites,
     AfterOwnerCas,
+    DeferredForeignKeyOnCommit,
     AfterCommitOutcomeUnknown,
 }
 
@@ -552,6 +555,7 @@ pub(crate) fn cutover_for_isolated_test(
     let mut conn = db
         .get_conn()
         .map_err(|error| LedgerError::Database(error.to_string()))?;
+    let mut ready_to_commit = false;
     let result = conn.immediate_transaction(|conn| {
         crate::database::paper_book_owner_schema_v2::require_isolated_for_test(conn)
             .map_err(|error| invalid(&error.to_string()))?;
@@ -698,6 +702,17 @@ pub(crate) fn cutover_for_isolated_test(
             .execute(conn)?;
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(conn)
             .map_err(|error| invalid(&error.to_string()))?;
+        if fault == TestCutoverFault::DeferredForeignKeyOnCommit {
+            conn.batch_execute(
+                "CREATE TEMP TABLE TEST_CODE_commit_parent (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TABLE TEST_CODE_commit_child (
+                     parent_id INTEGER REFERENCES TEST_CODE_commit_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+                 );
+                 INSERT INTO TEST_CODE_commit_child (parent_id) VALUES (1);",
+            )?;
+        }
+        ready_to_commit = true;
         Ok(TestCutoverReceipt {
             account_id: old.account_id,
             epoch_id: request.new_epoch_id.clone(),
@@ -707,9 +722,11 @@ pub(crate) fn cutover_for_isolated_test(
             already_applied: false,
         })
     });
-    if result.is_ok() && fault == TestCutoverFault::AfterCommitOutcomeUnknown {
-        Err(LedgerError::CommitOutcomeUnknown)
-    } else {
-        result
+    match result {
+        Err(_) if ready_to_commit => Err(LedgerError::CommitOutcomeUnknown),
+        Ok(_) if fault == TestCutoverFault::AfterCommitOutcomeUnknown => {
+            Err(LedgerError::CommitOutcomeUnknown)
+        }
+        result => result,
     }
 }
