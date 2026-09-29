@@ -1094,10 +1094,25 @@ impl AnalysisPipeline {
     }
 
     /// 处理单只股票的完整流程（含 120s 超时保护）
+    #[cfg(test)]
     pub(super) async fn process_stock(
         &self,
         code: String,
         macro_context: Arc<str>,
+    ) -> super::StockAnalysisOutcome {
+        self.process_stock_in_invocation(
+            code,
+            macro_context,
+            super::CliInvocationIdentity::new(super::CliProducer::Direct),
+        )
+        .await
+    }
+
+    pub(super) async fn process_stock_in_invocation(
+        &self,
+        code: String,
+        macro_context: Arc<str>,
+        invocation: super::CliInvocationIdentity,
     ) -> super::StockAnalysisOutcome {
         let start = std::time::Instant::now();
         info!("========== [{}] 开始处理 ==========", code);
@@ -1106,6 +1121,7 @@ impl AnalysisPipeline {
         let mut outcome = super::StockAnalysisOutcome::new(
             code.clone(),
             self.config.single_notify && self.config.send_notification && !self.config.dry_run,
+            &invocation,
         );
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
@@ -1267,9 +1283,19 @@ impl AnalysisPipeline {
         if self.config.single_notify && self.config.send_notification {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
+            outcome.report_snapshot = Some(super::CliReportSnapshot::new(
+                outcome
+                    .business_identity
+                    .invocation()
+                    .stock_notification(&code),
+                report,
+            ));
             outcome.notification =
                 super::AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-            let delivery = self.notifier.send_report(&report).await;
+            let delivery = self
+                .notifier
+                .send_report(outcome.report_snapshot.as_ref().expect("just set").report())
+                .await;
             match delivery.completion() {
                 crate::notification::NotificationCompletion::AllAccepted => {
                     info!("[{}] 单股推送全部渠道弱接受", code_clone)
@@ -2160,6 +2186,21 @@ mod tests {
                 .await;
             assert_eq!(outcome.saved, crate::pipeline::AnalysisSaveStatus::Saved);
             assert!(outcome.analysis.is_some());
+            let snapshot = outcome
+                .report_snapshot
+                .as_ref()
+                .expect("single report snapshot");
+            assert_eq!(
+                snapshot.identity().invocation(),
+                outcome.business_identity.invocation()
+            );
+            assert_eq!(
+                snapshot.report_bytes().as_bytes(),
+                pipeline
+                    .generate_single_report(outcome.analysis.as_ref().unwrap())
+                    .as_bytes()
+            );
+            let handed_report = snapshot.report().to_owned();
             assert_eq!(outcome.notification.completion(), Some(expected));
             assert_eq!(outcome.ensure_cli_success().is_ok(), cli_ok);
             let run = crate::pipeline::AnalysisRunReport {
@@ -2173,7 +2214,16 @@ mod tests {
                 expected == NotificationCompletion::AllAccepted
             );
             for fixture in fixtures {
-                assert_eq!(fixture.finish().len(), 1);
+                let requests = fixture.finish();
+                assert_eq!(requests.len(), 1);
+                let body_start = requests[0]
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("HTTP body delimiter")
+                    + 4;
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests[0][body_start..]).expect("custom body");
+                assert_eq!(body["content"].as_str(), Some(handed_report.as_str()));
             }
         }
     }
@@ -2202,6 +2252,7 @@ mod tests {
         );
         assert!(outcome.ensure_cli_success().is_err());
         assert!(outcome.analysis.is_some());
+        assert!(outcome.report_snapshot.is_some());
         pipeline.config.send_notification = false;
         let outcome = pipeline
             .process_stock("TEST_CODE_TASK2_NOTIFICATION".into(), Arc::from(""))
@@ -2210,6 +2261,7 @@ mod tests {
             outcome.notification,
             crate::pipeline::AnalysisNotification::NotRequested
         ));
+        assert!(outcome.report_snapshot.is_none());
         assert!(outcome.ensure_cli_success().is_ok());
     }
 
@@ -2253,11 +2305,15 @@ mod tests {
         let mut dry_run = test_pipeline(context.clone(), false);
         dry_run.test_fetched_data = Some(Ok(analysis_bars()));
         dry_run.config.dry_run = true;
-        assert!(dry_run
+        let dry_outcome = dry_run
             .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
-            .await
-            .analysis
-            .is_none());
+            .await;
+        assert!(dry_outcome.analysis.is_none());
+        assert!(dry_outcome.report_snapshot.is_none());
+        assert!(matches!(
+            dry_outcome.notification,
+            crate::pipeline::AnalysisNotification::NotRequested
+        ));
 
         let mut analysis_failure = test_pipeline(
             resolved_context(Err("TEST_CODE_上下文失败".to_string()), Ok(None)),
@@ -2338,6 +2394,28 @@ mod tests {
             )
             .await
             .expect("resolved full pipeline run");
+        let invocation = results.invocation.as_ref().expect("run invocation");
+        assert_eq!(results.stocks[0].business_identity.invocation(), invocation);
+        assert_eq!(
+            results
+                .summary
+                .business_identity
+                .as_ref()
+                .unwrap()
+                .invocation(),
+            invocation
+        );
+        assert_eq!(
+            results
+                .summary
+                .report_snapshot
+                .as_ref()
+                .unwrap()
+                .identity()
+                .invocation(),
+            invocation
+        );
+        assert!(results.stocks[0].report_snapshot.is_none());
         assert!(!results.is_complete());
         assert!(results.ensure_cli_success().is_err());
         assert_eq!(

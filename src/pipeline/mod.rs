@@ -6,7 +6,12 @@
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 子模块改 pub(super) 让 analyze.rs 等兄弟文件能 super::xxx 访问
 mod backtest_runner;
+mod cli_identity;
 mod completion;
+pub use cli_identity::{
+    CliBusinessIdentity, CliInvocationIdentity, CliNotificationIdentity, CliProducer,
+    CliReportSnapshot, CliSubject,
+};
 pub use completion::{
     AnalysisNotification, AnalysisRunReport, AnalysisSaveStatus, StockAnalysisOutcome,
     SummaryCompletion,
@@ -512,9 +517,24 @@ impl AnalysisPipeline {
         stock_codes: &[String],
         prefetched_macro: Option<String>,
     ) -> Result<AnalysisRunReport> {
+        self.run_with_producer(stock_codes, prefetched_macro, CliProducer::Direct)
+            .await
+    }
+
+    /// One CLI invocation shares an identity across its stock and summary work.
+    pub async fn run_with_producer(
+        &self,
+        stock_codes: &[String],
+        prefetched_macro: Option<String>,
+        producer: CliProducer,
+    ) -> Result<AnalysisRunReport> {
+        let invocation = CliInvocationIdentity::new(producer);
         if stock_codes.is_empty() {
             warn!("股票列表为空");
-            return Ok(AnalysisRunReport::default());
+            return Ok(AnalysisRunReport {
+                invocation: Some(invocation),
+                ..Default::default()
+            });
         }
 
         info!("===== 开始分析 {} 只股票 =====", stock_codes.len());
@@ -545,7 +565,13 @@ impl AnalysisPipeline {
             stock_codes
         );
         let stocks: Vec<StockAnalysisOutcome> = stream::iter(stock_codes.iter())
-            .map(|code| self.process_stock(code.clone(), macro_context.clone()))
+            .map(|code| {
+                self.process_stock_in_invocation(
+                    code.clone(),
+                    macro_context.clone(),
+                    invocation.clone(),
+                )
+            })
             .buffer_unordered(self.config.max_workers)
             .collect()
             .await;
@@ -657,11 +683,12 @@ impl AnalysisPipeline {
                     context.regime_section.as_deref(),
                     context.chain_section.as_deref(),
                     &context.output_dir,
+                    &invocation,
                 )
                 .await;
             } else {
                 summary = self
-                    .send_live_summary(&mut results, backtest_summary.as_ref())
+                    .send_live_summary(&mut results, backtest_summary.as_ref(), &invocation)
                     .await
                     .unwrap_or_else(|error| SummaryCompletion {
                         notification: AnalysisNotification::NotAttempted,
@@ -672,7 +699,7 @@ impl AnalysisPipeline {
             #[cfg(not(test))]
             {
                 summary = self
-                    .send_live_summary(&mut results, backtest_summary.as_ref())
+                    .send_live_summary(&mut results, backtest_summary.as_ref(), &invocation)
                     .await
                     .unwrap_or_else(|error| SummaryCompletion {
                         notification: AnalysisNotification::NotAttempted,
@@ -683,6 +710,7 @@ impl AnalysisPipeline {
         }
 
         Ok(AnalysisRunReport {
+            invocation: Some(invocation),
             results,
             stocks,
             summary,
@@ -693,6 +721,7 @@ impl AnalysisPipeline {
         &self,
         results: &mut [AnalysisResult],
         backtest_summary: Option<&crate::strategy::core::BacktestSummary>,
+        invocation: &CliInvocationIdentity,
     ) -> Result<SummaryCompletion> {
         // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
         // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
@@ -754,6 +783,7 @@ impl AnalysisPipeline {
             backtest_summary,
             regime_section.as_deref(),
             chain_section.as_deref(),
+            invocation,
         )
         .await)
     }
@@ -769,7 +799,7 @@ mod tests {
     use super::section_utils::normalize_ai_sections;
     use super::{
         key_stock_priority, preserve_exact_date_limit_up_state, score_to_advice, AnalysisPipeline,
-        AnalysisResult, PipelineConfig,
+        AnalysisResult, CliProducer, PipelineConfig,
     };
     use crate::data_provider::{AdjustType, KlineData};
     use crate::notification::{NotificationConfig, NotificationService};
@@ -893,12 +923,28 @@ mod tests {
         assert_eq!(pipeline.config.dq_nav_stale_sec, 24 * 3600);
         assert_eq!(pipeline.config.dq_daily_stale_sec, 24 * 3600);
 
-        assert!(pipeline
-            .run(&[], Some("TEST_CODE_宏观证据".to_string()))
+        let empty = pipeline
+            .run_with_producer(
+                &[],
+                Some("TEST_CODE_宏观证据".to_string()),
+                CliProducer::Default,
+            )
             .await
-            .expect("empty run")
-            .results
-            .is_empty());
+            .expect("empty run");
+        assert!(empty.results.is_empty());
+        assert_eq!(
+            empty.invocation.as_ref().unwrap().producer(),
+            CliProducer::Default
+        );
+        let repeat = pipeline
+            .run_with_producer(&[], None, CliProducer::Schedule)
+            .await
+            .expect("repeat empty run");
+        assert_eq!(
+            repeat.invocation.as_ref().unwrap().producer(),
+            CliProducer::Schedule
+        );
+        assert_ne!(empty.invocation, repeat.invocation);
 
         pipeline.test_fetched_data = Some(Ok(vec![kline()]));
         let results = pipeline
@@ -909,6 +955,10 @@ mod tests {
             .await
             .expect("dry run");
         assert!(results.results.is_empty());
+        assert!(results.invocation.is_some());
+        assert_eq!(results.stocks.len(), 1);
+        assert!(results.stocks[0].report_snapshot.is_none());
+        assert!(results.summary.report_snapshot.is_none());
 
         let report = pipeline.generate_single_report(&result());
         assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));

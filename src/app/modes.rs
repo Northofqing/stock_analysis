@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use log::info;
 use stock_analysis::config;
-use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
+use stock_analysis::pipeline::{AnalysisPipeline, CliProducer, PipelineConfig};
 
 use crate::app::get_max_workers;
 use crate::cli::Args;
@@ -56,7 +56,9 @@ pub async fn run_analysis(
     } else {
         Some(macro_context.to_string())
     };
-    let outcome = pipeline.run(stock_codes, mc).await?;
+    let outcome = pipeline
+        .run_with_producer(stock_codes, mc, CliProducer::Default)
+        .await?;
     outcome.log_completion();
     let completion = outcome.ensure_cli_success();
     let results = outcome.results;
@@ -696,7 +698,9 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
         dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
     let pipeline = AnalysisPipeline::new(config)?;
-    let outcome = pipeline.run(&stock_codes, None).await?;
+    let outcome = pipeline
+        .run_with_producer(&stock_codes, None, CliProducer::Lhb)
+        .await?;
     outcome.log_completion();
     let completion = outcome.ensure_cli_success();
     let results = outcome.results;

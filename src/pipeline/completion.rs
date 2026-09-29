@@ -1,4 +1,5 @@
 //! Analysis persistence and BestEffort notification observations are separate facts.
+use super::cli_identity::{CliBusinessIdentity, CliInvocationIdentity, CliReportSnapshot};
 use super::AnalysisResult;
 use crate::notification::{NotificationCompletion, NotificationSendReport};
 
@@ -49,17 +50,22 @@ impl AnalysisNotification {
 #[derive(Clone, Debug)]
 pub struct StockAnalysisOutcome {
     pub code: String,
+    pub business_identity: CliBusinessIdentity,
     pub analysis: Option<AnalysisResult>,
     pub saved: AnalysisSaveStatus,
+    /// Present only when the report was handed to the notification path.
+    pub report_snapshot: Option<CliReportSnapshot>,
     pub notification: AnalysisNotification,
     pub failure: Option<String>,
 }
 impl StockAnalysisOutcome {
-    pub(super) fn new(code: String, notify: bool) -> Self {
+    pub(super) fn new(code: String, notify: bool, invocation: &CliInvocationIdentity) -> Self {
         Self {
+            business_identity: invocation.stock_business(&code),
             code,
             analysis: None,
             saved: AnalysisSaveStatus::NotAttempted,
+            report_snapshot: None,
             notification: if notify {
                 AnalysisNotification::NotAttempted
             } else {
@@ -81,14 +87,18 @@ impl StockAnalysisOutcome {
 
 #[derive(Clone, Debug)]
 pub struct SummaryCompletion {
+    pub business_identity: Option<CliBusinessIdentity>,
     pub saved_paths: Vec<std::path::PathBuf>,
+    pub report_snapshot: Option<CliReportSnapshot>,
     pub notification: AnalysisNotification,
     pub failure: Option<String>,
 }
 impl Default for SummaryCompletion {
     fn default() -> Self {
         Self {
+            business_identity: None,
             saved_paths: Vec::new(),
+            report_snapshot: None,
             notification: AnalysisNotification::NotRequested,
             failure: None,
         }
@@ -97,6 +107,7 @@ impl Default for SummaryCompletion {
 
 #[derive(Clone, Debug, Default)]
 pub struct AnalysisRunReport {
+    pub invocation: Option<CliInvocationIdentity>,
     /// Saved analyses remain available even when their notification was not accepted.
     pub results: Vec<AnalysisResult>,
     pub stocks: Vec<StockAnalysisOutcome>,

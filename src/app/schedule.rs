@@ -5,7 +5,7 @@ use chrono::{Datelike, Local};
 use log::{error, info, warn};
 use std::collections::HashSet;
 use stock_analysis::config;
-use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
+use stock_analysis::pipeline::{AnalysisPipeline, CliProducer, PipelineConfig};
 
 use crate::app::get_max_workers;
 use crate::cli::Args;
@@ -262,9 +262,10 @@ async fn execute_analysis(
     match AnalysisPipeline::new(config.clone()) {
         Ok(pipeline) => match pipeline
             .with_limit_up_codes(limit_up_codes)
-            .run(
+            .run_with_producer(
                 stock_codes,
                 (!macro_context.is_empty()).then(|| macro_context.to_owned()),
+                CliProducer::Schedule,
             )
             .await
         {

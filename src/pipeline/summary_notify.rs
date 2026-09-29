@@ -7,7 +7,10 @@ use crate::chart_generator::ChartGenerator;
 use crate::notification::NotificationService;
 use crate::strategy::core::BacktestSummary;
 
-use super::{reporting, AnalysisNotification, AnalysisResult, SummaryCompletion};
+use super::{
+    reporting, AnalysisNotification, AnalysisResult, CliInvocationIdentity, CliReportSnapshot,
+    SummaryCompletion,
+};
 
 struct SummaryArtifacts {
     report: String,
@@ -48,6 +51,7 @@ pub(super) async fn send_summary_notification(
     backtest_summary: Option<&BacktestSummary>,
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
+    invocation: &CliInvocationIdentity,
 ) -> SummaryCompletion {
     send_summary_notification_to(
         notifier,
@@ -56,6 +60,7 @@ pub(super) async fn send_summary_notification(
         regime_section,
         chain_analysis_section,
         Path::new("reports"),
+        invocation,
     )
     .await
 }
@@ -67,8 +72,10 @@ pub(super) async fn send_summary_notification_to(
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
     output_dir: &Path,
+    invocation: &CliInvocationIdentity,
 ) -> SummaryCompletion {
     let mut outcome = SummaryCompletion {
+        business_identity: Some(invocation.summary_business()),
         notification: AnalysisNotification::NotAttempted,
         ..Default::default()
     };
@@ -125,7 +132,12 @@ pub(super) async fn send_summary_notification_to(
         .saved_paths
         .push(output_dir.join(&artifacts.filename));
 
-    let delivery = notifier.send_report(&artifacts.report).await;
+    let snapshot = CliReportSnapshot::new(invocation.summary_notification(), artifacts.report);
+    outcome.report_snapshot = Some(snapshot);
+    outcome.notification = AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
+    let delivery = notifier
+        .send_report(outcome.report_snapshot.as_ref().expect("just set").report())
+        .await;
     match delivery.completion() {
         crate::notification::NotificationCompletion::AllAccepted => {
             info!("✓ 股票分析报告全部渠道弱接受")
@@ -257,6 +269,7 @@ mod tests {
         let notifier = crate::notification::NotificationService::new(Default::default());
         let value = result();
         let summary = backtest();
+        let invocation = super::CliInvocationIdentity::new(super::super::CliProducer::Direct);
 
         let outcome = send_summary_notification_to(
             &notifier,
@@ -265,6 +278,7 @@ mod tests {
             Some("TEST_CODE_市场状态"),
             Some("TEST_CODE_产业链"),
             &output_dir,
+            &invocation,
         )
         .await;
         assert_eq!(
@@ -273,6 +287,26 @@ mod tests {
         );
         assert!(outcome.notification.ensure_cli_success().is_err());
         assert_eq!(outcome.saved_paths.len(), 2);
+        assert_eq!(
+            outcome.business_identity.as_ref().unwrap().invocation(),
+            &invocation
+        );
+        let snapshot = outcome.report_snapshot.as_ref().expect("summary snapshot");
+        assert_eq!(snapshot.identity().invocation(), &invocation);
+        let summary_path = outcome
+            .saved_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stock_analysis_")
+            })
+            .expect("saved summary path");
+        assert_eq!(
+            std::fs::read(summary_path).expect("saved summary"),
+            snapshot.report_bytes().as_bytes()
+        );
 
         let names = std::fs::read_dir(&output_dir)
             .expect("summary output directory")
