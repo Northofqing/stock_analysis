@@ -14,7 +14,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use sha2::{Digest, Sha256};
 
 use super::chain_shadow_input::{self, ChainReportInputObservation};
-use super::modes::{run_chain_analysis_mode_with_observation, ChainDeliveryEnvelope};
+use super::modes::{
+    run_chain_analysis_mode_with_observation, ChainDeliveryEnvelope, ChainSendSuppression,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainPhase {
@@ -614,17 +616,21 @@ where
             }
         }
     }
-    if envelope.send_attempted {
-        match observer(
-            phase,
-            date,
-            &envelope.prepared,
-            &envelope.report_input,
-            envelope.acquisition.as_ref(),
-        ) {
+    // Preparation already happened for every envelope, including a rejected
+    // pre-send guard or an unavailable channel. Observe those exact inputs as
+    // well, without preparing again or granting the observer send authority.
+    match observer(
+        phase,
+        date,
+        &envelope.prepared,
+        &envelope.report_input,
+        envelope.acquisition.as_ref(),
+    ) {
             Ok(observation) => log::info!(
-                "[chain_shadow_input] phase={} schedule_date={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} selected_news_source_ref_status={} selected_news_source_ref_reason={} selected_news_source_ref_v1={} selected_news_provider={:?} selected_news_source={} selected_news_batch_id_sha256={} selected_news_source_at={} selected_news_provider_observed_at={} selected_news_input_sha256={} selected_news_input_bytes={:?} prepared_macro_source_status={:?} selected_news_content_scope=selected_titles_utf8 provider_raw_batch_sha256=unobserved coverage={} covered_inputs={} foundation_persisted=false",
-                observation.phase.as_str(), observation.schedule_date, observation.prepared_business_date,
+                "[chain_shadow_input] phase={} schedule_date={} send_attempted={} suppression_reason={} prepared_business_date={} artifact_sha256={} artifact_bytes={} report_input_sha256={} report_input_bytes={} prepared_report_equals_input={} acquisition_sha256={} acquisition_report_binding_sha256={} selected_news_source_ref_status={} selected_news_source_ref_reason={} selected_news_source_ref_v1={} selected_news_provider={:?} selected_news_source={} selected_news_batch_id_sha256={} selected_news_source_at={} selected_news_provider_observed_at={} selected_news_input_sha256={} selected_news_input_bytes={:?} prepared_macro_source_status={:?} selected_news_content_scope=selected_titles_utf8 provider_raw_batch_sha256=unobserved coverage={} covered_inputs={} foundation_persisted=false",
+                observation.phase.as_str(), observation.schedule_date, envelope.send_attempted,
+                envelope.suppression.map(ChainSendSuppression::as_str).unwrap_or("none"),
+                observation.prepared_business_date,
                 observation.artifact_sha256, observation.artifact_bytes, observation.report_input_sha256,
                 observation.report_input_bytes, observation.prepared_report_equals_input,
                 observation.acquisition_sha256.as_deref().unwrap_or("absent"),
@@ -643,10 +649,11 @@ where
                 observation.coverage, observation.covered_inputs,
             ),
             Err(_error) => log::warn!(
-                "[chain_shadow_input] phase={} schedule_date={} coverage={} covered_inputs=unknown foundation_persisted=false observer_status=incomplete reason=source_or_artifact_observation_failed",
-                phase.as_str(), date, chain_shadow_input::COVERAGE,
+                "[chain_shadow_input] phase={} schedule_date={} send_attempted={} suppression_reason={} coverage={} covered_inputs=unknown foundation_persisted=false observer_status=incomplete reason=source_or_artifact_observation_failed",
+                phase.as_str(), date, envelope.send_attempted,
+                envelope.suppression.map(ChainSendSuppression::as_str).unwrap_or("none"),
+                chain_shadow_input::COVERAGE,
             ),
-        }
     }
     legacy_result
 }

@@ -341,6 +341,7 @@ mod tests_chain_delivery {
     use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase};
     use crate::app::chain_shadow_input::{observe, test_prepared};
     use chrono::NaiveDate;
+    use sha2::{Digest, Sha256};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -458,12 +459,12 @@ mod tests_chain_delivery {
     }
 
     #[tokio::test]
-    async fn send_failure_is_observed_and_guard_failure_is_not() {
+    async fn send_failure_and_guard_rejection_both_observe_prepared_input() {
         let (events, _, _, attempted, success) = scripted_delivery(true, false, true).await;
         assert_eq!(events, ["save", "guard", "send", "observe"]);
         assert!(attempted && !success);
         let (events, _, sent, attempted, success) = scripted_delivery(false, true, true).await;
-        assert_eq!(events, ["save", "guard"]);
+        assert_eq!(events, ["save", "guard", "observe"]);
         assert!(sent.is_empty() && !attempted && !success);
     }
 
@@ -475,6 +476,60 @@ mod tests_chain_delivery {
         let (events, _, _, _, success) = scripted_delivery(true, false, false).await;
         assert_eq!(events, ["save", "guard", "send", "observe"]);
         assert!(!success);
+        let (events, _, _, attempted, success) = scripted_delivery(false, true, false).await;
+        assert_eq!(events, ["save", "guard", "observe"]);
+        assert!(!attempted && !success);
+    }
+
+    #[tokio::test]
+    async fn no_channel_suppression_observes_exact_prepared_bytes_for_both_phases() {
+        let business_date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let schedule_date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        for phase in [ChainPhase::Preopen, ChainPhase::Postclose] {
+            let preparations = Rc::new(Cell::new(0));
+            let prepared = test_prepared(business_date, preparations.clone()).await;
+            let exact_report = prepared.report().as_bytes().to_vec();
+            let envelope = deliver_prepared(
+                prepared,
+                None,
+                |_| Ok("test-report.md".to_owned()),
+                false,
+                |_| panic!("no channel must not invoke the send guard"),
+                |_| panic!("no channel must not invoke a sender"),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                envelope.suppression,
+                Some(ChainSendSuppression::NoConfiguredChannel)
+            );
+            assert!(!envelope.send_attempted);
+            let error = finish_scheduled_delivery(
+                envelope,
+                phase,
+                schedule_date,
+                || panic!("suppressed delivery must not mark weak acceptance"),
+                |observed_phase, observed_date, prepared, input, acquisition| {
+                    assert_eq!(observed_phase, phase);
+                    assert_eq!(observed_date, schedule_date);
+                    assert_eq!(prepared.business_date(), business_date);
+                    assert_eq!(input, exact_report);
+                    assert!(acquisition.is_none());
+                    let observed =
+                        observe(observed_phase, observed_date, prepared, input, acquisition)?;
+                    assert!(observed.prepared_report_equals_input);
+                    assert_eq!(
+                        observed.report_input_sha256,
+                        format!("{:x}", Sha256::digest(input))
+                    );
+                    Ok(observed)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "产业链联动分析报告没有可用通知渠道");
+            assert_eq!(preparations.get(), 1);
+        }
     }
 
     #[tokio::test]

@@ -382,11 +382,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::chain_schedule::ChainPhase;
+    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase};
     use crate::app::chain_shadow_input::{
         observe, test_prepared, test_prepared_with_macro, SelectedNewsSourceRefStatus,
         ACQUISITION_INPUTS,
     };
+    use crate::app::modes::{ChainDeliveryEnvelope, ChainSendSuppression};
     use chrono::Utc;
     use std::{
         cell::{Cell, RefCell},
@@ -636,6 +637,58 @@ mod tests {
             format!("{:x}", Sha256::digest(selected.as_bytes()))
         );
         assert_eq!(source_ref.ref_sha256.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn suppressed_prepared_report_retains_source_and_exact_input_binding() {
+        let (prepared, acquisition, _) = scripted(
+            "TEST_CODE_pool_v3",
+            Ok(GatewayBatch::Available {
+                records: vec![news_record(0)],
+                evidence: batch(
+                    ProviderId::Cailianpress,
+                    "cls-v1",
+                    "TEST_CODE_news_v9",
+                    "2026-09-28T07:00:02Z",
+                ),
+            }),
+        )
+        .await;
+        let input = prepared.report().as_bytes().to_vec();
+        let schedule_date = acquisition.observed_at.date_naive();
+        let envelope = ChainDeliveryEnvelope {
+            prepared,
+            acquisition: Some(acquisition),
+            send_attempted: false,
+            report_input: input.clone(),
+            notification_report: None,
+            wechat_http_body: None,
+            feishu_http_body: None,
+            suppression: Some(ChainSendSuppression::NoConfiguredChannel),
+            legacy_result: Err(anyhow::anyhow!("TEST_CODE_no_channel")),
+        };
+        let error = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Preopen,
+            schedule_date,
+            || panic!("suppressed report must not mark weak acceptance"),
+            |phase, date, prepared, report_input, acquisition| {
+                assert_eq!(phase, ChainPhase::Preopen);
+                assert_eq!(date, schedule_date);
+                assert_eq!(report_input, input);
+                let observed = observe(phase, date, prepared, report_input, acquisition)?;
+                assert!(observed.prepared_report_equals_input);
+                assert_eq!(
+                    observed.selected_news_source_ref_status,
+                    SelectedNewsSourceRefStatus::Observed
+                );
+                assert!(observed.acquisition_sha256.is_some());
+                assert!(observed.acquisition_report_binding_sha256.is_some());
+                Ok(observed)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "TEST_CODE_no_channel");
     }
 
     #[tokio::test]
