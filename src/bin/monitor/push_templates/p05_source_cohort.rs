@@ -341,7 +341,30 @@ pub(super) fn observe_p05_candidate_cohort_v3(
     if replay.witness != batch.chain_query {
         return Err("P-05 v3 chain query witness differs from same-query rows".to_string());
     }
-    let expected_refs = p05_chain_witness::selected_refs(&batch.entries, replay.candidate_refs);
+    let surviving_entries: std::collections::HashMap<_, _> = batch
+        .entries
+        .iter()
+        .map(|entry| (entry.code.as_str(), entry))
+        .collect();
+    // Select by surviving identity before looking at its declared sources.
+    // Otherwise removing IndustryChain from an entry and deleting its ref
+    // would make both sides empty and hide a same-query source.
+    let expected_refs: Vec<_> = replay
+        .candidate_refs
+        .into_iter()
+        .filter(|reference| surviving_entries.contains_key(reference.code.as_str()))
+        .collect();
+    for reference in &expected_refs {
+        if !surviving_entries[reference.code.as_str()]
+            .sources
+            .contains(&CandidateSource::IndustryChain)
+        {
+            return Err(format!(
+                "P-05 v3 surviving candidate {} lost same-query IndustryChain source",
+                reference.code
+            ));
+        }
+    }
     if expected_refs != batch.chain_candidate_refs {
         return Err("P-05 v3 chain survivor refs differ from same-query rows".to_string());
     }
@@ -647,6 +670,57 @@ mod tests {
         assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_err());
         batch.chain_query = original;
         assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_ok());
+    }
+
+    #[test]
+    fn v3_rejects_removing_chain_source_and_ref_from_surviving_candidate() {
+        let (date, mut batch) = chain_fixture();
+        assert_eq!(batch.chain_candidate_refs.len(), 1);
+        batch.entries[0]
+            .sources
+            .retain(|source| *source != CandidateSource::IndustryChain);
+        batch.chain_candidate_refs.clear();
+        let rendered = format_candidate_board(&batch.entries);
+        assert!(observe_p05_candidate_cohort_v2(date, &batch, &rendered).is_ok());
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered)
+            .unwrap_err()
+            .contains("lost same-query IndustryChain source"));
+
+        // A candidate actually removed by the existing hard gates has no
+        // surviving identity and therefore needs no final chain ref.
+        batch.entries.remove(0);
+        let rendered = format_candidate_board(&batch.entries);
+        assert!(observe_p05_candidate_cohort_v3(date, &batch, &rendered).is_ok());
+    }
+
+    #[test]
+    fn v3_keeps_selected_empty_stocks_row_without_inventing_survivor_ref() {
+        let (date, mut batch) = fixture();
+        let projected = p05_chain_witness::project_same_query(vec![ChainDailyRow {
+            date: "2026-09-24".into(),
+            concept: "A".into(),
+            stocks: "[]".into(),
+            continuation_count: 1,
+        }])
+        .unwrap();
+        assert_eq!(projected.witness.selected_rows.len(), 1);
+        assert_eq!(projected.witness.selected_rows[0].row.stocks, "[]");
+        assert!(projected.candidate_refs.is_empty());
+        batch.chain_query = projected.witness;
+        let observed = observe_v3(date, &batch);
+        let facts: serde_json::Value = serde_json::from_slice(observed.canonical_bytes()).unwrap();
+        assert_eq!(
+            facts["chain_query"]["selected_rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(facts["chain_query"]["survivor_refs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(observed.require_qualified_origin().is_err());
     }
 
     #[test]
