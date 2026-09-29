@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::data_gateway::{GatewayBatch, ReviewDataGateway};
-use crate::database::concepts::ChainDailyRow;
+use crate::database::concepts::{ChainDailyReplaceError, ChainDailyRow};
 use crate::database::DatabaseManager;
 use crate::market_domain::{LimitPoolEntry, LimitPoolKind, ProviderId};
 
@@ -462,7 +462,7 @@ fn persist_p01_chain_artifact(
     // a retryable projection failure.
     DatabaseManager::get()
         .replace_and_read_chain_clusters_for_date_strict(evidence_date, &rows)
-        .map_err(|error| P01ProjectionError::transient("p01_chain_persistence_failed", error))?;
+        .map_err(map_chain_replace_error)?;
 
     Ok((
         P01ChainProjectionReceipt {
@@ -475,6 +475,21 @@ fn persist_p01_chain_artifact(
         },
         ordered_chain_rows,
     ))
+}
+
+fn map_chain_replace_error(error: ChainDailyReplaceError) -> P01ProjectionError {
+    let message = error.to_string();
+    match error {
+        ChainDailyReplaceError::ReadbackMismatch => {
+            P01ProjectionError::terminal("p01_chain_readback_mismatch", message)
+        }
+        ChainDailyReplaceError::InvalidInput(_) => {
+            P01ProjectionError::terminal("p01_chain_persistence_input_invalid", message)
+        }
+        ChainDailyReplaceError::Storage(_) => {
+            P01ProjectionError::transient("p01_chain_persistence_failed", message)
+        }
+    }
 }
 
 /// Acquire one exact completed-day LimitPools batch through the registered gateway seam,
@@ -794,6 +809,20 @@ mod tests {
                 .reason_code(),
             "p01_chain_generation_record_hash_mismatch"
         );
+    }
+
+    #[test]
+    fn p01_chain_readback_mismatch_is_terminal_while_storage_error_is_retryable() {
+        let mismatch =
+            super::map_chain_replace_error(super::ChainDailyReplaceError::ReadbackMismatch);
+        assert_eq!(mismatch.reason_code(), "p01_chain_readback_mismatch");
+        assert!(!mismatch.retryable());
+
+        let storage = super::map_chain_replace_error(super::ChainDailyReplaceError::Storage(
+            "TEST_CODE_sqlite_busy".into(),
+        ));
+        assert_eq!(storage.reason_code(), "p01_chain_persistence_failed");
+        assert!(storage.retryable());
     }
 
     #[test]

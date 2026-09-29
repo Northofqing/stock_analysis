@@ -54,6 +54,16 @@ pub struct ChainDailyRow {
     pub continuation_count: i32,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ChainDailyReplaceError {
+    #[error("P-01 exact-date 主线输入非法: {0}")]
+    InvalidInput(String),
+    #[error("P-01 exact-date 主线事务内读回与写入不一致")]
+    ReadbackMismatch,
+    #[error("P-01 exact-date 主线存储失败: {0}")]
+    Storage(String),
+}
+
 /// P-05 uses the same ordering as the exact-date P-01 reader. The primary key
 /// (date, concept) makes this a total order within the latest date.
 fn query_p05_latest_chain_clusters(
@@ -230,6 +240,7 @@ impl DatabaseManager {
     ) -> Result<(), String> {
         self.replace_and_read_chain_clusters_for_date_strict(date, clusters)
             .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Replace and verify the exact-date projection inside one SQLite write
@@ -239,7 +250,7 @@ impl DatabaseManager {
         &self,
         date: chrono::NaiveDate,
         clusters: &[(String, Vec<String>, i32)],
-    ) -> Result<Vec<ChainDailyRow>, String> {
+    ) -> Result<Vec<ChainDailyRow>, ChainDailyReplaceError> {
         let date = date.format("%Y-%m-%d").to_string();
         let mut concepts = std::collections::HashSet::with_capacity(clusters.len());
         let mut encoded = Vec::with_capacity(clusters.len());
@@ -249,21 +260,26 @@ impl DatabaseManager {
                 || codes.iter().any(|code| code.trim().is_empty())
                 || *continuation_count < 0
             {
-                return Err(format!(
+                return Err(ChainDailyReplaceError::InvalidInput(format!(
                     "P-01 exact-date 主线行非法: concept={concept:?} continuation_count={continuation_count}"
-                ));
+                )));
             }
             if !concepts.insert(concept.as_str()) {
-                return Err(format!("P-01 exact-date 主线概念重复: {concept}"));
+                return Err(ChainDailyReplaceError::InvalidInput(format!(
+                    "P-01 exact-date 主线概念重复: {concept}"
+                )));
             }
-            let stocks = serde_json::to_string(codes)
-                .map_err(|error| format!("序列化 P-01 主线 {concept} 失败: {error}"))?;
+            let stocks = serde_json::to_string(codes).map_err(|error| {
+                ChainDailyReplaceError::InvalidInput(format!(
+                    "序列化 P-01 主线 {concept} 失败: {error}"
+                ))
+            })?;
             encoded.push((concept, stocks, *continuation_count));
         }
 
         let mut conn = self
             .get_conn()
-            .map_err(|error| format!("P-01 exact-date 主线替换获取连接失败: {error}"))?;
+            .map_err(|error| ChainDailyReplaceError::Storage(error.to_string()))?;
         conn.transaction::<_, diesel::result::Error, _>(|tx| {
             diesel::sql_query("DELETE FROM chain_daily WHERE date = ?")
                 .bind::<Text, _>(&date)
@@ -300,10 +316,8 @@ impl DatabaseManager {
             Ok(read_back)
         })
         .map_err(|error| match error {
-            diesel::result::Error::RollbackTransaction => {
-                "P-01 exact-date 主线事务内读回与写入不一致".to_string()
-            }
-            other => format!("P-01 exact-date 主线原子替换失败: {other}"),
+            diesel::result::Error::RollbackTransaction => ChainDailyReplaceError::ReadbackMismatch,
+            other => ChainDailyReplaceError::Storage(other.to_string()),
         })
     }
 
@@ -681,7 +695,7 @@ mod tests {
                 &[("TEST_CODE_NEW".into(), vec!["TEST_CODE_600001".into()], 2)],
             )
             .expect_err("changed projection cannot commit as a producer generation");
-        assert!(error.contains("事务内读回"));
+        assert!(matches!(error, ChainDailyReplaceError::ReadbackMismatch));
         let rows = db.get_chain_clusters_for_date_strict(date).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].concept, "TEST_CODE_OLD");
