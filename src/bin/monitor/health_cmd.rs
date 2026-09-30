@@ -1,7 +1,7 @@
 //! Read-only operational health command backed by the live banner owner.
 //!
-//! This v19 slice reports banner account/data health and leased-process liveness.
-//! Breakers, error counts, and per-source recovery are outside its coverage.
+//! The banner and process lease determine overall health. The four registered
+//! raw GlobalNews feeds have a separately scoped recovery observation.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,9 @@ const HEARTBEAT_VERSION: u8 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 4_096;
 const MAX_SNAPSHOT_AGE: Duration = Duration::minutes(10);
 const MAX_CLOCK_LEAD: Duration = Duration::seconds(5);
+#[path = "health_cmd_source_recovery.rs"]
+mod source_recovery;
+pub use source_recovery::write_raw_news_source_snapshot;
 // Process-liveness reporting policy, not an availability SLA.
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 pub const MAX_HEARTBEAT_AGE: Duration = Duration::minutes(10);
@@ -101,6 +104,7 @@ struct HealthReport {
     account_metrics_complete: Option<bool>,
     missing_capabilities: Vec<String>,
     coverage: &'static str,
+    raw_news_source_recovery: source_recovery::SourceRecoveryReport,
 }
 
 fn snapshot_path(root: &Path, test_mode: bool) -> PathBuf {
@@ -447,12 +451,16 @@ fn monitor_lease_identity(path: &Path) -> Option<String> {
 }
 
 fn report_at(root: &Path, test_mode: bool, now: DateTime<Utc>) -> HealthReport {
-    report_from(
+    let lease_identity = monitor_lease_identity(&lease_path(root, test_mode));
+    let mut report = report_from(
         read_snapshot_at(&snapshot_path(root, test_mode)),
         read_heartbeat_at(&heartbeat_path(root, test_mode), now),
-        monitor_lease_identity(&lease_path(root, test_mode)),
+        lease_identity.clone(),
         now,
-    )
+    );
+    report.raw_news_source_recovery =
+        source_recovery::report_at(root, test_mode, lease_identity.as_deref(), now);
+    report
 }
 
 fn fresh_at(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -487,6 +495,7 @@ fn report_from(
         account_metrics_complete: None,
         missing_capabilities: Vec::new(),
         coverage: "banner_account_data_and_process_liveness_only",
+        raw_news_source_recovery: source_recovery::SourceRecoveryReport::unavailable(),
     };
     match heartbeat {
         Err(reason) => report.heartbeat_reason_code = Some(reason),
@@ -586,7 +595,7 @@ pub fn run(command: HealthCommand) -> i32 {
 
 fn render_text(report: &HealthReport) -> String {
     format!(
-            "status={} reason={} monitor_running={} snapshot_fresh={} heartbeat_fresh={} heartbeat_status={} heartbeat_reason_code={} heartbeat_observed_at={} heartbeat_age_seconds={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={}",
+            "status={} reason={} monitor_running={} snapshot_fresh={} heartbeat_fresh={} heartbeat_status={} heartbeat_reason_code={} heartbeat_observed_at={} heartbeat_age_seconds={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={} raw_news_source_recovery_status={} raw_news_source_recovery_reason={} raw_news_source_recovery_sources={}",
             report.status,
             report.reason_code.unwrap_or("none"),
             report.monitor_running,
@@ -607,6 +616,9 @@ fn render_text(report: &HealthReport) -> String {
             report.account_metrics_complete.map_or_else(|| "missing".to_owned(), |value| value.to_string()),
             if report.missing_capabilities.is_empty() { "none".to_owned() } else { report.missing_capabilities.join(",") },
             report.coverage,
+            report.raw_news_source_recovery.status,
+            report.raw_news_source_recovery.reason_code.unwrap_or("none"),
+            report.raw_news_source_recovery.source_summary(),
         )
 }
 
@@ -1302,5 +1314,40 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(files, vec!["heartbeat.json"]);
+    }
+
+    #[test]
+    fn health_command_reports_scoped_raw_news_recovery_without_changing_banner_verdict() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let lease_file = lease_path(root.path(), false);
+        let lease = crate::acquire_monitor_instance_lease_at(&lease_file).unwrap();
+        let mut banner = snapshot(now);
+        banner.boot_id = lease.boot_id.clone();
+        write_snapshot_at(&snapshot_path(root.path(), false), &banner).unwrap();
+        write_heartbeat_at(&heartbeat_path(root.path(), false), &lease.boot_id, now).unwrap();
+        let registry = stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
+        source_recovery::write_at(
+            &source_recovery::path(root.path(), false),
+            &lease.boot_id,
+            &registry,
+            now,
+        )
+        .unwrap();
+        let report = report_at(root.path(), false, now);
+        assert_eq!(report.status, "ok");
+        assert_eq!(report.raw_news_source_recovery.status, "warming");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["raw_news_source_recovery"]["sources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            json["raw_news_source_recovery"]["coverage"],
+            "four_registered_raw_global_news_feeds_only"
+        );
     }
 }

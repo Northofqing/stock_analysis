@@ -1915,6 +1915,25 @@ fn store_banner(
     Ok(())
 }
 
+fn publish_raw_news_source_recovery(
+    registry: &stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry,
+) {
+    let owner = match HEALTH_SNAPSHOT_OWNER.lock() {
+        Ok(owner) => owner.clone(),
+        Err(_) => {
+            log::error!("[health] raw news source snapshot owner lock poisoned");
+            return;
+        }
+    };
+    if let Some((test_mode, boot_id)) = owner {
+        if let Err(error) =
+            health_cmd::write_raw_news_source_snapshot(test_mode, &boot_id, registry)
+        {
+            log::error!("[health] raw news source recovery snapshot unavailable: {error}");
+        }
+    }
+}
+
 /// 最近交易日（今天若周一至五则为今天，否则回溯到上一工作日）。
 fn latest_trading_date(today: chrono::NaiveDate) -> chrono::NaiveDate {
     use chrono::Datelike;
@@ -8415,6 +8434,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     loop {
         if !NewsMonitor::should_run() {
+            publish_raw_news_source_recovery(&raw_news_sources);
             news_ai_producer.schedule_tick(
                 selection_v2_enabled,
                 stock_analysis::calendar::current_session(),
@@ -8500,6 +8520,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     }
                 }
             }
+            publish_raw_news_source_recovery(&raw_news_sources);
 
             let monitor_config = stock_analysis::config::get_monitor_config();
             // BR-244: projection and every immutable failure audit complete
