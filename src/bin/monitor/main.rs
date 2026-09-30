@@ -174,6 +174,40 @@ async fn g5b_no_provider_backoff() {
     tokio::time::sleep(PAPER_DECISION_TICK).await;
 }
 
+/// Empty input never seals the day: a production alert may arrive at any later
+/// tick, including the last minute of the attribution window.
+fn g5b_should_analyze(
+    local_now: chrono::NaiveDateTime,
+    last_run: Option<chrono::NaiveDate>,
+    eligible_events: usize,
+) -> bool {
+    use chrono::Timelike;
+    local_now.hour() == 15
+        && (5..=20).contains(&local_now.minute())
+        && last_run != Some(local_now.date())
+        && eligible_events > 0
+}
+
+#[cfg(test)]
+mod g5b_input_gate_tests {
+    use super::g5b_should_analyze;
+
+    #[test]
+    fn empty_ticks_leave_the_full_window_open_for_a_late_alert() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let at = |minute, second| day.and_hms_opt(15, minute, second).unwrap();
+        assert!(!g5b_should_analyze(at(5, 0), None, 0));
+        assert!(!g5b_should_analyze(at(20, 0), None, 0));
+        assert!(g5b_should_analyze(at(20, 45), None, 1));
+        assert!(!g5b_should_analyze(at(20, 45), Some(day), 1));
+        assert!(!g5b_should_analyze(
+            day.and_hms_opt(15, 21, 0).unwrap(),
+            None,
+            1
+        ));
+    }
+}
+
 #[cfg(test)]
 mod g5b_no_provider_backoff_tests {
     use super::{g5b_no_provider_backoff, PAPER_DECISION_TICK};
@@ -9966,8 +10000,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 }
             }
             // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
-            // 窗口同 15:05-15:20; 当日一次 (G5B_LAST_RUN 成功路径才记, 失败下 tick 重试);
-            // 无告警 / 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
+            // 窗口同 15:05-15:20; 空输入保留窗口内重查资格, 已尝试分析
+            // 的批次仍封日以免非确定 LLM 重跑或不明投递重复发送。
+            // 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
@@ -9979,18 +10014,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
-                let g5b_done = G5B_LAST_RUN
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map(|d| d == today)
-                    .unwrap_or(false);
-                if !g5b_done {
-                    let records = read_today_records();
-                    if records.is_empty() {
-                        log::info!("[g5b] 深链归因: 今日无告警记录, 跳过 (当日仅此一次)");
-                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                let g5b_last_run = *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+                if g5b_last_run != Some(today) {
+                    let events =
+                        top_events_for_deep(read_today_records(), DEEP_ATTRIBUTION_MAX_EVENTS);
+                    if !g5b_should_analyze(now.naive_local(), g5b_last_run, events.len()) {
+                        log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
                     } else {
-                        let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
                         let Some(provider) = LlmRegistry::from_env().select("g5b") else {
                             // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
                             // 以便用户补配 provider 后窗口内自愈。退避消耗一个 tick:
