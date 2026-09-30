@@ -54,6 +54,12 @@ struct SendAttempt {
     channel: String,
     target_index: usize,
     outcome: String,
+    // Optional hashes describe the initial built HTTP entity, not a remote
+    // acceptance receipt or the bytes of a redirected request.
+    initial_target_sha256: Option<String>,
+    initial_request_body_sha256: Option<String>,
+    initial_request_body_len: Option<usize>,
+    response_target_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -129,6 +135,7 @@ mod tests {
         CliAuditSendError,
     };
     use crate::pipeline::{CliInvocationIdentity, CliProducer, CliReportSnapshot};
+    use sha2::{Digest, Sha256};
 
     #[tokio::test]
     async fn audited_send_persists_redacted_intent_and_weak_observation() {
@@ -152,13 +159,13 @@ mod tests {
         let sent = send_cli_report_audited(&notifier, snapshot.clone(), directory.path())
             .await
             .unwrap();
-        assert_eq!(fixture.finish().len(), 1);
         let intent_bytes =
             std::fs::read(directory.path().join(format!("{key}.intent.json"))).unwrap();
         let observation_bytes =
             std::fs::read(directory.path().join(format!("{key}.observation.json"))).unwrap();
         let intent: SendIntent = serde_json::from_slice(&intent_bytes).unwrap();
         let observation: SendObservation = serde_json::from_slice(&observation_bytes).unwrap();
+        assert_eq!(observation.schema, "cli-send-weak-observation-v2");
         assert_eq!(intent.invocation_id, invocation.id());
         assert_eq!(
             intent.report_sha256,
@@ -169,6 +176,33 @@ mod tests {
         assert_eq!(observation.attempts.len(), 1);
         assert_eq!(observation.attempts[0].channel, "custom");
         assert_eq!(observation.attempts[0].outcome, "weak_accepted");
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        let body_start = requests[0]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let request_body = &requests[0][body_start..];
+        let mut digest = Sha256::new();
+        digest.update(b"stock_analysis.notification_http_entity.v1\0");
+        digest.update(request_body);
+        let expected_body_hash = format!("{:x}", digest.finalize());
+        assert_eq!(
+            observation.attempts[0]
+                .initial_request_body_sha256
+                .as_deref(),
+            Some(expected_body_hash.as_str())
+        );
+        assert_eq!(
+            observation.attempts[0].initial_request_body_len,
+            Some(request_body.len())
+        );
+        assert!(observation.attempts[0].initial_target_sha256.is_some());
+        assert_eq!(
+            observation.attempts[0].response_target_sha256.as_deref(),
+            observation.attempts[0].initial_target_sha256.as_deref()
+        );
         let targets =
             persist_custom_target_receipts(&sent, &directory.path().join("targets")).unwrap();
         assert_eq!(targets.receipts[0].notification_id, intent.notification_id);
@@ -239,7 +273,7 @@ mod tests {
 impl PendingSend {
     pub(super) fn observe(self, report: &NotificationSendReport) -> Result<()> {
         let observation = SendObservation {
-            schema: "cli-send-weak-observation-v1".into(),
+            schema: "cli-send-weak-observation-v2".into(),
             notification_id: self.notification_id.clone(),
             report_sha256: self.report_sha256,
             send_id: report.send_id().to_owned(),
@@ -250,6 +284,18 @@ impl PendingSend {
                     channel: channel_name(attempt.channel()).into(),
                     target_index: attempt.target_index(),
                     outcome: outcome_name(attempt.outcome()).into(),
+                    initial_target_sha256: attempt
+                        .request_entity()
+                        .map(|entity| entity.target_sha256().to_owned()),
+                    initial_request_body_sha256: attempt
+                        .request_entity()
+                        .map(|entity| entity.body_sha256().to_owned()),
+                    initial_request_body_len: attempt
+                        .request_entity()
+                        .map(|entity| entity.body_len()),
+                    response_target_sha256: attempt
+                        .request_entity()
+                        .and_then(|entity| entity.response_url_sha256().map(str::to_owned)),
                 })
                 .collect(),
         };
