@@ -259,11 +259,13 @@ impl NotificationService {
                 NotificationChannel::Discord => {
                     observe_attempt(&mut attempts, *channel, self.send_to_discord(content).await)
                 }
-                NotificationChannel::Pushover => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_pushover(content).await,
-                ),
+                NotificationChannel::Pushover => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_pushover_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 NotificationChannel::Custom => {
                     // 修复 P0-0: Custom 多个 webhook URL 都发送
                     for url in &self.config.custom_webhook_urls {
@@ -493,6 +495,15 @@ impl NotificationService {
     /// Pushover Message API 推送。
     /// 官方契约: POST /1/messages.json，HTTP 成功且 JSON status=1 才算成功。
     pub async fn send_to_pushover(&self, content: &str) -> Result<bool> {
+        self.send_to_pushover_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_pushover_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let request = match self.build_pushover_request(content) {
             Ok(request) => request,
             Err(error) => {
@@ -500,7 +511,19 @@ impl NotificationService {
                 return Ok(false);
             }
         };
+        self.execute_pushover_request(request, request_entity).await
+    }
+
+    async fn execute_pushover_request(
+        &self,
+        request: reqwest::Request,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
         let response = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(response.url());
+        }
         let status = response.status();
         let body: serde_json::Value = response.json().await?;
         let accepted =
@@ -757,6 +780,10 @@ pub async fn send_daily_report(results: &[AnalysisResult]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notification::send_report_tests::{
+        spawn_webhook_fixture as spawn_scripted_webhook_fixture, ScriptedResponse,
+    };
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -833,6 +860,70 @@ mod tests {
         assert!(form.contains("token=TEST_CODE_TOKEN"));
         assert!(form.contains("user=TEST_CODE_USER"));
         assert!(form.contains("message=TEST_CODE+alert"));
+    }
+
+    #[tokio::test]
+    async fn pushover_observation_binds_sent_form_and_keeps_disconnect_unknown() {
+        let service = NotificationService {
+            config: NotificationConfig::default(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            available_channels: vec![NotificationChannel::Pushover],
+        };
+        for (script, accepted) in [
+            (ScriptedResponse::Http(r#"{"status":1}"#), true),
+            (ScriptedResponse::Http(r#"{"status":0}"#), false),
+        ] {
+            let fixture = spawn_scripted_webhook_fixture(vec![script]);
+            let request = service
+                .client
+                .post(fixture.url())
+                .form(&[
+                    ("token", "TEST_CODE_TOKEN"),
+                    ("user", "TEST_CODE_USER"),
+                    ("message", "TEST_CODE alert"),
+                ])
+                .build()
+                .unwrap();
+            let body = request.body().unwrap().as_bytes().unwrap().to_vec();
+            let mut entity = None;
+            assert_eq!(
+                service
+                    .execute_pushover_request(request, &mut entity)
+                    .await
+                    .unwrap(),
+                accepted
+            );
+            let entity = entity.unwrap();
+            assert_eq!(entity.body_len(), body.len());
+            let mut digest = Sha256::new();
+            digest.update(b"stock_analysis.notification_http_entity.v1\0");
+            digest.update(&body);
+            assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+            assert_eq!(entity.response_target_differs(), Some(false));
+            let requests = fixture.finish();
+            assert_eq!(requests.len(), 1);
+            let body_start = requests[0]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            assert_eq!(&requests[0][body_start..], body);
+        }
+
+        let fixture = spawn_scripted_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+        let request = service
+            .client
+            .post(fixture.url())
+            .form(&[("message", "TEST_CODE uncertain")])
+            .build()
+            .unwrap();
+        let mut entity = None;
+        assert!(service
+            .execute_pushover_request(request, &mut entity)
+            .await
+            .is_err());
+        assert!(entity.unwrap().response_url_sha256().is_none());
+        assert_eq!(fixture.finish().len(), 1);
     }
 
     #[test]
