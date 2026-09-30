@@ -224,6 +224,7 @@ pub(crate) fn test_service(
         config,
         client: reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
             .build()
             .expect("build no-proxy test client"),
@@ -346,30 +347,23 @@ async fn custom_success_and_false_are_distinct_weak_observations() {
 }
 
 #[tokio::test]
-async fn custom_redirect_records_final_response_target_without_claiming_final_body() {
-    let fixture = spawn_webhook_fixture(vec![
-        ScriptedResponse::Redirect("/TEST_CODE_redirected"),
-        ScriptedResponse::Http(r#"{"ok":true}"#),
-    ]);
+async fn custom_redirect_is_unknown_and_does_not_send_second_request() {
+    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Redirect("/TEST_CODE_redirected")]);
     let initial_url = fixture.url();
-    let final_url = initial_url.replace("/TEST_CODE_fixture", "/TEST_CODE_redirected");
-    let service = test_service(
-        NotificationConfig {
-            custom_webhook_urls: vec![initial_url.clone()],
-            ..NotificationConfig::default()
-        },
-        vec![NotificationChannel::Custom],
-    );
+    let service = NotificationService::new(NotificationConfig {
+        custom_webhook_urls: vec![initial_url.clone()],
+        ..NotificationConfig::default()
+    });
 
     let report = service.send_report("TEST_CODE redirect").await;
 
     assert_attempts(
         &report,
-        &[(NotificationChannel::Custom, 0, WeakOutcomeKind::Accepted)],
+        &[(NotificationChannel::Custom, 0, WeakOutcomeKind::Unknown)],
     );
     let entity = report.attempts()[0].request_entity().unwrap();
     assert!(entity.matches_custom_content("TEST_CODE redirect"));
-    assert_eq!(entity.response_target_differs(), Some(true));
+    assert_eq!(entity.response_target_differs(), Some(false));
     let target_digest = |url: &str| {
         let mut hasher = Sha256::new();
         hasher.update(b"stock_analysis.notification_target_url.v1\0");
@@ -379,12 +373,11 @@ async fn custom_redirect_records_final_response_target_without_claiming_final_bo
     assert_eq!(entity.target_sha256(), target_digest(&initial_url));
     assert_eq!(
         entity.response_url_sha256(),
-        Some(target_digest(&final_url).as_str())
+        Some(target_digest(&initial_url).as_str())
     );
     let requests = fixture.finish();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with(b"POST /TEST_CODE_fixture HTTP/1.1"));
-    assert!(requests[1].starts_with(b"GET /TEST_CODE_redirected HTTP/1.1"));
 }
 
 #[tokio::test]

@@ -309,7 +309,7 @@ pub(super) struct ChainReportInputObservation {
 
 /// A weak, invocation-local binding of one Custom target to the prepared
 /// report and its already observed source/artifact identity. The entity is the
-/// first built Reqwest request; a redirect may change the actual method/body.
+/// first built Reqwest request; the production notification client rejects redirects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ChainCustomRequestObservation {
     pub send_id: String,

@@ -3,7 +3,7 @@
 //! This is a post-send audit of weak Custom channel results. A missing file does
 //! not prove no request was sent; a present file is not a remote delivery receipt
 //! or permission to retry. Target and entity hashes describe only the initial
-//! built request; the shared HTTP client may follow redirects.
+//! built request; the production notification client rejects redirects.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;

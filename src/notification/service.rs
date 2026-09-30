@@ -46,11 +46,14 @@ fn observe_attempt_with_entity(
             error!("[{}] 渠道方法返回 false，投递状态未知", channel.name());
             WeakOutcomeKind::Unknown
         }
-        Err(error) => {
+        Err(_error) => {
             error!(
-                "[{}] 渠道方法返回错误，投递状态未知: {}",
+                "[{}] 渠道方法返回错误，投递状态未知；target_sha256={}",
                 channel.name(),
-                error
+                request_entity
+                    .as_ref()
+                    .map(NotificationRequestEntity::target_sha256)
+                    .unwrap_or("unavailable")
             );
             WeakOutcomeKind::Unknown
         }
@@ -66,10 +69,8 @@ fn observe_attempt_with_entity(
 impl NotificationService {
     /// 创建新的通知服务
     pub fn new(config: NotificationConfig) -> Self {
-        // review #14: 改用 SHARED_HTTP_CLIENT 共享 client (30s timeout + Arc 内核),
-        // 替代每次 new Client. 多 NotificationService 实例 + 频繁 new 会浪费
-        // TLS handshake. SHARED_HTTP_CLIENT 是 Lazy static, 进程生命周期单例.
-        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+        // 复用连接，并禁止自动跳转：一次渠道尝试只对应初始目标的一个请求。
+        let client = crate::http_client::SHARED_NOTIFICATION_HTTP_CLIENT.clone();
 
         let available_channels = Self::detect_channels(&config);
 
@@ -395,12 +396,17 @@ impl NotificationService {
                                 warn!("[Custom] 未配置 webhook_urls, 跳过");
                                 fail_count += 1;
                             }
-                            for url in &self.config.custom_webhook_urls {
+                            for (target_index, url) in
+                                self.config.custom_webhook_urls.iter().enumerate()
+                            {
                                 match self.send_to_custom_url(url, content).await {
                                     Ok(true) => success_count += 1,
                                     Ok(false) => fail_count += 1,
-                                    Err(error) => {
-                                        warn!("[Custom] {} 出错: {}", url, error);
+                                    Err(_error) => {
+                                        warn!(
+                                            "[Custom] target_index={} 渠道方法出错，投递状态未知",
+                                            target_index
+                                        );
                                         fail_count += 1;
                                     }
                                 }
@@ -747,12 +753,7 @@ impl NotificationService {
         let status = response.status();
         let response_body = response.text().await?;
         if !status.is_success() || !custom_business_accepted(&response_body)? {
-            log::warn!(
-                "[Custom] {} 推送失败: HTTP {} body={:?}",
-                url,
-                status,
-                response_body
-            );
+            log::warn!("[Custom] 推送未获业务接受: HTTP {}", status);
             return Ok(false);
         }
         Ok(true)
