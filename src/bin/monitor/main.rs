@@ -8383,6 +8383,10 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     // news ticks. It carries no selection-ingress capability.
     let mut news_flash_gate =
         crate::news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
+    // Retain the four raw-feed breaker slots across every resident news tick.
+    // Source recovery here does not claim coverage of other gateway callers.
+    let raw_news_sources =
+        stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
     log::warn!(
         "{}",
         crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
@@ -8448,8 +8452,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             let mut raw_batch = None;
             let mut failure_audit_ready = authority_preflight.is_some();
             if authority_preflight.is_some() {
-                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
-                    .await
+                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(
+                    &raw_news_sources,
+                    20,
+                )
+                .await
                 {
                     Ok(batch) => {
                         let projection =
@@ -9700,8 +9707,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 }
             }
             // Compare policies after the legacy send and missed-window paths.
-            let postclose_shadow_at = chrono::Utc::now()
-                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+            let postclose_shadow_at =
+                chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
             let postclose_shadow_now = postclose_shadow_at.naive_local();
             if postclose_shadow_now.time() >= chrono::NaiveTime::from_hms_opt(15, 29, 0).unwrap()
                 && postclose_shadow_now.time() < chrono::NaiveTime::from_hms_opt(15, 36, 0).unwrap()
@@ -13266,8 +13273,16 @@ mod tests_post_session_review_scheduler {
             .find("project_news_flash_events(")
             .expect("BR-244 source projection caller");
         let acquisition = production[..projection]
-            .rfind("fetch_raw_global_news_batch(20)")
+            .rfind("fetch_raw_global_news_batch(")
             .expect("BR-244 raw acquisition caller");
+        assert!(production[acquisition..projection].contains("&raw_news_sources"));
+        let registry = production[..acquisition]
+            .rfind("GlobalNewsSourceRegistry::new()")
+            .expect("resident news owner retains raw source state");
+        let tick_loop = production[registry..acquisition]
+            .find("loop {")
+            .expect("raw source registry must be created before the resident tick loop");
+        assert!(registry + tick_loop < acquisition);
         let tick_authority = production[..acquisition]
             .rfind("reconcile_news_flash_business_date(")
             .expect("BR-244 tick authority caller");

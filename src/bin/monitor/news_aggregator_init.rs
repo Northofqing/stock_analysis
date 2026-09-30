@@ -104,9 +104,10 @@ fn sha256_domain(domain: &str, payload: &[u8]) -> String {
 /// Fetch the complete registered real-provider set without constructing
 /// notification events or mutating simhash.
 pub async fn fetch_raw_global_news_batch(
+    registry: &raw_v2::GlobalNewsSourceRegistry,
     per_feed_limit: u32,
 ) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
-    let batch = raw_v2::fetch_raw_global_news_batch(per_feed_limit).await?;
+    let batch = raw_v2::fetch_raw_global_news_batch(registry, per_feed_limit).await?;
     log::info!(
         "[NewsAggregator][BR-174] raw batch acquired attempts={} records={} sources_complete={} per_feed_limit={}",
         batch.attempts().len(),
@@ -3176,7 +3177,8 @@ mod tests {
 
     #[tokio::test]
     async fn raw_fetch_rejects_zero_limit_before_provider_work() {
-        let error = fetch_raw_global_news_batch(0)
+        let registry = raw_v2::GlobalNewsSourceRegistry::new();
+        let error = fetch_raw_global_news_batch(&registry, 0)
             .await
             .expect_err("TEST_CODE zero limit must fail before provider work");
         assert!(matches!(error, RawNewsAcquisitionError::InvalidLimit(0)));

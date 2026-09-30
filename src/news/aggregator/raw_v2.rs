@@ -5,11 +5,22 @@
 //! BR-244 exposes one narrower SourceOnly NewsFlash projection that consumes
 //! the same opaque tick, never mints a receipt and never changes impact facts.
 
+#[cfg(test)]
+#[path = "raw_v2_breaker_tests.rs"]
+mod breaker_tests;
 mod content_evidence;
+#[path = "raw_v2_source_breaker.rs"]
+mod source_breaker;
 pub(crate) use content_evidence::{replay_n02_admitted_record, NewsFlashRecordReplayError};
 pub use content_evidence::{
     NewsFlashRecordEvidenceError, NewsFlashRecordEvidenceV1, MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES,
 };
+pub use source_breaker::{
+    GlobalNewsSourceRegistry, SourceBreakerState, SourceRecoverySnapshot, SourceRegistryError,
+    GLOBAL_NEWS_BREAKER_COOLDOWN_SECONDS, GLOBAL_NEWS_BREAKER_COVERAGE,
+    GLOBAL_NEWS_BREAKER_FAILURE_THRESHOLD,
+};
+use source_breaker::{SourceAcquire, SourceSkipReason, SourceTerminal};
 
 use crate::data_gateway::global_news::{
     parse_global_news_observed_at, parse_global_news_provider_time,
@@ -1061,14 +1072,32 @@ impl RawGlobalNewsPort for ProductionRawGlobalNewsPort {
 }
 
 pub async fn fetch_raw_global_news_batch(
+    registry: &GlobalNewsSourceRegistry,
     per_feed_limit: u32,
 ) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
-    fetch_raw_global_news_batch_with(&ProductionRawGlobalNewsPort, per_feed_limit).await
+    fetch_raw_global_news_batch_with_clock(
+        &ProductionRawGlobalNewsPort,
+        registry,
+        per_feed_limit,
+        &Utc::now,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn fetch_raw_global_news_batch_with(
     port: &impl RawGlobalNewsPort,
     per_feed_limit: u32,
+) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
+    let registry = GlobalNewsSourceRegistry::new();
+    fetch_raw_global_news_batch_with_clock(port, &registry, per_feed_limit, &Utc::now).await
+}
+
+async fn fetch_raw_global_news_batch_with_clock(
+    port: &impl RawGlobalNewsPort,
+    registry: &GlobalNewsSourceRegistry,
+    per_feed_limit: u32,
+    clock: &(dyn Fn() -> DateTime<Utc> + Sync),
 ) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
     if !(1..=REGISTERED_GLOBAL_NEWS_LIMIT).contains(&per_feed_limit) {
         return Err(RawNewsAcquisitionError::InvalidLimit(per_feed_limit));
@@ -1076,21 +1105,46 @@ async fn fetch_raw_global_news_batch_with(
 
     let futures = REGISTERED_PROVIDERS
         .into_iter()
-        .map(|provider| fetch_registered_feed(port, provider, per_feed_limit));
+        .map(|provider| fetch_registered_feed(port, registry, provider, per_feed_limit, clock));
     let attempts = join_all(futures).await;
     Ok(RawNewsAggregationBatch {
         attempts,
-        observed_at: Utc::now(),
+        observed_at: clock(),
     })
 }
 
 async fn fetch_registered_feed(
     port: &impl RawGlobalNewsPort,
+    registry: &GlobalNewsSourceRegistry,
     provider: GlobalNewsProvider,
     limit: u32,
+    clock: &(dyn Fn() -> DateTime<Utc> + Sync),
 ) -> RawGlobalNewsFeedAttempt {
     let registration = RegisteredGlobalNewsFeed::for_provider(provider);
-    let attempted_at = Utc::now();
+    let attempted_at = clock();
+    let permit = match registry.begin(provider, attempted_at, clock) {
+        SourceAcquire::Call(permit) => permit,
+        SourceAcquire::Skipped(reason) => {
+            let (diagnostic_code, reason_code) = match reason {
+                SourceSkipReason::CircuitOpen => ("circuit_open", "circuit_open"),
+                SourceSkipReason::StateUnavailable => {
+                    ("breaker_state_unavailable", "breaker_state_unavailable")
+                }
+            };
+            return RawGlobalNewsFeedAttempt {
+                registration,
+                attempted_at,
+                terminal: RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
+                    failed_stage: "global_news_source_breaker",
+                    diagnostic_code,
+                    reason_code,
+                    retryable: true,
+                    available_evidence: None,
+                    source_record_count: 0,
+                }),
+            };
+        }
+    };
     let terminal = match port.fetch(provider, limit).await {
         Ok(batch)
             if batch.evidence().provider != registration.provider.provider_id()
@@ -1099,6 +1153,16 @@ async fn fetch_registered_feed(
             RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
                 failed_stage: "global_news_gateway_admission",
                 diagnostic_code: "provider_evidence_mismatch",
+                reason_code: "invalid_evidence",
+                retryable: false,
+                available_evidence: Some(batch.evidence().clone()),
+                source_record_count: batch.records().len(),
+            })
+        }
+        Ok(batch) if validate_global_news_batch_evidence(provider, batch.evidence()).is_err() => {
+            RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
+                failed_stage: "global_news_gateway_admission",
+                diagnostic_code: "batch_evidence_invalid",
                 reason_code: "invalid_evidence",
                 retryable: false,
                 available_evidence: Some(batch.evidence().clone()),
@@ -1143,6 +1207,16 @@ async fn fetch_registered_feed(
             })
         }
     };
+    let source_terminal = match &terminal {
+        RawGlobalNewsTerminal::Available { .. } | RawGlobalNewsTerminal::VerifiedEmpty { .. } => {
+            SourceTerminal::Verified
+        }
+        RawGlobalNewsTerminal::Unavailable(unavailable) => SourceTerminal::Unavailable {
+            reason_code: unavailable.reason_code(),
+            retryable: unavailable.retryable(),
+        },
+    };
+    permit.finish(source_terminal);
     RawGlobalNewsFeedAttempt {
         registration,
         attempted_at,
@@ -1527,7 +1601,10 @@ mod tests {
             StatusErrorContext::data(method, request_id),
         );
         assert_eq!(error.details().admission, Some(LocalAdmission::Unadmitted));
-        assert_eq!(error.details().reason_code.as_deref(), Some("source_precondition_failed"));
+        assert_eq!(
+            error.details().reason_code.as_deref(),
+            Some("source_precondition_failed")
+        );
 
         let failure = crate::data_gateway::grpc_source::map_external_query_error(
             Operation::GlobalNews,
@@ -1537,12 +1614,10 @@ mod tests {
         assert_eq!(failure.reason_code(), "source_precondition_failed");
         assert!(!failure.retryable());
 
-        let batch = fetch_raw_global_news_batch_with(
-            &EastmoneySourcePreconditionPort { failure },
-            1,
-        )
-        .await
-        .expect("typed acquisition returns all terminal attempts");
+        let batch =
+            fetch_raw_global_news_batch_with(&EastmoneySourcePreconditionPort { failure }, 1)
+                .await
+                .expect("typed acquisition returns all terminal attempts");
         let projection = project_news_flash_events(&batch);
         assert!(projection.events().is_empty());
         let source_failure = projection
@@ -1551,7 +1626,10 @@ mod tests {
             .find(|failure| failure.provider() == GlobalNewsProvider::Eastmoney)
             .expect("Eastmoney must remain unavailable");
         assert_eq!(source_failure.reason_code(), "source_precondition_failed");
-        assert_eq!(source_failure.diagnostic_code(), "source_precondition_failed");
+        assert_eq!(
+            source_failure.diagnostic_code(),
+            "source_precondition_failed"
+        );
         assert!(!source_failure.retryable());
     }
 
