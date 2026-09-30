@@ -65,12 +65,36 @@ pub(super) struct LotChange {
 }
 
 fn fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), LedgerError> {
-    if !(0..=5000).contains(&now.signed_duration_since(at).num_milliseconds()) {
+    if at > now || now.signed_duration_since(at) > chrono::Duration::seconds(5) {
         return Err(LedgerError::EvidenceUnavailable(
             "realtime quote/mark not fresh after lock acquisition".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fresh_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn quote_freshness_uses_exact_inclusive_five_second_window() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 29, 6, 30, 0).unwrap();
+        assert!(fresh(now, now).is_ok());
+        assert!(fresh(now - chrono::Duration::seconds(5), now).is_ok());
+        assert!(matches!(
+            fresh(now + chrono::Duration::nanoseconds(1), now),
+            Err(LedgerError::EvidenceUnavailable(_))
+        ));
+        assert!(matches!(
+            fresh(
+                now - chrono::Duration::seconds(5) - chrono::Duration::nanoseconds(1),
+                now
+            ),
+            Err(LedgerError::EvidenceUnavailable(_))
+        ));
+    }
 }
 fn check_head(view: &PaperView, version: i64, fingerprint: &str) -> Result<(), LedgerError> {
     if view.version != version {
