@@ -102,7 +102,22 @@ fn validate(file: &SourceRecoveryFile) -> Result<(), &'static str> {
                     })
             })
             || source.last_failure_at.is_some() != source.last_reason_code.is_some()
+            || source.last_failure_at.is_some() != source.last_retryable.is_some()
             || source.last_successful_pull_at.is_some() && source.last_attempt_at.is_none()
+            || match source.breaker_state.as_str() {
+                "closed" => source.opened_at.is_some() || source.next_probe_at.is_some(),
+                "open" => {
+                    source.opened_at.is_none()
+                        || source.next_probe_at.is_none()
+                        || source.outage_started_at.is_none()
+                }
+                "half_open" => {
+                    source.opened_at.is_none()
+                        || source.next_probe_at.is_some()
+                        || source.outage_started_at.is_none()
+                }
+                _ => true,
+            }
             || [
                 source.last_attempt_at,
                 source.last_successful_pull_at,
@@ -307,9 +322,13 @@ mod tests {
         file.sources[0].warming = false;
         file.sources[0].last_attempt_at = Some(at);
         file.sources[0].breaker_state = "open".to_owned();
+        file.sources[0].consecutive_retryable_failures = 10;
         file.sources[0].outage_started_at = Some(at);
         file.sources[0].last_failure_at = Some(at);
+        file.sources[0].opened_at = Some(at);
+        file.sources[0].next_probe_at = Some(at + chrono::Duration::seconds(60));
         file.sources[0].last_reason_code = Some("provider_transport".to_owned());
+        file.sources[0].last_retryable = Some(true);
         super::super::atomic_replace_bytes(
             &file_path,
             &serde_json::to_vec(&file).unwrap(),
@@ -380,5 +399,42 @@ mod tests {
         let idle = report_at(root.path(), true, Some("123:456:1"), at);
         assert_eq!(idle.status, "idle");
         assert_eq!(idle.reason_code, Some("raw_news_source_success_stale"));
+    }
+
+    #[test]
+    fn raw_news_source_rejects_contradictory_recovery_fields_before_claiming_ok() {
+        let at = Utc::now();
+        let registry = GlobalNewsSourceRegistry::new();
+        let root = tempfile::tempdir().unwrap();
+        let file_path = path(root.path(), true);
+        write_at(&file_path, "123:456:1", &registry, at).unwrap();
+        let mut healthy = read_at(&file_path).unwrap();
+        for source in &mut healthy.sources {
+            source.warming = false;
+            source.last_attempt_at = Some(at);
+            source.last_successful_pull_at = Some(at);
+        }
+        let assert_invalid = |file: &SourceRecoveryFile| {
+            super::super::atomic_replace_bytes(
+                &file_path,
+                &serde_json::to_vec(file).unwrap(),
+                "test source snapshot",
+            )
+            .unwrap();
+            let report = report_at(root.path(), true, Some("123:456:1"), at);
+            assert_eq!(report.status, "unavailable");
+            assert_eq!(report.reason_code, Some("raw_news_source_snapshot_invalid"));
+        };
+
+        let mut missing_retryable = healthy.clone();
+        missing_retryable.sources[0].last_failure_at = Some(at);
+        missing_retryable.sources[0].last_reason_code = Some("provider_transport".into());
+        assert_invalid(&missing_retryable);
+
+        let mut open_without_probe = healthy;
+        open_without_probe.sources[0].breaker_state = "open".into();
+        open_without_probe.sources[0].outage_started_at = Some(at);
+        open_without_probe.sources[0].opened_at = Some(at);
+        assert_invalid(&open_without_probe);
     }
 }
