@@ -39,6 +39,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+#[path = "coordinator_candidate_board.rs"]
+mod candidate_board;
+pub use candidate_board::{CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1};
+
 const AUDIT_KINDS: [&str; 14] = [
     "DecisionStateChanged",
     "LeaseGranted",

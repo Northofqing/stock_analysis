@@ -10,7 +10,9 @@ mod correlation;
 mod model;
 mod schema;
 
-pub use coordinator::DurableDeliveryCoordinator;
+pub use coordinator::{
+    CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1, DurableDeliveryCoordinator,
+};
 pub use correlation::P01OriginProducer;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,

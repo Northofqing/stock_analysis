@@ -6307,6 +6307,161 @@ fn candidate_board_policy_is_global_rolling_1800_and_budget_counted() {
     assert_eq!(row.push_kind.stable_template_id(), "candidate_board_v1");
 }
 
+fn p05_card_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope {
+    let business_date = "2026-08-18";
+    let rendered = format!("TEST_CODE_P05_RENDERED_{label}").into_bytes();
+    let rendered_sha256 = sha256_hex(&rendered);
+    let mut source = serde_json::json!({
+        "schema": "candidate-board-v1",
+        "business_date": business_date,
+        "rendered_sha256": rendered_sha256,
+    });
+    if extra_source_field {
+        source["unbound_stock_signal"] = serde_json::json!("TEST_CODE_FORGED");
+    }
+    let source_canonical = serde_json::to_vec(&source).unwrap();
+    let source_sha256 = sha256_hex(&source_canonical);
+    DeliveryEnvelope::new(
+        business_date,
+        PushKind::CandidateBoard,
+        DeliverySubKind::None,
+        "GLOBAL",
+        format!("candidate-board:{business_date}:10:30"),
+        source_sha256.clone(),
+        source_canonical,
+        source_sha256,
+        rendered,
+        false,
+        None,
+    )
+    .expect("TEST_CODE P-05 card envelope")
+}
+
+#[test]
+fn p05_card_observation_uses_one_frozen_decision_and_authoritative_accepted_receipt() {
+    let fixture = Fixture::new("P05_CARD_ACCEPTED");
+    let append = MemoryAppendPort::default();
+    let envelope = p05_card_envelope("ACCEPTED", false);
+    assert!(fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .unwrap()
+        .is_empty());
+    prepare_reserved(&fixture, &envelope, &append);
+
+    let pending = fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].decision_identity(), envelope.decision_identity);
+    assert_eq!(pending[0].business_date(), "2026-08-18");
+    assert_eq!(
+        pending[0].occurrence_identity(),
+        "candidate-board:2026-08-18:10:30"
+    );
+    assert_eq!(pending[0].terminal(), CandidateBoardCardTerminalV1::Pending);
+    assert_eq!(pending[0].decision_state(), DecisionState::Reserved);
+    assert!(!pending[0].is_authoritative_accepted_card());
+    assert!(pending[0].authoritative_attempt_identity().is_none());
+    assert!(pending[0].terminal_evidence_sha256().is_none());
+    assert_eq!(
+        pending[0].envelope_sha256(),
+        envelope.canonical_sha256().unwrap()
+    );
+    assert_eq!(
+        pending[0].source_binding_sha256(),
+        envelope.source_binding_sha256
+    );
+    assert_eq!(
+        pending[0].rendered_content_sha256(),
+        envelope.rendered_content_sha256
+    );
+
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .expect("TEST_CODE accepted P-05 card delivery");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &envelope.decision_identity,
+    );
+    let accepted = fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        accepted[0].terminal(),
+        CandidateBoardCardTerminalV1::Accepted
+    );
+    assert!(accepted[0].is_authoritative_accepted_card());
+    assert!(accepted[0].authoritative_attempt_identity().is_some());
+    assert!(accepted[0].immutable_audit_ref().is_some());
+    assert!(accepted[0].terminal_evidence_sha256().is_some());
+    assert_eq!(accepted[0].accepted_channel(), Some("TEST_CODE_CHANNEL"));
+    let repeated = fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .unwrap();
+    assert_eq!(accepted, repeated);
+    assert_eq!(
+        accepted[0].canonical_sha256().unwrap(),
+        repeated[0].canonical_sha256().unwrap()
+    );
+    assert!(fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-19")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn p05_card_observation_keeps_rejected_and_unbound_source_out_of_accepted_count() {
+    let fixture = Fixture::new("P05_CARD_REJECTED");
+    let append = MemoryAppendPort::default();
+    let envelope = p05_card_envelope("REJECTED", false);
+    prepare_reserved(&fixture, &envelope, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .expect("TEST_CODE rejected P-05 card delivery");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::RejectedDurable,
+        &envelope.decision_identity,
+    );
+    let rejected = fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(
+        rejected[0].terminal(),
+        CandidateBoardCardTerminalV1::Rejected
+    );
+    assert!(!rejected[0].is_authoritative_accepted_card());
+    assert!(rejected[0].terminal_evidence_sha256().is_some());
+    assert!(rejected[0].accepted_channel().is_none());
+
+    let forged = Fixture::new("P05_CARD_EXTRA_SOURCE");
+    let forged_envelope = p05_card_envelope("EXTRA_SOURCE", true);
+    prepare_reserved(&forged, &forged_envelope, &append);
+    assert!(matches!(
+        forged
+            .coordinator
+            .candidate_board_card_observations_for_date("2026-08-18"),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+}
+
 #[test]
 fn w13_p01_same_day_query_ignores_render_mode_but_reuses_one_claim() {
     let fixture = Fixture::new("W13_P01_SAME_DAY_KEY");
