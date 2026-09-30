@@ -237,11 +237,13 @@ impl NotificationService {
                 NotificationChannel::Email => {
                     observe_attempt(&mut attempts, *channel, self.send_to_email(content))
                 }
-                NotificationChannel::ServerChan => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_server_chan(content).await,
-                ),
+                NotificationChannel::ServerChan => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_server_chan_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
                 NotificationChannel::DingTalk => {
                     let mut request_entity = None;
@@ -250,11 +252,13 @@ impl NotificationService {
                         .await;
                     observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
                 }
-                NotificationChannel::Telegram => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_telegram(content).await,
-                ),
+                NotificationChannel::Telegram => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_telegram_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 NotificationChannel::Slack => {
                     let mut request_entity = None;
                     let result = self
@@ -447,11 +451,30 @@ impl NotificationService {
     /// Server酱推送（普通微信）。
     /// 文档: https://sct.ftqq.com/
     pub async fn send_to_server_chan(&self, content: &str) -> Result<bool> {
+        self.send_to_server_chan_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_server_chan_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let key = match &self.config.server_chan_key {
             Some(k) => k,
             None => return Ok(false),
         };
         let url = format!("https://sctapi.ftqq.com/{}.send", key);
+        self.send_to_server_chan_at(&url, content, request_entity)
+            .await
+    }
+
+    async fn send_to_server_chan_at(
+        &self,
+        url: &str,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         // 取第一行作为标题
         let title = content.lines().next().unwrap_or("监控告警");
         let title = if title.starts_with('#') {
@@ -462,12 +485,16 @@ impl NotificationService {
         let title = truncate(title, 32);
         let desp = truncate(content, 4096);
 
-        let resp = self
+        let request = self
             .client
-            .post(&url)
+            .post(url)
             .form(&[("title", title.as_str()), ("desp", desp.as_str())])
-            .send()
-            .await?;
+            .build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
 
         let status = resp.status();
         let body = resp.text().await?;
@@ -590,6 +617,15 @@ impl NotificationService {
     /// 文档: https://core.telegram.org/bots/api#sendmessage
     /// 之前 enum 里有但未实现, 走 _ => 死代码分支
     pub async fn send_to_telegram(&self, content: &str) -> Result<bool> {
+        self.send_to_telegram_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_telegram_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let token = match self.config.telegram_bot_token.as_ref() {
             Some(t) => t,
             None => {
@@ -612,12 +648,28 @@ impl NotificationService {
             .replace('[', r"\[")
             .replace('`', r"\`");
         let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        self.send_to_telegram_at(&url, chat_id, &escaped, request_entity)
+            .await
+    }
+
+    async fn send_to_telegram_at(
+        &self,
+        url: &str,
+        chat_id: &str,
+        escaped_content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let body = serde_json::json!({
             "chat_id": chat_id,
-            "text": escaped,
+            "text": escaped_content,
             "parse_mode": "MarkdownV2",
         });
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let request = self.client.post(url).json(&body).build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         let status = resp.status();
         let response_body: serde_json::Value = resp.json().await?;
         if !status.is_success() || !telegram_business_accepted(&response_body)? {
@@ -976,6 +1028,77 @@ mod tests {
             .is_err());
         assert!(entity.unwrap().response_url_sha256().is_none());
         assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_chan_and_telegram_observe_the_sent_entity() {
+        fn body_of(request: &[u8]) -> &[u8] {
+            let start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            &request[start..]
+        }
+
+        let service = NotificationService {
+            config: NotificationConfig::default(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            available_channels: vec![
+                NotificationChannel::ServerChan,
+                NotificationChannel::Telegram,
+            ],
+        };
+        let server_chan =
+            spawn_scripted_webhook_fixture(vec![ScriptedResponse::Http(r#"{"code":0}"#)]);
+        let mut server_chan_entity = None;
+        assert!(service
+            .send_to_server_chan_at(
+                &server_chan.url(),
+                "# TEST_CODE title\nTEST_CODE detail",
+                &mut server_chan_entity,
+            )
+            .await
+            .unwrap());
+        let server_chan_request = server_chan.finish();
+        assert_eq!(server_chan_request.len(), 1);
+        let server_chan_body = body_of(&server_chan_request[0]);
+        assert!(server_chan_body
+            .windows(b"title=TEST_CODE+title".len())
+            .any(|part| { part == b"title=TEST_CODE+title" }));
+
+        let telegram =
+            spawn_scripted_webhook_fixture(vec![ScriptedResponse::Http(r#"{"ok":true}"#)]);
+        let mut telegram_entity = None;
+        assert!(service
+            .send_to_telegram_at(
+                &telegram.url(),
+                "TEST_CODE_CHAT",
+                "TEST_CODE escaped\\_message",
+                &mut telegram_entity,
+            )
+            .await
+            .unwrap());
+        let telegram_request = telegram.finish();
+        assert_eq!(telegram_request.len(), 1);
+        let telegram_body: serde_json::Value =
+            serde_json::from_slice(body_of(&telegram_request[0])).unwrap();
+        assert_eq!(telegram_body["chat_id"], "TEST_CODE_CHAT");
+        assert_eq!(telegram_body["text"], "TEST_CODE escaped\\_message");
+        assert_eq!(telegram_body["parse_mode"], "MarkdownV2");
+
+        for (entity, request) in [
+            (server_chan_entity.unwrap(), &server_chan_request[0]),
+            (telegram_entity.unwrap(), &telegram_request[0]),
+        ] {
+            let body = body_of(request);
+            let mut digest = Sha256::new();
+            digest.update(b"stock_analysis.notification_http_entity.v1\0");
+            digest.update(body);
+            assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+            assert_eq!(entity.body_len(), body.len());
+            assert_eq!(entity.response_target_differs(), Some(false));
+        }
     }
 
     #[test]

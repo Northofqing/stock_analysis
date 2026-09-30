@@ -15,8 +15,9 @@ fn next_send_id() -> String {
     )
 }
 
-/// One built Reqwest HTTP entity for one configured target. URLs, headers,
-/// body bytes, and credentials are intentionally excluded from this record.
+/// One built Reqwest HTTP entity for one channel attempt. The target hash
+/// identifies the initial HTTP URL, which may serve multiple recipients.
+/// URLs, headers, body bytes, and credentials are excluded from this record.
 /// It does not observe redirects, TLS bytes, or a remote delivery receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotificationRequestEntity {
