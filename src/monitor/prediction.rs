@@ -18,6 +18,9 @@ use verifier::verify_due_predictions_with_page_size;
 #[cfg(test)]
 #[path = "prediction_completion_tests.rs"]
 mod completion_tests;
+#[cfg(test)]
+#[path = "prediction_scheduled_tests.rs"]
+mod scheduled_tests;
 
 /// Legacy prediction producer; existing frozen dates are never rewritten by verification.
 pub fn save_prediction(
@@ -76,10 +79,10 @@ pub fn shanghai_now() -> DateTime<FixedOffset> {
 
 /// Scheduled owner: logs the aggregate and returns it; failure does not stop scheduling.
 pub async fn verify_predictions() -> Result<PredictionVerificationReport, String> {
-    let as_of = shanghai_now().date_naive();
+    let now = shanghai_now();
     let result = tokio::task::spawn_blocking(move || {
         let db = DatabaseManager::try_get().ok_or_else(|| "Prediction DB 未初始化".to_string())?;
-        verify_due_predictions(db, as_of)
+        verify_predictions_on_at(db, now)
     })
     .await
     .map_err(|error| format!("Prediction verifier worker failed: {error}"))
@@ -89,6 +92,14 @@ pub async fn verify_predictions() -> Result<PredictionVerificationReport, String
         Err(error) => log::error!("[Prediction] 本轮验证失败，调度继续: {error}"),
     }
     result
+}
+
+fn verify_predictions_on_at(
+    db: &DatabaseManager,
+    now: DateTime<FixedOffset>,
+) -> Result<PredictionVerificationReport, String> {
+    let as_of = completed_session_as_of_at(now)?;
+    verify_due_predictions(db, as_of)
 }
 
 /// Resolve the latest completed session using the immutable checked-in calendar.
