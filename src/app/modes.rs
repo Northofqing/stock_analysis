@@ -164,7 +164,7 @@ impl ChainSendSuppression {
 }
 
 struct ChainSendResult {
-    weak_success: bool,
+    weak_completion: stock_analysis::notification::NotificationCompletion,
     notification_report: Option<stock_analysis::notification::NotificationSendReport>,
     wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
     feishu_http_body: Option<stock_analysis::notification::FeishuHttpBodySummary>,
@@ -177,7 +177,7 @@ impl ChainSendResult {
         feishu_http_body: Option<stock_analysis::notification::FeishuHttpBodySummary>,
     ) -> Self {
         Self {
-            weak_success: report.has_success(),
+            weak_completion: report.completion(),
             notification_report: Some(report),
             wechat_http_body,
             feishu_http_body,
@@ -186,8 +186,19 @@ impl ChainSendResult {
 
     #[cfg(test)]
     fn test_weak_result(weak_success: bool) -> Self {
+        Self::test_weak_completion(if weak_success {
+            stock_analysis::notification::NotificationCompletion::AllAccepted
+        } else {
+            stock_analysis::notification::NotificationCompletion::AllFailed
+        })
+    }
+
+    #[cfg(test)]
+    fn test_weak_completion(
+        weak_completion: stock_analysis::notification::NotificationCompletion,
+    ) -> Self {
         Self {
-            weak_success,
+            weak_completion,
             notification_report: None,
             wechat_http_body: None,
             feishu_http_body: None,
@@ -355,7 +366,7 @@ where
                     envelope.notification_report = sent.notification_report;
                     envelope.wechat_http_body = sent.wechat_http_body;
                     envelope.feishu_http_body = sent.feishu_http_body;
-                    require_chain_notification_success(Ok(sent.weak_success))
+                    require_chain_notification_success(Ok(sent.weak_completion))
                 }
                 Err(error) => require_chain_notification_success(Err(error)),
             };
@@ -372,13 +383,23 @@ where
     Ok(envelope)
 }
 
-fn require_chain_notification_success(result: Result<bool>) -> Result<()> {
+fn require_chain_notification_success(
+    result: Result<stock_analysis::notification::NotificationCompletion>,
+) -> Result<()> {
     match result.context("产业链联动分析报告推送异常")? {
-        true => {
-            info!("产业链联动分析报告已推送");
+        stock_analysis::notification::NotificationCompletion::AllAccepted => {
+            info!("产业链联动分析报告所有目标均本地弱接受");
             Ok(())
         }
-        false => anyhow::bail!("产业链联动分析报告推送失败（所有渠道均未成功）"),
+        stock_analysis::notification::NotificationCompletion::Partial => {
+            anyhow::bail!("产业链联动分析报告部分渠道弱接受，其余结果未知；需人工裁定")
+        }
+        stock_analysis::notification::NotificationCompletion::AllFailed => {
+            anyhow::bail!("产业链联动分析报告推送失败（所有渠道均未成功）")
+        }
+        stock_analysis::notification::NotificationCompletion::NoTargets => {
+            anyhow::bail!("产业链联动分析报告没有通知目标")
+        }
     }
 }
 
@@ -388,7 +409,9 @@ mod tests_chain_delivery {
         deliver_prepared, require_chain_notification_success, ChainDeliveryEnvelope,
         ChainSendResult, ChainSendSuppression,
     };
-    use crate::app::chain_schedule::{finish_scheduled_delivery, ChainPhase, ChainScheduleStatus};
+    use crate::app::chain_schedule::{
+        finish_scheduled_delivery, ChainPhase, ChainScheduleStatus, ChainScheduleStore,
+    };
     use crate::app::chain_shadow_input::{
         observe, observe_prepared_decision, test_prepared, ChainGateCapture, ChainPreparedDecision,
     };
@@ -401,8 +424,18 @@ mod tests_chain_delivery {
 
     #[test]
     fn chain_send_rejects_weak_failure() {
-        assert!(require_chain_notification_success(Ok(true)).is_ok());
-        assert!(require_chain_notification_success(Ok(false)).is_err());
+        use stock_analysis::notification::NotificationCompletion;
+        assert!(
+            require_chain_notification_success(Ok(NotificationCompletion::AllAccepted)).is_ok()
+        );
+        assert!(require_chain_notification_success(Ok(NotificationCompletion::Partial)).is_err());
+        assert!(require_chain_notification_success(Ok(NotificationCompletion::AllFailed)).is_err());
+        assert_eq!(
+            require_chain_notification_success(Ok(NotificationCompletion::NoTargets))
+                .unwrap_err()
+                .to_string(),
+            "产业链联动分析报告没有通知目标"
+        );
         assert!(
             require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
                 .is_err()
@@ -534,6 +567,54 @@ mod tests_chain_delivery {
         let (events, _, sent, attempted, success) = scripted_delivery(false, true, true).await;
         assert_eq!(events, ["save", "guard", "observe"]);
         assert!(sent.is_empty() && !attempted && !success);
+    }
+
+    #[tokio::test]
+    async fn partial_weak_acceptance_keeps_scheduled_attempt_uncertain() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let phase = ChainPhase::Postclose;
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ChainScheduleStore::new(directory.path().join("chain.sqlite3"));
+        let attempt_no = Cell::new(0);
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |path| {
+                attempt_no.set(store.begin_send(phase, date, path)?);
+                Ok(())
+            },
+            |_| {
+                Box::pin(async {
+                    Ok(ChainSendResult::test_weak_completion(
+                        stock_analysis::notification::NotificationCompletion::Partial,
+                    ))
+                })
+            },
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        let result = finish_scheduled_delivery(
+            envelope,
+            phase,
+            date,
+            &ready_gate(phase, date),
+            || store.mark_weak_accepted(phase, date, attempt_no.get()),
+            |observed_phase, observed_date, prepared, input, acquisition| {
+                let _ = observe(observed_phase, observed_date, prepared, input, acquisition)?;
+                anyhow::bail!("post-send observation unavailable")
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("部分渠道弱接受"));
+        let (status, evidence) = store.inspect(phase, date).unwrap();
+        assert_eq!(status, ChainScheduleStatus::Uncertain);
+        assert_eq!(evidence.unwrap().state, "sending");
+        assert!(store.begin_send(phase, date, "retry.md").is_err());
     }
 
     #[tokio::test]
