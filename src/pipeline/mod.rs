@@ -7,6 +7,7 @@
 // 修复 Top10#3+#4 (2026-06-29 audit): 子模块改 pub(super) 让 analyze.rs 等兄弟文件能 super::xxx 访问
 mod backtest_runner;
 mod cli_identity;
+mod cli_send_audit;
 pub mod cli_target_receipt;
 mod completion;
 pub use cli_identity::{

@@ -8,6 +8,8 @@
 
 2026-09-29 重核当前源码：`pipeline/completion.rs` 已用 `StockAnalysisOutcome`、`SummaryCompletion` 将保存与 BestEffort 通知分开，`AnalysisNotification::Unknown` 保留发送开始后的未知结果；`app/modes.rs` 与 `app/schedule.rs` 均检查 `ensure_cli_success()`。`summary_notify.rs` 和单票发送会区别全部弱接受、部分弱接受、全部失败及无渠道。这关闭了“发送失败仍按 CLI 成功返回”的局部代码缺口，但弱接受没有持久 `TransportAccepted` authority，重启后也没有独立通知 cursor。
 
+2026-10-01 开发切片：CLI 单票与汇总在调用旧多渠道发送器前，以 create-once 文件持久化本轮通知身份、主体和报告哈希；返回后持久化逐渠道本地弱观察。发送前落盘失败阻止发送，发送后观察缺失保留未知状态，不自动重发；Custom 逐目标弱回执与意图使用同一 `notification_id`。此切片仍以进程生成的 invocation 为界，没有跨重启稳定的定时 occurrence、目标渠道的 `TransportAccepted` 或 Foundation physical owner 接管，因此两个 Unit 均未晋级。
+
 ## 共同验收门
 
 每个 Unit 先保存同一份 `PreparedFacts`，shadow 比较 occurrence、业务日、主体、事实来源、规则/模板版本、抑制原因及 exact payload bytes，不重拉 provider、不再调用 LLM、不写 cursor、不触碰 sink。新 owner 的 intent、跨 business/durable DB finalizer、reconciler、activation manifest、readiness、Draining 回退必须在该 Unit 故障矩阵中闭合。

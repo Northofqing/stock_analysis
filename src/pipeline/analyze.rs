@@ -1292,11 +1292,30 @@ impl AnalysisPipeline {
             ));
             outcome.notification =
                 super::AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-            let sent = super::cli_target_receipt::send_cli_report(
+            let sent = super::cli_target_receipt::send_cli_report_audited(
                 &self.notifier,
                 outcome.report_snapshot.as_ref().expect("just set").clone(),
+                &self.cli_send_audit_dir(),
             )
             .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(super::cli_target_receipt::CliAuditSendError::BeforeSend(error)) => {
+                    outcome.notification = super::AnalysisNotification::NotAttempted;
+                    outcome.failure = Some(format!("CLI 发送前意图落盘失败: {error:#}"));
+                    error!("[{}] {}", code_clone, outcome.failure.as_deref().unwrap());
+                    return Some(result);
+                }
+                Err(super::cli_target_receipt::CliAuditSendError::AfterSend(error)) => {
+                    outcome.failure = Some(format!("CLI 发送后弱观察落盘失败: {error:#}"));
+                    error!(
+                        "[{}] {}；结果未知，不自动重发",
+                        code_clone,
+                        outcome.failure.as_deref().unwrap()
+                    );
+                    return Some(result);
+                }
+            };
             if sent.has_custom_attempts() {
                 let directory = self.cli_target_receipt_dir();
                 if let Err(error) =
@@ -1339,6 +1358,14 @@ impl AnalysisPipeline {
             return directory.join("cli_target_receipts");
         }
         std::path::PathBuf::from("reports/cli_target_receipts")
+    }
+
+    fn cli_send_audit_dir(&self) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.test_backtest_output_dir {
+            return directory.join("cli_send_audit");
+        }
+        std::path::PathBuf::from("reports/cli_send_audit")
     }
 }
 

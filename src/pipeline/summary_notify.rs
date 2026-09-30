@@ -135,11 +135,29 @@ pub(super) async fn send_summary_notification_to(
     let snapshot = CliReportSnapshot::new(invocation.summary_notification(), artifacts.report);
     outcome.report_snapshot = Some(snapshot);
     outcome.notification = AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-    let sent = super::cli_target_receipt::send_cli_report(
+    let sent = super::cli_target_receipt::send_cli_report_audited(
         notifier,
         outcome.report_snapshot.as_ref().expect("just set").clone(),
+        &output_dir.join("cli_send_audit"),
     )
     .await;
+    let sent = match sent {
+        Ok(sent) => sent,
+        Err(super::cli_target_receipt::CliAuditSendError::BeforeSend(error)) => {
+            outcome.notification = AnalysisNotification::NotAttempted;
+            outcome.failure = Some(format!("CLI 发送前意图落盘失败: {error:#}"));
+            error!("{}", outcome.failure.as_deref().unwrap());
+            return outcome;
+        }
+        Err(super::cli_target_receipt::CliAuditSendError::AfterSend(error)) => {
+            outcome.failure = Some(format!("CLI 发送后弱观察落盘失败: {error:#}"));
+            error!(
+                "{}；结果未知，不自动重发",
+                outcome.failure.as_deref().unwrap()
+            );
+            return outcome;
+        }
+    };
     if sent.has_custom_attempts() {
         let directory = output_dir.join("cli_target_receipts");
         if let Err(error) =

@@ -31,7 +31,7 @@ fn digest_fields(fields: &[&[u8]]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn producer_name(producer: CliProducer, subject: &CliSubject) -> &'static str {
+pub(super) fn producer_name(producer: CliProducer, subject: &CliSubject) -> &'static str {
     match (producer, subject) {
         (CliProducer::Default, CliSubject::Stock { .. }) => "cli-single-default",
         (CliProducer::Schedule, CliSubject::Stock { .. }) => "cli-single-schedule",
@@ -72,6 +72,20 @@ impl From<&CliSubject> for CliTargetSubject {
             CliSubject::Summary => Self::Summary,
         }
     }
+}
+
+/// Keep the pre-send intent and post-send Custom target receipts on the same
+/// notification identity without changing existing v2 receipt bytes.
+pub(super) fn notification_id_for(snapshot: &CliReportSnapshot) -> Result<String> {
+    let identity = snapshot.identity();
+    let producer = producer_name(identity.invocation().producer(), identity.subject());
+    let subject_json = serde_json::to_vec(&CliTargetSubject::from(identity.subject()))?;
+    Ok(digest_fields(&[
+        b"notification",
+        identity.invocation().id().as_bytes(),
+        producer.as_bytes(),
+        &subject_json,
+    ]))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +139,31 @@ impl CliBoundSend {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CliAuditSendError {
+    #[error("CLI send intent was not durable; no notification send started: {0:#}")]
+    BeforeSend(anyhow::Error),
+    #[error("CLI notification outcome is unknown; weak observation was not durable: {0:#}")]
+    AfterSend(anyhow::Error),
+}
+
+/// A durable intent must exist before any legacy channel can be called. The
+/// observation is only the local weak result; it never authorizes a retry.
+pub async fn send_cli_report_audited(
+    notifier: &NotificationService,
+    snapshot: CliReportSnapshot,
+    directory: &Path,
+) -> std::result::Result<CliBoundSend, CliAuditSendError> {
+    let pending = super::cli_send_audit::begin(&snapshot, directory)
+        .map_err(CliAuditSendError::BeforeSend)?;
+    let report = notifier.send_report(snapshot.report()).await;
+    pending
+        .observe(&report)
+        .map_err(CliAuditSendError::AfterSend)?;
+    Ok(CliBoundSend { snapshot, report })
+}
+
+#[cfg(test)]
 pub async fn send_cli_report(
     notifier: &NotificationService,
     snapshot: CliReportSnapshot,
@@ -168,13 +207,7 @@ pub fn persist_custom_target_receipts(
     let invocation_id = identity.invocation().id();
     let producer = producer_name(identity.invocation().producer(), identity.subject());
     let subject = CliTargetSubject::from(identity.subject());
-    let subject_json = serde_json::to_vec(&subject)?;
-    let notification_id = digest_fields(&[
-        b"notification",
-        invocation_id.as_bytes(),
-        producer.as_bytes(),
-        &subject_json,
-    ]);
+    let notification_id = notification_id_for(snapshot)?;
     let report_sha256 = snapshot.report_bytes().sha256().as_str();
 
     let mut receipts = Vec::with_capacity(custom_attempts.len());
