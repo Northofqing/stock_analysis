@@ -217,9 +217,44 @@ impl SourceRecoveryReport {
         if self.sources.is_empty() {
             return "none".to_owned();
         }
+        let checked_at = self
+            .observed_at
+            .zip(self.observed_age_seconds)
+            .map(|(observed_at, age)| observed_at + chrono::Duration::seconds(age));
         self.sources
             .iter()
-            .map(|source| format!("{}:{}", source.provider, source.breaker_state))
+            .map(|source| {
+                let mut summary = format!("{}:{}", source.provider, source.breaker_state);
+                if source.warming {
+                    summary.push_str(":warming");
+                }
+                if let Some(outage_at) = source.outage_started_at {
+                    if let Some(checked_at) = checked_at {
+                        summary.push_str(&format!(
+                            ":outage_age_s={}",
+                            checked_at
+                                .signed_duration_since(outage_at)
+                                .num_seconds()
+                                .max(0)
+                        ));
+                    }
+                    if let Some(reason) = source.last_reason_code.as_deref() {
+                        summary.push_str(":reason=");
+                        summary.push_str(reason);
+                    }
+                } else if let (Some(checked_at), Some(success_at)) =
+                    (checked_at, source.last_successful_pull_at)
+                {
+                    summary.push_str(&format!(
+                        ":last_success_age_s={}",
+                        checked_at
+                            .signed_duration_since(success_at)
+                            .num_seconds()
+                            .max(0)
+                    ));
+                }
+                summary
+            })
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -436,5 +471,61 @@ mod tests {
         open_without_probe.sources[0].outage_started_at = Some(at);
         open_without_probe.sources[0].opened_at = Some(at);
         assert_invalid(&open_without_probe);
+    }
+
+    #[test]
+    fn text_summary_exposes_closed_breaker_outage_and_recovery_age() {
+        let at = Utc::now();
+        let registry = GlobalNewsSourceRegistry::new();
+        let root = tempfile::tempdir().unwrap();
+        let file_path = path(root.path(), true);
+        write_at(&file_path, "123:456:1", &registry, at).unwrap();
+        let mut file = read_at(&file_path).unwrap();
+        let source = &mut file.sources[0];
+        source.warming = false;
+        source.last_attempt_at = Some(at);
+        source.outage_started_at = Some(at);
+        source.last_failure_at = Some(at);
+        source.last_reason_code = Some("provider_transport".to_owned());
+        source.last_retryable = Some(true);
+        super::super::atomic_replace_bytes(
+            &file_path,
+            &serde_json::to_vec(&file).unwrap(),
+            "test source snapshot",
+        )
+        .unwrap();
+
+        let degraded = report_at(
+            root.path(),
+            true,
+            Some("123:456:1"),
+            at + chrono::Duration::seconds(17),
+        );
+        assert_eq!(degraded.status, "degraded");
+        assert!(degraded
+            .source_summary()
+            .contains("Eastmoney:closed:outage_age_s=17:reason=provider_transport"));
+
+        let source = &mut file.sources[0];
+        source.outage_started_at = None;
+        source.last_successful_pull_at = Some(at + chrono::Duration::seconds(5));
+        super::super::atomic_replace_bytes(
+            &file_path,
+            &serde_json::to_vec(&file).unwrap(),
+            "test source snapshot",
+        )
+        .unwrap();
+        let recovered = report_at(
+            root.path(),
+            true,
+            Some("123:456:1"),
+            at + chrono::Duration::seconds(17),
+        );
+        assert!(recovered
+            .source_summary()
+            .contains("Eastmoney:closed:last_success_age_s=12"));
+        assert!(!recovered
+            .source_summary()
+            .contains("reason=provider_transport"));
     }
 }
