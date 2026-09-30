@@ -4372,7 +4372,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
 
     /// BR-232: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
     /// 返回 (去重样本数, 命中数); 按 (pred_date, stock_code) 去重取首行,
-    /// 只统计已回填 (actual_change NOT NULL) 且 pred_date <= business_date 的行。
+    /// 只统计已完成观察交易日、且收益与命中结果均完整的行。
     pub fn candidate_promotion_samples(
         &self,
         business_date: &str,
@@ -4386,13 +4386,35 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             hit_sum: i64,
         }
+        #[derive(QueryableByName)]
+        struct TargetDate {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            target_date: String,
+        }
+        // The table predates this read model. Reject malformed legacy dates
+        // before a lexical due-date comparison can silently promote a cohort.
+        let target_dates = diesel::sql_query(
+            "SELECT DISTINCT target_date FROM prediction_tracker \
+             WHERE pred_detail = 'candidate-strong' AND pred_date <= ?1",
+        )
+        .bind::<diesel::sql_types::Text, _>(business_date)
+        .load::<TargetDate>(&mut *conn)?;
+        for row in target_dates {
+            let parsed = NaiveDate::parse_from_str(&row.target_date, "%Y-%m-%d")
+                .map_err(|error| invalid_input(format!("candidate target_date 无效: {error}")))?;
+            if parsed.format("%Y-%m-%d").to_string() != row.target_date {
+                return Err(
+                    invalid_input("candidate target_date 不是规范 YYYY-MM-DD".into()).into(),
+                );
+            }
+        }
         let row = diesel::sql_query(
             "SELECT COUNT(*) AS sample_count, COALESCE(SUM(hit), 0) AS hit_sum \
              FROM prediction_tracker \
              WHERE id IN ( \
                SELECT MIN(id) FROM prediction_tracker \
                WHERE pred_detail = 'candidate-strong' AND actual_change IS NOT NULL \
-                 AND pred_date <= ?1 \
+                 AND hit IN (0, 1) AND pred_date <= ?1 AND target_date <= ?1 \
                GROUP BY pred_date, stock_code \
              )",
         )

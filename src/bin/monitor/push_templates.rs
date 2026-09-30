@@ -7955,8 +7955,10 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
     let promotion_evidence = match tokio::task::spawn_blocking(|| {
         use stock_analysis::database::DatabaseManager;
         let db = DatabaseManager::get();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        db.candidate_promotion_samples(&today)
+        let completed_session = stock_analysis::monitor::prediction::completed_session_as_of_at(
+            stock_analysis::monitor::prediction::shanghai_now(),
+        )?;
+        db.candidate_promotion_samples(&completed_session.to_string())
             .map_err(|e| e.to_string())
     })
     .await

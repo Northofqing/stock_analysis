@@ -136,6 +136,131 @@ fn hit_rate_window_counts_only_due_rows_on_verified_trading_dates() {
         .is_err());
 }
 
+#[test]
+fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
+    let (_dir, db) = private_db();
+    for (code, pred_date, target_date, detail, hit) in [
+        (
+            "TEST_CODE_due_win",
+            "2026-09-30",
+            "2026-10-08",
+            "candidate-strong",
+            Some(true),
+        ),
+        (
+            "TEST_CODE_due_win",
+            "2026-09-30",
+            "2026-10-08",
+            "candidate-strong",
+            Some(false),
+        ),
+        (
+            "TEST_CODE_due_loss",
+            "2026-09-30",
+            "2026-10-08",
+            "candidate-strong",
+            Some(false),
+        ),
+        (
+            "TEST_CODE_today_early",
+            "2026-10-08",
+            "2026-10-09",
+            "candidate-strong",
+            Some(true),
+        ),
+        (
+            "TEST_CODE_pending",
+            "2026-09-30",
+            "2026-10-08",
+            "candidate-strong",
+            None,
+        ),
+        (
+            "TEST_CODE_other",
+            "2026-09-30",
+            "2026-10-08",
+            "other",
+            Some(true),
+        ),
+    ] {
+        db.save_prediction_legacy(
+            pred_date,
+            target_date,
+            None,
+            Some(code),
+            "up",
+            75.,
+            Some(detail),
+        )
+        .unwrap();
+        if let Some(hit) = hit {
+            let id = db.get_prediction_by_code_date(code, pred_date).unwrap().id;
+            assert_eq!(
+                db.update_prediction_result_by_id(id, if hit { 1.0 } else { -1.0 }, hit)
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    for (code, hit) in [
+        ("TEST_CODE_partial", None),
+        ("TEST_CODE_invalid_hit", Some(2)),
+    ] {
+        db.save_prediction_legacy(
+            "2026-09-30",
+            "2026-10-08",
+            None,
+            Some(code),
+            "up",
+            75.,
+            Some("candidate-strong"),
+        )
+        .unwrap();
+        let mut conn = db.get_conn().unwrap();
+        diesel::sql_query(
+            "UPDATE prediction_tracker SET actual_change = 1.0, hit = ?1 WHERE stock_code = ?2",
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(hit)
+        .bind::<diesel::sql_types::Text, _>(code)
+        .execute(&mut conn)
+        .unwrap();
+    }
+
+    let before_close = "2026-10-09T14:59:59+08:00"
+        .parse::<DateTime<FixedOffset>>()
+        .unwrap();
+    let after_close = "2026-10-09T15:00:00+08:00"
+        .parse::<DateTime<FixedOffset>>()
+        .unwrap();
+    let previous_session = completed_session_as_of_at(before_close).unwrap();
+    assert_eq!(previous_session.to_string(), "2026-10-08");
+    assert_eq!(
+        db.candidate_promotion_samples(&previous_session.to_string())
+            .unwrap(),
+        (2, 1),
+        "prematurely written target-day results must not open the promotion gate"
+    );
+    let completed_today = completed_session_as_of_at(after_close).unwrap();
+    assert_eq!(
+        db.candidate_promotion_samples(&completed_today.to_string())
+            .unwrap(),
+        (3, 2),
+        "one complete row per candidate and prediction day is counted"
+    );
+
+    // Legacy SQLite content can bypass save_prediction's date validation.
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query(
+        "INSERT INTO prediction_tracker \
+         (pred_date,target_date,stock_code,pred_direction,pred_score,pred_detail,actual_change,hit) \
+         VALUES ('2026-09-30','2026-10-99','TEST_CODE_bad_date','up',75,'candidate-strong',1,1)",
+    )
+    .execute(&mut conn)
+    .unwrap();
+    drop(conn);
+    assert!(db.candidate_promotion_samples("2026-10-09").is_err());
+}
+
 fn close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
     let mut conn = db.get_conn().unwrap();
     diesel::sql_query("INSERT INTO stock_daily (code,date,close) VALUES (?1,?2,?3)")
