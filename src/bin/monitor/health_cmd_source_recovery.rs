@@ -173,7 +173,10 @@ pub fn write_raw_news_source_snapshot(
 }
 
 fn read_at(path: &Path) -> Result<SourceRecoveryFile, &'static str> {
-    let file = std::fs::File::open(path).map_err(|_| "raw_news_source_snapshot_unavailable")?;
+    let file = super::open_regular_health_file(path).map_err(|error| match error {
+        super::HealthFileOpenError::Unavailable => "raw_news_source_snapshot_unavailable",
+        super::HealthFileOpenError::Invalid => "raw_news_source_snapshot_invalid",
+    })?;
     let mut bytes = Vec::new();
     file.take(super::MAX_SNAPSHOT_BYTES + 1)
         .read_to_end(&mut bytes)

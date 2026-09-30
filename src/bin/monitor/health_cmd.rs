@@ -13,6 +13,26 @@ const HEARTBEAT_VERSION: u8 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 4_096;
 const MAX_SNAPSHOT_AGE: Duration = Duration::minutes(10);
 const MAX_CLOCK_LEAD: Duration = Duration::seconds(5);
+#[cfg(target_os = "linux")]
+const HEALTH_O_NOFOLLOW: i32 = 0x0002_0000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const HEALTH_O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(target_os = "linux")]
+const HEALTH_O_NONBLOCK: i32 = 0x0000_0800;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const HEALTH_O_NONBLOCK: i32 = 0x0000_0004;
 #[path = "health_cmd_source_recovery.rs"]
 mod source_recovery;
 pub use source_recovery::write_raw_news_source_snapshot;
@@ -365,8 +385,54 @@ fn validate_heartbeat_at(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum HealthFileOpenError {
+    Unavailable,
+    Invalid,
+}
+
+/// Open a snapshot or lease without waiting for a substituted pipe or following
+/// a leaf symlink. Linux, macOS and the listed BSD targets also protect the
+/// name-check/open race with O_NONBLOCK and O_NOFOLLOW; the retained descriptor
+/// must be a regular file on every target.
+pub(super) fn open_regular_health_file(path: &Path) -> Result<std::fs::File, HealthFileOpenError> {
+    let named = std::fs::symlink_metadata(path).map_err(|_| HealthFileOpenError::Unavailable)?;
+    if !named.file_type().is_file() {
+        return Err(HealthFileOpenError::Invalid);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(HEALTH_O_NOFOLLOW | HEALTH_O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| HealthFileOpenError::Unavailable)?;
+    if !file
+        .metadata()
+        .map_err(|_| HealthFileOpenError::Invalid)?
+        .file_type()
+        .is_file()
+    {
+        return Err(HealthFileOpenError::Invalid);
+    }
+    Ok(file)
+}
+
 fn read_heartbeat_at(path: &Path, now: DateTime<Utc>) -> Result<ProcessHeartbeat, &'static str> {
-    let file = std::fs::File::open(path).map_err(|_| "process_heartbeat_unavailable")?;
+    let file = open_regular_health_file(path).map_err(|error| match error {
+        HealthFileOpenError::Unavailable => "process_heartbeat_unavailable",
+        HealthFileOpenError::Invalid => "process_heartbeat_invalid",
+    })?;
     let mut bytes = Vec::new();
     file.take(MAX_SNAPSHOT_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -417,7 +483,10 @@ fn valid_boot_id(value: &str) -> bool {
 }
 
 fn read_snapshot_at(path: &Path) -> Result<HealthSnapshot, &'static str> {
-    let file = std::fs::File::open(path).map_err(|_| "health_snapshot_unavailable")?;
+    let file = open_regular_health_file(path).map_err(|error| match error {
+        HealthFileOpenError::Unavailable => "health_snapshot_unavailable",
+        HealthFileOpenError::Invalid => "health_snapshot_invalid",
+    })?;
     let mut bytes = Vec::new();
     file.take(MAX_SNAPSHOT_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -432,7 +501,7 @@ fn read_snapshot_at(path: &Path) -> Result<HealthSnapshot, &'static str> {
 }
 
 fn monitor_lease_identity(path: &Path) -> Option<String> {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = open_regular_health_file(path) else {
         return None;
     };
     match fs2::FileExt::try_lock_shared(&file) {
@@ -626,6 +695,33 @@ fn render_text(report: &HealthReport) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` owns a NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    fn returns_without_waiting<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(read());
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("health read blocked on a nonregular file");
+        worker.join().unwrap();
+        result
+    }
+
     fn heartbeat(at: DateTime<Utc>) -> ProcessHeartbeat {
         ProcessHeartbeat {
             version: HEARTBEAT_VERSION,
@@ -801,6 +897,83 @@ mod tests {
             read_snapshot_at(&path).unwrap_err(),
             "health_snapshot_invalid"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_readers_reject_fifo_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let banner = snapshot_path(root.path(), false);
+        let heartbeat = heartbeat_path(root.path(), false);
+        let sources = source_recovery::path(root.path(), false);
+        let lease = lease_path(root.path(), false);
+        for path in [&banner, &heartbeat, &sources, &lease] {
+            create_fifo(path);
+        }
+
+        assert_eq!(
+            returns_without_waiting(move || read_snapshot_at(&banner)).unwrap_err(),
+            "health_snapshot_invalid"
+        );
+        assert_eq!(
+            returns_without_waiting(move || read_heartbeat_at(&heartbeat, now)),
+            Err("process_heartbeat_invalid")
+        );
+        assert_eq!(
+            returns_without_waiting(move || monitor_lease_identity(&lease)),
+            None
+        );
+        let root_path = root.path().to_path_buf();
+        let source_report = returns_without_waiting(move || {
+            source_recovery::report_at(&root_path, false, Some("123:456:1"), now)
+        });
+        assert_eq!(
+            source_report.reason_code,
+            Some("raw_news_source_snapshot_invalid")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_readers_do_not_follow_valid_snapshot_or_lease_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let banner_target = root.path().join("banner-target.json");
+        let heartbeat_target = root.path().join("heartbeat-target.json");
+        let sources_target = root.path().join("sources-target.json");
+        let lease_target = root.path().join("lease-target.lock");
+        write_snapshot_at(&banner_target, &snapshot(now)).unwrap();
+        write_heartbeat_at(&heartbeat_target, "123:456:1", now).unwrap();
+        let registry = stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
+        source_recovery::write_at(&sources_target, "123:456:1", &registry, now).unwrap();
+        let held_lease = crate::acquire_monitor_instance_lease_at(&lease_target).unwrap();
+        for (target, link) in [
+            (&banner_target, snapshot_path(root.path(), false)),
+            (&heartbeat_target, heartbeat_path(root.path(), false)),
+            (&sources_target, source_recovery::path(root.path(), false)),
+            (&lease_target, lease_path(root.path(), false)),
+        ] {
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(target, link).unwrap();
+        }
+
+        assert_eq!(
+            read_snapshot_at(&snapshot_path(root.path(), false)).unwrap_err(),
+            "health_snapshot_invalid"
+        );
+        assert_eq!(
+            read_heartbeat_at(&heartbeat_path(root.path(), false), now),
+            Err("process_heartbeat_invalid")
+        );
+        assert_eq!(
+            source_recovery::report_at(root.path(), false, Some("123:456:1"), now).reason_code,
+            Some("raw_news_source_snapshot_invalid")
+        );
+        assert!(monitor_lease_identity(&lease_path(root.path(), false)).is_none());
+        assert!(!held_lease.boot_id.is_empty());
     }
 
     #[test]
