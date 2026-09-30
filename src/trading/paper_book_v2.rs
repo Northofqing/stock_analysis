@@ -3,7 +3,8 @@
 
 use crate::database::DatabaseManager;
 use crate::trading::paper_ledger::{
-    verified_v1_snapshot_on, AccountBinding, LedgerError, Money, VerifiedV1Snapshot,
+    verified_v1_snapshot_on, verified_v1_snapshot_with_audit_guard_on, AccountBinding,
+    LedgerError, Money, V1AuditReplayGuard, VerifiedV1Snapshot,
 };
 use diesel::prelude::*;
 #[cfg(test)]
@@ -314,6 +315,10 @@ fn verify_genesis_rows(
 /// Row-level half of the CatalogV5 verifier. Caller first checks the exact
 /// schema/fee/review namespace; this function cannot issue cutover authority.
 pub(crate) fn verify_owner_rows_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    conn.transaction(verify_owner_rows_in_transaction_on)
+}
+
+fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
     let old_accounts: Vec<V1AccountRow> = diesel::sql_query(
         "SELECT account_id,epoch_id,manifest_hash FROM paper_ledger_account ORDER BY account_id",
     )
@@ -373,6 +378,7 @@ pub(crate) fn verify_owner_rows_on(conn: &mut SqliteConnection) -> Result<(), Le
             && heads.len() == head_count,
         "duplicate owner or V2 account/event/head row",
     )?;
+    let mut audit_guard = V1AuditReplayGuard::default();
     for old in old_accounts {
         let owner = owners
             .remove(&old.account_id)
@@ -413,7 +419,11 @@ pub(crate) fn verify_owner_rows_on(conn: &mut SqliteConnection) -> Result<(), Le
                     epoch_id: old.epoch_id.clone(),
                     manifest_hash: old.manifest_hash.clone(),
                 };
-                let snapshot = verified_v1_snapshot_on(conn, &binding)?;
+                let snapshot = verified_v1_snapshot_with_audit_guard_on(
+                    conn,
+                    &binding,
+                    &mut audit_guard,
+                )?;
                 verify_genesis_rows(&old, &account, &event, &head, &snapshot, &fee)?;
             }
             _ => return Err(invalid("unknown active generation")),

@@ -1605,6 +1605,59 @@ fn catalog_v5_cutover_replays_adjudicated_v1_without_catalog_recursion() {
 }
 
 #[test]
+fn catalog_v5_owner_replay_validates_global_audit_chain_once_for_multiple_rulings() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    let (_dir, db, binding, mut request) = catalog_v5_cutover_fixture();
+    let ledger = PaperLedger::open(&db, &instant);
+    let fill_id = ledger.effective_fills(&binding).unwrap()[0].paper_trade_id;
+    let mut ruling = ruling_for(&ledger, &binding, fill_id, "TEST_CODE_v5_first_ruling");
+    let first = ledger.adjudicate(ruling.clone()).unwrap();
+    ruling.request_id = "TEST_CODE_v5_second_ruling".into();
+    ruling.expected_version = first.version;
+    ruling.expected_head = first.event_hash.clone();
+    ruling.expected_predecessor = Some(first.event_hash);
+    ruling.action = AdjudicationAction::CorrectionDeclared {
+        price: Money::from_cny(9.0).unwrap(),
+        quantity: 100,
+        fact_at: instant(),
+    };
+    ledger.adjudicate(ruling).unwrap();
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    request.expected_v1_version = snapshot.version;
+    request.expected_v1_head_hash = snapshot.event_hash;
+    request.expected_v1_projection_hash = snapshot.projection_hash;
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    crate::database::order_audit::take_order_audit_chain_validations_for_test();
+    read_v2_on(&db, &binding.account_id).unwrap();
+    assert_eq!(
+        crate::database::order_audit::take_order_audit_chain_validations_for_test(),
+        1,
+        "one full global audit replay per V5 owner verification"
+    );
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.batch_execute(
+            "DROP TRIGGER trg_order_audit_chain_no_update;
+             UPDATE order_audit_chain SET record_hash='TEST_CODE_TAMPERED';
+             CREATE TRIGGER IF NOT EXISTS trg_order_audit_chain_no_update
+             BEFORE UPDATE ON order_audit_chain
+             BEGIN SELECT RAISE(ABORT, 'BR-086 order audit hash chain is immutable'); END",
+        ).unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn)
+            .unwrap();
+    }
+    assert!(read_v2_on(&db, &binding.account_id).is_err());
+    assert_eq!(
+        crate::database::order_audit::take_order_audit_chain_validations_for_test(),
+        1,
+        "a new V5 read must revalidate the audit chain"
+    );
+}
+
+#[test]
 fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
     use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
     let (_dir, db, binding, request) = catalog_v5_cutover_fixture();

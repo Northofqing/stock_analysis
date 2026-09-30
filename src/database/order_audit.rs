@@ -150,9 +150,21 @@ pub(crate) fn validate_canonical_order_audit_chain(
 pub(crate) fn validate_order_audit_chain(
     conn: &mut SqliteConnection,
 ) -> diesel::QueryResult<String> {
+    #[cfg(test)]
+    ORDER_AUDIT_CHAIN_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let audits = load_audit_rows(conn)?;
     let chain = load_chain_rows(conn)?;
     validate_canonical_order_audit_chain(&audits, &chain).map_err(audit_chain_error)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ORDER_AUDIT_CHAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_order_audit_chain_validations_for_test() -> usize {
+    ORDER_AUDIT_CHAIN_VALIDATIONS.with(|count| count.replace(0))
 }
 
 fn append_chain_row(

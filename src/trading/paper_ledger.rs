@@ -124,6 +124,24 @@ impl From<diesel::result::Error> for LedgerError {
         }
     }
 }
+
+/// Reuse a full audit-chain proof only while replaying one database snapshot.
+/// The V5 owner verifier holds a transaction around all uses of this guard.
+#[derive(Default)]
+pub(crate) struct V1AuditReplayGuard {
+    validated: bool,
+}
+
+impl V1AuditReplayGuard {
+    fn ensure_validated(&mut self, conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+        if !self.validated {
+            crate::database::order_audit::validate_order_audit_chain(conn)?;
+            self.validated = true;
+        }
+        Ok(())
+    }
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<String, LedgerError> {
     serde_json::to_string(value).map_err(|error| LedgerError::IntegrityFailure(error.to_string()))
 }
@@ -883,7 +901,7 @@ fn replay_through(
     binding: &AccountBinding,
     until: Option<i64>,
 ) -> Result<PaperView, LedgerError> {
-    replay_through_inner(conn, binding, until, false)
+    replay_through_inner(conn, binding, until, false, None)
 }
 
 fn replay_through_inner(
@@ -891,6 +909,7 @@ fn replay_through_inner(
     binding: &AccountBinding,
     until: Option<i64>,
     catalog_already_verified: bool,
+    mut audit_guard: Option<&mut V1AuditReplayGuard>,
 ) -> Result<PaperView, LedgerError> {
     let account = account(conn, &binding.account_id)?.ok_or(LedgerError::NotSeeded)?;
     let manifest: SeedManifest = decode(&account.manifest_bytes)?;
@@ -943,6 +962,7 @@ fn replay_through_inner(
                 &row.previous_hash,
                 ruling,
                 catalog_already_verified,
+                audit_guard.as_deref_mut(),
                 state
                     .as_ref()
                     .ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
@@ -989,7 +1009,16 @@ fn load_inner(
     binding: &AccountBinding,
     catalog_already_verified: bool,
 ) -> Result<PaperView, LedgerError> {
-    let view = replay_through_inner(conn, binding, None, catalog_already_verified)?;
+    load_inner_with_audit_guard(conn, binding, catalog_already_verified, None)
+}
+
+fn load_inner_with_audit_guard(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    catalog_already_verified: bool,
+    audit_guard: Option<&mut V1AuditReplayGuard>,
+) -> Result<PaperView, LedgerError> {
+    let view = replay_through_inner(conn, binding, None, catalog_already_verified, audit_guard)?;
     let head = head(conn, binding)?.ok_or_else(|| {
         LedgerError::IntegrityFailure("missing projection; explicit repair required".into())
     })?;
@@ -1014,7 +1043,22 @@ pub(crate) fn verified_v1_snapshot_on(
     conn: &mut SqliteConnection,
     binding: &AccountBinding,
 ) -> Result<VerifiedV1Snapshot, LedgerError> {
-    let view = load_inner(conn, binding, true)?;
+    conn.transaction(|conn| {
+        verified_v1_snapshot_with_audit_guard_on(
+            conn,
+            binding,
+            &mut V1AuditReplayGuard::default(),
+        )
+    })
+}
+
+/// Caller owns one transaction covering every reuse of `audit_guard`.
+pub(crate) fn verified_v1_snapshot_with_audit_guard_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    audit_guard: &mut V1AuditReplayGuard,
+) -> Result<VerifiedV1Snapshot, LedgerError> {
+    let view = load_inner_with_audit_guard(conn, binding, true, Some(audit_guard))?;
     view.require_available()?;
     let equity = view.equity()?;
     let stored = head(conn, binding)?
