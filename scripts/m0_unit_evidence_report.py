@@ -5,6 +5,7 @@ with mode=ro/query_only; a live production WAL database requires a separately
 controlled snapshot before it is passed here.
 """
 
+import argparse
 import datetime as dt
 import hashlib
 import json
@@ -12,6 +13,7 @@ from contextlib import closing
 from pathlib import Path
 import re
 import sqlite3
+import sys
 
 import push_catalog_drift
 
@@ -27,9 +29,11 @@ ORIGIN_DOMAIN = "durable-delivery-correlation-observation-v1"
 
 REQUIRED_COLUMNS = {
     "delivery_decisions": {"decision_identity", "business_date", "push_kind", "state"},
+    "delivery_attempts": {"attempt_identity", "decision_identity"},
     "sink_results": {
         "result_event_identity",
         "decision_identity",
+        "attempt_identity",
         "result_kind",
         "authoritative_for_state",
         "late_after_fence",
@@ -211,11 +215,15 @@ def _correlated_candidates(connection, units, from_date, to_date):
         FROM delivery_correlation_observations AS c
         JOIN delivery_decisions AS d ON d.decision_identity=c.decision_identity
         LEFT JOIN (
-          SELECT decision_identity,COUNT(DISTINCT result_event_identity) AS accepted_events
-          FROM sink_results
-          WHERE result_kind='Accepted' AND authoritative_for_state=1
-            AND late_after_fence=0
-          GROUP BY decision_identity
+          SELECT s.decision_identity,
+                 COUNT(DISTINCT s.result_event_identity) AS accepted_events
+          FROM sink_results AS s
+          JOIN delivery_attempts AS a
+            ON a.attempt_identity=s.attempt_identity
+           AND a.decision_identity=s.decision_identity
+          WHERE s.result_kind='Accepted' AND s.authoritative_for_state=1
+            AND s.late_after_fence=0
+          GROUP BY s.decision_identity
         ) AS s ON s.decision_identity=d.decision_identity
         WHERE d.business_date>=? AND d.business_date<=?
         ORDER BY d.business_date,c.decision_identity,c.observation_identity
@@ -296,6 +304,22 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str, units: list[dic
                 }
                 if table_type != ("table",) or not required <= columns:
                     raise ValueError(f"missing durable-delivery columns in {table}")
+            invalid_sink_link = connection.execute(
+                """
+                SELECT 1 FROM sink_results AS s
+                JOIN delivery_decisions AS d
+                  ON d.decision_identity=s.decision_identity
+                LEFT JOIN delivery_attempts AS a
+                  ON a.attempt_identity=s.attempt_identity
+                WHERE d.business_date>=? AND d.business_date<=?
+                  AND (a.attempt_identity IS NULL
+                       OR a.decision_identity<>s.decision_identity)
+                LIMIT 1
+                """,
+                (from_date, to_date),
+            ).fetchone()
+            if invalid_sink_link:
+                raise ValueError("sink result is not bound to its decision attempt")
             if version == 10:
                 for column in ("sub_kind", "scope_key", "envelope_canonical", "envelope_sha256"):
                     if column not in {
@@ -321,18 +345,23 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str, units: list[dic
                 SELECT d.business_date, d.push_kind, d.state,
                        COUNT(DISTINCT d.decision_identity),
                        COUNT(DISTINCT CASE
-                           WHEN s.result_kind='Accepted'
+                           WHEN a.attempt_identity IS NOT NULL
+                            AND s.result_kind='Accepted'
                             AND s.authoritative_for_state=1
                             AND s.late_after_fence=0
                            THEN d.decision_identity END),
                        COUNT(DISTINCT CASE
-                           WHEN s.result_kind='Accepted'
+                           WHEN a.attempt_identity IS NOT NULL
+                            AND s.result_kind='Accepted'
                             AND s.authoritative_for_state=1
                             AND s.late_after_fence=0
                            THEN s.result_event_identity END)
                 FROM delivery_decisions AS d
                 LEFT JOIN sink_results AS s
                   ON s.decision_identity=d.decision_identity
+                LEFT JOIN delivery_attempts AS a
+                  ON a.attempt_identity=s.attempt_identity
+                 AND a.decision_identity=d.decision_identity
                 WHERE d.business_date>=? AND d.business_date<=?
                   {unattributed}
                 GROUP BY d.business_date, d.push_kind, d.state
@@ -383,3 +412,27 @@ def build_report(root: Path, durable_db: Path, from_date: str, to_date: str) -> 
             "an Accepted sink result proves external receipt or business finalization."
         ),
     }
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--durable-snapshot", type=Path, required=True,
+        help="path to an isolated, stable v9/v10 SQLite snapshot; never a live WAL database",
+    )
+    parser.add_argument("--from-date", required=True, help="inclusive YYYY-MM-DD")
+    parser.add_argument("--to-date", required=True, help="inclusive YYYY-MM-DD")
+    args = parser.parse_args(argv)
+    try:
+        report = build_report(
+            Path(__file__).resolve().parents[1], args.durable_snapshot,
+            args.from_date, args.to_date,
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        parser.exit(1, f"m0 evidence report failed: {exc}\n")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

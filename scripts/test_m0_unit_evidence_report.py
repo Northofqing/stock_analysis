@@ -5,6 +5,8 @@ import hashlib
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -31,9 +33,14 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
                     state TEXT NOT NULL,
                     envelope_canonical BLOB
                 );
+                CREATE TABLE delivery_attempts (
+                    attempt_identity TEXT PRIMARY KEY,
+                    decision_identity TEXT NOT NULL
+                );
                 CREATE TABLE sink_results (
                     result_event_identity TEXT PRIMARY KEY,
                     decision_identity TEXT NOT NULL,
+                    attempt_identity TEXT NOT NULL,
                     result_kind TEXT NOT NULL,
                     authoritative_for_state INTEGER NOT NULL,
                     late_after_fence INTEGER NOT NULL,
@@ -51,12 +58,18 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
                 "VALUES (?,?,?,?,?)",
                 (identity, day, kind, state, b"SECRET_SOURCE_CONTENT"),
             )
+            connection.execute(
+                "INSERT INTO delivery_attempts VALUES (?,?)",
+                (f"attempt-{identity}", identity),
+            )
 
-    def result(self, identity, decision, kind="Accepted", authority=1, late=0):
+    def result(self, identity, decision, kind="Accepted", authority=1, late=0,
+               attempt=None):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute(
-                "INSERT INTO sink_results VALUES (?,?,?,?,?,?,?)",
-                (identity, decision, kind, authority, late, b"SECRET_SINK_CONTENT", "SECRET_MESSAGE"),
+                "INSERT INTO sink_results VALUES (?,?,?,?,?,?,?,?)",
+                (identity, decision, attempt or f"attempt-{decision}", kind,
+                 authority, late, b"SECRET_SINK_CONTENT", "SECRET_MESSAGE"),
             )
 
     def report(self, from_date=DAY, to_date=DAY):
@@ -183,6 +196,16 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             self.assertEqual(by_unit[unit_id]["correlation"], "NotRecorded")
         self.assertNotIn("SECRET_DECISION", json.dumps(report))
 
+    def test_misbound_attempt_cannot_be_counted_as_authoritative_result(self):
+        self.decision("SECRET_DECISION_A", "MarketActionAlert")
+        self.decision("SECRET_DECISION_B", "MarketActionAlert")
+        self.result(
+            "SECRET_MISBOUND_RESULT", "SECRET_DECISION_A",
+            attempt="attempt-SECRET_DECISION_B",
+        )
+        with self.assertRaisesRegex(ValueError, "not bound to its decision attempt"):
+            self.report()
+
     def test_uncertain_result_is_not_accepted_and_dates_are_bounded(self):
         self.decision("SECRET_UNCERTAIN", "DataMode", "UncertainManualReview")
         self.result("SECRET_RESULT_U", "SECRET_UNCERTAIN", "Uncertain")
@@ -211,6 +234,7 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
                 CREATE TABLE sink_results (
                     result_event_identity TEXT,
                     decision_identity TEXT,
+                    attempt_identity TEXT,
                     result_kind TEXT,
                     authoritative_for_state INTEGER
                 );
@@ -387,6 +411,23 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
             str(self.db),
         ):
             self.assertNotIn(secret, output)
+
+    def test_cli_reports_only_caller_supplied_stable_snapshot(self):
+        self.decision("SECRET_CLI_DECISION", "DataMode")
+        self.result("SECRET_CLI_RESULT", "SECRET_CLI_DECISION")
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/m0_unit_evidence_report.py"),
+             "--durable-snapshot", str(self.db),
+             "--from-date", DAY, "--to-date", DAY],
+            cwd=self.temp.name, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertEqual(len(report["units"]), 52)
+        self.assertEqual(report["unattributed_kind_candidates"][0]["decisions"], 1)
+        self.assertNotIn("SECRET_CLI_DECISION", completed.stdout)
+        self.assertNotIn("SECRET_CLI_RESULT", completed.stdout)
+        self.assertNotIn(str(self.db), completed.stdout)
 
     def test_wal_read_only_connection_can_create_sidecars(self):
         self.decision("SECRET_WAL_DECISION", "DataMode")
