@@ -2,13 +2,15 @@
 //! generations; the only writer is compiled for isolated tests.
 
 use crate::database::DatabaseManager;
+#[cfg(test)]
+use crate::trading::paper_ledger::verified_v1_snapshot_on;
 use crate::trading::paper_ledger::{
-    verified_v1_snapshot_on, verified_v1_snapshot_with_audit_guard_on, AccountBinding,
-    LedgerError, Money, V1AuditReplayGuard, VerifiedV1Snapshot,
+    verified_v1_snapshot_with_audit_guard_on, AccountBinding, LedgerError, Money,
+    V1AuditReplayGuard, VerifiedV1Snapshot,
 };
-use diesel::prelude::*;
 #[cfg(test)]
 use diesel::connection::SimpleConnection;
+use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -419,11 +421,8 @@ fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<()
                     epoch_id: old.epoch_id.clone(),
                     manifest_hash: old.manifest_hash.clone(),
                 };
-                let snapshot = verified_v1_snapshot_with_audit_guard_on(
-                    conn,
-                    &binding,
-                    &mut audit_guard,
-                )?;
+                let snapshot =
+                    verified_v1_snapshot_with_audit_guard_on(conn, &binding, &mut audit_guard)?;
                 verify_genesis_rows(&old, &account, &event, &head, &snapshot, &fee)?;
             }
             _ => return Err(invalid("unknown active generation")),
