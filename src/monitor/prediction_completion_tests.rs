@@ -353,6 +353,57 @@ async fn task2_due_rows_exact_dates_large_returns_direction_and_keyset() {
 }
 
 #[tokio::test]
+async fn neutral_direction_counts_verified_sideways_moves_as_hits() {
+    let (_dir, db) = private_db();
+    let pred_date = "2026-10-08";
+    let target_date = "2026-10-09";
+    for (code, target_close, expected_hit) in [
+        ("TEST_CODE_neutral_flat", 100.0, true),
+        ("TEST_CODE_neutral_up_edge", 100.5, true),
+        ("TEST_CODE_neutral_down_edge", 99.5, true),
+        ("TEST_CODE_neutral_up_miss", 100.75, false),
+        ("TEST_CODE_neutral_down_miss", 99.25, false),
+    ] {
+        db.save_prediction_legacy(pred_date, target_date, None, Some(code), "中性", 80., None)
+            .unwrap();
+        qualified_close(&db, code, pred_date, 100.);
+        qualified_close(&db, code, target_date, target_close);
+        let outcome = verify_one(&db, code, pred_date, target_date, "中性")
+            .await
+            .unwrap();
+        assert_eq!(outcome.hit, expected_hit, "{code}");
+    }
+
+    for code in ["TEST_CODE_neutral_missing", "TEST_CODE_neutral_unqualified"] {
+        db.save_prediction_legacy(pred_date, target_date, None, Some(code), "中性", 80., None)
+            .unwrap();
+        qualified_close(&db, code, pred_date, 100.);
+    }
+    close(&db, "TEST_CODE_neutral_unqualified", target_date, 100.);
+
+    let as_of = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+    let report = verify_due_predictions(&db, as_of).unwrap();
+    assert_eq!(
+        (
+            report.pending,
+            report.verified,
+            report.hits,
+            report.deferred
+        ),
+        (7, 5, 3, 2)
+    );
+    assert!(report.errors.is_empty());
+    assert!(db
+        .get_verified_prediction_sample_hit_rate(as_of, 1)
+        .is_err());
+    let week = db
+        .get_verified_prediction_sample_hit_rate(as_of, 5)
+        .unwrap();
+    assert_eq!((week.samples, week.hits), (5, 3));
+    assert_eq!(week.rate, 0.6);
+}
+
+#[tokio::test]
 async fn task2_missing_target_close_never_uses_future_price() {
     let (_dir, db) = private_db();
     qualified_close(&db, "TEST_CODE_exact", "2026-02-02", 100.);
