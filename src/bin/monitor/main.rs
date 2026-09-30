@@ -188,6 +188,102 @@ fn g5b_should_analyze(
         && eligible_events > 0
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AttributionDailyPreflight {
+    Prepare,
+    ExistingClaim {
+        decision_identity: String,
+        state: stock_analysis::durable_delivery::DecisionState,
+    },
+    Unavailable(String),
+}
+
+fn classify_attribution_daily_preflight(
+    claim: Result<
+        Option<crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence>,
+        String,
+    >,
+) -> AttributionDailyPreflight {
+    match claim {
+        Ok(None) => AttributionDailyPreflight::Prepare,
+        Ok(Some(evidence))
+            if evidence.state == stock_analysis::durable_delivery::DecisionState::Delivered
+                && evidence.authoritative_receipt_sha256.is_none() =>
+        {
+            AttributionDailyPreflight::Unavailable(
+                "Delivered attribution claim has no authoritative receipt".to_owned(),
+            )
+        }
+        Ok(Some(evidence)) => AttributionDailyPreflight::ExistingClaim {
+            decision_identity: evidence.decision_identity,
+            state: evidence.state,
+        },
+        Err(error) => AttributionDailyPreflight::Unavailable(error),
+    }
+}
+
+#[cfg(test)]
+mod attribution_daily_preflight_tests {
+    use super::{classify_attribution_daily_preflight, AttributionDailyPreflight};
+    use stock_analysis::durable_delivery::DecisionState;
+
+    fn claim(
+        state: DecisionState,
+        receipt: Option<&str>,
+    ) -> crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+        crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+            decision_identity: "TEST_CODE_attribution_daily_decision".to_owned(),
+            state,
+            sink_calls: 0,
+            current_attempt_identity: None,
+            authoritative_receipt_sha256: receipt.map(str::to_owned),
+            source_binding_mode: None,
+            schedule_hydration: None,
+        }
+    }
+
+    #[test]
+    fn unclaimed_day_can_prepare_but_any_persisted_attempt_blocks_recomputation() {
+        assert_eq!(
+            classify_attribution_daily_preflight(Ok(None)),
+            AttributionDailyPreflight::Prepare
+        );
+        for state in [
+            DecisionState::Reserved,
+            DecisionState::AttemptInFlight,
+            DecisionState::RejectedDurable,
+            DecisionState::UncertainManualReview,
+        ] {
+            assert!(matches!(
+                classify_attribution_daily_preflight(Ok(Some(claim(state, None)))),
+                AttributionDailyPreflight::ExistingClaim { state: found, .. } if found == state
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_requires_authoritative_receipt_and_read_error_fails_closed() {
+        assert!(matches!(
+            classify_attribution_daily_preflight(Ok(Some(claim(
+                DecisionState::Delivered,
+                Some("TEST_CODE_authoritative_receipt_hash"),
+            )))),
+            AttributionDailyPreflight::ExistingClaim {
+                state: DecisionState::Delivered,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_attribution_daily_preflight(Ok(Some(claim(DecisionState::Delivered, None)))),
+            AttributionDailyPreflight::Unavailable(_)
+        ));
+        assert_eq!(
+            classify_attribution_daily_preflight(Err("TEST_CODE storage unavailable".to_owned())),
+            AttributionDailyPreflight::Unavailable("TEST_CODE storage unavailable".to_owned())
+        );
+    }
+}
+
 #[cfg(test)]
 mod g5b_input_gate_tests {
     use super::g5b_should_analyze;
@@ -9953,8 +10049,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 与 PerformanceEngine 同点运行, 当日一次, 失败出声。
             // 重试窗口 15:05-15:20: 失败后每个 tick 重试直到成功 (2026-08-22 实测
             // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
-            // 计算成功 (Ok(text)) 即记 ATTRIBUTION_LAST_RUN — 推送结果不门控
-            // (推送失败由 durable 决策补偿, 见 Ok 臂注释); 计算失败窗口内持续重试。
+            // 计算前只读检查当日 durable claim，避免重启后重算已投递或状态不明的报告。
+            // 首次无 claim 时，现有 LAST_RUN 仍在计算成功后封日；无 claim 的通知
+            // 准备失败需要先冻结精确摘要和报告 revision，才能安全开放自动重试。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::performance::attribution::{
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
@@ -9969,7 +10066,42 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     .unwrap_or_else(|e| e.into_inner())
                     .map(|d| d == today)
                     .unwrap_or(false);
-                if !already_run {
+                let should_prepare = if already_run {
+                    false
+                } else {
+                    let occurrence_identity = format!("attribution-daily:{today}");
+                    match classify_attribution_daily_preflight(
+                        crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                            today,
+                            stock_analysis::durable_delivery::PushKind::AttributionDaily,
+                            stock_analysis::durable_delivery::DeliverySubKind::None,
+                            "GLOBAL",
+                            &occurrence_identity,
+                        )
+                        .await,
+                    ) {
+                        AttributionDailyPreflight::Prepare => true,
+                        AttributionDailyPreflight::ExistingClaim {
+                            decision_identity,
+                            state,
+                        } => {
+                            log::info!(
+                                "[attribution] 当日 durable claim 已存在，跳过重算/重复准备: decision={decision_identity} state={state:?}"
+                            );
+                            *ATTRIBUTION_LAST_RUN
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                            false
+                        }
+                        AttributionDailyPreflight::Unavailable(error) => {
+                            log::error!(
+                                "[attribution] durable claim 只读检查失败，跳过本 tick: {error}"
+                            );
+                            false
+                        }
+                    }
+                };
+                if should_prepare {
                     match (|| -> Result<String, AttributionEpochRuntimeError> {
                         let database = stock_analysis::database::DatabaseManager::get();
                         if std::env::var_os(
