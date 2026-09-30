@@ -467,10 +467,61 @@ async fn mixed_builtin_channels_keep_target_order_and_protocol_success() {
     assert!(report.has_success());
     assert_eq!(wechat.finish().len(), 1);
     assert_eq!(feishu.finish().len(), 1);
+    for (index, requests) in [
+        (2, dingtalk.finish()),
+        (3, slack.finish()),
+        (4, discord.finish()),
+    ] {
+        assert_eq!(requests.len(), 1);
+        let body = received_http_body(&requests[0]);
+        let mut digest = Sha256::new();
+        digest.update(b"stock_analysis.notification_http_entity.v1\0");
+        digest.update(body);
+        let entity = report.attempts()[index].request_entity().unwrap();
+        assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+        assert_eq!(entity.body_len(), body.len());
+        assert_eq!(entity.response_target_differs(), Some(false));
+    }
+    assert_eq!(custom.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn webhook_disconnects_retain_built_entities_without_response_targets() {
+    let dingtalk = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let slack = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let discord = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let service = test_service(
+        NotificationConfig {
+            dingtalk_webhook_url: Some(dingtalk.url()),
+            slack_webhook_url: Some(slack.url()),
+            discord_webhook_url: Some(discord.url()),
+            ..NotificationConfig::default()
+        },
+        vec![
+            NotificationChannel::DingTalk,
+            NotificationChannel::Slack,
+            NotificationChannel::Discord,
+        ],
+    );
+
+    let report = service.send_report("TEST_CODE uncertain webhooks").await;
+
+    assert_attempts(
+        &report,
+        &[
+            (NotificationChannel::DingTalk, 0, WeakOutcomeKind::Unknown),
+            (NotificationChannel::Slack, 1, WeakOutcomeKind::Unknown),
+            (NotificationChannel::Discord, 2, WeakOutcomeKind::Unknown),
+        ],
+    );
+    for attempt in report.attempts() {
+        let entity = attempt.request_entity().unwrap();
+        assert!(entity.body_len() > 0);
+        assert!(entity.response_url_sha256().is_none());
+    }
     assert_eq!(dingtalk.finish().len(), 1);
     assert_eq!(slack.finish().len(), 1);
     assert_eq!(discord.finish().len(), 1);
-    assert_eq!(custom.finish().len(), 1);
 }
 
 #[tokio::test]

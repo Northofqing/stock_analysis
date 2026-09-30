@@ -243,21 +243,31 @@ impl NotificationService {
                     self.send_to_server_chan(content).await,
                 ),
                 // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
-                NotificationChannel::DingTalk => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_dingtalk(content).await,
-                ),
+                NotificationChannel::DingTalk => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_dingtalk_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 NotificationChannel::Telegram => observe_attempt(
                     &mut attempts,
                     *channel,
                     self.send_to_telegram(content).await,
                 ),
                 NotificationChannel::Slack => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_slack(content).await)
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_slack_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
                 }
                 NotificationChannel::Discord => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_discord(content).await)
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_discord_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
                 }
                 NotificationChannel::Pushover => {
                     let mut request_entity = None;
@@ -537,6 +547,15 @@ impl NotificationService {
     /// 修复 P0-0: 钉钉 webhook 推送
     /// 文档: https://open.dingtalk.com/document/orgapp/custom-robots-send-group-messages
     pub async fn send_to_dingtalk(&self, content: &str) -> Result<bool> {
+        self.send_to_dingtalk_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_dingtalk_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.dingtalk_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -548,7 +567,12 @@ impl NotificationService {
             "msgtype": "text",
             "text": { "content": content }
         });
-        let resp = self.client.post(url).json(&body).send().await?;
+        let request = self.client.post(url).json(&body).build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         if !resp.status().is_success() {
             log::warn!("[钉钉] 推送失败: HTTP {}", resp.status());
             return Ok(false);
@@ -611,6 +635,15 @@ impl NotificationService {
     /// 修复 P0-0: Slack Incoming Webhook 推送
     /// 文档: https://api.slack.com/messaging/webhooks
     pub async fn send_to_slack(&self, content: &str) -> Result<bool> {
+        self.send_to_slack_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_slack_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.slack_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -621,7 +654,12 @@ impl NotificationService {
         let body = serde_json::json!({
             "text": content
         });
-        let resp = self.client.post(url).json(&body).send().await?;
+        let request = self.client.post(url).json(&body).build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         let status = resp.status();
         let response_body = resp.text().await?;
         if !status.is_success() || !slack_business_accepted(&response_body)? {
@@ -671,6 +709,15 @@ impl NotificationService {
     /// 修复 P0-0: Discord Webhook 推送
     /// 文档: https://discord.com/developers/docs/resources/webhook
     pub async fn send_to_discord(&self, content: &str) -> Result<bool> {
+        self.send_to_discord_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_discord_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.discord_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -693,7 +740,12 @@ impl NotificationService {
         let body = serde_json::json!({
             "content": truncated
         });
-        let resp = self.client.post(url).json(&body).send().await?;
+        let request = self.client.post(url).json(&body).build()?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self.client.execute(request).await?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         if !resp.status().is_success() {
             log::warn!("[Discord] 推送失败: HTTP {}", resp.status());
             return Ok(false);
