@@ -17,6 +17,7 @@ pub mod economic_release_schedule;
 pub mod event_calendar;
 pub mod evidence_time;
 pub mod exchange_calendar_authority;
+pub mod external_flow;
 pub mod futures_delivery;
 pub mod general_web_research;
 pub mod global_market;
