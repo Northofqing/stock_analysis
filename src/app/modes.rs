@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use log::info;
+use std::path::Path;
 use stock_analysis::config;
 use stock_analysis::pipeline::{AnalysisPipeline, CliProducer, PipelineConfig};
 
@@ -109,7 +110,14 @@ pub async fn run_market_review_only() -> Result<()> {
 
 /// 产业链联动分析模式：涨停池 → 概念聚类 → 产业链上下游定位（LLM）→ 报告 + 推送。
 pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
-    run_chain_analysis_mode_with_send_guard(send_notify, None, |_| Ok(())).await
+    run_chain_analysis_mode_with_observation_inner(
+        send_notify,
+        None,
+        |_| Ok(()),
+        Some(Path::new("reports/chain_cli_send_audit")),
+    )
+    .await?
+    .legacy_result
 }
 
 /// The scheduler uses the guard to record a durable attempt after the report is
@@ -192,6 +200,21 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
     scheduled_filename: Option<&str>,
     before_send: impl FnOnce(&str) -> Result<()>,
 ) -> Result<ChainDeliveryEnvelope> {
+    run_chain_analysis_mode_with_observation_inner(
+        send_notify,
+        scheduled_filename,
+        before_send,
+        None,
+    )
+    .await
+}
+
+async fn run_chain_analysis_mode_with_observation_inner(
+    send_notify: bool,
+    scheduled_filename: Option<&str>,
+    before_send: impl FnOnce(&str) -> Result<()>,
+    cli_audit_directory: Option<&Path>,
+) -> Result<ChainDeliveryEnvelope> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
@@ -268,6 +291,7 @@ pub(super) async fn run_chain_analysis_mode_with_observation(
             })
         },
         send_notify,
+        cli_audit_directory,
     )
     .await
 }
@@ -280,6 +304,7 @@ async fn deliver_prepared<S, G, T>(
     before_send: G,
     send: T,
     send_notify: bool,
+    cli_audit_directory: Option<&Path>,
 ) -> Result<ChainDeliveryEnvelope>
 where
     S: FnOnce(&str) -> Result<String>,
@@ -307,6 +332,23 @@ where
             envelope.suppression = Some(ChainSendSuppression::BeforeSendRejected);
             envelope.legacy_result = Err(error);
         } else {
+            let pending = if let Some(directory) = cli_audit_directory {
+                match super::chain_cli_send_audit::begin(
+                    &envelope.prepared,
+                    &envelope.report_input,
+                    directory,
+                ) {
+                    Ok(pending) => Some(pending),
+                    Err(error) => {
+                        envelope.suppression = Some(ChainSendSuppression::BeforeSendRejected);
+                        envelope.legacy_result =
+                            Err(error.context("产业链 CLI 通知意图未持久化，未启动渠道发送"));
+                        return Ok(envelope);
+                    }
+                }
+            } else {
+                None
+            };
             envelope.send_attempted = true;
             envelope.legacy_result = match send(envelope.prepared.report()).await {
                 Ok(sent) => {
@@ -317,6 +359,14 @@ where
                 }
                 Err(error) => require_chain_notification_success(Err(error)),
             };
+            if let (Some(pending), Some(report)) = (pending, envelope.notification_report.as_ref())
+            {
+                if let Err(error) = pending.observe(&envelope.report_input, report) {
+                    envelope.legacy_result =
+                        Err(error
+                            .context("产业链 CLI 通知已尝试发送，但弱结果未持久化；物理结果未知"));
+                }
+            }
         }
     }
     Ok(envelope)
@@ -421,6 +471,7 @@ mod tests_chain_delivery {
                 }
             },
             true,
+            None,
         )
         .await
         .unwrap();
@@ -575,6 +626,7 @@ mod tests_chain_delivery {
                 |_| panic!("no channel must not invoke the send guard"),
                 |_| panic!("no channel must not invoke a sender"),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -662,6 +714,7 @@ mod tests_chain_delivery {
                 |_| panic!("no-send path must not invoke the guard"),
                 |_| panic!("no-send path must not invoke a channel"),
                 send_notify,
+                None,
             )
             .await
             .unwrap();
@@ -701,6 +754,7 @@ mod tests_chain_delivery {
                 })
             },
             true,
+            None,
         )
         .await
         .unwrap();
@@ -722,6 +776,173 @@ mod tests_chain_delivery {
             envelope.legacy_result.unwrap_err().to_string(),
             "产业链联动分析报告推送失败（所有渠道均未成功）"
         );
+    }
+
+    #[tokio::test]
+    async fn cli_chain_intent_precedes_send_and_binds_weak_result() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let audit_root = tempfile::tempdir().unwrap();
+        let audit_dir = audit_root.path().join("chain_cli_send_audit");
+        let send_dir = audit_dir.clone();
+        let config = stock_analysis::notification::NotificationConfig {
+            email_sender: Some("TEST_CODE_sender@example.invalid".to_owned()),
+            email_password: Some("TEST_CODE_password".to_owned()),
+            ..Default::default()
+        };
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            move |report| {
+                Box::pin(async move {
+                    let intent_path = std::fs::read_dir(&send_dir)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+                    assert_eq!(
+                        intent["report_sha256"],
+                        format!("{:x}", Sha256::digest(report.as_bytes()))
+                    );
+                    let notifier = stock_analysis::notification::NotificationService::new(config);
+                    Ok(ChainSendResult::from_report(
+                        notifier.send_report(report).await,
+                        None,
+                        None,
+                    ))
+                })
+            },
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        let report = envelope.notification_report.as_ref().unwrap();
+        assert_eq!(report.attempts().len(), 1);
+        let paths = std::fs::read_dir(&audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        let intent_path = paths
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".intent.json"))
+            .unwrap();
+        let observation_path = paths
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".observation.json"))
+            .unwrap();
+        let intent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+        let observation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(observation_path).unwrap()).unwrap();
+        assert_eq!(intent["notification_id"], observation["notification_id"]);
+        assert_eq!(intent["invocation_id"], observation["invocation_id"]);
+        assert_eq!(intent["report_sha256"], observation["report_sha256"]);
+        assert_eq!(observation["send_id"], report.send_id());
+        assert_eq!(observation["attempts"][0]["outcome"], "unknown");
+        assert!(envelope.legacy_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cli_chain_intent_failure_prevents_send() {
+        let prepared = test_prepared(
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            Rc::new(Cell::new(0)),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let audit_dir = blocked.join("audit");
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            |_| panic!("undurable intent must prevent physical send"),
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(!envelope.send_attempted);
+        assert_eq!(
+            envelope.suppression,
+            Some(ChainSendSuppression::BeforeSendRejected)
+        );
+        assert!(envelope
+            .legacy_result
+            .unwrap_err()
+            .to_string()
+            .contains("通知意图未持久化"));
+    }
+
+    #[tokio::test]
+    async fn cli_chain_observation_collision_leaves_sent_attempt_unknown() {
+        let prepared = test_prepared(
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            Rc::new(Cell::new(0)),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let audit_dir = root.path().join("audit");
+        let send_dir = audit_dir.clone();
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            move |_| {
+                Box::pin(async move {
+                    let intent_path = std::fs::read_dir(&send_dir)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+                    let key = intent["notification_id"].as_str().unwrap();
+                    std::fs::write(
+                        send_dir.join(format!("{key}.observation.json")),
+                        b"collision",
+                    )
+                    .unwrap();
+                    Ok(ChainSendResult::from_report(
+                        stock_analysis::notification::NotificationSendReport::default(),
+                        None,
+                        None,
+                    ))
+                })
+            },
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        assert!(envelope.notification_report.is_some());
+        assert!(envelope
+            .legacy_result
+            .unwrap_err()
+            .to_string()
+            .contains("弱结果未持久化"));
+        let collision = std::fs::read_dir(&audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".observation.json"))
+            .unwrap();
+        assert_eq!(std::fs::read(collision).unwrap(), b"collision");
     }
 }
 

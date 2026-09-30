@@ -7,6 +7,7 @@
 
 pub mod bootstrap;
 mod chain_acquisition;
+mod chain_cli_send_audit;
 pub mod chain_schedule;
 mod chain_shadow_input;
 pub mod modes;
