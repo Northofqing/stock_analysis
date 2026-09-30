@@ -28,6 +28,48 @@ pub fn build_external_query_request(
     params: Value,
 ) -> Result<QueryRequest, ExternalContractError> {
     let (schema, schema_version, preferred_provider, data) = match operation {
+        Operation::MoneyFlows => {
+            ensure_only_keys(&params, &["instruments"])?;
+            let instruments = required_instruments(&params)?;
+            if instruments.len() != 1
+                || !matches!(
+                    instruments[0].get("exchange").and_then(Value::as_str),
+                    Some("Shanghai" | "Shenzhen")
+                )
+            {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            (
+                "magic.market.money_flows.request",
+                1,
+                "Eastmoney".to_owned(),
+                serde_json::json!({"instruments": instruments}),
+            )
+        }
+        Operation::BoardFlows => {
+            ensure_only_keys(&params, &["category", "interval", "limit"])?;
+            let category = params
+                .get("category")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "Industry" | "Concept" | "Region"))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            let interval = params
+                .get("interval")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "Day1" | "Day5" | "Day10"))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|value| (1..=200).contains(value))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            (
+                "magic.market.board_flows.request",
+                1,
+                "Eastmoney".to_owned(),
+                serde_json::json!({"category": category, "interval": interval, "limit": limit}),
+            )
+        }
         Operation::SecurityMetadata => {
             ensure_only_keys(&params, &["instruments"])?;
             let instruments = required_instruments(&params)?;
@@ -467,6 +509,74 @@ mod tests {
             })
         );
         assert!(!allow_unadmitted);
+    }
+
+    #[test]
+    fn money_flows_request_is_exactly_one_shanghai_or_shenzhen_equity() {
+        let instrument = json!({
+            "exchange": "Shenzhen", "code": "300005", "asset_class": "Equity"
+        });
+        let request = build_external_query_request(
+            Operation::MoneyFlows,
+            json!({"instruments": [instrument.clone()]}),
+        )
+        .unwrap();
+        assert_eq!(request.preferred_provider, "Eastmoney");
+        let payload = request.payload.unwrap();
+        assert_eq!(payload.schema, "magic.market.money_flows.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"instruments": [instrument.clone()]})
+        );
+        assert!(!request.allow_unadmitted);
+        for params in [
+            json!({"instruments": []}),
+            json!({"instruments": [instrument.clone(), instrument.clone()]}),
+            json!({"instruments": [{"exchange":"Beijing","code":"830799","asset_class":"Equity"}]}),
+            json!({"instruments": [{"exchange":"Shanghai","code":"000001","asset_class":"Index"}]}),
+            json!({"codes": ["300005"]}),
+            json!({"instruments": [instrument], "limit": 1}),
+        ] {
+            assert_eq!(
+                build_external_query_request(Operation::MoneyFlows, params).unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
+    }
+
+    #[test]
+    fn board_flows_request_requires_explicit_bounded_page_contract() {
+        let request = build_external_query_request(
+            Operation::BoardFlows,
+            json!({"category":"Industry","interval":"Day1","limit":10}),
+        )
+        .unwrap();
+        assert_eq!(request.preferred_provider, "Eastmoney");
+        let payload = request.payload.unwrap();
+        assert_eq!(payload.schema, "magic.market.board_flows.request");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload.data).unwrap(),
+            json!({"category":"Industry","interval":"Day1","limit":10})
+        );
+        assert!(!request.allow_unadmitted);
+        for params in [
+            json!({"category":"Industry","interval":"Day1","limit":0}),
+            json!({"category":"Industry","interval":"Day1","limit":201}),
+            json!({"category":"Theme","interval":"Day1","limit":10}),
+            json!({"category":"Industry","interval":"Day30","limit":10}),
+            json!({"category":"Industry","limit":10}),
+            json!({"category":"Industry","interval":"Day1","limit":10,"date":"2026-09-30"}),
+            json!({"kind":"Industry","limit":10}),
+        ] {
+            assert_eq!(
+                build_external_query_request(Operation::BoardFlows, params).unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
     }
 
     #[test]
