@@ -2015,10 +2015,80 @@ impl SnapshotReminderGate {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotReminderAttempt {
+    AlreadyHandled,
+    ExistingClaim {
+        decision_identity: String,
+        state: stock_analysis::durable_delivery::DecisionState,
+    },
+    PreflightFailed(String),
+    Sent(notify::PushOutcome),
+}
+
+/// The in-process gate serializes startup and timer. The durable claim check
+/// follows that reservation. An existing claim blocks a second preparation,
+/// including after restart when the in-process gate has been reset.
+async fn dispatch_snapshot_reminder_with_claim<Inspect, InspectFuture, Send, SendFuture>(
+    gate: &std::sync::Mutex<SnapshotReminderGate>,
+    today: chrono::NaiveDate,
+    inspect: Inspect,
+    send: Send,
+) -> SnapshotReminderAttempt
+where
+    Inspect: FnOnce() -> InspectFuture,
+    InspectFuture: std::future::Future<
+        Output = Result<
+            Option<crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence>,
+            String,
+        >,
+    >,
+    Send: FnOnce() -> SendFuture,
+    SendFuture: std::future::Future<Output = notify::PushOutcome>,
+{
+    if !gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .try_begin(today)
+    {
+        return SnapshotReminderAttempt::AlreadyHandled;
+    }
+    let claim = match inspect().await {
+        Ok(claim) => claim,
+        Err(error) => {
+            gate.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .finish(today, false);
+            return SnapshotReminderAttempt::PreflightFailed(error);
+        }
+    };
+    if let Some(claim) = claim {
+        let confirmed = claim.state == stock_analysis::durable_delivery::DecisionState::Delivered
+            && claim.authoritative_receipt_sha256.is_some();
+        gate.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish(today, confirmed);
+        if claim.state == stock_analysis::durable_delivery::DecisionState::Delivered && !confirmed {
+            return SnapshotReminderAttempt::PreflightFailed(
+                "Delivered snapshot reminder claim has no authoritative receipt".to_owned(),
+            );
+        }
+        return SnapshotReminderAttempt::ExistingClaim {
+            decision_identity: claim.decision_identity,
+            state: claim.state,
+        };
+    }
+    let outcome = send().await;
+    gate.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(today, periodic_delivery_confirmed(&outcome));
+    SnapshotReminderAttempt::Sent(outcome)
+}
+
 /// 任务#3: 持仓快照过期检查 — BR-234b 后快照过期时系统自动估值（持仓×实时价），
 /// 快照的唯一用途是反映真实持仓变动。连续 5 个交易日无新快照 → 推送提醒
 /// （低频率交易者一周一检；1-4 个交易日仅日志）。触发点: 启动时 + 每日 15:10。
-/// 每日最多推 1 次（静态日期去重）；快照新鲜或无记录时仅日志，不出声推送。
+/// 每日最多推 1 次（静态日期和 durable claim 去重）；快照新鲜或无记录时仅日志，不出声推送。
 async fn check_snapshot_staleness_and_notify() {
     use stock_analysis::database::user_account_summary;
     let Some(summary) = user_account_summary::latest().ok().flatten() else {
@@ -2048,60 +2118,80 @@ async fn check_snapshot_staleness_and_notify() {
         );
         return;
     }
-    // BR-116: 短锁预约本次投递，确认后才提交日期；失败清除预约并保留重试资格。
+    // BR-116: 短锁串行化启动与定时入口，随后只读检查当日 durable claim。
+    // 只有尚无 claim 才准备投递；已持久化的失败或不确定结果必须留待人工裁定。
     static LAST: std::sync::Mutex<SnapshotReminderGate> =
         std::sync::Mutex::new(SnapshotReminderGate {
             last_confirmed: None,
             in_flight: None,
         });
-    let should_attempt = {
-        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
-        gate.try_begin(today)
-    };
-    if !should_attempt {
-        return;
-    }
-    let text = crate::push_templates::render_snapshot_stale(
-        days_behind,
-        &summary.effective_at,
-        summary.total_assets,
-    );
-    log::warn!("[快照提醒] {}", text);
-    // 2026-09-20: 快照提醒升级 counted (MU-snapshot-stale)。健康提醒类每日
-    // 一次 (进程内 SnapshotReminderGate 语义保留); counted 门取
-    // CountedCombinedAccount (requires_banner=true, 门内部取 banner — T-16
-    // 同形态)。BusinessDateOnce 幂等 + 豁免日预算; retry_authorized=false
-    // (days_behind 时刻锚定 + 进程内 gate 失败保留重试资格补偿)。
-    let outcome = match crate::push_templates::build_snapshot_stale_counted_binding(
+    let occurrence_identity = format!("snapshot-stale:{today}");
+    let attempt = dispatch_snapshot_reminder_with_claim(
+        &LAST,
         today,
-        days_behind,
-        &summary.effective_at,
-        summary.total_assets,
+        || async {
+            crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                today,
+                stock_analysis::durable_delivery::PushKind::SnapshotStale,
+                stock_analysis::durable_delivery::DeliverySubKind::None,
+                "GLOBAL",
+                &occurrence_identity,
+            )
+            .await
+        },
+        || async {
+            let text = crate::push_templates::render_snapshot_stale(
+                days_behind,
+                &summary.effective_at,
+                summary.total_assets,
+            );
+            log::warn!("[快照提醒] {}", text);
+            // Counted BusinessDateOnce, retry_authorized=false. The durable claim
+            // preflight above keeps a later entry from preparing a second intent.
+            match crate::push_templates::build_snapshot_stale_counted_binding(
+                today,
+                days_behind,
+                &summary.effective_at,
+                summary.total_assets,
+            )
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-20-snapshot-stale",
+                    PushKind::SnapshotStale,
+                    "snapshot_stale_dispatcher",
+                    "render_snapshot_stale",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding).await
+                }
+                Err(reason) => {
+                    log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
+                    crate::notify::PushOutcome::Denied(reason)
+                }
+            }
+        },
     )
-    .and_then(|binding| {
-        crate::presentation_registry::acquire_token(
-            "T-20-snapshot-stale",
-            PushKind::SnapshotStale,
-            "snapshot_stale_dispatcher",
-            "render_snapshot_stale",
-        )
-        .map(|token| (token, binding))
-    }) {
-        Ok((token, binding)) => {
-            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+    .await;
+    match attempt {
+        SnapshotReminderAttempt::AlreadyHandled => {}
+        SnapshotReminderAttempt::ExistingClaim {
+            decision_identity,
+            state,
+        } => {
+            log::info!(
+                "[快照提醒] 当日 durable claim 已存在，跳过重复准备: decision={decision_identity} state={state:?}"
+            );
         }
-        Err(reason) => {
-            log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
-            crate::notify::PushOutcome::Denied(reason)
+        SnapshotReminderAttempt::PreflightFailed(error) => {
+            log::error!("[快照提醒] durable claim 只读检查失败，跳过投递: {error}");
         }
-    };
-    let confirmed = periodic_delivery_confirmed(&outcome);
-    {
-        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
-        gate.finish(today, confirmed);
-    }
-    if !confirmed {
-        log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
+        SnapshotReminderAttempt::Sent(outcome) => {
+            if !periodic_delivery_confirmed(&outcome) {
+                log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
+            }
+        }
     }
 }
 
@@ -12881,6 +12971,21 @@ fn snapshot_portfolio_value() -> Result<(), String> {
 mod tests_v17_4_d {
     use super::*;
 
+    fn snapshot_reminder_claim(
+        state: stock_analysis::durable_delivery::DecisionState,
+        receipt: Option<&str>,
+    ) -> crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+        crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+            decision_identity: "TEST_CODE_snapshot_stale_decision".to_owned(),
+            state,
+            sink_calls: 1,
+            current_attempt_identity: Some("TEST_CODE_attempt".to_owned()),
+            authoritative_receipt_sha256: receipt.map(str::to_owned),
+            source_binding_mode: None,
+            schedule_hydration: None,
+        }
+    }
+
     fn board_flow_batch(
         records: Vec<stock_analysis::data_gateway::BoardFlowFact>,
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::BoardFlowFact>
@@ -12988,7 +13093,7 @@ mod tests_v17_4_d {
     }
 
     #[test]
-    fn br116_snapshot_reminder_gate_serializes_attempts_and_retries_unconfirmed() {
+    fn br116_snapshot_reminder_gate_serializes_attempts_and_reinspects_unconfirmed() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let mut gate = SnapshotReminderGate::default();
 
@@ -13001,11 +13106,210 @@ mod tests_v17_4_d {
         gate.finish(today, false);
         assert!(
             gate.try_begin(today),
-            "unconfirmed attempt must remain retryable"
+            "unconfirmed attempt must allow a durable claim reinspection"
         );
 
         gate.finish(today, true);
         assert!(!gate.try_begin(today), "confirmed attempt closes the day");
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_startup_then_timer_prepares_once() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let inspect_calls = std::sync::atomic::AtomicUsize::new(0);
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let startup = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || {
+                inspect_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(None))
+            },
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(
+            startup,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::Pushed)
+        );
+
+        let timer = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || {
+                inspect_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(None))
+            },
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(timer, SnapshotReminderAttempt::AlreadyHandled);
+        assert_eq!(inspect_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_uncertain_claim_blocks_same_day_retry() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        let first = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Ok(None)),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::SinkError(
+                    "TEST_CODE timeout".to_owned(),
+                ))
+            },
+        )
+        .await;
+        assert!(matches!(
+            first,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::SinkError(_))
+        ));
+
+        for _ in 0..2 {
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &gate,
+                today,
+                || {
+                    std::future::ready(Ok(Some(snapshot_reminder_claim(
+                        DecisionState::UncertainManualReview,
+                        None,
+                    ))))
+                },
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(
+                attempt,
+                SnapshotReminderAttempt::ExistingClaim {
+                    state: DecisionState::UncertainManualReview,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_restarted_gate_honors_durable_claim_and_receipt() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        for (state, receipt) in [
+            (DecisionState::Delivered, Some("TEST_CODE_receipt")),
+            (DecisionState::RejectedDurable, None),
+            (DecisionState::AttemptInFlight, None),
+        ] {
+            let restarted_gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &restarted_gate,
+                today,
+                || std::future::ready(Ok(Some(snapshot_reminder_claim(state, receipt)))),
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(attempt, SnapshotReminderAttempt::ExistingClaim {
+                state: found,
+                ..
+            } if found == state));
+            let confirmed = restarted_gate.lock().unwrap().last_confirmed;
+            assert_eq!(
+                confirmed,
+                (state == DecisionState::Delivered).then_some(today)
+            );
+        }
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_preflight_failure_fails_closed_until_clean_read() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        let unavailable = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Err("TEST_CODE claim read unavailable".to_owned())),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert!(matches!(
+            unavailable,
+            SnapshotReminderAttempt::PreflightFailed(_)
+        ));
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let clean_read = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Ok(None)),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(
+            clean_read,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::Pushed)
+        );
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_delivered_without_receipt_stays_unconfirmed() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &gate,
+                today,
+                || {
+                    std::future::ready(Ok(Some(snapshot_reminder_claim(
+                        DecisionState::Delivered,
+                        None,
+                    ))))
+                },
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(
+                attempt,
+                SnapshotReminderAttempt::PreflightFailed(_)
+            ));
+        }
+        assert_eq!(gate.lock().unwrap().last_confirmed, None);
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
 
