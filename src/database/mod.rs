@@ -444,6 +444,19 @@ pub struct VerifiedPredictionSampleHitRate {
     pub rate: f64,
 }
 
+/// Candidate promotion cannot treat an unaudited legacy horizon as a settled sample.
+#[derive(Debug, thiserror::Error)]
+pub enum CandidatePromotionEvidenceError {
+    #[error("candidate_promotion_invalid_input: {0}")]
+    InvalidInput(String),
+    #[error("candidate_promotion_storage_unavailable: {0}")]
+    StorageUnavailable(String),
+    #[error("candidate_promotion_calendar_unavailable: {0}")]
+    CalendarUnavailable(String),
+    #[error("candidate_promotion_ineligible_first_sample id={id} reason={reason}")]
+    IneligibleFirstSample { id: i32, reason: &'static str },
+}
+
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 #[cfg(test)]
@@ -4376,51 +4389,84 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
     pub fn candidate_promotion_samples(
         &self,
         business_date: &str,
-    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-        validate_date_text("business_date", business_date).map_err(invalid_input)?;
-        let mut conn = self.get_conn()?;
-        #[derive(QueryableByName, Debug)]
-        struct SampleCounts {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            sample_count: i64,
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            hit_sum: i64,
-        }
+    ) -> Result<(usize, usize), CandidatePromotionEvidenceError> {
+        use CandidatePromotionEvidenceError as EvidenceError;
+
+        validate_date_text("business_date", business_date).map_err(EvidenceError::InvalidInput)?;
+        let business_date = NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
+            .map_err(|error| EvidenceError::InvalidInput(error.to_string()))?;
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| EvidenceError::StorageUnavailable(error.to_string()))?;
         #[derive(QueryableByName)]
-        struct TargetDate {
+        struct FirstSample {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_date: String,
             #[diesel(sql_type = diesel::sql_types::Text)]
             target_date: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            actual_change: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+            hit: Option<i32>,
         }
-        // The table predates this read model. Reject malformed legacy dates
-        // before a lexical due-date comparison can silently promote a cohort.
-        let target_dates = diesel::sql_query(
-            "SELECT DISTINCT target_date FROM prediction_tracker \
-             WHERE pred_detail = 'candidate-strong' AND pred_date <= ?1",
-        )
-        .bind::<diesel::sql_types::Text, _>(business_date)
-        .load::<TargetDate>(&mut *conn)?;
-        for row in target_dates {
-            let parsed = NaiveDate::parse_from_str(&row.target_date, "%Y-%m-%d")
-                .map_err(|error| invalid_input(format!("candidate target_date 无效: {error}")))?;
-            if parsed.format("%Y-%m-%d").to_string() != row.target_date {
-                return Err(
-                    invalid_input("candidate target_date 不是规范 YYYY-MM-DD".into()).into(),
-                );
-            }
-        }
-        let row = diesel::sql_query(
-            "SELECT COUNT(*) AS sample_count, COALESCE(SUM(hit), 0) AS hit_sum \
-             FROM prediction_tracker \
+        // One read freezes the earliest row and its completion state per key.
+        // Legacy natural-day targets and unchecked calendar years cannot
+        // contribute to the promotion denominator.
+        let first_samples = diesel::sql_query(
+            "SELECT id, pred_date, target_date, actual_change, hit FROM prediction_tracker \
              WHERE id IN ( \
                SELECT MIN(id) FROM prediction_tracker \
-               WHERE pred_detail = 'candidate-strong' AND actual_change IS NOT NULL \
-                 AND hit IN (0, 1) AND pred_date <= ?1 AND target_date <= ?1 \
+               WHERE pred_detail = 'candidate-strong' \
                GROUP BY pred_date, stock_code \
-             )",
+             ) ORDER BY id ASC",
         )
-        .bind::<diesel::sql_types::Text, _>(business_date)
-        .get_result::<SampleCounts>(&mut *conn)?;
-        Ok((row.sample_count as usize, row.hit_sum as usize))
+        .load::<FirstSample>(&mut *conn)
+        .map_err(|error| EvidenceError::StorageUnavailable(error.to_string()))?;
+        let mut sample_count = 0;
+        let mut hit_sum = 0;
+        for row in first_samples {
+            let parse_canonical = |text: &str, reason: &'static str| {
+                NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                    .ok()
+                    .filter(|date| date.format("%Y-%m-%d").to_string() == text)
+                    .ok_or(EvidenceError::IneligibleFirstSample { id: row.id, reason })
+            };
+            let pred_date = parse_canonical(&row.pred_date, "pred_date_invalid")?;
+            if pred_date > business_date {
+                continue;
+            }
+            let target_date = parse_canonical(&row.target_date, "target_date_invalid")?;
+            if !crate::calendar::verified_a_share_trading_day(pred_date)
+                .map_err(EvidenceError::CalendarUnavailable)?
+            {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "pred_date_not_trading",
+                });
+            }
+            let mut expected_target = pred_date;
+            for _ in 0..5 {
+                expected_target =
+                    crate::calendar::verified_next_a_share_trading_day(expected_target)
+                        .map_err(EvidenceError::CalendarUnavailable)?;
+            }
+            if target_date != expected_target {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "target_not_fifth_trading_day",
+                });
+            }
+            if target_date <= business_date
+                && row.actual_change.is_some()
+                && matches!(row.hit, Some(0 | 1))
+            {
+                sample_count += 1;
+                hit_sum += usize::from(row.hit == Some(1));
+            }
+        }
+        Ok((sample_count, hit_sum))
     }
 
     /// BR-192 收尾 (2026-08-07): P-03/T-07 候选触发的选中决策持久化。

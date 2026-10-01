@@ -142,42 +142,42 @@ fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
     for (code, pred_date, target_date, detail, hit) in [
         (
             "TEST_CODE_due_win",
-            "2026-09-30",
+            "2026-09-23",
             "2026-10-08",
             "candidate-strong",
             Some(true),
         ),
         (
             "TEST_CODE_due_win",
-            "2026-09-30",
+            "2026-09-23",
             "2026-10-08",
             "candidate-strong",
             Some(false),
         ),
         (
             "TEST_CODE_due_loss",
-            "2026-09-30",
+            "2026-09-23",
             "2026-10-08",
             "candidate-strong",
             Some(false),
         ),
         (
             "TEST_CODE_today_early",
-            "2026-10-08",
+            "2026-09-24",
             "2026-10-09",
             "candidate-strong",
             Some(true),
         ),
         (
             "TEST_CODE_pending",
-            "2026-09-30",
+            "2026-09-23",
             "2026-10-08",
             "candidate-strong",
             None,
         ),
         (
             "TEST_CODE_other",
-            "2026-09-30",
+            "2026-09-24",
             "2026-10-08",
             "other",
             Some(true),
@@ -207,7 +207,7 @@ fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
         ("TEST_CODE_invalid_hit", Some(2)),
     ] {
         db.save_prediction_legacy(
-            "2026-09-30",
+            "2026-09-23",
             "2026-10-08",
             None,
             Some(code),
@@ -253,12 +253,172 @@ fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
     diesel::sql_query(
         "INSERT INTO prediction_tracker \
          (pred_date,target_date,stock_code,pred_direction,pred_score,pred_detail,actual_change,hit) \
-         VALUES ('2026-09-30','2026-10-99','TEST_CODE_bad_date','up',75,'candidate-strong',1,1)",
+         VALUES ('2026-09-24','2026-10-99','TEST_CODE_bad_date','up',75,'candidate-strong',1,1)",
     )
     .execute(&mut conn)
     .unwrap();
     drop(conn);
-    assert!(db.candidate_promotion_samples("2026-10-09").is_err());
+    assert!(matches!(
+        db.candidate_promotion_samples("2026-10-09"),
+        Err(
+            crate::database::CandidatePromotionEvidenceError::IneligibleFirstSample {
+                reason: "target_date_invalid",
+                ..
+            }
+        )
+    ));
+}
+
+#[test]
+fn candidate_promotion_never_substitutes_a_later_duplicate_for_the_first_row() {
+    let (_dir, db) = private_db();
+    for (code, pred_date, target_date, hit) in [
+        ("TEST_CODE_control", "2026-09-23", "2026-10-08", Some(true)),
+        ("TEST_CODE_first_pending", "2026-09-23", "2026-10-08", None),
+        (
+            "TEST_CODE_first_pending",
+            "2026-09-23",
+            "2026-10-08",
+            Some(true),
+        ),
+        (
+            "TEST_CODE_first_future",
+            "2026-09-24",
+            "2026-10-09",
+            Some(false),
+        ),
+        (
+            "TEST_CODE_first_future",
+            "2026-09-24",
+            "2026-10-08",
+            Some(true),
+        ),
+    ] {
+        db.save_prediction_legacy(
+            pred_date,
+            target_date,
+            None,
+            Some(code),
+            "up",
+            75.,
+            Some("candidate-strong"),
+        )
+        .unwrap();
+        if let Some(hit) = hit {
+            let id = db.get_prediction_by_code_date(code, pred_date).unwrap().id;
+            assert_eq!(
+                db.update_prediction_result_by_id(id, if hit { 1.0 } else { -1.0 }, hit)
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    assert_eq!(
+        db.candidate_promotion_samples("2026-10-08").unwrap(),
+        (1, 1),
+        "the complete later rows cannot replace pending or not-yet-due first rows"
+    );
+    assert_eq!(
+        db.candidate_promotion_samples("2026-10-09").unwrap(),
+        (2, 1),
+        "once due, the first future row contributes its own miss, not the later hit"
+    );
+}
+
+#[test]
+fn candidate_promotion_requires_first_row_fifth_trading_day_authority() {
+    use crate::database::CandidatePromotionEvidenceError;
+
+    for (pred_date, target_date, reason) in [
+        ("2026-10-01", "2026-10-09", "pred_date_not_trading"),
+        ("2026-09-23", "2026-10-09", "target_not_fifth_trading_day"),
+        ("2026-09-24", "2026-09-23", "target_not_fifth_trading_day"),
+    ] {
+        let (_dir, db) = private_db();
+        db.save_prediction_legacy(
+            pred_date,
+            target_date,
+            None,
+            Some("TEST_CODE_ineligible"),
+            "up",
+            75.,
+            Some("candidate-strong"),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.candidate_promotion_samples("2026-10-09"),
+            Err(CandidatePromotionEvidenceError::IneligibleFirstSample {
+                reason: found,
+                ..
+            }) if found == reason
+        ));
+    }
+
+    let (_dir, db) = private_db();
+    db.save_prediction_legacy(
+        "2024-12-30",
+        "2025-01-07",
+        None,
+        Some("TEST_CODE_legacy_calendar"),
+        "up",
+        75.,
+        Some("candidate-strong"),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.candidate_promotion_samples("2026-10-09"),
+        Err(CandidatePromotionEvidenceError::CalendarUnavailable(_))
+    ));
+
+    let (_dir, db) = private_db();
+    db.save_prediction_legacy(
+        "2026-10-01",
+        "2026-10-02",
+        None,
+        Some("TEST_CODE_unrelated"),
+        "up",
+        75.,
+        Some("other-prediction"),
+    )
+    .unwrap();
+    assert_eq!(
+        db.candidate_promotion_samples("2026-10-09").unwrap(),
+        (0, 0)
+    );
+
+    let (_dir, db) = private_db();
+    db.save_prediction_legacy(
+        "2026-10-09",
+        "2026-10-13",
+        None,
+        Some("TEST_CODE_future"),
+        "up",
+        75.,
+        Some("candidate-strong"),
+    )
+    .unwrap();
+    assert_eq!(
+        db.candidate_promotion_samples("2026-10-08").unwrap(),
+        (0, 0),
+        "future prediction dates are outside the completed candidate cohort"
+    );
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query(
+        "INSERT INTO prediction_tracker \
+         (pred_date,target_date,stock_code,pred_direction,pred_score,pred_detail,actual_change,hit) \
+         VALUES ('not-a-date','2026-10-08','TEST_CODE_bad_pred_date','up',75,'candidate-strong',1,1)",
+    )
+    .execute(&mut conn)
+    .unwrap();
+    drop(conn);
+    assert!(matches!(
+        db.candidate_promotion_samples("2026-10-08"),
+        Err(CandidatePromotionEvidenceError::IneligibleFirstSample {
+            reason: "pred_date_invalid",
+            ..
+        })
+    ));
 }
 
 fn close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
