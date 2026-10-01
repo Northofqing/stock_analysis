@@ -652,17 +652,20 @@ mod tests {
         assert!(!block.contains("persist_daily("));
 
         let success = block
-            .find("Ok(text) =>")
+            .find("Ok(frozen) =>")
             .expect("TEST_CODE explicit success arm");
         // 2026-09-20: A-12 升级 counted 持久投递 — push seam 从 push_governor_v3
         // 换成 push_counted_with_binding; 守卫同步 (不得残留旧路径, 错误臂不得推送)。
+        let attempt = block
+            .find("store.reserve_dispatch_attempt(today, &frozen)")
+            .expect("TEST_CODE durable attribution attempt before counted push");
         let push = block
             .find("push_counted_with_binding(")
             .expect("TEST_CODE counted attribution push call");
         let unavailable = block
-            .find("Err(AttributionEpochRuntimeError::Unavailable")
+            .find("Err(FreezeError::Prepare(AttributionEpochRuntimeError::Unavailable")
             .expect("TEST_CODE unavailable arm");
-        assert!(success < push && push < unavailable);
+        assert!(success < attempt && attempt < push && push < unavailable);
         assert!(!block.contains("push_governor_v3(&text"));
         assert!(!block[unavailable..].contains("push_counted_with_binding("));
     }
