@@ -3,6 +3,8 @@ use std::sync::{Arc, Barrier};
 
 fn isolated() -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
+    // TempDir's default DirBuilder permissions follow umask, not 0700.
+    std::fs::set_permissions(directory.path(), Permissions::from_mode(0o700)).unwrap();
     let path = std::fs::canonicalize(directory.path()).unwrap();
     (directory, path)
 }

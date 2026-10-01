@@ -35,6 +35,7 @@ async fn wg06_observed_diagnostic_persists_actual_gateway_negative_status_withou
     use crate::grpc_client::client::external_query_wire_fixture::{
         ExternalQueryWireFixture, HistoricalCapabilityBehavior, HistoricalQueryReply,
     };
+    use std::os::unix::fs::PermissionsExt as _;
     let fixture = ExternalQueryWireFixture::bind_historical(
         HistoricalQueryReply::StatusWithTrailer,
         HistoricalCapabilityBehavior::Ready,
@@ -42,6 +43,7 @@ async fn wg06_observed_diagnostic_persists_actual_gateway_negative_status_withou
     .await
     .unwrap();
     let output = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let output_root = std::fs::canonicalize(output.path()).unwrap();
     fixture.release_capabilities();
     fixture.release();
@@ -90,6 +92,7 @@ async fn wg06_observed_diagnostic_pre_call_failure_has_no_artifact_and_forbidden
     use crate::grpc_client::client::external_query_wire_fixture::{
         ExternalQueryWireFixture, HistoricalCapabilityBehavior, HistoricalQueryReply,
     };
+    use std::os::unix::fs::PermissionsExt as _;
     let fixture = ExternalQueryWireFixture::bind_historical(
         HistoricalQueryReply::Success,
         HistoricalCapabilityBehavior::Missing,
@@ -97,6 +100,7 @@ async fn wg06_observed_diagnostic_pre_call_failure_has_no_artifact_and_forbidden
     .await
     .unwrap();
     let output = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = std::fs::canonicalize(output.path()).unwrap();
     fixture.release_capabilities();
     fixture.release();
@@ -115,6 +119,7 @@ async fn wg06_observed_diagnostic_pre_call_failure_has_no_artifact_and_forbidden
     fixture.finish().await.unwrap();
 
     let bundle = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(bundle.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let bundle_root = std::fs::canonicalize(bundle.path()).unwrap();
     let alias = root.join("TEST_CODE_ALIAS");
     std::os::unix::fs::symlink(&bundle_root, &alias).unwrap();

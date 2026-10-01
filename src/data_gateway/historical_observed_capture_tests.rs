@@ -7,6 +7,7 @@ use crate::grpc_client::client::external_historical_read::ExternalHistoricalTrai
 use crate::grpc_client::client::external_query_wire_fixture::{
     ExternalQueryWireFixture, HistoricalCapabilityBehavior, HistoricalQueryReply,
 };
+use std::os::unix::fs::PermissionsExt as _;
 
 fn test_request() -> HistoricalWindowRequest {
     HistoricalWindowRequest::new(
@@ -63,6 +64,7 @@ async fn wg06_observed_store_capture_v1_parts_keep_original_hash_and_failed_raw_
         assert_eq!(parts[11], capture.observation().request_bytes);
         assert_eq!(hash_capture_parts_v1(&parts), capture.capture_hash());
         let output = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::fs::canonicalize(output.path()).unwrap();
         let store = HistoricalObservedStore::open_existing(&root, &[]).unwrap();
         let (artifact, _) = store.persist(&capture).unwrap();
@@ -142,6 +144,7 @@ async fn wg06_observed_store_negative_binding_and_non_utf8_status_preserve_bytes
     assert!(capture.request_binding_error().is_some());
     assert!(project_observed_historical_records(&capture).is_err());
     let output = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = std::fs::canonicalize(output.path()).unwrap();
     let store = HistoricalObservedStore::open_existing(&root, &[]).unwrap();
     let (artifact, _) = store.persist(&capture).unwrap();
