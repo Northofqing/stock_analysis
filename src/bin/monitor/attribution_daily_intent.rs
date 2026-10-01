@@ -7,12 +7,15 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = "attribution-daily-frozen-intent-v1";
 const RESERVATION_SCHEMA: &str = "attribution-daily-preparation-reservation-v1";
+const DISPATCH_ATTEMPT_SCHEMA: &str = "attribution-daily-dispatch-attempt-v1";
+const RETRY_AUTHORIZATION_SCHEMA: &str = "attribution-daily-retry-authorization-v1";
 
 #[derive(Debug)]
 pub(super) struct PreparedAttributionDaily {
@@ -36,6 +39,20 @@ pub(super) struct FrozenAttributionDaily {
 struct PreparationReservation {
     schema: String,
     business_date: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DispatchRecord {
+    schema: String,
+    business_date: String,
+    ordinal: u32,
+    summary_sha256: String,
+}
+
+#[derive(Debug, Default)]
+struct DispatchProgress {
+    last_attempt: u32,
+    retry_authorized: bool,
 }
 
 impl FrozenAttributionDaily {
@@ -79,6 +96,169 @@ impl AttributionDailyIntentStore {
         self.report_directory
             .join("daily-notification-intents")
             .join(format!("{date}.prepare"))
+    }
+
+    fn dispatch_record_path(&self, date: NaiveDate, label: &str, ordinal: u32) -> PathBuf {
+        self.report_directory
+            .join("daily-notification-intents")
+            .join(format!("{date}.{label}-{ordinal}.json"))
+    }
+
+    fn dispatch_progress(
+        &self,
+        date: NaiveDate,
+        frozen: &FrozenAttributionDaily,
+    ) -> Result<DispatchProgress, String> {
+        let directory = self
+            .intent_path(date)
+            .parent()
+            .expect("fixed A-12 intent path has a parent")
+            .to_owned();
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("A-12 scan dispatch attempts: {error}"))?;
+        let attempt_prefix = format!("{date}.dispatch-");
+        let retry_prefix = format!("{date}.retry-");
+        let mut attempts = BTreeSet::new();
+        let mut retries = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("A-12 read dispatch entry: {error}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let (label, schema, suffix, set) =
+                if let Some(suffix) = name.strip_prefix(&attempt_prefix) {
+                    ("dispatch", DISPATCH_ATTEMPT_SCHEMA, suffix, &mut attempts)
+                } else if let Some(suffix) = name.strip_prefix(&retry_prefix) {
+                    ("retry", RETRY_AUTHORIZATION_SCHEMA, suffix, &mut retries)
+                } else {
+                    continue;
+                };
+            let ordinal = suffix
+                .strip_suffix(".json")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "A-12 dispatch record filename invalid".to_owned())?;
+            if entry.path() != self.dispatch_record_path(date, label, ordinal) {
+                return Err("A-12 dispatch record filename is not canonical".to_owned());
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("A-12 inspect dispatch record: {error}"))?;
+            if !file_type.is_file() {
+                return Err("A-12 dispatch record is not a regular file".to_owned());
+            }
+            let bytes = fs::read(entry.path())
+                .map_err(|error| format!("A-12 read dispatch record: {error}"))?;
+            let record: DispatchRecord = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("A-12 parse dispatch record: {error}"))?;
+            if record
+                != (DispatchRecord {
+                    schema: schema.to_owned(),
+                    business_date: date.to_string(),
+                    ordinal,
+                    summary_sha256: frozen.summary_sha256.clone(),
+                })
+            {
+                return Err("A-12 dispatch record identity mismatch".to_owned());
+            }
+            set.insert(ordinal);
+        }
+        let last_attempt = attempts.last().copied().unwrap_or_default();
+        for (index, ordinal) in attempts.iter().enumerate() {
+            if u32::try_from(index + 1).ok() != Some(*ordinal)
+                || (*ordinal < last_attempt && !retries.contains(ordinal))
+            {
+                return Err("A-12 dispatch attempts are not contiguous and authorized".to_owned());
+            }
+        }
+        if !retries.is_subset(&attempts) {
+            return Err("A-12 retry authorization has no dispatch attempt".to_owned());
+        }
+        Ok(DispatchProgress {
+            last_attempt,
+            retry_authorized: retries.contains(&last_attempt),
+        })
+    }
+
+    fn write_dispatch_record(
+        &self,
+        date: NaiveDate,
+        frozen: &FrozenAttributionDaily,
+        label: &str,
+        schema: &str,
+        ordinal: u32,
+    ) -> Result<(), String> {
+        let path = self.dispatch_record_path(date, label, ordinal);
+        let directory = path
+            .parent()
+            .expect("fixed A-12 dispatch path has a parent");
+        let bytes = serde_json::to_vec(&DispatchRecord {
+            schema: schema.to_owned(),
+            business_date: date.to_string(),
+            ordinal,
+            summary_sha256: frozen.summary_sha256.clone(),
+        })
+        .map_err(|error| format!("A-12 serialize dispatch record: {error}"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("A-12 create-once dispatch record: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("A-12 sync dispatch record: {error}"))?;
+        OpenOptions::new()
+            .read(true)
+            .open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("A-12 sync dispatch record directory: {error}"))?;
+        Ok(())
+    }
+
+    fn ensure_dispatch_can_start(
+        &self,
+        date: NaiveDate,
+        frozen: &FrozenAttributionDaily,
+    ) -> Result<DispatchProgress, String> {
+        let progress = self.dispatch_progress(date, frozen)?;
+        if progress.last_attempt > 0 && !progress.retry_authorized {
+            return Err(
+                "A-12 last dispatch attempt has no durable no-claim retry authorization; manual review required"
+                    .to_owned(),
+            );
+        }
+        Ok(progress)
+    }
+
+    /// Record the possibility of a physical attempt before entering the
+    /// existing counted owner. A crash or missing postflight observation then
+    /// blocks restart even if a later claim read reports no owner.
+    pub(super) fn reserve_dispatch_attempt(
+        &self,
+        date: NaiveDate,
+        frozen: &FrozenAttributionDaily,
+    ) -> Result<u32, String> {
+        let progress = self.ensure_dispatch_can_start(date, frozen)?;
+        let ordinal = progress
+            .last_attempt
+            .checked_add(1)
+            .ok_or_else(|| "A-12 dispatch ordinal exhausted".to_owned())?;
+        self.write_dispatch_record(date, frozen, "dispatch", DISPATCH_ATTEMPT_SCHEMA, ordinal)?;
+        Ok(ordinal)
+    }
+
+    /// Call only after a failed counted result and an exact postflight read
+    /// proving the durable claim is absent. The authorization is create-once.
+    pub(super) fn authorize_no_claim_retry(
+        &self,
+        date: NaiveDate,
+        frozen: &FrozenAttributionDaily,
+        ordinal: u32,
+    ) -> Result<(), String> {
+        let progress = self.dispatch_progress(date, frozen)?;
+        if progress.last_attempt != ordinal || progress.retry_authorized {
+            return Err("A-12 retry authorization does not match latest attempt".to_owned());
+        }
+        self.write_dispatch_record(date, frozen, "retry", RETRY_AUTHORIZATION_SCHEMA, ordinal)
     }
 
     fn inspect_reservation(&self, date: NaiveDate) -> Result<bool, String> {
@@ -305,6 +485,8 @@ impl AttributionDailyIntentStore {
         F: FnOnce(&Self) -> Result<PreparedAttributionDaily, FreezeError<E>>,
     {
         if let Some(frozen) = self.load(date).map_err(FreezeError::Storage)? {
+            self.ensure_dispatch_can_start(date, &frozen)
+                .map_err(FreezeError::Storage)?;
             return Ok(frozen);
         }
         if self
@@ -326,7 +508,10 @@ impl AttributionDailyIntentStore {
             ));
         }
         let prepared = prepare(self)?;
-        self.freeze(date, prepared).map_err(FreezeError::Storage)
+        let frozen = self.freeze(date, prepared).map_err(FreezeError::Storage)?;
+        self.ensure_dispatch_can_start(date, &frozen)
+            .map_err(FreezeError::Storage)?;
+        Ok(frozen)
     }
 }
 
@@ -472,5 +657,64 @@ mod tests {
             panic!("reservation must guard a failed database commit")
         });
         assert!(matches!(retry, Err(FreezeError::Storage(_))));
+    }
+
+    #[test]
+    fn missing_postflight_observation_blocks_restart_even_with_no_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttributionDailyIntentStore::new(dir.path());
+        let frozen = freeze_once(&store);
+        assert_eq!(store.reserve_dispatch_attempt(date(), &frozen).unwrap(), 1);
+
+        let restarted = AttributionDailyIntentStore::new(dir.path());
+        let result: Result<_, FreezeError<String>> = restarted.load_or_freeze(date(), |_| {
+            panic!("unobserved dispatch must not be retried after restart")
+        });
+        assert!(matches!(result, Err(FreezeError::Storage(_))));
+    }
+
+    #[test]
+    fn durable_no_claim_authorization_permits_one_frozen_retry_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttributionDailyIntentStore::new(dir.path());
+        let frozen = freeze_once(&store);
+        let first = store.reserve_dispatch_attempt(date(), &frozen).unwrap();
+        store
+            .authorize_no_claim_retry(date(), &frozen, first)
+            .unwrap();
+
+        let restarted = AttributionDailyIntentStore::new(dir.path());
+        let same: FrozenAttributionDaily = restarted
+            .load_or_freeze(date(), |_| -> Result<_, FreezeError<String>> {
+                panic!("authorized retry must use frozen summary")
+            })
+            .unwrap();
+        assert_eq!(same, frozen);
+        assert_eq!(
+            restarted.reserve_dispatch_attempt(date(), &same).unwrap(),
+            2
+        );
+        let result: Result<_, FreezeError<String>> = restarted.load_or_freeze(date(), |_| {
+            panic!("second attempt without observation must block")
+        });
+        assert!(matches!(result, Err(FreezeError::Storage(_))));
+    }
+
+    #[test]
+    fn corrupt_dispatch_record_blocks_restart_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttributionDailyIntentStore::new(dir.path());
+        let frozen = freeze_once(&store);
+        let first = store.reserve_dispatch_attempt(date(), &frozen).unwrap();
+        let record = store.dispatch_record_path(date(), "dispatch", first);
+        fs::write(record, b"{\"partial\":").unwrap();
+
+        let result: Result<_, FreezeError<String>> = store.load_or_freeze(date(), |_| {
+            panic!("corrupt dispatch record must not authorize a resend")
+        });
+        assert!(matches!(result, Err(FreezeError::Storage(_))));
+        assert!(store
+            .authorize_no_claim_retry(date(), &frozen, first)
+            .is_err());
     }
 }

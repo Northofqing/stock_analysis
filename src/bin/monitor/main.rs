@@ -10277,6 +10277,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 frozen.report_revision_file(),
                                 text.len(),
                             );
+                            let attempt_ordinal = match store.reserve_dispatch_attempt(today, &frozen) {
+                                Ok(ordinal) => Some(ordinal),
+                                Err(error) => {
+                                    log::error!("[attribution] 持久发送尝试记录失败，封日待核对: {error}");
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
+                                    None
+                                }
+                            };
+                            if let Some(attempt_ordinal) = attempt_ordinal {
                             // 继续使用原 counted 物理投递 owner。sink 失败由 durable
                             // claim 对账；Unknown 留待人工裁定。无 claim 的前置失败仅
                             // 复用本次冻结的摘要，绝不重新计算行情或改写报告 revision。
@@ -10322,10 +10333,25 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 AttributionDailyPreflight::Prepare if may_retry => {
                                     // prepare() persists the exact claim before any sink call.
                                     // No claim after this failure proves there was no physical
-                                    // attempt; the next tick may only reuse frozen summary bytes.
-                                    log::warn!(
-                                        "[attribution] 无 durable claim/物理尝试，保留冻结摘要供下个 tick 重试"
-                                    );
+                                    // attempt; persist authorization before another tick may
+                                    // reuse the frozen summary, including after a restart.
+                                    match store.authorize_no_claim_retry(
+                                        today,
+                                        &frozen,
+                                        attempt_ordinal,
+                                    ) {
+                                        Ok(()) => log::warn!(
+                                            "[attribution] 无 durable claim/物理尝试，已持久授权下个 tick 复用冻结摘要"
+                                        ),
+                                        Err(error) => {
+                                            log::error!(
+                                                "[attribution] 无 claim 重试授权落盘失败，封日待核对: {error}"
+                                            );
+                                            *ATTRIBUTION_LAST_RUN
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
+                                        }
+                                    }
                                 }
                                 AttributionDailyPreflight::Prepare => {
                                     log::error!(
@@ -10354,6 +10380,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner()) = Some(today);
                                 }
+                            }
                             }
                         }
                         Err(FreezeError::Prepare(AttributionEpochRuntimeError::Unavailable {
