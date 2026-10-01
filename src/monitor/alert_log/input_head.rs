@@ -85,6 +85,11 @@ pub struct AlertInputHeadV1 {
 }
 
 impl AlertInputHeadV1 {
+    pub(crate) fn source_identity(&self) -> Option<(u64, u64)> {
+        self.source_identity
+            .as_ref()
+            .map(|value| (value.device, value.inode))
+    }
     pub fn business_date(&self) -> NaiveDate {
         self.business_date
     }
@@ -358,6 +363,27 @@ pub(crate) struct DateFence {
 }
 
 impl DateFence {
+    pub(crate) fn namespace_path(&self) -> io::Result<&Path> {
+        self.ensure_current()?;
+        Ok(&self.dir)
+    }
+
+    pub(crate) fn namespace_identity(&self) -> io::Result<(u64, u64)> {
+        self.ensure_current()?;
+        let value = file_identity(&self.dir_file.metadata()?)?;
+        Ok((value.device, value.inode))
+    }
+
+    pub(crate) fn namespace_file(&self) -> io::Result<&File> {
+        self.ensure_current()?;
+        Ok(&self.dir_file)
+    }
+
+    pub(crate) fn lock_identity(&self) -> io::Result<(u64, u64)> {
+        self.ensure_current()?;
+        let value = file_identity(&self.lock_file.metadata()?)?;
+        Ok((value.device, value.inode))
+    }
     fn acquire(dir: &Path, date: NaiveDate, writer: bool) -> Result<Self, AlertInputHeadUnknown> {
         if writer {
             fs::create_dir_all(dir)?;
@@ -486,16 +512,25 @@ struct ReadHead {
 
 fn read_head(path: &Path, date: NaiveDate) -> Result<ReadHead, AlertInputHeadUnknown> {
     let (bytes, metadata) = read_regular(path, AlertInputHeadUnknown::MissingHead)?;
-    let value: AlertInputHeadV1 =
-        serde_json::from_slice(&bytes).map_err(|_| AlertInputHeadUnknown::InvalidHead)?;
-    if !value.valid_for(date) || head_bytes(&value).map_err(AlertInputHeadUnknown::Io)? != bytes {
-        return Err(AlertInputHeadUnknown::InvalidHead);
-    }
+    let value = validate_saved_input_head(date, &bytes)?;
     Ok(ReadHead {
         value,
         bytes,
         metadata,
     })
+}
+
+/// Structural evidence only: this performs no filesystem or completeness admission.
+pub(crate) fn validate_saved_input_head(
+    date: NaiveDate,
+    bytes: &[u8],
+) -> Result<AlertInputHeadV1, AlertInputHeadUnknown> {
+    let value: AlertInputHeadV1 =
+        serde_json::from_slice(bytes).map_err(|_| AlertInputHeadUnknown::InvalidHead)?;
+    if !value.valid_for(date) || head_bytes(&value).map_err(AlertInputHeadUnknown::Io)? != bytes {
+        return Err(AlertInputHeadUnknown::InvalidHead);
+    }
+    Ok(value)
 }
 
 fn head_bytes(head: &AlertInputHeadV1) -> io::Result<Vec<u8>> {

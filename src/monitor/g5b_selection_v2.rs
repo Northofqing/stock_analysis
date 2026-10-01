@@ -5,8 +5,8 @@
 //! legacy compatibility; original raw bytes do not assert a stricter schema.
 
 use super::alert_log::{
-    AlertInputHeadUnknown, AlertRecord, LockedAlertInputPrefix, VerifiedAlertInputCutoff,
-    VerifiedAlertInputLine,
+    validate_saved_input_head, AlertInputHeadUnknown, AlertRecord, LockedAlertInputPrefix,
+    VerifiedAlertInputCutoff, VerifiedAlertInputLine,
 };
 use super::attribution_deep::DEEP_ATTRIBUTION_MAX_EVENTS;
 use chrono::NaiveDate;
@@ -66,45 +66,167 @@ impl std::error::Error for G5bSelectionV2Error {}
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SourceIdentity {
-    device: u64,
-    inode: u64,
+pub(crate) struct SourceIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Cutoff {
-    input_head_canonical: Vec<u8>,
-    input_head_sha256: String,
-    generation: u64,
-    committed_offset: u64,
-    prefix_sha256: String,
-    source_identity: Option<SourceIdentity>,
+pub(crate) struct Cutoff {
+    pub(crate) input_head_canonical: Vec<u8>,
+    pub(crate) input_head_sha256: String,
+    pub(crate) generation: u64,
+    pub(crate) committed_offset: u64,
+    pub(crate) prefix_sha256: String,
+    pub(crate) source_identity: Option<SourceIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SelectedLine {
-    line_ordinal: u64,
-    start_offset: u64,
-    end_offset: u64,
-    raw_line_bytes: Vec<u8>,
-    raw_line_sha256: String,
-    record_canonical: Vec<u8>,
-    record_sha256: String,
+pub(crate) struct SelectedLine {
+    pub(crate) line_ordinal: u64,
+    pub(crate) start_offset: u64,
+    pub(crate) end_offset: u64,
+    pub(crate) raw_line_bytes: Vec<u8>,
+    pub(crate) raw_line_sha256: String,
+    pub(crate) record_canonical: Vec<u8>,
+    pub(crate) record_sha256: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EncodedSelection {
-    schema: String,
-    business_date: NaiveDate,
-    selection_policy: String,
-    selection_policy_sha256: String,
-    cutoff_policy: String,
-    cutoff_policy_sha256: String,
-    cutoff: Cutoff,
-    selected: Vec<SelectedLine>,
+pub(crate) struct EncodedSelection {
+    pub(crate) schema: String,
+    pub(crate) business_date: NaiveDate,
+    pub(crate) selection_policy: String,
+    pub(crate) selection_policy_sha256: String,
+    pub(crate) cutoff_policy: String,
+    pub(crate) cutoff_policy_sha256: String,
+    pub(crate) cutoff: Cutoff,
+    pub(crate) selected: Vec<SelectedLine>,
+}
+
+/// Strictly checked encoded evidence, never a candidate or owner receipt.
+pub(crate) struct G5bSelectionEvidence {
+    encoded: EncodedSelection,
+    canonical: Vec<u8>,
+    cohort_preimage: Vec<u8>,
+    occurrences: Vec<(String, Vec<u8>)>,
+}
+
+impl G5bSelectionEvidence {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, G5bSelectionV2Error> {
+        let encoded: EncodedSelection = serde_json::from_slice(bytes)?;
+        let mut canonical = serde_json::to_vec(&encoded)?;
+        canonical.push(b'\n');
+        let invalid = || G5bSelectionV2Error::BindingMismatch;
+        if canonical != bytes
+            || encoded.schema != SCHEMA
+            || encoded.selection_policy != SELECTION_POLICY
+            || encoded.selection_policy_sha256 != hash(SELECTION_POLICY.as_bytes())
+            || encoded.cutoff_policy != CUTOFF_POLICY
+            || encoded.cutoff_policy_sha256 != hash(CUTOFF_POLICY.as_bytes())
+            || encoded.selected.is_empty()
+            || encoded.selected.len() > DEEP_ATTRIBUTION_MAX_EVENTS
+        {
+            return Err(invalid());
+        }
+        let head =
+            validate_saved_input_head(encoded.business_date, &encoded.cutoff.input_head_canonical)?;
+        if hash(&encoded.cutoff.input_head_canonical) != encoded.cutoff.input_head_sha256
+            || head.generation() != encoded.cutoff.generation
+            || head.committed_offset() != encoded.cutoff.committed_offset
+            || head.prefix_sha256() != encoded.cutoff.prefix_sha256
+            || head.source_identity()
+                != encoded
+                    .cutoff
+                    .source_identity
+                    .as_ref()
+                    .map(|v| (v.device, v.inode))
+        {
+            return Err(invalid());
+        }
+        let mut cohort_preimage = COHORT_DOMAIN.as_bytes().to_vec();
+        cohort_preimage.push(0);
+        cohort_preimage.extend_from_slice(bytes);
+        let cohort_identity = hash(&cohort_preimage);
+        let mut occurrences = Vec::new();
+        let mut positions = std::collections::BTreeSet::new();
+        let mut previous_rank = None;
+        for line in &encoded.selected {
+            let record: AlertRecord = serde_json::from_slice(&line.raw_line_bytes)?;
+            let rank = match record.level.as_str() {
+                "紧急" => 0,
+                "重要" => 1,
+                _ => 2,
+            };
+            if !record.is_production_eligible()
+                || line.line_ordinal == 0
+                || line.line_ordinal > head.generation()
+                || line.end_offset <= line.start_offset
+                || line.end_offset > head.committed_offset()
+                || line.end_offset - line.start_offset != line.raw_line_bytes.len() as u64
+                || line.raw_line_bytes.last() != Some(&b'\n')
+                || line.raw_line_bytes[..line.raw_line_bytes.len() - 1].contains(&b'\n')
+                || hash(&line.raw_line_bytes) != line.raw_line_sha256
+                || serde_json::to_vec(&record)? != line.record_canonical
+                || hash(&line.record_canonical) != line.record_sha256
+                || !positions.insert((line.line_ordinal, line.start_offset, line.end_offset))
+                || previous_rank.is_some_and(|(old_rank, old_ordinal)| {
+                    (rank, line.line_ordinal) <= (old_rank, old_ordinal)
+                })
+            {
+                return Err(invalid());
+            }
+            previous_rank = Some((rank, line.line_ordinal));
+            let canonical = serde_json::to_vec(&OccurrencePreimage {
+                business_date: encoded.business_date,
+                cohort_identity: &cohort_identity,
+                source_identity: &encoded.cutoff.source_identity,
+                line_ordinal: line.line_ordinal,
+                start_offset: line.start_offset,
+                end_offset: line.end_offset,
+                raw_line_sha256: &line.raw_line_sha256,
+            })?;
+            let mut preimage = OCCURRENCE_DOMAIN.as_bytes().to_vec();
+            preimage.push(0);
+            preimage.extend_from_slice(&canonical);
+            occurrences.push((hash(&preimage), preimage));
+        }
+        Ok(Self {
+            encoded,
+            canonical,
+            cohort_preimage,
+            occurrences,
+        })
+    }
+    pub(crate) fn encoded(&self) -> &EncodedSelection {
+        &self.encoded
+    }
+    pub(crate) fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+    pub(crate) fn cohort_preimage(&self) -> &[u8] {
+        &self.cohort_preimage
+    }
+    pub(crate) fn cohort_identity(&self) -> String {
+        hash(&self.cohort_preimage)
+    }
+    pub(crate) fn occurrences(&self) -> &[(String, Vec<u8>)] {
+        &self.occurrences
+    }
+
+    /// Verifies actual source without returning a candidate. A stored owner
+    /// capability must be constructed separately by the attested coordinator.
+    pub(crate) fn verify_locked_prefix(
+        &self,
+        prefix: &LockedAlertInputPrefix<'_>,
+    ) -> Result<(), G5bSelectionV2Error> {
+        let cutoff = prefix.cutoff_for_captured_head(&self.encoded.cutoff.input_head_canonical)?;
+        let candidate = G5bSelectionV2Candidate::from_verified_cutoff(cutoff)?;
+        candidate.verify_encoding_against_locked_prefix(prefix, &self.canonical)
+    }
 }
 
 #[derive(Serialize)]

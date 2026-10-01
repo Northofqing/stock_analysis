@@ -15,7 +15,8 @@ pub use input_head::{
     inspect_date_input_head, AlertInputHeadUnknown, AlertInputHeadV1, VerifiedAlertInputPrefix,
 };
 pub(crate) use input_head::{
-    LockedAlertInputPrefix, VerifiedAlertInputCutoff, VerifiedAlertInputLine,
+    validate_saved_input_head, LockedAlertInputPrefix, VerifiedAlertInputCutoff,
+    VerifiedAlertInputLine,
 };
 
 fn alerts_dir() -> PathBuf {

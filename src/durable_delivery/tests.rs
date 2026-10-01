@@ -21,8 +21,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Barrier, Mutex};
 
+#[path = "g5b_cohort_session_tests.rs"]
+mod g5b_cohort_session_tests;
 #[path = "g5b_mutation_fence_tests.rs"]
 mod g5b_mutation_fence_tests;
+#[path = "g5b_schema12_migration_tests.rs"]
+mod g5b_schema12_migration_tests;
 
 static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -412,6 +416,7 @@ fn initialize_test_schema(connection: &mut Connection) -> Result<()> {
 }
 
 fn downgrade_manual_resolution_schema_for_test(connection: &mut Connection, schema_version: i64) {
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(connection);
     assert!(
         matches!(schema_version, 1 | 2),
         "legacy regression supports schema v1 or v2"
@@ -576,6 +581,7 @@ fn br194_sha256_function_catalog_is_deterministic_innocuous_and_blob_only() {
 }
 
 fn downgrade_replay_schema_v4_for_test(connection: &mut Connection, replay_present: bool) {
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(connection);
     let decision_canonical = br#"{"schema":"TEST_CODE_V4_DECISION"}"#;
     let decision_hash = sha256_hex(decision_canonical);
     connection
@@ -2528,6 +2534,7 @@ fn br194_schema_v5_migration_matrix_is_repeatable_and_rejects_newer_versions() {
         } else if legacy_version == 4 {
             downgrade_replay_schema_v4_for_test(&mut connection, false);
         } else {
+            super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
             connection
                 .pragma_update(None, "user_version", legacy_version)
                 .expect("set legacy schema version");
@@ -7928,6 +7935,7 @@ fn p05_v10_upgrade_retains_historical_duplicate_but_reader_rejects_ambiguous_own
         .execute_batch("DROP TRIGGER candidate_board_exact_occurrence_owner_insert")
         .unwrap();
     p05_direct_decision_insert(&connection, &second, "").unwrap();
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
     connection
         .pragma_update(None, "user_version", 10_i64)
         .unwrap();
@@ -9305,6 +9313,7 @@ fn p01_schema_v7_to_v9_replays_only_policy_catalog_and_preserves_delivery_author
     connection
         .execute("UPDATE delivery_policy_catalog SET policy_version=3", [])
         .expect("restore schema-v7 policy version");
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
     connection
         .pragma_update(None, "user_version", 7_i64)
         .expect("restore schema-v7 marker");
@@ -9412,6 +9421,7 @@ fn br245_schema_v9_replays_only_policy_catalog_and_preserves_all_authority_rows(
             [],
         )
         .expect("restore schema-v8 TomorrowWatch policy");
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
     connection
         .pragma_update(None, "user_version", 8_i64)
         .expect("restore schema-v8 marker");
@@ -9487,6 +9497,7 @@ fn m0_schema_v9_to_v10_adds_empty_immutable_correlation_without_rewriting_author
     connection
         .execute_batch("DROP TABLE delivery_correlation_observations;")
         .expect("remove only v10 sidecar to reconstruct v9 fixture");
+    super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
     connection
         .pragma_update(None, "user_version", 9_i64)
         .expect("mark isolated fixture as v9");

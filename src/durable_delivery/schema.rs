@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 11;
+pub(crate) const SCHEMA_VERSION: i64 = 12;
 
 #[cfg(test)]
 thread_local! {
@@ -96,6 +96,13 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
         return Err(DurableDeliveryError::InvalidConfiguration(format!(
             "durable-delivery schema version {current_version} is newer than supported {SCHEMA_VERSION}"
         )));
+    }
+    if current_version == SCHEMA_VERSION {
+        // Reopening must not heal missing or changed schema12 objects.
+        super::schema_g5b_cohort::verify_catalog(transaction)?;
+        super::coordinator::validate_g5b_cohort_rows(transaction)?;
+    } else {
+        super::schema_g5b_cohort::reject_preexisting_extension(transaction)?;
     }
     match current_version {
         1 => {
@@ -846,6 +853,12 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
     )?;
 
     seed_and_verify_policy_catalog(transaction)?;
+    if current_version < SCHEMA_VERSION {
+        super::schema_g5b_cohort::initialize(transaction)?;
+    }
+    super::schema_g5b_cohort::verify_catalog(transaction)?;
+    super::schema_g5b_cohort::verify_foreign_keys(transaction)?;
+    super::coordinator::validate_g5b_cohort_rows(transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }

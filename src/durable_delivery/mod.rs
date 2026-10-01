@@ -9,11 +9,16 @@ mod coordinator;
 mod correlation;
 mod model;
 mod schema;
+mod schema_g5b_cohort;
 
 pub use coordinator::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
     CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2, DurableDeliveryCoordinator,
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+};
+pub(crate) use coordinator::{
+    G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, PreparedG5bArtifact,
+    VerifiedStoredG5bCohort,
 };
 pub use correlation::P01OriginProducer;
 pub use model::{

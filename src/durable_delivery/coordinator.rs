@@ -48,8 +48,14 @@ pub use candidate_board::{
 };
 #[path = "coordinator_g5b.rs"]
 mod g5b;
+#[path = "coordinator_g5b_cohort.rs"]
+mod g5b_cohort;
 pub use g5b::{
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+};
+pub(crate) use g5b_cohort::{
+    G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, PreparedG5bArtifact,
+    VerifiedStoredG5bCohort,
 };
 
 const AUDIT_KINDS: [&str; 14] = [
@@ -10121,7 +10127,13 @@ fn require_current_schema_version(connection: &Connection) -> Result<()> {
             "durable-delivery schema version {schema_version} does not match required version {SCHEMA_VERSION}"
         )));
     }
+    super::schema_g5b_cohort::verify_catalog(connection)?;
+    validate_g5b_cohort_rows(connection)?;
     Ok(())
+}
+
+pub(super) fn validate_g5b_cohort_rows(connection: &Connection) -> Result<()> {
+    g5b_cohort::validate_rows(connection)
 }
 
 fn validate_persisted_immutable_references(connection: &Connection) -> Result<()> {
