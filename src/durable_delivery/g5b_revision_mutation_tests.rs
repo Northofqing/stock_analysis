@@ -684,7 +684,7 @@ fn g5b_revision_mutation_non_g5b_and_legacy_without_head_do_not_adopt_the_day() 
 }
 
 #[test]
-fn g5b_revision_mutation_business_write_preserves_unmatched_artifact_dirty_state() {
+fn g5b_revision_mutation_new_legacy_write_rejects_without_changing_unmatched_artifact_dirty_state() {
     let fixture = Fixture::new("REVISION_DIRTY");
     prospective_head(&fixture, DATE);
     let day = NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();
@@ -720,11 +720,11 @@ fn g5b_revision_mutation_business_write_preserves_unmatched_artifact_dirty_state
         session.prepare_cohort(&ready).unwrap();
     }
     assert_eq!(revision(&fixture, DATE), 1);
-    // This is the existing v1 mutation route under D1. It grants no v2 member,
-    // owner, model/handoff or seal qualification; C2 closes new v1 admissions.
+    // C2 closes fresh v1 admission once this actual v2 cohort exists. Rejection
+    // must preserve the original unmatched artifact and every typed SQL cell.
     let candidate = g5b_frozen_envelope("REVISION_DIRTY_LEGACY", false);
-    changed(&fixture, || {
-        fixture.coordinator.prepare(&candidate, 1, now()).unwrap()
+    unchanged(&fixture, || {
+        assert!(fixture.coordinator.prepare(&candidate, 1, now()).is_err())
     });
     assert_eq!(
         fixture.query_strings("SELECT artifact_state FROM g5b_day_heads"),
