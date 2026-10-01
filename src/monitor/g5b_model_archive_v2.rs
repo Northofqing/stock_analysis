@@ -100,9 +100,15 @@ fn validate_snapshot(
     bundle: &VerifiedG5bModelBundle,
     actual: &[ArchiveItem],
 ) -> Result<()> {
-    let evidence = G5bSelectionEvidence::decode(bundle.cohort().selection_bytes())
-        .map_err(|e| invalid(&e.to_string()))?;
-    let count = bundle.cohort().selected_count();
+    validate_snapshot_evidence(snapshot, bundle.cohort().selection_bytes(), actual)
+}
+fn validate_snapshot_evidence(
+    snapshot: &ArchiveSnapshot,
+    selection: &[u8],
+    actual: &[ArchiveItem],
+) -> Result<()> {
+    let evidence = G5bSelectionEvidence::decode(selection).map_err(|e| invalid(&e.to_string()))?;
+    let count = evidence.encoded().selected.len();
     let coverage = if snapshot.items.len() == count {
         G5bModelArchiveCoverageV2::Full
     } else {
@@ -111,8 +117,8 @@ fn validate_snapshot(
     if snapshot.schema != ARCHIVE_SCHEMA
         || snapshot.policy != ARCHIVE_POLICY
         || snapshot.business_date != evidence.encoded().business_date
-        || snapshot.cohort_identity != bundle.cohort().identity()
-        || snapshot.selection_sha256 != hash(bundle.cohort().selection_bytes())
+        || snapshot.cohort_identity != evidence.cohort_identity()
+        || snapshot.selection_sha256 != hash(selection)
         || snapshot.selected_count != count
         || snapshot.items.is_empty()
         || snapshot.items.len() > count
@@ -287,4 +293,73 @@ pub(crate) fn bytes_for_test(
         return Err(invalid("first archive byte fixture unavailable"));
     }
     canonical(&next_snapshot(&bundle, items))
+}
+
+/// Pure codec projection shared by the SQL gate and the actual-file owner.
+/// Partial archives qualify only their included member, never day completion.
+pub(super) fn validate_archived_member(
+    selection: &[u8],
+    selected_index: usize,
+    load: &dyn Fn(usize) -> Result<Option<(String, Vec<u8>, String, Vec<u8>)>>,
+    archives: &[(String, Vec<u8>, bool)],
+) -> Result<()> {
+    let evidence = G5bSelectionEvidence::decode(selection).map_err(|e| invalid(&e.to_string()))?;
+    let mut actual = Vec::new();
+    for index in 0..evidence.encoded().selected.len() {
+        if let Some((attempt_identity, attempt, frozen_identity, frozen)) = load(index)? {
+            let core = validate_handoff(&frozen, &attempt, &attempt_identity)?;
+            if core.member != member(&evidence, index)? {
+                return Err(invalid("archived member raw anchors differ"));
+            }
+            actual.push(ArchiveItem {
+                selection_index: index,
+                occurrence_identity: core.member.occurrence_identity,
+                attempt_identity,
+                attempt_sha256: hash(&attempt),
+                frozen_identity,
+                frozen_sha256: hash(&frozen),
+                handoff_canonical: frozen,
+            });
+        }
+    }
+    let mut previous: Option<ArchiveSnapshot> = None;
+    let mut witnessed = false;
+    for (index, (identity, bytes, committed)) in archives.iter().enumerate() {
+        let snapshot: ArchiveSnapshot = decode(bytes)?;
+        validate_snapshot_evidence(&snapshot, selection, &actual)?;
+        let prev = index.checked_sub(1).map(|i| archives[i].0.clone());
+        if snapshot.version != index as u64 + 1 || snapshot.previous_archive_identity != prev {
+            return Err(invalid("counted archive chain differs"));
+        }
+        if let Some(previous) = &previous {
+            if !archives[index - 1].2
+                || previous.items.len() >= snapshot.items.len()
+                || !previous
+                    .items
+                    .iter()
+                    .all(|item| snapshot.items.contains(item))
+            {
+                return Err(invalid(
+                    "counted archive chain does not grow Committed members",
+                ));
+            }
+        }
+        if *committed
+            && snapshot
+                .items
+                .iter()
+                .any(|item| item.selection_index == selected_index)
+        {
+            witnessed = true;
+        }
+        // Keep identity tied to the actual row even for the last Prepared version.
+        if identity.is_empty() {
+            return Err(invalid("archive row identity absent"));
+        }
+        previous = Some(snapshot);
+    }
+    if !witnessed {
+        return Err(invalid("member has no actual Committed closed Archive"));
+    }
+    Ok(())
 }

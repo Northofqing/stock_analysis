@@ -534,3 +534,6 @@ async fn g5b_analysis_v2_behavior_committed_frozen_missing_file_is_not_healed_or
 
 #[path = "g5b_model_archive_v2_behavior_tests.rs"]
 mod model_archive_v2_tests;
+
+#[path = "g5b_v2_owner_behavior_tests.rs"]
+mod owner_v2_tests;

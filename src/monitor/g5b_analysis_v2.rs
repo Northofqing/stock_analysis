@@ -1,4 +1,5 @@
-//! Claim-bound model observations. No counted admission, send or day-seal authority.
+//! Claim-bound model observations and contextual counted owner admission.
+//! No new physical send or day-seal authority.
 
 use super::alert_log::AlertRecord;
 use super::attribution_deep::{
@@ -382,6 +383,194 @@ fn validate_handoff(bytes: &[u8], actual_attempt: &[u8], actual_identity: &str) 
         return Err(invalid("closed source/envelope differs"));
     }
     Ok(core)
+}
+
+/// Closed decoded evidence only. This cannot authorize admission or sending;
+/// the durable owner must additionally verify the actual SQL/file bundle.
+pub(crate) struct G5bV2OwnerBytes {
+    pub(crate) envelope: DeliveryEnvelope,
+    pub(crate) frozen: Vec<u8>,
+    pub(crate) source: Vec<u8>,
+    pub(crate) rendered: Vec<u8>,
+    pub(crate) occurrence: String,
+    pub(crate) cohort: String,
+    pub(crate) date: NaiveDate,
+}
+pub(crate) fn source_is_v2(bytes: &[u8]) -> bool {
+    // Classification must see either duplicate schema occurrence, rather than
+    // a serde Value's last-wins map. Full v2 qualification remains the codec.
+    let saw_v2 = std::cell::Cell::new(false);
+    struct SchemaVisitor<'a> {
+        saw_v2: &'a std::cell::Cell<bool>,
+    }
+    impl<'de> serde::de::Visitor<'de> for SchemaVisitor<'_> {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("source object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> std::result::Result<bool, M::Error> {
+            let mut v2 = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "schema" {
+                    let value: serde_json::Value = map.next_value()?;
+                    v2 |= value.as_str() == Some(SOURCE_SCHEMA);
+                    if v2 {
+                        self.saw_v2.set(true);
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(v2)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let _ =
+        serde::de::Deserializer::deserialize_map(&mut decoder, SchemaVisitor { saw_v2: &saw_v2 });
+    saw_v2.get()
+}
+
+/// Classification only. A recognized v2 source must pass the closed codec;
+/// unknown older source bytes gain no v2 qualification or authority.
+pub(crate) fn classify_stored_source_v2(bytes: &[u8]) -> Result<bool> {
+    if !source_is_v2(bytes) {
+        return Ok(false);
+    }
+    let source: Source = decode(bytes)?;
+    if source.schema != SOURCE_SCHEMA {
+        return Err(invalid("persisted v2 source schema differs"));
+    }
+    Ok(true)
+}
+
+/// The loader returns only already-Committed original model rows. Decoding
+/// these bytes does not mint a trusted bundle; no file or provider is read here.
+pub(crate) fn owner_bytes_from_model_rows(
+    selection: &[u8],
+    index: usize,
+    load: &dyn Fn(usize) -> Result<Option<(String, Vec<u8>, String, Vec<u8>)>>,
+    archives: &[(String, Vec<u8>, bool)],
+) -> Result<G5bV2OwnerBytes> {
+    g5b_model_archive_v2::validate_archived_member(selection, index, load, archives)?;
+    let (attempt_id, attempt, _, frozen) = load(index)?
+        .ok_or_else(|| invalid("counted member has no Committed original Attempt/Frozen"))?;
+    let core = validate_handoff(&frozen, &attempt, &attempt_id)?;
+    let evidence = G5bSelectionEvidence::decode(selection).map_err(|e| invalid(&e.to_string()))?;
+    if core.member != member(&evidence, index)? {
+        return Err(invalid("counted member raw anchors differ"));
+    }
+    let handoff: Handoff = decode(&frozen)?;
+    let envelope = decode(&handoff.envelope_canonical)?;
+    Ok(G5bV2OwnerBytes {
+        envelope,
+        frozen,
+        source: handoff.source_canonical,
+        rendered: core.summary_utf8,
+        occurrence: core.member.occurrence_identity,
+        cohort: core.member.cohort_identity,
+        date: core.member.business_date,
+    })
+}
+
+/// Read-only model facts for presentation/launch/governance checks. A view
+/// cannot register an owner: admission rereads the actual files and SQL rows.
+/// No Clone/Deserialize or arbitrary byte constructor.
+pub struct G5bModelDispatchViewV2 {
+    index: usize,
+    bytes: G5bV2OwnerBytes,
+}
+impl G5bModelDispatchViewV2 {
+    pub fn business_date(&self) -> NaiveDate {
+        self.bytes.date
+    }
+    pub fn selection_index(&self) -> usize {
+        self.index
+    }
+    pub fn occurrence_identity(&self) -> &str {
+        &self.bytes.occurrence
+    }
+    pub fn source_canonical(&self) -> &[u8] {
+        &self.bytes.source
+    }
+    pub fn source_sha256(&self) -> &str {
+        &self.bytes.envelope.source_binding_sha256
+    }
+    pub fn rendered_content(&self) -> &[u8] {
+        &self.bytes.rendered
+    }
+    pub fn rendered_sha256(&self) -> &str {
+        &self.bytes.envelope.rendered_content_sha256
+    }
+    pub fn decision_identity(&self) -> &str {
+        &self.bytes.envelope.decision_identity
+    }
+    pub fn envelope(&self) -> &DeliveryEnvelope {
+        &self.bytes.envelope
+    }
+}
+/// No model, provider, caller time or budget/decision writes. Archive inclusion
+/// and all actual file witnesses are verified before these facts escape.
+pub fn inspect_model_dispatch_v2(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+    index: usize,
+) -> Result<Option<G5bModelDispatchViewV2>> {
+    Ok(coordinator
+        .inspect_g5b_model_dispatch_v2(date, index)?
+        .map(|bytes| G5bModelDispatchViewV2 { index, bytes }))
+}
+
+/// Original verified cohort cardinality for bounded recovery. This observes
+/// no model/provider readiness, owner, budget or day-completion authority.
+pub fn inspect_analysis_cohort_v2(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+) -> Result<Option<usize>> {
+    let session = coordinator.g5b_day_session(date)?;
+    Ok(session.read_cohort()?.map(|cohort| cohort.selected_count()))
+}
+
+/// Contextually registered owner observation. It carries the exact original
+/// envelope for the existing runtime, but is not a physical receipt/day seal.
+/// No Clone/Deserialize or caller-supplied byte constructor.
+pub struct G5bPreparedModelOwnerV2 {
+    outcome: crate::durable_delivery::PrepareOutcome,
+    envelope: DeliveryEnvelope,
+}
+impl G5bPreparedModelOwnerV2 {
+    pub fn outcome(&self) -> &crate::durable_delivery::PrepareOutcome {
+        &self.outcome
+    }
+    pub fn envelope(&self) -> &DeliveryEnvelope {
+        &self.envelope
+    }
+}
+/// Short contextual admission. The producer cannot supply a source, rendered
+/// content or envelope. The durable store owns the real frozen member binding.
+pub fn prepare_model_owner_v2(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+    index: usize,
+    authoritative_sink_count: usize,
+) -> Result<G5bPreparedModelOwnerV2> {
+    let (outcome, envelope) =
+        coordinator.prepare_g5b_model_owner_v2(date, index, authoritative_sink_count)?;
+    Ok(G5bPreparedModelOwnerV2 { outcome, envelope })
+}
+#[cfg(test)]
+pub(crate) fn prepare_model_owner_v2_for_test(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+    index: usize,
+    authoritative_sink_count: usize,
+    now: DateTime<Utc>,
+) -> Result<crate::durable_delivery::PrepareOutcome> {
+    Ok(coordinator
+        .prepare_g5b_model_owner_v2_at_for_test(date, index, authoritative_sink_count, now)?
+        .0)
 }
 
 pub enum G5bAnalysisClaimV2 {

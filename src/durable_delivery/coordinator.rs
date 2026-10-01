@@ -56,6 +56,8 @@ pub(crate) use p05_unit::{
 mod g5b;
 #[path = "coordinator_g5b_cohort.rs"]
 mod g5b_cohort;
+#[path = "coordinator_g5b_v2.rs"]
+mod g5b_v2;
 pub use g5b::{
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
 };
@@ -433,6 +435,8 @@ pub(crate) enum OperationPostvalidationTestFault {
     SinkDeliveryAuditRef,
     TaskHydrationState,
     SchemaVersion(i64),
+    G5bHeadRevisionAdvance,
+    G5bHeadArtifactStateDrift,
 }
 
 #[derive(Clone, Copy)]
@@ -3366,6 +3370,7 @@ impl DurableDeliveryCoordinator {
                 authoritative_sink_count,
                 admission_at,
                 origin_observation,
+                None,
             )
         })?;
         match transaction_outcome {
@@ -3399,6 +3404,7 @@ impl DurableDeliveryCoordinator {
         authoritative_sink_count: usize,
         admission_at: DateTime<Utc>,
         origin_observation: Option<&CorrelationObservationV1>,
+        g5b_admission: Option<&g5b_v2::Admission<'_>>,
     ) -> Result<MutationEffect<PrepareTransactionOutcome>> {
         if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
             if existing.envelope_canonical.as_slice() == raw_canonical
@@ -3452,6 +3458,7 @@ impl DurableDeliveryCoordinator {
             ));
         }
 
+        g5b_v2::validate_new_prepare_tx(transaction, envelope, g5b_admission)?;
         self.require_g5b_business_open_tx(transaction, route)?;
         envelope.validate()?;
         if envelope.push_kind == PushKind::CandidateBoard {
@@ -5395,7 +5402,17 @@ impl DurableDeliveryCoordinator {
         validator: Option<&dyn Fn() -> Result<()>>,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.with_connection_core(schema_policy, true, validator.is_none(), |connection| {
+        self.with_immediate_transaction_validated_sql(schema_policy, validator, None, operation)
+    }
+
+    fn with_immediate_transaction_validated_sql<T>(
+        &self,
+        schema_policy: SchemaVersionPolicy,
+        validator: Option<&dyn Fn() -> Result<()>>,
+        sql_validator: Option<&dyn Fn(&Transaction<'_>) -> Result<()>>,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_connection_core(schema_policy, true, validator.is_none() && sql_validator.is_none(), |connection| {
             if let Some(validate) = validator {
                 validate()?;
             }
@@ -5449,7 +5466,7 @@ impl DurableDeliveryCoordinator {
             // Ordinary transactions retain their original connection-core
             // hook order; an explicit hook below covers actual post-COMMIT.
             #[cfg(test)]
-            if validator.is_some() {
+            if validator.is_some() || sql_validator.is_some() {
                 if let Err(primary) = self.run_database_operation_test_hook(
                     DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
                 ) {
@@ -5458,6 +5475,12 @@ impl DurableDeliveryCoordinator {
                         "after-sql postvalidation test hook",
                         primary,
                     ));
+                }
+            }
+            #[cfg(test)]
+            if validator.is_some() || sql_validator.is_some() {
+                if let Err(primary)=self.apply_g5b_head_revision_test_fault(&transaction) {
+                    return Err(self.rollback_transaction_with_evidence(&transaction,"after-post-sql exact revision test fault",primary));
                 }
             }
             if let Err(primary) = require_current_schema_version(&transaction) {
@@ -5473,6 +5496,11 @@ impl DurableDeliveryCoordinator {
                     "pre-commit immutable-reference validation",
                     primary,
                 ));
+            }
+            if let Some(validate_sql)=sql_validator {
+                if let Err(primary)=validate_sql(&transaction) {
+                    return Err(self.rollback_transaction_with_evidence(&transaction,"pre-commit exact SQL witness validation",primary));
+                }
             }
             if let Err(primary) = self.database_binding()?.validate_under_open_lock() {
                 return Err(self.rollback_transaction_with_evidence(
@@ -5506,13 +5534,18 @@ impl DurableDeliveryCoordinator {
                 ));
             }
             #[cfg(test)]
-            if validator.is_some() {
+            if validator.is_some() || sql_validator.is_some() {
                 if let Err(error) = self.run_database_operation_test_hook(
                     DatabaseOperationTestPhase::AfterCommitBeforePostValidation,
                 ) {
                     return Err(DurableDeliveryError::IsolationViolation(format!(
                         "post-commit G5b test hook failed after COMMIT succeeded: {error}"
                     )));
+                }
+            }
+            if let Some(validate_sql)=sql_validator {
+                if let Err(error)=validate_sql(&transaction) {
+                    return Err(DurableDeliveryError::IsolationViolation(format!("post-commit exact SQL witness validation failed after COMMIT succeeded: {error}")));
                 }
             }
             match self.database_binding()?.validate_under_open_lock() {
@@ -5527,6 +5560,30 @@ impl DurableDeliveryCoordinator {
                 },
             }
         })
+    }
+
+    #[cfg(test)]
+    fn apply_g5b_head_revision_test_fault(&self, transaction: &Transaction<'_>) -> Result<()> {
+        // Only this new fault is consumed at the second after-SQL boundary.
+        // All older faults retain their original one-pass timing.
+        let pending = *self
+            .operation_postvalidation_test_fault
+            .lock()
+            .map_err(|_| {
+                DurableDeliveryError::IsolationViolation(
+                    "TEST_CODE revision fault mutex poisoned".to_owned(),
+                )
+            })?;
+        if matches!(
+            pending,
+            Some(
+                OperationPostvalidationTestFault::G5bHeadRevisionAdvance
+                    | OperationPostvalidationTestFault::G5bHeadArtifactStateDrift
+            )
+        ) {
+            self.apply_operation_postvalidation_test_fault(transaction)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5548,6 +5605,34 @@ impl DurableDeliveryCoordinator {
         };
         let whitespace = " \t\n\r";
         let changed = match fault {
+            OperationPostvalidationTestFault::G5bHeadArtifactStateDrift => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE head fault cannot access Production".to_owned(),
+                    ));
+                }
+                transaction.execute(
+                    "UPDATE g5b_day_heads SET artifact_state='Dirty',current_seal_identity=NULL",
+                    [],
+                )?
+            }
+            OperationPostvalidationTestFault::G5bHeadRevisionAdvance => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE revision fault cannot access Production".to_owned(),
+                    ));
+                }
+                transaction.execute(
+                    "UPDATE g5b_day_heads SET revision=revision+1,current_seal_identity=NULL",
+                    [],
+                )?
+            }
             OperationPostvalidationTestFault::SchemaVersion(version) => {
                 transaction.pragma_update(None, "user_version", version)?;
                 return Ok(());
@@ -5940,7 +6025,7 @@ impl DurableDeliveryCoordinator {
         let route = self.with_mutation_routing_connection(|connection| {
             DecisionMutationRoute::from_stored(connection, stored)
         })?;
-        self.with_mutation_transaction(&route, |transaction| {
+        self.with_pre_sink_mutation_transaction(&route, |transaction| {
             let current =
                 load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
@@ -6011,7 +6096,7 @@ impl DurableDeliveryCoordinator {
         now: DateTime<Utc>,
     ) -> Result<Option<AttemptLease>> {
         let route = self.decision_mutation_route(decision_identity)?;
-        self.with_mutation_transaction(&route, |transaction| {
+        self.with_pre_sink_mutation_transaction(&route, |transaction| {
             let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;

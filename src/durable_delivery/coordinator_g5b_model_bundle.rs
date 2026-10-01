@@ -50,6 +50,8 @@ pub(crate) struct VerifiedG5bModelBundle {
     members: Vec<G5bModelMemberArtifacts>,
     archives: Vec<G5bModelArtifact>,
     revision: i64,
+    head_state: String,
+    seal_pointer: Option<String>,
     sql_binding: Vec<u8>,
 }
 impl VerifiedG5bModelBundle {
@@ -88,6 +90,8 @@ impl VerifiedG5bModelBundle {
             self.cohort.selection_bytes(),
             &self.cohort.admission,
             self.revision,
+            &self.head_state,
+            &self.seal_pointer,
             artifacts,
         ))
     }
@@ -117,9 +121,36 @@ impl VerifiedG5bModelBundle {
         // The prefix must still match after reading every model/archive file.
         session.verify_actual_prefix(&self.cohort.evidence)
     }
-    fn verify_sql(&self, session: &G5bDaySession<'_>, tx: &Transaction<'_>) -> Result<()> {
-        let current = load_bundle(tx, session.date)?
+    pub(crate) fn verify_sql(
+        &self,
+        session: &G5bDaySession<'_>,
+        tx: &Transaction<'_>,
+    ) -> Result<()> {
+        self.verify_sql_with_revision_delta(session, tx, 0)
+    }
+    pub(crate) fn verify_sql_with_revision_delta(
+        &self,
+        session: &G5bDaySession<'_>,
+        tx: &Transaction<'_>,
+        delta: i64,
+    ) -> Result<()> {
+        if !matches!(delta, 0 | 1) {
+            return Err(mismatch("unsupported own mutation revision delta"));
+        }
+        let mut current = load_bundle(tx, session.date)?
             .ok_or_else(|| mismatch("actual model bundle disappeared"))?;
+        let expected = self
+            .revision
+            .checked_add(delta)
+            .ok_or_else(|| mismatch("expected revision exhausted"))?;
+        if current.revision != expected {
+            return Err(mismatch(
+                "actual model bundle revision differs from own mutation effect",
+            ));
+        }
+        // Normalize only our explicitly declared effect. Every original cohort,
+        // Selection/model/archive intent and actual witness remains exact.
+        current.revision = self.revision;
         if current.binding()? != self.sql_binding {
             return Err(mismatch("actual model bundle SQL snapshot changed"));
         }
@@ -144,14 +175,14 @@ fn load_artifact(tx: &Transaction<'_>, identity: &str) -> Result<G5bModelArtifac
 // SQL-only loader is not a trusted factory: read_model_bundle performs the
 // unified physical verification before its result can escape the owner.
 fn load_bundle(tx: &Transaction<'_>, date: NaiveDate) -> Result<Option<VerifiedG5bModelBundle>> {
-    let head: Option<(i64, Option<String>)> = tx
+    let head: Option<(i64,String,Option<String>,Option<String>)> = tx
         .query_row(
-            "SELECT revision,cohort_identity FROM g5b_day_heads WHERE business_date=?1",
+            "SELECT revision,artifact_state,cohort_identity,current_seal_identity FROM g5b_day_heads WHERE business_date=?1",
             [date.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?,row.get(2)?,row.get(3)?)),
         )
         .optional()?;
-    let Some((revision, Some(identity))) = head else {
+    let Some((revision, head_state, Some(identity), seal_pointer)) = head else {
         return Ok(None);
     };
     let (selection_bytes,admission_bytes):(Vec<u8>,Vec<u8>)=tx.query_row(
@@ -208,6 +239,8 @@ fn load_bundle(tx: &Transaction<'_>, date: NaiveDate) -> Result<Option<VerifiedG
         members,
         archives,
         revision,
+        head_state,
+        seal_pointer,
         sql_binding: Vec::new(),
     };
     value.sql_binding = value.binding()?;

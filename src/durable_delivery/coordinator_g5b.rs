@@ -216,7 +216,7 @@ fn observe_validated_g5b_decision(
     envelope: &DeliveryEnvelope,
     business_date: &str,
 ) -> Result<G5bCountedObservationV1> {
-    validate_g5b_binding(&stored, envelope, business_date)?;
+    validate_g5b_binding(transaction, &stored, envelope, business_date)?;
     let (terminal, attempt, disposition, evidence_sha256, accepted_channel) = if matches!(
         stored.state,
         DecisionState::Delivered
@@ -266,6 +266,7 @@ fn g5b_mismatch(detail: &'static str) -> DurableDeliveryError {
 }
 
 fn validate_g5b_binding(
+    transaction: &rusqlite::Transaction<'_>,
     stored: &StoredDecision,
     envelope: &DeliveryEnvelope,
     business_date: &str,
@@ -287,6 +288,9 @@ fn validate_g5b_binding(
         || !envelope.original_batch_ids.is_empty()
     {
         return Err(g5b_mismatch("decision/envelope binding mismatch"));
+    }
+    if crate::monitor::g5b_analysis_v2::source_is_v2(&envelope.source_binding_canonical) {
+        return super::g5b_v2::validate_owner_tx(transaction, envelope);
     }
     let source: serde_json::Value = serde_json::from_slice(&envelope.source_binding_canonical)?;
     let fields = source

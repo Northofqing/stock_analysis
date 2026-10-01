@@ -6,7 +6,11 @@ use crate::monitor::g5b_analysis_v2::{
 };
 use std::os::unix::fs::PermissionsExt;
 
-async fn freeze_member(fixture: &Fixture, provider: &Arc<dyn LlmProvider>, index: usize) {
+pub(super) async fn freeze_member(
+    fixture: &Fixture,
+    provider: &Arc<dyn LlmProvider>,
+    index: usize,
+) {
     let live = work(
         claim_for_test(
             owner(fixture),
@@ -21,7 +25,7 @@ async fn freeze_member(fixture: &Fixture, provider: &Arc<dyn LlmProvider>, index
     live.assess().await.unwrap().freeze().unwrap();
     capture_snapshots(fixture);
 }
-fn artifact(fixture: &Fixture, role: &str) -> PathBuf {
+pub(super) fn artifact(fixture: &Fixture, role: &str) -> PathBuf {
     let connection = Connection::open(&fixture.database_path).unwrap();
     let (cohort,intent):(String,String)=connection.query_row(
         "SELECT cohort_identity,logical_intent FROM g5b_artifact_events WHERE artifact_role=?1 AND phase='Prepared' ORDER BY prepared_revision LIMIT 1",
@@ -41,7 +45,7 @@ fn tables(fixture: &Fixture) -> Vec<Vec<String>> {
         .flat_map(|table| authority_table_rows(&connection, table))
         .collect()
 }
-fn replacement(fixture: &Fixture, path: &Path) -> (PathBuf, PathBuf) {
+pub(super) fn replacement(fixture: &Fixture, path: &Path) -> (PathBuf, PathBuf) {
     let replacement = path.with_extension("TEST_CODE_REPLACEMENT");
     let aside = path.with_extension("TEST_CODE_ORIGINAL_ASIDE");
     std::fs::write(&replacement, std::fs::read(path).unwrap()).unwrap();
@@ -51,15 +55,15 @@ fn replacement(fixture: &Fixture, path: &Path) -> (PathBuf, PathBuf) {
         .record(&replacement, OwnedPathKind::FileOrSymlink);
     (replacement, aside)
 }
-fn replace(path: &Path, replacement: &Path, aside: &Path) {
+pub(super) fn replace(path: &Path, replacement: &Path, aside: &Path) {
     std::fs::rename(path, aside).unwrap();
     std::fs::rename(replacement, path).unwrap();
 }
-fn capture_replaced(fixture: &Fixture, path: &Path, aside: &Path) {
+pub(super) fn capture_replaced(fixture: &Fixture, path: &Path, aside: &Path) {
     fixture.cleanup.record(path, OwnedPathKind::FileOrSymlink);
     fixture.cleanup.record(aside, OwnedPathKind::FileOrSymlink);
 }
-fn arm_nth_sql(
+pub(super) fn arm_nth_sql(
     weak: std::sync::Weak<DurableDeliveryCoordinator>,
     remaining: usize,
     action: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,

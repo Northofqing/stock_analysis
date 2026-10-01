@@ -15,7 +15,7 @@ use std::sync::Arc;
 mod artifact;
 #[path = "coordinator_g5b_model_bundle.rs"]
 mod model_bundle;
-pub(crate) use model_bundle::{G5bModelArtifact, G5bModelMemberArtifacts, VerifiedG5bModelBundle};
+pub(crate) use model_bundle::VerifiedG5bModelBundle;
 
 const ADMISSION_MATERIAL: &str = "g5b-configured-analysis-owner-v1";
 const MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
@@ -278,6 +278,30 @@ impl DurableDeliveryCoordinator {
 }
 
 impl G5bDaySession<'_> {
+    pub(crate) fn with_held_transaction_sql<T>(
+        &self,
+        extra: &dyn Fn() -> Result<()>,
+        sql_validator: Option<&dyn Fn(&Transaction<'_>) -> Result<()>>,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let validate = || {
+            self.validate()?;
+            extra()
+        };
+        let outcome = self.coordinator.with_immediate_transaction_validated_sql(
+            SchemaVersionPolicy::Runtime,
+            Some(&validate),
+            sql_validator,
+            operation,
+        );
+        // The connection core performs final SQL reference checks after its
+        // commit validator. Recheck the preloaded files before the value exits.
+        match (outcome,validate()) {
+            (Ok(value),Ok(()))=>Ok(value), (Err(primary),Ok(()))=>Err(primary),
+            (Ok(_),Err(error))=>Err(DurableDeliveryError::IsolationViolation(format!("held G5b witness validation failed after COMMIT succeeded: {error}"))),
+            (Err(primary),Err(post))=>Err(DurableDeliveryError::IsolationViolation(format!("held G5b transaction and witness validation failed; operation={primary}; post={post}"))),
+        }
+    }
     fn validate(&self) -> Result<()> {
         self.fence.ensure_date(self.date).map_err(io_error)?;
         if self.fence.namespace_identity().map_err(io_error)? != self.namespace_identity {
@@ -859,6 +883,7 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
             ));
         }
     }
+    super::g5b_v2::validate_global_rows(connection)?;
     type EventRow = (
         String,
         String,
