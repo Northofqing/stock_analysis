@@ -36,8 +36,8 @@ pub struct CandidateBoardCardObservationV1 {
     rendered_content_sha256: String,
     decision_state: DecisionState,
     terminal: CandidateBoardCardTerminalV1,
-    authoritative_attempt_identity: Option<String>,
-    immutable_audit_ref: Option<String>,
+    terminal_attempt_identity: Option<String>,
+    disposition_identity: Option<String>,
     terminal_evidence_sha256: Option<String>,
     accepted_channel: Option<String>,
 }
@@ -75,12 +75,12 @@ impl CandidateBoardCardObservationV1 {
         self.terminal
     }
 
-    pub fn authoritative_attempt_identity(&self) -> Option<&str> {
-        self.authoritative_attempt_identity.as_deref()
+    pub fn terminal_attempt_identity(&self) -> Option<&str> {
+        self.terminal_attempt_identity.as_deref()
     }
 
-    pub fn immutable_audit_ref(&self) -> Option<&str> {
-        self.immutable_audit_ref.as_deref()
+    pub fn disposition_identity(&self) -> Option<&str> {
+        self.disposition_identity.as_deref()
     }
 
     pub fn terminal_evidence_sha256(&self) -> Option<&str> {
@@ -139,7 +139,7 @@ impl DurableDeliveryCoordinator {
                     return Err(p05_mismatch("frozen envelope is not canonical"));
                 }
                 validate_p05_card_binding(&stored, &envelope, business_date)?;
-                let (terminal, attempt, audit_ref, evidence_sha256, accepted_channel) = if matches!(
+                let (terminal, attempt, disp_id, evidence_sha256, accepted_channel) = if matches!(
                     stored.state,
                     DecisionState::Delivered
                         | DecisionState::RejectedDurable
@@ -190,8 +190,8 @@ impl DurableDeliveryCoordinator {
                     rendered_content_sha256: envelope.rendered_content_sha256,
                     decision_state: stored.state,
                     terminal,
-                    authoritative_attempt_identity: attempt,
-                    immutable_audit_ref: audit_ref,
+                    terminal_attempt_identity: attempt,
+                    disposition_identity: disp_id,
                     terminal_evidence_sha256: evidence_sha256,
                     accepted_channel,
                 });

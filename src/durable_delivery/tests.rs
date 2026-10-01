@@ -6363,7 +6363,7 @@ fn p05_card_observation_uses_one_frozen_decision_and_authoritative_accepted_rece
     assert_eq!(pending[0].terminal(), CandidateBoardCardTerminalV1::Pending);
     assert_eq!(pending[0].decision_state(), DecisionState::Reserved);
     assert!(!pending[0].is_authoritative_accepted_card());
-    assert!(pending[0].authoritative_attempt_identity().is_none());
+    assert!(pending[0].terminal_attempt_identity().is_none());
     assert!(pending[0].terminal_evidence_sha256().is_none());
     assert_eq!(
         pending[0].envelope_sha256(),
@@ -6400,8 +6400,18 @@ fn p05_card_observation_uses_one_frozen_decision_and_authoritative_accepted_rece
         CandidateBoardCardTerminalV1::Accepted
     );
     assert!(accepted[0].is_authoritative_accepted_card());
-    assert!(accepted[0].authoritative_attempt_identity().is_some());
-    assert!(accepted[0].immutable_audit_ref().is_some());
+    assert!(accepted[0].terminal_attempt_identity().is_some());
+    let disposition_identity =
+        fixture.query_strings("SELECT disposition_identity FROM delivery_disposition_payloads");
+    let immutable_audit_ref =
+        fixture.query_strings("SELECT immutable_audit_ref FROM delivery_disposition_payloads");
+    assert_eq!(disposition_identity.len(), 1);
+    assert_eq!(immutable_audit_ref.len(), 1);
+    assert_eq!(
+        accepted[0].disposition_identity(),
+        Some(disposition_identity[0].as_str())
+    );
+    assert_ne!(disposition_identity[0], immutable_audit_ref[0]);
     assert!(accepted[0].terminal_evidence_sha256().is_some());
     assert_eq!(accepted[0].accepted_channel(), Some("TEST_CODE_CHANNEL"));
     let repeated = fixture
