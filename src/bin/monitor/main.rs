@@ -573,6 +573,7 @@ mod l6_sink;
 
 mod news_aggregator_init;
 mod news_ai_shadow;
+mod news_authority_recovery;
 
 mod health;
 mod health_cmd;
@@ -8972,7 +8973,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
             let authority_date = chrono::Local::now().date_naive();
             let authority_preflight =
-                match stock_analysis::event::reconcile_news_flash_business_date(authority_date) {
+                match news_authority_recovery::reconcile_news_flash_business_date(authority_date)
+                    .await
+                {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
                         log::error!(
@@ -9040,9 +9043,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             // before the snapshot that may authorize reservation. The earlier
             // read is provider preflight only and is never reused for reserve.
             let reserve_now = chrono::Local::now();
-            let fresh_authority = match stock_analysis::event::reconcile_news_flash_business_date(
+            let fresh_authority = match news_authority_recovery::reconcile_news_flash_business_date(
                 reserve_now.date_naive(),
-            ) {
+            )
+            .await
+            {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     failure_audit_ready = false;
