@@ -5970,6 +5970,8 @@ fn g5b_frozen_observation_requires_matching_source_and_authoritative_receipt() {
     let pending = observe(&envelope.source_binding_sha256).unwrap().unwrap();
     assert_eq!(pending.terminal(), G5bCountedTerminalV1::Pending);
     assert!(!pending.is_authoritative_accepted());
+    assert!(pending.terminal_attempt_identity().is_none());
+    assert!(pending.disposition_identity().is_none());
     assert!(pending.terminal_evidence_sha256().is_none());
     assert!(matches!(
         observe(&"0".repeat(64)),
@@ -5992,8 +5994,22 @@ fn g5b_frozen_observation_requires_matching_source_and_authoritative_receipt() {
     assert_eq!(accepted.decision_identity(), envelope.decision_identity);
     assert_eq!(accepted.terminal(), G5bCountedTerminalV1::Accepted);
     assert!(accepted.is_authoritative_accepted());
-    assert!(accepted.authoritative_attempt_identity().is_some());
-    assert!(accepted.immutable_audit_ref().is_some());
+    assert!(accepted.terminal_attempt_identity().is_some());
+    let disposition = fixture.query_strings(
+        "SELECT current_disposition_identity FROM delivery_decisions WHERE push_kind='G5bAttribution'",
+    );
+    let immutable_audit_ref =
+        fixture.query_strings("SELECT immutable_audit_ref FROM delivery_disposition_payloads");
+    assert_eq!(disposition.len(), 1);
+    assert_eq!(immutable_audit_ref.len(), 1);
+    assert_eq!(
+        accepted.disposition_identity(),
+        Some(disposition[0].as_str())
+    );
+    assert_ne!(
+        accepted.disposition_identity(),
+        Some(immutable_audit_ref[0].as_str())
+    );
     assert!(accepted.terminal_evidence_sha256().is_some());
     assert_eq!(accepted.accepted_channel(), Some("TEST_CODE_CHANNEL"));
     assert_eq!(
@@ -6045,6 +6061,7 @@ fn g5b_frozen_observation_rejects_unbound_source_and_nonaccepted_terminal() {
         .unwrap();
     assert_eq!(observation.terminal(), G5bCountedTerminalV1::Rejected);
     assert!(!observation.is_authoritative_accepted());
+    assert!(observation.disposition_identity().is_some());
     assert!(observation.terminal_evidence_sha256().is_some());
     assert!(observation.accepted_channel().is_none());
 }

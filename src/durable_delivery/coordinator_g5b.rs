@@ -23,8 +23,8 @@ pub enum G5bCountedTerminalV1 {
 pub struct G5bCountedObservationV1 {
     decision_identity: String,
     terminal: G5bCountedTerminalV1,
-    authoritative_attempt_identity: Option<String>,
-    immutable_audit_ref: Option<String>,
+    terminal_attempt_identity: Option<String>,
+    disposition_identity: Option<String>,
     terminal_evidence_sha256: Option<String>,
     accepted_channel: Option<String>,
 }
@@ -43,12 +43,14 @@ impl G5bCountedObservationV1 {
         matches!(self.terminal, G5bCountedTerminalV1::Accepted)
     }
 
-    pub fn authoritative_attempt_identity(&self) -> Option<&str> {
-        self.authoritative_attempt_identity.as_deref()
+    /// Terminal attempt, including an attempt later resolved manually.
+    pub fn terminal_attempt_identity(&self) -> Option<&str> {
+        self.terminal_attempt_identity.as_deref()
     }
 
-    pub fn immutable_audit_ref(&self) -> Option<&str> {
-        self.immutable_audit_ref.as_deref()
+    /// Identity of the current disposition payload, not its audit append ref.
+    pub fn disposition_identity(&self) -> Option<&str> {
+        self.disposition_identity.as_deref()
     }
 
     pub fn terminal_evidence_sha256(&self) -> Option<&str> {
@@ -113,7 +115,7 @@ impl DurableDeliveryCoordinator {
                 {
                     return Err(g5b_mismatch("frozen source or summary mismatch"));
                 }
-                let (terminal, attempt, audit_ref, evidence_sha256, accepted_channel) = if matches!(
+                let (terminal, attempt, disposition, evidence_sha256, accepted_channel) = if matches!(
                     stored.state,
                     DecisionState::Delivered
                         | DecisionState::RejectedDurable
@@ -146,8 +148,8 @@ impl DurableDeliveryCoordinator {
                 observation = Some(G5bCountedObservationV1 {
                     decision_identity: stored.decision_identity,
                     terminal,
-                    authoritative_attempt_identity: attempt,
-                    immutable_audit_ref: audit_ref,
+                    terminal_attempt_identity: attempt,
+                    disposition_identity: disposition,
                     terminal_evidence_sha256: evidence_sha256,
                     accepted_channel,
                 });
