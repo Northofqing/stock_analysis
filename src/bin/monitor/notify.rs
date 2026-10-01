@@ -3046,6 +3046,47 @@ pub async fn push_counted_with_binding(
     push_counted_with_binding_inner(token, text, sub_kind, binding, None).await
 }
 
+/// The preview is read-only. Actual owner admission follows presentation,
+/// launch and stable governance checks in the dedicated runtime route.
+pub(crate) async fn push_g5b_model_dispatch_v2(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    view: stock_analysis::monitor::g5b_analysis_v2::G5bModelDispatchViewV2,
+) -> PushOutcome {
+    use crate::v14_adapter::V14Gate;
+    let kind = token.descriptor().push_kind;
+    if kind != PushKind::G5bAttribution {
+        return PushOutcome::Denied("g5b_v2_presentation_kind_mismatch".to_owned());
+    }
+    let occurrence = view.occurrence_identity().to_owned();
+    let date = view.business_date();
+    let gate = tokio::task::spawn_blocking(move || {
+        if !launch_gate_check(kind) {
+            return Err(PushOutcome::Denied("launch_gate_stage".to_owned()));
+        }
+        match crate::v14_adapter::v14_gate_counted_binding(kind, None, None, &occurrence, date) {
+            V14Gate::Deduped => Err(PushOutcome::Denied(
+                "counted_gate_returned_legacy_dedup".to_owned(),
+            )),
+            V14Gate::Denied(reason) => Err(PushOutcome::Denied(reason)),
+            V14Gate::Approved(event) => {
+                log::debug!(
+                    "[g5b] v2 governance approved event_id={} occurrence={}",
+                    event.event_id,
+                    occurrence
+                );
+                Ok(())
+            }
+        }
+    })
+    .await;
+    match gate {
+        Ok(Ok(())) => {}
+        Ok(Err(outcome)) => return outcome,
+        Err(e) => return PushOutcome::Denied(format!("g5b_v2_governance_join_failed: {e}")),
+    }
+    crate::durable_delivery_runtime::deliver_g5b_model_dispatch_v2(view).await
+}
+
 pub(crate) async fn push_p01_origin_with_binding(
     token: crate::presentation_registry::ProductionPresentationToken,
     text: &str,

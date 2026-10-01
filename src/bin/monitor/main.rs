@@ -556,6 +556,7 @@ fn audit_full_market_rankings_unavailable(owner: &str) {
 mod intraday_market;
 
 mod durable_delivery_runtime;
+mod g5b_v2;
 mod v14_adapter;
 
 mod l6_sink;
@@ -10395,13 +10396,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     use crate::attribution_daily_intent::{
                         AttributionDailyIntentStore, FreezeError, PreparedAttributionDaily,
                     };
-                    let store = AttributionDailyIntentStore::new(std::path::Path::new(
-                        "data/attribution",
-                    ));
-                    type AttributionPreparation = Result<
-                        PreparedAttributionDaily,
-                        FreezeError<AttributionEpochRuntimeError>,
-                    >;
+                    let store =
+                        AttributionDailyIntentStore::new(std::path::Path::new("data/attribution"));
+                    type AttributionPreparation =
+                        Result<PreparedAttributionDaily, FreezeError<AttributionEpochRuntimeError>>;
                     match store.load_or_freeze(today, |store| -> AttributionPreparation {
                         let database = stock_analysis::database::DatabaseManager::get();
                         if std::env::var_os(
@@ -10742,233 +10740,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 }
                 state.fresh_allowed()
             };
-            // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
-            // 窗口同 15:05-15:20; 空输入保留窗口内重查资格。选集与每次 LLM
-            // attempt 先持久化, 重启后不会重选或重算已开始的非确定分析。
-            // 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
-            if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute()) {
-                use stock_analysis::llm::registry::LlmRegistry;
-                use stock_analysis::monitor::alert_log::read_today_records;
-                use stock_analysis::monitor::attribution_deep::{
-                    render_deep_attribution_summary, top_events_for_deep, DeepAttributionAnalyzer,
-                    DeepAttributionArchiveOutcome, DeepAttributionClaim, DeepAttributionJournal,
-                    DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
-                };
-                let today = now.date_naive();
-                {
-                    let candidates =
-                        top_events_for_deep(read_today_records(), DEEP_ATTRIBUTION_MAX_EVENTS);
-                    let provider = if candidates.is_empty() {
-                        None
-                    } else {
-                        LlmRegistry::from_env().select("g5b")
-                    };
-                    if !candidates.is_empty() && provider.is_none() {
-                        // 尚未开始分析时不冻结选集，provider 恢复后仍可纳入新告警。
-                        g5b_no_provider_backoff().await;
-                        continue;
-                    }
-                    let journal = DeepAttributionJournal::production();
-                    let mut selection_failed = false;
-                    let events =
-                        journal
-                            .load_or_select(today, candidates)
-                            .unwrap_or_else(|error| {
-                                log::error!(
-                                    "[g5b] 深链归因选集不可用, 本 tick fail closed: {error}"
-                                );
-                                selection_failed = true;
-                                Vec::new()
-                            });
-                    if !selection_failed && !g5b_should_analyze(now.naive_local(), events.len()) {
-                        log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
-                    } else if !selection_failed {
-                        let Some(provider) =
-                            provider.or_else(|| LlmRegistry::from_env().select("g5b"))
-                        else {
-                            // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
-                            // 以便用户补配 provider 后窗口内自愈。退避消耗一个 tick:
-                            // 裸 continue 会绕过循环尾部的 sleep, 造成无退避空转。
-                            g5b_no_provider_backoff().await;
-                            continue;
-                        };
-                        let analyzer = DeepAttributionAnalyzer::new(provider);
-                        let mut done = 0usize;
-                        let mut failed = 0usize;
-                        let mut journal_failed = false;
-                        for (index, record) in events.into_iter().enumerate() {
-                            match journal.begin_assessment(today, index) {
-                                Ok(DeepAttributionClaim::Fresh) => {}
-                                Ok(DeepAttributionClaim::CompletionUnproven) => {
-                                    log::warn!(
-                                        "[g5b] 已有 attempt 但 LLM 完成状态无持久证据, 不重算或重发: {} {}",
-                                        record.code,
-                                        record.triggered_at
-                                    );
-                                    continue;
-                                }
-                                Ok(DeepAttributionClaim::Frozen(frozen)) => {
-                                    match journal.archive_frozen_result(today, index) {
-                                        Ok(DeepAttributionArchiveOutcome::Appended) => log::warn!(
-                                            "[g5b] 已冻结结果的缺失归档已恢复; counted/物理状态未知, 不自动投递: {} {} row_sha256={} summary_sha256={}",
-                                            record.code,
-                                            record.triggered_at,
-                                            frozen.row_sha256(),
-                                            frozen.summary_sha256()
-                                        ),
-                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => log::info!(
-                                            "[g5b] 已冻结结果归档完整; counted/物理状态未知, 不自动投递: {} {} row_sha256={}",
-                                            record.code,
-                                            record.triggered_at,
-                                            frozen.row_sha256()
-                                        ),
-                                        Err(error) => {
-                                            log::error!(
-                                                "[g5b] 已冻结结果归档无法确定, 不自动投递: {} {}: {error}",
-                                                record.code,
-                                                record.triggered_at
-                                            );
-                                            G5B_ARCHIVE_RECOVERY
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                .retry_date(today, recovery_now);
-                                            journal_failed = true;
-                                            break;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Err(error) => {
-                                    log::error!(
-                                        "[g5b] 分析前 attempt 标记失败, 本事件 fail closed: {} {}: {error}",
-                                        record.code,
-                                        record.triggered_at
-                                    );
-                                    journal_failed = true;
-                                    failed += 1;
-                                    continue;
-                                }
-                            }
-                            let request = DeepAttributionRequest {
-                                record,
-                                as_of: chrono::Utc::now(),
-                            };
-                            match analyzer.assess(&request).await {
-                                Ok(outcome) => {
-                                    let row = DeepAttributionRow {
-                                        record: request.record,
-                                        result: outcome.result,
-                                        analyzed_at: chrono::Utc::now().to_rfc3339(),
-                                        provider: outcome.receipt.provider().to_string(),
-                                        model: outcome.receipt.model().to_string(),
-                                        upstream_request_id: outcome
-                                            .receipt
-                                            .upstream_request_id()
-                                            .map(str::to_owned),
-                                        upstream_response_id: outcome
-                                            .receipt
-                                            .upstream_response_id()
-                                            .map(str::to_owned),
-                                        elapsed_ms: outcome.elapsed_ms,
-                                    };
-                                    let summary = render_deep_attribution_summary(&row);
-                                    let frozen = match journal
-                                        .freeze_result(today, index, &row, &summary)
-                                    {
-                                        Ok(frozen) => frozen,
-                                        Err(error) => {
-                                            log::error!("[g5b] LLM 完成但结果冻结失败, 禁止归档和投递: {} {}: {error}", row.record.code, row.record.triggered_at);
-                                            failed += 1;
-                                            continue;
-                                        }
-                                    };
-                                    done += 1;
-                                    match journal.archive_frozen_result(today, index) {
-                                        Ok(DeepAttributionArchiveOutcome::Appended) => {}
-                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => {
-                                            log::warn!("[g5b] 深链归因同事件已归档, counted/物理状态未知, 禁止自动投递: {} {}", row.record.code, row.record.triggered_at);
-                                            failed += 1;
-                                            continue;
-                                        }
-                                        Err(error) => {
-                                            log::warn!("[g5b] 深链归因归档失败, attempt 已记录且禁止自动重算, 需人工核对: {error}");
-                                            G5B_ARCHIVE_RECOVERY
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                .retry_date(today, recovery_now);
-                                            journal_failed = true;
-                                            failed += 1;
-                                            break;
-                                        }
-                                    }
-                                    log::info!(
-                                        "[g5b] 深链归因完成 {}/{}: {} {} ({}ms)",
-                                        done,
-                                        DEEP_ATTRIBUTION_MAX_EVENTS,
-                                        row.record.code,
-                                        row.record.name,
-                                        row.elapsed_ms
-                                    );
-                                    // 2026-09-20: G5b 升级 counted 持久投递 (MU-g5b-attribution)。
-                                    // 冻结结果已持久化; counted handoff 只消费其原摘要字节。
-                                    let outcome = match push_templates::build_g5b_counted_binding(
-                                        today,
-                                        &row.record,
-                                        frozen.summary(),
-                                    )
-                                    .and_then(|binding| {
-                                        crate::presentation_registry::acquire_token(
-                                            "G5b-attribution-deep",
-                                            PushKind::G5bAttribution,
-                                            "g5b_attribution_dispatcher",
-                                            "render_deep_attribution",
-                                        )
-                                        .map(|token| (token, binding))
-                                    }) {
-                                        Ok((token, binding)) => {
-                                            crate::notify::push_counted_with_binding(
-                                                token,
-                                                frozen.summary(),
-                                                None,
-                                                binding,
-                                            )
-                                            .await
-                                        }
-                                        Err(reason) => {
-                                            log::error!(
-                                                "[g5b][BR-192][BR-196] counted 准备失败: {reason}"
-                                            );
-                                            crate::notify::PushOutcome::Denied(reason)
-                                        }
-                                    };
-                                    if matches!(
-                                        &outcome,
-                                        crate::notify::PushOutcome::Denied(_)
-                                            | crate::notify::PushOutcome::SinkError(_)
-                                    ) {
-                                        log::warn!("[g5b] counted 未确认, attempt 已记录且禁止自动重算, 需人工核对: {:?}", outcome);
-                                    }
-                                    log::info!("[g5b] 深链归因 counted 投递观察: {:?}", outcome);
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[g5b] 深链归因分析失败 ({}), attempt 已记录且禁止自动重算: {e}",
-                                        request.record.code
-                                    );
-                                    failed += 1;
-                                }
-                            }
-                        }
-                        log::info!(
-                            "[g5b] 深链归因本批观察: 新冻结 {done}, 失败 {failed}, journal_io_failed={journal_failed} (上限 {}); 无持久日封存证据",
-                            DEEP_ATTRIBUTION_MAX_EVENTS,
-                        );
-                        // A finished loop, model result or PushOutcome cannot
-                        // seal the day. Later ticks inspect the exact persistent
-                        // claims; attempted/frozen events never restart the LLM
-                        // or automatically hand off to the physical sink again.
-                    }
+            // G5b v2 current-day work follows historical archive observation.
+            // Fresh model attempts retain the 15:05–15:20 window. Stored exact
+            // handoff recovery is independent of provider availability/time.
+            let fresh_window = recovery_ready && g5b_should_analyze(now.naive_local(), 1);
+            match g5b_v2::run_tick(now.date_naive(), fresh_window).await {
+                Ok(true) => {
+                    g5b_no_provider_backoff().await;
+                    continue;
                 }
+                Ok(false) => {}
+                Err(error) => log::error!(
+                    "[g5b] v2 local evidence unavailable, this tick fail closed: {error}"
+                ),
             }
             // BR-226: 持仓快照 24h 新鲜度 — 收盘后主动预警。
             // 快照 effective_at 超过 6h (即非今日导入) → 次日 9:20 竞价时必过期
@@ -14562,33 +14346,20 @@ mod tests_post_session_review_scheduler {
     #[test]
     fn g5b_archive_recovery_precedes_model_window_and_counted_handoff() {
         let source = include_str!("main.rs");
-        let g5b = source
+        let phase = source
             .split("// G5b 只在阻塞线程扫描已有 journal")
             .nth(1)
             .and_then(|tail| tail.split("// BR-226: 持仓快照").next())
             .expect("G5b monitor phase");
-        let recovery = g5b
+        let historical = phase
             .find(".existing_recovery_dates(recovery_now)")
-            .expect("read-only archive discovery");
-        let window = g5b
-            .find("if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute())")
-            .expect("fresh G5b analysis window");
-        let provider = g5b
-            .find("LlmRegistry::from_env().select(\"g5b\")")
-            .expect("fresh G5b model provider");
-        assert!(recovery < window && window < provider);
-        let no_provider_gate = g5b
-            .find("if !candidates.is_empty() && provider.is_none()")
-            .expect("fresh G5b no-provider gate");
-        let new_selection = g5b
-            .find(".load_or_select(today, candidates)")
-            .expect("fresh G5b selection");
-        assert!(provider < no_provider_gate && no_provider_gate < new_selection);
-        let recovery_phase = &g5b[..window];
-        assert!(!recovery_phase.contains("begin_assessment("));
-        assert!(!recovery_phase.contains("LlmRegistry::from_env()"));
-        assert!(!recovery_phase.contains("push_counted_with_binding("));
-        assert!(recovery_phase.contains("tokio::task::spawn_blocking"));
+            .expect("historical read-only discovery");
+        let current = phase.find("g5b_v2::run_tick(").expect("current v2 owner");
+        assert!(historical < current);
+        assert!(!phase[..current].contains("push_counted_with_binding("));
+        assert!(!phase.contains(".load_or_select("));
+        assert!(!phase.contains("build_g5b_counted_binding("));
+        assert!(phase.contains("tokio::task::spawn_blocking"));
     }
 
     #[test]

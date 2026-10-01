@@ -22,6 +22,13 @@ use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
 use crate::notify::{DailyReportSubKind, PushKind, PushOutcome};
 
+#[path = "durable_delivery_runtime/g5b_v2.rs"]
+mod g5b_v2;
+pub(crate) use g5b_v2::{
+    archive_g5b_v2, claim_g5b_analysis_v2, deliver_g5b_model_dispatch_v2, freeze_g5b_analysis_v2,
+    inspect_g5b_cohort_v2, inspect_g5b_dispatch_v2,
+};
+
 tokio::task_local! {
     static P01_COMPENSATION_BUSINESS_DATE: NaiveDate;
 }
