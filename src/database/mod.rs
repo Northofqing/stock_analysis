@@ -2647,6 +2647,7 @@ mod kline;
 mod lhb;
 pub mod news_ai;
 pub mod order_audit;
+pub mod p05_prediction_freeze;
 pub(crate) mod paper_book_owner_schema_v1;
 pub(crate) mod paper_book_owner_schema_v2;
 pub(crate) mod paper_book_v2_ledger_schema_v1;
@@ -3800,6 +3801,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             "CREATE INDEX IF NOT EXISTS ix_pred_date ON prediction_tracker(pred_date)",
         )
         .execute(&mut *conn)?;
+        p05_prediction_freeze::create_schema(conn).map_err(std::io::Error::other)?;
 
         // 2026-08-07 BR-192 收尾 (T-07): P-03 候选触发选中决策持久化 —
         // counted binding 的真实证据 (见 record_candidate_trigger 文档)。
