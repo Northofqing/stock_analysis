@@ -8786,36 +8786,44 @@ mod news_monitor_startup_tests {
     use super::initialize_news_monitor;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocked_news_initialization_does_not_delay_data_mode_tick() {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
+    async fn blocked_news_startup_steps_do_not_delay_data_mode_tick() {
+        for blocked_step in 0..4 {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
 
-        let main_loops = tokio::spawn(async move {
-            tokio::join!(
-                initialize_news_monitor(move || {
-                    let _ = entered_tx.send(());
-                    release_rx.recv().expect("release blocked initializer");
-                }),
-                async {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    let _ = tick_tx.send(());
-                }
-            );
-        });
+            let main_loops = tokio::spawn(async move {
+                tokio::join!(
+                    initialize_news_monitor(move || {
+                        let mut entered_tx = Some(entered_tx);
+                        // Model audience read, metadata, news dedup, and signal state.
+                        for step in 0..4 {
+                            if step == blocked_step {
+                                let _ = entered_tx.take().unwrap().send(());
+                                release_rx.recv().expect("release blocked startup step");
+                            }
+                        }
+                    }),
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        let _ = tick_tx.send(());
+                    }
+                );
+            });
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
-            .await
-            .expect("news initializer must start")
-            .expect("news initializer start signal");
-        let tick = tokio::time::timeout(std::time::Duration::from_secs(1), tick_rx).await;
-        release_tx.send(()).expect("release news initializer");
-        tick.expect("data mode tick must run while news initialization waits")
-            .expect("data mode tick signal");
-        tokio::time::timeout(std::time::Duration::from_secs(1), main_loops)
-            .await
-            .expect("main loops must finish")
-            .expect("main loops task must succeed");
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+                .await
+                .expect("news startup step must start")
+                .expect("news startup step signal");
+            let tick = tokio::time::timeout(std::time::Duration::from_secs(1), tick_rx).await;
+            release_tx.send(()).expect("release news startup step");
+            tick.expect("data mode tick must run while news startup waits")
+                .expect("data mode tick signal");
+            tokio::time::timeout(std::time::Duration::from_secs(1), main_loops)
+                .await
+                .expect("main loops must finish")
+                .expect("main loops task must succeed");
+        }
     }
 }
 
@@ -8832,51 +8840,53 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
-    // BR-226: 启动时声明持仓受众证据状态 (用户确认快照 vs 券商批次)
-    match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
-        Ok(Some(snapshot)) => {
-            let age_hours = chrono::Local::now()
-                .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
-                .num_hours();
-            if age_hours <= 24 {
-                log::info!(
-                    "[NewsMonitor][BR-226] 持仓受众证据: 用户确认快照 ({} 只, effective_at {}, {}h 内)",
-                    snapshot.items.len(),
-                    snapshot.effective_at,
-                    age_hours
-                );
-            } else {
-                log::warn!(
-                    "[NewsMonitor][BR-226] 持仓受众证据过期: 快照 effective_at {} 已 {age_hours}h; 持仓身份排除, 自选受众继续",
-                    snapshot.effective_at
-                );
+    // Startup reads metadata and SQLite, including dedup and signal restoration.
+    // Keep the ordered blocking work off the joined DataMode timer task.
+    let (mut nm, mut sm, news_ai_producer) = initialize_news_monitor(move || {
+        // BR-226: 启动时声明持仓受众证据状态 (用户确认快照 vs 券商批次)
+        match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+            Ok(Some(snapshot)) => {
+                let age_hours = chrono::Local::now()
+                    .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                    .num_hours();
+                if age_hours <= 24 {
+                    log::info!(
+                        "[NewsMonitor][BR-226] 持仓受众证据: 用户确认快照 ({} 只, effective_at {}, {}h 内)",
+                        snapshot.items.len(),
+                        snapshot.effective_at,
+                        age_hours
+                    );
+                } else {
+                    log::warn!(
+                        "[NewsMonitor][BR-226] 持仓受众证据过期: 快照 effective_at {} 已 {age_hours}h; 持仓身份排除, 自选受众继续",
+                        snapshot.effective_at
+                    );
+                }
             }
+            Ok(None) => log::warn!(
+                "[NewsMonitor][BR-226] 持仓受众证据缺失: 未提供用户持仓快照; 持仓身份排除, 自选受众继续"
+            ),
+            Err(error) => log::warn!(
+                "[NewsMonitor][BR-226] 持仓受众证据读取失败: {error}; 持仓身份排除, 自选受众继续"
+            ),
         }
-        Ok(None) => log::warn!(
-            "[NewsMonitor][BR-226] 持仓受众证据缺失: 未提供用户持仓快照; 持仓身份排除, 自选受众继续"
-        ),
-        Err(error) => log::warn!(
-            "[NewsMonitor][BR-226] 持仓受众证据读取失败: {error}; 持仓身份排除, 自选受众继续"
-        ),
-    }
 
-    // Constructor metadata loading synchronously joins a provider thread.
-    // Keep that wait off the joined main loops so health timers can advance.
-    let mut nm = initialize_news_monitor(NewsMonitor::new).await;
+        let mut nm = NewsMonitor::new();
+        nm.restore_dedup();
 
-    nm.restore_dedup();
+        let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
+        news_ai_producer.log_startup_banner();
+        news_ai_producer.schedule_tick(
+            selection_v2_enabled,
+            stock_analysis::calendar::current_session(),
+            None,
+        );
 
-    let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
-    news_ai_producer.log_startup_banner();
-    news_ai_producer.schedule_tick(
-        selection_v2_enabled,
-        stock_analysis::calendar::current_session(),
-        None,
-    );
-
-    let mut sm = SignalStateMachine::default();
-
-    sm.restore_state();
+        let mut sm = SignalStateMachine::default();
+        sm.restore_state();
+        (nm, sm, news_ai_producer)
+    })
+    .await;
 
     let mut last_concept_refresh = std::time::Instant::now();
 
@@ -8898,37 +8908,42 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     // BR-244: one process-local owner preserves event/window dedup across all
     // news ticks. It carries no selection-ingress capability.
-    let mut news_flash_gate =
+    let news_flash_gate =
         crate::news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
     // Retain the four raw-feed breaker slots across every resident news tick.
     // Source recovery here does not claim coverage of other gateway callers.
     let raw_news_sources =
         stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
-    log::warn!(
-        "{}",
-        crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
-    );
-    push_templates::log_dispatcher_attempt(
-        "N-01",
-        false,
-        0,
-        "disabled=no_authoritative_strength_provider",
-    );
-    let news_flash_startup_date = chrono::Local::now().date_naive();
-    match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
-        Ok(snapshot) => {
-            if let Err(error) = news_flash_gate.recover(&snapshot) {
+    let mut news_flash_gate = initialize_news_monitor(move || {
+        let mut news_flash_gate = news_flash_gate;
+        log::warn!(
+            "{}",
+            crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
+        );
+        push_templates::log_dispatcher_attempt(
+            "N-01",
+            false,
+            0,
+            "disabled=no_authoritative_strength_provider",
+        );
+        let news_flash_startup_date = chrono::Local::now().date_naive();
+        match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
+            Ok(snapshot) => {
+                if let Err(error) = news_flash_gate.recover(&snapshot) {
+                    log::error!(
+                        "[GlobalNews][BR-244] startup NewsFlash authority recovery failed: {error:?}"
+                    );
+                }
+            }
+            Err(error) => {
                 log::error!(
-                    "[GlobalNews][BR-244] startup NewsFlash authority recovery failed: {error:?}"
+                    "[GlobalNews][BR-244] startup NewsFlash authority unavailable; sink disabled until recovery: {error}"
                 );
             }
         }
-        Err(error) => {
-            log::error!(
-                "[GlobalNews][BR-244] startup NewsFlash authority unavailable; sink disabled until recovery: {error}"
-            );
-        }
-    }
+        news_flash_gate
+    })
+    .await;
 
     loop {
         if !NewsMonitor::should_run() {

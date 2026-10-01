@@ -3636,6 +3636,15 @@ impl GrpcSource {
                 ),
             ));
         }
+        if external && batch.records().len() == limit as usize {
+            return Err(GatewayError::invalid_evidence(
+                "MarketAnnouncements",
+                Some(batch.evidence().provider),
+                format!(
+                    "external market announcement coverage unverified: response saturated requested limit {limit}"
+                ),
+            ));
+        }
         Ok(batch)
     }
 
@@ -6549,6 +6558,66 @@ mod tests {
         )))]);
         let error = block_on(bridge.market_announcements_async(date, 300)).unwrap_err();
         assert_eq!(error.reason_code(), "invalid_evidence");
+    }
+
+    #[test]
+    fn br161_saturated_external_market_announcements_fail_closed() {
+        let _env = test_grpc_env_guard();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let response = |provenance| QueryResult {
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
+            selected_provider: "Cninfo".to_string(),
+            batch_id: "TEST_CODE_market_announcements".to_string(),
+            complete: true,
+            observed_at: "2026-09-23T18:01:00+08:00".to_string(),
+            source_at: "2026-09-23T18:00:00+08:00".to_string(),
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "magic.market.announcement".to_string(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: serde_json::json!({
+                    "announcement_id": "TEST_CODE_announcement",
+                    "code": "600000",
+                    "category": "重大合同",
+                    "title": "TEST_CODE 公告",
+                    "published_at": "2026-09-23T18:00:00+08:00",
+                    "url": "https://example.invalid/TEST_CODE_announcement"
+                })
+                .to_string()
+                .into_bytes(),
+            }],
+            provenance,
+            diagnostic_blocker: String::new(),
+        };
+
+        std::env::set_var(
+            "GRPC_MARKET_CLIENT_BUNDLE",
+            "/TEST_CODE_market_announcements_bundle",
+        );
+        reset_bridge();
+        let external = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(
+            AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:magic-market.local".to_string(),
+            ),
+        ))]);
+        let error = block_on(external.market_announcements_async(date, 1)).unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(error.message().contains("coverage unverified"));
+
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+        let local = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(AcquisitionProvenance::LocalWireSource(
+            "cninfo-market".to_string(),
+        )))]);
+        assert_eq!(
+            block_on(local.market_announcements_async(date, 1))
+                .unwrap()
+                .records()
+                .len(),
+            1
+        );
     }
 
     #[test]
