@@ -151,26 +151,14 @@ impl AlertLog {
     }
 
     pub fn append_jsonl(&self, event: &AlertEvent) -> std::io::Result<()> {
-        self.ensure_io_allowed()?;
-        let record = AlertRecord::from_event(event, self.origin);
-        if self.origin == AlertRecordOrigin::Production && !record.is_production_eligible() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "production alert archive rejected ineligible code: {}",
-                    record.code
-                ),
-            ));
-        }
-        fs::create_dir_all(&self.dir)?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dated_file(&self.dir, "jsonl"))?;
-        write_jsonl(file, &record)
+        self.append_date_jsonl(Local::now().date_naive(), event)
     }
 
     pub fn append_md(&self, event: &AlertEvent) -> std::io::Result<()> {
+        self.append_date_md(Local::now().date_naive(), event)
+    }
+
+    fn append_date_md(&self, date: NaiveDate, event: &AlertEvent) -> std::io::Result<()> {
         self.ensure_io_allowed()?;
         if self.origin == AlertRecordOrigin::Production && is_test_code(&event.code) {
             return Err(std::io::Error::new(
@@ -185,14 +173,18 @@ impl AlertLog {
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dated_file(&self.dir, "md"))?;
+            .open(dated_file_for(&self.dir, "md", date))?;
         write_markdown(file, event)
     }
 
     pub fn append_batch(&self, events: &[AlertEvent]) -> std::io::Result<()> {
+        self.append_date_batch(Local::now().date_naive(), events)
+    }
+
+    fn append_date_batch(&self, date: NaiveDate, events: &[AlertEvent]) -> std::io::Result<()> {
         for event in events {
-            self.append_jsonl(event)?;
-            self.append_md(event)?;
+            self.append_date_jsonl(date, event)?;
+            self.append_date_md(date, event)?;
         }
         Ok(())
     }
@@ -491,6 +483,60 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].origin, AlertRecordOrigin::Test);
         assert!(second_archive.read_today_records().is_empty());
+    }
+
+    #[test]
+    fn ordinary_jsonl_writer_publishes_and_advances_exact_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::for_test(temp.path()).unwrap();
+        archive.append_jsonl(&e()).unwrap();
+        archive.append_jsonl(&e()).unwrap();
+        let date = Local::now().date_naive();
+        let snapshot = archive.inspect_date_input_head(date).unwrap();
+        let bytes = fs::read(dated_file_for(temp.path(), "jsonl", date)).unwrap();
+        assert_eq!(snapshot.records().len(), 2);
+        assert_eq!(snapshot.head().generation(), 2);
+        assert_eq!(snapshot.head().committed_offset(), bytes.len() as u64);
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            snapshot.head().prefix_sha256(),
+            hex::encode(Sha256::digest(bytes))
+        );
+    }
+
+    #[test]
+    fn batch_uses_one_explicit_date_for_jsonl_and_markdown() {
+        use chrono::TimeZone;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::for_test(temp.path()).unwrap();
+        let date = past_date();
+        let mut first = e();
+        first.code = "TEST_CODE_FIRST".into();
+        first.triggered_at = Local
+            .with_ymd_and_hms(2026, 10, 1, 23, 59, 59)
+            .single()
+            .unwrap();
+        let mut second = e();
+        second.code = "TEST_CODE_SECOND".into();
+        second.triggered_at = Local
+            .with_ymd_and_hms(2026, 10, 2, 0, 0, 1)
+            .single()
+            .unwrap();
+        archive.append_date_batch(date, &[first, second]).unwrap();
+        let snapshot = archive.inspect_date_input_head(date).unwrap();
+        assert_eq!(snapshot.head().generation(), 2);
+        assert_eq!(snapshot.records()[0].code, "TEST_CODE_FIRST");
+        assert_eq!(snapshot.records()[1].code, "TEST_CODE_SECOND");
+        let markdown = fs::read_to_string(dated_file_for(temp.path(), "md", date)).unwrap();
+        assert!(markdown.contains("TEST_CODE_FIRST"));
+        assert!(markdown.contains("TEST_CODE_SECOND"));
+        for other_date in [
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+        ] {
+            assert!(!dated_file_for(temp.path(), "jsonl", other_date).exists());
+            assert!(!dated_file_for(temp.path(), "md", other_date).exists());
+        }
     }
 
     #[test]

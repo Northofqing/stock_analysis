@@ -1,6 +1,6 @@
-//! Opt-in G5b alert input provenance. Legacy append/read entry points remain unchanged.
-//! This verifies one fenced prefix at one instant; it is not a day seal. The other
-//! alert and journal writers must join this fence before a seal can use this evidence.
+//! G5b alert input provenance. Every JSONL writer shares the date fence.
+//! A pre-head historical archive stays Unknown, even after a fenced append.
+//! A verified prefix is not a day seal; journal/DB writers still need a shared protocol.
 
 use super::{
     dated_file_for, same_file_state, write_jsonl, AlertLog, AlertRecord, AlertRecordOrigin,
@@ -498,6 +498,52 @@ fn reject_prehead_source(dir: &Path, date: NaiveDate) -> io::Result<()> {
     }
 }
 
+/// Preserve historical append behavior without granting provenance to old bytes.
+fn append_prehead_locked(guard: &DateFence, date: NaiveDate, line: &[u8]) -> io::Result<()> {
+    let ensure_prehead = || {
+        guard.ensure_current()?;
+        match fs::symlink_metadata(head_path(&guard.dir, date)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "input head appeared during pre-head append",
+            )),
+            Err(error) => Err(error),
+        }
+    };
+    ensure_prehead()?;
+    let path = dated_file_for(&guard.dir, "jsonl", date);
+    let (mut expected, before) =
+        read_regular(&path, AlertInputHeadUnknown::MissingSource).map_err(io_unknown)?;
+    if !expected.is_empty() && expected.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pre-head alert file has an incomplete final line",
+        ));
+    }
+    let mut file = nofollow(OpenOptions::new().append(true)).open(&path)?;
+    if !same_file_state(&before, &file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pre-head source changed before append",
+        ));
+    }
+    ensure_prehead()?;
+    file.write_all(line)?;
+    file.sync_all()?;
+    guard.dir_file.sync_all()?;
+    expected.extend_from_slice(line);
+    let (actual, after) =
+        read_regular(&path, AlertInputHeadUnknown::MissingSource).map_err(io_unknown)?;
+    if !same_identity(&before, &after) || actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pre-head source changed during append",
+        ));
+    }
+    ensure_prehead()
+}
+
 impl AlertLog {
     /// Start provenance only for a genuinely new date. A pre-head file, even
     /// if empty, is historical/unknown and is never silently adopted.
@@ -517,13 +563,27 @@ impl AlertLog {
         }
     }
 
-    /// Opt-in append: D is captured by the caller once before lock/path choice.
-    /// This does not alter the legacy append_jsonl or append_batch behavior.
+    /// Require committed-prefix provenance. A pre-head archive cannot be adopted.
     pub fn append_date_jsonl_fenced(
         &self,
         date: NaiveDate,
         event: &AlertEvent,
     ) -> io::Result<AlertInputHeadV1> {
+        self.append_date_jsonl_inner(date, event, false)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "input head unavailable"))
+    }
+
+    /// Ordinary writer: new dates gain a head; historical dates stay Unknown.
+    pub(super) fn append_date_jsonl(&self, date: NaiveDate, event: &AlertEvent) -> io::Result<()> {
+        self.append_date_jsonl_inner(date, event, true).map(|_| ())
+    }
+
+    fn append_date_jsonl_inner(
+        &self,
+        date: NaiveDate,
+        event: &AlertEvent,
+        allow_prehead: bool,
+    ) -> io::Result<Option<AlertInputHeadV1>> {
         self.ensure_io_allowed()?;
         let record = AlertRecord::from_event(event, self.origin);
         if self.origin == AlertRecordOrigin::Production && !record.is_production_eligible() {
@@ -538,6 +598,14 @@ impl AlertLog {
         let (snapshot, old_head, old_bytes) = match inspect_locked(&guard, date, self.origin) {
             Ok(state) => state,
             Err(AlertInputHeadUnknown::MissingHead) => {
+                match fs::symlink_metadata(dated_file_for(&guard.dir, "jsonl", date)) {
+                    Ok(_) if allow_prehead => {
+                        append_prehead_locked(&guard, date, &line)?;
+                        return Ok(None);
+                    }
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
                 reject_prehead_source(&guard.dir, date)?;
                 publish_head(&guard, date, &AlertInputHeadV1::empty(date), None)?;
                 inspect_locked(&guard, date, self.origin).map_err(io_unknown)?
@@ -589,7 +657,7 @@ impl AlertLog {
         };
         publish_head(&guard, date, &next, Some(&old_head))?;
         let (verified, _, _) = inspect_locked(&guard, date, self.origin).map_err(io_unknown)?;
-        Ok(verified.head)
+        Ok(Some(verified.head))
     }
 
     /// Snapshot the exact committed prefix; any missing, uncommitted, replaced,
@@ -842,6 +910,160 @@ mod tests {
             .collect();
         codes.sort_unstable();
         assert_eq!(codes, ["600001", "600002"]);
+    }
+
+    #[test]
+    fn ordinary_and_opt_in_writers_share_one_date_fence_and_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::production_at(temp.path());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [false, true]
+            .into_iter()
+            .map(|opt_in| {
+                let archive = archive.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for ordinal in 0..10 {
+                        let code = format!("600{}{:02}", usize::from(opt_in), ordinal);
+                        if opt_in {
+                            archive
+                                .append_date_jsonl_fenced(date(), &event(&code))
+                                .unwrap();
+                        } else {
+                            archive.append_date_jsonl(date(), &event(&code)).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let snapshot = archive.inspect_date_input_head(date()).unwrap();
+        assert_eq!(snapshot.head().generation(), 20);
+        assert_eq!(snapshot.records().len(), 20);
+        let codes: std::collections::BTreeSet<_> =
+            snapshot.records().iter().map(|row| &row.code).collect();
+        assert_eq!(codes.len(), 20);
+    }
+
+    #[test]
+    fn ordinary_append_preserves_prehead_unknown_without_adopting_old_bytes() {
+        for empty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = AlertLog::production_at(temp.path());
+            let source = dated_file_for(temp.path(), "jsonl", date());
+            let mut old = Vec::new();
+            if !empty {
+                write_jsonl(
+                    &mut old,
+                    &AlertRecord::from_event(&event("600001"), AlertRecordOrigin::LegacyUnknown),
+                )
+                .unwrap();
+            }
+            fs::write(&source, &old).unwrap();
+            archive.append_date_jsonl(date(), &event("600002")).unwrap();
+            let written = fs::read(&source).unwrap();
+            assert!(written.starts_with(&old));
+            assert!(written.len() > old.len());
+            assert!(matches!(
+                archive.inspect_date_input_head(date()),
+                Err(AlertInputHeadUnknown::MissingHead)
+            ));
+            assert!(!head_path(temp.path(), date()).exists());
+            assert!(archive.initialize_date_input_head(date()).is_err());
+            assert!(archive
+                .append_date_jsonl_fenced(date(), &event("600003"))
+                .is_err());
+            assert_eq!(fs::read(&source).unwrap(), written);
+        }
+    }
+
+    #[test]
+    fn ordinary_append_rejects_corrupt_head_suffix_and_source_identity_without_fallback() {
+        for damage in ["head", "suffix", "identity"] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = AlertLog::production_at(temp.path());
+            archive.append_date_jsonl(date(), &event("600001")).unwrap();
+            let source = dated_file_for(temp.path(), "jsonl", date());
+            match damage {
+                "head" => fs::write(head_path(temp.path(), date()), b"not a head").unwrap(),
+                "suffix" => OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(b"{\"partial\"")
+                    .unwrap(),
+                "identity" => {
+                    let original = fs::read(&source).unwrap();
+                    fs::rename(&source, temp.path().join("old.jsonl")).unwrap();
+                    fs::write(&source, original).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before_source = fs::read(&source).unwrap();
+            let before_head = fs::read(head_path(temp.path(), date())).unwrap();
+            assert!(
+                archive.append_date_jsonl(date(), &event("600002")).is_err(),
+                "{damage}"
+            );
+            assert_eq!(fs::read(&source).unwrap(), before_source, "{damage}");
+            assert_eq!(
+                fs::read(head_path(temp.path(), date())).unwrap(),
+                before_head,
+                "{damage}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_prehead_append_rejects_incomplete_final_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::production_at(temp.path());
+        let source = dated_file_for(temp.path(), "jsonl", date());
+        fs::write(&source, b"{\"partial\"").unwrap();
+        assert!(archive.append_date_jsonl(date(), &event("600001")).is_err());
+        assert_eq!(fs::read(source).unwrap(), b"{\"partial\"");
+        assert!(!head_path(temp.path(), date()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_append_rejects_source_head_and_fence_symlinks() {
+        for artifact in ["source", "prehead-source", "head", "fence"] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = AlertLog::production_at(temp.path());
+            if artifact != "prehead-source" {
+                archive.append_date_jsonl(date(), &event("600001")).unwrap();
+            }
+            let path = match artifact {
+                "source" | "prehead-source" => dated_file_for(temp.path(), "jsonl", date()),
+                "head" => head_path(temp.path(), date()),
+                "fence" => lock_path(temp.path(), date()),
+                _ => unreachable!(),
+            };
+            let target = temp.path().join("symlink-target");
+            fs::write(&target, b"TEST_CODE_preserve_target\n").unwrap();
+            if artifact != "prehead-source" {
+                fs::remove_file(&path).unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(
+                archive.append_date_jsonl(date(), &event("600002")).is_err(),
+                "{artifact}"
+            );
+            assert_eq!(
+                fs::read(target).unwrap(),
+                b"TEST_CODE_preserve_target\n",
+                "{artifact}"
+            );
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            if artifact == "prehead-source" {
+                assert!(!head_path(temp.path(), date()).exists());
+            }
+        }
     }
 
     #[cfg(unix)]
