@@ -22,7 +22,8 @@ use super::schema::{
     configure_attested_connection, initialize_schema, load_policy, materialize_wal_capability,
     verify_connection_configuration, SCHEMA_VERSION,
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use crate::monitor::alert_log::{AlertLog, G5bDateFence};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
@@ -195,6 +196,7 @@ pub struct DurableDeliveryCoordinator {
     connection: Option<Arc<Mutex<Connection>>>,
     database_binding: Option<PinnedDatabaseBinding>,
     config: CoordinatorConfig,
+    g5b_input_log: AlertLog,
     #[cfg(test)]
     database_operation_test_hook: Mutex<Option<DatabaseOperationTestHook>>,
     #[cfg(test)]
@@ -359,10 +361,12 @@ struct AttestedOperationLease<'a> {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DatabaseOperationTestPhase {
+    AfterMutationRoutingBeforeDateFence,
     AfterPreValidationBeforeSql,
     AfterConnectionSchemaValidationBeforeTransaction,
     AfterSqlBeforePreCommitValidation,
     AfterSqlBeforePostValidation,
+    AfterCommitBeforePostValidation,
 }
 
 #[cfg(test)]
@@ -417,6 +421,86 @@ struct StoredDecision {
     fence_generation: i64,
     retry_authorized: bool,
     task_binding_present: bool,
+}
+
+/// A private routing witness, never a serialized authority or a day seal.
+/// None records a preflight absence; existing rows bind exact immutable bytes.
+struct DecisionMutationRoute {
+    decision_identity: String,
+    expected_envelope: Option<(Vec<u8>, String)>,
+    g5b_date: Option<NaiveDate>,
+}
+
+impl DecisionMutationRoute {
+    fn from_stored(connection: &Connection, stored: &StoredDecision) -> Result<Self> {
+        let envelope = parse_envelope(&stored.envelope_canonical)?;
+        let (business_date, push_kind): (String, String) = connection.query_row(
+            "SELECT business_date,push_kind FROM delivery_decisions WHERE decision_identity=?1",
+            [&stored.decision_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256
+            || envelope.decision_identity != stored.decision_identity
+            || envelope.business_date != business_date
+            || envelope.push_kind.as_str() != push_kind
+        {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "mutation routing immutable envelope mismatch".to_owned(),
+            ));
+        }
+        let g5b_date = if envelope.push_kind == PushKind::G5bAttribution {
+            super::model::validate_business_date(&business_date)?;
+            Some(
+                NaiveDate::parse_from_str(&business_date, "%Y-%m-%d").map_err(|error| {
+                    DurableDeliveryError::InvalidEnvelope(format!("G5b mutation date: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            decision_identity: stored.decision_identity.clone(),
+            expected_envelope: Some((
+                stored.envelope_canonical.clone(),
+                stored.envelope_sha256.clone(),
+            )),
+            g5b_date,
+        })
+    }
+
+    fn validate(&self, connection: &Connection) -> Result<()> {
+        let current = load_decision(connection, &self.decision_identity)?;
+        match (&self.expected_envelope, current) {
+            (None, None) => Ok(()),
+            (Some((bytes, hash)), Some(stored))
+                if &stored.envelope_canonical == bytes && &stored.envelope_sha256 == hash =>
+            {
+                let current = Self::from_stored(connection, &stored)?;
+                if current.g5b_date == self.g5b_date {
+                    Ok(())
+                } else {
+                    Err(Self::changed())
+                }
+            }
+            // Preserve ordinary non-G5b prepare races. A newly discovered G5b
+            // owner always requires a fresh routed operation, even on this date.
+            (None, Some(stored)) if self.g5b_date.is_none() => {
+                if Self::from_stored(connection, &stored)?.g5b_date.is_none() {
+                    Ok(())
+                } else {
+                    Err(Self::changed())
+                }
+            }
+            _ => Err(Self::changed()),
+        }
+    }
+
+    fn changed() -> DurableDeliveryError {
+        DurableDeliveryError::PolicyMismatch(
+            "mutation routing changed after preflight; no unguarded audit or write is allowed"
+                .to_owned(),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2498,10 +2582,23 @@ impl DurableDeliveryCoordinator {
             &config.owner_instance_identity,
         )?;
         let _lifetime = database_binding.validate_under_open_lock()?;
+        let g5b_input_log = match &config.environment {
+            super::model::StoreEnvironment::Production => AlertLog::production(),
+            // The parent has already passed the exact TEST_CODE namespace and
+            // descriptor attestation. Both coordinators for this DB share it.
+            super::model::StoreEnvironment::Test { .. } => {
+                AlertLog::for_test(route.parent().ok_or_else(|| {
+                    DurableDeliveryError::IsolationViolation(
+                        "attested G5b test database has no parent".to_owned(),
+                    )
+                })?)?
+            }
+        };
         let coordinator = Self {
             connection: Some(connection),
             database_binding: Some(database_binding),
             config,
+            g5b_input_log,
             #[cfg(test)]
             database_operation_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2903,6 +3000,117 @@ impl DurableDeliveryCoordinator {
         self.prepare_internal(envelope, authoritative_sink_count, admission_at, None)
     }
 
+    fn decision_mutation_route(&self, decision_identity: &str) -> Result<DecisionMutationRoute> {
+        self.with_mutation_routing_connection(|connection| {
+            let stored = load_decision(connection, decision_identity)?.ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
+            })?;
+            DecisionMutationRoute::from_stored(connection, &stored)
+        })
+    }
+
+    fn prepare_mutation_route(&self, envelope: &DeliveryEnvelope) -> Result<DecisionMutationRoute> {
+        self.with_mutation_routing_connection(|connection| {
+            if let Some(stored) = load_decision(connection, &envelope.decision_identity)? {
+                // Identity-conflict audits belong to the stored owner, even
+                // when the incoming envelope claims another kind or date.
+                return DecisionMutationRoute::from_stored(connection, &stored);
+            }
+            let g5b_date = if envelope.push_kind == PushKind::G5bAttribution {
+                super::model::validate_business_date(&envelope.business_date)?;
+                Some(
+                    NaiveDate::parse_from_str(&envelope.business_date, "%Y-%m-%d").map_err(
+                        |error| {
+                            DurableDeliveryError::InvalidEnvelope(format!(
+                                "G5b mutation date: {error}"
+                            ))
+                        },
+                    )?,
+                )
+            } else {
+                None
+            };
+            Ok(DecisionMutationRoute {
+                decision_identity: envelope.decision_identity.clone(),
+                expected_envelope: None,
+                g5b_date,
+            })
+        })
+    }
+
+    fn attempt_mutation_route(
+        &self,
+        attempt_identity: &str,
+        fence_token: i64,
+    ) -> Result<DecisionMutationRoute> {
+        self.with_mutation_routing_connection(|connection| {
+            let decision_identity: String = connection
+                .query_row(
+                    "SELECT decision_identity FROM delivery_attempts
+                     WHERE attempt_identity=?1 AND fence_token=?2",
+                    params![attempt_identity, fence_token],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(format!(
+                        "attempt {attempt_identity}/{fence_token}"
+                    ))
+                })?;
+            let stored = load_decision(connection, &decision_identity)?
+                .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.clone()))?;
+            DecisionMutationRoute::from_stored(connection, &stored)
+        })
+    }
+
+    fn with_mutation_transaction<T>(
+        &self,
+        route: &DecisionMutationRoute,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        // Routing has released every attestation lease and connection mutex.
+        // Never acquire a date lock from inside a SQLite operation.
+        #[cfg(test)]
+        self.run_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterMutationRoutingBeforeDateFence,
+        )?;
+        let fence: Option<G5bDateFence> = route
+            .g5b_date
+            .map(|date| self.g5b_input_log.acquire_date_writer_fence(date))
+            .transpose()?;
+        let validate = || match (&fence, route.g5b_date) {
+            (Some(fence), Some(date)) => fence.ensure_date(date).map_err(|error| {
+                DurableDeliveryError::IsolationViolation(format!("G5b date fence invalid: {error}"))
+            }),
+            (None, None) => Ok(()),
+            _ => Err(DurableDeliveryError::IsolationViolation(
+                "G5b mutation route has no matching date fence".to_owned(),
+            )),
+        };
+        let validator: Option<&dyn Fn() -> Result<()>> =
+            fence.as_ref().map(|_| &validate as &dyn Fn() -> Result<()>);
+        let outcome = self.with_immediate_transaction_validated(
+            SchemaVersionPolicy::Runtime,
+            validator,
+            |transaction| {
+                route.validate(transaction)?;
+                operation(transaction)
+            },
+        );
+        // Covers the connection core's post-SQL hooks as well as the commit
+        // boundary, and preserves committed/compound error evidence.
+        match (outcome, validate()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(error)) => Err(DurableDeliveryError::IsolationViolation(format!(
+                "post-operation G5b date-fence validation failed after COMMIT succeeded: {error}"
+            ))),
+            (Err(primary), Err(post)) => Err(DurableDeliveryError::IsolationViolation(format!(
+                "G5b transaction and post-operation date-fence validation both failed; operation={primary}; post_validation={post}"
+            ))),
+        }
+    }
+
     /// The monitor verifies producer catalog membership and the full P01 input
     /// binding. This public boundary verifies immutable source metadata needed
     /// to keep an Origin consistent with that single rendered decision; it is
@@ -2959,7 +3167,8 @@ impl DurableDeliveryCoordinator {
         }
         let raw_canonical = serde_json::to_vec(envelope)?;
         let raw_sha256 = sha256_hex(&raw_canonical);
-        let transaction_outcome = self.with_immediate_transaction(|transaction| {
+        let route = self.prepare_mutation_route(envelope)?;
+        let transaction_outcome = self.with_mutation_transaction(&route, |transaction| {
             if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
                 if existing.envelope_canonical == raw_canonical
                     && existing.envelope_sha256 == raw_sha256
@@ -4121,15 +4330,18 @@ impl DurableDeliveryCoordinator {
     /// (错过窗口/进程未启时, 无 sink 拒因可依据, 由调度器决定重试)。授权后
     /// `resume_deliverable` 会对该决策走 `reacquire_rejected` 重开 attempt。
     pub fn authorize_rejected_retry(&self, decision_identity: &str) -> Result<()> {
-        let state = self.decision_state(decision_identity)?;
-        if state != DecisionState::RejectedDurable {
-            return Err(DurableDeliveryError::IllegalTransition {
-                from: state.to_string(),
-                to: "retry_authorized".to_owned(),
-            });
-        }
-        self.with_connection(|connection| {
-            connection.execute(
+        let route = self.decision_mutation_route(decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
+            let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
+                DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
+            })?;
+            if stored.state != DecisionState::RejectedDurable {
+                return Err(DurableDeliveryError::IllegalTransition {
+                    from: stored.state.to_string(),
+                    to: "retry_authorized".to_owned(),
+                });
+            }
+            transaction.execute(
                 "UPDATE delivery_decisions SET retry_authorized=1,updated_at=datetime('now')
                  WHERE decision_identity=?1 AND state='RejectedDurable'",
                 [decision_identity],
@@ -4197,7 +4409,15 @@ impl DurableDeliveryCoordinator {
         heartbeat_at: DateTime<Utc>,
     ) -> Result<bool> {
         let lease_expires_at = heartbeat_at + Duration::seconds(self.config.attempt_lease_secs);
-        self.with_immediate_transaction(|transaction| {
+        let route = self.with_mutation_routing_connection(|connection| {
+            load_decision(connection, decision_identity)?
+                .map(|stored| DecisionMutationRoute::from_stored(connection, &stored))
+                .transpose()
+        })?;
+        let Some(route) = route else {
+            return Ok(false);
+        };
+        self.with_mutation_transaction(&route, |transaction| {
             let changed = transaction.execute(
                 "UPDATE delivery_attempts
                  SET lease_expires_at=?1,lease_heartbeat_at=?2
@@ -4388,7 +4608,8 @@ impl DurableDeliveryCoordinator {
             &resolution_identity,
         )?;
 
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(&command.decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let stored =
                 load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
@@ -4559,7 +4780,25 @@ impl DurableDeliveryCoordinator {
                 "hydration acknowledgement requires transition identity and hash".to_owned(),
             ));
         }
-        self.with_immediate_transaction(|transaction| {
+        let route = self.with_mutation_routing_connection(|connection| {
+            let decision_identity: String = connection
+                .query_row(
+                    "SELECT decision_identity FROM task_transition_payloads
+                     WHERE transition_identity=?1",
+                    [transition_identity],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(format!(
+                        "task transition {transition_identity}"
+                    ))
+                })?;
+            let stored = load_decision(connection, &decision_identity)?
+                .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.clone()))?;
+            DecisionMutationRoute::from_stored(connection, &stored)
+        })?;
+        self.with_mutation_transaction(&route, |transaction| {
             let row: Option<(String, String, String, String)> = transaction
                 .query_row(
                     "SELECT decision_identity,transition_sha256,append_state,hydration_state
@@ -4575,6 +4814,9 @@ impl DurableDeliveryCoordinator {
                     "task transition {transition_identity}"
                 )));
             };
+            if decision_identity != route.decision_identity {
+                return Err(DecisionMutationRoute::changed());
+            }
             if stored_sha256 != transition_sha256 {
                 return Err(DurableDeliveryError::PolicyMismatch(format!(
                     "task transition hash mismatch for {transition_identity}"
@@ -4774,6 +5016,26 @@ impl DurableDeliveryCoordinator {
         schema_policy: SchemaVersionPolicy,
         operation: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
+        self.with_connection_core(schema_policy, true, true, operation)
+    }
+
+    fn with_mutation_routing_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        // Routing is an additional read-only preflight. Keep mutation fault
+        // hooks at their original SQL boundary, with all attestation and
+        // schema/reference checks still applied to this preflight.
+        self.with_connection_core(SchemaVersionPolicy::Runtime, false, false, operation)
+    }
+
+    fn with_connection_core<T>(
+        &self,
+        schema_policy: SchemaVersionPolicy,
+        _run_test_hooks: bool,
+        _run_post_sql_hook: bool,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         // The global lease serializes process-fd attestation with coordinator
         // opens and retains one live SHM-owning Connection Arc throughout the
         // complete pre -> SQLite operation -> post boundary.
@@ -4786,9 +5048,13 @@ impl DurableDeliveryCoordinator {
         })?;
         let _locked_pre_lifetime = database_binding.validate_under_open_lock()?;
         #[cfg(test)]
-        let pre_sql_hook = self.run_database_operation_test_hook(
-            DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
-        );
+        let pre_sql_hook = if _run_test_hooks {
+            self.run_database_operation_test_hook(
+                DatabaseOperationTestPhase::AfterPreValidationBeforeSql,
+            )
+        } else {
+            Ok(())
+        };
         #[cfg(not(test))]
         let pre_sql_hook = Ok(());
         let outcome = match pre_sql_hook {
@@ -4803,9 +5069,13 @@ impl DurableDeliveryCoordinator {
         };
         #[cfg(test)]
         let outcome = match outcome {
-            Ok(value) => match self.run_database_operation_test_hook(
-                DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
-            ) {
+            Ok(value) => match if _run_test_hooks && _run_post_sql_hook {
+                self.run_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+                )
+            } else {
+                Ok(())
+            } {
                 Ok(()) => Ok(value),
                 Err(error) => Err(error),
             },
@@ -4863,11 +5133,26 @@ impl DurableDeliveryCoordinator {
         schema_policy: SchemaVersionPolicy,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.with_connection_for_schema_policy(schema_policy, |connection| {
+        self.with_immediate_transaction_validated(schema_policy, None, operation)
+    }
+
+    fn with_immediate_transaction_validated<T>(
+        &self,
+        schema_policy: SchemaVersionPolicy,
+        validator: Option<&dyn Fn() -> Result<()>>,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_connection_core(schema_policy, true, validator.is_none(), |connection| {
+            if let Some(validate) = validator {
+                validate()?;
+            }
             #[cfg(test)]
             self.run_database_operation_test_hook(
                 DatabaseOperationTestPhase::AfterConnectionSchemaValidationBeforeTransaction,
             )?;
+            if let Some(validate) = validator {
+                validate()?;
+            }
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if matches!(schema_policy, SchemaVersionPolicy::Runtime) {
@@ -4907,6 +5192,21 @@ impl DurableDeliveryCoordinator {
                     primary,
                 ));
             }
+            // G5b executes every after-SQL hook before its commit validators.
+            // Ordinary transactions retain their original connection-core
+            // hook order; an explicit hook below covers actual post-COMMIT.
+            #[cfg(test)]
+            if validator.is_some() {
+                if let Err(primary) = self.run_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+                ) {
+                    return Err(self.rollback_transaction_with_evidence(
+                        &transaction,
+                        "after-sql postvalidation test hook",
+                        primary,
+                    ));
+                }
+            }
             if let Err(primary) = require_current_schema_version(&transaction) {
                 return Err(self.rollback_transaction_with_evidence(
                     &transaction,
@@ -4928,6 +5228,15 @@ impl DurableDeliveryCoordinator {
                     primary,
                 ));
             }
+            if let Some(validate) = validator {
+                if let Err(primary) = validate() {
+                    return Err(self.rollback_transaction_with_evidence(
+                        &transaction,
+                        "pre-commit G5b date-fence validation",
+                        primary,
+                    ));
+                }
+            }
             #[cfg(test)]
             if take_commit_test_fault() {
                 return Err(self.rollback_transaction_with_evidence(
@@ -4943,11 +5252,26 @@ impl DurableDeliveryCoordinator {
                     DurableDeliveryError::from(error),
                 ));
             }
+            #[cfg(test)]
+            if validator.is_some() {
+                if let Err(error) = self.run_database_operation_test_hook(
+                    DatabaseOperationTestPhase::AfterCommitBeforePostValidation,
+                ) {
+                    return Err(DurableDeliveryError::IsolationViolation(format!(
+                        "post-commit G5b test hook failed after COMMIT succeeded: {error}"
+                    )));
+                }
+            }
             match self.database_binding()?.validate_under_open_lock() {
                 Err(error) => Err(DurableDeliveryError::IsolationViolation(format!(
                     "post-commit isolation validation failed after COMMIT succeeded: {error}"
                 ))),
-                Ok(_post_commit_lifetime) => Ok(value),
+                Ok(_post_commit_lifetime) => match validator.map(|validate| validate()) {
+                    Some(Err(error)) => Err(DurableDeliveryError::IsolationViolation(format!(
+                        "post-commit G5b date-fence validation failed after COMMIT succeeded: {error}"
+                    ))),
+                    _ => Ok(value),
+                },
             }
         })
     }
@@ -5360,7 +5684,10 @@ impl DurableDeliveryCoordinator {
 
     fn reacquire_rejected(&self, stored: &StoredDecision, now: DateTime<Utc>) -> Result<bool> {
         let envelope = parse_envelope(&stored.envelope_canonical)?;
-        self.with_immediate_transaction(|transaction| {
+        let route = self.with_mutation_routing_connection(|connection| {
+            DecisionMutationRoute::from_stored(connection, stored)
+        })?;
+        self.with_mutation_transaction(&route, |transaction| {
             let current =
                 load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
@@ -5429,7 +5756,8 @@ impl DurableDeliveryCoordinator {
         authoritative_sink_count: usize,
         now: DateTime<Utc>,
     ) -> Result<Option<AttemptLease>> {
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;
@@ -5583,7 +5911,8 @@ impl DurableDeliveryCoordinator {
         result: AuthoritativeSinkResult,
         recorded_at: DateTime<Utc>,
     ) -> Result<()> {
-        self.with_immediate_transaction(|transaction| {
+        let route = self.attempt_mutation_route(attempt_identity, fence_token)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let (decision_identity, attempt_state): (String, String) = transaction
                 .query_row(
                     "SELECT decision_identity,state FROM delivery_attempts
@@ -5597,6 +5926,9 @@ impl DurableDeliveryCoordinator {
                         "attempt {attempt_identity}/{fence_token}"
                     ))
                 })?;
+            if decision_identity != route.decision_identity {
+                return Err(DecisionMutationRoute::changed());
+            }
             let stored = load_decision(transaction, &decision_identity)?
                 .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.clone()))?;
             let authoritative = stored.state == DecisionState::AttemptInFlight
@@ -5871,112 +6203,172 @@ impl DurableDeliveryCoordinator {
         scope: ReconcileScope<'_>,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        self.with_immediate_transaction(|transaction| {
-            let candidate: Option<(String, String, i64, String)> = transaction
-                .query_row(
-                    "SELECT a.attempt_identity,a.decision_identity,a.fence_token,a.lease_expires_at
-                 FROM delivery_attempts a
-                 JOIN delivery_decisions d
-                   ON d.decision_identity=a.decision_identity
-                  AND d.current_attempt_identity=a.attempt_identity
-                 WHERE a.state='AttemptInFlight' AND d.state='AttemptInFlight'
-                   AND a.lease_expires_at<=?1
-                   AND (?2 IS NULL OR d.decision_identity=?2)
-                 ORDER BY d.business_date,d.decision_identity LIMIT 1",
-                    params![timestamp(now), scope.decision_identity()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-            let Some((attempt_identity, decision_identity, fence_token, lease_expires_at)) =
+        loop {
+            let candidate = self.with_mutation_routing_connection(|connection| {
+                let candidate: Option<(String, String, i64, String, i64)> = connection
+                    .query_row(
+                        "SELECT a.attempt_identity,a.decision_identity,a.fence_token,
+                                a.lease_expires_at,d.fence_generation
+                         FROM delivery_attempts a
+                         JOIN delivery_decisions d
+                           ON d.decision_identity=a.decision_identity
+                          AND d.current_attempt_identity=a.attempt_identity
+                         WHERE a.state='AttemptInFlight' AND d.state='AttemptInFlight'
+                           AND a.lease_expires_at<=?1
+                           AND (?2 IS NULL OR d.decision_identity=?2)
+                         ORDER BY d.business_date,d.decision_identity LIMIT 1",
+                        params![timestamp(now), scope.decision_identity()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
                 candidate
+                    .map(|candidate| {
+                        let stored = load_decision(connection, &candidate.1)?.ok_or_else(|| {
+                            DurableDeliveryError::DecisionNotFound(candidate.1.clone())
+                        })?;
+                        let route = DecisionMutationRoute::from_stored(connection, &stored)?;
+                        Ok((candidate, route))
+                    })
+                    .transpose()
+            })?;
+            let Some((
+                (
+                    attempt_identity,
+                    decision_identity,
+                    fence_token,
+                    lease_expires_at,
+                    decision_fence,
+                ),
+                route,
+            )) = candidate
             else {
                 return Ok(false);
             };
-            let stored = load_decision(transaction, &decision_identity)?
-                .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.clone()))?;
-            let new_fence = stored.fence_generation + 1;
-            let changed = transaction.execute(
-                "UPDATE delivery_attempts SET state='Uncertain',fence_revoked_at=?1
+            let progressed = self.with_mutation_transaction(&route, |transaction| {
+                // No candidate selection while holding a SQLite writer slot.
+                // Recheck the exact selected attempt after the date-lock wait.
+                let still_current: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM delivery_attempts a JOIN delivery_decisions d
+                         ON d.decision_identity=a.decision_identity
+                        AND d.current_attempt_identity=a.attempt_identity
+                       WHERE a.attempt_identity=?1 AND a.decision_identity=?2
+                         AND a.fence_token=?3 AND a.lease_expires_at=?4
+                         AND d.fence_generation=?5 AND a.lease_expires_at<=?6
+                         AND a.state='AttemptInFlight' AND d.state='AttemptInFlight')",
+                    params![
+                        attempt_identity,
+                        decision_identity,
+                        fence_token,
+                        lease_expires_at,
+                        decision_fence,
+                        timestamp(now)
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !still_current {
+                    return Ok(false);
+                }
+                let stored = load_decision(transaction, &decision_identity)?.ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(decision_identity.clone())
+                })?;
+                let new_fence = stored.fence_generation + 1;
+                let changed = transaction.execute(
+                    "UPDATE delivery_attempts SET state='Uncertain',fence_revoked_at=?1
              WHERE attempt_identity=?2 AND decision_identity=?3
                AND fence_token=?4 AND state='AttemptInFlight'
                AND lease_expires_at<=?1",
-                params![
-                    timestamp(now),
-                    attempt_identity,
-                    decision_identity,
-                    fence_token
-                ],
-            )?;
-            if changed != 1 {
-                return Ok(false);
-            }
-            transaction.execute(
-                "UPDATE delivery_decisions SET fence_generation=?1,updated_at=?2
+                    params![
+                        timestamp(now),
+                        attempt_identity,
+                        decision_identity,
+                        fence_token
+                    ],
+                )?;
+                if changed != 1 {
+                    return Ok(false);
+                }
+                transaction.execute(
+                    "UPDATE delivery_decisions SET fence_generation=?1,updated_at=?2
              WHERE decision_identity=?3 AND state='AttemptInFlight'
                AND current_attempt_identity=?4 AND fence_generation=?5",
-                params![
-                    new_fence,
-                    timestamp(now),
-                    decision_identity,
-                    attempt_identity,
-                    fence_token
-                ],
-            )?;
-            let fence_evidence = canonical_json(&json!({
-                "attempt_identity": attempt_identity,
-                "revoked_fence_token": fence_token,
-                "replacement_fence_generation": new_fence,
-                "lease_expires_at": lease_expires_at,
-            }))?;
-            record_attempt_event(
-                transaction,
-                &attempt_identity,
-                &decision_identity,
-                "FenceRevoked",
-                fence_evidence.clone(),
-                now,
-            )?;
-            record_attempt_event(
-                transaction,
-                &attempt_identity,
-                &decision_identity,
-                "RecoveryClassified",
-                canonical_json(&json!({
-                    "classification": "Uncertain",
-                    "automatic_resend": false,
-                    "persisted_receipt": false,
-                    "fence_evidence_sha256": sha256_hex(&fence_evidence),
-                }))?,
-                now,
-            )?;
-            let envelope = parse_envelope(&stored.envelope_canonical)?;
-            freeze_disposition(
-                transaction,
-                &envelope,
-                Some(&attempt_identity),
-                None,
-                None,
-                "Uncertain",
-                &sha256_hex(&fence_evidence),
-                false,
-                now,
-            )?;
-            mutate_reservations(transaction, &stored, "Uncertain", now, None)?;
-            transition_existing_state(
-                transaction,
-                &stored,
-                DecisionState::UncertainAuditPending,
-                "expired-attempt-recovery",
-                None,
-                canonical_json(&json!({
+                    params![
+                        new_fence,
+                        timestamp(now),
+                        decision_identity,
+                        attempt_identity,
+                        fence_token
+                    ],
+                )?;
+                let fence_evidence = canonical_json(&json!({
                     "attempt_identity": attempt_identity,
                     "revoked_fence_token": fence_token,
-                    "persisted_receipt": false,
-                }))?,
-                now,
-            )?;
-            Ok(true)
-        })
+                    "replacement_fence_generation": new_fence,
+                    "lease_expires_at": lease_expires_at,
+                }))?;
+                record_attempt_event(
+                    transaction,
+                    &attempt_identity,
+                    &decision_identity,
+                    "FenceRevoked",
+                    fence_evidence.clone(),
+                    now,
+                )?;
+                record_attempt_event(
+                    transaction,
+                    &attempt_identity,
+                    &decision_identity,
+                    "RecoveryClassified",
+                    canonical_json(&json!({
+                        "classification": "Uncertain",
+                        "automatic_resend": false,
+                        "persisted_receipt": false,
+                        "fence_evidence_sha256": sha256_hex(&fence_evidence),
+                    }))?,
+                    now,
+                )?;
+                let envelope = parse_envelope(&stored.envelope_canonical)?;
+                freeze_disposition(
+                    transaction,
+                    &envelope,
+                    Some(&attempt_identity),
+                    None,
+                    None,
+                    "Uncertain",
+                    &sha256_hex(&fence_evidence),
+                    false,
+                    now,
+                )?;
+                mutate_reservations(transaction, &stored, "Uncertain", now, None)?;
+                transition_existing_state(
+                    transaction,
+                    &stored,
+                    DecisionState::UncertainAuditPending,
+                    "expired-attempt-recovery",
+                    None,
+                    canonical_json(&json!({
+                        "attempt_identity": attempt_identity,
+                        "revoked_fence_token": fence_token,
+                        "persisted_receipt": false,
+                    }))?,
+                    now,
+                )?;
+                Ok(true)
+            })?;
+            if progressed {
+                return Ok(true);
+            }
+            // A stale LIMIT-1 candidate is not evidence that the global scope
+            // has no work; release this guard and inspect the next candidate.
+        }
     }
 
     fn append_one_audit(
@@ -6024,7 +6416,8 @@ impl DurableDeliveryCoordinator {
             &pending.record_kind,
             &pending.identity,
         )?;
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(&pending.decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let changed = transaction.execute(
                 "UPDATE immutable_audit_outbox
                  SET append_state='Appended',immutable_audit_ref=?1
@@ -6222,7 +6615,8 @@ impl DurableDeliveryCoordinator {
             &pending.record_kind,
             &pending.identity,
         )?;
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(&pending.decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let changed = transaction.execute(
                 "UPDATE delivery_disposition_payloads
                  SET append_state='Appended',immutable_audit_ref=?1
@@ -6318,7 +6712,8 @@ impl DurableDeliveryCoordinator {
                     &manual.record_kind,
                     &manual.identity,
                 )?;
-                self.with_immediate_transaction(|transaction| {
+                let route = self.decision_mutation_route(&manual.decision_identity)?;
+                self.with_mutation_transaction(&route, |transaction| {
                     let changed = transaction.execute(
                         "UPDATE manual_resolutions
                          SET accepted_audit_append_state='Appended',accepted_audit_ref=?1
@@ -6352,7 +6747,8 @@ impl DurableDeliveryCoordinator {
             &pending.record_kind,
             &pending.identity,
         )?;
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(&pending.decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let changed = transaction.execute(
                 "UPDATE sink_results SET delivery_audit_ref=?1
                  WHERE result_event_identity=?2 AND delivery_audit_ref IS NULL
@@ -6409,7 +6805,8 @@ impl DurableDeliveryCoordinator {
             &pending.record_kind,
             &pending.identity,
         )?;
-        self.with_immediate_transaction(|transaction| {
+        let route = self.decision_mutation_route(&pending.decision_identity)?;
+        self.with_mutation_transaction(&route, |transaction| {
             let changed = transaction.execute(
                 "UPDATE task_transition_payloads
                  SET append_state='Appended',immutable_audit_ref=?1
@@ -6484,7 +6881,10 @@ impl DurableDeliveryCoordinator {
         if target == DecisionState::Delivered {
             self.run_delivered_reconcile_test_hook()?;
         }
-        self.with_immediate_transaction(|transaction| {
+        let route = self.with_mutation_routing_connection(|connection| {
+            DecisionMutationRoute::from_stored(connection, stored)
+        })?;
+        self.with_mutation_transaction(&route, |transaction| {
             let current =
                 load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())

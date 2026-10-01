@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Barrier, Mutex};
 
+#[path = "g5b_mutation_fence_tests.rs"]
+mod g5b_mutation_fence_tests;
+
 static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[cfg(unix)]
@@ -251,6 +254,23 @@ impl Fixture {
             ))
             .expect("open second coordinator"),
         )
+    }
+
+    fn g5b_input_log(&self, business_date: &str) -> crate::monitor::alert_log::AlertLog {
+        let date = chrono::NaiveDate::parse_from_str(business_date, "%Y-%m-%d").unwrap();
+        let database = Path::new(env!("CARGO_MANIFEST_DIR")).join(&self.database_path);
+        let parent = database.parent().unwrap();
+        let input_log = crate::monitor::alert_log::AlertLog::for_test(parent).unwrap();
+        let fence = input_log.acquire_date_writer_fence(date).unwrap();
+        // Capture only the known lock inode created by this fixture, before
+        // any adversarial replacement; never sweep arbitrary files on drop.
+        #[cfg(unix)]
+        self.cleanup.record(
+            parent.join(format!("{}.g5b-day.lock", date.format("%Y%m%d"))),
+            OwnedPathKind::FileOrSymlink,
+        );
+        drop(fence);
+        input_log
     }
 
     fn query_i64(&self, sql: &str) -> i64 {
@@ -5410,6 +5430,9 @@ fn prepare_reserved(
     envelope: &DeliveryEnvelope,
     append: &dyn ImmutableAppendPort,
 ) {
+    if envelope.push_kind == PushKind::G5bAttribution {
+        fixture.g5b_input_log(&envelope.business_date);
+    }
     let outcome = fixture
         .coordinator
         .prepare(envelope, 1, now())
@@ -5950,6 +5973,254 @@ fn g5b_frozen_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelop
         None,
     )
     .expect("TEST_CODE G5b frozen envelope")
+}
+
+#[test]
+fn g5b_first_insert_race_cannot_leave_unguarded_incoming_conflict_audit() {
+    let fixture = Fixture::new("G5B_FIRST_INSERT_ROUTING");
+    let candidate = g5b_frozen_envelope("FIRST_INSERT_OWNER", false);
+    fixture.g5b_input_log(&candidate.business_date);
+    let mut incoming = candidate.clone();
+    incoming.push_kind = PushKind::HoldingEvent;
+    // Existing conflict admission deliberately accepts the incoming raw
+    // envelope; its identity need not validate as a new counted decision.
+    let same_owner = fixture.coordinator.0.as_ref().unwrap().clone();
+    let new_owner = candidate.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterMutationRoutingBeforeDateFence,
+            move || {
+                same_owner.prepare(&new_owner, 1, now())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let outcome = fixture.coordinator.prepare(&incoming, 1, now());
+    assert!(
+        matches!(outcome, Err(DurableDeliveryError::PolicyMismatch(ref reason))
+        if reason.contains("mutation routing changed after preflight"))
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        1
+    );
+    assert_eq!(fixture.query_i64(
+        "SELECT COUNT(*) FROM immutable_audit_outbox WHERE audit_kind='DecisionIdentityConflict'"), 0);
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT envelope_canonical FROM delivery_decisions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, serde_json::to_vec(&candidate).unwrap());
+    drop(connection);
+    assert!(matches!(
+        fixture.coordinator.prepare(&incoming, 1, now()),
+        Err(DurableDeliveryError::DecisionIdentityConflict { .. })
+    ));
+    assert_eq!(fixture.query_i64(
+        "SELECT COUNT(*) FROM immutable_audit_outbox WHERE audit_kind='DecisionIdentityConflict'"), 1);
+}
+
+#[test]
+fn g5b_global_expired_recovery_continues_after_selected_lease_changes() {
+    let fixture = Fixture::new("G5B_STALE_RECOVERY");
+    let append = MemoryAppendPort::default();
+    let mut candidates = [
+        g5b_frozen_envelope("STALE_FIRST", false),
+        g5b_frozen_envelope("EXPIRED_NEXT", false),
+    ];
+    candidates.sort_by(|a, b| a.decision_identity.cmp(&b.decision_identity));
+    for candidate in &candidates {
+        prepare_reserved(&fixture, candidate, &append);
+    }
+    let first_attempt = fixture
+        .coordinator
+        .begin_attempt(&candidates[0].decision_identity, 1, now())
+        .unwrap()
+        .unwrap();
+    fixture
+        .coordinator
+        .begin_attempt(&candidates[1].decision_identity, 1, now())
+        .unwrap()
+        .unwrap();
+    let recovery_at = now() + chrono::Duration::seconds(121);
+    let same_owner = fixture.coordinator.0.as_ref().unwrap().clone();
+    let first_identity = candidates[0].decision_identity.clone();
+    fixture
+        .coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterMutationRoutingBeforeDateFence,
+            move || {
+                assert!(same_owner.heartbeat_attempt(
+                    &first_identity,
+                    &first_attempt.attempt_identity,
+                    first_attempt.fence_token,
+                    recovery_at,
+                )?);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let summary = fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovery_at)
+        .expect("stale first candidate must not hide the next expired attempt");
+    assert_eq!(summary.sink_calls, 0);
+    assert_eq!(summary.provider_calls, 0);
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidates[0].decision_identity)
+            .unwrap(),
+        DecisionState::AttemptInFlight
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidates[1].decision_identity)
+            .unwrap(),
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM delivery_attempt_events WHERE event_kind='FenceRevoked'"
+        ),
+        1
+    );
+    assert_eq!(
+        fixture.query_i64(
+            "SELECT COUNT(*) FROM delivery_attempt_events WHERE event_kind='LeaseHeartbeat'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn g5b_date_fenced_late_receipt_retains_raw_bytes_and_cannot_authorize_resend() {
+    let fixture = Fixture::new("G5B_FENCED_LATE_RECEIPT");
+    let append = MemoryAppendPort::default();
+    let candidate = g5b_frozen_envelope("LATE_RECEIPT", false);
+    let original_envelope = serde_json::to_vec(&candidate).unwrap();
+    prepare_reserved(&fixture, &candidate, &append);
+    let attempt = fixture
+        .coordinator
+        .begin_attempt(&candidate.decision_identity, 1, now())
+        .unwrap()
+        .unwrap();
+    let recovery_at = now() + chrono::Duration::seconds(121);
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovery_at)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&candidate.decision_identity)
+            .unwrap(),
+        DecisionState::UncertainManualReview
+    );
+    let late_receipt = receipt(recovery_at);
+    let expected_raw = serde_json::to_vec(&serde_json::json!({
+        "kind": "Accepted", "receipt": late_receipt,
+    }))
+    .unwrap();
+    fixture
+        .coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            AuthoritativeSinkResult::Accepted(late_receipt),
+            recovery_at,
+        )
+        .unwrap();
+    fixture
+        .coordinator
+        .reconcile_all_pending(&append, recovery_at)
+        .unwrap();
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let persisted: (Vec<u8>, String, i64, i64, String, String) = connection
+        .query_row(
+            "SELECT result_canonical,result_sha256,authoritative_for_state,late_after_fence,
+                authority_audit_identity,late_receipt_audit_identity FROM sink_results",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(persisted.0, expected_raw);
+    assert_eq!(persisted.1, sha256_hex(&expected_raw));
+    assert_eq!((persisted.2, persisted.3), (0, 1));
+    assert!(!persisted.4.is_empty() && !persisted.5.is_empty());
+    let frozen: Vec<u8> = connection
+        .query_row(
+            "SELECT envelope_canonical FROM delivery_decisions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(frozen, original_envelope);
+    drop(connection);
+    assert_eq!(append.count_kind("SinkResultAuthorityClassified"), 1);
+    assert_eq!(append.count_kind("LateReceiptObserved"), 1);
+    let forbidden = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(recovery_at)));
+    let sinks: Vec<AuthoritativeSink> = vec![forbidden.clone()];
+    let outcome = fixture
+        .coordinator
+        .resume_deliverable(&candidate.decision_identity, &sinks, recovery_at)
+        .unwrap();
+    assert_eq!(outcome.state, DecisionState::UncertainManualReview);
+    assert_eq!(outcome.sink_calls, 0);
+    assert_eq!(forbidden.calls.load(Ordering::SeqCst), 0);
+    let observed = fixture
+        .coordinator
+        .g5b_counted_observation_for_frozen(
+            &candidate.business_date,
+            &candidate.schedule_occurrence_identity,
+            &candidate.source_binding_sha256,
+            &candidate.rendered_content_sha256,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!observed.is_authoritative_accepted());
+    assert_eq!(observed.terminal(), G5bCountedTerminalV1::Uncertain);
+}
+
+#[test]
+fn non_g5b_missing_heartbeat_retains_false_without_date_namespace_writes() {
+    let fixture = Fixture::new("NO_ROUTE_HEARTBEAT");
+    assert!(!fixture
+        .coordinator
+        .heartbeat_attempt(
+            "TEST_CODE_MISSING_DECISION",
+            "TEST_CODE_MISSING_ATTEMPT",
+            1,
+            now(),
+        )
+        .unwrap());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_attempt_events"),
+        0
+    );
+    assert!(!std::fs::read_dir(fixture.database_path.parent().unwrap())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".g5b-day.lock")));
 }
 
 #[test]
