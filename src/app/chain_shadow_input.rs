@@ -308,8 +308,9 @@ pub(super) struct ChainReportInputObservation {
 }
 
 /// A weak, invocation-local binding of one Custom target to the prepared
-/// report and its already observed source/artifact identity. The entity is the
-/// first built Reqwest request; the production notification client rejects redirects.
+/// report, the retained send input and its already observed source/artifact
+/// identity. The entity is the first built Reqwest request; the production
+/// notification client rejects redirects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ChainCustomRequestObservation {
     pub send_id: String,
@@ -323,20 +324,31 @@ pub(super) struct ChainCustomRequestObservation {
     pub built_body_sha256: Option<String>,
     pub built_body_bytes: Option<usize>,
     pub built_body_matches_prepared: Option<bool>,
+    pub built_body_matches_report_input: Option<bool>,
     pub response_url_sha256: Option<String>,
     pub response_target_differs: Option<bool>,
     pub binding_sha256: String,
 }
 
+/// Compare each first built Custom HTTP entity with the UTF-8 report input
+/// retained from this send. The send report still supplies only a weak outcome.
 pub(super) fn observe_custom_requests(
     prepared: &PreparedChainAnalysis,
     input: &ChainReportInputObservation,
+    report_input: &[u8],
     report: &NotificationSendReport,
 ) -> Result<Vec<ChainCustomRequestObservation>> {
     anyhow::ensure!(
         prepared.business_date() == input.prepared_business_date,
         "产业链 Custom 请求与准备对象业务日期不一致"
     );
+    anyhow::ensure!(
+        report_input.len() == input.report_input_bytes
+            && format!("{:x}", Sha256::digest(report_input)) == input.report_input_sha256
+            && (prepared.report().as_bytes() == report_input) == input.prepared_report_equals_input,
+        "产业链 Custom 请求与已观察的报告输入不一致"
+    );
+    let report_input = std::str::from_utf8(report_input)?;
     report
         .attempts()
         .iter()
@@ -348,6 +360,8 @@ pub(super) fn observe_custom_requests(
             let built_body_bytes = entity.map(|entity| entity.body_len());
             let built_body_matches_prepared =
                 entity.map(|entity| entity.matches_custom_content(prepared.report()));
+            let built_body_matches_report_input =
+                entity.map(|entity| entity.matches_custom_content(report_input));
             let response_url_sha256 = entity
                 .and_then(|entity| entity.response_url_sha256())
                 .map(str::to_owned);
@@ -359,7 +373,7 @@ pub(super) fn observe_custom_requests(
                 WeakOutcomeKind::Unknown => "unknown",
             };
             let binding = serde_json::to_vec(&serde_json::json!({
-                "schema": "chain-custom-request-observation-v1",
+                "schema": "chain-custom-request-observation-v2",
                 "phase": input.phase.as_str(),
                 "schedule_date": input.schedule_date.to_string(),
                 "prepared_business_date": input.prepared_business_date.to_string(),
@@ -374,6 +388,7 @@ pub(super) fn observe_custom_requests(
                 "built_body_sha256": &built_body_sha256,
                 "built_body_bytes": built_body_bytes,
                 "built_body_matches_prepared": built_body_matches_prepared,
+                "built_body_matches_report_input": built_body_matches_report_input,
                 "response_url_sha256": &response_url_sha256,
                 "response_target_differs": response_target_differs,
             }))?;
@@ -389,6 +404,7 @@ pub(super) fn observe_custom_requests(
                 built_body_sha256,
                 built_body_bytes,
                 built_body_matches_prepared,
+                built_body_matches_report_input,
                 response_url_sha256,
                 response_target_differs,
                 binding_sha256: format!("{:x}", Sha256::digest(binding)),
@@ -861,7 +877,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let requests = observe_custom_requests(&prepared, &input, &report).unwrap();
+        let requests =
+            observe_custom_requests(&prepared, &input, prepared.report().as_bytes(), &report)
+                .unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.send_id, report.send_id());
@@ -892,6 +910,7 @@ mod tests {
         assert_eq!(request.report_input_sha256, input.report_input_sha256);
         assert!(request.prepared_report_equals_input);
         assert_eq!(request.built_body_matches_prepared, Some(true));
+        assert_eq!(request.built_body_matches_report_input, Some(true));
         assert_eq!(request.response_target_differs, Some(false));
         assert_eq!(request.binding_sha256.len(), 64);
 
@@ -903,10 +922,31 @@ mod tests {
             None,
         )
         .unwrap();
-        let changed = observe_custom_requests(&prepared, &changed_input, &report).unwrap();
+        let changed =
+            observe_custom_requests(&prepared, &changed_input, b"changed input", &report).unwrap();
         assert!(!changed[0].prepared_report_equals_input);
+        assert_eq!(changed[0].built_body_matches_prepared, Some(true));
+        assert_eq!(changed[0].built_body_matches_report_input, Some(false));
         assert_ne!(changed[0].binding_sha256, request.binding_sha256);
+        assert!(observe_custom_requests(
+            &prepared,
+            &changed_input,
+            prepared.report().as_bytes(),
+            &report,
+        )
+        .is_err());
         assert_eq!(preparations.get(), 1);
-        assert!(server.join().unwrap().starts_with(b"POST /custom HTTP/1.1"));
+        let sent = server.join().unwrap();
+        assert!(sent.starts_with(b"POST /custom HTTP/1.1"));
+        let body_start = sent
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let expected_body = serde_json::to_vec(&serde_json::json!({
+            "content": prepared.report(),
+        }))
+        .unwrap();
+        assert_eq!(&sent[body_start..], expected_body.as_slice());
     }
 }

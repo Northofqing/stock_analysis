@@ -722,11 +722,16 @@ where
         }
     }
     if let (Ok(input), Some(report)) = (&input_observation, envelope.notification_report.as_ref()) {
-        match chain_shadow_input::observe_custom_requests(&envelope.prepared, input, report) {
+        match chain_shadow_input::observe_custom_requests(
+            &envelope.prepared,
+            input,
+            &envelope.report_input,
+            report,
+        ) {
             Ok(requests) => {
                 for request in requests {
                     log::info!(
-                        "[chain_shadow_custom_request] phase={} schedule_date={} send_id={} target_index={} outcome={:?} artifact_sha256={} acquisition_report_binding_sha256={} report_input_sha256={} prepared_report_equals_input={} built_target_sha256={} built_body_sha256={} built_body_bytes={:?} built_body_matches_prepared={:?} response_url_sha256={} response_target_differs={:?} binding_sha256={} scope=first_built_custom_http_entity redirected_request_body=unobserved full_http_wire=unobserved authority=weak coverage=incomplete",
+                        "[chain_shadow_custom_request] phase={} schedule_date={} send_id={} target_index={} outcome={:?} artifact_sha256={} acquisition_report_binding_sha256={} report_input_sha256={} prepared_report_equals_input={} built_target_sha256={} built_body_sha256={} built_body_bytes={:?} built_body_matches_prepared={:?} built_body_matches_report_input={:?} response_url_sha256={} response_target_differs={:?} binding_sha256={} binding_schema=chain-custom-request-observation-v2 scope=first_built_custom_http_entity redirected_request_body=unobserved full_http_wire=unobserved authority=weak coverage=incomplete",
                         phase.as_str(), date, request.send_id, request.target_index, request.outcome,
                         request.artifact_sha256,
                         request.acquisition_report_binding_sha256.as_deref().unwrap_or("absent"),
@@ -734,6 +739,7 @@ where
                         request.built_target_sha256.as_deref().unwrap_or("unobserved"),
                         request.built_body_sha256.as_deref().unwrap_or("unobserved"),
                         request.built_body_bytes, request.built_body_matches_prepared,
+                        request.built_body_matches_report_input,
                         request.response_url_sha256.as_deref().unwrap_or("unobserved"),
                         request.response_target_differs, request.binding_sha256,
                     );
