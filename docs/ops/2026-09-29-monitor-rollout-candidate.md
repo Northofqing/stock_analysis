@@ -31,6 +31,8 @@
 
 `selection_activation_prepare print-activation` 明确要求**人工 review 后**才写入 `config/selection/selection_activation.v1.json`。当前候选的 `reviewed_by=codex-platform-production-20260929` 仅用于预览，不能代替人审。完成复核后应重新生成实际 reviewer、未来 `effective_from` 的文件，核对新 hash 与字节，再同步到仓库和生产运行根。切换前再次核对 launchd PID、数据库/投递锁与 Uncertain 水位；78 条既有 Uncertain 保持隔离，不能因本次重启自动裁定。按单实例顺序重启 monitor，桥接保持原 PID；等待 DB 初始化及 gRPC 重连。新 PID、binary hash、activation、实际公告批次、来源健康和投递/账本状态必须逐项验收。
 
+候选源码与生产运行根分别核对封存输入清单时，运行 `python3 scripts/verify_executable_input_manifest.py /path/to/manifest.json /path/to/root --activation-ready --allow-extra config/selection/selection_activation.v1.json`（替换清单和根目录路径），并单独核对 activation 文件的批准 SHA-256。activation 会枚举 `src/` 和 `config/` 中每个普通文件；若有 `.DS_Store` 等清单外文件，先移出输入树并重算 hash，不得用额外的 `--allow-extra` 宣称激活就绪。
+
 `selection::process_bootstrap` 在启动时计算 activation gate；`activation_gate` 在 `now < effective_from` 时返回 `activation_not_effective`。因此必须等新文件的未来生效时刻到达后再重启 monitor，不能先重启、事后仅等时钟越过生效点。等待期间旧 PID 继续提供服务。
 
 18:00 UTC 后，`/private/tmp/stock-analysis-rollout-20260929-activation.json` 中的预览 `effective_from=2026-09-28T18:00:00Z` 已过；该文件的 `reviewed_by` 也是占位值。它只能供比对旧候选哈希，不能直接安装。实际切换需在候选源码和二进制重新放回运行根并核对哈希后，使用真实复核人和新的未来生效时刻生成 activation，再按上述顺序重启。

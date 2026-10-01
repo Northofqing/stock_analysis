@@ -3,6 +3,9 @@
 
 The manifest excludes the activation file. Pass that file as an allowed extra
 only after checking its approved SHA-256 separately.
+
+For activation readiness, use --activation-ready: activation hashes every
+regular src/config file except the activation file, so no other extra is safe.
 """
 
 import argparse
@@ -14,6 +17,7 @@ import re
 
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+ACTIVATION_FILE = "config/selection/selection_activation.v1.json"
 
 
 def canonical_path(value: object) -> str | None:
@@ -25,7 +29,9 @@ def canonical_path(value: object) -> str | None:
     return value if path.as_posix() == value else None
 
 
-def verify(manifest: Path, root: Path, allowed_extra: set[str]) -> tuple[int, list[str]]:
+def verify(
+    manifest: Path, root: Path, allowed_extra: set[str], activation_ready: bool = False
+) -> tuple[int, list[str]]:
     errors: list[str] = []
     try:
         entries = json.loads(manifest.read_text(encoding="utf-8"))
@@ -35,6 +41,10 @@ def verify(manifest: Path, root: Path, allowed_extra: set[str]) -> tuple[int, li
         return 0, ["manifest must contain a nonempty list"]
     if not root.is_dir() or root.is_symlink():
         return 0, ["root must be a real directory"]
+
+    if activation_ready:
+        for name in sorted(allowed_extra - {ACTIVATION_FILE}):
+            errors.append(f"activation input cannot be allowed extra: {name}")
 
     expected: dict[str, tuple[int, str]] = {}
     for index, entry in enumerate(entries):
@@ -100,11 +110,15 @@ def main() -> int:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("root", type=Path)
     parser.add_argument("--allow-extra", action="append", default=[], metavar="RELATIVE_PATH")
+    parser.add_argument(
+        "--activation-ready", action="store_true",
+        help="reject allowed extras other than the separately verified activation file",
+    )
     args = parser.parse_args()
     allowed_extra = set(args.allow_extra)
     if any(canonical_path(name) is None for name in allowed_extra):
         parser.error("--allow-extra requires canonical relative paths")
-    count, errors = verify(args.manifest, args.root, allowed_extra)
+    count, errors = verify(args.manifest, args.root, allowed_extra, args.activation_ready)
     if errors:
         for error in errors:
             print(error)
