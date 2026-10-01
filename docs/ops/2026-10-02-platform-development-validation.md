@@ -99,3 +99,21 @@ b21 默认并行 durable 224/224 已通过。复用该提交实际 Cargo 生成�
 共享反馈 `client-bundle/mac-evidence-20261002.2/` 含五项公开文件，manifest SHA `bfd4a7a2514adb29e0b949719efa76a9bc636f816cdc50f25b11de5b2fcdb631`，附实际原始 Health/BuildIdentity/Capabilities/capability 和 issued/observed request；未共享凭据材料或完整业务捕获。native send 成功，随后状态 revision19 确认 Windows 对话 active/inProgress。继续要求精确请求 echo、coverage/missing reason/sourceRevision/PIT 和此前资金流/公告/身份来源任务。
 
 G5b B 已在独立 managed worktree `/Users/zhangzhen/.codex/worktrees/g5b-cohort-schema12-20261002/stock_analysis` 从 8cd 开始，分支 `codex/g5b-cohort-schema12-20261002`；实施 additive schema12、私有 date session、cohort/artifact intent/revision 与同内容恢复，并进行交叉审查。尚无 B 编译/行为结果，不称 B 完成；后续 C/D 的唯一 owner/handoff、真实终态与 CAS seal 仍未接线。
+
+## Windows 后续源码修复与公开响应补证
+
+第四批 14 项、第五批 2 项 Windows public evidence 的文件长度与原始 SHA 全部通过，manifest 分别为 `d084998a68e7ce21201a48db3faae8406bb5b578202f77d64b1396b7543fd830`、`ab75bc7e66f80f816021f4a8d78ea3a8d75d2b49baa6ff6a869e755af27aae07`。资金流具体 Gate A 设计已复核，并按用户原有 VM 协调与继续开发授权确认：仅 Day1 官网日资金流路径、固定回调的严格 data-only JSONP 与公开 `FundFlowSeries` 的真实 HTTP 通路。新路径的一次正样本不能代替 TLS 修复；此前四次重复请求仍在 HTTP 前失败。05:05 CST 原生状态 revision21 确认 VM 正在修改源码，旧实现已被真实官网 JSONP 样本复现失败；未完成检查或部署，不提前称修复上线。
+
+Mac 第三批已保存共享 `client-bundle/mac-evidence-20261002.3/`，6 项文件逐字节复算通过，manifest SHA `638a7e8b4f7b0d90966c22229855d5e5dea16d4eb3390abdab2332790c43e6c4`，原生发送成功。它补充已有两次实际 RPC 的 QueryResponse 原始 protobuf payload、CanonicalPayload/data 原始切片、response request ID 和捕获的 status/trailer part；并说明带域的 request correlation 和编译时 CSV 日历 authority hash 算法。
+
+688561 原始 payload 为 5090 字节，SHA `44cd78b7784d93b67d6ae9f1e6129aadfb01a9335f6d908a33caced4f0338c35`；688277 为 572 字节，SHA `32ee65ba59aeb8ad3731ac6f67bb75cedd4bf4e2c9ff3a01ac1950fa201cf369`。两者来源是传输 body 捕获并校验单一无压缩 gRPC frame 后移除 5-byte header 的原始 payload，不是 prost 重编码；逐条 data 又与保存的 typed outcome 相等。response request ID 与 issued context 相等、correlation 与日历 hash/日期向量/limit 独立复算通过。status part 为 Absent，不能宣称保存了完整 HTTP trailer；CSV 来源声明不能替代 SSE 网页发布/修订证据。仍是 ObservedOnly / coverage Unknown / PIT NotCertified，未再次调用 RPC，也未导出认证或连接凭据引用。
+
+## P05 真实 producer 保存与 counted 关联
+
+`d95170bce34f770df422aa8a80c7329cf364409a` 仅修改 5 个 P05 文件。真实 dispatcher 在 source await 前固定同一上海业务日与分钟；有 sampled Strong 时，实际保存预测行并提交不可变 v2 freeze，然后用其原 card/source/member bytes 构造既有 counted binding。精确重放不再次保存；并发相同请求读取 winner 原 IDs，冲突卡片拒绝；部分保存、未知 worker、错误日历或冻结内容漂移阻止投递。无 sampled Strong 只保留明确 UnlinkedV1，不能绕过已有 v2 owner。未改变来源资格、Strong 统计分母或共享 Unit 完成规则。
+
+同源源码冻结后实际验证：`cargo test --locked --offline --lib p05_counted_producer_` 为 9/9；`--bin monitor p05_counted_producer_` 为 2 通过、1 个 child 标记 ignored。该 child 被 parent 以 exact/ignored filter 实际启动于两个独立进程，并检查 running1 与 marker；真实 async helper、counted consumer 的 Test adapter 和跨库 reader 均参与，重启后两条预测行不增加，durable attempts/results 均为 1，v1 competing owner 拒绝。它不覆盖 provider acquisition、presentation/governance 或远端物理投递。
+
+复用上述实际 Cargo 生成的不可变 lib harness，既有 P05 freeze/link 19 项、candidate save/worker 1 项与实际 prediction row ID 1 项全通过；没有重复编译或重跑本轮新 9 项。原始日志及 harness SHA 在 `validation/dev-d951-p05-tests.json` 与 `dev-d951-p05-existing-tests.json`。验证后停止本切片检查。
+
+下一 S1 统一实际 main caller 的一次 batch/clock 与三个通知 preparation；完整 S2 仍需持久 parent/child intent、A02/T08 原子 owner、权威 receipt finalizer 和 snapshot revision CAS。当前 legacy snapshot 提前推进、partial 后重新采集与共享完成游标仍未关闭，不能把本次 producer 关联称作完整 Unit 迁移。
