@@ -81,13 +81,13 @@ fn feishu_business_accepted(body: &serde_json::Value) -> Result<bool> {
         "StatusCode"
     } else {
         return Err(anyhow::anyhow!(
-            "飞书响应缺少 code/StatusCode，不能确认投递成功: {body}"
+            "飞书响应缺少 code/StatusCode，不能确认投递成功"
         ));
     };
     body.get(field)
         .and_then(serde_json::Value::as_i64)
         .map(|code| code == 0)
-        .ok_or_else(|| anyhow::anyhow!("飞书响应 {field} 不是整数: {body}"))
+        .ok_or_else(|| anyhow::anyhow!("飞书响应 {field} 不是整数"))
 }
 
 fn feishu_page_marker(page: usize, total: usize) -> String {
@@ -223,14 +223,26 @@ impl NotificationService {
             }
         });
 
-        let request = self.client.post(url).json(&card_payload).build()?;
+        let request = self
+            .client
+            .post(url)
+            .json(&card_payload)
+            .build()
+            .map_err(|_| anyhow::anyhow!("飞书卡片请求构建失败"))?;
         if let Some(observation) = observation.as_deref_mut() {
             observation.observe_request(&request);
         }
-        let response = self.client.execute(request).await?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("飞书卡片 HTTP 请求失败"))?;
 
         if response.status().is_success() {
-            let result: serde_json::Value = response.json().await?;
+            let result: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| anyhow::anyhow!("飞书卡片响应解析失败"))?;
             if feishu_business_accepted(&result)? {
                 info!("飞书消息发送成功");
                 return Ok(true);
@@ -245,13 +257,25 @@ impl NotificationService {
             }
         });
 
-        let request = self.client.post(url).json(&text_payload).build()?;
+        let request = self
+            .client
+            .post(url)
+            .json(&text_payload)
+            .build()
+            .map_err(|_| anyhow::anyhow!("飞书文本请求构建失败"))?;
         if let Some(observation) = observation {
             observation.observe_request(&request);
         }
-        let response = self.client.execute(request).await?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("飞书文本 HTTP 请求失败"))?;
         let status = response.status();
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("飞书文本响应解析失败"))?;
         Ok(status.is_success() && feishu_business_accepted(&body)?)
     }
 
@@ -585,6 +609,19 @@ mod delivery_contract_tests {
         assert!(!feishu_business_accepted(&json!({"code": 19001})).unwrap());
         assert!(feishu_business_accepted(&json!({})).is_err());
         assert!(feishu_business_accepted(&json!({"code": "0"})).is_err());
+        let error =
+            feishu_business_accepted(&json!({"message": "TEST_SECRET_RESPONSE"})).unwrap_err();
+        assert!(!error.to_string().contains("TEST_SECRET_RESPONSE"));
+    }
+
+    #[tokio::test]
+    async fn malformed_webhook_url_is_not_returned_in_error() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let error = service
+            .send_feishu_message("http://[TEST_SECRET_TOKEN", "TEST_CODE local", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "飞书卡片请求构建失败");
     }
 
     #[tokio::test]

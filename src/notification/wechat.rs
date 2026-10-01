@@ -99,23 +99,40 @@ impl NotificationService {
             }
         });
 
-        let request = self.client.post(url).json(&payload).build()?;
+        let request = self
+            .client
+            .post(url)
+            .json(&payload)
+            .build()
+            .map_err(|_| anyhow::anyhow!("企业微信请求构建失败"))?;
         if let Some(observation) = observation {
             observation.observe_request(&request);
         }
-        let response = self.client.execute(request).await?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("企业微信 HTTP 请求失败"))?;
 
-        if response.status().is_success() {
-            let result: serde_json::Value = response.json().await?;
+        let status = response.status();
+        if status.is_success() {
+            let result: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| anyhow::anyhow!("企业微信响应解析失败"))?;
             if result.get("errcode").and_then(|v| v.as_i64()) == Some(0) {
                 info!("企业微信消息发送成功");
                 Ok(true)
             } else {
-                error!("企业微信返回错误: {:?}", result);
+                error!(
+                    "企业微信返回错误: HTTP {} errcode={:?}",
+                    status,
+                    result.get("errcode").and_then(serde_json::Value::as_i64)
+                );
                 Ok(false)
             }
         } else {
-            error!("企业微信请求失败: {}", response.status());
+            error!("企业微信请求失败: HTTP {}", status);
             Ok(false)
         }
     }
@@ -273,5 +290,15 @@ mod tests {
         let service = NotificationService::new(NotificationConfig::default());
         let error = service.send_to_wechat("TEST_CODE local").await.unwrap_err();
         assert!(error.to_string().contains("Webhook 未配置"));
+    }
+
+    #[tokio::test]
+    async fn malformed_webhook_url_is_not_returned_in_error() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let error = service
+            .send_wechat_message("http://[TEST_SECRET_TOKEN", "TEST_CODE local", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "企业微信请求构建失败");
     }
 }
