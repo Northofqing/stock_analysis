@@ -23,6 +23,20 @@ pub enum ExternalContractError {
     Serialize,
 }
 
+/// Flow-only ExternalV1 entry point. The two profile catalogs are kept
+/// distinct even though their request JSON happens to have the same shape.
+pub fn build_external_flow_query_request(
+    operation: ExternalOperation,
+    params: Value,
+) -> Result<QueryRequest, ExternalContractError> {
+    let local_shape = match operation {
+        ExternalOperation::MoneyFlows => Operation::MoneyFlows,
+        ExternalOperation::BoardFlows => Operation::BoardFlows,
+        _ => return Err(ExternalContractError::UndeliveredOperation),
+    };
+    build_external_query_request(local_shape, params)
+}
+
 pub fn build_external_query_request(
     operation: Operation,
     params: Value,

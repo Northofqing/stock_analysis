@@ -104,6 +104,8 @@ enum ExternalQueryWireReply {
     },
     CatalogLifecycleStatus,
     CatalogRequestedProviderStatus,
+    FlowUnavailableStatus,
+    FlowIncomplete,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +120,7 @@ enum ExternalCapabilitiesBehavior {
     ReleaseObservations,
     ReleaseSchedule,
     FuturesDelivery,
+    Flows,
 }
 
 #[derive(Default)]
@@ -324,6 +327,21 @@ impl SystemService for ExternalQueryWireService {
                     diagnostic_available: true,
                 }],
             },
+            ExternalCapabilitiesBehavior::Flows => CapabilitiesResponse {
+                request_id,
+                capabilities: [Operation::MoneyFlows, Operation::BoardFlows]
+                    .into_iter()
+                    .map(|operation| Capability {
+                        operation: operation as i32,
+                        repository_admission: AdmissionState::Admitted as i32,
+                        runtime_available: true,
+                        provider: "Eastmoney".to_owned(),
+                        exact_scope: "TEST_CODE_FLOW_READ".to_owned(),
+                        blocker: String::new(),
+                        diagnostic_available: false,
+                    })
+                    .collect(),
+            },
         };
         self.state
             .lock()
@@ -394,6 +412,23 @@ impl ExternalQueryWireService {
             .lock()
             .expect("TEST_CODE External query wire reply mode")
             .reply;
+        if reply == ExternalQueryWireReply::FlowUnavailableStatus {
+            let details = ErrorDetail {
+                request_id,
+                operation: operation as i32,
+                provider: "Eastmoney".to_owned(),
+                reason_code: "unavailable".to_owned(),
+                retryable: true,
+                admission: AdmissionState::Admitted as i32,
+                ..ErrorDetail::default()
+            }
+            .encode_to_vec();
+            return Err(Status::with_details(
+                tonic::Code::Unavailable,
+                "TEST_CODE flow provider unavailable",
+                details.into(),
+            ));
+        }
         let attempt_status = match reply {
             ExternalQueryWireReply::ProviderAttemptsStatus {
                 unpublished_provider,
@@ -444,6 +479,8 @@ impl ExternalQueryWireService {
                 requested_provider.as_str(),
             )),
             ExternalQueryWireReply::Success => None,
+            ExternalQueryWireReply::FlowUnavailableStatus => unreachable!(),
+            ExternalQueryWireReply::FlowIncomplete => None,
         };
         if let Some((provider_attempts, provider)) = attempt_status {
             let details = ErrorDetail {
@@ -462,6 +499,59 @@ impl ExternalQueryWireService {
                 "TEST_CODE External provider attempts",
                 details.into(),
             ));
+        }
+        if matches!(operation, Operation::MoneyFlows | Operation::BoardFlows) {
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE flow payload missing"))?;
+            let body: serde_json::Value = serde_json::from_slice(&payload.data)
+                .map_err(|_| Status::invalid_argument("TEST_CODE flow JSON invalid"))?;
+            let expected = match operation {
+                Operation::MoneyFlows => (
+                    "magic.market.money_flows.request",
+                    serde_json::json!({"instruments":[{"exchange":"Shanghai","code":"600519","asset_class":"Equity"}]}),
+                    "magic.market.money_flow",
+                    serde_json::json!({"instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},"main_net":1.0,"super_large_net":2.0,"large_net":3.0,"medium_net":4.0,"small_net":5.0,"status":"Available","source_at":"2026-09-14","observed_at":"2026-09-14T15:31:00+08:00","provider":"Eastmoney","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}),
+                ),
+                Operation::BoardFlows => (
+                    "magic.market.board_flows.request",
+                    serde_json::json!({"category":"Industry","interval":"Day1","limit":2}),
+                    "magic.market.board_flow",
+                    serde_json::json!({"board_code":"BK0001","board_name":"TEST_CODE board","category":"Industry","interval":"Day1","rank":1,"return_ratio":{"value":1.0,"unit":"Percent"},"main_net":1.0,"super_large_net":2.0,"large_net":3.0,"medium_net":4.0,"small_net":5.0,"leader_instrument":null,"leader_name":null,"leader_return_ratio":null,"evidence":{"provider":"Eastmoney","source_at":"1789457400","observed_at":"2026-09-14T15:31:00+08:00","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}}),
+                ),
+                _ => unreachable!(),
+            };
+            if payload.schema != expected.0
+                || payload.schema_version != 1
+                || requested_provider != "Eastmoney"
+                || request.allow_unadmitted
+                || body != expected.1
+            {
+                return Err(Status::invalid_argument("TEST_CODE flow request contract"));
+            }
+            return Ok(Response::new(QueryResponse {
+                request_id,
+                operation: operation as i32,
+                admission: AdmissionState::Admitted as i32,
+                selected_provider: "Eastmoney".to_owned(),
+                batch_id: "TEST_CODE_EXTERNAL_DATA_BATCH".to_owned(),
+                complete: reply != ExternalQueryWireReply::FlowIncomplete,
+                observed_at: "2026-09-14T15:31:00+08:00".to_owned(),
+                source_at: if operation == Operation::MoneyFlows {
+                    "2026-09-14"
+                } else {
+                    "1789457400"
+                }
+                .to_owned(),
+                records: vec![CanonicalPayload {
+                    schema: expected.2.to_owned(),
+                    schema_version: 1,
+                    content_type: "application/json; charset=utf-8".to_owned(),
+                    data: serde_json::to_vec(&expected.3).expect("TEST_CODE flow record JSON"),
+                }],
+                diagnostic_blocker: String::new(),
+            }));
         }
         if operation == Operation::CurrentAuctionObservations {
             let payload = request
@@ -658,6 +748,20 @@ macro_rules! external_query_wire_service {
     ($($method:ident),* $(,)?) => {
         #[tonic::async_trait]
         impl MarketDataService for ExternalQueryWireService {
+            async fn money_flows(
+                &self,
+                request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                self.respond(request, "money_flows", Operation::MoneyFlows).await
+            }
+
+            async fn board_flows(
+                &self,
+                request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                self.respond(request, "board_flows", Operation::BoardFlows).await
+            }
+
             async fn global_news(
                 &self,
                 request: Request<QueryRequest>,
@@ -735,7 +839,6 @@ external_query_wire_service!(
     historical_bars,
     minute_data,
     realtime_quotes,
-    money_flows,
     order_books,
     auctions,
     trades,
@@ -764,7 +867,6 @@ external_query_wire_service!(
     target_prices,
     semantic_search,
     fund_flow_series,
-    board_flows,
     margin_data,
     block_trades,
     holder_counts,
@@ -1018,6 +1120,33 @@ impl ExternalQueryWireFixture {
             ExternalQueryWireRoute::Generated,
             ExternalQueryWireReply::Success,
             ExternalCapabilitiesBehavior::FuturesDelivery,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_qualified_flows() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::Success,
+            ExternalCapabilitiesBehavior::Flows,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_flow_status() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::FlowUnavailableStatus,
+            ExternalCapabilitiesBehavior::Flows,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_flow_incomplete() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::FlowIncomplete,
+            ExternalCapabilitiesBehavior::Flows,
         )
         .await
     }

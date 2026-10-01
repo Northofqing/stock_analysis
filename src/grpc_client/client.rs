@@ -52,6 +52,8 @@ mod external_control_attempt_tests;
 #[cfg(test)]
 #[path = "external_control_loopback_fixture.rs"]
 pub(crate) mod external_control_loopback_fixture;
+#[path = "external_flow_read.rs"]
+pub(crate) mod external_flow_read;
 #[cfg(test)]
 #[path = "external_mtls_attempt_tests.rs"]
 mod external_mtls_attempt_tests;

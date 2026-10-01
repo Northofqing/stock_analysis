@@ -9,6 +9,43 @@ use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 #[test]
+fn flow_routes_use_external_operation_and_exact_generated_method() {
+    use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
+    use crate::grpc_client::pb::magic::market::v1::Operation as LocalOperation;
+
+    for (external, local, method_name) in [
+        (
+            ExternalOperation::MoneyFlows,
+            LocalOperation::MoneyFlows,
+            "MoneyFlows",
+        ),
+        (
+            ExternalOperation::BoardFlows,
+            LocalOperation::BoardFlows,
+            "BoardFlows",
+        ),
+    ] {
+        let route = ExternalQueryMethod::from_external_operation(external)
+            .expect("TEST_CODE delivered External flow method");
+        assert_eq!(ExternalQueryMethod::from_local_operation(local), None);
+        assert!(route.matches_binding(
+            &format!("/magic.market.v1.MarketDataService/{method_name}"),
+            Some(&tonic::GrpcMethod::new(
+                "magic.market.v1.MarketDataService",
+                method_name,
+            )),
+        ));
+        assert!(!route.matches_binding(
+            "/magic.market.v1.MarketDataService/GlobalNews",
+            Some(&tonic::GrpcMethod::new(
+                "magic.market.v1.MarketDataService",
+                "GlobalNews",
+            )),
+        ));
+    }
+}
+
+#[test]
 fn r08_futures_delivery_uses_external_method_identity_and_exact_rpc_path() {
     let method = ExternalQueryMethod::from_external_operation(
         crate::grpc_client::external_pb::magic::market::v1::Operation::FuturesDelivery,
