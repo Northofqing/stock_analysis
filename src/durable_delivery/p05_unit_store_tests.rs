@@ -381,10 +381,10 @@ fn p05_unit_store_affected_legacy_decision_blocks_origin_but_unrelated_family_do
             DATE,
             kind,
             super::super::super::model::DeliverySubKind::None,
-            if matches!(kind, PushKind::AuctionRepush | PushKind::CandidateBoard) {
-                "GLOBAL"
-            } else {
+            if kind == PushKind::CandidateInvalidated {
                 "SSE:EQUITY:TEST_CODE_P05_LEGACY"
+            } else {
+                "GLOBAL"
             },
             if kind == PushKind::CandidateBoard {
                 "candidate-board:2026-09-23:09:18"
