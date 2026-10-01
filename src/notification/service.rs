@@ -339,8 +339,8 @@ impl NotificationService {
                             error!("[邮件] 发送失败");
                             fail_count += 1;
                         }
-                        Err(e) => {
-                            error!("[邮件] 发送出错: {}", e);
+                        Err(_error) => {
+                            error!("[邮件] 发送出错，投递状态未知");
                             fail_count += 1;
                         }
                     }
@@ -507,11 +507,15 @@ impl NotificationService {
         if status.is_success() && serverchan_business_accepted(&body)? {
             Ok(true)
         } else {
-            log::warn!(
-                "[Server酱] 推送失败: HTTP {} body={}",
-                status,
-                truncate(&body, 200)
-            );
+            if status.is_success() {
+                log::warn!(
+                    "[Server酱] 推送失败: HTTP {} code={}",
+                    status,
+                    serverchan_response_code(&body)?
+                );
+            } else {
+                log::warn!("[Server酱] 推送失败: HTTP {}", status);
+            }
             Ok(false)
         }
     }
@@ -549,8 +553,8 @@ impl NotificationService {
     ) -> Result<bool> {
         let request = match self.build_pushover_request(content) {
             Ok(request) => request,
-            Err(error) => {
-                log::warn!("[Pushover] 配置无效: {}", error);
+            Err(_error) => {
+                log::warn!("[Pushover] 配置无效");
                 return Ok(false);
             }
         };
@@ -572,7 +576,11 @@ impl NotificationService {
         let accepted =
             status.is_success() && body.get("status").and_then(|v| v.as_i64()) == Some(1);
         if !accepted {
-            log::warn!("[Pushover] 推送失败: HTTP {} body={}", status, body);
+            log::warn!(
+                "[Pushover] 推送失败: HTTP {} status_code={:?}",
+                status,
+                body.get("status").and_then(serde_json::Value::as_i64)
+            );
         }
         Ok(accepted)
     }
@@ -606,13 +614,18 @@ impl NotificationService {
         if let Some(entity) = request_entity.as_mut() {
             entity.observe_response_url(resp.url());
         }
-        if !resp.status().is_success() {
-            log::warn!("[钉钉] 推送失败: HTTP {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            log::warn!("[钉钉] 推送失败: HTTP {}", status);
             return Ok(false);
         }
         let body: serde_json::Value = resp.json().await?;
         if !dingtalk_business_accepted(&body)? {
-            log::warn!("[钉钉] 业务错误: {}", body);
+            log::warn!(
+                "[钉钉] 业务错误: HTTP {} errcode={:?}",
+                status,
+                body.get("errcode").and_then(serde_json::Value::as_i64)
+            );
             return Ok(false);
         }
         log::info!("[钉钉] 推送成功");
@@ -680,9 +693,11 @@ impl NotificationService {
         let response_body: serde_json::Value = resp.json().await?;
         if !status.is_success() || !telegram_business_accepted(&response_body)? {
             log::warn!(
-                "[Telegram] 推送失败: HTTP {} body={}",
+                "[Telegram] 推送失败: HTTP {} error_code={:?}",
                 status,
                 response_body
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_i64)
             );
             return Ok(false);
         }
@@ -721,7 +736,7 @@ impl NotificationService {
         let status = resp.status();
         let response_body = resp.text().await?;
         if !status.is_success() || !slack_business_accepted(&response_body)? {
-            log::warn!("[Slack] 推送失败: HTTP {} body={:?}", status, response_body);
+            log::warn!("[Slack] 推送失败: HTTP {}", status);
             return Ok(false);
         }
         log::info!("[Slack] 推送成功");
@@ -813,19 +828,22 @@ fn dingtalk_business_accepted(body: &serde_json::Value) -> Result<bool> {
         Some(0) => Ok(true),
         Some(_) => Ok(false),
         None => Err(anyhow::anyhow!(
-            "钉钉响应缺少整数 errcode，不能确认投递成功: {body}"
+            "钉钉响应缺少整数 errcode，不能确认投递成功"
         )),
     }
 }
 
 fn serverchan_business_accepted(body: &str) -> Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| anyhow::anyhow!("Server酱响应不是合法 JSON: {error}"))?;
+    Ok(serverchan_response_code(body)? == 0)
+}
+
+fn serverchan_response_code(body: &str) -> Result<i64> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| anyhow::anyhow!("Server酱响应不是合法 JSON"))?;
     match value.get("code").and_then(serde_json::Value::as_i64) {
-        Some(0) => Ok(true),
-        Some(_) => Ok(false),
+        Some(code) => Ok(code),
         None => Err(anyhow::anyhow!(
-            "Server酱响应缺少整数 code，不能确认投递成功: {value}"
+            "Server酱响应缺少整数 code，不能确认投递成功"
         )),
     }
 }
@@ -834,7 +852,7 @@ fn telegram_business_accepted(body: &serde_json::Value) -> Result<bool> {
     match body.get("ok").and_then(serde_json::Value::as_bool) {
         Some(accepted) => Ok(accepted),
         None => Err(anyhow::anyhow!(
-            "Telegram 响应缺少布尔 ok，不能确认投递成功: {body}"
+            "Telegram 响应缺少布尔 ok，不能确认投递成功"
         )),
     }
 }
@@ -854,11 +872,11 @@ fn slack_business_accepted(body: &str) -> Result<bool> {
 
 fn custom_business_accepted(body: &str) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| anyhow::anyhow!("Custom webhook 响应不是合法 JSON: {error}"))?;
+        .map_err(|_| anyhow::anyhow!("Custom webhook 响应不是合法 JSON"))?;
     match value.get("ok").and_then(serde_json::Value::as_bool) {
         Some(accepted) => Ok(accepted),
         None => Err(anyhow::anyhow!(
-            "Custom webhook 响应缺少布尔 ok，不能确认投递成功: {value}"
+            "Custom webhook 响应缺少布尔 ok，不能确认投递成功"
         )),
     }
 }
