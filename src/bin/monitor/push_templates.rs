@@ -4622,6 +4622,7 @@ struct RealCandidateBatch {
 
 mod p05_chain_witness;
 mod p05_file_witness;
+mod p05_shared_unit;
 mod p05_source_cohort;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9732,76 +9733,9 @@ pub fn render_auction_repush(
 /// BR-223: A-02 竞价优选重推 (9:20-9:25, v13.10.1 曾停用, 现恢复)。
 /// 复用统一网关候选链路 load_real_candidate_batch, 按 Strong 档优先 + 热度排序取 Top5。
 pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
-    let entries = match load_real_candidate_batch().await {
-        Ok(batch) => batch.entries,
-        Err(error) => {
-            log::warn!("[A-02][BR-223] 候选源不可用: {error}");
-            return false;
-        }
-    };
-    if entries.is_empty() {
-        log_dispatcher_attempt("A-02", false, 0, "no candidates at auction");
-        return false;
-    }
-    let candidate_count = entries.len();
-    let mut ranked: Vec<_> = entries
-        .into_iter()
-        .filter(|entry| {
-            entry
-                .current_price
-                .is_some_and(|value| value.is_finite() && value > 0.0)
-                && entry.heat_score.is_some_and(|value| value.is_finite())
-        })
-        .collect();
-    let excluded_count = candidate_count.saturating_sub(ranked.len());
-    if excluded_count > 0 {
-        log::warn!(
-            "[A-02][BR-223] excluded {excluded_count} candidate(s) with missing/invalid price or heat"
-        );
-    }
-    ranked.sort_by(|a, b| {
-        let tier_a = a.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
-        let tier_b = b.tier == stock_analysis::opportunity::candidate_panel::EvidenceTier::Strong;
-        tier_b
-            .cmp(&tier_a)
-            .then_with(|| match (b.heat_score, a.heat_score) {
-                (Some(heat_b), Some(heat_a)) => heat_b.total_cmp(&heat_a),
-                _ => std::cmp::Ordering::Equal,
-            })
-    });
-    let top5: Vec<_> = ranked.into_iter().take(5).collect();
-    if top5.is_empty() {
-        log_dispatcher_attempt("A-02", false, 0, "no priced candidates at auction");
-        return false;
-    }
-    let text = render_auction_repush(hhmm, &top5);
-    // 2026-09-20: A-02 升级 counted (MU-auction-candidates)。盘中信息卡;
-    // Rolling 600s 镜像显式 L4; retry_authorized=false (盘中竞价快照时刻
-    // 锚定 + 下一轮 repush 重渲染补偿)。业务日取 Local::now (I-01
-    // SectorRotation 同形态)。
-    let result =
-        match build_auction_repush_counted_binding(chrono::Local::now().date_naive(), hhmm, &text)
-            .and_then(|binding| {
-                crate::presentation_registry::acquire_token(
-                    "A-02-auction-repush",
-                    crate::notify::PushKind::AuctionRepush,
-                    "auction_repush_dispatcher",
-                    "render_auction_repush",
-                )
-                .map(|token| (token, binding))
-            }) {
-            Ok((token, binding)) => {
-                crate::notify::push_counted_with_binding(token, &text, None, binding)
-                    .await
-                    .is_pushed()
-            }
-            Err(reason) => {
-                log::error!("[A-02][BR-196] counted 准备失败: {reason}");
-                false
-            }
-        };
-    log_dispatcher_attempt("A-02", result, top5.len(), "");
-    result
+    p05_shared_unit::dispatch_auction_repush_compat(hhmm)
+        .await
+        .was_pushed()
 }
 
 /// BR-223: A-11 IPO 阶段催化模板渲染 (静态供应链表)。
@@ -10368,135 +10302,17 @@ mod p05_counted_producer_tests;
 
 /// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
 pub async fn dispatch_candidate_board(date: &str) -> bool {
-    use stock_analysis::monitor::prediction::{
-        prepare_candidate_board, CandidateBoardPreparation, CandidateBoardPreparationRequest,
-    };
-    use stock_analysis::opportunity::candidate_panel::EvidenceTier;
-    // Fix the slot before source acquisition or any save can cross a minute.
-    let captured_at = stock_analysis::monitor::prediction::shanghai_now();
-    let (business_date, hhmm) = match candidate_board_slot_at(date, captured_at) {
-        Ok(slot) => slot,
-        Err(reason) => {
-            log::warn!("[P-05] preparation blocked reason={reason}");
-            return false;
-        }
-    };
-    let batch = match load_real_candidate_batch().await {
-        Ok(batch) => batch,
-        Err(error) => {
-            log::warn!("[P-05][BR-223] 候选源不可用: {error}");
-            return false;
-        }
-    };
-    if batch.entries.is_empty() {
-        log_dispatcher_attempt("P-05", false, 0, "no candidates");
-        return false;
-    }
-    let codes_now: std::collections::BTreeSet<String> = batch
-        .entries
-        .iter()
-        .map(|entry| entry.code.clone())
-        .collect();
-    // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
-    if let Some(previous) = candidate_snapshot_previous(date) {
-        let invalidated_hhmmss = captured_at.format("%H:%M:%S").to_string();
-        for code in previous.difference(&codes_now) {
-            let name = batch
-                .entries
-                .iter()
-                .find(|entry| &entry.code == code)
-                .map(|entry| entry.name.clone())
-                .unwrap_or_else(|| code.clone());
-            let _ = push_candidate_invalidated(
-                business_date,
-                code,
-                &invalidated_hhmmss,
-                &name,
-                "候选",
-                "从候选台消失",
-            )
-            .await;
-        }
-    }
-    // BR-232: SignalTracker 采样 — Strong 候选写入 prediction_tracker (5 日后回填)
-    let strong_samples: Vec<(String, f64)> = batch
-        .entries
-        .iter()
-        .filter(|entry| entry.tier == EvidenceTier::Strong && entry.current_price.is_some())
-        .map(|entry| (entry.code.clone(), entry.heat_score.unwrap_or(50.0)))
-        .collect();
-    let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
-    let request = match CandidateBoardPreparationRequest::new(
-        date,
-        &hhmm,
-        text.as_bytes().to_vec(),
-        strong_samples,
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            log::warn!("[P-05] preparation blocked reason={}", error.reason());
-            return false;
-        }
-    };
-    let prepared = match prepare_candidate_board(request).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            if let Some(report) = error.save_report() {
-                report.log();
-            }
-            log::warn!("[P-05] preparation blocked reason={}", error.reason());
-            return false;
-        }
-    };
-    let (text, binding) = match prepared {
-        CandidateBoardPreparation::Frozen {
-            record,
-            save_report,
-            ..
-        } => {
-            if let Some(report) = save_report {
-                report.log();
-            }
-            let binding = build_candidate_board_counted_binding_v2(&record);
-            // Only persisted bytes can reach the counted consumer.
-            let text = match String::from_utf8(record.rendered_bytes().to_vec()) {
-                Ok(text) => text,
-                Err(_) => return false,
-            };
-            (text, binding)
-        }
-        CandidateBoardPreparation::UnlinkedNoStrong => {
-            log::info!("[P-05] no sampled Strong rows; card remains UnlinkedV1");
-            let binding = build_candidate_board_counted_binding(business_date, &hhmm, &text);
-            (text, binding)
-        }
-    };
-    // Shared Unit snapshot/delta completion is still an independent contract.
-    candidate_snapshot_persist(date, &codes_now);
-    // 2026-09-20: P-05 升级 counted (MU-auction-candidates)。盘中信息卡;
-    // Rolling 1800s 镜像 L4 默认; retry_authorized=false (盘中快照锚定 +
-    // 下一轮重渲染补偿)。
-    let result = match binding.and_then(|binding| {
-        crate::presentation_registry::acquire_token(
-            "P-05-candidate-board",
-            crate::notify::PushKind::CandidateBoard,
-            "candidate_board_dispatcher",
-            "format_candidate_board",
-        )
-        .map(|token| (token, binding))
-    }) {
-        Ok((token, binding)) => {
-            crate::notify::push_counted_with_binding(token, &text, None, binding)
-                .await
-                .is_pushed()
-        }
-        Err(reason) => {
-            log::error!("[P-05][BR-196] counted 准备失败: {reason}");
-            false
-        }
-    };
-    log_dispatcher_attempt("P-05", result, batch.entries.len(), "");
-    result
+    p05_shared_unit::dispatch_candidate_board_compat(date)
+        .await
+        .was_pushed()
+}
+
+/// One real candidate acquisition; child observations retain legacy policies.
+pub(super) async fn dispatch_auction_candidate_unit(
+    date: &str,
+    captured_at: chrono::DateTime<chrono::FixedOffset>,
+) -> p05_shared_unit::CandidateUnitDispatchObservation {
+    p05_shared_unit::dispatch(date, captured_at).await
 }
 
 /// BR-222: R-07 counted 投递材料 (BR-140/BR-192 counted ceremony)。
@@ -17165,30 +16981,9 @@ pub async fn push_candidate_invalidated(
     prev: &str,
     reason: &str,
 ) -> bool {
-    let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
-    // 2026-09-20: T-08 升级 counted (MU-auction-candidates)。盘中信息卡;
-    // PerTicket Rolling 1800s 镜像旧逐票冷却; retry_authorized=true
-    // (失效事件事实 + 旧系统无进程内补偿 — durable 是唯一恢复路径)。
-    match build_candidate_invalidated_counted_binding(business_date, code, prev, reason, &text)
-        .and_then(|binding| {
-            crate::presentation_registry::acquire_token(
-                "T-08-candidate-invalidated",
-                crate::notify::PushKind::CandidateInvalidated,
-                "candidate_dispatcher",
-                "render_candidate_invalidated",
-            )
-            .map(|token| (token, binding))
-        }) {
-        Ok((token, binding)) => {
-            crate::notify::push_counted_with_binding(token, &text, None, binding)
-                .await
-                .is_pushed()
-        }
-        Err(reason) => {
-            log::error!("[T-08][BR-196] counted 准备失败: {reason}");
-            false
-        }
-    }
+    p05_shared_unit::dispatch_invalidated_compat(business_date, code, hhmm, name, prev, reason)
+        .await
+        .was_pushed()
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.

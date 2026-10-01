@@ -24,14 +24,15 @@ const CHILD_ENV: &str = "TEST_CODE_P05_PRODUCER_BINDING_CHILD";
 const CHILD_TEST: &str =
     "push_templates::p05_counted_producer_tests::p05_counted_producer_real_binding_child";
 
-/// Runs the library's actual blocking workflow, the production v2 factory,
-/// the real counted binding consumer and its isolated Test receipt adapter.
-/// This does not exercise provider acquisition or presentation/governance gates.
+/// Reuses the producer process fixture for the actual shared orchestration,
+/// renderer, blocking workflow, v2 factory and counted consumer/Test receipt.
+/// The single acquisition callback returns observed test data, not admitted
+/// provider authority; A02/T08 outcomes are negative local observations.
 #[tokio::test]
 #[ignore = "exact isolated child invoked by the P05 producer restart test"]
 async fn p05_counted_producer_real_binding_child() {
     use stock_analysis::monitor::prediction::{
-        prepare_candidate_board, CandidateBoardPreparation, CandidateBoardPreparationRequest,
+        prepare_candidate_board, CandidateBoardPreparationRequest,
     };
     use stock_analysis::p05_candidate_board_link::{
         read_candidate_board_occurrence_link, CandidateBoardOccurrenceLinkV1,
@@ -50,54 +51,179 @@ async fn p05_counted_producer_real_binding_child() {
     let prediction_path = root.join("TEST_CODE_p05_prediction.db");
     stock_analysis::database::DatabaseManager::init(Some(prediction_path)).unwrap();
     let database = stock_analysis::database::DatabaseManager::get();
-    let request = || {
-        CandidateBoardPreparationRequest::new(
-            "2026-09-23",
-            "10:30",
-            b"TEST_CODE exact production-binding card".to_vec(),
-            vec![
-                ("TEST_CODE_p05_a".to_owned(), 80.0),
-                ("TEST_CODE_p05_b".to_owned(), 81.0),
-            ],
-        )
-        .unwrap()
+    use p05_shared_unit::{CandidateChildObservation, InvalidatedObservation};
+    use std::cell::{Cell, RefCell};
+    use stock_analysis::opportunity::candidate_panel::EvidenceTier;
+    let observed_batch = || {
+        p05_shared_unit::tests::batch(vec![
+            p05_shared_unit::tests::entry(
+                "TEST_CODE_p05_a",
+                EvidenceTier::Strong,
+                Some(10.0),
+                Some(80.0),
+            ),
+            p05_shared_unit::tests::entry(
+                "TEST_CODE_p05_b",
+                EvidenceTier::Strong,
+                Some(11.0),
+                Some(81.0),
+            ),
+        ])
     };
-    let CandidateBoardPreparation::Frozen {
-        record,
-        reused,
-        save_report,
-    } = prepare_candidate_board(request()).await.unwrap()
-    else {
-        panic!("real Strong producer must freeze its actual committed rows");
-    };
-    assert_eq!(reused, role == "restart");
-    assert_eq!(save_report.is_none(), role == "restart");
-    assert_eq!(database.count_predictions().unwrap(), 2);
-    let binding = build_candidate_board_counted_binding_v2(&record).unwrap();
-    assert_eq!(
-        binding.source_binding_canonical(),
-        record.source_canonical()
+    let expected_board = stock_analysis::opportunity::candidate_panel::format_candidate_board(
+        &observed_batch().entries,
     );
-    assert_eq!(
-        binding.source_evidence_fingerprint(),
-        record.source_sha256()
-    );
-    assert_eq!(binding.delivery_subject_hash(), record.source_sha256());
-    assert_eq!(
-        binding.schedule_occurrence_identity(),
-        record.occurrence_identity()
-    );
-    assert!(binding.task_binding().is_none());
-    assert!(!binding.retry_authorized());
-    let text = String::from_utf8(record.rendered_bytes().to_vec()).unwrap();
-    let outcome = crate::durable_delivery_runtime::deliver_counted_binding(
-        binding,
-        crate::notify::PushKind::CandidateBoard,
-        text,
-        None,
+    let mut auction_entries = observed_batch().entries;
+    auction_entries.reverse();
+    let expected_auction = render_auction_repush("10:30:59", &auction_entries);
+    let occurrence = "candidate-board:2026-09-23:10:30";
+    let before = database.read_candidate_board_v2_freeze(occurrence).unwrap();
+    assert_eq!(before.is_some(), role == "restart");
+    let acquisitions = Cell::new(0);
+    let events = RefCell::new(Vec::new());
+    let auction_denied =
+        crate::notify::PushOutcome::Denied("TEST_CODE original auction denial".to_owned());
+    let invalidated_error =
+        crate::notify::PushOutcome::SinkError("TEST_CODE original T08 sink uncertainty".to_owned());
+    let observations = p05_shared_unit::dispatch_with(
+        "2026-09-23",
+        "2026-09-23T10:30:59+08:00".parse().unwrap(),
+        || async {
+            acquisitions.set(acquisitions.get() + 1);
+            // The captured slot must survive an actual await before preparation.
+            tokio::task::yield_now().await;
+            Ok(observed_batch())
+        },
+        |child| {
+            let kind = child.token.descriptor().push_kind;
+            assert_eq!(child.binding.business_date().to_string(), "2026-09-23");
+            assert!(child.binding.task_binding().is_none());
+            let outcome = match kind {
+                crate::notify::PushKind::AuctionRepush => {
+                    events.borrow_mut().push("A02");
+                    assert_eq!(child.text, expected_auction);
+                    assert_eq!(
+                        child.binding.schedule_occurrence_identity(),
+                        "auction-repush:2026-09-23:10:30:59"
+                    );
+                    assert!(!child.binding.retry_authorized());
+                    Some(auction_denied.clone())
+                }
+                crate::notify::PushKind::CandidateInvalidated => {
+                    events.borrow_mut().push("T08");
+                    assert_eq!(
+                        child.text,
+                        render_candidate_invalidated(
+                            "10:30:59",
+                            "600009",
+                            "600009",
+                            "候选",
+                            "从候选台消失"
+                        )
+                    );
+                    assert_eq!(
+                        child.binding.schedule_occurrence_identity(),
+                        "candidate-invalidated:2026-09-23:600009"
+                    );
+                    assert_eq!(child.binding.governance_code(), Some("600009"));
+                    assert!(child.binding.retry_authorized());
+                    Some(invalidated_error.clone())
+                }
+                crate::notify::PushKind::CandidateBoard => {
+                    events.borrow_mut().push("P05");
+                    let frozen = database
+                        .read_candidate_board_v2_freeze(occurrence)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(child.text, expected_board);
+                    assert_eq!(child.text.as_bytes(), frozen.rendered_bytes());
+                    assert_eq!(
+                        child.binding.source_binding_canonical(),
+                        frozen.source_canonical()
+                    );
+                    assert_eq!(
+                        child.binding.source_evidence_fingerprint(),
+                        frozen.source_sha256()
+                    );
+                    assert_eq!(
+                        child.binding.delivery_subject_hash(),
+                        frozen.source_sha256()
+                    );
+                    assert_eq!(child.binding.schedule_occurrence_identity(), occurrence);
+                    assert!(!child.binding.retry_authorized());
+                    None
+                }
+                _ => panic!("shared candidate batch cannot dispatch another kind"),
+            };
+            async move {
+                match outcome {
+                    Some(outcome) => outcome,
+                    None => {
+                        crate::durable_delivery_runtime::deliver_counted_binding(
+                            child.binding,
+                            kind,
+                            child.text,
+                            None,
+                        )
+                        .await
+                    }
+                }
+            }
+        },
+        || {
+            events.borrow_mut().push("previous");
+            Some(["600009".to_owned()].into())
+        },
+        |codes| {
+            events.borrow_mut().push("snapshot");
+            let expected_codes: std::collections::BTreeSet<_> =
+                ["TEST_CODE_p05_a".to_owned(), "TEST_CODE_p05_b".to_owned()].into();
+            assert_eq!(codes, &expected_codes);
+            assert_eq!(database.count_predictions().unwrap(), 2);
+        },
     )
     .await;
-    assert_eq!(outcome, crate::notify::PushOutcome::Pushed);
+    assert_eq!(acquisitions.get(), 1);
+    assert_eq!(
+        *events.borrow(),
+        vec!["A02", "previous", "T08", "snapshot", "P05"]
+    );
+    assert_eq!(
+        observations.auction_repush,
+        CandidateChildObservation::Observed(auction_denied)
+    );
+    assert_eq!(
+        observations.candidate_board,
+        CandidateChildObservation::Observed(crate::notify::PushOutcome::Pushed)
+    );
+    assert_eq!(
+        observations.invalidated,
+        InvalidatedObservation::Items(vec![(
+            "600009".to_owned(),
+            CandidateChildObservation::Observed(invalidated_error)
+        )])
+    );
+    assert!(!observations.auction_repush.was_pushed() && observations.candidate_board.was_pushed());
+    let record = database
+        .read_candidate_board_v2_freeze(occurrence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .ordered_rows()
+            .iter()
+            .map(|row| row.code())
+            .collect::<Vec<_>>(),
+        vec!["TEST_CODE_p05_a", "TEST_CODE_p05_b"]
+    );
+    assert_eq!(record.rendered_bytes(), expected_board.as_bytes());
+    if let Some(before) = before {
+        assert_eq!(
+            record, before,
+            "restart must reuse exact bytes and original prediction row IDs"
+        );
+    }
+    assert_eq!(database.count_predictions().unwrap(), 2);
 
     let counted = stock_analysis::durable_delivery::DurableDeliveryCoordinator::open(
         stock_analysis::durable_delivery::CoordinatorConfig::test(
@@ -136,6 +262,75 @@ async fn p05_counted_producer_real_binding_child() {
     .unwrap();
     assert_eq!(card.decision_identity(), expected.decision_identity);
     assert_eq!(card.envelope_sha256(), expected.canonical_sha256().unwrap());
+
+    // A missing legacy baseline and an explicitly empty observed difference
+    // stay distinct. Neither can manufacture another child's Accepted result.
+    for (previous, outcome, expected_delta) in [
+        (
+            None,
+            crate::notify::PushOutcome::SinkError(
+                "TEST_CODE exact board sink uncertainty".to_owned(),
+            ),
+            InvalidatedObservation::NoPreviousSnapshot,
+        ),
+        (
+            Some(["TEST_CODE_p05_a".to_owned(), "TEST_CODE_p05_b".to_owned()].into()),
+            crate::notify::PushOutcome::Deduped,
+            InvalidatedObservation::EmptyObservedDifference,
+        ),
+        (
+            None,
+            crate::notify::PushOutcome::Denied("TEST_CODE exact board denial".to_owned()),
+            InvalidatedObservation::NoPreviousSnapshot,
+        ),
+    ] {
+        let reads = Cell::new(0);
+        let snapshots = Cell::new(0);
+        let observed = p05_shared_unit::dispatch_with(
+            "2026-09-23",
+            "2026-09-23T10:30:59+08:00".parse().unwrap(),
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(Ok(observed_batch()))
+            },
+            |child| {
+                let kind = child.token.descriptor().push_kind;
+                std::future::ready(match kind {
+                    crate::notify::PushKind::AuctionRepush => crate::notify::PushOutcome::Deduped,
+                    crate::notify::PushKind::CandidateBoard => {
+                        assert_eq!(
+                            snapshots.get(),
+                            1,
+                            "legacy snapshot precedes even a negative board send"
+                        );
+                        assert_eq!(child.text.as_bytes(), record.rendered_bytes());
+                        outcome.clone()
+                    }
+                    _ => panic!("missing or empty baseline must not invent T08 delivery"),
+                })
+            },
+            || previous,
+            |_| {
+                snapshots.set(snapshots.get() + 1);
+            },
+        )
+        .await;
+        assert_eq!(reads.get(), 1);
+        assert_eq!(snapshots.get(), 1);
+        assert_eq!(observed.invalidated, expected_delta);
+        assert_eq!(
+            observed.candidate_board,
+            CandidateChildObservation::Observed(outcome)
+        );
+        assert!(!observed.auction_repush.was_pushed() && !observed.candidate_board.was_pushed());
+        assert_eq!(
+            database
+                .read_candidate_board_v2_freeze(occurrence)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+    }
 
     let legacy_binding = build_candidate_board_counted_binding(
         chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap(),
@@ -186,7 +381,7 @@ async fn p05_counted_producer_real_binding_child() {
 }
 
 #[test]
-fn p05_counted_producer_real_binding_restarts_without_second_sink_or_prediction_rows() {
+fn p05_shared_unit_one_acquisition_reuses_real_binding_fixture_across_restart() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let code = format!(
         "TEST_CODE_P05_PRODUCER_{}_{}",

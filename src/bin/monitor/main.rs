@@ -11642,14 +11642,21 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         // 窗口内每次扫描 tick (约 30s) 保留重试资格; 重复推送由进程内
                         // cooldown 拦截 (AuctionRepush=600s, CandidateBoard=1800s)。
                         if !post_close_candidates_notified {
-                            let repush_ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                            let repushed =
-                                push_templates::dispatch_auction_repush(&repush_ts).await;
-                            log::info!("[竞价][BR-223] A-02 auction repush pushed={repushed}");
-                            let board_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                            let board_pushed =
-                                push_templates::dispatch_candidate_board(&board_date).await;
-                            log::info!("[竞价][BR-223] P-05 candidate board pushed={board_pushed}");
+                            let captured_at = stock_analysis::monitor::prediction::shanghai_now();
+                            let board_date = captured_at.format("%Y-%m-%d").to_string();
+                            let observations = push_templates::dispatch_auction_candidate_unit(
+                                &board_date,
+                                captured_at,
+                            )
+                            .await;
+                            let repushed = observations.auction_repush.was_pushed();
+                            let board_pushed = observations.candidate_board.was_pushed();
+                            log::info!(
+                                "[竞价][BR-223] A-02={} P-05={} T-08 observed_children={}; legacy completion pair only",
+                                observations.auction_repush.label(),
+                                observations.candidate_board.label(),
+                                observations.invalidated.observed_count(),
+                            );
 
                             if repushed && board_pushed {
                                 post_close_candidates_notified = true;
