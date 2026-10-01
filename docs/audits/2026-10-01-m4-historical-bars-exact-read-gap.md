@@ -5,6 +5,18 @@ Read-only audit at `68781c4c`, 2026-10-01. This records why a
 not admit a backtest run, certify a point-in-time data set, or change legacy
 acquisition and storage.
 
+## 2026-10-02 handoff update
+
+The Windows public bundle 2026-10-01.3 documents explicit inclusive start/end
+for HithinkFinance HistoricalBars (and EmQuant, whose bridge is currently
+unavailable). Mac's general acquisition still sends codes/days. The next task
+is to map the existing exact-date request, verify caller-limit truncation and
+per-symbol trading-date coverage, and retain an immutable request/evidence
+capture. A date-range RPC alone does not establish complete coverage or PIT.
+Do not continue describing the upstream as having no date-range interface.
+See the [handoff task plan](../superpowers/plans/2026-10-01-windows-grpc-development-plan.md),
+WG06, for the current dependency and acceptance criteria.
+
 ## Current boundaries
 
 | Boundary | What it proves | What it does not prove |

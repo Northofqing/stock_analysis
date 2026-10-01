@@ -2,6 +2,14 @@
 
 本文按**生产事实、开发验证、外部依赖**分层记录当前欠项。完整目标和阶段依赖见[平台路线图](../superpowers/plans/2026-09-28-platform-complete-roadmap.md)；单次上线的制品与运行证据见[Wave 0 切换记录](../ops/2026-10-01-wave0-monitor-cutover.md)。本文不是上线批准，也不将源码测试等同于真实接收、账本或交易日观察。
 
+## 2026-10-02 Windows 交接更新
+
+本次已读取 Windows 交接和 2026-10-01.3 公开包。10/1 23:55:58 CST Mac最小验证exit0：manifest9/9、TLS/认证、Health live/ready及四项身份一致，Capabilities129条；未做本轮业务RPC或生产切换。服务source67c832e4、descriptor abf28a3e、binary9302a303与根/生产/Wave1旧编译pin不同，现有Rust来源资格不能因此通过。新包父目录凭据路径也不满足Rust loader边界。先准备自包含独立探针包、同步版本化信任和历史回执策略、封存公开构建输入，后做当前同版业务验收及独立后继候选。Wave1获批元组保持精确，切换前以实际来源门禁判断。
+
+具体任务、责任、前置和验收见[Windows交接开发任务](../superpowers/plans/2026-10-01-windows-grpc-development-plan.md)。历史日线已有Hithink start/end公开合同，欠Mac exact-window映射、完整coverage/PIT与immutable读取；资金流只有新能力登记，缺同版业务成功证据；公告全量/D14/D17/D20权威合同及R08确认交割仍未补齐。CFFEXv2 Planned合同与Mac分离实现已有，保留确认语义缺口。新增官方发布64/65为独立后续切片，不能关闭M0–M7。
+
+下方22:45及更早运行事实保留各自时间点，不代表本轮重新检查后的生产快照。
+
 ## 已有的生产事实
 
 - Wave 0 在冻结源码 `1f0fc6a7f2c90916066a937e128500c532ae1c85` 和获批 activation 下单实例运行。20:35 CST 持久投递库为 `Delivered=981`、`RejectedDurable=3988`、`ManualResolvedRejected=6`、`UncertainManualReview=78`；一条 `AcceptedAuditPending` 仅恢复审计和最终状态，没有重发。
