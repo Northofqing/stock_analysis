@@ -7189,6 +7189,228 @@ fn p05_v1_and_frozen_v2_compete_for_one_counted_occurrence_without_row_delivery_
 }
 
 #[test]
+fn p05_cross_db_read_tracks_freeze_pending_and_accepted_without_resend() {
+    use crate::p05_candidate_board_link::{
+        read_candidate_board_occurrence_link, CandidateBoardOccurrenceLinkV1,
+    };
+
+    let (prediction_directory, frozen) = p05_v2_frozen_source();
+    let prediction_db = crate::database::DatabaseManager::open_isolated_for_test(
+        prediction_directory
+            .path()
+            .join("TEST_CODE_p05_counted_source.db"),
+    )
+    .unwrap();
+    let fixture = Fixture::new("P05_CROSS_DB_ACCEPTED");
+    let read = || {
+        read_candidate_board_occurrence_link(
+            &prediction_db,
+            &fixture.coordinator,
+            frozen.business_date(),
+            frozen.occurrence_identity(),
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        read(),
+        CandidateBoardOccurrenceLinkV1::FrozenOnly { .. }
+    ));
+    assert!(read().accepted_rows().is_none());
+
+    let envelope = p05_v2_envelope(&frozen, frozen.source_canonical().to_vec());
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &envelope, &append);
+    let first = read();
+    assert!(matches!(
+        &first,
+        CandidateBoardOccurrenceLinkV1::VerifiedV2 { .. }
+    ));
+    assert!(first.accepted_rows().is_none());
+    let codes: Vec<String> = frozen
+        .ordered_rows()
+        .iter()
+        .map(|row| row.code().to_owned())
+        .collect();
+    let retry_samples: Vec<(String, f64)> = codes.iter().map(|code| (code.clone(), 80.0)).collect();
+    let retry_report = crate::monitor::prediction::save_candidate_samples(
+        &prediction_db,
+        frozen.business_date(),
+        frozen.target_date(),
+        &retry_samples,
+    );
+    let retry_freeze = prediction_db
+        .freeze_candidate_board_v2(
+            frozen.business_date(),
+            frozen.occurrence_identity(),
+            frozen.target_date(),
+            frozen.rendered_bytes(),
+            &codes,
+            &retry_report,
+        )
+        .unwrap();
+    assert!(!retry_freeze.inserted());
+    assert_eq!(retry_freeze.record(), &frozen);
+    let retry = fixture.coordinator.prepare(&envelope, 1, now()).unwrap();
+    assert_eq!(retry.state, DecisionState::Reserved);
+    assert_eq!(read(), first);
+
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &envelope.decision_identity,
+    );
+    let accepted = read();
+    let rows = accepted.accepted_rows().expect("verified Accepted receipt");
+    assert_eq!(rows, frozen.ordered_rows());
+    assert_eq!(read(), accepted, "crash recovery is a read, not a resend");
+}
+
+#[test]
+fn p05_cross_db_read_keeps_legacy_v1_unlinked_despite_matching_freeze() {
+    use crate::p05_candidate_board_link::{
+        read_candidate_board_occurrence_link, CandidateBoardOccurrenceLinkV1,
+    };
+
+    let (prediction_directory, frozen) = p05_v2_frozen_source();
+    let prediction_db = crate::database::DatabaseManager::open_isolated_for_test(
+        prediction_directory
+            .path()
+            .join("TEST_CODE_p05_counted_source.db"),
+    )
+    .unwrap();
+    let fixture = Fixture::new("P05_CROSS_DB_V1");
+    let legacy_source = serde_json::to_vec(&serde_json::json!({
+        "schema": "candidate-board-v1",
+        "business_date": frozen.business_date(),
+        "rendered_sha256": frozen.rendered_sha256(),
+    }))
+    .unwrap();
+    let legacy_source_hash = sha256_hex(&legacy_source);
+    let legacy = DeliveryEnvelope::new(
+        frozen.business_date(),
+        PushKind::CandidateBoard,
+        DeliverySubKind::None,
+        "GLOBAL",
+        frozen.occurrence_identity(),
+        &legacy_source_hash,
+        legacy_source,
+        legacy_source_hash.clone(),
+        frozen.rendered_bytes().to_vec(),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(legacy.rendered_content_sha256, frozen.rendered_sha256());
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &legacy, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&legacy.decision_identity, &sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &legacy.decision_identity,
+    );
+    let result = read_candidate_board_occurrence_link(
+        &prediction_db,
+        &fixture.coordinator,
+        frozen.business_date(),
+        frozen.occurrence_identity(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &result,
+        CandidateBoardOccurrenceLinkV1::UnlinkedV1 { .. }
+    ));
+    assert!(result.accepted_rows().is_none());
+}
+
+#[test]
+fn p05_cross_db_read_fails_closed_on_mismatched_or_missing_prediction_truth() {
+    use crate::p05_candidate_board_link::{
+        read_candidate_board_occurrence_link, CandidateBoardLinkError,
+    };
+
+    let (prediction_directory, frozen) = p05_v2_frozen_source();
+    let prediction_db = crate::database::DatabaseManager::open_isolated_for_test(
+        prediction_directory
+            .path()
+            .join("TEST_CODE_p05_counted_source.db"),
+    )
+    .unwrap();
+    let source = std::str::from_utf8(frozen.source_canonical()).unwrap();
+    let first_id = frozen.ordered_rows()[0].prediction_row_id();
+    let forged_source = source.replacen(
+        &format!("\"prediction_row_id\":{first_id}"),
+        &format!("\"prediction_row_id\":{}", first_id + 1_000_000),
+        1,
+    );
+    assert_ne!(forged_source, source);
+    let forged = p05_v2_envelope(&frozen, forged_source.into_bytes());
+    let fixture = Fixture::new("P05_CROSS_DB_MISMATCH");
+    fixture.coordinator.prepare(&forged, 1, now()).unwrap();
+    assert!(matches!(
+        read_candidate_board_occurrence_link(
+            &prediction_db,
+            &fixture.coordinator,
+            frozen.business_date(),
+            frozen.occurrence_identity(),
+        ),
+        Err(CandidateBoardLinkError::Mismatch(_))
+    ));
+
+    let missing_directory = tempfile::tempdir().unwrap();
+    let missing_db = crate::database::DatabaseManager::open_isolated_for_test(
+        missing_directory.path().join("TEST_CODE_p05_missing.db"),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_candidate_board_occurrence_link(
+            &missing_db,
+            &fixture.coordinator,
+            frozen.business_date(),
+            frozen.occurrence_identity(),
+        ),
+        Err(CandidateBoardLinkError::Mismatch(_))
+    ));
+
+    let exact = Fixture::new("P05_CROSS_DB_TAMPERED_ROW");
+    let envelope = p05_v2_envelope(&frozen, frozen.source_canonical().to_vec());
+    exact.coordinator.prepare(&envelope, 1, now()).unwrap();
+    Connection::open(
+        prediction_directory
+            .path()
+            .join("TEST_CODE_p05_counted_source.db"),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE prediction_tracker SET stock_code='TEST_CODE_p05_tampered' WHERE id=?1",
+        [first_id],
+    )
+    .unwrap();
+    assert!(matches!(
+        read_candidate_board_occurrence_link(
+            &prediction_db,
+            &exact.coordinator,
+            frozen.business_date(),
+            frozen.occurrence_identity(),
+        ),
+        Err(CandidateBoardLinkError::Prediction(_))
+    ));
+}
+
+#[test]
 fn p05_counted_v2_admission_rejects_source_with_wrong_trading_dates_or_row_identity() {
     let (_prediction_directory, frozen) = p05_v2_frozen_source();
     let fixture = Fixture::new("P05_V2_BAD_SOURCE");
