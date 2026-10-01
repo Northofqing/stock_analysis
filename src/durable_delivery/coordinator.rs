@@ -42,6 +42,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 #[path = "coordinator_candidate_board.rs"]
 mod candidate_board;
 pub use candidate_board::{CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1};
+#[path = "coordinator_g5b.rs"]
+mod g5b;
+pub use g5b::{G5bCountedObservationV1, G5bCountedTerminalV1};
 
 const AUDIT_KINDS: [&str; 14] = [
     "DecisionStateChanged",

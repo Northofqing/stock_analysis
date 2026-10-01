@@ -5912,6 +5912,143 @@ fn g5b_policy_is_global_no_cooldown_and_budget_exempt() {
     assert_eq!(row.push_kind.stable_template_id(), "g5b_attribution_v1");
 }
 
+fn g5b_frozen_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope {
+    let business_date = "2026-08-18";
+    let code = "TEST_CODE_G5B";
+    let triggered_at = "2026-08-18T15:06:00+08:00";
+    let category = "TEST_CODE_CATEGORY";
+    let message = format!("TEST_CODE_EVENT_{label}");
+    let rendered = format!("TEST_CODE_FROZEN_SUMMARY_{label}").into_bytes();
+    let rendered_sha256 = sha256_hex(&rendered);
+    let event_hash = sha256_hex(format!("{triggered_at}|{code}|{category}|{message}").as_bytes());
+    let mut source = serde_json::json!({
+        "schema": "g5b-attribution-v1",
+        "business_date": business_date,
+        "code": code,
+        "triggered_at": triggered_at,
+        "category": category,
+        "level": "TEST_CODE_LEVEL",
+        "message": message,
+        "rendered_sha256": rendered_sha256,
+    });
+    if extra_source_field {
+        source["forged"] = serde_json::json!("TEST_CODE_FORGED");
+    }
+    let source_canonical = serde_json::to_vec(&source).unwrap();
+    let source_sha256 = sha256_hex(&source_canonical);
+    DeliveryEnvelope::new(
+        business_date,
+        PushKind::G5bAttribution,
+        DeliverySubKind::None,
+        "GLOBAL",
+        format!("g5b-attribution:{business_date}:{code}:{event_hash}"),
+        source_sha256.clone(),
+        source_canonical,
+        source_sha256,
+        rendered,
+        true,
+        None,
+    )
+    .expect("TEST_CODE G5b frozen envelope")
+}
+
+#[test]
+fn g5b_frozen_observation_requires_matching_source_and_authoritative_receipt() {
+    let fixture = Fixture::new("G5B_FROZEN_ACCEPTED");
+    let append = MemoryAppendPort::default();
+    let envelope = g5b_frozen_envelope("ACCEPTED", false);
+    let observe = |source_sha256: &str| {
+        fixture.coordinator.g5b_counted_observation_for_frozen(
+            &envelope.business_date,
+            &envelope.schedule_occurrence_identity,
+            source_sha256,
+            &envelope.rendered_content_sha256,
+        )
+    };
+    assert!(observe(&envelope.source_binding_sha256).unwrap().is_none());
+    prepare_reserved(&fixture, &envelope, &append);
+    let pending = observe(&envelope.source_binding_sha256).unwrap().unwrap();
+    assert_eq!(pending.terminal(), G5bCountedTerminalV1::Pending);
+    assert!(!pending.is_authoritative_accepted());
+    assert!(pending.terminal_evidence_sha256().is_none());
+    assert!(matches!(
+        observe(&"0".repeat(64)),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    fixture
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .expect("TEST_CODE accepted G5b counted delivery");
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &envelope.decision_identity,
+    );
+    let accepted = observe(&envelope.source_binding_sha256).unwrap().unwrap();
+    assert_eq!(accepted.decision_identity(), envelope.decision_identity);
+    assert_eq!(accepted.terminal(), G5bCountedTerminalV1::Accepted);
+    assert!(accepted.is_authoritative_accepted());
+    assert!(accepted.authoritative_attempt_identity().is_some());
+    assert!(accepted.immutable_audit_ref().is_some());
+    assert!(accepted.terminal_evidence_sha256().is_some());
+    assert_eq!(accepted.accepted_channel(), Some("TEST_CODE_CHANNEL"));
+    assert_eq!(
+        accepted,
+        observe(&envelope.source_binding_sha256).unwrap().unwrap()
+    );
+}
+
+#[test]
+fn g5b_frozen_observation_rejects_unbound_source_and_nonaccepted_terminal() {
+    let forged = Fixture::new("G5B_FROZEN_FORGED");
+    let forged_envelope = g5b_frozen_envelope("FORGED", true);
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&forged, &forged_envelope, &append);
+    assert!(matches!(
+        forged.coordinator.g5b_counted_observation_for_frozen(
+            &forged_envelope.business_date,
+            &forged_envelope.schedule_occurrence_identity,
+            &forged_envelope.source_binding_sha256,
+            &forged_envelope.rendered_content_sha256,
+        ),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+
+    let rejected = Fixture::new("G5B_FROZEN_REJECTED");
+    let envelope = g5b_frozen_envelope("REJECTED", false);
+    prepare_reserved(&rejected, &envelope, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Rejected(rejection(now(), false)));
+    let sinks: Vec<AuthoritativeSink> = vec![sink];
+    rejected
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .expect("TEST_CODE rejected G5b counted delivery");
+    reconcile_terminal(
+        &rejected,
+        &append,
+        DecisionState::RejectedDurable,
+        &envelope.decision_identity,
+    );
+    let observation = rejected
+        .coordinator
+        .g5b_counted_observation_for_frozen(
+            &envelope.business_date,
+            &envelope.schedule_occurrence_identity,
+            &envelope.source_binding_sha256,
+            &envelope.rendered_content_sha256,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.terminal(), G5bCountedTerminalV1::Rejected);
+    assert!(!observation.is_authoritative_accepted());
+    assert!(observation.terminal_evidence_sha256().is_some());
+    assert!(observation.accepted_channel().is_none());
+}
+
 #[test]
 fn a12_attribution_daily_policy_is_global_business_date_once_and_budget_exempt() {
     // 2026-09-20 用户决策 (分流规则): 每日必达类豁免日预算 — 15:05 归因日推

@@ -12,6 +12,7 @@ mod schema;
 
 pub use coordinator::{
     CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1, DurableDeliveryCoordinator,
+    G5bCountedObservationV1, G5bCountedTerminalV1,
 };
 pub use correlation::P01OriginProducer;
 pub use model::{
