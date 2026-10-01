@@ -12667,6 +12667,18 @@ fn r08_is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn r08_market_announcement_source_allowed(source: &str) -> bool {
+    source == "cninfo-market"
+        || source
+            .strip_prefix("grpc-mtls:")
+            .is_some_and(|server_name| {
+                !server_name.is_empty()
+                    && server_name.trim() == server_name
+                    && !server_name.chars().any(char::is_whitespace)
+                    && url::Host::parse(server_name).is_ok()
+            })
+}
+
 fn validate_r08_public_binding_fields(
     binding: R08PublicSourceBinding,
 ) -> Result<ValidatedR08PublicBinding, &'static str> {
@@ -12711,9 +12723,14 @@ fn validate_r08_public_binding_fields(
             .position(|(component, _, _)| *component == evidence.component)
             .ok_or(INVALID)?;
         let observed_at = parse_r08_observed_at(&evidence.observed_at).map_err(|_| INVALID)?;
+        let source_allowed = if evidence.component == "market_announcements" {
+            r08_market_announcement_source_allowed(&evidence.source)
+        } else {
+            evidence.source == allowed[position].2
+        };
         if previous_position.is_some_and(|previous| position <= previous)
             || evidence.provider != allowed[position].1
-            || evidence.source != allowed[position].2
+            || !source_allowed
             || evidence.batch_id.trim().is_empty()
             || !matches!(evidence.status.as_str(), "available" | "verified_empty")
             || (evidence.status == "available"
@@ -12962,9 +12979,14 @@ fn r08_provider_evidence_binding<T>(
             evidence.provider
         ));
     }
-    if evidence.source != expected_source {
+    let source_allowed = if component == "market_announcements" {
+        r08_market_announcement_source_allowed(&evidence.source)
+    } else {
+        evidence.source == expected_source
+    };
+    if !source_allowed {
         return Err(format!(
-            "R-08 {component} source mismatch: expected={expected_source} actual={}",
+            "R-08 {component} source mismatch: expected={expected_source} or qualified announcement mTLS authority actual={}",
             evidence.source
         ));
     }
@@ -14353,6 +14375,55 @@ mod tests_br140_r08_partial_components {
             serde_json::from_slice(&prepared.task_transition_basis_canonical).unwrap();
         assert_eq!(task_basis["task"], "R-08");
         assert_eq!(task_basis["batch_ids"][3], "TEST_CODE_fx_batch");
+    }
+
+    #[test]
+    fn br161_r08_external_announcement_authority_survives_durable_binding() {
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let reminder_date = r08_reminder_trading_date(business_date);
+        let mut announcements = announcement_batch(business_date);
+        match &mut announcements {
+            stock_analysis::data_gateway::GatewayBatch::Available { evidence, .. } => {
+                evidence.source = "grpc-mtls:magic-market.local".to_string();
+            }
+            stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(_) => unreachable!(),
+        }
+        let futures = cffex_batch(reminder_date);
+        let prepared = prepare_r08_counted_delivery(
+            business_date,
+            reminder_date,
+            prepared_calendar(),
+            Some(&announcements),
+            Some(&futures),
+            Some(&indices_batch()),
+            Some(&fx_batch()),
+        )
+        .expect("qualified ExternalV1 announcement source is accepted");
+        let binding =
+            counted_binding_from_r08(&prepared, prepared.source_binding_canonical.clone());
+        assert_eq!(
+            binding.validate_r08_public_source_only_text(&prepared.rendered),
+            Ok(())
+        );
+        let mut recorded: R08PublicSourceBinding =
+            serde_json::from_slice(&prepared.source_binding_canonical).unwrap();
+        assert_eq!(
+            recorded.provider_batches[0].source,
+            "grpc-mtls:magic-market.local"
+        );
+
+        for invalid in [
+            "grpc-mtls:",
+            "grpc-mtls: bad.local",
+            "grpc-mtls:https://bad.local",
+        ] {
+            recorded.provider_batches[0].source = invalid.to_string();
+            let canonical = serde_json::to_vec(&recorded).unwrap();
+            assert!(matches!(
+                validate_r08_public_source_binding_canonical_bytes(&canonical),
+                Err("counted_r08_source_only_binding_invalid")
+            ));
+        }
     }
 
     #[test]
