@@ -16,12 +16,19 @@ class VerifyExecutableInputManifestTests(unittest.TestCase):
         self.root = Path(self.temp.name) / "root"
         (self.root / "src").mkdir(parents=True)
         (self.root / "config").mkdir()
+        cargo = self.root / "Cargo.toml"
+        cargo.write_bytes(b'[package]\nname="TEST_CODE"\n')
         self.input = self.root / "src" / "example.rs"
         self.input.write_bytes(b"fn main() {}\n")
         self.manifest = Path(self.temp.name) / "manifest.json"
         self.manifest.write_text(
             json.dumps(
                 [
+                    {
+                        "path": "Cargo.toml",
+                        "length": cargo.stat().st_size,
+                        "sha256": hashlib.sha256(cargo.read_bytes()).hexdigest(),
+                    },
                     {
                         "path": "src/example.rs",
                         "length": self.input.stat().st_size,
@@ -42,7 +49,7 @@ class VerifyExecutableInputManifestTests(unittest.TestCase):
             {"config/selection/selection_activation.v1.json"},
             activation_ready=True,
         )
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
         self.assertEqual(errors, [])
 
     def test_modified_bytes_and_unexpected_extra_fail(self):
@@ -51,6 +58,81 @@ class VerifyExecutableInputManifestTests(unittest.TestCase):
         _, errors = verify(self.manifest, self.root, set())
         self.assertTrue(any("input differs: src/example.rs" == error for error in errors))
         self.assertTrue(any("unexpected input file: src/extra.rs" == error for error in errors))
+
+    def test_activation_ready_rejects_unsealed_root_build_inputs(self):
+        for name in ("Cargo.extra.toml", "Cargo.lock", "build.rs"):
+            with self.subTest(name=name):
+                extra = self.root / name
+                extra.write_bytes(b"TEST_CODE_unsealed_build_input\n")
+                try:
+                    _, generic_errors = verify(self.manifest, self.root, set())
+                    self.assertEqual(generic_errors, [])
+                    _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+                    self.assertIn(f"unexpected root input file: {name}", errors)
+                finally:
+                    extra.unlink()
+
+    def test_activation_ready_requires_root_cargo_manifest_even_if_omitted_from_seal(self):
+        (self.root / "Cargo.toml").unlink()
+        rows = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.manifest.write_text(
+            json.dumps([row for row in rows if row["path"] != "Cargo.toml"]),
+            encoding="utf-8",
+        )
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn("required root input missing: Cargo.toml", errors)
+
+    def test_activation_ready_rejects_selected_root_symlinks_and_directories(self):
+        for name in ("Cargo.extra.toml", "Cargo.lock", "build.rs"):
+            for dangling in (False, True):
+                with self.subTest(name=name, dangling=dangling):
+                    link = self.root / name
+                    link.symlink_to(
+                        Path(self.temp.name) / "missing" if dangling else self.input
+                    )
+                    try:
+                        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+                        self.assertIn(f"root input is not a regular file: {name}", errors)
+                    finally:
+                        link.unlink()
+            with self.subTest(name=name, directory=True):
+                directory = self.root / name
+                directory.mkdir()
+                try:
+                    _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+                    self.assertIn(f"root input is not a regular file: {name}", errors)
+                finally:
+                    directory.rmdir()
+
+    def test_v1_activation_seals_exact_root_build_inputs_and_ignores_other_root_files(self):
+        rows = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for name in ("Cargo.wave1.toml", "Cargo.lock", "build.rs"):
+            path = self.root / name
+            path.write_bytes(b"TEST_CODE_sealed_wave1_build_input\n")
+            rows.append({
+                "path": name, "length": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        self.manifest.write_text(json.dumps(rows), encoding="utf-8")
+        (self.root / "README.md").write_bytes(b"TEST_CODE_non_executable_root_file\n")
+        (self.root / "target").mkdir()
+        count, errors = verify(
+            self.manifest, self.root, set(), activation_ready=True,
+            input_manifest_version=MANIFEST_V1,
+        )
+        self.assertEqual(count, 5)
+        self.assertEqual(errors, [])
+        for name in ("Cargo.wave1.toml", "Cargo.lock", "build.rs"):
+            with self.subTest(name=name, missing=True):
+                path = self.root / name
+                original = path.read_bytes()
+                path.unlink()
+                _, errors = verify(
+                    self.manifest, self.root, set(), activation_ready=True,
+                    input_manifest_version=MANIFEST_V1,
+                )
+                self.assertIn(f"input invalid: {name}: missing or non-file input", errors)
+                path.write_bytes(original)
 
     def test_activation_ready_rejects_allowlisted_src_config_files(self):
         (self.root / "src" / ".DS_Store").write_bytes(b"finder")
@@ -101,7 +183,7 @@ class VerifyExecutableInputManifestTests(unittest.TestCase):
             })
         self.manifest.write_text(json.dumps(rows), encoding="utf-8")
         count, errors = verify(self.manifest, self.root, set(), activation_ready=True)
-        self.assertEqual(count, 1 + len(COMPILED_PUBLIC_INPUTS))
+        self.assertEqual(count, 2 + len(COMPILED_PUBLIC_INPUTS))
         self.assertEqual(errors, [])
 
         metadata = "contracts/external_v1_current/bundle-metadata.json"

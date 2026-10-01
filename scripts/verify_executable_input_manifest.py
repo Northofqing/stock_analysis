@@ -5,7 +5,8 @@ The manifest excludes the activation file. Pass that file as an allowed extra
 only after checking its approved SHA-256 separately.
 
 For activation readiness, use --activation-ready: activation hashes every
-regular src/config file except the activation file, so no other extra is safe.
+regular src/config file except the activation file, plus selected root
+Cargo*.toml/Cargo.lock/build.rs inputs, so no other executable extra is safe.
 V2 also requires every checked-in public gRPC build input. It is selected
 from the declared manifest, sealed build entry, or current contract directory.
 """
@@ -103,6 +104,26 @@ def verify(
     if version == MANIFEST_V2:
         for name in sorted(COMPILED_PUBLIC_INPUTS - expected.keys()):
             errors.append(f"compiled public input missing from manifest: {name}")
+
+    if activation_ready:
+        selected_root_inputs: set[str] = set()
+        try:
+            for path in root.iterdir():
+                name = path.name
+                selected = (name.startswith("Cargo") and name.endswith(".toml")) or name in {
+                    "Cargo.lock", "build.rs",
+                }
+                if not selected:
+                    continue
+                selected_root_inputs.add(name)
+                if path.is_symlink() or not path.is_file():
+                    errors.append(f"root input is not a regular file: {name}")
+                elif name not in expected:
+                    errors.append(f"unexpected root input file: {name}")
+            if "Cargo.toml" not in selected_root_inputs:
+                errors.append("required root input missing: Cargo.toml")
+        except OSError as error:
+            errors.append(f"root input enumeration failed: {error}")
 
     for name, (expected_length, expected_digest) in expected.items():
         path = root
