@@ -1314,11 +1314,18 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.board_source = candidates.board_source;
     prepared.data.candidate_board_codes = candidates.selected_boards;
     let positions_result = io.positions_observed().await;
-    if positions_result.is_err() {
-        // The original stage error is retained by observe_stage. This stable
-        // reason does not persist a database error that may contain row data.
-        prepared.data.positions_source =
-            SourceObservation::unavailable("positions_read_failed".into());
+    if let Err(error) = &positions_result {
+        // A durable adapter may stop before any source read or after an
+        // unconfirmed effect. Its typed stop cannot certify a failed query.
+        // Neither branch persists a database error that may contain row data.
+        prepared.data.positions_source = if error.downcast_ref::<PreparationStop>().is_some() {
+            SourceObservation {
+                reason: Some("positions_stage_stopped_before_verified_observation".into()),
+                ..SourceObservation::unknown()
+            }
+        } else {
+            SourceObservation::unavailable("positions_read_failed".into())
+        };
     }
     let (positions, positions_source) =
         observe_stage(positions_result, PreparationStage::Positions, &mut prepared)?;

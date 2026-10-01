@@ -1286,6 +1286,11 @@ impl ChainPreparationIo for SyntheticIo {
 
     async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
         self.events.push("positions");
+        if self.fail_at == Some("positions_stop") {
+            return Err(anyhow::Error::new(PreparationStop::StageNotMigrated {
+                next: super::preparation::UnmigratedStage::Positions,
+            }));
+        }
         if self.fail_at == Some("positions") {
             anyhow::bail!("TEST_CODE_核心持仓失败");
         }
@@ -1483,6 +1488,43 @@ async fn core_failure_retains_stage_and_prior_observations_without_continuing_ef
         assert!(!format!("{failure:?}").contains("TEST_CODE"));
         assert!(!error.to_string().contains("TEST_CODE"));
     }
+}
+
+#[tokio::test]
+async fn typed_position_stop_does_not_claim_an_ordinary_failed_read() {
+    use super::preparation::{PreparationFailure, PreparationStage, UnmigratedStage};
+
+    let mut io = SyntheticIo {
+        events: Vec::new(),
+        fail_at: Some("positions_stop"),
+        candidate_batch: None,
+    };
+    let error = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        synthetic_input(),
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .expect_err("typed position stop must halt preparation");
+    assert!(matches!(
+        error.downcast_ref::<PreparationStop>(),
+        Some(PreparationStop::StageNotMigrated {
+            next: UnmigratedStage::Positions
+        })
+    ));
+    let failure = error.downcast_ref::<PreparationFailure>().unwrap();
+    assert_eq!(failure.stage(), PreparationStage::Positions);
+    assert_eq!(failure.positions_source().status(), &SourceStatus::Unknown);
+    assert_eq!(
+        failure.positions_source().reason(),
+        Some("positions_stage_stopped_before_verified_observation")
+    );
+    assert_eq!(failure.positions_source().batch_id(), None);
+    assert_eq!(
+        io.events,
+        ["concepts", "chain_daily", "board_codes", "positions"]
+    );
 }
 
 #[tokio::test]
