@@ -1463,6 +1463,20 @@ async fn core_failure_retains_stage_and_prior_observations_without_continuing_ef
                 .reason()
                 .unwrap()
                 .contains("TEST_CODE_目录不可用原因"));
+            assert_eq!(
+                failure.positions_source().status(),
+                &SourceStatus::Unavailable
+            );
+            assert_eq!(
+                failure.positions_source().reason(),
+                Some("positions_read_failed")
+            );
+            assert_eq!(failure.positions_source().batch_id(), None);
+        } else {
+            assert_eq!(
+                failure.positions_source().status(),
+                &SourceStatus::NotRequested
+            );
         }
         assert!(failure.failed_stage_may_have_effects());
         assert_eq!(io.events, events);
@@ -1761,6 +1775,16 @@ async fn macro_typed_stop_aborts_before_models_and_retains_prior_observations() 
             self.base.positions().await
         }
 
+        async fn positions_observed(
+            &mut self,
+        ) -> anyhow::Result<(Vec<PositionInput>, SourceObservation)> {
+            let positions = self.positions().await?;
+            let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-21T08:00:00Z")?
+                .with_timezone(&chrono::Utc);
+            let source = SourceObservation::local_positions(&positions, observed_at);
+            Ok((positions, source))
+        }
+
         async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
             self.base.lhb().await
         }
@@ -1892,6 +1916,24 @@ async fn macro_typed_stop_aborts_before_models_and_retains_prior_observations() 
         assert_eq!(failure.clusters()[0].concept, "TEST_CODE_产业");
         assert_eq!(failure.positions().len(), 1);
         assert_eq!(failure.positions()[0].code(), "TEST_CODE_持仓");
+        assert_eq!(
+            failure.positions_source().status(),
+            &SourceStatus::Available
+        );
+        let expected_source = SourceObservation::local_positions(
+            failure.positions(),
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T08:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        assert_eq!(
+            failure.positions_source().batch_id(),
+            expected_source.batch_id()
+        );
+        assert_eq!(
+            failure.positions_source().observed_at(),
+            expected_source.observed_at()
+        );
         assert_eq!(
             failure.position_concepts()["TEST_CODE_持仓"],
             ["TEST_CODE_产业"]

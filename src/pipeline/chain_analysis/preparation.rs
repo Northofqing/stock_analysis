@@ -857,6 +857,9 @@ impl PreparationFailure {
     pub fn positions(&self) -> &[PositionInput] {
         self.observed.positions()
     }
+    pub fn positions_source(&self) -> &SourceObservation {
+        self.observed.positions_source()
+    }
     pub fn position_concepts(&self) -> &BTreeMap<String, Vec<String>> {
         self.observed.position_concepts()
     }
@@ -1310,11 +1313,15 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.board_directory = candidates.board_directory;
     prepared.data.board_source = candidates.board_source;
     prepared.data.candidate_board_codes = candidates.selected_boards;
-    let (positions, positions_source) = observe_stage(
-        io.positions_observed().await,
-        PreparationStage::Positions,
-        &mut prepared,
-    )?;
+    let positions_result = io.positions_observed().await;
+    if positions_result.is_err() {
+        // The original stage error is retained by observe_stage. This stable
+        // reason does not persist a database error that may contain row data.
+        prepared.data.positions_source =
+            SourceObservation::unavailable("positions_read_failed".into());
+    }
+    let (positions, positions_source) =
+        observe_stage(positions_result, PreparationStage::Positions, &mut prepared)?;
     prepared.data.positions = positions.clone();
     prepared.data.positions_source = positions_source;
     let position_concepts = if positions.is_empty() {
