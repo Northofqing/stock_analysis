@@ -275,6 +275,19 @@ impl G5bDaySession<'_> {
         }
         Ok(())
     }
+    fn verify_actual_prefix(&self, evidence: &G5bSelectionEvidence) -> Result<()> {
+        self.validate()?;
+        let prefix = self
+            .coordinator
+            .g5b_input_log
+            .inspect_date_input_prefix_locked(self.date, &self.fence)
+            .map_err(codec_error)?;
+        evidence
+            .verify_locked_prefix(&prefix)
+            .map_err(codec_error)?;
+        self.validate()
+    }
+
     fn transaction<T>(&self, operation: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         self.validate()?;
         let validator = || self.validate();
@@ -1134,7 +1147,9 @@ impl G5bDaySession<'_> {
         if artifact::inspect(self, &intent)? != expected {
             return Err(mismatch("published cohort selection witness changed"));
         }
-        self.validate()?;
+        // The last DB transaction can run after-SQL hooks. Recheck the real
+        // source after that boundary, not merely the namespace and artifact.
+        self.verify_actual_prefix(&evidence)?;
         Ok(Some(VerifiedStoredG5bCohort {
             evidence,
             admission,
@@ -1173,9 +1188,37 @@ impl G5bDaySession<'_> {
 
     pub(crate) fn commit_prepared_artifact(&self, intent: &PreparedG5bArtifact) -> Result<()> {
         self.validate_saved_intent(intent)?;
+        // Fetch SQLite preimages before entering the validated write; the
+        // validator itself must never reacquire the DB mutex/date guard.
+        let (evidence, committed_selection) = self.transaction(|tx| {
+            let bytes: Vec<u8> = tx.query_row(
+                "SELECT selection_canonical FROM g5b_cohorts WHERE cohort_identity=?1",
+                [&intent.material.intent.cohort_identity], |row| row.get(0),
+            )?;
+            let evidence = G5bSelectionEvidence::decode(&bytes).map_err(codec_error)?;
+            let selection = if intent.material.intent.role == ArtifactRole::Selection {
+                None // First Selection commit is the publication boundary.
+            } else {
+                let selection = load_selection_intent(tx, &evidence.cohort_identity())?;
+                let encoded: Vec<u8> = tx.query_row(
+                    "SELECT file_witness_canonical FROM g5b_artifact_events WHERE logical_intent=?1 AND phase='Committed'",
+                    [&selection.logical_intent], |row| row.get(0),
+                )?;
+                let expected: artifact::FileWitness = serde_json::from_slice(&encoded)?;
+                Some((selection, expected))
+            };
+            Ok((evidence, selection))
+        })?;
         let witness = artifact::inspect(self, intent)?;
         let validate = || {
-            self.validate()?;
+            self.verify_actual_prefix(&evidence)?;
+            if let Some((selection, expected)) = &committed_selection {
+                if artifact::inspect(self, selection)? != *expected {
+                    return Err(mismatch(
+                        "committed Selection changed at transaction boundary",
+                    ));
+                }
+            }
             if artifact::inspect(self, intent)? != witness {
                 return Err(mismatch("artifact witness changed at transaction boundary"));
             }

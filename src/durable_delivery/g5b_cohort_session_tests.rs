@@ -623,3 +623,139 @@ fn g5b_cohort_b_legacy_journal_and_unknown_snapshot_do_not_gain_first_admission(
         );
     }
 }
+
+fn after_n_sql_transactions(
+    coordinator: &Arc<DurableDeliveryCoordinator>,
+    count: usize,
+    mutation: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+) {
+    let owner = Arc::downgrade(coordinator);
+    coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePreCommitValidation,
+            move || {
+                if count == 1 {
+                    mutation()
+                } else {
+                    let owner = owner.upgrade().expect("isolated owner remains live");
+                    after_n_sql_transactions(&owner, count - 1, mutation);
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn g5b_cohort_b_read_rechecks_source_after_second_witness_sql_boundary() {
+    let fixture = Fixture::new("COHORT_B_READ_FINAL_PREFIX");
+    let log = initialize(&fixture);
+    append(&fixture, &log, &raw("600001", "重要"));
+    let (session, _) = published(&fixture);
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&called);
+    let path = source(&fixture);
+    let mutation = Arc::new(move || {
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(b"TEST_CODE_second_SQL_uncommitted_suffix\n")?;
+        file.sync_all()?;
+        observed.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    // First SELECT obtains cohort evidence; second SELECT obtains committed
+    // artifact witness after the original actual-prefix check has completed.
+    after_n_sql_transactions(fixture.coordinator.0.as_ref().unwrap(), 2, mutation);
+    let before = blob_rows(&fixture);
+    assert!(session.read_cohort().is_err());
+    assert!(called.load(Ordering::SeqCst));
+    assert_eq!(blob_rows(&fixture), before);
+}
+
+#[test]
+fn g5b_cohort_b_commit_sql_hook_rechecks_source_and_prior_selection_before_acknowledgement() {
+    for mode in [
+        "first_selection_source",
+        "attempt_source",
+        "attempt_selection_inode",
+    ] {
+        let fixture = Fixture::new(&format!("COHORT_B_COMMIT_FINAL_{mode}"));
+        let log = initialize(&fixture);
+        append(&fixture, &log, &raw("600001", "重要"));
+        let session = fixture.coordinator.g5b_day_session(date()).unwrap();
+        let selection = session.prepare_cohort(&ready(&session)).unwrap();
+        publish(&fixture, &session, &selection);
+        let target = if mode == "first_selection_source" {
+            selection
+        } else {
+            session.commit_prepared_artifact(&selection).unwrap();
+            let cohort = session.read_cohort().unwrap().unwrap();
+            let attempt = session
+                .prepare_opaque_snapshot(
+                    &cohort,
+                    G5bSnapshotKind::Attempt,
+                    Some(0),
+                    b"TEST_CODE_attempt_final_boundary",
+                )
+                .unwrap();
+            publish(&fixture, &session, &attempt);
+            attempt
+        };
+        let selection_path = {
+            let connection = Connection::open(&fixture.database_path).unwrap();
+            let filename: Vec<u8> = if mode == "attempt_selection_inode" {
+                connection.query_row("SELECT file_witness_canonical FROM g5b_artifact_events WHERE artifact_role='Selection' AND phase='Committed'",[],|r|r.get(0)).unwrap()
+            } else {
+                Vec::new()
+            };
+            if filename.is_empty() {
+                None
+            } else {
+                let witness: serde_json::Value = serde_json::from_slice(&filename).unwrap();
+                Some(namespace(&fixture).join(witness["filename"].as_str().unwrap()))
+            }
+        };
+        let retained = namespace(&fixture).join("TEST_CODE_retained-committed-selection");
+        let hook_retained = retained.clone();
+        let replacement_path = selection_path.clone();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let source = source(&fixture);
+        let mutation = Arc::new(move || {
+            if let Some(path) = &replacement_path {
+                let bytes = std::fs::read(path)?;
+                std::fs::rename(path, &hook_retained)?;
+                std::fs::write(path, &bytes)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+            } else {
+                let mut file = std::fs::OpenOptions::new().append(true).open(&source)?;
+                file.write_all(b"TEST_CODE_commit_SQL_uncommitted_suffix\n")?;
+                file.sync_all()?;
+            }
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        // Two saved-intent SELECTs and one evidence/witness SELECT precede
+        // the actual fourth transaction's Committed INSERT + head CAS.
+        after_n_sql_transactions(fixture.coordinator.0.as_ref().unwrap(), 4, mutation);
+        let before = blob_rows(&fixture);
+        let result = session.commit_prepared_artifact(&target);
+        if let Some(path) = selection_path {
+            fixture
+                .cleanup
+                .record_if_present(&retained, OwnedPathKind::FileOrSymlink);
+            fixture
+                .cleanup
+                .record_if_present(&path, OwnedPathKind::FileOrSymlink);
+        }
+        assert!(
+            called.load(Ordering::SeqCst),
+            "actual commit SQL boundary was not reached: {mode}"
+        );
+        assert!(result.is_err(), "{mode}");
+        assert_eq!(
+            blob_rows(&fixture),
+            before,
+            "Committed SQL/head CAS must roll back: {mode}"
+        );
+    }
+}
