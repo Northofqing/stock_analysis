@@ -33,6 +33,9 @@ pub struct ResearchStrategyDeclarationV2<'a> {
 
 /// The complete requested symbol set must have one sealed observation each.
 /// `benchmark` must come from `BenchmarkReader::read_verified_exact`.
+/// `from/to` bound the evaluation and modeled-execution window, not a complete
+/// historical-bars acquisition window. Earlier warmup bars may be observed;
+/// gaps inside the window remain unqualified and later bars are rejected.
 pub struct ObservedResearchRunRequestV2<'a> {
     pub strategy: ResearchStrategyDeclarationV2<'a>,
     pub from: NaiveDate,
@@ -475,8 +478,8 @@ mod tests {
         portfolio
     }
 
-    fn observed(code: &str, batch_id: &str, bar_date: NaiveDate) -> ObservedDailyBarsCapture {
-        let record = KlineData {
+    fn observed_record(bar_date: NaiveDate) -> KlineData {
+        KlineData {
             date: bar_date,
             open: 10.0,
             high: 10.5,
@@ -507,11 +510,14 @@ mod tests {
             is_limit_down: false,
             is_suspended: false,
             adjust: AdjustType::None,
-        };
+        }
+    }
+
+    fn observed_dates(code: &str, batch_id: &str, dates: &[NaiveDate]) -> ObservedDailyBarsCapture {
         AdmittedDailyBars::from_test_fixture_with_days(
             code,
-            1,
-            vec![record],
+            dates.len(),
+            dates.iter().copied().map(observed_record).collect(),
             BatchEvidence {
                 provider: ProviderId::Tdx,
                 source: "TEST_CODE_historical_bars".to_owned(),
@@ -525,11 +531,27 @@ mod tests {
         .unwrap()
     }
 
+    fn observed(code: &str, batch_id: &str, bar_date: NaiveDate) -> ObservedDailyBarsCapture {
+        observed_dates(code, batch_id, &[bar_date])
+    }
+
     fn exact_benchmark() -> (
         tempfile::TempDir,
         BenchmarkRequest,
         VerifiedBenchmarkSnapshot,
     ) {
+        exact_benchmark_dates(&[day()])
+    }
+
+    fn exact_benchmark_dates(
+        dates: &[NaiveDate],
+    ) -> (
+        tempfile::TempDir,
+        BenchmarkRequest,
+        VerifiedBenchmarkSnapshot,
+    ) {
+        let from = *dates.first().unwrap();
+        let to = *dates.last().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db = DatabaseManager::open_isolated_for_test(
             dir.path().join("TEST_CODE_m4_observed_run.db"),
@@ -537,16 +559,15 @@ mod tests {
         .unwrap();
         let request = BenchmarkRequest {
             instrument: "TEST_CODE_sh000300".to_owned(),
-            range: BenchmarkRange::Daily {
-                from: day(),
-                to: day(),
-            },
+            range: BenchmarkRange::Daily { from, to },
         };
+        let source_at = format!("{to}T15:00:00+08:00");
+        let observed_at = format!("{to}T16:00:00+08:00");
         let evidence = BatchEvidence {
             provider: ProviderId::Tdx,
             source: "TEST_CODE_benchmark_source".to_owned(),
-            source_at: Some("2026-01-05T15:00:00+08:00".to_owned()),
-            observed_at: "2026-01-05T16:00:00+08:00".to_owned(),
+            source_at: Some(source_at),
+            observed_at,
             batch_id: "TEST_CODE_benchmark_batch".to_owned(),
         };
         let request_hash = request.canonical_request_hash();
@@ -566,7 +587,7 @@ mod tests {
                 batch_id: Some(&evidence.batch_id),
                 outcome: "available",
                 request_count: 1,
-                accepted_count: 1,
+                accepted_count: dates.len() as i64,
                 rejected_count: 0,
                 reason_code: "accepted",
                 retryable: false,
@@ -574,15 +595,19 @@ mod tests {
             .unwrap();
         let audited = AuditedBenchmarkBatch {
             batch: GatewayBatch::Available {
-                records: vec![BenchmarkBar {
-                    at: BenchmarkBarTime::Daily(day()),
-                    open: 100.0,
-                    high: 102.0,
-                    low: 99.0,
-                    close: 101.0,
-                    volume: Some(1000.0),
-                    amount: None,
-                }],
+                records: dates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, date)| BenchmarkBar {
+                        at: BenchmarkBarTime::Daily(*date),
+                        open: 100.0 + index as f64,
+                        high: 102.0 + index as f64,
+                        low: 99.0 + index as f64,
+                        close: 101.0 + index as f64,
+                        volume: Some(1000.0),
+                        amount: None,
+                    })
+                    .collect(),
                 evidence,
             },
             receipt,
@@ -716,6 +741,80 @@ mod tests {
             build_observed_research_run_descriptor_v2(&portfolio, &changed_data)
                 .unwrap()
                 .observed_run_id()
+        );
+    }
+
+    #[test]
+    fn cross_day_lookback_is_observed_only_and_future_bars_are_rejected() {
+        let jan_2 = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let jan_6 = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
+        let jan_7 = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
+        let jan_8 = NaiveDate::from_ymd_opt(2026, 1, 8).unwrap();
+        let (_dir, benchmark_request, benchmark) = exact_benchmark_dates(&[day(), jan_6, jan_7]);
+        let instruments = vec![instrument("TEST_CODE_600000")];
+        let portfolio = portfolio_with_fill(3, "TEST_CODE_600000", 100);
+
+        // Jan 2 is explicit lookback; Jan 6 is absent from the observed equity
+        // batch even though the exact benchmark has that day. This is still
+        // only an observation identity, never full-window bar qualification.
+        let sparse = vec![observed_dates(
+            "TEST_CODE_600000",
+            "TEST_CODE_sparse_batch",
+            &[jan_2, day(), jan_7],
+        )];
+        let mut sparse_request = request(
+            br#"{"lookback":20}"#,
+            GIT_A,
+            &instruments,
+            &sparse,
+            &benchmark_request,
+            &benchmark,
+        );
+        sparse_request.to = jan_7;
+        let sparse_id = build_observed_research_run_descriptor_v2(&portfolio, &sparse_request)
+            .unwrap()
+            .observed_run_id()
+            .to_owned();
+        let complete = vec![observed_dates(
+            "TEST_CODE_600000",
+            "TEST_CODE_complete_batch",
+            &[jan_2, day(), jan_6, jan_7],
+        )];
+        let mut complete_request = request(
+            br#"{"lookback":20}"#,
+            GIT_A,
+            &instruments,
+            &complete,
+            &benchmark_request,
+            &benchmark,
+        );
+        complete_request.to = jan_7;
+        assert_ne!(
+            sparse_id,
+            build_observed_research_run_descriptor_v2(&portfolio, &complete_request)
+                .unwrap()
+                .observed_run_id()
+        );
+
+        let future = vec![observed_dates(
+            "TEST_CODE_600000",
+            "TEST_CODE_future_batch",
+            &[jan_2, day(), jan_8],
+        )];
+        let mut future_request = request(
+            br#"{"lookback":20}"#,
+            GIT_A,
+            &instruments,
+            &future,
+            &benchmark_request,
+            &benchmark,
+        );
+        future_request.to = jan_7;
+        assert_eq!(
+            build_observed_research_run_descriptor_v2(&portfolio, &future_request),
+            Err(ResearchRunDescriptorV2Error::InvalidObservation(
+                "TEST_CODE_600000".to_owned()
+            ))
         );
     }
 

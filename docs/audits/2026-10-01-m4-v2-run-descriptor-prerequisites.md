@@ -86,6 +86,11 @@ still lacks an exact persisted window, PIT membership, source-qualified
 instrument class, and a verified association between the caller-declared Git
 SHA and the executing binary. No report writer or legacy/live wrapper consumes
 this descriptor. The historical-bars exact read gate above remains open.
+Here `from/to` is the evaluation and modeled-fill window. An observed equity
+batch may include older warmup bars and may omit trading days inside that
+window; at least one in-window bar is required and a bar after `to` is rejected.
+The exact benchmark covers `from/to`, but its coverage does not repair gaps in
+the separate equity observations.
 
 Code inspected: `src/strategy/research_fill_v2.rs`,
 `src/strategy/research_portfolio_v2.rs`, `src/performance/fee_policy.rs`,
