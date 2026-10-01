@@ -27,6 +27,8 @@ mod g5b_cohort_session_tests;
 mod g5b_analysis_v2_behavior_tests;
 #[path = "g5b_mutation_fence_tests.rs"]
 mod g5b_mutation_fence_tests;
+#[path = "g5b_revision_mutation_tests.rs"]
+mod g5b_revision_mutation_tests;
 #[path = "g5b_schema12_migration_tests.rs"]
 mod g5b_schema12_migration_tests;
 

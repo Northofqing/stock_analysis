@@ -451,6 +451,19 @@ struct StoredDecision {
     task_binding_present: bool,
 }
 
+/// Explicit business effect of one transaction, independent of its public outcome.
+/// SQL helpers must not infer this from total_changes or matched UPDATE rows.
+enum MutationEffect<T> {
+    NoChange(T),
+    Changed(T),
+}
+
+enum PrepareTransactionOutcome {
+    Existing(Box<PrepareOutcome>),
+    IdentityConflict,
+    Inserted,
+}
+
 /// A private routing witness, never a serialized authority or a day seal.
 /// None records a preflight absence; existing rows bind exact immutable bytes.
 struct DecisionMutationRoute {
@@ -3172,7 +3185,7 @@ impl DurableDeliveryCoordinator {
     fn with_mutation_transaction<T>(
         &self,
         route: &DecisionMutationRoute,
-        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
         // Routing has released every attestation lease and connection mutex.
         // Never acquire a date lock from inside a SQLite operation.
@@ -3198,10 +3211,7 @@ impl DurableDeliveryCoordinator {
         let outcome = self.with_immediate_transaction_validated(
             SchemaVersionPolicy::Runtime,
             validator,
-            |transaction| {
-                route.validate(transaction)?;
-                operation(transaction)
-            },
+            |transaction| self.mutation_transaction_body(transaction, route, operation),
         );
         // Covers the connection core's post-SQL hooks as well as the commit
         // boundary, and preserves committed/compound error evidence.
@@ -3215,6 +3225,77 @@ impl DurableDeliveryCoordinator {
                 "G5b transaction and post-operation date-fence validation both failed; operation={primary}; post_validation={post}"
             ))),
         }
+    }
+
+    /// Borrowed-fence owners use this exact SQL body under their validated
+    /// Session transaction. It neither obtains a lock nor runs an external port.
+    fn mutation_transaction_body<T>(
+        &self,
+        transaction: &Transaction<'_>,
+        route: &DecisionMutationRoute,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<MutationEffect<T>>,
+    ) -> Result<T> {
+        route.validate(transaction)?;
+        match operation(transaction)? {
+            MutationEffect::NoChange(value) => Ok(value),
+            MutationEffect::Changed(value) => {
+                self.advance_g5b_mutation_revision_tx(transaction, route)?;
+                Ok(value)
+            }
+        }
+    }
+
+    fn advance_g5b_mutation_revision_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        route: &DecisionMutationRoute,
+    ) -> Result<()> {
+        let Some(date) = route.g5b_date else {
+            return Ok(());
+        };
+        let revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM g5b_day_heads WHERE business_date=?1",
+                [date.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Historical v1 writers keep their existing evidence. A business
+        // mutation cannot manufacture provenance or adopt a day into v2.
+        let Some(revision) = revision else {
+            return Ok(());
+        };
+        let next = revision.checked_add(1).ok_or_else(|| {
+            DurableDeliveryError::PolicyMismatch("G5b revision exhausted".to_owned())
+        })?;
+        let changed = transaction.execute(
+            "UPDATE g5b_day_heads SET revision=?1,current_seal_identity=NULL
+             WHERE business_date=?2 AND revision=?3",
+            params![next, date.to_string(), revision],
+        )?;
+        require_single_cas_update(changed, "G5b mutation revision advance")
+    }
+
+    // The current pointer can be NULL after late evidence. The immutable
+    // history, rather than that pointer, fences every new business opening.
+    fn require_g5b_business_open_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        route: &DecisionMutationRoute,
+    ) -> Result<()> {
+        if let Some(date) = route.g5b_date {
+            let sealed: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM g5b_day_seals WHERE business_date=?1)",
+                [date.to_string()],
+                |row| row.get(0),
+            )?;
+            if sealed {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "G5b business opening is closed by a historical day seal".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The monitor verifies producer catalog membership and the full P01 input
@@ -3266,119 +3347,20 @@ impl DurableDeliveryCoordinator {
         admission_at: DateTime<Utc>,
         origin_observation: Option<&CorrelationObservationV1>,
     ) -> Result<PrepareOutcome> {
-        enum PrepareTransactionOutcome {
-            Existing(Box<PrepareOutcome>),
-            IdentityConflict,
-            Inserted,
-        }
         let raw_canonical = serde_json::to_vec(envelope)?;
         let raw_sha256 = sha256_hex(&raw_canonical);
         let route = self.prepare_mutation_route(envelope)?;
         let transaction_outcome = self.with_mutation_transaction(&route, |transaction| {
-            if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
-                if existing.envelope_canonical == raw_canonical
-                    && existing.envelope_sha256 == raw_sha256
-                {
-                    envelope.validate()?;
-                    if envelope.push_kind == PushKind::CandidateBoard {
-                        candidate_board::validate_candidate_board_source(envelope)?;
-                        let owners = candidate_board_occurrence_owners(transaction, envelope)?;
-                        if owners.len() != 1 || owners[0] != envelope.decision_identity {
-                            return Err(DurableDeliveryError::PolicyMismatch(
-                                "P-05 exact occurrence has ambiguous counted owners".to_owned(),
-                            ));
-                        }
-                    }
-                    let hydration =
-                        load_schedule_hydration(transaction, &envelope.decision_identity)?;
-                    if let Some(observation) = origin_observation {
-                        insert_or_verify_origin_observation(
-                            transaction,
-                            envelope,
-                            observation,
-                            admission_at,
-                        )?;
-                    }
-                    return Ok(PrepareTransactionOutcome::Existing(Box::new(
-                        outcome_from_stored(&existing, &hydration),
-                    )));
-                }
-                let evidence = canonical_json(&json!({
-                    "decision_identity": envelope.decision_identity,
-                    "stored_envelope_sha256": existing.envelope_sha256,
-                    "incoming_envelope_sha256": raw_sha256,
-                }))?;
-                enqueue_audit(
-                    transaction,
-                    &envelope.decision_identity,
-                    None,
-                    "DecisionIdentityConflict",
-                    &evidence,
-                    admission_at,
-                )?;
-                return Ok(PrepareTransactionOutcome::IdentityConflict);
-            }
-
-            envelope.validate()?;
-            if envelope.push_kind == PushKind::CandidateBoard {
-                candidate_board::validate_candidate_board_source(envelope)?;
-                // BEGIN IMMEDIATE holds the writer slot across this lookup and
-                // insert. The schema trigger fences direct SQL writers too.
-                if !candidate_board_occurrence_owners(transaction, envelope)?.is_empty() {
-                    return Err(DurableDeliveryError::PolicyMismatch(
-                        "P-05 exact occurrence already has a counted decision".to_owned(),
-                    ));
-                }
-            }
-            let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
-            let denial = self.evaluate_prepare_denial(
+            self.prepare_transaction_body(
                 transaction,
-                envelope,
-                &policy,
-                authoritative_sink_count,
-                admission_at,
-            )?;
-            let initial_state = if denial.is_some() {
-                DecisionState::RejectedAuditPending
-            } else {
-                DecisionState::Reserved
-            };
-            insert_new_decision(
-                transaction,
+                &route,
                 envelope,
                 &raw_canonical,
                 &raw_sha256,
-                initial_state,
+                authoritative_sink_count,
                 admission_at,
-            )?;
-            record_state_transition(
-                transaction,
-                &envelope.decision_identity,
-                None,
-                initial_state,
-                "prepare",
-                None,
-                canonical_json(&json!({
-                    "envelope_sha256": raw_sha256,
-                    "reservation_generation": if denial.is_some() { 0 } else { 1 },
-                }))?,
-                admission_at,
-            )?;
-
-            if let Some(denial) = denial {
-                freeze_pre_sink_denial(transaction, envelope, &policy, denial, admission_at)?;
-            } else {
-                self.reserve_generation(transaction, envelope, &policy, 1, admission_at)?;
-            }
-            if let Some(observation) = origin_observation {
-                insert_or_verify_origin_observation(
-                    transaction,
-                    envelope,
-                    observation,
-                    admission_at,
-                )?;
-            }
-            Ok(PrepareTransactionOutcome::Inserted)
+                origin_observation,
+            )
         })?;
         match transaction_outcome {
             PrepareTransactionOutcome::Existing(outcome) => return Ok(*outcome),
@@ -3395,6 +3377,131 @@ impl DurableDeliveryCoordinator {
             })
         })?;
         Ok(outcome_from_stored(&stored, &None))
+    }
+
+    /// The same original prepare body is borrowed by contextual G5b admission.
+    /// Callers register any member owner before the common mutation body applies
+    /// its one effect; no budget/policy/audit logic is duplicated.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_transaction_body(
+        &self,
+        transaction: &Transaction<'_>,
+        route: &DecisionMutationRoute,
+        envelope: &DeliveryEnvelope,
+        raw_canonical: &[u8],
+        raw_sha256: &str,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        origin_observation: Option<&CorrelationObservationV1>,
+    ) -> Result<MutationEffect<PrepareTransactionOutcome>> {
+        if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
+            if existing.envelope_canonical.as_slice() == raw_canonical
+                && existing.envelope_sha256 == raw_sha256
+            {
+                envelope.validate()?;
+                if envelope.push_kind == PushKind::CandidateBoard {
+                    candidate_board::validate_candidate_board_source(envelope)?;
+                    let owners = candidate_board_occurrence_owners(transaction, envelope)?;
+                    if owners.len() != 1 || owners[0] != envelope.decision_identity {
+                        return Err(DurableDeliveryError::PolicyMismatch(
+                            "P-05 exact occurrence has ambiguous counted owners".to_owned(),
+                        ));
+                    }
+                }
+                let hydration = load_schedule_hydration(transaction, &envelope.decision_identity)?;
+                let origin_changed = if let Some(observation) = origin_observation {
+                    insert_or_verify_origin_observation(
+                        transaction,
+                        envelope,
+                        observation,
+                        admission_at,
+                    )?
+                } else {
+                    false
+                };
+                let outcome = PrepareTransactionOutcome::Existing(Box::new(outcome_from_stored(
+                    &existing, &hydration,
+                )));
+                return Ok(if origin_changed {
+                    MutationEffect::Changed(outcome)
+                } else {
+                    MutationEffect::NoChange(outcome)
+                });
+            }
+            let evidence = canonical_json(&json!({
+                "decision_identity": envelope.decision_identity,
+                "stored_envelope_sha256": existing.envelope_sha256,
+                "incoming_envelope_sha256": raw_sha256,
+            }))?;
+            enqueue_audit(
+                transaction,
+                &envelope.decision_identity,
+                None,
+                "DecisionIdentityConflict",
+                &evidence,
+                admission_at,
+            )?;
+            return Ok(MutationEffect::Changed(
+                PrepareTransactionOutcome::IdentityConflict,
+            ));
+        }
+
+        self.require_g5b_business_open_tx(transaction, route)?;
+        envelope.validate()?;
+        if envelope.push_kind == PushKind::CandidateBoard {
+            candidate_board::validate_candidate_board_source(envelope)?;
+            // BEGIN IMMEDIATE holds the writer slot across this lookup and
+            // insert. The schema trigger fences direct SQL writers too.
+            if !candidate_board_occurrence_owners(transaction, envelope)?.is_empty() {
+                return Err(DurableDeliveryError::PolicyMismatch(
+                    "P-05 exact occurrence already has a counted decision".to_owned(),
+                ));
+            }
+        }
+        let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
+        let denial = self.evaluate_prepare_denial(
+            transaction,
+            envelope,
+            &policy,
+            authoritative_sink_count,
+            admission_at,
+        )?;
+        let initial_state = if denial.is_some() {
+            DecisionState::RejectedAuditPending
+        } else {
+            DecisionState::Reserved
+        };
+        insert_new_decision(
+            transaction,
+            envelope,
+            raw_canonical,
+            raw_sha256,
+            initial_state,
+            admission_at,
+        )?;
+        record_state_transition(
+            transaction,
+            &envelope.decision_identity,
+            None,
+            initial_state,
+            "prepare",
+            None,
+            canonical_json(&json!({
+                "envelope_sha256": raw_sha256,
+                "reservation_generation": if denial.is_some() { 0 } else { 1 },
+            }))?,
+            admission_at,
+        )?;
+
+        if let Some(denial) = denial {
+            freeze_pre_sink_denial(transaction, envelope, &policy, denial, admission_at)?;
+        } else {
+            self.reserve_generation(transaction, envelope, &policy, 1, admission_at)?;
+        }
+        if let Some(observation) = origin_observation {
+            insert_or_verify_origin_observation(transaction, envelope, observation, admission_at)?;
+        }
+        Ok(MutationEffect::Changed(PrepareTransactionOutcome::Inserted))
     }
 
     pub fn decision_state(&self, decision_identity: &str) -> Result<DecisionState> {
@@ -4447,12 +4554,16 @@ impl DurableDeliveryCoordinator {
                     to: "retry_authorized".to_owned(),
                 });
             }
+            if stored.retry_authorized {
+                return Ok(MutationEffect::NoChange(()));
+            }
+            self.require_g5b_business_open_tx(transaction, &route)?;
             transaction.execute(
                 "UPDATE delivery_decisions SET retry_authorized=1,updated_at=datetime('now')
                  WHERE decision_identity=?1 AND state='RejectedDurable'",
                 [decision_identity],
             )?;
-            Ok(())
+            Ok(MutationEffect::Changed(()))
         })
     }
 
@@ -4524,6 +4635,31 @@ impl DurableDeliveryCoordinator {
             return Ok(false);
         };
         self.with_mutation_transaction(&route, |transaction| {
+            let current: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT a.lease_expires_at,a.lease_heartbeat_at FROM delivery_attempts a
+                 JOIN delivery_decisions d ON d.decision_identity=a.decision_identity
+                 WHERE a.attempt_identity=?1 AND a.decision_identity=?2
+                   AND a.owner_instance_identity=?3 AND a.fence_token=?4
+                   AND a.state='AttemptInFlight' AND d.state='AttemptInFlight'
+                   AND d.current_attempt_identity=a.attempt_identity AND d.fence_generation=?4",
+                    params![
+                        attempt_identity,
+                        decision_identity,
+                        self.config.owner_instance_identity,
+                        fence_token
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((old_expiry, old_heartbeat)) = current else {
+                return Ok(MutationEffect::NoChange(false));
+            };
+            if old_expiry == timestamp(lease_expires_at) && old_heartbeat == timestamp(heartbeat_at)
+            {
+                return Ok(MutationEffect::NoChange(true));
+            }
+            self.require_g5b_business_open_tx(transaction, &route)?;
             let changed = transaction.execute(
                 "UPDATE delivery_attempts
                  SET lease_expires_at=?1,lease_heartbeat_at=?2
@@ -4557,7 +4693,11 @@ impl DurableDeliveryCoordinator {
                     heartbeat_at,
                 )?;
             }
-            Ok(changed == 1)
+            Ok(if changed == 1 {
+                MutationEffect::Changed(true)
+            } else {
+                MutationEffect::NoChange(false)
+            })
         })
     }
 
@@ -4726,6 +4866,7 @@ impl DurableDeliveryCoordinator {
                     stored.state
                 )));
             }
+            self.require_g5b_business_open_tx(transaction, &route)?;
             let attempt_identity = stored.current_attempt_identity.clone().ok_or_else(|| {
                 DurableDeliveryError::InvalidManualResolution(
                     "uncertain decision has no original attempt".to_owned(),
@@ -4864,7 +5005,7 @@ impl DurableDeliveryCoordinator {
                     )?;
                 }
             }
-            Ok(())
+            Ok(MutationEffect::Changed(()))
         })?;
         self.with_connection(|connection| {
             load_decision(connection, &command.decision_identity)?
@@ -4934,7 +5075,7 @@ impl DurableDeliveryCoordinator {
                 )));
             }
             if hydration_state == "Applied" {
-                return Ok(false);
+                return Ok(MutationEffect::NoChange(false));
             }
             let acknowledgement_identity = stable_identity(
                 "schedule-hydration-ack-v1",
@@ -4972,7 +5113,7 @@ impl DurableDeliveryCoordinator {
                     "task transition hydration CAS failed for {transition_identity}"
                 )));
             }
-            Ok(true)
+            Ok(MutationEffect::Changed(true))
         })
     }
 
@@ -5799,7 +5940,7 @@ impl DurableDeliveryCoordinator {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
                 })?;
             if current.state != DecisionState::RejectedDurable || !current.retry_authorized {
-                return Ok(false);
+                return Ok(MutationEffect::NoChange(false));
             }
             // NewsAI uses a frozen rendered card, so a definitive pre-send
             // transport rejection can be retried under the same identity.
@@ -5807,7 +5948,7 @@ impl DurableDeliveryCoordinator {
             // recovery attempts, even if every sink call rejects again.
             if envelope.push_kind == PushKind::NewsAiAnalysis && current.reservation_generation >= 3
             {
-                return Ok(false);
+                return Ok(MutationEffect::NoChange(false));
             }
             let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
             if policy.window_mode == WindowMode::BusinessDateOnce {
@@ -5825,19 +5966,20 @@ impl DurableDeliveryCoordinator {
                     )
                     .optional()?;
                 if claim.as_deref() != Some(&stored.decision_identity) {
-                    return Ok(false);
+                    return Ok(MutationEffect::NoChange(false));
                 }
             } else if policy.window_mode == WindowMode::Rolling
                 && rolling_head_conflicts(transaction, &envelope, now)?
             {
-                return Ok(false);
+                return Ok(MutationEffect::NoChange(false));
             }
             // BR-237: 豁免类 (counts_against_daily_budget=false) 重试不占预算。
             if policy.counts_against_daily_budget
                 && first_available_budget_slot(transaction, &envelope.business_date)?.is_none()
             {
-                return Ok(false);
+                return Ok(MutationEffect::NoChange(false));
             }
+            self.require_g5b_business_open_tx(transaction, &route)?;
             let generation = current.reservation_generation + 1;
             self.reserve_generation(transaction, &envelope, &policy, generation, now)?;
             transition_existing_state(
@@ -5852,7 +5994,7 @@ impl DurableDeliveryCoordinator {
                 }))?,
                 now,
             )?;
-            Ok(true)
+            Ok(MutationEffect::Changed(true))
         })
     }
 
@@ -5868,8 +6010,9 @@ impl DurableDeliveryCoordinator {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;
             if stored.state != DecisionState::Reserved {
-                return Ok(None);
+                return Ok(MutationEffect::NoChange(None));
             }
+            self.require_g5b_business_open_tx(transaction, &route)?;
             let envelope = parse_envelope(&stored.envelope_canonical)?;
             if authoritative_sink_count != 1 {
                 let denial = PrepareDenial::InvalidSinkCardinality(authoritative_sink_count);
@@ -5906,7 +6049,7 @@ impl DurableDeliveryCoordinator {
                     evidence,
                     now,
                 )?;
-                return Ok(None);
+                return Ok(MutationEffect::Changed(None));
             }
             let attempt_no: i64 = transaction.query_row(
                 "SELECT COALESCE(MAX(attempt_no),0)+1 FROM delivery_attempts
@@ -5991,7 +6134,7 @@ impl DurableDeliveryCoordinator {
                 }))?,
                 now,
             )?;
-            Ok(Some(AttemptLease {
+            Ok(MutationEffect::Changed(Some(AttemptLease {
                 attempt_identity: attempt_identity.clone(),
                 fence_token,
                 request: AuthoritativeDeliveryRequest {
@@ -6006,7 +6149,7 @@ impl DurableDeliveryCoordinator {
                     rendered_content: envelope.rendered_content,
                     rendered_content_sha256: envelope.rendered_content_sha256,
                 },
-            }))
+            })))
         })
     }
 
@@ -6161,7 +6304,7 @@ impl DurableDeliveryCoordinator {
                 ],
             )?;
             if !authoritative {
-                return Ok(());
+                return Ok(MutationEffect::Changed(()));
             }
 
             let envelope = parse_envelope(&stored.envelope_canonical)?;
@@ -6287,7 +6430,7 @@ impl DurableDeliveryCoordinator {
                     )?;
                 }
             }
-            Ok(())
+            Ok(MutationEffect::Changed(()))
         })
     }
 
@@ -6381,7 +6524,7 @@ impl DurableDeliveryCoordinator {
                     |row| row.get(0),
                 )?;
                 if !still_current {
-                    return Ok(false);
+                    return Ok(MutationEffect::NoChange(false));
                 }
                 let stored = load_decision(transaction, &decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(decision_identity.clone())
@@ -6400,7 +6543,7 @@ impl DurableDeliveryCoordinator {
                     ],
                 )?;
                 if changed != 1 {
-                    return Ok(false);
+                    return Ok(MutationEffect::NoChange(false));
                 }
                 transaction.execute(
                     "UPDATE delivery_decisions SET fence_generation=?1,updated_at=?2
@@ -6467,7 +6610,7 @@ impl DurableDeliveryCoordinator {
                     }))?,
                     now,
                 )?;
-                Ok(true)
+                Ok(MutationEffect::Changed(true))
             })?;
             if progressed {
                 return Ok(true);
@@ -6537,6 +6680,7 @@ impl DurableDeliveryCoordinator {
                 ],
             )?;
             require_single_cas_update(changed, "immutable audit append acknowledgement")
+                .map(MutationEffect::Changed)
         })?;
         Ok(true)
     }
@@ -6731,6 +6875,7 @@ impl DurableDeliveryCoordinator {
                 params![immutable_ref, pending.identity, pending.sha256],
             )?;
             require_single_cas_update(changed, "delivery disposition append acknowledgement")
+                .map(MutationEffect::Changed)
         })
     }
 
@@ -6839,6 +6984,7 @@ impl DurableDeliveryCoordinator {
                         changed,
                         "manual accepted delivery audit acknowledgement",
                     )
+                    .map(MutationEffect::Changed)
                 })?;
             }
             return Ok(());
@@ -6862,6 +7008,7 @@ impl DurableDeliveryCoordinator {
                 params![immutable_ref, pending.identity, pending.sha256],
             )?;
             require_single_cas_update(changed, "accepted delivery audit acknowledgement")
+                .map(MutationEffect::Changed)
         })
     }
 
@@ -6921,6 +7068,7 @@ impl DurableDeliveryCoordinator {
                 params![immutable_ref, pending.identity, pending.sha256],
             )?;
             require_single_cas_update(changed, "task transition append acknowledgement")
+                .map(MutationEffect::Changed)
         })
     }
 
@@ -6996,7 +7144,7 @@ impl DurableDeliveryCoordinator {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
                 })?;
             if current.state == target || current.state != stored.state {
-                return Ok(());
+                return Ok(MutationEffect::NoChange(()));
             }
             if target == DecisionState::Delivered {
                 #[cfg(test)]
@@ -7015,6 +7163,7 @@ impl DurableDeliveryCoordinator {
                 }))?,
                 now,
             )
+            .map(MutationEffect::Changed)
         })
     }
 
@@ -10269,7 +10418,7 @@ fn insert_or_verify_origin_observation(
     envelope: &DeliveryEnvelope,
     observation: &CorrelationObservationV1,
     admission_at: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<bool> {
     let observation_identity = observation.identity_for_decision(&envelope.decision_identity);
     let existing: Option<(i64, String, String, String, String, String)> = transaction
         .query_row(
@@ -10305,7 +10454,7 @@ fn insert_or_verify_origin_observation(
                 "noncanonical correlation observation timestamp for {observation_identity}"
             )));
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let observed_at = timestamp(admission_at);
@@ -10329,7 +10478,7 @@ fn insert_or_verify_origin_observation(
             observed_at,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
