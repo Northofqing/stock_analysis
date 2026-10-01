@@ -558,6 +558,14 @@ impl GrpcMarketClient {
     }
 
     pub async fn get_external_health(&mut self) -> Result<ExternalHealthResponse, GrpcError> {
+        self.get_external_health_observed()
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn get_external_health_observed(
+        &mut self,
+    ) -> Result<(ExternalHealthResponse, Vec<u8>), GrpcError> {
         if !matches!(&self.system, SystemTransport::External(_)) {
             return Err(system_profile_mismatch());
         }
@@ -570,9 +578,9 @@ impl GrpcMarketClient {
         });
         self.attach_request_auth(&mut request)?;
         match self.execute_external_health(request).await {
-            ExternalSystemCall::Response(response, _) => {
+            ExternalSystemCall::Response(response, bytes) => {
                 self.observe_external_health(&request_id, &response)?;
-                Ok(response)
+                Ok((response, bytes))
             }
             ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
                 status,
@@ -585,6 +593,14 @@ impl GrpcMarketClient {
         &mut self,
     ) -> Result<Vec<crate::grpc_client::external_pb::magic::market::v1::Capability>, GrpcError>
     {
+        self.get_external_capabilities_observed()
+            .await
+            .map(|(response, _)| response.capabilities)
+    }
+
+    async fn get_external_capabilities_observed(
+        &mut self,
+    ) -> Result<(ExternalCapabilitiesResponse, Vec<u8>), GrpcError> {
         if !matches!(&self.system, SystemTransport::External(_)) {
             return Err(system_profile_mismatch());
         }
@@ -598,9 +614,9 @@ impl GrpcMarketClient {
         });
         self.attach_request_auth(&mut request)?;
         match self.execute_external_capabilities(request).await {
-            ExternalSystemCall::Response(response, _) => {
+            ExternalSystemCall::Response(response, bytes) => {
                 self.accept_external_capabilities(&request_id, &response)?;
-                Ok(response.capabilities)
+                Ok((response, bytes))
             }
             ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
                 status,

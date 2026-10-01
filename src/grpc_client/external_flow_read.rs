@@ -15,6 +15,7 @@ pub(crate) struct ExternalFlowReadClient {
 }
 
 pub(crate) struct ExternalFlowStatusEvidence {
+    pub(crate) raw_status: tonic::Status,
     pub(crate) code: i32,
     pub(crate) details: Vec<u8>,
     pub(crate) error_detail_trailer: super::unary_attempt::UnaryTrailerMaterial,
@@ -26,7 +27,11 @@ pub(crate) struct ExternalFlowStatusEvidence {
 pub(crate) struct ExternalFlowObservation {
     pub(crate) operation: ExternalOperation,
     pub(crate) connection_identity: ConnectionIdentity,
+    pub(crate) health: ExternalHealthResponse,
+    pub(crate) health_wire: Vec<u8>,
     pub(crate) server_build_identity: BuildIdentity,
+    pub(crate) capabilities_response: ExternalCapabilitiesResponse,
+    pub(crate) capabilities_wire: Vec<u8>,
     pub(crate) capability: Capability,
     pub(crate) request_id_correlation: String,
     pub(crate) request_bytes: Vec<u8>,
@@ -63,13 +68,16 @@ impl ExternalFlowReadClient {
         if self.client.profile != ContractProfile::ExternalV1 {
             return Err(unsupported_flow());
         }
-        let health = self.client.get_external_health().await?;
+        let (health, health_wire) = self.client.get_external_health_observed().await?;
         let connection_identity = self.client.external_connection_identity()?;
         let server_build_identity = health
             .build_identity
+            .clone()
             .ok_or_else(|| crate::grpc_client::connection_qualification::unqualified())?;
-        let capabilities = self.client.get_external_capabilities().await?;
-        let capability = require_flow_capability(&capabilities, operation)?.clone();
+        let (capabilities_response, capabilities_wire) =
+            self.client.get_external_capabilities_observed().await?;
+        let capability =
+            require_flow_capability(&capabilities_response.capabilities, operation)?.clone();
 
         let request_id = request
             .context
@@ -128,6 +136,7 @@ impl ExternalFlowReadClient {
                 (evidence, None, result)
             }
             ExternalQueryCall::UnaryStatus { status, evidence } => {
+                let raw_status = status.clone();
                 let (code, details, error_detail_trailer) =
                     super::unary_attempt::capture_status_material(&status);
                 let result = Err(self.client.external_status_error(
@@ -138,6 +147,7 @@ impl ExternalFlowReadClient {
                 (
                     evidence,
                     Some(ExternalFlowStatusEvidence {
+                        raw_status,
                         code,
                         details,
                         error_detail_trailer,
@@ -150,7 +160,11 @@ impl ExternalFlowReadClient {
         Ok(ExternalFlowObservation {
             operation,
             connection_identity,
+            health,
+            health_wire,
             server_build_identity,
+            capabilities_response,
+            capabilities_wire,
             capability,
             request_id_correlation,
             request_bytes,

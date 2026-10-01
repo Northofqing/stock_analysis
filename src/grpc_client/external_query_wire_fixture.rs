@@ -106,6 +106,7 @@ enum ExternalQueryWireReply {
     CatalogRequestedProviderStatus,
     FlowUnavailableStatus,
     FlowIncomplete,
+    FlowRecordUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -481,6 +482,7 @@ impl ExternalQueryWireService {
             ExternalQueryWireReply::Success => None,
             ExternalQueryWireReply::FlowUnavailableStatus => unreachable!(),
             ExternalQueryWireReply::FlowIncomplete => None,
+            ExternalQueryWireReply::FlowRecordUnavailable => None,
         };
         if let Some((provider_attempts, provider)) = attempt_status {
             let details = ErrorDetail {
@@ -518,7 +520,7 @@ impl ExternalQueryWireService {
                     "magic.market.board_flows.request",
                     serde_json::json!({"category":"Industry","interval":"Day1","limit":2}),
                     "magic.market.board_flow",
-                    serde_json::json!({"board_code":"BK0001","board_name":"TEST_CODE board","category":"Industry","interval":"Day1","rank":1,"return_ratio":{"value":1.0,"unit":"Percent"},"main_net":1.0,"super_large_net":2.0,"large_net":3.0,"medium_net":4.0,"small_net":5.0,"leader_instrument":null,"leader_name":null,"leader_return_ratio":null,"evidence":{"provider":"Eastmoney","source_at":"1789457400","observed_at":"2026-09-14T15:31:00+08:00","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}}),
+                    serde_json::json!({"board_code":"BK0001","board_name":"TEST_CODE board","category":"Industry","interval":"Day1","rank":1,"return_ratio":{"value":1.0,"unit":"Percent"},"main_net":1.0,"super_large_net":2.0,"large_net":3.0,"medium_net":4.0,"small_net":5.0,"leader_instrument":null,"leader_name":null,"leader_return_ratio":null,"evidence":{"provider":"Eastmoney","source_at":"1789371000","observed_at":"2026-09-14T15:31:00+08:00","batch_id":"TEST_CODE_EXTERNAL_DATA_BATCH"}}),
                 ),
                 _ => unreachable!(),
             };
@@ -541,14 +543,24 @@ impl ExternalQueryWireService {
                 source_at: if operation == Operation::MoneyFlows {
                     "2026-09-14"
                 } else {
-                    "1789457400"
+                    "1789371000"
                 }
                 .to_owned(),
                 records: vec![CanonicalPayload {
                     schema: expected.2.to_owned(),
                     schema_version: 1,
                     content_type: "application/json; charset=utf-8".to_owned(),
-                    data: serde_json::to_vec(&expected.3).expect("TEST_CODE flow record JSON"),
+                    data: serde_json::to_vec(&if reply
+                        == ExternalQueryWireReply::FlowRecordUnavailable
+                        && operation == Operation::MoneyFlows
+                    {
+                        let mut record = expected.3;
+                        record["status"] = serde_json::json!("Unavailable");
+                        record
+                    } else {
+                        expected.3
+                    })
+                    .expect("TEST_CODE flow record JSON"),
                 }],
                 diagnostic_blocker: String::new(),
             }));
@@ -1146,6 +1158,15 @@ impl ExternalQueryWireFixture {
         Self::bind_with_route_reply_and_capabilities(
             ExternalQueryWireRoute::Generated,
             ExternalQueryWireReply::FlowIncomplete,
+            ExternalCapabilitiesBehavior::Flows,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_flow_record_unavailable() -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::FlowRecordUnavailable,
             ExternalCapabilitiesBehavior::Flows,
         )
         .await
