@@ -92,6 +92,10 @@ impl ResearchPortfolioV2 {
         &self.policy
     }
 
+    pub fn required_coverage(&self) -> FeeCoverageRequirement {
+        self.required_coverage
+    }
+
     pub fn initial_cash_micro_cny(&self) -> i64 {
         self.initial_cash_micro_cny
     }

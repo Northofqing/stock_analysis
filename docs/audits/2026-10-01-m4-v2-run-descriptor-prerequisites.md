@@ -68,6 +68,25 @@ Only after these inputs exist should a separate versioned CSV/JSON/report
 writer use the run ID for atomic, retry-safe output. No legacy `Trade`, runner,
 PaperLedger, or output path is changed here.
 
+## Subsequent local observation-identity slice
+
+`strategy::research_run_descriptor_v2` now has a pure, domain-separated
+`m4-observed-run-v2` descriptor for an already executed `ResearchPortfolioV2`.
+It requires canonical strategy config, explicit strategy/version and declared
+full Git SHA, complete requested instrument membership with one sealed
+`ObservedDailyBarsCapture` per instrument, and a
+`VerifiedBenchmarkSnapshot` whose exact daily request matches the run window.
+The canonical bytes retain the portfolio's fee policy, required coverage,
+ordered applied effects, initial/final cash and holdings. Missing or ambiguous
+observations and mismatched benchmark requests fail closed.
+
+The descriptor's `input_assurance` explicitly says the historical bars are
+observed only. Its ID is not a qualified backtest run ID: the Gateway capture
+still lacks an exact persisted window, PIT membership, source-qualified
+instrument class, and a verified association between the caller-declared Git
+SHA and the executing binary. No report writer or legacy/live wrapper consumes
+this descriptor. The historical-bars exact read gate above remains open.
+
 Code inspected: `src/strategy/research_fill_v2.rs`,
 `src/strategy/research_portfolio_v2.rs`, `src/performance/fee_policy.rs`,
 `src/data_gateway/historical_bars.rs`, `src/data_gateway/outcome_daily_bars.rs`,
