@@ -41,13 +41,25 @@ pub const BOARD_ARTIFACT_RELATIVE_PATH: &str = BOARD_BINDINGS_PATH;
 pub const ACTIVATION_FILE_RELATIVE_PATH: &str = "config/selection/selection_activation.v1.json";
 pub const CONFIG_SNAPSHOT_SCHEMA_VERSION: &str = "selection-config-snapshot-v1";
 pub const ACTIVATION_FILE_SCHEMA_VERSION: &str = "selection-config-activation-v1";
-pub const EXECUTABLE_INPUT_MANIFEST_VERSION: &str = "selection-executable-inputs-v1";
+pub const EXECUTABLE_INPUT_MANIFEST_VERSION: &str = "selection-executable-inputs-v2";
 pub const RELATION_SCHEMA_VERSION: &str = "event-relation-v2";
 pub const INGRESS_GATE_VERSION: &str = "br137-ingress-v1";
 pub const INGRESS_FRESHNESS_MAX_AGE_SECS: u64 = 86_400;
 pub const INGRESS_FUTURE_TOLERANCE_SECS: u64 = 0;
 
 const CONFIG_ACTIVATION_PAYLOAD_SCHEMA: &str = "config-activation-stage-v1";
+
+// Exact public inputs compiled by build.rs or include_str!. Runtime credential
+// directories are deliberately outside this closed input set.
+const COMPILED_PUBLIC_CONTRACT_INPUTS: [&str; 7] = [
+    "contracts/local_bridge_v1/market.proto",
+    "contracts/external_v1_current/market.proto",
+    "contracts/external_v1_current/bundle-metadata.json",
+    "contracts/external_v1_history/market.proto",
+    "contracts/external_v1_history/bundle-20260917.1.json",
+    "contracts/external_v1_history/20260928.2/market.proto",
+    "contracts/external_v1_history/20260928.2/bundle-metadata.json",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigActivationGateContract {
@@ -424,8 +436,7 @@ pub(crate) fn compute_executable_revision(
     let mut files = Vec::with_capacity(relative_paths.len());
     let mut first_read_hashes = BTreeMap::new();
     for relative_path in &relative_paths {
-        let absolute = root.join(relative_path);
-        let bytes = read_stable_regular_file(&absolute, relative_path)?;
+        let bytes = read_stable_regular_file(&root, relative_path)?;
         let content_sha256 = sha256_bytes(&bytes);
         first_read_hashes.insert(relative_path.clone(), content_sha256.clone());
         files.push(ExecutableInputFilePreimage {
@@ -441,7 +452,7 @@ pub(crate) fn compute_executable_revision(
     }
 
     for relative_path in &relative_paths {
-        let bytes = read_stable_regular_file(&root.join(relative_path), relative_path)?;
+        let bytes = read_stable_regular_file(&root, relative_path)?;
         let expected = first_read_hashes.get(relative_path).ok_or_else(|| {
             ConfigActivationPreparationError::new(
                 "executable_input_manifest_internal_mismatch",
@@ -1009,6 +1020,7 @@ fn enumerate_executable_inputs(
             "root Cargo.toml is required",
         ));
     }
+    paths.extend(COMPILED_PUBLIC_CONTRACT_INPUTS.map(PathBuf::from));
     paths.retain(|path| path != Path::new(ACTIVATION_FILE_RELATIVE_PATH));
     paths.sort_by(|left, right| {
         path_to_slash_string(left)
@@ -1106,10 +1118,12 @@ fn require_real_directory(
 }
 
 fn read_stable_regular_file(
-    path: &Path,
+    root: &Path,
     relative_path: &Path,
 ) -> Result<Vec<u8>, ConfigActivationPreparationError> {
-    let before = fs::symlink_metadata(path).map_err(|error| {
+    validate_input_parent_directories(root, relative_path)?;
+    let path = root.join(relative_path);
+    let before = fs::symlink_metadata(&path).map_err(|error| {
         ConfigActivationPreparationError::new(
             "executable_input_unavailable",
             format!("{}: {error}", relative_path.display()),
@@ -1121,13 +1135,13 @@ fn read_stable_regular_file(
             relative_path.display().to_string(),
         ));
     }
-    let bytes = fs::read(path).map_err(|error| {
+    let bytes = fs::read(&path).map_err(|error| {
         ConfigActivationPreparationError::new(
             "executable_input_read_failed",
             format!("{}: {error}", relative_path.display()),
         )
     })?;
-    let after = fs::symlink_metadata(path).map_err(|error| {
+    let after = fs::symlink_metadata(&path).map_err(|error| {
         ConfigActivationPreparationError::new(
             "executable_input_post_read_failed",
             format!("{}: {error}", relative_path.display()),
@@ -1144,7 +1158,22 @@ fn read_stable_regular_file(
             relative_path.display().to_string(),
         ));
     }
+    validate_input_parent_directories(root, relative_path)?;
     Ok(bytes)
+}
+
+fn validate_input_parent_directories(
+    root: &Path,
+    relative_path: &Path,
+) -> Result<(), ConfigActivationPreparationError> {
+    let mut directory = root.to_owned();
+    if let Some(parent) = relative_path.parent() {
+        for component in parent.components() {
+            directory.push(component);
+            require_real_directory(&directory, "executable input parent")?;
+        }
+    }
+    Ok(())
 }
 
 fn read_required_file(
@@ -1342,6 +1371,12 @@ mod tests {
             .expect("write Cargo.toml");
             fs::write(root.join("src/lib.rs"), b"pub const TEST_CODE: u8 = 1;\n")
                 .expect("write source");
+            for relative in COMPILED_PUBLIC_CONTRACT_INPUTS {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).expect("create public input directory");
+                fs::write(path, b"TEST_CODE_public_release_input\n")
+                    .expect("write public release input");
+            }
             Self { root }
         }
 
@@ -1480,6 +1515,80 @@ mod tests {
             second.executable_revision.hash
         );
         assert_ne!(first.config_hash, second.config_hash);
+    }
+
+    #[test]
+    fn public_contract_bytes_change_executable_and_config_revision() {
+        for relative in [
+            "contracts/external_v1_current/market.proto",
+            "contracts/external_v1_current/bundle-metadata.json",
+        ] {
+            let fixture = TestFixture::new();
+            fixture.install_verified_config();
+            let first = prepare_snapshot(
+                &fixture.root,
+                fixture.context().activated_at,
+                &ConfigActivationGateContract::checked_in(),
+            )
+            .unwrap();
+            let path = fixture.root.join(relative);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] = b'U';
+            fs::write(path, bytes).unwrap();
+            let second = prepare_snapshot(
+                &fixture.root,
+                fixture.context().activated_at,
+                &ConfigActivationGateContract::checked_in(),
+            )
+            .unwrap();
+            assert_ne!(
+                first.executable_revision.hash,
+                second.executable_revision.hash
+            );
+            assert_ne!(first.config_hash, second.config_hash);
+        }
+    }
+
+    #[test]
+    fn missing_compiled_public_contract_is_rejected() {
+        let fixture = TestFixture::new();
+        fs::remove_file(fixture.root.join(COMPILED_PUBLIC_CONTRACT_INPUTS[2])).unwrap();
+        let error = compute_executable_revision(&fixture.root).unwrap_err();
+        assert_eq!(error.code, "executable_input_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_compiled_public_contract_or_parent_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let fixture = TestFixture::new();
+        let path = fixture.root.join(COMPILED_PUBLIC_CONTRACT_INPUTS[2]);
+        fs::remove_file(&path).unwrap();
+        symlink(fixture.root.join("src/lib.rs"), &path).unwrap();
+        let error = compute_executable_revision(&fixture.root).unwrap_err();
+        assert_eq!(error.code, "executable_input_not_regular");
+
+        let fixture = TestFixture::new();
+        let directory = fixture.root.join("contracts/external_v1_current");
+        let moved = fixture.root.join("TEST_CODE_public_input_directory");
+        fs::rename(&directory, &moved).unwrap();
+        symlink(&moved, &directory).unwrap();
+        let error = compute_executable_revision(&fixture.root).unwrap_err();
+        assert_eq!(error.code, "required_input_root_invalid");
+    }
+
+    #[test]
+    fn credential_files_are_not_compiled_public_inputs() {
+        let fixture = TestFixture::new();
+        let first = compute_executable_revision(&fixture.root).unwrap();
+        fs::create_dir(fixture.root.join("client-bundle")).unwrap();
+        let path = fixture.root.join("client-bundle/client-key.pem");
+        fs::write(&path, b"TEST_CODE_private_material_a").unwrap();
+        let second = compute_executable_revision(&fixture.root).unwrap();
+        fs::write(path, b"TEST_CODE_private_material_b").unwrap();
+        let third = compute_executable_revision(&fixture.root).unwrap();
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(second.hash, third.hash);
     }
 
     #[test]

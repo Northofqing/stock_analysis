@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from verify_executable_input_manifest import verify
+from verify_executable_input_manifest import COMPILED_PUBLIC_INPUTS, MANIFEST_V1, verify
 
 
 class VerifyExecutableInputManifestTests(unittest.TestCase):
@@ -88,6 +88,85 @@ class VerifyExecutableInputManifestTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(rows), encoding="utf-8")
         _, errors = verify(self.manifest, self.root, set())
         self.assertTrue(any("invalid or duplicate" in error for error in errors))
+
+    def test_v2_requires_public_contracts_and_detects_changed_metadata(self):
+        rows = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for name in sorted(COMPILED_PUBLIC_INPUTS):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"TEST_CODE_public_contract")
+            rows.append({
+                "path": name, "length": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        self.manifest.write_text(json.dumps(rows), encoding="utf-8")
+        count, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertEqual(count, 1 + len(COMPILED_PUBLIC_INPUTS))
+        self.assertEqual(errors, [])
+
+        metadata = "contracts/external_v1_current/bundle-metadata.json"
+        (self.root / metadata).write_bytes(b"TEST_CODE_changed_contract")
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn(f"input differs: {metadata}", errors)
+        self.manifest.write_text(
+            json.dumps([row for row in rows if row["path"] != metadata]), encoding="utf-8"
+        )
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn(f"compiled public input missing from manifest: {metadata}", errors)
+
+    def test_current_public_contracts_cannot_use_v1_activation_scope(self):
+        (self.root / "contracts/external_v1_current").mkdir(parents=True)
+        _, errors = verify(
+            self.manifest, self.root, set(), activation_ready=True,
+            input_manifest_version=MANIFEST_V1,
+        )
+        self.assertIn(
+            "current public contracts require executable input manifest v2", errors
+        )
+
+    def test_missing_current_directory_cannot_downgrade_sealed_build(self):
+        build = self.root / "build.rs"
+        build.write_bytes(b'let source = "contracts/external_v1_current/market.proto";\n')
+        rows = json.loads(self.manifest.read_text(encoding="utf-8"))
+        rows.append({
+            "path": "build.rs", "length": build.stat().st_size,
+            "sha256": hashlib.sha256(build.read_bytes()).hexdigest(),
+        })
+        self.manifest.write_text(json.dumps(rows), encoding="utf-8")
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn(
+            "compiled public input missing from manifest: contracts/external_v1_current/market.proto",
+            errors,
+        )
+        _, errors = verify(
+            self.manifest, self.root, set(), activation_ready=True,
+            input_manifest_version=MANIFEST_V1,
+        )
+        self.assertIn("current public contracts require executable input manifest v2", errors)
+
+    def test_dangling_current_directory_cannot_downgrade_scope(self):
+        (self.root / "contracts").mkdir()
+        (self.root / "contracts/external_v1_current").symlink_to(
+            Path(self.temp.name) / "missing-public-inputs", target_is_directory=True,
+        )
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn(
+            "compiled public input missing from manifest: contracts/external_v1_current/market.proto",
+            errors,
+        )
+
+    def test_declared_current_inputs_require_v2_even_when_all_contracts_missing(self):
+        rows = json.loads(self.manifest.read_text(encoding="utf-8"))
+        rows.append({
+            "path": "contracts/external_v1_current/market.proto", "length": 1,
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+        })
+        self.manifest.write_text(json.dumps(rows), encoding="utf-8")
+        _, errors = verify(self.manifest, self.root, set(), activation_ready=True)
+        self.assertIn(
+            "compiled public input missing from manifest: contracts/external_v1_current/bundle-metadata.json",
+            errors,
+        )
 
 
 if __name__ == "__main__":

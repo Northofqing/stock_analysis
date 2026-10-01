@@ -6,6 +6,8 @@ only after checking its approved SHA-256 separately.
 
 For activation readiness, use --activation-ready: activation hashes every
 regular src/config file except the activation file, so no other extra is safe.
+V2 also requires every checked-in public gRPC build input. It is selected
+from the declared manifest, sealed build entry, or current contract directory.
 """
 
 import argparse
@@ -18,6 +20,17 @@ import re
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 ACTIVATION_FILE = "config/selection/selection_activation.v1.json"
+MANIFEST_V1 = "selection-executable-inputs-v1"
+MANIFEST_V2 = "selection-executable-inputs-v2"
+COMPILED_PUBLIC_INPUTS = {
+    "contracts/local_bridge_v1/market.proto",
+    "contracts/external_v1_current/market.proto",
+    "contracts/external_v1_current/bundle-metadata.json",
+    "contracts/external_v1_history/market.proto",
+    "contracts/external_v1_history/bundle-20260917.1.json",
+    "contracts/external_v1_history/20260928.2/market.proto",
+    "contracts/external_v1_history/20260928.2/bundle-metadata.json",
+}
 
 
 def canonical_path(value: object) -> str | None:
@@ -30,7 +43,8 @@ def canonical_path(value: object) -> str | None:
 
 
 def verify(
-    manifest: Path, root: Path, allowed_extra: set[str], activation_ready: bool = False
+    manifest: Path, root: Path, allowed_extra: set[str], activation_ready: bool = False,
+    input_manifest_version: str | None = None,
 ) -> tuple[int, list[str]]:
     errors: list[str] = []
     try:
@@ -41,7 +55,6 @@ def verify(
         return 0, ["manifest must contain a nonempty list"]
     if not root.is_dir() or root.is_symlink():
         return 0, ["root must be a real directory"]
-
     if activation_ready:
         for name in sorted(allowed_extra - {ACTIVATION_FILE}):
             errors.append(f"activation input cannot be allowed extra: {name}")
@@ -66,6 +79,30 @@ def verify(
             errors.append(f"manifest row {index}: invalid or duplicate path/length/hash")
             continue
         expected[name] = (length, digest)
+
+    current_directory = root / "contracts/external_v1_current"
+    current_contract_required = os.path.lexists(current_directory) or any(
+        name.startswith("contracts/external_v1_current/") for name in expected
+    )
+    build_path = root / "build.rs"
+    if "build.rs" in expected and build_path.is_file() and not build_path.is_symlink():
+        try:
+            current_contract_required |= (
+                b"contracts/external_v1_current/market.proto" in build_path.read_bytes()
+            )
+        except OSError as error:
+            errors.append(f"build entry unreadable: {error}")
+    version = input_manifest_version or (
+        MANIFEST_V2 if current_contract_required else MANIFEST_V1
+    )
+    if version not in {MANIFEST_V1, MANIFEST_V2}:
+        return 0, ["unsupported executable input manifest version"]
+    if activation_ready and current_contract_required and version != MANIFEST_V2:
+        errors.append("current public contracts require executable input manifest v2")
+
+    if version == MANIFEST_V2:
+        for name in sorted(COMPILED_PUBLIC_INPUTS - expected.keys()):
+            errors.append(f"compiled public input missing from manifest: {name}")
 
     for name, (expected_length, expected_digest) in expected.items():
         path = root
@@ -114,17 +151,24 @@ def main() -> int:
         "--activation-ready", action="store_true",
         help="reject allowed extras other than the separately verified activation file",
     )
+    parser.add_argument(
+        "--input-manifest-version", choices=(MANIFEST_V1, MANIFEST_V2),
+        help="defaults to v2 when declared public inputs or the sealed build require it",
+    )
     args = parser.parse_args()
     allowed_extra = set(args.allow_extra)
     if any(canonical_path(name) is None for name in allowed_extra):
         parser.error("--allow-extra requires canonical relative paths")
-    count, errors = verify(args.manifest, args.root, allowed_extra, args.activation_ready)
+    count, errors = verify(
+        args.manifest, args.root, allowed_extra, args.activation_ready,
+        args.input_manifest_version,
+    )
     if errors:
         for error in errors:
             print(error)
         print(f"FAIL: {count} declared inputs, {len(errors)} errors")
         return 1
-    print(f"OK: {count} declared inputs match; no unexpected src/config files")
+    print(f"OK: {count} declared inputs match; input scope verified")
     return 0
 
 
