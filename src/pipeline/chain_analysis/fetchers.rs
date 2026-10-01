@@ -12,6 +12,7 @@ use log::info;
 #[cfg(test)]
 use log::warn;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 use crate::agent::tool::Tool;
@@ -22,6 +23,7 @@ use crate::data_gateway::{
 };
 use crate::database::DatabaseManager;
 use crate::market_data::TopStock;
+use crate::market_domain::EvidenceTimestamp;
 
 use super::ChainCluster;
 // is_generic_board 在 mod.rs 是 pub(super) — 让 fetchers 可见
@@ -104,6 +106,116 @@ pub(crate) fn format_membership_fetch_failure(code: &str, error: &dyn std::fmt::
 pub(super) fn parse_tool_boards(raw: &str, code: &str) -> Result<Vec<String>, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("产业链 {code} 板块 JSON 非法: {error}"))?;
+    parse_tool_board_values(&value, code)
+}
+
+/// Syntactic evidence from one tool response. The provider label is opaque;
+/// this value does not qualify an upstream provider batch as Available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ToolBoardsObservation {
+    pub(super) requested_code: String,
+    pub(super) all_boards: Vec<String>,
+    pub(super) boards: Vec<String>,
+    pub(super) board_count: usize,
+    pub(super) evidence: OpaqueToolBatchEvidence,
+    pub(super) raw_response_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OpaqueToolBatchEvidence {
+    pub(super) provider_label: String,
+    pub(super) source: String,
+    pub(super) source_at: Option<String>,
+    pub(super) observed_at: String,
+    pub(super) batch_id: String,
+}
+
+/// Parse the same raw bytes returned by the existing tool call. No additional
+/// gateway call is made, and the SHA-256 covers the unmodified response bytes.
+pub(super) fn parse_tool_boards_observed(
+    raw: &str,
+    code: &str,
+) -> Result<ToolBoardsObservation, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("产业链 {code} 板块 JSON 非法: {error}"))?;
+    if value.get("fetched") != Some(&serde_json::Value::Bool(true)) {
+        return Err(format!("产业链 {code} 工具结果未确认已拉取"));
+    }
+    if required_tool_text(&value, "secucode", code)? != code {
+        return Err(format!("产业链 {code} 工具结果代码不匹配"));
+    }
+    let rows = value
+        .get("all_boards")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("产业链 {code} 缺少 all_boards 数组"))?;
+    let board_count = value
+        .get("board_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("产业链 {code} board_count 非法"))?;
+    let actual_board_count =
+        u64::try_from(rows.len()).map_err(|_| format!("产业链 {code} all_boards 过大"))?;
+    if board_count != actual_board_count {
+        return Err(format!("产业链 {code} board_count 与 all_boards 不一致"));
+    }
+    let boards = parse_tool_board_values(&value, code)?;
+    let all_boards = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            row.as_str()
+                .filter(|board| !board.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("产业链 {code} all_boards[{index}] 非法"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let evidence = value
+        .get("evidence")
+        .filter(|evidence| evidence.is_object())
+        .ok_or_else(|| format!("产业链 {code} 缺少 evidence 对象"))?;
+    let provider_label = required_tool_text(evidence, "provider", code)?.to_owned();
+    let source = required_tool_text(evidence, "source", code)?.to_owned();
+    let observed_at = required_tool_text(evidence, "observed_at", code)?.to_owned();
+    EvidenceTimestamp::parse_instant(&observed_at)
+        .map_err(|_| format!("产业链 {code} observed_at 非明确时刻"))?;
+    let batch_id = required_tool_text(evidence, "batch_id", code)?.to_owned();
+    let source_at = match evidence.get("source_at") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            EvidenceTimestamp::parse(value)
+                .map_err(|_| format!("产业链 {code} source_at 非有效时间"))?;
+            Some(value.clone())
+        }
+        _ => return Err(format!("产业链 {code} source_at 字段非法或缺失")),
+    };
+    Ok(ToolBoardsObservation {
+        requested_code: code.to_owned(),
+        all_boards,
+        boards,
+        board_count: rows.len(),
+        evidence: OpaqueToolBatchEvidence {
+            provider_label,
+            source,
+            source_at,
+            observed_at,
+            batch_id,
+        },
+        raw_response_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+    })
+}
+
+fn required_tool_text<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    code: &str,
+) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| format!("产业链 {code} 工具结果 {field} 字段非法或缺失"))
+}
+
+fn parse_tool_board_values(value: &serde_json::Value, code: &str) -> Result<Vec<String>, String> {
     let rows = value
         .get("all_boards")
         .and_then(serde_json::Value::as_array)
@@ -458,11 +570,13 @@ mod tests {
     use super::{
         append_after_market_items, append_cluster_news_items, append_generated_cluster_queries,
         build_cluster_query_context, fetch_concepts_cached, fetch_laggard_candidates,
-        map_lhb_reviews, parse_tool_boards, render_after_market_section,
-        resolve_after_market_catalysts, resolve_cluster_news,
+        map_lhb_reviews, parse_tool_boards, parse_tool_boards_observed,
+        render_after_market_section, resolve_after_market_catalysts, resolve_cluster_news,
     };
-    use crate::data_gateway::DragonTigerStockReview;
-    use crate::market_domain::Exchange;
+    use crate::data_gateway::{
+        BatchEvidence, BoardKind, BoardMembershipRecord, DragonTigerStockReview, GatewayBatch,
+    };
+    use crate::market_domain::{Exchange, ProviderId};
     use std::collections::{HashMap, HashSet};
 
     fn search_result(
@@ -673,6 +787,123 @@ mod tests {
         ] {
             assert!(parse_tool_boards(raw, "TEST_CODE_000001").is_err(), "{raw}");
         }
+    }
+
+    fn rendered_membership_raw() -> String {
+        let code = "TEST_CODE_000001";
+        let records = [
+            ("TEST_CODE_BOARD_A", "TEST_CODE_算力"),
+            ("TEST_CODE_BOARD_B", "TEST_CODE_液冷"),
+            ("TEST_CODE_BOARD_C", "TEST_CODE_算力"),
+        ]
+        .into_iter()
+        .map(|(board_code, board_name)| BoardMembershipRecord {
+            instrument_code: code.into(),
+            board_code: board_code.into(),
+            board_name: board_name.into(),
+            kind: BoardKind::Concept,
+        })
+        .collect();
+        crate::agent::tools_sector::render_membership_batch(
+            code,
+            GatewayBatch::Available {
+                records,
+                evidence: BatchEvidence {
+                    provider: ProviderId::Tdx,
+                    source: "TEST_CODE_tdx_membership_v1".into(),
+                    source_at: None,
+                    observed_at: "2026-10-01T09:31:00+08:00".into(),
+                    batch_id: "TEST_CODE_batch_1".into(),
+                },
+            },
+        )
+        .expect("render the real sector tool schema")
+    }
+
+    #[test]
+    fn observed_tool_boards_preserve_raw_response_and_opaque_evidence() {
+        let raw = rendered_membership_raw();
+        let observed = parse_tool_boards_observed(&raw, "TEST_CODE_000001")
+            .expect("real tool response has complete syntactic evidence");
+        assert_eq!(observed.requested_code, "TEST_CODE_000001");
+        assert_eq!(observed.board_count, 3);
+        assert_eq!(
+            observed.all_boards,
+            ["TEST_CODE_算力", "TEST_CODE_液冷", "TEST_CODE_算力"]
+        );
+        assert_eq!(observed.boards, ["TEST_CODE_算力", "TEST_CODE_液冷"]);
+        assert_eq!(observed.evidence.provider_label, "Tdx");
+        assert_eq!(observed.evidence.source, "TEST_CODE_tdx_membership_v1");
+        assert_eq!(observed.evidence.source_at, None);
+        assert_eq!(observed.evidence.observed_at, "2026-10-01T09:31:00+08:00");
+        assert_eq!(observed.evidence.batch_id, "TEST_CODE_batch_1");
+        assert_eq!(observed.raw_response_sha256.len(), 64);
+        assert!(observed
+            .raw_response_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+
+        let same_json_with_extra_whitespace = format!("{raw} ");
+        let changed =
+            parse_tool_boards_observed(&same_json_with_extra_whitespace, "TEST_CODE_000001")
+                .expect("JSON whitespace does not change board projection");
+        assert_eq!(changed.boards, observed.boards);
+        assert_ne!(changed.raw_response_sha256, observed.raw_response_sha256);
+
+        let mut opaque_provider: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        opaque_provider["evidence"]["provider"] = serde_json::json!("TEST_CODE_NewProvider");
+        opaque_provider["evidence"]["source_at"] = serde_json::json!("2026-10-01");
+        let opaque = parse_tool_boards_observed(&opaque_provider.to_string(), "TEST_CODE_000001")
+            .expect("provider labels remain opaque and source date is retained");
+        assert_eq!(opaque.evidence.provider_label, "TEST_CODE_NewProvider");
+        assert_eq!(opaque.evidence.source_at.as_deref(), Some("2026-10-01"));
+    }
+
+    #[test]
+    fn observed_tool_boards_reject_mismatched_shape_and_incomplete_evidence() {
+        let raw = rendered_membership_raw();
+        let base: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parse_tool_boards_observed(&raw, "TEST_CODE_OTHER").is_err());
+        for (field, value) in [
+            ("board_count", serde_json::json!(2)),
+            ("secucode", serde_json::json!("TEST_CODE_OTHER")),
+            ("fetched", serde_json::json!(false)),
+        ] {
+            let mut changed = base.clone();
+            changed[field] = value;
+            assert!(
+                parse_tool_boards_observed(&changed.to_string(), "TEST_CODE_000001").is_err(),
+                "field={field}"
+            );
+        }
+        for (field, value) in [
+            ("provider", serde_json::json!(" ")),
+            ("source", serde_json::json!(null)),
+            ("source_at", serde_json::json!("not-a-date")),
+            ("observed_at", serde_json::json!("2026-10-01")),
+            ("batch_id", serde_json::json!("")),
+        ] {
+            let mut changed = base.clone();
+            changed["evidence"][field] = value;
+            assert!(
+                parse_tool_boards_observed(&changed.to_string(), "TEST_CODE_000001").is_err(),
+                "evidence field={field}"
+            );
+        }
+        let mut missing_source_at = base;
+        missing_source_at["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_at");
+        assert!(
+            parse_tool_boards_observed(&missing_source_at.to_string(), "TEST_CODE_000001").is_err()
+        );
+
+        // The legacy parser keeps accepting its original projection-only shape.
+        assert_eq!(
+            parse_tool_boards(r#"{"all_boards":["TEST_CODE_算力"]}"#, "TEST_CODE_000001").unwrap(),
+            ["TEST_CODE_算力"]
+        );
     }
 
     #[test]
