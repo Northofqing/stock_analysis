@@ -26,6 +26,8 @@ pub mod global_market;
 pub mod global_news;
 pub mod grpc_source;
 pub mod historical_bars;
+mod historical_observed_diagnostic;
+mod historical_observed_store;
 pub(crate) mod historical_record_projection;
 pub mod index;
 pub mod instrument_identity;
@@ -106,6 +108,8 @@ pub use historical_bars::{
     daily_bar_provider_label, AdmittedDailyBars, HistoricalBarsGateway, ObservedDailyBarProjection,
     ObservedDailyBarsCapture,
 };
+#[doc(hidden)]
+pub use historical_observed_diagnostic::observed_history_diagnostic;
 pub use index::{IndexDataGateway, RealtimeIndexQuote};
 pub use intraday_shape::{IntradayShapeFact, IntradayShapeGateway};
 pub use market_capabilities::{

@@ -171,10 +171,15 @@ impl GatewayObservedHistoricalWindowCapture {
         &self.capture_hash
     }
 
-    /// A rejected binding still retains the original wire and typed result;
-    /// subsequent record admission or persistence must reject this capture.
+    /// A rejected binding still retains the original wire and typed result.
+    /// Record admission must reject it; the raw observed store may preserve
+    /// this negative evidence without granting any admission or live authority.
     pub(crate) fn request_binding_error(&self) -> Option<&GrpcError> {
         self.request_binding_error.as_ref()
+    }
+
+    pub(crate) fn hash_parts_v1(&self) -> Result<[Vec<u8>; 16], GrpcError> {
+        observed_capture_parts_v1(&self.request, &self.issued_request_bytes, &self.observation)
     }
 
     fn from_observed(
@@ -233,6 +238,26 @@ fn observed_capture_hash(
     issued_request_bytes: &[u8],
     observation: &ExternalHistoricalObservation,
 ) -> Result<String, GrpcError> {
+    Ok(hash_capture_parts_v1(&observed_capture_parts_v1(
+        request,
+        issued_request_bytes,
+        observation,
+    )?))
+}
+
+pub(crate) fn hash_capture_parts_v1(parts: &[Vec<u8>; 16]) -> String {
+    let mut hasher = Sha256::new();
+    for bytes in parts {
+        hash_bytes(&mut hasher, bytes);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn observed_capture_parts_v1(
+    request: &HistoricalWindowRequest,
+    issued_request_bytes: &[u8],
+    observation: &ExternalHistoricalObservation,
+) -> Result<[Vec<u8>; 16], GrpcError> {
     let serialize = |value: &serde_json::Value| {
         serde_json::to_vec(value)
             .map_err(|_| request_error("external_historical_capture_serialization", false))
@@ -267,33 +292,29 @@ fn observed_capture_hash(
             }
         }))?,
     };
-    let mut hasher = Sha256::new();
-    for bytes in [
-        CAPTURE_MATERIAL.as_bytes(),
-        &request_material,
-        &connection_material,
-        &observation.health_wire,
-        &observation.health.encode_to_vec(),
-        &observation.server_build_identity.encode_to_vec(),
-        &observation.capabilities_wire,
-        &observation.capabilities_response.encode_to_vec(),
-        &observation.capability.encode_to_vec(),
-        observation.request_id_correlation.as_bytes(),
-        issued_request_bytes,
-        &observation.request_bytes,
-        &wire_material,
-        &status_material,
-        &serialize(&observed_result_material(&observation.result))?,
-        &serialize(
+    Ok([
+        CAPTURE_MATERIAL.as_bytes().to_vec(),
+        request_material,
+        connection_material,
+        observation.health_wire.clone(),
+        observation.health.encode_to_vec(),
+        observation.server_build_identity.encode_to_vec(),
+        observation.capabilities_wire.clone(),
+        observation.capabilities_response.encode_to_vec(),
+        observation.capability.encode_to_vec(),
+        observation.request_id_correlation.as_bytes().to_vec(),
+        issued_request_bytes.to_vec(),
+        observation.request_bytes.clone(),
+        wire_material,
+        status_material,
+        serialize(&observed_result_material(&observation.result))?,
+        serialize(
             &match request_binding_error(issued_request_bytes, observation) {
                 None => serde_json::json!({"request_binding":"Matched"}),
                 Some(error) => observed_result_material(&Err(error)),
             },
         )?,
-    ] {
-        hash_bytes(&mut hasher, bytes);
-    }
-    Ok(hex::encode(hasher.finalize()))
+    ])
 }
 
 fn observed_result_material(
@@ -390,3 +411,7 @@ fn observed_result_material(
 #[cfg(test)]
 #[path = "external_historical_bars_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "historical_observed_capture_tests.rs"]
+mod observed_store_tests;
