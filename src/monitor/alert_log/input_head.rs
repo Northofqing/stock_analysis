@@ -147,6 +147,8 @@ impl VerifiedAlertInputPrefix {
 #[derive(Debug)]
 pub enum AlertInputHeadUnknown {
     AccessDenied,
+    MissingDirectory,
+    MissingFence,
     MissingHead,
     MissingSource,
     NonRegular,
@@ -177,7 +179,10 @@ impl From<io::Error> for AlertInputHeadUnknown {
 }
 
 fn io_unknown(error: AlertInputHeadUnknown) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"))
+    match error {
+        AlertInputHeadUnknown::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::InvalidData, format!("{other:?}")),
+    }
 }
 
 fn same_identity(left: &Metadata, right: &Metadata) -> bool {
@@ -196,43 +201,52 @@ struct DateFence {
 }
 
 impl DateFence {
-    fn acquire(dir: &Path, date: NaiveDate) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-        if !fs::symlink_metadata(dir)?.file_type().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "alert directory is not a real directory",
-            ));
+    fn acquire(dir: &Path, date: NaiveDate, writer: bool) -> Result<Self, AlertInputHeadUnknown> {
+        if writer {
+            fs::create_dir_all(dir)?;
+        }
+        let directory = match fs::symlink_metadata(dir) {
+            Ok(metadata) => metadata,
+            Err(error) if !writer && error.kind() == io::ErrorKind::NotFound => {
+                return Err(AlertInputHeadUnknown::MissingDirectory);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !directory.file_type().is_dir() {
+            return Err(AlertInputHeadUnknown::NonRegular);
         }
         let requested_dir = dir.to_path_buf();
         let dir = fs::canonicalize(dir)?;
         let dir_file = File::open(&dir)?;
         if !same_identity(&dir_file.metadata()?, &fs::symlink_metadata(&dir)?) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "alert directory changed",
-            ));
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "alert directory changed").into(),
+            );
         }
         let lock_path = lock_path(&dir, date);
         match fs::symlink_metadata(&lock_path) {
             Ok(before) if !before.file_type().is_file() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "date fence is not a regular file",
-                ));
+                return Err(AlertInputHeadUnknown::NonRegular);
             }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(error) if !writer && error.kind() == io::ErrorKind::NotFound => {
+                return Err(AlertInputHeadUnknown::MissingFence);
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
             _ => {}
         }
-        let lock_file =
-            nofollow(OpenOptions::new().read(true).write(true).create(true)).open(&lock_path)?;
+        let lock_file = if writer {
+            nofollow(OpenOptions::new().read(true).write(true).create(true)).open(&lock_path)?
+        } else {
+            nofollow(OpenOptions::new().read(true)).open(&lock_path)?
+        };
         if !lock_file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "date fence is not a regular file",
-            ));
+            return Err(AlertInputHeadUnknown::NonRegular);
         }
-        lock_file.lock_exclusive()?;
+        if writer {
+            lock_file.lock_exclusive()?;
+        } else {
+            FileExt::lock_shared(&lock_file)?;
+        }
         let guard = Self {
             requested_dir,
             dir,
@@ -489,7 +503,7 @@ impl AlertLog {
     /// if empty, is historical/unknown and is never silently adopted.
     pub fn initialize_date_input_head(&self, date: NaiveDate) -> io::Result<AlertInputHeadV1> {
         self.ensure_io_allowed()?;
-        let guard = DateFence::acquire(&self.dir, date)?;
+        let guard = DateFence::acquire(&self.dir, date, true).map_err(io_unknown)?;
         match inspect_locked(&guard, date, self.origin) {
             Ok((snapshot, _, _)) => Ok(snapshot.head),
             Err(AlertInputHeadUnknown::MissingHead) => {
@@ -520,7 +534,7 @@ impl AlertLog {
         }
         let mut line = Vec::new();
         write_jsonl(&mut line, &record)?;
-        let guard = DateFence::acquire(&self.dir, date)?;
+        let guard = DateFence::acquire(&self.dir, date, true).map_err(io_unknown)?;
         let (snapshot, old_head, old_bytes) = match inspect_locked(&guard, date, self.origin) {
             Ok(state) => state,
             Err(AlertInputHeadUnknown::MissingHead) => {
@@ -591,7 +605,7 @@ impl AlertLog {
                 AlertInputHeadUnknown::Io(error)
             }
         })?;
-        let guard = DateFence::acquire(&self.dir, date)?;
+        let guard = DateFence::acquire(&self.dir, date, false)?;
         let (snapshot, _, _) = inspect_locked(&guard, date, self.origin)?;
         Ok(snapshot)
     }
@@ -653,14 +667,22 @@ mod tests {
     fn missing_head_and_prehead_file_stay_unknown_but_explicit_zero_head_is_readable() {
         let temp = tempfile::tempdir().unwrap();
         let archive = AlertLog::production_at(temp.path());
+        let absent_dir = temp.path().join("absent");
+        let absent_archive = AlertLog::production_at(&absent_dir);
+        assert!(matches!(
+            absent_archive.inspect_date_input_head(date()),
+            Err(AlertInputHeadUnknown::MissingDirectory)
+        ));
+        assert!(!absent_dir.exists());
         assert!(matches!(
             AlertLog::production().inspect_date_input_head(date()),
             Err(AlertInputHeadUnknown::AccessDenied)
         ));
         assert!(matches!(
             archive.inspect_date_input_head(date()),
-            Err(AlertInputHeadUnknown::MissingHead)
+            Err(AlertInputHeadUnknown::MissingFence)
         ));
+        assert!(!lock_path(temp.path(), date()).exists());
         let source = dated_file_for(temp.path(), "jsonl", date());
         fs::write(&source, []).unwrap();
         assert!(archive.initialize_date_input_head(date()).is_err());
@@ -679,6 +701,27 @@ mod tests {
             archive.inspect_date_input_head(date()),
             Err(AlertInputHeadUnknown::UnexpectedSource)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_read_succeeds_with_read_only_directory_and_fence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::production_at(temp.path());
+        archive
+            .append_date_jsonl_fenced(date(), &event("600001"))
+            .unwrap();
+        let lock = lock_path(temp.path(), date());
+        let dir_mode = fs::metadata(temp.path()).unwrap().permissions().mode();
+        let lock_mode = fs::metadata(&lock).unwrap().permissions().mode();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let result = archive.inspect_date_input_head(date());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(dir_mode)).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(lock_mode)).unwrap();
+        assert_eq!(result.unwrap().records()[0].code, "600001");
     }
 
     #[test]
@@ -806,8 +849,10 @@ mod tests {
     fn head_and_fence_symlinks_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let archive = AlertLog::production_at(temp.path());
+        archive.initialize_date_input_head(date()).unwrap();
         let target = temp.path().join("target");
         fs::write(&target, b"{}\n").unwrap();
+        fs::remove_file(head_path(temp.path(), date())).unwrap();
         std::os::unix::fs::symlink(&target, head_path(temp.path(), date())).unwrap();
         assert!(matches!(
             archive.inspect_date_input_head(date()),
@@ -816,6 +861,10 @@ mod tests {
         fs::remove_file(head_path(temp.path(), date())).unwrap();
         fs::remove_file(lock_path(temp.path(), date())).unwrap();
         std::os::unix::fs::symlink(&target, lock_path(temp.path(), date())).unwrap();
+        assert!(matches!(
+            archive.inspect_date_input_head(date()),
+            Err(AlertInputHeadUnknown::NonRegular)
+        ));
         assert!(archive.initialize_date_input_head(date()).is_err());
     }
 }
