@@ -699,7 +699,7 @@ where
             captured_gate,
             ChainPreparedDecision {
                 input,
-                suppression_reason: envelope.suppression.map(ChainSendSuppression::as_str),
+                suppression: envelope.suppression,
                 send_attempted: envelope.send_attempted,
                 report_observed: envelope.notification_report.is_some(),
                 send_id: envelope.notification_report.as_ref().map(|report| report.send_id()),
@@ -709,10 +709,11 @@ where
             },
         ) {
             Ok(decision) => log::info!(
-                "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} send_id={} scope={} reason={} targets={} coverage=incomplete authority=weak foundation_persisted=false",
+                "[chain_shadow_decision] phase={} schedule_date={} gate_sha256={} binding_sha256={} binding_schema=chain-decision-observation-v2 send_id={} scope={} reason={} prepared_report_equals_input={:?} targets={} coverage=incomplete authority=weak foundation_persisted=false",
                 phase.as_str(), date, decision.gate_sha256,
                 decision.binding_sha256, decision.send_id.as_deref().unwrap_or("none"),
                 decision.scope, decision.reason,
+                decision.prepared_report_equals_input,
                 decision.target_count,
             ),
             Err(error) => log::warn!(

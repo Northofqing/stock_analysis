@@ -647,7 +647,7 @@ mod tests_chain_delivery {
             &wrong_gate,
             ChainPreparedDecision {
                 input: &input,
-                suppression_reason: None,
+                suppression: None,
                 send_attempted: true,
                 report_observed: false,
                 send_id: None,

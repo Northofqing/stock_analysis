@@ -12,6 +12,7 @@ use super::chain_acquisition::{
     MissingSelectedNewsSourceTime,
 };
 use super::chain_schedule::{ChainPhase, ChainScheduleStatus};
+use super::modes::ChainSendSuppression;
 
 pub(super) const COVERAGE: &str = "incomplete";
 pub(super) const REPORT_INPUTS: &str = "prepared_report_utf8_only";
@@ -123,7 +124,7 @@ impl ChainWeakTargetResult {
 
 pub(super) struct ChainPreparedDecision<'a> {
     pub input: &'a ChainReportInputObservation,
-    pub suppression_reason: Option<&'static str>,
+    pub suppression: Option<ChainSendSuppression>,
     pub send_attempted: bool,
     pub report_observed: bool,
     pub send_id: Option<&'a str>,
@@ -139,6 +140,8 @@ pub(super) struct ChainDecisionObservation {
     pub send_id: Option<String>,
     pub scope: &'static str,
     pub reason: &'static str,
+    /// Exact retained report-input comparison, not channel payload parity.
+    pub prepared_report_equals_input: Option<bool>,
     pub target_count: usize,
 }
 
@@ -170,6 +173,7 @@ pub(super) fn observe_schedule_only(gate: &ChainGateCapture) -> Result<ChainDeci
         send_id: None,
         scope: "schedule_only",
         reason,
+        prepared_report_equals_input: None,
         target_count: 0,
     })
 }
@@ -187,6 +191,24 @@ pub(super) fn observe_prepared_decision(
     anyhow::ensure!(
         decision.input.phase == gate.phase && decision.input.schedule_date == gate.schedule_date,
         "chain decision gate and prepared input disagree"
+    );
+    anyhow::ensure!(
+        decision.suppression.is_some() != decision.send_attempted,
+        "chain suppression and send attempt disagree"
+    );
+    anyhow::ensure!(
+        !decision.mark_attempted || decision.send_attempted,
+        "chain weak acceptance mark exists without a send attempt"
+    );
+    anyhow::ensure!(
+        !matches!(
+            decision.suppression,
+            Some(
+                ChainSendSuppression::NoConfiguredChannel
+                    | ChainSendSuppression::BeforeSendRejected
+            )
+        ) || !decision.legacy_succeeded,
+        "chain failed send guard cannot have a successful legacy result"
     );
     anyhow::ensure!(
         decision.report_observed || decision.targets.is_empty(),
@@ -223,17 +245,20 @@ pub(super) fn observe_prepared_decision(
         })
         .collect::<Vec<_>>();
     let gate_sha256 = gate.sha256()?;
+    let suppression_reason = decision.suppression.map(ChainSendSuppression::as_str);
     let binding_sha256 = digest_decision(&serde_json::json!({
-        "schema": "chain-decision-observation-v1",
+        "schema": "chain-decision-observation-v2",
         "scope": "prepared",
         "gate_sha256": gate_sha256,
         "prepared_business_date": decision.input.prepared_business_date,
         "artifact_sha256": decision.input.artifact_sha256,
         "report_input_sha256": decision.input.report_input_sha256,
+        "report_input_bytes": decision.input.report_input_bytes,
+        "prepared_report_equals_input": decision.input.prepared_report_equals_input,
         "acquisition_report_binding_sha256": decision.input.acquisition_report_binding_sha256,
         "selected_news_source_ref_sha256": decision.input.selected_news_source_ref.as_ref().map(|source| &source.ref_sha256),
         "selected_news_source_ref_status": decision.input.selected_news_source_ref_status.reason(),
-        "suppression_reason": decision.suppression_reason,
+        "suppression_reason": suppression_reason,
         "send_attempted": decision.send_attempted,
         "report_observed": decision.report_observed,
         "send_id": decision.send_id,
@@ -246,7 +271,8 @@ pub(super) fn observe_prepared_decision(
         binding_sha256,
         send_id: decision.send_id.map(str::to_owned),
         scope: "prepared",
-        reason: decision.suppression_reason.unwrap_or("none"),
+        reason: suppression_reason.unwrap_or("none"),
+        prepared_report_equals_input: Some(decision.input.prepared_report_equals_input),
         target_count: decision.targets.len(),
     })
 }
@@ -546,6 +572,7 @@ mod decision_tests {
             assert_eq!(closed.scope, "schedule_only");
             assert_eq!(closed.send_id, None);
             assert_eq!(closed.reason, "already_closed");
+            assert_eq!(closed.prepared_report_equals_input, None);
             assert_eq!(uncertain.reason, "uncertain_needs_review");
             assert_eq!(outside.reason, "outside_send_window");
             assert_ne!(closed.binding_sha256, uncertain.binding_sha256);
@@ -577,7 +604,7 @@ mod decision_tests {
             target(1, "custom", WeakOutcomeKind::Unknown),
         ];
         let bind = |input: &ChainReportInputObservation,
-                    suppression_reason,
+                    suppression,
                     targets: &[ChainWeakTargetResult],
                     send_attempted,
                     send_id,
@@ -587,7 +614,7 @@ mod decision_tests {
                 &gate,
                 ChainPreparedDecision {
                     input,
-                    suppression_reason,
+                    suppression,
                     send_attempted,
                     report_observed: send_attempted,
                     send_id,
@@ -610,6 +637,7 @@ mod decision_tests {
         assert_eq!(first.scope, "prepared");
         assert_eq!(first.target_count, 2);
         assert_eq!(first.send_id.as_deref(), Some("TEST_CODE_SEND_A"));
+        assert_eq!(first.prepared_report_equals_input, Some(true));
         assert_eq!(first.gate_sha256, gate.sha256().unwrap());
         assert_eq!(
             first,
@@ -638,6 +666,15 @@ mod decision_tests {
             .unwrap()
             .binding_sha256
         );
+        for suppression in [
+            ChainSendSuppression::NotificationDisabled,
+            ChainSendSuppression::NoConfiguredChannel,
+            ChainSendSuppression::BeforeSendRejected,
+        ] {
+            let observed = bind(&input, Some(suppression), &[], false, None, false, false).unwrap();
+            assert_eq!(observed.reason, suppression.as_str());
+            assert_eq!(observed.prepared_report_equals_input, Some(true));
+        }
         let changed_outcome = [
             target(0, "wechat", WeakOutcomeKind::Unknown),
             target(1, "custom", WeakOutcomeKind::Accepted),
@@ -660,7 +697,7 @@ mod decision_tests {
             first.binding_sha256,
             bind(
                 &input,
-                Some("before_send_rejected"),
+                Some(ChainSendSuppression::BeforeSendRejected),
                 &[],
                 false,
                 None,
@@ -684,6 +721,26 @@ mod decision_tests {
             .unwrap()
             .binding_sha256
         );
+        let altered_input = observe(
+            ChainPhase::Preopen,
+            schedule_date,
+            &prepared,
+            b"changed report input",
+            None,
+        )
+        .unwrap();
+        let altered = bind(
+            &altered_input,
+            None,
+            &targets,
+            true,
+            Some("TEST_CODE_SEND_A"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(altered.prepared_report_equals_input, Some(false));
+        assert_ne!(first.binding_sha256, altered.binding_sha256);
         input.acquisition_report_binding_sha256 = Some("TEST_CODE_DIFFERENT_SOURCE".into());
         assert_ne!(
             first.binding_sha256,
@@ -714,6 +771,37 @@ mod decision_tests {
         )
         .is_err());
         assert!(bind(&input, None, &targets, true, None, false, false).is_err());
+        assert!(bind(&input, None, &[], false, None, false, false).is_err());
+        assert!(bind(
+            &input,
+            Some(ChainSendSuppression::BeforeSendRejected),
+            &targets,
+            true,
+            Some("TEST_CODE_SEND_A"),
+            false,
+            false
+        )
+        .is_err());
+        assert!(bind(
+            &input,
+            Some(ChainSendSuppression::BeforeSendRejected),
+            &[],
+            false,
+            None,
+            true,
+            false
+        )
+        .is_err());
+        assert!(bind(
+            &input,
+            Some(ChainSendSuppression::NoConfiguredChannel),
+            &[],
+            false,
+            None,
+            false,
+            true
+        )
+        .is_err());
         assert_eq!(preparations.get(), 1);
     }
 }
@@ -895,7 +983,7 @@ mod tests {
             &gate,
             ChainPreparedDecision {
                 input: &input,
-                suppression_reason: None,
+                suppression: None,
                 send_attempted: true,
                 report_observed: true,
                 send_id: Some(report.send_id()),
