@@ -760,6 +760,20 @@ macro_rules! external_query_wire_service {
     ($($method:ident),* $(,)?) => {
         #[tonic::async_trait]
         impl MarketDataService for ExternalQueryWireService {
+            async fn official_publications(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE official publications unavailable"))
+            }
+
+            async fn official_publication(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE official publication unavailable"))
+            }
+
             async fn money_flows(
                 &self,
                 request: Request<QueryRequest>,

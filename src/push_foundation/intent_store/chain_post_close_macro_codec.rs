@@ -2082,6 +2082,223 @@ mod tests {
     }
 
     #[test]
+    fn wg03_sep28_v4_control_receipt_replays_exact_bytes_and_rejects_crossed_trust() {
+        use crate::grpc_client::archived_external_20260928;
+        use crate::grpc_client::connection_qualification::ConnectionIdentity;
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        let connection = ConnectionIdentity {
+            version: 1,
+            epoch: "TEST_CODE_SEP28_RECORDED_EPOCH".into(),
+            policy_sha256: "de9a897d7e35f35bdd475b4133f002b27e9dfb40cb029aeb81d590ac3e70f54a"
+                .into(),
+            descriptor_sha256: archived_external_20260928::DESCRIPTOR_SHA256.into(),
+        };
+        assert!(connection.validate_recorded());
+        let request = ControlRequest::capture_current(
+            ExternalControlRequestMaterial {
+                kind: ExternalControlKind::Health,
+                request_bytes: HealthRequest {
+                    context: Some(
+                        crate::grpc_client::external_pb::magic::market::v1::RequestContext {
+                            protocol_version: 1,
+                            request_id: "TEST_CODE_SEP28_FROZEN_HEALTH".into(),
+                        },
+                    ),
+                }
+                .encode_to_vec(),
+                request_id: "TEST_CODE_SEP28_FROZEN_HEALTH".into(),
+                profile: ContractProfile::ExternalV1,
+                endpoint_uri: "https://TEST_CODE.invalid:443".into(),
+                acquisition_authority: "grpc-mtls:TEST_CODE.invalid".into(),
+            },
+            &connection,
+        )
+        .unwrap();
+        let health = HealthResponse {
+            request_id: request.id.clone(),
+            live: true,
+            ready: true,
+            state: "TEST_CODE_READY".into(),
+            observability: Some(
+                crate::grpc_client::external_pb::magic::market::v1::RuntimeObservability {
+                    process_started_at_unix_ms: 1_790_589_600_000,
+                    query_started: 23,
+                    query_succeeded: 22,
+                    query_failed: 1,
+                    unary_concurrency_limit: 4,
+                    unary_concurrency_available: 3,
+                    ..Default::default()
+                },
+            ),
+            build_identity: Some(BuildIdentity {
+                service_version: "0.2.0".into(),
+                source_revision: "4e4995f8d3f2c7cd504d1dec0f238e6d4b4fc02c".into(),
+                contract_sha256: "0c4485545dbfd0979a7d5ea206c840f39fd504ed62fb7eef92f1940bdc9c2f41"
+                    .into(),
+                binary_sha256: "517e0b4c31bb42330f4bc2a0395e3af385a164212414a65775bed40c9eb87ae3"
+                    .into(),
+                identity_error: String::new(),
+            }),
+        };
+        let health_bytes = health.encode_to_vec();
+        assert!(matches!(
+            ExternalDecoder::for_descriptor(&connection.descriptor_sha256).unwrap(),
+            ExternalDecoder::Archived20260928
+        ));
+        assert_eq!(
+            archived_external_20260928::health(&health_bytes).unwrap(),
+            health
+        );
+        let mut raw: ControlRawResult = serde_json::from_value(serde_json::json!({
+            "version":2,"connect_unavailable":false,"response":health_bytes,
+            "code":null,"details":null,"trailer":"Absent","diagnostic":null
+        }))
+        .unwrap();
+        raw.bind_connection_identity(&request, &connection, None)
+            .unwrap();
+        assert_eq!(raw.version, 4);
+        assert!(raw.project(&request).unwrap().is_ok());
+        let frozen_request = encode(&request).unwrap();
+        let frozen_raw = encode(&raw).unwrap();
+        let frozen_connection = encode(&connection).unwrap();
+        let reopened_request: ControlRequest = decode(&frozen_request).unwrap();
+        let reopened_raw: ControlRawResult = decode(&frozen_raw).unwrap();
+        let reopened_connection: ConnectionIdentity = decode(&frozen_connection).unwrap();
+        assert!(reopened_raw.project(&reopened_request).unwrap().is_ok());
+        reopened_raw
+            .validate_connection_binding(&reopened_connection, Some(&health_bytes))
+            .unwrap();
+        assert_eq!(encode(&reopened_request).unwrap(), frozen_request);
+        assert_eq!(encode(&reopened_raw).unwrap(), frozen_raw);
+        assert_eq!(encode(&reopened_connection).unwrap(), frozen_connection);
+        assert_eq!(
+            reopened_raw.response.as_deref(),
+            Some(health_bytes.as_slice())
+        );
+
+        let saved = serde_json::to_value(&raw).unwrap();
+        for field in ["policy_sha256", "descriptor_sha256"] {
+            let mut crossed = saved.clone();
+            crossed["connection_identity"][field] = serde_json::json!(match field {
+                "policy_sha256" => trust.current_policy_sha256(),
+                _ => trust.current_descriptor().to_owned(),
+            });
+            let crossed: ControlRawResult = serde_json::from_value(crossed).unwrap();
+            assert!(crossed.project(&request).is_err(), "{field}");
+        }
+        let mut crossed = saved.clone();
+        crossed["connection_identity"]["policy_sha256"] =
+            serde_json::json!(trust.current_policy_sha256());
+        crossed["connection_identity"]["descriptor_sha256"] =
+            serde_json::json!(trust.current_descriptor());
+        crossed["wire_identity"]["client_descriptor_sha256"] =
+            serde_json::json!(trust.current_descriptor());
+        let crossed: ControlRawResult = serde_json::from_value(crossed).unwrap();
+        assert!(
+            crossed.project(&request).is_err(),
+            "new policy cannot bless old build"
+        );
+        let mut new_health = health.clone();
+        new_health.build_identity =
+            Some(crate::grpc_client::build_identity::test_public_build_identity());
+        let mut crossed = saved.clone();
+        crossed["response"] = serde_json::json!(new_health.encode_to_vec());
+        let crossed: ControlRawResult = serde_json::from_value(crossed).unwrap();
+        assert!(
+            crossed.project(&request).is_err(),
+            "old policy cannot bless new build"
+        );
+        let mut crossed = saved.clone();
+        crossed["verified_build_identity"] =
+            serde_json::to_value(new_health.build_identity.unwrap()).unwrap();
+        let crossed: ControlRawResult = serde_json::from_value(crossed).unwrap();
+        assert!(
+            crossed.project(&request).is_err(),
+            "verified build must match response and policy"
+        );
+        for strip_connection in [false, true] {
+            let mut downgraded = saved.clone();
+            downgraded["version"] = serde_json::json!(3);
+            if strip_connection {
+                downgraded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("connection_identity");
+            }
+            let downgraded: ControlRawResult = serde_json::from_value(downgraded).unwrap();
+            assert!(downgraded.project(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn wg03_sep28_v4_data_receipt_preserves_unknown_wire_bytes_and_rejects_downgrade() {
+        use crate::grpc_client::archived_external_20260928;
+        use crate::grpc_client::connection_qualification::ConnectionIdentity;
+        // The former current release allowed unknown query fields and empty
+        // field 11. Keep those exact bytes and its original decoder semantics.
+        let (identity, request, mut completion) =
+            external_v2_material(&[0x5a, 0x00, 0xa0, 0x06, 0x01]);
+        let connection = ConnectionIdentity {
+            version: 1,
+            epoch: "TEST_CODE_SEP28_RECORDED_DATA_EPOCH".into(),
+            policy_sha256: "de9a897d7e35f35bdd475b4133f002b27e9dfb40cb029aeb81d590ac3e70f54a"
+                .into(),
+            descriptor_sha256: archived_external_20260928::DESCRIPTOR_SHA256.into(),
+        };
+        let ExternalMacroAttemptCompletion::Unary(material) = &mut completion else {
+            unreachable!()
+        };
+        material
+            .external_wire
+            .as_mut()
+            .unwrap()
+            .client_descriptor_sha256 = connection.descriptor_sha256.clone();
+        let original_payload = material.response_bytes.clone().unwrap();
+        let mut raw = RawResult::capture_external_bound(&completion, &identity, &request).unwrap();
+        raw.bind_current_connection(&connection).unwrap();
+        let frozen = encode(&raw).unwrap();
+        let reopened: RawResult = decode(&frozen).unwrap();
+        assert_eq!(reopened.version, 4);
+        assert!(reopened
+            .project_for(&identity, &request, 1, None)
+            .unwrap()
+            .0
+            .is_ok());
+        reopened
+            .validate_current_connection(Some(&connection))
+            .unwrap();
+        assert_eq!(
+            reopened.response.as_deref(),
+            Some(original_payload.as_slice())
+        );
+        assert_eq!(encode(&reopened).unwrap(), frozen);
+        let saved = serde_json::to_value(&reopened).unwrap();
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        for field in ["policy_sha256", "descriptor_sha256"] {
+            let mut crossed = saved.clone();
+            crossed["connection_identity"][field] = serde_json::json!(match field {
+                "policy_sha256" => trust.current_policy_sha256(),
+                _ => trust.current_descriptor().to_owned(),
+            });
+            let crossed: RawResult = serde_json::from_value(crossed).unwrap();
+            assert!(
+                crossed.project_for(&identity, &request, 1, None).is_err(),
+                "{field}"
+            );
+        }
+        let mut downgraded = saved;
+        downgraded["version"] = serde_json::json!(3);
+        downgraded
+            .as_object_mut()
+            .unwrap()
+            .remove("connection_identity");
+        let downgraded: RawResult = serde_json::from_value(downgraded).unwrap();
+        assert!(downgraded
+            .project_for(&identity, &request, 1, None)
+            .is_err());
+    }
+
+    #[test]
     fn new_external_control_requests_bind_typed_method_and_descriptor_without_rewriting_v1() {
         for kind in [
             ExternalControlKind::Health,

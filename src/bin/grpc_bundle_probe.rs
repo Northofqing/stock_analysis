@@ -496,6 +496,12 @@ async fn main() -> anyhow::Result<()> {
         .map(|selection| native_query_spec(&args, selection))
         .transpose()?;
     let bundle = canonical_bundle_path(&args.bundle)?;
+    let public_inputs = stock_analysis::grpc_client::build_identity::compiled_public_inputs()
+        .map_err(|error| anyhow::anyhow!("compiled public inputs unavailable: {error}"))?;
+    println!(
+        "compiled_public_inputs={}",
+        serde_json::to_string(&public_inputs)?
+    );
 
     let mut client = GrpcMarketClient::connect_client_bundle(&bundle)
         .await

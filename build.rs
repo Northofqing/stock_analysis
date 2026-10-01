@@ -1,6 +1,6 @@
 //! Generate independent LocalBridgeV1 and ExternalV1 wire contracts.
-//! Local is frozen with its private 61/62 extensions; External uses the public
-//! client-bundle proto verbatim. Their identical package names have separate
+//! Local is frozen with its private 61/62 extensions; External uses the
+//! checked-in public proto verbatim. Their identical package names have separate
 //! generated modules and descriptors.
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,7 @@ fn main() {
         .compile_protos(&[local_input.as_path()], &[local_dir.as_path()])
         .expect("compile frozen LocalBridgeV1 contract");
 
-    let external_source = "client-bundle/market.proto";
+    let external_source = "contracts/external_v1_current/market.proto";
     let external_dir = out_dir.join("external_v1");
     std::fs::create_dir_all(&external_dir).expect("create ExternalV1 output directory");
     tonic_prost_build::configure()
@@ -42,7 +42,10 @@ fn main() {
         .build_client(true)
         .out_dir(&external_dir)
         .file_descriptor_set_path(external_dir.join("descriptor.bin"))
-        .compile_protos(&[Path::new(external_source)], &[Path::new("client-bundle")])
+        .compile_protos(
+            &[Path::new(external_source)],
+            &[Path::new("contracts/external_v1_current")],
+        )
         .expect("compile unmodified ExternalV1 contract");
 
     println!("cargo:rerun-if-changed={local_source}");
@@ -62,6 +65,22 @@ fn main() {
         )
         .expect("compile frozen historical External contract");
     println!("cargo:rerun-if-changed={history_source}");
+    // The former current V4 release remains an independent messages-only
+    // decoder; it cannot acquire a live connection qualification.
+    let archived_source = "contracts/external_v1_history/20260928.2/market.proto";
+    let archived_dir = out_dir.join("external_history_20260928");
+    std::fs::create_dir_all(&archived_dir).expect("create archived External output");
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .out_dir(&archived_dir)
+        .file_descriptor_set_path(archived_dir.join("descriptor.bin"))
+        .compile_protos(
+            &[Path::new(archived_source)],
+            &[Path::new("contracts/external_v1_history/20260928.2")],
+        )
+        .expect("compile frozen Sep28 External contract");
+    println!("cargo:rerun-if-changed={archived_source}");
     // An explicit additive TEST_CODE release, compiled independently from A.
     // Only cfg(test) modules include these messages; never a runtime registry.
     let upgrade_dir = out_dir.join("external_test_upgrade_b");

@@ -5,7 +5,12 @@
 use super::external_pb::magic::market::v1::{BuildIdentity, HealthResponse};
 use serde::{Deserialize, Serialize};
 
-const PUBLIC_BUNDLE_METADATA: &str = include_str!("../../client-bundle/bundle-metadata.json");
+const PUBLIC_BUNDLE_METADATA: &str =
+    include_str!("../../contracts/external_v1_current/bundle-metadata.json");
+const PUBLIC_BUNDLE_PROTO: &[u8] =
+    include_bytes!("../../contracts/external_v1_current/market.proto");
+const ARCHIVED_20260928_METADATA: &str =
+    include_str!("../../contracts/external_v1_history/20260928.2/bundle-metadata.json");
 // V1-V3 recorded no expected-policy receipt. Their explicit legacy policy is
 // this frozen public release, never the current bundle or a response's claim.
 const HISTORICAL_V3_METADATA: &str =
@@ -17,6 +22,7 @@ const BINARY_HASH_SCOPE: &str =
 
 #[derive(Debug, Deserialize)]
 struct BundleMetadata {
+    bundle_version: String,
     deployment_build_identity: Option<ExpectedBuildIdentity>,
 }
 
@@ -36,6 +42,7 @@ struct ExpectedBuildIdentity {
 pub(crate) struct BuildIdentityTrust {
     current: ExpectedBuildIdentity,
     historical_v3: ExpectedBuildIdentity,
+    archived_20260928: ExpectedBuildIdentity,
     current_descriptor: &'static str,
 }
 
@@ -75,6 +82,10 @@ impl BuildIdentityTrust {
             && digest == policy_sha256(&self.historical_v3, descriptor)
         {
             return Some(self.historical_v3.clone());
+        } else if super::archived_external_20260928::accepts_descriptor(descriptor)
+            && digest == policy_sha256(&self.archived_20260928, descriptor)
+        {
+            return Some(self.archived_20260928.clone());
         }
         // Explicit compiled test release, never learned from response/env. This
         // only verifies a recorded receipt; it does not change live A's pin.
@@ -93,6 +104,7 @@ impl BuildIdentityTrust {
         Ok(Self {
             current: expected_identity()?,
             historical_v3: parse_expected_identity(HISTORICAL_V3_METADATA)?,
+            archived_20260928: parse_expected_identity(ARCHIVED_20260928_METADATA)?,
             current_descriptor:
                 super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         })
@@ -152,6 +164,42 @@ impl BuildIdentityTrust {
         value.current.binary_sha256 = "b".repeat(64);
         value
     }
+}
+
+/// Public release inputs embedded in this binary. Runtime bundle files and
+/// response identity fields cannot change this versioned receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompiledPublicInputs {
+    pub version: u32,
+    pub bundle_version: String,
+    pub raw_proto_sha256: String,
+    pub raw_metadata_sha256: String,
+    pub compiled_descriptor_sha256: String,
+    pub policy_sha256: String,
+}
+
+pub fn compiled_public_inputs() -> Result<CompiledPublicInputs, BuildIdentityError> {
+    let metadata: BundleMetadata = serde_json::from_str(PUBLIC_BUNDLE_METADATA)
+        .map_err(|_| BuildIdentityError::ExpectedIdentityUnavailable)?;
+    let trust = BuildIdentityTrust::bundled()?;
+    let descriptor = super::external_query_transport::compiled_descriptor_sha256();
+    if descriptor != trust.current_descriptor() {
+        return Err(BuildIdentityError::ExpectedIdentityUnavailable);
+    }
+    Ok(CompiledPublicInputs {
+        version: 1,
+        bundle_version: metadata.bundle_version,
+        raw_proto_sha256: crate::monitor::push_job::raw_digest(PUBLIC_BUNDLE_PROTO)
+            .as_str()
+            .to_owned(),
+        raw_metadata_sha256: crate::monitor::push_job::raw_digest(
+            PUBLIC_BUNDLE_METADATA.as_bytes(),
+        )
+        .as_str()
+        .to_owned(),
+        compiled_descriptor_sha256: descriptor,
+        policy_sha256: trust.current_policy_sha256(),
+    })
 }
 
 fn policy_sha256(identity: &ExpectedBuildIdentity, descriptor: &str) -> String {
@@ -394,5 +442,85 @@ mod tests {
             qualify_public_health(&response),
             Err(BuildIdentityError::NotReady)
         );
+    }
+
+    #[test]
+    fn compiled_public_inputs_receipt_binds_exact_current_release_bytes() {
+        let receipt = compiled_public_inputs().unwrap();
+        assert_eq!(receipt.version, 1);
+        assert_eq!(receipt.bundle_version, "2026-10-01.3");
+        assert_eq!(
+            receipt.raw_proto_sha256,
+            "39694bb9650ee54b18cb44e4dbd27b42dbca4f3f797572ee86f5d15601d2ab6d"
+        );
+        assert_eq!(
+            receipt.raw_metadata_sha256,
+            "010cfd26409b486ffa655111f27e7847a4b7ae4d844231ca79997d6308d2d36b"
+        );
+        assert_eq!(
+            receipt.compiled_descriptor_sha256,
+            "41db4b931010d7dfed7240dd1713ad85dac91ddee6338265737fcc6970ace90b"
+        );
+        assert_eq!(
+            receipt.policy_sha256,
+            BuildIdentityTrust::bundled()
+                .unwrap()
+                .current_policy_sha256()
+        );
+        assert_ne!(
+            receipt.compiled_descriptor_sha256,
+            expected().contract_sha256
+        );
+    }
+
+    #[test]
+    fn sep28_recorded_identity_cannot_qualify_current_live_connection() {
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        let descriptor = super::super::archived_external_20260928::DESCRIPTOR_SHA256;
+        let policy = "de9a897d7e35f35bdd475b4133f002b27e9dfb40cb029aeb81d590ac3e70f54a";
+        assert_eq!(policy_sha256(&trust.archived_20260928, descriptor), policy);
+        let old_health = HealthResponse {
+            request_id: "TEST_CODE_SEP28_HEALTH".into(),
+            live: true,
+            ready: true,
+            build_identity: Some(actual(&trust.archived_20260928)),
+            ..Default::default()
+        };
+        assert_eq!(
+            trust.recorded_health(policy, descriptor, &old_health),
+            Ok(())
+        );
+        assert!(trust.historical_health(&old_health).is_err());
+        assert!(trust.current_health(&old_health).is_err());
+        assert!(qualify_public_health(&old_health).is_err());
+        assert!(!trust.accepts_recorded_policy(policy, trust.current_descriptor()));
+        assert!(!trust.accepts_recorded_policy(&trust.current_policy_sha256(), descriptor));
+
+        let live = super::super::connection_qualification::ConnectionGeneration::new(trust.clone());
+        assert!(live
+            .observe_health(&old_health.request_id, &old_health)
+            .is_err());
+        assert!(live.require_qualified().is_err());
+        let new_health = HealthResponse {
+            build_identity: Some(test_public_build_identity()),
+            ..old_health
+        };
+        assert_eq!(qualify_public_health(&new_health), Ok(()));
+        live.observe_health(&new_health.request_id, &new_health)
+            .unwrap();
+        live.require_qualified().unwrap();
+        assert!(trust
+            .recorded_health(policy, descriptor, &new_health)
+            .is_err());
+        assert!(trust
+            .recorded_health(
+                &trust.current_policy_sha256(),
+                trust.current_descriptor(),
+                &HealthResponse {
+                    build_identity: Some(actual(&trust.archived_20260928)),
+                    ..new_health
+                }
+            )
+            .is_err());
     }
 }

@@ -1,13 +1,17 @@
 //! Explicit release decoder catalog. Test B is an independently compiled
 //! additive protobuf contract, not a digest learned from a server response.
 use super::external_query_transport::{wire_error, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256};
-use super::{errors::GrpcError, external_pb::magic::market::v1 as current, historical_external};
+use super::{
+    archived_external_20260928, errors::GrpcError, external_pb::magic::market::v1 as current,
+    historical_external,
+};
 use prost::Message;
 
 #[derive(Clone, Copy)]
 pub(crate) enum ExternalDecoder {
     Current,
     ArchivedA,
+    Archived20260928,
     #[cfg(test)]
     TestB,
 }
@@ -27,6 +31,9 @@ impl ExternalDecoder {
         if historical_external::accepts_descriptor(descriptor) {
             return Ok(Self::ArchivedA);
         }
+        if archived_external_20260928::accepts_descriptor(descriptor) {
+            return Ok(Self::Archived20260928);
+        }
         #[cfg(test)]
         if descriptor == test_b::descriptor() {
             return Ok(Self::TestB);
@@ -41,6 +48,9 @@ impl ExternalDecoder {
     ) -> Result<(u32, String), GrpcError> {
         if matches!(self, Self::ArchivedA) {
             return historical_external::request_context(health, bytes);
+        }
+        if matches!(self, Self::Archived20260928) {
+            return archived_external_20260928::request_context(health, bytes);
         }
         #[cfg(test)]
         if matches!(self, Self::TestB) {
@@ -67,6 +77,9 @@ impl ExternalDecoder {
         if matches!(self, Self::ArchivedA) {
             return historical_external::query_request(bytes);
         }
+        if matches!(self, Self::Archived20260928) {
+            return archived_external_20260928::query_request(bytes);
+        }
         // A→B continuation is supported only for the identical canonical
         // GlobalNews request shape. Frozen plan validation checks its identity;
         // this verifies current decoder compatibility without rewriting bytes.
@@ -82,6 +95,7 @@ impl ExternalDecoder {
     pub(crate) fn health(self, bytes: &[u8]) -> Result<current::HealthResponse, GrpcError> {
         match self {
             Self::ArchivedA => historical_external::health(bytes),
+            Self::Archived20260928 => archived_external_20260928::health(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -96,6 +110,7 @@ impl ExternalDecoder {
     ) -> Result<current::CapabilitiesResponse, GrpcError> {
         match self {
             Self::ArchivedA => historical_external::capabilities(bytes),
+            Self::Archived20260928 => archived_external_20260928::capabilities(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -109,6 +124,7 @@ impl ExternalDecoder {
         // bytes. The caller rejects forbidden wire fields after capture.
         match self {
             Self::ArchivedA => historical_external::query(bytes),
+            Self::Archived20260928 => archived_external_20260928::query(bytes),
             Self::Current => decode(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -120,6 +136,7 @@ impl ExternalDecoder {
     pub(crate) fn error_detail(self, bytes: &[u8]) -> Option<current::ErrorDetail> {
         match self {
             Self::ArchivedA => historical_external::error_detail(bytes),
+            Self::Archived20260928 => archived_external_20260928::error_detail(bytes),
             Self::Current => current::ErrorDetail::decode(bytes).ok(),
             #[cfg(test)]
             Self::TestB => {
@@ -228,5 +245,69 @@ pub(crate) mod test_b {
                 "/external_test_upgrade_b/descriptor.bin"
             ))))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sep28_decoder_keeps_canonical_controls_and_forward_compatible_status() {
+        let decoder =
+            ExternalDecoder::for_descriptor(archived_external_20260928::DESCRIPTOR_SHA256).unwrap();
+        assert!(matches!(decoder, ExternalDecoder::Archived20260928));
+        let health = current::HealthResponse {
+            request_id: "TEST_CODE_SEP28_DECODER".into(),
+            live: true,
+            ready: true,
+            observability: Some(current::RuntimeObservability {
+                process_started_at_unix_ms: 123,
+                uptime_millis: 456,
+                query_timed_out: 7,
+                blocking_concurrency_available: 8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut bytes = health.encode_to_vec();
+        assert_eq!(decoder.health(&bytes).unwrap(), health);
+        bytes.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        assert!(
+            decoder.health(&bytes).is_err(),
+            "unknown control fields stay rejected"
+        );
+        let mut bytes = health.encode_to_vec();
+        bytes.extend_from_slice(&[0x10, 0x01]);
+        assert!(
+            decoder.health(&bytes).is_err(),
+            "noncanonical control bytes stay rejected"
+        );
+        let mut bytes = current::CapabilitiesResponse {
+            request_id: health.request_id.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        bytes.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        assert!(decoder.capabilities(&bytes).is_err());
+        let detail = current::ErrorDetail {
+            request_id: health.request_id,
+            reason_code: "unavailable".into(),
+            ..Default::default()
+        };
+        let mut bytes = detail.encode_to_vec();
+        bytes.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        assert_eq!(decoder.error_detail(&bytes).unwrap(), detail);
+        let query = current::QueryResponse::default();
+        let mut bytes = query.encode_to_vec();
+        bytes.extend_from_slice(&[0x5a, 0x00, 0xa0, 0x06, 0x01]);
+        assert_eq!(decoder.query(&bytes).unwrap(), query);
+        assert!(super::super::external_query_transport::admit_external_payload(&bytes).is_ok());
+        let mut conflicting = query.encode_to_vec();
+        conflicting.extend_from_slice(&[0x5a, 0x01, b'x']);
+        assert_eq!(decoder.query(&conflicting).unwrap(), query);
+        assert!(
+            super::super::external_query_transport::admit_external_payload(&conflicting).is_err()
+        );
     }
 }

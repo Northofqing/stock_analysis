@@ -712,6 +712,20 @@ macro_rules! external_control_data_service {
     ($($method:ident),* $(,)?) => {
         #[tonic::async_trait]
         impl MarketDataService for ExternalControlService {
+            async fn official_publications(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE official publications unavailable"))
+            }
+
+            async fn official_publication(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE official publication unavailable"))
+            }
+
             async fn global_news(
                 &self,
                 request: Request<QueryRequest>,
