@@ -197,6 +197,10 @@ impl DeepAttributionJournal {
             .join(format!("{date}.jsonl"))
     }
 
+    fn archive_lock_path(&self, date: NaiveDate) -> PathBuf {
+        self.dir.join(format!("{date}.archive.lock"))
+    }
+
     /// 已保存的选集优先于当天不断增长的告警文件。首次无可选事件时不冻结选集。
     pub fn load_or_select(
         &self,
@@ -228,6 +232,20 @@ impl DeepAttributionJournal {
                                 )))
                             }
                         }
+                    }
+                }
+                let archive_lock = self.archive_lock_path(date);
+                match fs::symlink_metadata(&archive_lock) {
+                    Ok(_) => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "G5b 选集缺失但归档锁留存, 需人工裁定: {archive_lock:?}"
+                        )))
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "检查 {archive_lock:?}: {error}"
+                        )))
                     }
                 }
                 // 升级前的结果归档没有 pre-call 标记，不能据此证明尚未开始分析。
@@ -497,7 +515,7 @@ impl DeepAttributionJournal {
         }
         let key = DeepAttributionEventKey::from(&row.record);
         let path = self.archive_path(date);
-        let lock_path = self.dir.join(format!("{date}.archive.lock"));
+        let lock_path = self.archive_lock_path(date);
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1442,6 +1460,21 @@ mod tests {
         fs::create_dir_all(&journal.dir).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(journal.attempt_path(date, 0), b"").unwrap();
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.selection_path(date).exists());
+    }
+
+    #[test]
+    fn orphan_archive_lock_without_selection_blocks_reselection() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        fs::create_dir_all(&journal.dir).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        fs::write(journal.dir.join(format!("{date}.archive.lock")), b"").unwrap();
+
         assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
         assert!(!journal.selection_path(date).exists());
     }
