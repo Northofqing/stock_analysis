@@ -7087,6 +7087,25 @@ pub fn build_candidate_board_counted_binding(
     .map_err(|error| format!("P-05 counted binding 构造失败: {error}"))
 }
 
+/// Committed prediction membership is producer evidence, not source qualification.
+/// Keep this envelope contract identical to the keyed cross-DB link reader.
+fn build_candidate_board_counted_binding_v2(
+    frozen: &stock_analysis::database::p05_prediction_freeze::FrozenCandidateBoardV2,
+) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
+    let date = chrono::NaiveDate::parse_from_str(frozen.business_date(), "%Y-%m-%d")
+        .map_err(|_| "p05_frozen_date_invalid".to_owned())?;
+    crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+        date,
+        frozen.occurrence_identity(),
+        frozen.source_canonical().to_vec(),
+        crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+        frozen.source_sha256(),
+        crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+        None,
+        false,
+    )
+}
+
 /// MU-paper-sell counted dispatch (2026-09-20): 盘中/盘后两调用点共用。
 /// counted 门取 CountedCombinedAccount (requires_banner=true, 门内部取
 /// LATEST_BANNER — T-16 先例)。
@@ -10323,9 +10342,45 @@ fn candidate_prediction_target_date(
     Ok(target)
 }
 
+fn candidate_board_slot_at(
+    date: &str,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<(chrono::NaiveDate, String), String> {
+    let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| "p05_business_date_invalid".to_owned())?;
+    if business_date.format("%Y-%m-%d").to_string() != date
+        || now.offset().local_minus_utc() != 8 * 60 * 60
+        || now.date_naive() != business_date
+    {
+        return Err("p05_business_date_invalid".to_owned());
+    }
+    if !stock_analysis::calendar::verified_a_share_trading_day(business_date)
+        .map_err(|_| "p05_calendar_unavailable".to_owned())?
+    {
+        return Err("p05_not_trading_day".to_owned());
+    }
+    Ok((business_date, now.format("%H:%M").to_string()))
+}
+
+#[cfg(test)]
+#[path = "push_templates/p05_counted_producer_tests.rs"]
+mod p05_counted_producer_tests;
+
 /// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
 pub async fn dispatch_candidate_board(date: &str) -> bool {
+    use stock_analysis::monitor::prediction::{
+        prepare_candidate_board, CandidateBoardPreparation, CandidateBoardPreparationRequest,
+    };
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
+    // Fix the slot before source acquisition or any save can cross a minute.
+    let captured_at = stock_analysis::monitor::prediction::shanghai_now();
+    let (business_date, hhmm) = match candidate_board_slot_at(date, captured_at) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            log::warn!("[P-05] preparation blocked reason={reason}");
+            return false;
+        }
+    };
     let batch = match load_real_candidate_batch().await {
         Ok(batch) => batch,
         Err(error) => {
@@ -10344,11 +10399,7 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
         .collect();
     // 失效 diff: 上轮有本轮无 → 推送失效 (renderer 已有 push_candidate_invalidated)
     if let Some(previous) = candidate_snapshot_previous(date) {
-        let hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
-        // T-08 counted (2026-09-20): binding 锚定候选台业务日 (date 参数
-        // 解析, 失败回退 Local::now 保底 — 与 hhmm 同源)。
-        let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .unwrap_or_else(|_| chrono::Local::now().date_naive());
+        let invalidated_hhmmss = captured_at.format("%H:%M:%S").to_string();
         for code in previous.difference(&codes_now) {
             let name = batch
                 .entries
@@ -10359,7 +10410,7 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
             let _ = push_candidate_invalidated(
                 business_date,
                 code,
-                &hhmm,
+                &invalidated_hhmmss,
                 &name,
                 "候选",
                 "从候选台消失",
@@ -10374,48 +10425,66 @@ pub async fn dispatch_candidate_board(date: &str) -> bool {
         .filter(|entry| entry.tier == EvidenceTier::Strong && entry.current_price.is_some())
         .map(|entry| (entry.code.clone(), entry.heat_score.unwrap_or(50.0)))
         .collect();
-    if !strong_samples.is_empty() {
-        let target_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .map_err(|error| format!("invalid prediction date: {error}"))
-            .and_then(candidate_prediction_target_date);
-        match target_date {
-            Ok(target_date) => {
-                let prediction_date = date.to_owned();
-                let target_date = target_date.format("%Y-%m-%d").to_string();
-                let persistence = stock_analysis::monitor::prediction::persist_candidate_samples(
-                    prediction_date,
-                    target_date,
-                    strong_samples,
-                )
-                .await;
-                persistence.log();
-            }
-            Err(error) => log::warn!(
-                "[BR-232] 候选样本未保存：预测日或权威交易日历不可用 date={} error={}",
-                date,
-                error
-            ),
-        }
-    }
-    candidate_snapshot_persist(date, &codes_now);
     let text = stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
+    let request = match CandidateBoardPreparationRequest::new(
+        date,
+        &hhmm,
+        text.as_bytes().to_vec(),
+        strong_samples,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            log::warn!("[P-05] preparation blocked reason={}", error.reason());
+            return false;
+        }
+    };
+    let prepared = match prepare_candidate_board(request).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(report) = error.save_report() {
+                report.log();
+            }
+            log::warn!("[P-05] preparation blocked reason={}", error.reason());
+            return false;
+        }
+    };
+    let (text, binding) = match prepared {
+        CandidateBoardPreparation::Frozen {
+            record,
+            save_report,
+            ..
+        } => {
+            if let Some(report) = save_report {
+                report.log();
+            }
+            let binding = build_candidate_board_counted_binding_v2(&record);
+            // Only persisted bytes can reach the counted consumer.
+            let text = match String::from_utf8(record.rendered_bytes().to_vec()) {
+                Ok(text) => text,
+                Err(_) => return false,
+            };
+            (text, binding)
+        }
+        CandidateBoardPreparation::UnlinkedNoStrong => {
+            log::info!("[P-05] no sampled Strong rows; card remains UnlinkedV1");
+            let binding = build_candidate_board_counted_binding(business_date, &hhmm, &text);
+            (text, binding)
+        }
+    };
+    // Shared Unit snapshot/delta completion is still an independent contract.
+    candidate_snapshot_persist(date, &codes_now);
     // 2026-09-20: P-05 升级 counted (MU-auction-candidates)。盘中信息卡;
     // Rolling 1800s 镜像 L4 默认; retry_authorized=false (盘中快照锚定 +
     // 下一轮重渲染补偿)。
-    let business_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .unwrap_or_else(|_| chrono::Local::now().date_naive());
-    let hhmm = chrono::Local::now().format("%H:%M").to_string();
-    let result = match build_candidate_board_counted_binding(business_date, &hhmm, &text).and_then(
-        |binding| {
-            crate::presentation_registry::acquire_token(
-                "P-05-candidate-board",
-                crate::notify::PushKind::CandidateBoard,
-                "candidate_board_dispatcher",
-                "format_candidate_board",
-            )
-            .map(|token| (token, binding))
-        },
-    ) {
+    let result = match binding.and_then(|binding| {
+        crate::presentation_registry::acquire_token(
+            "P-05-candidate-board",
+            crate::notify::PushKind::CandidateBoard,
+            "candidate_board_dispatcher",
+            "format_candidate_board",
+        )
+        .map(|token| (token, binding))
+    }) {
         Ok((token, binding)) => {
             crate::notify::push_counted_with_binding(token, &text, None, binding)
                 .await
