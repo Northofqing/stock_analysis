@@ -2209,8 +2209,14 @@ mod tests {
             "old policy cannot bless new build"
         );
         let mut crossed = saved.clone();
-        crossed["verified_build_identity"] =
-            serde_json::to_value(new_health.build_identity.unwrap()).unwrap();
+        let new_build = new_health.build_identity.unwrap();
+        crossed["verified_build_identity"] = serde_json::json!({
+            "service_version": new_build.service_version,
+            "source_revision": new_build.source_revision,
+            "contract_sha256": new_build.contract_sha256,
+            "binary_sha256": new_build.binary_sha256,
+            "identity_error": new_build.identity_error,
+        });
         let crossed: ControlRawResult = serde_json::from_value(crossed).unwrap();
         assert!(
             crossed.project(&request).is_err(),
