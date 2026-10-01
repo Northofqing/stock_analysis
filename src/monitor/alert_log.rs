@@ -9,6 +9,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+mod input_head;
+pub use input_head::{
+    inspect_date_input_head, AlertInputHeadUnknown, AlertInputHeadV1, VerifiedAlertInputPrefix,
+};
+
 fn alerts_dir() -> PathBuf {
     PathBuf::from("reports/alerts")
 }
