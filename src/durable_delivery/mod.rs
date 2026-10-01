@@ -18,7 +18,7 @@ pub use coordinator::{
 };
 pub(crate) use coordinator::{
     G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, PreparedG5bArtifact,
-    VerifiedStoredG5bCohort,
+    VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
 };
 pub use correlation::P01OriginProducer;
 pub use model::{

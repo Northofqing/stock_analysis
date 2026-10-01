@@ -531,3 +531,6 @@ async fn g5b_analysis_v2_behavior_committed_frozen_missing_file_is_not_healed_or
     assert_eq!(original_count(&fixture, "Attempt"), 1);
     assert_eq!(original_count(&fixture, "Frozen"), 1);
 }
+
+#[path = "g5b_model_archive_v2_behavior_tests.rs"]
+mod model_archive_v2_tests;

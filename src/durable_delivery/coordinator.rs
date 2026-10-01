@@ -55,7 +55,7 @@ pub use g5b::{
 };
 pub(crate) use g5b_cohort::{
     G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, PreparedG5bArtifact,
-    VerifiedStoredG5bCohort,
+    VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
 };
 
 const AUDIT_KINDS: [&str; 14] = [

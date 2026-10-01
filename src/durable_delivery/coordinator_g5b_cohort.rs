@@ -13,6 +13,9 @@ use std::sync::Arc;
 
 #[path = "coordinator_g5b_artifact.rs"]
 mod artifact;
+#[path = "coordinator_g5b_model_bundle.rs"]
+mod model_bundle;
+pub(crate) use model_bundle::{G5bModelArtifact, G5bModelMemberArtifacts, VerifiedG5bModelBundle};
 
 const ADMISSION_MATERIAL: &str = "g5b-configured-analysis-owner-v1";
 const MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
@@ -1246,6 +1249,14 @@ impl G5bDaySession<'_> {
     }
 
     pub(crate) fn commit_prepared_artifact(&self, intent: &PreparedG5bArtifact) -> Result<()> {
+        self.commit_prepared_artifact_with_validation(intent, None, None)
+    }
+    fn commit_prepared_artifact_with_validation(
+        &self,
+        intent: &PreparedG5bArtifact,
+        extra_fs: Option<&dyn Fn() -> Result<()>>,
+        extra_sql: Option<&dyn Fn(&Transaction<'_>) -> Result<()>>,
+    ) -> Result<()> {
         self.validate_saved_intent(intent)?;
         // Fetch SQLite preimages before entering the validated write; the
         // validator itself must never reacquire the DB mutex/date guard.
@@ -1281,9 +1292,13 @@ impl G5bDaySession<'_> {
             if artifact::inspect(self, intent)? != witness {
                 return Err(mismatch("artifact witness changed at transaction boundary"));
             }
+            if let Some(validate) = extra_fs {
+                validate()?;
+            }
             Ok(())
         };
         self.coordinator.with_immediate_transaction_validated(SchemaVersionPolicy::Runtime,Some(&validate),|tx| {
+            if let Some(validate) = extra_sql { validate(tx)?; }
             let saved=load_intent(tx,&intent.logical_intent)?.ok_or_else(||mismatch("prepared intent disappeared"))?;
             if saved.material!=intent.material || saved.desired_bytes!=intent.desired_bytes {return Err(mismatch("prepared identity conflict at commit"));}
             let committed:Option<Vec<u8>>=tx.query_row("SELECT event_canonical FROM g5b_artifact_events WHERE logical_intent=?1 AND phase='Committed'",[&intent.logical_intent],|r|r.get(0)).optional()?;

@@ -729,3 +729,25 @@ pub(crate) fn claim_for_test(
 #[cfg(test)]
 #[path = "g5b_analysis_v2_tests.rs"]
 mod tests;
+
+#[path = "g5b_model_archive_v2.rs"]
+mod model_archive;
+pub use model_archive::{
+    archive_model_observations_v2, G5bArchivedModelObservationV2, G5bModelArchiveCoverageV2,
+};
+
+#[cfg(test)]
+pub(crate) fn prepare_model_archive_for_test(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+) -> Result<crate::durable_delivery::PreparedG5bArtifact> {
+    model_archive::prepare_for_test(coordinator, date)
+}
+
+#[cfg(test)]
+pub(crate) fn model_archive_bytes_for_test(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    date: NaiveDate,
+) -> Result<Vec<u8>> {
+    model_archive::bytes_for_test(coordinator, date)
+}
