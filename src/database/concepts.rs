@@ -4,7 +4,7 @@
 //! 概念标签（东财 F10 核心题材）变化缓慢，落库缓存避免每日重复请求。
 //! 供 `pipeline::chain_analysis` 产业链聚类使用。
 
-use chrono::{Duration, Local};
+use chrono::{DateTime, Duration, Local, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::{Binary, Integer, Text};
 use diesel::sqlite::SqliteConnection;
@@ -21,6 +21,78 @@ struct ConceptRow {
     code: String,
     #[diesel(sql_type = Text)]
     concepts: String,
+    #[diesel(sql_type = Text)]
+    updated_at: String,
+}
+
+/// One exact row returned by the local `stock_concepts` cache query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalConceptCacheRow {
+    code: String,
+    concepts_json: String,
+    concepts: Vec<String>,
+    updated_at: String,
+}
+
+impl LocalConceptCacheRow {
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn concepts_json(&self) -> &str {
+        &self.concepts_json
+    }
+
+    pub fn concepts(&self) -> &[String] {
+        &self.concepts
+    }
+
+    /// The raw local-naive SQLite timestamp; this is not provider source time.
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+}
+
+/// Local cache evidence from one read, without any upstream qualification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalConceptCacheRead {
+    cutoff_local: String,
+    observed_at_utc: DateTime<Utc>,
+    rows: Vec<LocalConceptCacheRow>,
+}
+
+impl LocalConceptCacheRead {
+    /// The exact local-naive cutoff bound to the cache SELECT.
+    pub fn cutoff_local(&self) -> &str {
+        &self.cutoff_local
+    }
+
+    pub fn observed_at_utc(&self) -> DateTime<Utc> {
+        self.observed_at_utc
+    }
+
+    pub fn rows(&self) -> &[LocalConceptCacheRow] {
+        &self.rows
+    }
+
+    pub fn into_map(self) -> HashMap<String, Vec<String>> {
+        self.rows
+            .into_iter()
+            .map(|row| (row.code, row.concepts))
+            .collect()
+    }
+}
+
+fn parse_cached_concept_values(code: &str, concepts: &str) -> Result<Vec<String>, String> {
+    if code.trim().is_empty() {
+        return Err("概念缓存存在空 code".to_string());
+    }
+    let list = serde_json::from_str::<Vec<String>>(concepts)
+        .map_err(|error| format!("概念缓存 {code} JSON 非法: {error}"))?;
+    if list.is_empty() || list.iter().any(|concept| concept.trim().is_empty()) {
+        return Err(format!("概念缓存 {code} 含空概念列表/字段"));
+    }
+    Ok(list)
 }
 
 pub(crate) fn parse_cached_concept_rows<I>(rows: I) -> Result<HashMap<String, Vec<String>>, String>
@@ -29,14 +101,7 @@ where
 {
     let mut map = HashMap::new();
     for (code, concepts) in rows {
-        if code.trim().is_empty() {
-            return Err("概念缓存存在空 code".to_string());
-        }
-        let list = serde_json::from_str::<Vec<String>>(&concepts)
-            .map_err(|error| format!("概念缓存 {code} JSON 非法: {error}"))?;
-        if list.is_empty() || list.iter().any(|concept| concept.trim().is_empty()) {
-            return Err(format!("概念缓存 {code} 含空概念列表/字段"));
-        }
+        let list = parse_cached_concept_values(&code, &concepts)?;
         map.insert(code, list);
     }
     Ok(map)
@@ -358,6 +423,15 @@ impl DatabaseManager {
         &self,
         max_age_days: i64,
     ) -> Result<HashMap<String, Vec<String>>, String> {
+        Ok(self.get_cached_concepts_observed(max_age_days)?.into_map())
+    }
+
+    /// Read the same cache rows once, retaining the exact cutoff, read time,
+    /// raw JSON and each row's local `updated_at` for later provenance work.
+    pub fn get_cached_concepts_observed(
+        &self,
+        max_age_days: i64,
+    ) -> Result<LocalConceptCacheRead, String> {
         if max_age_days <= 0 {
             return Err(format!("概念缓存 max_age_days 非法: {max_age_days}"));
         }
@@ -369,13 +443,31 @@ impl DatabaseManager {
             .get_conn()
             .map_err(|error| format!("概念缓存获取数据库连接失败: {error}"))?;
 
-        let rows: Vec<ConceptRow> =
-            diesel::sql_query("SELECT code, concepts FROM stock_concepts WHERE updated_at >= ?")
-                .bind::<Text, _>(&cutoff)
-                .load(&mut conn)
-                .map_err(|error| format!("概念缓存查询失败: {error}"))?;
-
-        parse_cached_concept_rows(rows.into_iter().map(|row| (row.code, row.concepts)))
+        let rows: Vec<ConceptRow> = diesel::sql_query(
+            "SELECT code, concepts, updated_at FROM stock_concepts WHERE updated_at >= ?",
+        )
+        .bind::<Text, _>(&cutoff)
+        .load(&mut conn)
+        .map_err(|error| format!("概念缓存查询失败: {error}"))?;
+        let observed_at_utc = Utc::now();
+        let mut rows = rows
+            .into_iter()
+            .map(|row| {
+                let concepts = parse_cached_concept_values(&row.code, &row.concepts)?;
+                Ok(LocalConceptCacheRow {
+                    code: row.code,
+                    concepts_json: row.concepts,
+                    concepts,
+                    updated_at: row.updated_at,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        rows.sort_by(|left, right| left.code.cmp(&right.code));
+        Ok(LocalConceptCacheRead {
+            cutoff_local: cutoff,
+            observed_at_utc,
+            rows,
+        })
     }
 
     /// 写入/覆盖某只股票的概念标签缓存。
@@ -958,6 +1050,62 @@ impl DatabaseManager {
 mod tests {
     use super::*;
     use std::{io, path::Path};
+
+    #[test]
+    fn local_concept_cache_read_retains_exact_query_rows_and_old_map() {
+        let isolated = tempfile::tempdir().expect("isolated concept cache database");
+        let db = DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_concept_cache_read.db"),
+        )
+        .expect("open isolated concept cache database");
+        let recent = (Local::now() - Duration::days(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let stale = (Local::now() - Duration::days(8))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let concepts = vec!["TEST_CODE_算力".to_string(), "TEST_CODE_液冷".to_string()];
+        for (code, updated_at) in [
+            ("TEST_CODE_CACHE_Z", &recent),
+            ("TEST_CODE_CACHE_A", &recent),
+            ("TEST_CODE_CACHE_STALE", &stale),
+        ] {
+            db.save_stock_concepts(code, &concepts)
+                .expect("seed concept cache row");
+            diesel::sql_query("UPDATE stock_concepts SET updated_at = ? WHERE code = ?")
+                .bind::<Text, _>(updated_at)
+                .bind::<Text, _>(code)
+                .execute(&mut db.get_conn().unwrap())
+                .expect("set exact row timestamp");
+        }
+
+        let before = Utc::now();
+        let read = db
+            .get_cached_concepts_observed(7)
+            .expect("one observed cache query");
+        let after = Utc::now();
+        assert!(read.observed_at_utc() >= before);
+        assert!(read.observed_at_utc() <= after);
+        assert!(stale < read.cutoff_local().to_string());
+        assert!(recent >= read.cutoff_local().to_string());
+        assert_eq!(
+            read.rows()
+                .iter()
+                .map(LocalConceptCacheRow::code)
+                .collect::<Vec<_>>(),
+            ["TEST_CODE_CACHE_A", "TEST_CODE_CACHE_Z"]
+        );
+        for row in read.rows() {
+            assert_eq!(
+                row.concepts_json(),
+                serde_json::to_string(&concepts).unwrap()
+            );
+            assert_eq!(row.concepts(), concepts);
+            assert_eq!(row.updated_at(), recent);
+        }
+        let old_map = db.get_cached_concepts(7).expect("compatible cache map");
+        assert_eq!(read.into_map(), old_map);
+    }
 
     #[test]
     fn p05_latest_chain_query_uses_latest_date_and_exact_date_tie_order() {
