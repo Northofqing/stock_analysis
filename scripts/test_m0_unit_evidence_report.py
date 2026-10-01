@@ -308,6 +308,30 @@ class M0UnitEvidenceReportTests(unittest.TestCase):
         for secret in (decision, "SECRET_RESULT_1", "SECRET_UNOBSERVED"):
             self.assertNotIn(secret, output)
 
+    def test_v11_preserves_p01_origin_attribution_and_validation(self):
+        self.upgrade_v10()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("PRAGMA user_version=11")
+        decision = "d" * 64
+        self.decision(decision, "PreopenNewsHot")
+        self.result("SECRET_RESULT", decision)
+        self.observe(decision)
+
+        report = self.report()
+        self.assertEqual(report["schema_version"], 11)
+        p01 = next(unit for unit in report["units"] if unit["id"] == "MU-p01")
+        self.assertEqual(p01["correlation"], "Observed")
+        self.assertEqual(p01["correlated_durable_candidates"][0]["decisions"], 1)
+        self.assertEqual(report["unattributed_kind_candidates"], [])
+
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE delivery_correlation_observations SET observation_identity=?",
+                ("0" * 64,),
+            )
+        with self.assertRaisesRegex(ValueError, "invalid v10 P01 Origin"):
+            self.report()
+
     def test_v10_origin_identity_is_compatible_with_rust_golden(self):
         self.assertEqual(
             _origin_observation_identity("0" * 64, "p01-scheduled", "p01:2026-08-18"),

@@ -293,7 +293,7 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str, units: list[dic
         connection.execute("BEGIN")
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (9, 10):
+            if version not in (9, 10, 11):
                 raise ValueError(f"unsupported durable-delivery schema version {version}")
             for table, required in REQUIRED_COLUMNS.items():
                 table_type = connection.execute(
@@ -320,7 +320,7 @@ def _kind_counts(durable_db: Path, from_date: str, to_date: str, units: list[dic
             ).fetchone()
             if invalid_sink_link:
                 raise ValueError("sink result is not bound to its decision attempt")
-            if version == 10:
+            if version in (10, 11):
                 for column in ("sub_kind", "scope_key", "envelope_canonical", "envelope_sha256"):
                     if column not in {
                         row[1] for row in connection.execute("PRAGMA table_info(delivery_decisions)")
