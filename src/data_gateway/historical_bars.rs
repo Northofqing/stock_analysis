@@ -14,9 +14,10 @@ use crate::market_domain::SecurityBar;
 
 use chrono::NaiveDate;
 
-use crate::data_provider::KlineData;
+use crate::data_provider::{AdjustType, KlineData};
 use crate::database::daily_change_confirmation::DailyChangeConfirmationQuery;
 use crate::database::DatabaseManager;
+use sha2::{Digest, Sha256};
 
 use crate::monitor::data_quality::{
     AdjacentDailyChange, MAX_UNCONFIRMED_ADJACENT_DAILY_CHANGE_PCT,
@@ -32,6 +33,7 @@ use super::security_lifecycle::{
 };
 
 const CAPABILITY: &str = "HistoricalDailyBars";
+const OBSERVED_PROJECTION_DOMAIN: &str = "stock_analysis.m4.observed_daily_ohlcv_projection.v1";
 
 /// Only a qualified Gateway Adapter may construct discovery authority. Neither
 /// CLI JSON nor an error string can deserialize or construct this capability.
@@ -128,6 +130,7 @@ pub struct HistoricalBarsGateway;
 #[derive(Debug)]
 pub struct AdmittedDailyBars {
     target_code: String,
+    requested_days: usize,
     records: Vec<KlineData>,
     evidence: BatchEvidence,
 }
@@ -137,6 +140,11 @@ impl AdmittedDailyBars {
     /// Gateway request that acquired this batch.
     pub fn target_code(&self) -> &str {
         &self.target_code
+    }
+
+    /// Actual Gateway request count; it does not identify exact trading days.
+    pub const fn requested_days(&self) -> usize {
+        self.requested_days
     }
 
     pub fn records(&self) -> &[KlineData] {
@@ -159,16 +167,24 @@ impl AdmittedDailyBars {
         (self.target_code, self.records, self.evidence)
     }
 
+    /// Seal the Gateway's admitted observation. This is not a full-window,
+    /// point-in-time, or persisted-read verification.
+    pub fn into_observed_projection(self) -> Result<ObservedDailyBarsCapture, GatewayError> {
+        ObservedDailyBarsCapture::from_admitted(self)
+    }
+
     /// Only this module can turn the audited transport envelope into the
     /// capability type. Public `GatewayBatch<KlineData>` values therefore
     /// cannot forge proof that identity, quality and freshness admission ran.
     fn from_audited_batch(
         target_code: String,
+        requested_days: usize,
         batch: GatewayBatch<KlineData>,
     ) -> Result<Self, GatewayError> {
         match batch {
             GatewayBatch::Available { records, evidence } if !records.is_empty() => Ok(Self {
                 target_code,
+                requested_days,
                 records,
                 evidence,
             }),
@@ -194,6 +210,17 @@ impl AdmittedDailyBars {
         records: Vec<KlineData>,
         evidence: BatchEvidence,
     ) -> Result<Self, GatewayError> {
+        let requested_days = records.len();
+        Self::from_test_fixture_with_days(target_code, requested_days, records, evidence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_fixture_with_days(
+        target_code: &str,
+        requested_days: usize,
+        records: Vec<KlineData>,
+        evidence: BatchEvidence,
+    ) -> Result<Self, GatewayError> {
         if !target_code.starts_with("TEST_CODE_")
             || !evidence.source.starts_with("TEST_CODE")
             || !evidence.batch_id.starts_with("TEST_CODE")
@@ -205,9 +232,181 @@ impl AdmittedDailyBars {
         }
         Self::from_audited_batch(
             target_code.to_owned(),
+            requested_days,
             GatewayBatch::Available { records, evidence },
         )
     }
+}
+
+/// Immutable observed projection. Only these fields, in this order, are bound
+/// by the capture hash. `KlineData`'s derived indicators, `pct_chg`, settled
+/// state, intraday price, and financial fields are outside this projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedDailyBarProjection {
+    date: NaiveDate,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    amount: f64,
+    adjust: AdjustType,
+}
+
+impl ObservedDailyBarProjection {
+    pub const fn date(&self) -> NaiveDate {
+        self.date
+    }
+
+    /// In order: open, high, low, close, volume, amount.
+    pub const fn ohlcv_amount(&self) -> [f64; 6] {
+        [
+            self.open,
+            self.high,
+            self.low,
+            self.close,
+            self.volume,
+            self.amount,
+        ]
+    }
+
+    pub const fn adjust(&self) -> AdjustType {
+        self.adjust
+    }
+
+    fn from_record(record: KlineData, provider: ProviderId) -> Result<Self, GatewayError> {
+        for (field, value) in [
+            ("open", record.open),
+            ("high", record.high),
+            ("low", record.low),
+            ("close", record.close),
+            ("volume", record.volume),
+            ("amount", record.amount),
+        ] {
+            if !value.is_finite() {
+                return Err(GatewayError::invalid_evidence(
+                    CAPABILITY,
+                    Some(provider),
+                    format!(
+                        "observed projection has nonfinite {field} on {}",
+                        record.date
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            date: record.date,
+            open: record.open,
+            high: record.high,
+            low: record.low,
+            close: record.close,
+            volume: record.volume,
+            amount: record.amount,
+            adjust: record.adjust,
+        })
+    }
+}
+
+/// A sealed Gateway observation, not a full-window, PIT, or persisted proof.
+/// Its hash covers the actual request, ordered projection, and all five
+/// `BatchEvidence` fields; it does not identify the provider's original wire.
+#[derive(Debug)]
+pub struct ObservedDailyBarsCapture {
+    target_code: String,
+    requested_days: usize,
+    bars: Vec<ObservedDailyBarProjection>,
+    evidence: BatchEvidence,
+    projection_hash: String,
+}
+
+impl ObservedDailyBarsCapture {
+    pub fn target_code(&self) -> &str {
+        &self.target_code
+    }
+
+    pub const fn requested_days(&self) -> usize {
+        self.requested_days
+    }
+
+    pub fn bars(&self) -> &[ObservedDailyBarProjection] {
+        &self.bars
+    }
+
+    pub const fn evidence(&self) -> &BatchEvidence {
+        &self.evidence
+    }
+
+    pub fn projection_hash(&self) -> &str {
+        &self.projection_hash
+    }
+
+    fn from_admitted(admitted: AdmittedDailyBars) -> Result<Self, GatewayError> {
+        let AdmittedDailyBars {
+            target_code,
+            requested_days,
+            records,
+            evidence,
+        } = admitted;
+        let bars = records
+            .into_iter()
+            .map(|record| ObservedDailyBarProjection::from_record(record, evidence.provider))
+            .collect::<Result<Vec<_>, _>>()?;
+        let projection_hash =
+            observed_projection_hash(&target_code, requested_days, &bars, &evidence)?;
+        Ok(Self {
+            target_code,
+            requested_days,
+            bars,
+            evidence,
+            projection_hash,
+        })
+    }
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn observed_projection_hash(
+    target_code: &str,
+    requested_days: usize,
+    bars: &[ObservedDailyBarProjection],
+    evidence: &BatchEvidence,
+) -> Result<String, GatewayError> {
+    let provider_wire = serde_json::to_vec(&evidence.provider).map_err(|error| {
+        GatewayError::invalid_evidence(
+            CAPABILITY,
+            Some(evidence.provider),
+            format!("provider identity serialization failed: {error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, OBSERVED_PROJECTION_DOMAIN.as_bytes());
+    hash_length_prefixed(&mut hasher, target_code.as_bytes());
+    hasher.update((requested_days as u64).to_be_bytes());
+    hasher.update((bars.len() as u64).to_be_bytes());
+    for bar in bars {
+        hash_length_prefixed(&mut hasher, bar.date.to_string().as_bytes());
+        for value in bar.ohlcv_amount() {
+            // Admission to this projection rejects NaN and infinity first.
+            // IEEE-754 bits retain exact finite values, including -0.0.
+            hasher.update(value.to_bits().to_be_bytes());
+        }
+        hash_length_prefixed(&mut hasher, bar.adjust.as_str().as_bytes());
+    }
+    hash_length_prefixed(&mut hasher, &provider_wire);
+    hash_length_prefixed(&mut hasher, evidence.source.as_bytes());
+    match &evidence.source_at {
+        Some(source_at) => {
+            hasher.update([1]);
+            hash_length_prefixed(&mut hasher, source_at.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hash_length_prefixed(&mut hasher, evidence.observed_at.as_bytes());
+    hash_length_prefixed(&mut hasher, evidence.batch_id.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 impl HistoricalBarsGateway {
@@ -287,11 +486,11 @@ impl HistoricalBarsGateway {
                     ))
                 });
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
-                return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
+                return AdmittedDailyBars::from_audited_batch(code.to_owned(), days, audited);
             }
             Err(error) => {
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error))?;
-                return AdmittedDailyBars::from_audited_batch(code.to_owned(), audited);
+                return AdmittedDailyBars::from_audited_batch(code.to_owned(), days, audited);
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -318,11 +517,11 @@ impl HistoricalBarsGateway {
                     Err(error) => Err(error),
                 };
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, result)?;
-                return AdmittedDailyBars::from_audited_batch(code, audited);
+                return AdmittedDailyBars::from_audited_batch(code, days, audited);
             }
             Err(error) => {
                 let audited = audit_routed_gateway_result(CAPABILITY, &request_hash, Err(error))?;
-                return AdmittedDailyBars::from_audited_batch(code, audited);
+                return AdmittedDailyBars::from_audited_batch(code, days, audited);
             }
         }
         // no-feature (monitor 零 magic): library transport 不存在。
@@ -866,6 +1065,142 @@ pub(super) async fn finalize_outcome_sequence_async(
 mod tests {
     use super::*;
     use diesel::RunQueryDsl;
+
+    fn observed_fixture(
+        code: &str,
+        days: usize,
+        records: Vec<KlineData>,
+        evidence: BatchEvidence,
+    ) -> ObservedDailyBarsCapture {
+        AdmittedDailyBars::from_test_fixture_with_days(code, days, records, evidence)
+            .unwrap()
+            .into_observed_projection()
+            .unwrap()
+    }
+
+    #[test]
+    fn observed_daily_projection_binds_actual_request_ordered_ohlcv_and_adjust() {
+        let (batch, _) = super::super::outcome_daily_bars::task8_review_fixture();
+        let records = batch.records().to_vec();
+        let evidence = batch.evidence().clone();
+        let baseline = observed_fixture("TEST_CODE_300005", 60, records.clone(), evidence.clone());
+        let identical = observed_fixture("TEST_CODE_300005", 60, records.clone(), evidence.clone());
+        assert_eq!(baseline.projection_hash(), identical.projection_hash());
+        assert_eq!(baseline.target_code(), "TEST_CODE_300005");
+        assert_eq!(baseline.requested_days(), 60);
+        assert_eq!(baseline.bars().len(), 3);
+        assert_eq!(baseline.bars()[0].date(), records[0].date);
+        assert_eq!(baseline.bars()[0].ohlcv_amount()[3], records[0].close);
+        assert_eq!(baseline.bars()[0].adjust(), records[0].adjust);
+
+        let changed_days =
+            observed_fixture("TEST_CODE_300005", 61, records.clone(), evidence.clone());
+        assert_ne!(baseline.projection_hash(), changed_days.projection_hash());
+        let changed_code =
+            observed_fixture("TEST_CODE_300006", 60, records.clone(), evidence.clone());
+        assert_ne!(baseline.projection_hash(), changed_code.projection_hash());
+        let mut changed_close = records.clone();
+        changed_close[0].close += 0.01;
+        assert_ne!(
+            baseline.projection_hash(),
+            observed_fixture("TEST_CODE_300005", 60, changed_close, evidence.clone())
+                .projection_hash()
+        );
+        let mut changed_adjust = records.clone();
+        changed_adjust[0].adjust = AdjustType::Qfq;
+        assert_ne!(
+            baseline.projection_hash(),
+            observed_fixture("TEST_CODE_300005", 60, changed_adjust, evidence.clone())
+                .projection_hash()
+        );
+        let mut reversed = records.clone();
+        reversed.reverse();
+        assert_ne!(
+            baseline.projection_hash(),
+            observed_fixture("TEST_CODE_300005", 60, reversed, evidence.clone()).projection_hash()
+        );
+
+        // Derived KlineData fields are deliberately outside this projection.
+        let mut changed_derived = records;
+        changed_derived[0].pct_chg += 1.0;
+        changed_derived[0].settled = !changed_derived[0].settled;
+        changed_derived[0].intraday_price = Some(1.0);
+        assert_eq!(
+            baseline.projection_hash(),
+            observed_fixture("TEST_CODE_300005", 60, changed_derived, evidence).projection_hash()
+        );
+    }
+
+    #[test]
+    fn observed_daily_projection_binds_all_batch_evidence_fields() {
+        let (batch, _) = super::super::outcome_daily_bars::task8_review_fixture();
+        let records = batch.records().to_vec();
+        let evidence = batch.evidence().clone();
+        let baseline = observed_fixture("TEST_CODE_300005", 60, records.clone(), evidence.clone());
+
+        let mut variants = Vec::new();
+        let mut changed = evidence.clone();
+        changed.provider = ProviderId::Tencent;
+        variants.push(changed);
+        let mut changed = evidence.clone();
+        changed.source.push_str("_changed");
+        variants.push(changed);
+        let mut changed = evidence.clone();
+        changed.source_at = None;
+        variants.push(changed);
+        let mut changed = evidence.clone();
+        changed.observed_at.push_str("_changed");
+        variants.push(changed);
+        let mut changed = evidence;
+        changed.batch_id.push_str("_changed");
+        variants.push(changed);
+
+        for changed in variants {
+            let capture = observed_fixture("TEST_CODE_300005", 60, records.clone(), changed);
+            assert_ne!(baseline.projection_hash(), capture.projection_hash());
+        }
+    }
+
+    #[test]
+    fn observed_daily_projection_rejects_nonfinite_values_before_hashing() {
+        let (batch, _) = super::super::outcome_daily_bars::task8_review_fixture();
+        let evidence = batch.evidence().clone();
+        let mut nan_close = batch.records().to_vec();
+        nan_close[0].close = f64::NAN;
+        let error = AdmittedDailyBars::from_test_fixture_with_days(
+            "TEST_CODE_300005",
+            60,
+            nan_close,
+            evidence.clone(),
+        )
+        .unwrap()
+        .into_observed_projection()
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+
+        let mut infinite_amount = batch.records().to_vec();
+        infinite_amount[0].amount = f64::INFINITY;
+        let error = AdmittedDailyBars::from_test_fixture_with_days(
+            "TEST_CODE_300005",
+            60,
+            infinite_amount,
+            evidence.clone(),
+        )
+        .unwrap()
+        .into_observed_projection()
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+
+        let mut positive_zero = batch.records().to_vec();
+        positive_zero[0].volume = 0.0;
+        let mut negative_zero = positive_zero.clone();
+        negative_zero[0].volume = -0.0;
+        assert_ne!(
+            observed_fixture("TEST_CODE_300005", 60, positive_zero, evidence.clone())
+                .projection_hash(),
+            observed_fixture("TEST_CODE_300005", 60, negative_zero, evidence).projection_hash(),
+        );
+    }
 
     #[derive(diesel::QueryableByName)]
     struct AuditProviderRow {

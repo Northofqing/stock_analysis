@@ -100,7 +100,10 @@ pub use general_web_research::{
 };
 pub use global_market::{ForeignExchangeFact, GlobalIndexFact, GlobalMarketGateway};
 pub use global_news::{GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord};
-pub use historical_bars::{daily_bar_provider_label, AdmittedDailyBars, HistoricalBarsGateway};
+pub use historical_bars::{
+    daily_bar_provider_label, AdmittedDailyBars, HistoricalBarsGateway, ObservedDailyBarProjection,
+    ObservedDailyBarsCapture,
+};
 pub use index::{IndexDataGateway, RealtimeIndexQuote};
 pub use intraday_shape::{IntradayShapeFact, IntradayShapeGateway};
 pub use market_capabilities::{
