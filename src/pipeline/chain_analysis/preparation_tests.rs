@@ -689,6 +689,90 @@ fn position_concept_fixture_io(
 }
 
 #[tokio::test]
+async fn production_position_concepts_share_one_observed_fetch_with_prepared_projection() {
+    use super::fetchers::fetch_concepts_cached_observed_in;
+    use super::preparation::{ProductionIo, SourceStatus};
+    use std::{cell::RefCell, rc::Rc};
+
+    let isolated = tempfile::tempdir().unwrap();
+    let db = crate::database::DatabaseManager::open_isolated_for_test(
+        isolated.path().join("TEST_CODE_same_fetch.db"),
+    )
+    .unwrap();
+    db.save_stock_concepts("TEST_CODE_协议持仓", &["TEST_CODE_深度主线".into()])
+        .unwrap();
+    db.save_stock_concepts("TEST_CODE_UNRELATED", &["TEST_CODE_无关".into()])
+        .unwrap();
+    let requested = vec!["TEST_CODE_协议持仓".into(), "TEST_CODE_工具持仓".into()];
+    let raw = serde_json::json!({
+        "fetched": true,
+        "secucode": "TEST_CODE_工具持仓",
+        "all_boards": ["TEST_CODE_深度主线"],
+        "board_count": 1,
+        "evidence": {
+            "provider": "TEST_CODE_OPAQUE_PROVIDER",
+            "source": "TEST_CODE_TOOL_SOURCE",
+            "source_at": null,
+            "observed_at": "2026-07-22T00:30:00Z",
+            "batch_id": "TEST_CODE_TOOL_BATCH"
+        }
+    })
+    .to_string();
+    let tool_calls = Rc::new(RefCell::new(Vec::<String>::new()));
+    let fetched = fetch_concepts_cached_observed_in(&db, &requested, {
+        let tool_calls = Rc::clone(&tool_calls);
+        move |code| {
+            tool_calls.borrow_mut().push(code);
+            let raw = raw.clone();
+            async move { Ok(raw) }
+        }
+    })
+    .await;
+    let mut production = ProductionIo::new();
+    let legacy_map = production.apply_position_concept_fetch(fetched).unwrap();
+    let projection = production.take_position_concept_projection().unwrap();
+    assert!(production.take_position_concept_projection().is_none());
+    assert_eq!(*tool_calls.borrow(), ["TEST_CODE_工具持仓"]);
+    assert_eq!(legacy_map["TEST_CODE_协议持仓"], ["TEST_CODE_深度主线"]);
+    assert_eq!(legacy_map["TEST_CODE_工具持仓"], ["TEST_CODE_深度主线"]);
+    assert_eq!(legacy_map["TEST_CODE_UNRELATED"], ["TEST_CODE_无关"]);
+
+    let (stocks, mut controlled) = position_concept_fixture_io(projection, None);
+    controlled.position_rows.pop();
+    for code in &requested {
+        controlled
+            .concepts
+            .insert(code.clone(), legacy_map[code].clone());
+    }
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_固定宏观".into()),
+        &mut controlled,
+    )
+    .await
+    .unwrap();
+    assert_eq!(controlled.position_reads, 1);
+    assert_eq!(*tool_calls.borrow(), ["TEST_CODE_工具持仓"]);
+    for code in &requested {
+        assert_eq!(prepared.position_concepts()[code], legacy_map[code]);
+        assert_eq!(
+            prepared.position_concept_projection().unwrap().concepts()[code],
+            legacy_map[code]
+        );
+    }
+    assert!(!prepared
+        .position_concept_projection()
+        .unwrap()
+        .concepts()
+        .contains_key("TEST_CODE_UNRELATED"));
+    assert_eq!(
+        prepared.position_concept_source().status(),
+        &SourceStatus::Unknown
+    );
+}
+
+#[tokio::test]
 async fn mixed_position_concept_projection_survives_prepared_artifact() {
     use super::fetchers::ConceptFetchTerminal;
     use super::preparation::{

@@ -92,7 +92,7 @@ pub(super) async fn fetch_concepts_cached_observed(
     .await
 }
 
-async fn fetch_concepts_cached_observed_in<F, Fut>(
+pub(super) async fn fetch_concepts_cached_observed_in<F, Fut>(
     db: &DatabaseManager,
     codes: &[String],
     fetch_raw: F,

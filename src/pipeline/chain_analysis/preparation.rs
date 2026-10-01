@@ -1444,26 +1444,32 @@ pub struct ModelEffect<'a> {
     pub concept: Option<&'a str>,
 }
 
-struct ProductionIo {
+pub(super) struct ProductionIo {
     analyzer: Option<GeminiAnalyzer>,
     position_concept_projection: Option<ConceptProjectionObservation>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl ChainPreparationIo for ProductionIo {
-    async fn concepts(&mut self, codes: &[String]) -> Result<HashMap<String, Vec<String>>> {
-        super::fetch_concepts_cached(codes)
-            .await
-            .map_err(anyhow::Error::msg)
+impl ProductionIo {
+    pub(super) fn new() -> Self {
+        Self {
+            analyzer: None,
+            position_concept_projection: None,
+        }
     }
-    async fn position_concepts(
+
+    /// Split the one observed fetch into the legacy return and optional
+    /// evidence. This function performs no further cache or Tool I/O.
+    pub(super) fn apply_position_concept_fetch(
         &mut self,
-        codes: &[String],
+        result: std::result::Result<
+            super::fetchers::ObservedConceptFetch,
+            super::fetchers::ObservedConceptFetchError,
+        >,
     ) -> Result<HashMap<String, Vec<String>>> {
         use super::fetchers::ObservedConceptFetchError;
 
         self.position_concept_projection = None;
-        match super::fetchers::fetch_concepts_cached_observed(codes).await {
+        match result {
             Ok(fetch) => {
                 self.position_concept_projection =
                     Some(ConceptProjectionObservation::from_fetch(fetch.observation));
@@ -1481,6 +1487,23 @@ impl ChainPreparationIo for ProductionIo {
                 Err(anyhow::Error::msg(legacy_error))
             }
         }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChainPreparationIo for ProductionIo {
+    async fn concepts(&mut self, codes: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        super::fetch_concepts_cached(codes)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+    async fn position_concepts(
+        &mut self,
+        codes: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        self.apply_position_concept_fetch(
+            super::fetchers::fetch_concepts_cached_observed(codes).await,
+        )
     }
     fn take_position_concept_projection(&mut self) -> Option<ConceptProjectionObservation> {
         self.position_concept_projection.take()
@@ -1580,10 +1603,7 @@ pub async fn prepare_chain_analysis(
         business_date,
         limit_ups,
         macro_news,
-        &mut ProductionIo {
-            analyzer: None,
-            position_concept_projection: None,
-        },
+        &mut ProductionIo::new(),
     )
     .await
 }
