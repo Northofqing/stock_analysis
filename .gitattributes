@@ -1,0 +1,5 @@
+# Public release inputs are sealed by their raw byte hashes, including CRLF.
+contracts/external_v1_current/*.proto -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+contracts/external_v1_current/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+contracts/external_v1_history/20260928.2/*.proto -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+contracts/external_v1_history/20260928.2/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
