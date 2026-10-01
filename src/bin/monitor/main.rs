@@ -9042,9 +9042,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             // BR-244: projection and every immutable failure audit complete
             // before the snapshot that may authorize reservation. The earlier
             // read is provider preflight only and is never reused for reserve.
-            let reserve_now = chrono::Local::now();
+            let reserve_authority_date = chrono::Local::now().date_naive();
             let fresh_authority = match news_authority_recovery::reconcile_news_flash_business_date(
-                reserve_now.date_naive(),
+                reserve_authority_date,
             )
             .await
             {
@@ -9057,6 +9057,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     None
                 }
             };
+            // Recovery may wait on a worker or cross a window/date boundary.
+            // Reservation uses the clock after that immutable read completes.
+            let reserve_now = chrono::Local::now();
             let reservations = if failure_audit_ready {
                 match fresh_authority.as_ref() {
                     Some(snapshot) => match news_flash_gate.reserve_from_authority(
