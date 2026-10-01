@@ -23,6 +23,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -205,10 +206,6 @@ pub fn g5b_counted_source_facts(
     record: &AlertRecord,
     summary: &str,
 ) -> G5bCountedSourceFacts {
-    let event_facts = format!(
-        "{}|{}|{}|{}",
-        record.triggered_at, record.code, record.category, record.message
-    );
     let rendered_sha256 = sha256_hex(summary.as_bytes());
     let canonical = serde_json::json!({
         "schema": "g5b-attribution-v1",
@@ -222,15 +219,23 @@ pub fn g5b_counted_source_facts(
     });
     let canonical_source = canonical.to_string().into_bytes();
     G5bCountedSourceFacts {
-        occurrence_identity: format!(
-            "g5b-attribution:{business_date}:{}:{}",
-            record.code,
-            sha256_hex(event_facts.as_bytes())
-        ),
+        occurrence_identity: g5b_event_occurrence_identity(business_date, record),
         source_sha256: sha256_hex(&canonical_source),
         canonical_source,
         rendered_sha256,
     }
+}
+
+fn g5b_event_occurrence_identity(business_date: NaiveDate, record: &AlertRecord) -> String {
+    let event_facts = format!(
+        "{}|{}|{}|{}",
+        record.triggered_at, record.code, record.category, record.message
+    );
+    format!(
+        "g5b-attribution:{business_date}:{}:{}",
+        record.code,
+        sha256_hex(event_facts.as_bytes())
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,8 +274,8 @@ pub struct G5bSelectedEventObservation {
     pub decision_identity: Option<String>,
 }
 
-/// Counts and rows cover only the saved G5b selection. Durable decisions or
-/// receipts with no matching selected row are outside this observation.
+/// Counts and rows cover only the saved G5b selection. An unmatched durable
+/// G5b decision fails reconciliation instead of being omitted from counts.
 #[derive(Debug)]
 pub struct G5bSelectedEventsObservation {
     pub business_date: NaiveDate,
@@ -291,6 +296,7 @@ impl G5bSelectedEventsObservation {
 pub enum G5bSelectedEventsObservationError {
     Journal(DeepAttributionError),
     Counted(DurableDeliveryError),
+    Reconciliation(String),
 }
 
 impl std::fmt::Display for G5bSelectedEventsObservationError {
@@ -298,6 +304,7 @@ impl std::fmt::Display for G5bSelectedEventsObservationError {
         match self {
             Self::Journal(error) => write!(f, "G5b selected journal inspection: {error}"),
             Self::Counted(error) => write!(f, "G5b selected counted observation: {error}"),
+            Self::Reconciliation(error) => write!(f, "G5b selected reconciliation: {error}"),
         }
     }
 }
@@ -341,6 +348,14 @@ impl DeepAttributionJournal {
         Self {
             dir: PathBuf::from("data/g5b/attempts"),
             production: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            production: false,
         }
     }
 
@@ -853,44 +868,83 @@ impl DeepAttributionJournal {
     }
 
     /// Observe only events in the saved selection. `None` means no selection
-    /// artifact, not absence of orphan counted decisions or receipts. Each
-    /// frozen event uses a separate read-only DB snapshot; this is not one
-    /// atomic day snapshot and cannot seal G5B_LAST_RUN. This never prepares
-    /// or retries a decision. Run it off the async monitor tick.
+    /// artifact. All G5b decisions for the date are validated in one DB read
+    /// snapshot, including decisions outside the selection; those fail closed.
+    /// Files and SQLite are not one atomic snapshot, so this cannot directly
+    /// seal G5B_LAST_RUN. This never prepares or retries a decision. Run it
+    /// off the async monitor tick.
     pub fn inspect_selected_events_delivery(
         &self,
         date: NaiveDate,
         coordinator: &DurableDeliveryCoordinator,
     ) -> Result<Option<G5bSelectedEventsObservation>, G5bSelectedEventsObservationError> {
-        let Some(inspections) = self.inspect_existing_day(date)? else {
+        let inspections = self.inspect_existing_day(date)?;
+        let counted = coordinator.g5b_counted_day_snapshot(&date.to_string())?;
+        let Some(inspections) = inspections else {
+            if !counted.facts().is_empty() {
+                return Err(G5bSelectedEventsObservationError::Reconciliation(
+                    "counted decision exists without a saved selection".to_owned(),
+                ));
+            }
             return Ok(None);
         };
+        let selected_occurrences = inspections
+            .iter()
+            .map(|event| g5b_event_occurrence_identity(date, &event.record))
+            .collect::<BTreeSet<_>>();
+        for fact in counted.facts() {
+            if !selected_occurrences.contains(fact.occurrence_identity()) {
+                return Err(G5bSelectedEventsObservationError::Reconciliation(format!(
+                    "counted occurrence is outside saved selection: {}",
+                    fact.occurrence_identity()
+                )));
+            }
+        }
         let mut events = Vec::with_capacity(inspections.len());
         for inspection in inspections {
+            let occurrence = g5b_event_occurrence_identity(date, &inspection.record);
+            let fact = counted
+                .facts()
+                .iter()
+                .find(|fact| fact.occurrence_identity() == occurrence);
             let (completion, archived, decision_identity) = match inspection.progress {
                 DeepAttributionEventProgress::NotStarted => {
+                    if fact.is_some() {
+                        return Err(G5bSelectedEventsObservationError::Reconciliation(format!(
+                            "counted decision has no analysis attempt: {occurrence}"
+                        )));
+                    }
                     (G5bSelectedEventState::NotStarted, None, None)
                 }
                 DeepAttributionEventProgress::CompletionUnproven => {
+                    if fact.is_some() {
+                        return Err(G5bSelectedEventsObservationError::Reconciliation(format!(
+                            "counted decision has no frozen result: {occurrence}"
+                        )));
+                    }
                     (G5bSelectedEventState::CompletionUnproven, None, None)
                 }
                 DeepAttributionEventProgress::Frozen { result, archived } => {
-                    let facts =
+                    let expected =
                         g5b_counted_source_facts(date, &inspection.record, result.summary());
-                    let counted = coordinator.g5b_counted_observation_for_frozen(
-                        &date.to_string(),
-                        facts.occurrence_identity(),
-                        facts.source_sha256(),
-                        result.summary_sha256(),
-                    )?;
-                    let completion = counted
-                        .as_ref()
-                        .map(|item| selected_state_for_counted_terminal(item.terminal()))
+                    if let Some(fact) = fact {
+                        if fact.source_binding_sha256() != expected.source_sha256()
+                            || fact.rendered_content_sha256() != result.summary_sha256()
+                        {
+                            return Err(G5bSelectedEventsObservationError::Reconciliation(
+                                format!("frozen source or summary mismatch: {occurrence}"),
+                            ));
+                        }
+                    }
+                    let completion = fact
+                        .map(|fact| {
+                            selected_state_for_counted_terminal(fact.observation().terminal())
+                        })
                         .unwrap_or(G5bSelectedEventState::NoCountedDecision);
                     (
                         completion,
                         Some(archived),
-                        counted.map(|item| item.decision_identity().to_string()),
+                        fact.map(|fact| fact.observation().decision_identity().to_string()),
                     )
                 }
             };

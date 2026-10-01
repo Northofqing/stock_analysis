@@ -6067,6 +6067,209 @@ fn g5b_frozen_observation_rejects_unbound_source_and_nonaccepted_terminal() {
 }
 
 #[test]
+fn g5b_day_snapshot_enumerates_all_counted_occurrences_and_distinguishes_manual_acceptance() {
+    let fixture = Fixture::new("G5B_DAY_FACTS");
+    let append = MemoryAppendPort::default();
+    let accepted = g5b_frozen_envelope("DAY_PHYSICAL", false);
+    let manual = g5b_frozen_envelope("DAY_MANUAL", false);
+    let other_kind = envelope(
+        "G5B_DAY_OTHER_KIND",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        &accepted.business_date,
+        false,
+    );
+    for candidate in [&accepted, &manual, &other_kind] {
+        prepare_reserved(&fixture, candidate, &append);
+    }
+
+    let accepted_sinks: Vec<AuthoritativeSink> = vec![StaticSink::new(
+        AuthoritativeSinkResult::Accepted(receipt(now())),
+    )];
+    fixture
+        .coordinator
+        .resume_deliverable(&accepted.decision_identity, &accepted_sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &accepted.decision_identity,
+    );
+
+    let uncertain_sinks: Vec<AuthoritativeSink> = vec![StaticSink::new(
+        AuthoritativeSinkResult::Uncertain(uncertainty(now())),
+    )];
+    fixture
+        .coordinator
+        .resume_deliverable(&manual.decision_identity, &uncertain_sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::UncertainManualReview,
+        &manual.decision_identity,
+    );
+    fixture
+        .coordinator
+        .resolve_uncertain(
+            &ManualResolutionCommand {
+                decision_identity: manual.decision_identity.clone(),
+                disposition: ManualDisposition::Accepted {
+                    receipt: Some(receipt(now())),
+                },
+                operator_identity: "TEST_CODE_G5B_DAY_OPERATOR".to_owned(),
+                reason: "TEST_CODE_G5B_DAY_CONFIRMED_DELIVERED".to_owned(),
+                external_evidence: b"TEST_CODE_G5B_DAY_MANUAL_EVIDENCE".to_vec(),
+                resolved_at: now(),
+            },
+            &append,
+        )
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &manual.decision_identity,
+    );
+
+    let snapshot = fixture
+        .coordinator
+        .g5b_counted_day_snapshot(&accepted.business_date)
+        .unwrap();
+    assert_eq!(snapshot.facts().len(), 2);
+    let physical = snapshot
+        .facts()
+        .iter()
+        .find(|fact| fact.occurrence_identity() == accepted.schedule_occurrence_identity)
+        .unwrap();
+    assert_eq!(
+        physical.observation().terminal(),
+        G5bCountedTerminalV1::Accepted
+    );
+    assert!(physical.observation().is_authoritative_accepted());
+    assert_eq!(
+        physical.source_binding_sha256(),
+        accepted.source_binding_sha256
+    );
+    assert_eq!(
+        physical.rendered_content_sha256(),
+        accepted.rendered_content_sha256
+    );
+    let manual_fact = snapshot
+        .facts()
+        .iter()
+        .find(|fact| fact.occurrence_identity() == manual.schedule_occurrence_identity)
+        .unwrap();
+    assert_eq!(
+        manual_fact.observation().terminal(),
+        G5bCountedTerminalV1::ManualAccepted
+    );
+    assert!(!manual_fact.observation().is_authoritative_accepted());
+    assert!(manual_fact
+        .observation()
+        .terminal_attempt_identity()
+        .is_some());
+    assert!(snapshot
+        .facts()
+        .iter()
+        .all(|fact| { fact.occurrence_identity() != other_kind.schedule_occurrence_identity }));
+}
+
+#[test]
+fn g5b_day_snapshot_fails_closed_on_tampered_or_missing_source() {
+    let tampered = Fixture::new("G5B_DAY_TAMPERED");
+    let append = MemoryAppendPort::default();
+    let candidate = g5b_frozen_envelope("DAY_TAMPERED", false);
+    prepare_reserved(&tampered, &candidate, &append);
+    {
+        let connection = Connection::open(&tampered.database_path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER immutable_decision_envelope_update;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE delivery_decisions SET envelope_sha256=?1 WHERE decision_identity=?2",
+                params![
+                    sha256_hex(b"TEST_CODE_CORRUPTED"),
+                    candidate.decision_identity
+                ],
+            )
+            .unwrap();
+    }
+    assert!(tampered
+        .coordinator
+        .g5b_counted_day_snapshot(&candidate.business_date)
+        .is_err());
+
+    let missing = Fixture::new("G5B_DAY_MISSING_SOURCE");
+    let source = b"{}".to_vec();
+    let source_sha256 = sha256_hex(&source);
+    let no_event_source = DeliveryEnvelope::new(
+        "2026-08-18",
+        PushKind::G5bAttribution,
+        DeliverySubKind::None,
+        "GLOBAL",
+        "g5b-attribution:2026-08-18:TEST_CODE_MISSING:missing",
+        source_sha256.clone(),
+        source,
+        source_sha256,
+        b"TEST_CODE_SUMMARY".to_vec(),
+        true,
+        None,
+    )
+    .unwrap();
+    prepare_reserved(&missing, &no_event_source, &append);
+    assert!(missing
+        .coordinator
+        .g5b_counted_day_snapshot(&no_event_source.business_date)
+        .is_err());
+}
+
+#[test]
+fn g5b_selected_events_reject_counted_decision_without_selection() {
+    use crate::monitor::attribution_deep::{
+        DeepAttributionJournal, G5bSelectedEventsObservationError,
+    };
+
+    let fixture = Fixture::new("G5B_DAY_ORPHAN");
+    let append = MemoryAppendPort::default();
+    let orphan = g5b_frozen_envelope("DAY_ORPHAN", false);
+    prepare_reserved(&fixture, &orphan, &append);
+    let root = tempfile::tempdir().unwrap();
+    let journal = DeepAttributionJournal::isolated_for_test(root.path().join("attempts"));
+    let date = chrono::NaiveDate::parse_from_str(&orphan.business_date, "%Y-%m-%d").unwrap();
+    assert!(matches!(
+        journal.inspect_selected_events_delivery(date, &fixture.coordinator),
+        Err(G5bSelectedEventsObservationError::Reconciliation(_))
+    ));
+    assert!(!root.path().join("attempts").exists());
+
+    let selected = crate::monitor::alert_log::AlertRecord {
+        origin: Default::default(),
+        triggered_at: "2026-08-18T15:05:00+08:00".to_owned(),
+        code: "600001".to_owned(),
+        name: "selected".to_owned(),
+        level: "重要".to_owned(),
+        category: "异动".to_owned(),
+        message: "selected event".to_owned(),
+        price: None,
+        change_pct: None,
+        main_flow_yi: None,
+        news_title: None,
+        news_importance: None,
+        attribution_decision: None,
+        routed_external_id: None,
+        t1_locked: false,
+    };
+    journal.load_or_select(date, vec![selected]).unwrap();
+    assert!(matches!(
+        journal.inspect_selected_events_delivery(date, &fixture.coordinator),
+        Err(G5bSelectedEventsObservationError::Reconciliation(_))
+    ));
+}
+
+#[test]
 fn a12_attribution_daily_policy_is_global_business_date_once_and_budget_exempt() {
     // 2026-09-20 用户决策 (分流规则): 每日必达类豁免日预算 — 15:05 归因日推
     // 与复盘类同语义 (BR-237), 不被盘中信号饿死。

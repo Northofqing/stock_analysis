@@ -44,7 +44,9 @@ mod candidate_board;
 pub use candidate_board::{CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1};
 #[path = "coordinator_g5b.rs"]
 mod g5b;
-pub use g5b::{G5bCountedObservationV1, G5bCountedTerminalV1};
+pub use g5b::{
+    G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+};
 
 const AUDIT_KINDS: [&str; 14] = [
     "DecisionStateChanged",

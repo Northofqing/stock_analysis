@@ -8,6 +8,7 @@ use super::{
 };
 use crate::durable_delivery::model::{validate_business_date, CooldownScope, DeliverySubKind};
 use rusqlite::{params, TransactionBehavior};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum G5bCountedTerminalV1 {
@@ -62,7 +63,76 @@ impl G5bCountedObservationV1 {
     }
 }
 
+/// Every persisted G5b decision for one business date, validated in one
+/// SQLite read transaction. This is a DB snapshot, not a journal/LLM snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct G5bCountedDaySnapshotV1 {
+    facts: Vec<G5bCountedDayFactV1>,
+}
+
+impl G5bCountedDaySnapshotV1 {
+    pub fn facts(&self) -> &[G5bCountedDayFactV1] {
+        &self.facts
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct G5bCountedDayFactV1 {
+    occurrence_identity: String,
+    source_binding_sha256: String,
+    rendered_content_sha256: String,
+    observation: G5bCountedObservationV1,
+}
+
+impl G5bCountedDayFactV1 {
+    pub fn occurrence_identity(&self) -> &str {
+        &self.occurrence_identity
+    }
+
+    pub fn source_binding_sha256(&self) -> &str {
+        &self.source_binding_sha256
+    }
+
+    pub fn rendered_content_sha256(&self) -> &str {
+        &self.rendered_content_sha256
+    }
+
+    pub fn observation(&self) -> &G5bCountedObservationV1 {
+        &self.observation
+    }
+}
+
 impl DurableDeliveryCoordinator {
+    /// Enumerate all G5b decisions for this business date, including decisions
+    /// outside any saved LLM selection. Every row is revalidated; malformed
+    /// historical rows and duplicate occurrences fail the whole observation.
+    pub fn g5b_counted_day_snapshot(&self, business_date: &str) -> Result<G5bCountedDaySnapshotV1> {
+        validate_business_date(business_date)?;
+        self.with_connection(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let identities = g5b_decision_identities(&transaction, business_date)?;
+            let mut occurrences = BTreeSet::new();
+            let mut facts = Vec::with_capacity(identities.len());
+            for identity in identities {
+                let (stored, envelope) = load_g5b_envelope(&transaction, &identity)?;
+                let observation =
+                    observe_validated_g5b_decision(&transaction, stored, &envelope, business_date)?;
+                if !occurrences.insert(envelope.schedule_occurrence_identity.clone()) {
+                    return Err(g5b_mismatch("multiple decisions own one occurrence"));
+                }
+                facts.push(G5bCountedDayFactV1 {
+                    occurrence_identity: envelope.schedule_occurrence_identity,
+                    source_binding_sha256: envelope.source_binding_sha256,
+                    rendered_content_sha256: envelope.rendered_content_sha256,
+                    observation,
+                });
+            }
+            transaction.commit()?;
+            Ok(G5bCountedDaySnapshotV1 { facts })
+        })
+    }
+
     /// Inspect the one G5b decision for a frozen event without admission or
     /// sink access. Expected hashes must come from the validated frozen row
     /// and its exact summary, never from a newly generated LLM result.
@@ -80,84 +150,108 @@ impl DurableDeliveryCoordinator {
         self.with_connection(|connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            let identities = {
-                let mut query = transaction.prepare(
-                    "SELECT decision_identity FROM delivery_decisions
-                     WHERE business_date=?1 AND push_kind=?2
-                     ORDER BY decision_identity",
-                )?;
-                let rows = query.query_map(
-                    params![business_date, PushKind::G5bAttribution.as_str()],
-                    |row| row.get::<_, String>(0),
-                )?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            let identities = g5b_decision_identities(&transaction, business_date)?;
             let mut observation = None;
             for identity in identities {
-                let stored = load_decision(&transaction, &identity)?
-                    .ok_or_else(|| DurableDeliveryError::DecisionNotFound(identity.clone()))?;
-                if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
-                    return Err(g5b_mismatch("frozen envelope hash mismatch"));
-                }
-                let envelope = parse_envelope(&stored.envelope_canonical)?;
-                if envelope.canonical_bytes()? != stored.envelope_canonical {
-                    return Err(g5b_mismatch("frozen envelope is not canonical"));
-                }
+                let (stored, envelope) = load_g5b_envelope(&transaction, &identity)?;
                 if envelope.schedule_occurrence_identity != occurrence_identity {
                     continue;
                 }
                 if observation.is_some() {
                     return Err(g5b_mismatch("multiple decisions own one occurrence"));
                 }
-                validate_g5b_binding(&stored, &envelope, business_date)?;
                 if envelope.source_binding_sha256 != source_binding_sha256
                     || envelope.rendered_content_sha256 != rendered_content_sha256
                 {
                     return Err(g5b_mismatch("frozen source or summary mismatch"));
                 }
-                let (terminal, attempt, disposition, evidence_sha256, accepted_channel) = if matches!(
-                    stored.state,
-                    DecisionState::Delivered
-                        | DecisionState::RejectedDurable
-                        | DecisionState::UncertainManualReview
-                        | DecisionState::ManualResolvedRejected
-                ) {
-                    let verified =
-                        build_validated_terminal_evidence(&transaction, &stored, &envelope, None)?;
-                    let terminal = match verified.disposition {
-                        FoundationTerminalDisposition::Accepted => G5bCountedTerminalV1::Accepted,
-                        FoundationTerminalDisposition::ManualAccepted => {
-                            G5bCountedTerminalV1::ManualAccepted
-                        }
-                        FoundationTerminalDisposition::Rejected => G5bCountedTerminalV1::Rejected,
-                        FoundationTerminalDisposition::Uncertain => G5bCountedTerminalV1::Uncertain,
-                        FoundationTerminalDisposition::ManualNotDelivered => {
-                            G5bCountedTerminalV1::ManualNotDelivered
-                        }
-                    };
-                    (
-                        terminal,
-                        verified.attempt_id,
-                        Some(verified.ref_id),
-                        Some(verified.evidence_sha256),
-                        verified.accepted_channel,
-                    )
-                } else {
-                    (G5bCountedTerminalV1::Pending, None, None, None, None)
-                };
-                observation = Some(G5bCountedObservationV1 {
-                    decision_identity: stored.decision_identity,
-                    terminal,
-                    terminal_attempt_identity: attempt,
-                    disposition_identity: disposition,
-                    terminal_evidence_sha256: evidence_sha256,
-                    accepted_channel,
-                });
+                observation = Some(observe_validated_g5b_decision(
+                    &transaction,
+                    stored,
+                    &envelope,
+                    business_date,
+                )?);
             }
             transaction.commit()?;
             Ok(observation)
         })
     }
+}
+
+fn g5b_decision_identities(
+    transaction: &rusqlite::Transaction<'_>,
+    business_date: &str,
+) -> Result<Vec<String>> {
+    let mut query = transaction.prepare(
+        "SELECT decision_identity FROM delivery_decisions
+         WHERE business_date=?1 AND push_kind=?2
+         ORDER BY decision_identity",
+    )?;
+    let rows = query.query_map(
+        params![business_date, PushKind::G5bAttribution.as_str()],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn load_g5b_envelope(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &str,
+) -> Result<(StoredDecision, DeliveryEnvelope)> {
+    let stored = load_decision(transaction, identity)?
+        .ok_or_else(|| DurableDeliveryError::DecisionNotFound(identity.to_owned()))?;
+    if sha256_hex(&stored.envelope_canonical) != stored.envelope_sha256 {
+        return Err(g5b_mismatch("frozen envelope hash mismatch"));
+    }
+    let envelope = parse_envelope(&stored.envelope_canonical)?;
+    if envelope.canonical_bytes()? != stored.envelope_canonical {
+        return Err(g5b_mismatch("frozen envelope is not canonical"));
+    }
+    Ok((stored, envelope))
+}
+
+fn observe_validated_g5b_decision(
+    transaction: &rusqlite::Transaction<'_>,
+    stored: StoredDecision,
+    envelope: &DeliveryEnvelope,
+    business_date: &str,
+) -> Result<G5bCountedObservationV1> {
+    validate_g5b_binding(&stored, envelope, business_date)?;
+    let (terminal, attempt, disposition, evidence_sha256, accepted_channel) = if matches!(
+        stored.state,
+        DecisionState::Delivered
+            | DecisionState::RejectedDurable
+            | DecisionState::UncertainManualReview
+            | DecisionState::ManualResolvedRejected
+    ) {
+        let verified = build_validated_terminal_evidence(transaction, &stored, envelope, None)?;
+        let terminal = match verified.disposition {
+            FoundationTerminalDisposition::Accepted => G5bCountedTerminalV1::Accepted,
+            FoundationTerminalDisposition::ManualAccepted => G5bCountedTerminalV1::ManualAccepted,
+            FoundationTerminalDisposition::Rejected => G5bCountedTerminalV1::Rejected,
+            FoundationTerminalDisposition::Uncertain => G5bCountedTerminalV1::Uncertain,
+            FoundationTerminalDisposition::ManualNotDelivered => {
+                G5bCountedTerminalV1::ManualNotDelivered
+            }
+        };
+        (
+            terminal,
+            verified.attempt_id,
+            Some(verified.ref_id),
+            Some(verified.evidence_sha256),
+            verified.accepted_channel,
+        )
+    } else {
+        (G5bCountedTerminalV1::Pending, None, None, None, None)
+    };
+    Ok(G5bCountedObservationV1 {
+        decision_identity: stored.decision_identity,
+        terminal,
+        terminal_attempt_identity: attempt,
+        disposition_identity: disposition,
+        terminal_evidence_sha256: evidence_sha256,
+        accepted_channel,
+    })
 }
 
 fn valid_sha256(value: &str) -> bool {
