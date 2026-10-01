@@ -175,18 +175,12 @@ async fn g5b_no_provider_backoff() {
     tokio::time::sleep(PAPER_DECISION_TICK).await;
 }
 
-/// Empty input never seals the day: a production alert may arrive at any later
-/// tick, including the last minute of the attribution window.
-fn g5b_should_analyze(
-    local_now: chrono::NaiveDateTime,
-    last_run: Option<chrono::NaiveDate>,
-    eligible_events: usize,
-) -> bool {
+/// Window eligibility grants no day-completion authority. Persistent per-event
+/// claims prevent recomputation/resending on subsequent ticks, including after
+/// failed or unproven outcomes. Empty ticks remain eligible for later input.
+fn g5b_should_analyze(local_now: chrono::NaiveDateTime, eligible_events: usize) -> bool {
     use chrono::Timelike;
-    local_now.hour() == 15
-        && (5..=20).contains(&local_now.minute())
-        && last_run != Some(local_now.date())
-        && eligible_events > 0
+    local_now.hour() == 15 && (5..=20).contains(&local_now.minute()) && eligible_events > 0
 }
 
 const G5B_RECOVERY_BATCH_DATES: usize = 8;
@@ -458,15 +452,10 @@ mod g5b_input_gate_tests {
     fn empty_ticks_leave_the_full_window_open_for_a_late_alert() {
         let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
         let at = |minute, second| day.and_hms_opt(15, minute, second).unwrap();
-        assert!(!g5b_should_analyze(at(5, 0), None, 0));
-        assert!(!g5b_should_analyze(at(20, 0), None, 0));
-        assert!(g5b_should_analyze(at(20, 45), None, 1));
-        assert!(!g5b_should_analyze(at(20, 45), Some(day), 1));
-        assert!(!g5b_should_analyze(
-            day.and_hms_opt(15, 21, 0).unwrap(),
-            None,
-            1
-        ));
+        assert!(!g5b_should_analyze(at(5, 0), 0));
+        assert!(!g5b_should_analyze(at(20, 0), 0));
+        assert!(g5b_should_analyze(at(20, 45), 1));
+        assert!(!g5b_should_analyze(day.and_hms_opt(15, 21, 0).unwrap(), 1));
     }
 }
 
@@ -10765,11 +10754,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     DeepAttributionArchiveOutcome, DeepAttributionClaim, DeepAttributionJournal,
                     DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
-                static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
-                    std::sync::Mutex::new(None);
                 let today = now.date_naive();
-                let g5b_last_run = *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-                if g5b_last_run != Some(today) {
+                {
                     let candidates =
                         top_events_for_deep(read_today_records(), DEEP_ATTRIBUTION_MAX_EVENTS);
                     let provider = if candidates.is_empty() {
@@ -10794,9 +10780,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 selection_failed = true;
                                 Vec::new()
                             });
-                    if !selection_failed
-                        && !g5b_should_analyze(now.naive_local(), g5b_last_run, events.len())
-                    {
+                    if !selection_failed && !g5b_should_analyze(now.naive_local(), events.len()) {
                         log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
                     } else if !selection_failed {
                         let Some(provider) =
@@ -10898,6 +10882,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             continue;
                                         }
                                     };
+                                    done += 1;
                                     match journal.archive_frozen_result(today, index) {
                                         Ok(DeepAttributionArchiveOutcome::Appended) => {}
                                         Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => {
@@ -10918,7 +10903,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                     log::info!(
                                         "[g5b] 深链归因完成 {}/{}: {} {} ({}ms)",
-                                        done + 1,
+                                        done,
                                         DEEP_ATTRIBUTION_MAX_EVENTS,
                                         row.record.code,
                                         row.record.name,
@@ -10963,8 +10948,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     ) {
                                         log::warn!("[g5b] counted 未确认, attempt 已记录且禁止自动重算, 需人工核对: {:?}", outcome);
                                     }
-                                    log::info!("[g5b] 深链归因推送完成: {:?}", outcome);
-                                    done += 1;
+                                    log::info!("[g5b] 深链归因 counted 投递观察: {:?}", outcome);
                                 }
                                 Err(e) => {
                                     log::warn!(
@@ -10976,13 +10960,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                         log::info!(
-                            "[g5b] 深链归因当日批次结束: 成功 {done}, 失败 {failed} (上限 {})",
-                            DEEP_ATTRIBUTION_MAX_EVENTS
+                            "[g5b] 深链归因本批观察: 新冻结 {done}, 失败 {failed}, journal_io_failed={journal_failed} (上限 {}); 无持久日封存证据",
+                            DEEP_ATTRIBUTION_MAX_EVENTS,
                         );
-                        // 标记 IO 故障可在下 tick 重试; 已标记事件不会重复调用 LLM。
-                        if !journal_failed {
-                            *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
-                        }
+                        // A finished loop, model result or PushOutcome cannot
+                        // seal the day. Later ticks inspect the exact persistent
+                        // claims; attempted/frozen events never restart the LLM
+                        // or automatically hand off to the physical sink again.
                     }
                 }
             }
@@ -14582,13 +14566,10 @@ mod tests_post_session_review_scheduler {
         let window = g5b
             .find("if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute())")
             .expect("fresh G5b analysis window");
-        let last_run = g5b
-            .find("if g5b_last_run != Some(today)")
-            .expect("fresh G5b daily gate");
         let provider = g5b
             .find("LlmRegistry::from_env().select(\"g5b\")")
             .expect("fresh G5b model provider");
-        assert!(recovery < window && window < last_run && last_run < provider);
+        assert!(recovery < window && window < provider);
         let no_provider_gate = g5b
             .find("if !candidates.is_empty() && provider.is_none()")
             .expect("fresh G5b no-provider gate");
