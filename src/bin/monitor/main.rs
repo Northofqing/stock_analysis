@@ -10418,8 +10418,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
                     append_deep_attribution_row, render_deep_attribution_summary,
-                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionJournal,
-                    DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
+                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionClaim,
+                    DeepAttributionJournal, DeepAttributionRequest, DeepAttributionRow,
+                    DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
@@ -10470,12 +10471,22 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let mut journal_failed = false;
                         for (index, record) in events.into_iter().enumerate() {
                             match journal.begin_assessment(today, index) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    log::info!(
-                                        "[g5b] 已有分析 attempt 标记, 不重算或重发: {} {}",
+                                Ok(DeepAttributionClaim::Fresh) => {}
+                                Ok(DeepAttributionClaim::CompletionUnproven) => {
+                                    log::warn!(
+                                        "[g5b] 已有 attempt 但 LLM 完成状态无持久证据, 不重算或重发: {} {}",
                                         record.code,
                                         record.triggered_at
+                                    );
+                                    continue;
+                                }
+                                Ok(DeepAttributionClaim::Frozen(frozen)) => {
+                                    log::warn!(
+                                        "[g5b] LLM 结果已冻结但归档/counted/物理状态未知, 不自动恢复: {} {} row_sha256={} summary_sha256={}",
+                                        record.code,
+                                        record.triggered_at,
+                                        frozen.row_sha256(),
+                                        frozen.summary_sha256()
                                     );
                                     continue;
                                 }
@@ -10512,6 +10523,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             .map(str::to_owned),
                                         elapsed_ms: outcome.elapsed_ms,
                                     };
+                                    let summary = render_deep_attribution_summary(&row);
+                                    let frozen = match journal
+                                        .freeze_result(today, index, &row, &summary)
+                                    {
+                                        Ok(frozen) => frozen,
+                                        Err(error) => {
+                                            log::error!("[g5b] LLM 完成但结果冻结失败, 禁止归档和投递: {} {}: {error}", row.record.code, row.record.triggered_at);
+                                            failed += 1;
+                                            continue;
+                                        }
+                                    };
                                     if let Err(e) = append_deep_attribution_row(&row) {
                                         log::warn!("[g5b] 深链归因落库失败, attempt 已记录且禁止自动重算, 需人工核对: {e}");
                                         failed += 1;
@@ -10525,13 +10547,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         row.record.name,
                                         row.elapsed_ms
                                     );
-                                    let summary = render_deep_attribution_summary(&row);
                                     // 2026-09-20: G5b 升级 counted 持久投递 (MU-g5b-attribution)。
-                                    // attempt 已持久化; counted handoff 只消费本次分析的摘要。
+                                    // 冻结结果已持久化; counted handoff 只消费其原摘要字节。
                                     let outcome = match push_templates::build_g5b_counted_binding(
                                         today,
                                         &row.record,
-                                        &summary,
+                                        frozen.summary(),
                                     )
                                     .and_then(|binding| {
                                         crate::presentation_registry::acquire_token(
@@ -10544,7 +10565,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }) {
                                         Ok((token, binding)) => {
                                             crate::notify::push_counted_with_binding(
-                                                token, &summary, None, binding,
+                                                token,
+                                                frozen.summary(),
+                                                None,
+                                                binding,
                                             )
                                             .await
                                         }
