@@ -10417,10 +10417,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
-                    append_deep_attribution_row, render_deep_attribution_summary,
-                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionClaim,
-                    DeepAttributionJournal, DeepAttributionRequest, DeepAttributionRow,
-                    DEEP_ATTRIBUTION_MAX_EVENTS,
+                    render_deep_attribution_summary, top_events_for_deep, DeepAttributionAnalyzer,
+                    DeepAttributionArchiveOutcome, DeepAttributionClaim, DeepAttributionJournal,
+                    DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
@@ -10481,13 +10480,26 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     continue;
                                 }
                                 Ok(DeepAttributionClaim::Frozen(frozen)) => {
-                                    log::warn!(
-                                        "[g5b] LLM 结果已冻结但归档/counted/物理状态未知, 不自动恢复: {} {} row_sha256={} summary_sha256={}",
-                                        record.code,
-                                        record.triggered_at,
-                                        frozen.row_sha256(),
-                                        frozen.summary_sha256()
-                                    );
+                                    match journal.archive_frozen_result(today, index) {
+                                        Ok(DeepAttributionArchiveOutcome::Appended) => log::warn!(
+                                            "[g5b] 已冻结结果的缺失归档已恢复; counted/物理状态未知, 不自动投递: {} {} row_sha256={} summary_sha256={}",
+                                            record.code,
+                                            record.triggered_at,
+                                            frozen.row_sha256(),
+                                            frozen.summary_sha256()
+                                        ),
+                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => log::info!(
+                                            "[g5b] 已冻结结果归档完整; counted/物理状态未知, 不自动投递: {} {} row_sha256={}",
+                                            record.code,
+                                            record.triggered_at,
+                                            frozen.row_sha256()
+                                        ),
+                                        Err(error) => log::error!(
+                                            "[g5b] 已冻结结果归档无法确定, 不自动投递: {} {}: {error}",
+                                            record.code,
+                                            record.triggered_at
+                                        ),
+                                    }
                                     continue;
                                 }
                                 Err(error) => {
@@ -10534,10 +10546,18 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             continue;
                                         }
                                     };
-                                    if let Err(e) = append_deep_attribution_row(&row) {
-                                        log::warn!("[g5b] 深链归因落库失败, attempt 已记录且禁止自动重算, 需人工核对: {e}");
-                                        failed += 1;
-                                        continue;
+                                    match journal.archive_frozen_result(today, index) {
+                                        Ok(DeepAttributionArchiveOutcome::Appended) => {}
+                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => {
+                                            log::warn!("[g5b] 深链归因同事件已归档, counted/物理状态未知, 禁止自动投递: {} {}", row.record.code, row.record.triggered_at);
+                                            failed += 1;
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            log::warn!("[g5b] 深链归因归档失败, attempt 已记录且禁止自动重算, 需人工核对: {error}");
+                                            failed += 1;
+                                            continue;
+                                        }
                                     }
                                     log::info!(
                                         "[g5b] 深链归因完成 {}/{}: {} {} ({}ms)",

@@ -17,10 +17,11 @@ use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
 use crate::monitor::alert_log::AlertRecord;
 use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
 use chrono::{DateTime, NaiveDate, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -134,6 +135,32 @@ pub enum DeepAttributionClaim {
     Frozen(DeepAttributionFrozenResult),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepAttributionArchiveOutcome {
+    Appended,
+    AlreadyPresent,
+}
+
+/// 与 G5b counted occurrence 的事件事实字段保持一致；业务日由归档路径约束。
+#[derive(PartialEq, Eq)]
+struct DeepAttributionEventKey {
+    code: String,
+    event_hash: String,
+}
+
+impl From<&AlertRecord> for DeepAttributionEventKey {
+    fn from(record: &AlertRecord) -> Self {
+        let event_facts = format!(
+            "{}|{}|{}|{}",
+            record.triggered_at, record.code, record.category, record.message
+        );
+        Self {
+            code: record.code.clone(),
+            event_hash: sha256_hex(event_facts.as_bytes()),
+        }
+    }
+}
+
 impl DeepAttributionJournal {
     pub fn production() -> Self {
         Self {
@@ -161,6 +188,13 @@ impl DeepAttributionJournal {
 
     fn result_path(&self, date: NaiveDate, index: usize) -> PathBuf {
         self.dir.join(format!("{date}.{index}.result.json"))
+    }
+
+    fn archive_path(&self, date: NaiveDate) -> PathBuf {
+        self.dir
+            .parent()
+            .expect("G5b journal directory has parent")
+            .join(format!("{date}.jsonl"))
     }
 
     /// 已保存的选集优先于当天不断增长的告警文件。首次无可选事件时不冻结选集。
@@ -279,6 +313,11 @@ impl DeepAttributionJournal {
         let path = self.attempt_path(date, index);
         let result_path = self.result_path(date, index);
         match fs::symlink_metadata(&result_path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 冻结结果不是普通文件: {result_path:?}"
+                )))
+            }
             Ok(_) => match fs::symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -299,12 +338,34 @@ impl DeepAttributionJournal {
         }
         match write_new_synced(&path, b"") {
             Ok(true) => Ok(DeepAttributionClaim::Fresh),
-            Ok(false) => match self.read_frozen_result(date, index, selected)? {
-                Some(frozen) => Ok(DeepAttributionClaim::Frozen(frozen)),
-                None => Ok(DeepAttributionClaim::CompletionUnproven),
-            },
+            Ok(false) => {
+                self.validate_attempt_marker(date, index)?;
+                match self.read_frozen_result(date, index, selected)? {
+                    Some(frozen) => Ok(DeepAttributionClaim::Frozen(frozen)),
+                    None => Ok(DeepAttributionClaim::CompletionUnproven),
+                }
+            }
             Err(error) => Err(DeepAttributionError::Io(format!("记录 {path:?}: {error}"))),
         }
+    }
+
+    fn validate_attempt_marker(
+        &self,
+        date: NaiveDate,
+        index: usize,
+    ) -> Result<(), DeepAttributionError> {
+        let path = self.attempt_path(date, index);
+        let marker = fs::symlink_metadata(&path)
+            .map_err(|error| DeepAttributionError::Io(format!("检查 {path:?}: {error}")))?;
+        if !marker.file_type().is_file() || marker.len() != 0 {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b attempt 标记无效: {path:?}"
+            )));
+        }
+        fs::File::open(&path)
+            .and_then(|file| file.sync_all())
+            .and_then(|()| sync_parent(&path))
+            .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))
     }
 
     /// 必须在首次 JSONL 归档或 counted 调用前执行；已存在结果绝不覆盖。
@@ -329,18 +390,7 @@ impl DeepAttributionJournal {
                 "G5b 冻结结果与选集或摘要渲染不一致".to_string(),
             ));
         }
-        let attempt = self.attempt_path(date, index);
-        let marker = fs::symlink_metadata(&attempt)
-            .map_err(|error| DeepAttributionError::Io(format!("检查 {attempt:?}: {error}")))?;
-        if !marker.file_type().is_file() || marker.len() != 0 {
-            return Err(DeepAttributionError::Io(format!(
-                "G5b attempt 标记无效: {attempt:?}"
-            )));
-        }
-        fs::File::open(&attempt)
-            .and_then(|file| file.sync_all())
-            .and_then(|()| sync_parent(&attempt))
-            .map_err(|error| DeepAttributionError::Io(format!("同步 {attempt:?}: {error}")))?;
+        self.validate_attempt_marker(date, index)?;
 
         let row_json = serde_json::to_string(row)
             .map_err(|error| DeepAttributionError::Io(error.to_string()))?;
@@ -375,6 +425,16 @@ impl DeepAttributionJournal {
         selected: &AlertRecord,
     ) -> Result<Option<DeepAttributionFrozenResult>, DeepAttributionError> {
         let path = self.result_path(date, index);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 冻结结果不是普通文件: {path:?}"
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(DeepAttributionError::Io(format!("检查 {path:?}: {error}"))),
+        }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -395,6 +455,8 @@ impl DeepAttributionJournal {
             || frozen.selected_record_sha256 != sha256_hex(&selected_bytes)
             || frozen.row_sha256 != sha256_hex(frozen.row_json.as_bytes())
             || frozen.summary_sha256 != sha256_hex(frozen.summary.as_bytes())
+            || serde_json::to_string(&row).ok().as_deref() != Some(frozen.row_json.as_str())
+            || frozen.summary != render_deep_attribution_summary(&row)
         {
             return Err(DeepAttributionError::Io(format!(
                 "G5b 冻结结果完整性检查失败: {path:?}"
@@ -406,6 +468,184 @@ impl DeepAttributionJournal {
             .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
         Ok(Some(frozen))
     }
+
+    /// 将已冻结的精确行字节投影到旧 JSONL。只证明归档完成，不授权 counted 重发。
+    /// 同日锁保护完整扫描与原子替换；坏行、重复事件或不同结果均拒绝写入。
+    pub fn archive_frozen_result(
+        &self,
+        date: NaiveDate,
+        index: usize,
+    ) -> Result<DeepAttributionArchiveOutcome, DeepAttributionError> {
+        self.ensure_allowed()?;
+        let events = self.load_or_select(date, Vec::new())?;
+        let selected = events.get(index).ok_or_else(|| {
+            DeepAttributionError::Io(format!("G5b 归档不在已保存选集内: {date} index={index}"))
+        })?;
+        self.validate_attempt_marker(date, index)?;
+        let frozen = self
+            .read_frozen_result(date, index, selected)?
+            .ok_or_else(|| {
+                DeepAttributionError::Io(format!("G5b 归档缺少冻结结果: {date} index={index}"))
+            })?;
+        let row: DeepAttributionRow = serde_json::from_str(&frozen.row_json)
+            .map_err(|error| DeepAttributionError::Io(error.to_string()))?;
+        if !row.record.is_production_eligible() {
+            return Err(DeepAttributionError::IneligibleRecord(format!(
+                "code={} origin={:?}",
+                row.record.code, row.record.origin
+            )));
+        }
+        let key = DeepAttributionEventKey::from(&row.record);
+        let path = self.archive_path(date);
+        let lock_path = self.dir.join(format!("{date}.archive.lock"));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|error| DeepAttributionError::Io(format!("打开 {lock_path:?}: {error}")))?;
+        let lock_metadata = fs::symlink_metadata(&lock_path)
+            .map_err(|error| DeepAttributionError::Io(format!("检查 {lock_path:?}: {error}")))?;
+        if !lock_metadata.file_type().is_file()
+            || !lock
+                .metadata()
+                .map_err(|error| DeepAttributionError::Io(error.to_string()))?
+                .is_file()
+        {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b 归档锁不是普通文件: {lock_path:?}"
+            )));
+        }
+        lock.lock_exclusive()
+            .map_err(|error| DeepAttributionError::Io(format!("锁定 {lock_path:?}: {error}")))?;
+
+        let original = read_archive_bytes(&path)?;
+        let mut seen: Vec<DeepAttributionEventKey> = Vec::new();
+        if !original.is_empty() {
+            if original.last() != Some(&b'\n') {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 历史归档末行不完整: {path:?}"
+                )));
+            }
+            for (line_number, line) in original[..original.len() - 1]
+                .split(|byte| *byte == b'\n')
+                .enumerate()
+            {
+                let historical: DeepAttributionRow = serde_json::from_slice(line).map_err(|e| {
+                    DeepAttributionError::Io(format!(
+                        "G5b 历史归档第 {} 行无效 {path:?}: {e}",
+                        line_number + 1
+                    ))
+                })?;
+                let historical_key = DeepAttributionEventKey::from(&historical.record);
+                if seen.contains(&historical_key) {
+                    return Err(DeepAttributionError::Io(format!(
+                        "G5b 历史归档事件身份重复: {path:?} line={}",
+                        line_number + 1
+                    )));
+                }
+                if historical_key == key {
+                    if line != frozen.row_json.as_bytes() {
+                        return Err(DeepAttributionError::Io(format!(
+                            "G5b 同事件归档字节冲突: {path:?} line={}",
+                            line_number + 1
+                        )));
+                    }
+                    // 仍扫描余下各行，不能将后续坏行或重复行误判为有效归档。
+                }
+                seen.push(historical_key);
+            }
+        }
+        if seen.contains(&key) {
+            return Ok(DeepAttributionArchiveOutcome::AlreadyPresent);
+        }
+        let mut projected = original;
+        projected.extend_from_slice(frozen.row_json.as_bytes());
+        projected.push(b'\n');
+        write_atomic_archive(&path, &projected)?;
+        Ok(DeepAttributionArchiveOutcome::Appended)
+    }
+}
+
+fn read_archive_bytes(path: &Path) -> Result<Vec<u8>, DeepAttributionError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b 历史归档不是普通文件: {path:?}"
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(DeepAttributionError::Io(format!("检查 {path:?}: {error}"))),
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|error| DeepAttributionError::Io(format!("打开 {path:?}: {error}")))?;
+    if !file
+        .metadata()
+        .map_err(|error| DeepAttributionError::Io(error.to_string()))?
+        .is_file()
+    {
+        return Err(DeepAttributionError::Io(format!(
+            "G5b 历史归档不是普通文件: {path:?}"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .and_then(|_| file.sync_all())
+        .and_then(|_| sync_parent(path))
+        .map_err(|error| DeepAttributionError::Io(format!("读取/同步 {path:?}: {error}")))?;
+    Ok(bytes)
+}
+
+fn write_atomic_archive(path: &Path, bytes: &[u8]) -> Result<(), DeepAttributionError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().expect("G5b archive path has parent");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| DeepAttributionError::Io(error.to_string()))?
+        .as_nanos();
+    for _ in 0..16 {
+        let candidate = parent.join(format!(
+            ".{}.tmp.{}.{}.{}",
+            path.file_name()
+                .expect("archive has filename")
+                .to_string_lossy(),
+            std::process::id(),
+            nonce,
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(DeepAttributionError::Io(format!(
+                    "创建 {candidate:?}: {error}"
+                )))
+            }
+        };
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&candidate, path))
+            .and_then(|()| sync_parent(path));
+        if let Err(error) = result {
+            let _ = fs::remove_file(&candidate);
+            return Err(DeepAttributionError::Io(format!(
+                "原子归档 {path:?}: {error}"
+            )));
+        }
+        return Ok(());
+    }
+    Err(DeepAttributionError::Io(format!(
+        "G5b 归档临时文件名冲突: {path:?}"
+    )))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -647,36 +887,6 @@ pub fn top_events_for_deep(records: Vec<AlertRecord>, max: usize) -> Vec<AlertRe
     events
 }
 
-/// 落库: data/g5b/{date}.jsonl (行追加, 失败显式返回)。
-pub fn append_deep_attribution_row(row: &DeepAttributionRow) -> Result<(), DeepAttributionError> {
-    if !row.record.is_production_eligible() {
-        return Err(DeepAttributionError::IneligibleRecord(format!(
-            "code={} origin={:?}",
-            row.record.code, row.record.origin
-        )));
-    }
-    if runtime_is_test_process() || current_env() == TradingEnv::Test {
-        return Err(DeepAttributionError::Io(
-            "test runtime cannot write the production G5b archive".to_string(),
-        ));
-    }
-    let dir = PathBuf::from("data/g5b");
-    fs::create_dir_all(&dir).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
-    let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y-%m-%d")));
-    let mut line =
-        serde_json::to_string(row).map_err(|e| DeepAttributionError::Io(e.to_string()))?;
-    line.push('\n');
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(line.as_bytes())
-        })
-        .map_err(|e| DeepAttributionError::Io(format!("写入 {path:?}: {e}")))
-}
-
 /// 渲染单条深链归因 markdown 段 (15:05 报告追加 + 推送文本复用)。
 pub fn render_deep_attribution(row: &DeepAttributionRow) -> String {
     let r = &row.record;
@@ -781,6 +991,29 @@ mod tests {
             upstream_response_id: Some("resp-1".into()),
             elapsed_ms: 123,
         }
+    }
+
+    fn prepared_archive_journal(
+        root: &Path,
+    ) -> (
+        DeepAttributionJournal,
+        NaiveDate,
+        DeepAttributionFrozenResult,
+    ) {
+        let journal = DeepAttributionJournal {
+            dir: root.join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let summary = render_deep_attribution_summary(&row);
+        let frozen = journal.freeze_result(date, 0, &row, &summary).unwrap();
+        (journal, date, frozen)
     }
 
     #[test]
@@ -981,6 +1214,167 @@ mod tests {
     }
 
     #[test]
+    fn frozen_summary_tampering_with_matching_hash_blocks_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let summary = render_deep_attribution_summary(&row);
+        let mut frozen = journal.freeze_result(date, 0, &row, &summary).unwrap();
+        frozen.summary.push_str("\n伪造后缀");
+        frozen.summary_sha256 = sha256_hex(frozen.summary.as_bytes());
+        fs::write(
+            journal.result_path(date, 0),
+            serde_json::to_vec(&frozen).unwrap(),
+        )
+        .unwrap();
+
+        assert!(journal.begin_assessment(date, 0).is_err());
+    }
+
+    #[test]
+    fn non_regular_attempt_marker_blocks_analysis() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        fs::create_dir(journal.attempt_path(date, 0)).unwrap();
+        assert!(journal.begin_assessment(date, 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_frozen_result_blocks_restart() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let summary = render_deep_attribution_summary(&row);
+        journal.freeze_result(date, 0, &row, &summary).unwrap();
+        let result = journal.result_path(date, 0);
+        let target = root.path().join("frozen-result.json");
+        fs::rename(&result, &target).unwrap();
+        symlink(&target, &result).unwrap();
+        assert!(journal.begin_assessment(date, 0).is_err());
+    }
+
+    #[test]
+    fn frozen_event_archive_is_idempotent_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("isolated-g5b-attempts");
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let journal = DeepAttributionJournal {
+            dir: dir.clone(),
+            production: false,
+        };
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let summary = render_deep_attribution_summary(&row);
+        let frozen = journal.freeze_result(date, 0, &row, &summary).unwrap();
+
+        assert_eq!(
+            journal.archive_frozen_result(date, 0).unwrap(),
+            DeepAttributionArchiveOutcome::Appended
+        );
+        let archive = root.path().join(format!("{date}.jsonl"));
+        let expected = format!("{}\n", frozen.row_json);
+        assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
+
+        let restarted = DeepAttributionJournal {
+            dir,
+            production: false,
+        };
+        assert_eq!(
+            restarted.archive_frozen_result(date, 0).unwrap(),
+            DeepAttributionArchiveOutcome::AlreadyPresent
+        );
+        assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
+    }
+
+    #[test]
+    fn archive_rejects_partial_or_malformed_historical_rows_without_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, date, _) = prepared_archive_journal(root.path());
+        let archive = journal.archive_path(date);
+        let no_newline = serde_json::to_string(&sample_row()).unwrap();
+        for broken in [
+            b"{\"record\":".as_slice(),
+            no_newline.as_bytes(),
+            b"not-json\n".as_slice(),
+        ] {
+            fs::write(&archive, broken).unwrap();
+            assert!(journal.archive_frozen_result(date, 0).is_err());
+            assert_eq!(fs::read(&archive).unwrap(), broken);
+        }
+    }
+
+    #[test]
+    fn archive_rejects_conflicting_or_duplicate_counted_occurrence() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, date, frozen) = prepared_archive_journal(root.path());
+        let archive = journal.archive_path(date);
+        let mut conflicting = sample_row();
+        conflicting.result.main_reason = "另一份模型输出".into();
+        let historical = format!("{}\n", serde_json::to_string(&conflicting).unwrap());
+        fs::write(&archive, &historical).unwrap();
+        assert!(journal.archive_frozen_result(date, 0).is_err());
+        assert_eq!(fs::read_to_string(&archive).unwrap(), historical);
+
+        let duplicate = format!("{0}\n{0}\n", frozen.row_json);
+        fs::write(&archive, &duplicate).unwrap();
+        assert!(journal.archive_frozen_result(date, 0).is_err());
+        assert_eq!(fs::read_to_string(&archive).unwrap(), duplicate);
+    }
+
+    #[test]
+    fn archive_preserves_unrelated_historical_bytes_after_orphan_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, date, frozen) = prepared_archive_journal(root.path());
+        let archive = journal.archive_path(date);
+        let mut other = sample_row();
+        other.record.code = "600001".into();
+        let historical = format!("{}\r\n", serde_json::to_string(&other).unwrap());
+        fs::write(&archive, &historical).unwrap();
+        let orphan = root.path().join(format!(".{date}.jsonl.tmp.crashed"));
+        fs::write(&orphan, b"{broken").unwrap();
+
+        assert_eq!(
+            journal.archive_frozen_result(date, 0).unwrap(),
+            DeepAttributionArchiveOutcome::Appended
+        );
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            format!("{historical}{}\n", frozen.row_json).as_bytes()
+        );
+        assert_eq!(fs::read(&orphan).unwrap(), b"{broken");
+    }
+
+    #[test]
     fn partial_frozen_result_blocks_reanalysis() {
         let root = tempfile::tempdir().unwrap();
         let journal = DeepAttributionJournal {
@@ -1061,34 +1455,24 @@ mod tests {
     }
 
     #[test]
-    fn append_rejects_ineligible_record_before_production_io() {
-        let mut record = sample_record();
-        record.code = "TEST_CODE_000001".into();
-        let mut row = DeepAttributionRow {
-            record,
-            result: DeepAttributionResult {
-                main_reason: "fixture".into(),
-                catalyst_chain: vec![],
-                capital_logic: "fixture".into(),
-                confidence: "low".into(),
-                risk_note: "fixture".into(),
-            },
-            analyzed_at: "2026-09-05T15:05:00Z".into(),
-            provider: "fixture".into(),
-            model: "fixture".into(),
-            upstream_request_id: None,
-            upstream_response_id: None,
-            elapsed_ms: 0,
+    fn frozen_result_rejects_ineligible_record_before_archive_io() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
         };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
-            append_deep_attribution_row(&row),
-            Err(DeepAttributionError::IneligibleRecord(_))
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
         ));
-        row.record = sample_record();
-        assert!(matches!(
-            append_deep_attribution_row(&row),
-            Err(DeepAttributionError::Io(_))
-        ));
+        let mut row = sample_row();
+        row.record.code = "TEST_CODE_000001".into();
+        let summary = render_deep_attribution_summary(&row);
+        assert!(journal.freeze_result(date, 0, &row, &summary).is_err());
+        assert!(!journal.result_path(date, 0).exists());
+        assert!(!journal.archive_path(date).exists());
     }
 
     #[test]
