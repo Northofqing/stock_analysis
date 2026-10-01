@@ -8771,6 +8771,54 @@ fn announcement_alert_action(
     }
 }
 
+async fn initialize_news_monitor<T, F>(initialize: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(initialize)
+        .await
+        .expect("NewsMonitor initialization worker panicked")
+}
+
+#[cfg(test)]
+mod news_monitor_startup_tests {
+    use super::initialize_news_monitor;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_news_initialization_does_not_delay_data_mode_tick() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
+
+        let main_loops = tokio::spawn(async move {
+            tokio::join!(
+                initialize_news_monitor(move || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release blocked initializer");
+                }),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let _ = tick_tx.send(());
+                }
+            );
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .expect("news initializer must start")
+            .expect("news initializer start signal");
+        let tick = tokio::time::timeout(std::time::Duration::from_secs(1), tick_rx).await;
+        release_tx.send(()).expect("release news initializer");
+        tick.expect("data mode tick must run while news initialization waits")
+            .expect("data mode tick signal");
+        tokio::time::timeout(std::time::Duration::from_secs(1), main_loops)
+            .await
+            .expect("main loops must finish")
+            .expect("main loops task must succeed");
+    }
+}
+
 async fn news_monitor_loop(selection_v2_enabled: bool) {
     use stock_analysis::monitor::detector::AlertEvent;
 
@@ -8812,7 +8860,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         ),
     }
 
-    let mut nm = NewsMonitor::new();
+    // Constructor metadata loading synchronously joins a provider thread.
+    // Keep that wait off the joined main loops so health timers can advance.
+    let mut nm = initialize_news_monitor(NewsMonitor::new).await;
 
     nm.restore_dedup();
 
