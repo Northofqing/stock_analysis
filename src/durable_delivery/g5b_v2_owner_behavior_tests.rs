@@ -776,7 +776,24 @@ fn g5b_v2_owner_malformed_legacy_without_cohort_stays_unknown_and_preserves_othe
     let unknown = vec![0xff, 0x80, b'\n'];
     let sha = sha256_hex(&unknown);
     let connection = Connection::open(&fixture.database_path).unwrap();
+    // The ordinary immutable envelope guard must reject this write. Inject
+    // historical corruption only in this isolated Test database, then restore
+    // the exact original trigger before exercising any runtime operation.
+    assert!(connection.execute("UPDATE delivery_decisions SET envelope_canonical=?1,envelope_sha256=?2 WHERE decision_identity=?3",params![unknown,sha,legacy.decision_identity]).is_err());
+    let trigger: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='immutable_decision_envelope_update'",
+        [], |row| row.get(0),
+    ).unwrap();
+    connection
+        .execute_batch("BEGIN IMMEDIATE; DROP TRIGGER immutable_decision_envelope_update;")
+        .unwrap();
     assert_eq!(connection.execute("UPDATE delivery_decisions SET envelope_canonical=?1,envelope_sha256=?2 WHERE decision_identity=?3",params![unknown,sha,legacy.decision_identity]).unwrap(),1);
+    connection.execute_batch(&trigger).unwrap();
+    connection.execute_batch("COMMIT;").unwrap();
+    assert_eq!(connection.query_row::<String, _, _>(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='immutable_decision_envelope_update'",
+        [], |row| row.get(0),
+    ).unwrap(), trigger);
     drop(connection);
     let other = envelope(
         "C2_OTHER_KIND_AFTER_UNKNOWN",
