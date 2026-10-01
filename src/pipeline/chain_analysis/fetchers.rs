@@ -13,7 +13,7 @@ use log::info;
 use log::warn;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::agent::tool::Tool;
 use crate::agent::tools_sector::FetchSectorTool;
@@ -21,6 +21,7 @@ use crate::data_gateway::{
     BatchEvidence, BoardDataGateway, BoardKind, DragonTigerGateway, DragonTigerStockReview,
     GatewayBatch,
 };
+use crate::database::concepts::{LocalConceptCacheRead, LocalConceptCacheRow};
 use crate::database::DatabaseManager;
 use crate::market_data::TopStock;
 use crate::market_domain::EvidenceTimestamp;
@@ -234,6 +235,156 @@ fn parse_tool_board_values(value: &serde_json::Value, code: &str) -> Result<Vec<
         }
     }
     Ok(boards)
+}
+
+/// A provider result recorded only after the corresponding legacy cache write
+/// succeeds. The vector of these records preserves actual write order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ObservedConceptCacheWrite {
+    observation: ToolBoardsObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConceptFetchTerminal {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ConceptProjectionCompletion {
+    Complete { content_sha256: String },
+    Incomplete { reason: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ConceptCodeEvidence {
+    LocalCache(LocalConceptCacheRow),
+    ToolResponse(ToolBoardsObservation),
+}
+
+/// Requested-code content and per-code origin from one cache read plus the
+/// provider writes that actually succeeded. Complete here describes only the
+/// local projection, not upstream provider admission or M1 source availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ObservedConceptProjection {
+    pub(super) cache_read: LocalConceptCacheRead,
+    pub(super) requested_codes: Vec<String>,
+    pub(super) concepts: BTreeMap<String, Vec<String>>,
+    pub(super) sources: BTreeMap<String, ConceptCodeEvidence>,
+    pub(super) successful_writes: Vec<ObservedConceptCacheWrite>,
+    pub(super) completion: ConceptProjectionCompletion,
+}
+
+/// Pure composition seam for the existing single-read, multi-provider flow.
+/// `successful_writes` must be recorded in the legacy write loop immediately
+/// after each successful `save_stock_concepts`; a failed terminal always stays
+/// incomplete even when an earlier duplicate write covered every code.
+pub(super) fn compose_observed_concepts(
+    requested_codes: &[String],
+    cache_read: LocalConceptCacheRead,
+    successful_writes: Vec<ObservedConceptCacheWrite>,
+    terminal: ConceptFetchTerminal,
+) -> Result<ObservedConceptProjection, String> {
+    if requested_codes.is_empty() || requested_codes.iter().any(|code| code.trim().is_empty()) {
+        return Err("产业链概念批次代码为空".to_string());
+    }
+    let requested = requested_codes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut concepts = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for row in cache_read.rows() {
+        if requested.contains(row.code()) {
+            concepts.insert(row.code().to_owned(), row.concepts().to_vec());
+            sources.insert(
+                row.code().to_owned(),
+                ConceptCodeEvidence::LocalCache(row.clone()),
+            );
+        }
+    }
+    let mut expected_provider_writes = BTreeMap::<String, usize>::new();
+    for code in requested_codes {
+        if !sources.contains_key(code) {
+            *expected_provider_writes.entry(code.clone()).or_default() += 1;
+        }
+    }
+    let mut observed_provider_writes = BTreeMap::<String, usize>::new();
+    let mut unexpected_write = false;
+    for write in &successful_writes {
+        let code = write.observation.requested_code.as_str();
+        *observed_provider_writes.entry(code.to_owned()).or_default() += 1;
+        if !requested.contains(code)
+            || matches!(sources.get(code), Some(ConceptCodeEvidence::LocalCache(_)))
+        {
+            unexpected_write = true;
+        }
+        if requested.contains(code) {
+            concepts.insert(code.to_owned(), write.observation.boards.clone());
+            sources.insert(
+                code.to_owned(),
+                ConceptCodeEvidence::ToolResponse(write.observation.clone()),
+            );
+        }
+    }
+    let completion = if terminal == ConceptFetchTerminal::Failed {
+        ConceptProjectionCompletion::Incomplete {
+            reason: if successful_writes.is_empty() {
+                "fetch_failed_before_any_write"
+            } else {
+                "fetch_failed_after_partial_writes"
+            },
+        }
+    } else if unexpected_write {
+        ConceptProjectionCompletion::Incomplete {
+            reason: "provider_write_did_not_match_cache_miss",
+        }
+    } else if requested.iter().any(|code| !concepts.contains_key(*code)) {
+        ConceptProjectionCompletion::Incomplete {
+            reason: "requested_code_uncovered",
+        }
+    } else if expected_provider_writes != observed_provider_writes {
+        ConceptProjectionCompletion::Incomplete {
+            reason: "provider_write_cardinality_mismatch",
+        }
+    } else {
+        ConceptProjectionCompletion::Complete {
+            content_sha256: requested_concept_projection_sha256(requested_codes, &concepts),
+        }
+    };
+    Ok(ObservedConceptProjection {
+        cache_read,
+        requested_codes: requested_codes.to_vec(),
+        concepts,
+        sources,
+        successful_writes,
+        completion,
+    })
+}
+
+fn requested_concept_projection_sha256(
+    requested_codes: &[String],
+    concepts: &BTreeMap<String, Vec<String>>,
+) -> String {
+    fn text_field(hash: &mut Sha256, value: &str) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"stock_analysis.chain.requested_concept_projection.v1\0");
+    hash.update((requested_codes.len() as u64).to_be_bytes());
+    for code in requested_codes {
+        text_field(&mut hash, code);
+    }
+    hash.update((concepts.len() as u64).to_be_bytes());
+    for (code, boards) in concepts {
+        text_field(&mut hash, code);
+        hash.update((boards.len() as u64).to_be_bytes());
+        for board in boards {
+            text_field(&mut hash, board);
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 pub(super) struct BoardCodeMapBatch {
@@ -569,9 +720,11 @@ where
 mod tests {
     use super::{
         append_after_market_items, append_cluster_news_items, append_generated_cluster_queries,
-        build_cluster_query_context, fetch_concepts_cached, fetch_laggard_candidates,
-        map_lhb_reviews, parse_tool_boards, parse_tool_boards_observed,
+        build_cluster_query_context, compose_observed_concepts, fetch_concepts_cached,
+        fetch_laggard_candidates, map_lhb_reviews, parse_tool_boards, parse_tool_boards_observed,
         render_after_market_section, resolve_after_market_catalysts, resolve_cluster_news,
+        ConceptCodeEvidence, ConceptFetchTerminal, ConceptProjectionCompletion,
+        ObservedConceptCacheWrite,
     };
     use crate::data_gateway::{
         BatchEvidence, BoardKind, BoardMembershipRecord, DragonTigerStockReview, GatewayBatch,
@@ -904,6 +1057,187 @@ mod tests {
             parse_tool_boards(r#"{"all_boards":["TEST_CODE_算力"]}"#, "TEST_CODE_000001").unwrap(),
             ["TEST_CODE_算力"]
         );
+    }
+
+    #[test]
+    fn observed_concept_projection_binds_content_and_each_code_origin() {
+        let isolated = tempfile::tempdir().expect("isolated concept projection database");
+        let db = crate::database::DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_concept_projection.db"),
+        )
+        .expect("open isolated concept projection database");
+        db.save_stock_concepts("TEST_CODE_CACHE_A", &["TEST_CODE_缓存概念".into()])
+            .unwrap();
+        db.save_stock_concepts("TEST_CODE_UNRELATED", &["TEST_CODE_无关".into()])
+            .unwrap();
+        let cache_read = db.get_cached_concepts_observed(7).unwrap();
+        let provider =
+            parse_tool_boards_observed(&rendered_membership_raw(), "TEST_CODE_000001").unwrap();
+        let writes = vec![ObservedConceptCacheWrite {
+            observation: provider,
+        }];
+        let requested = vec!["TEST_CODE_CACHE_A".into(), "TEST_CODE_000001".into()];
+        let first = compose_observed_concepts(
+            &requested,
+            cache_read.clone(),
+            writes.clone(),
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        let second = compose_observed_concepts(
+            &requested,
+            cache_read.clone(),
+            writes.clone(),
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.requested_codes, requested);
+        assert_eq!(first.cache_read, cache_read);
+        assert!(!first.concepts.contains_key("TEST_CODE_UNRELATED"));
+        assert!(matches!(
+            first.sources.get("TEST_CODE_CACHE_A"),
+            Some(ConceptCodeEvidence::LocalCache(row))
+                if row.code() == "TEST_CODE_CACHE_A" && !row.updated_at().is_empty()
+        ));
+        assert!(matches!(
+            first.sources.get("TEST_CODE_000001"),
+            Some(ConceptCodeEvidence::ToolResponse(observed))
+                if observed.evidence.provider_label == "Tdx"
+                    && observed.raw_response_sha256.len() == 64
+        ));
+        let ConceptProjectionCompletion::Complete { content_sha256 } = &first.completion else {
+            panic!("fully covered requested projection must be complete");
+        };
+        assert_eq!(content_sha256.len(), 64);
+        let same_boards_new_raw = parse_tool_boards_observed(
+            &format!("{} ", rendered_membership_raw()),
+            "TEST_CODE_000001",
+        )
+        .unwrap();
+        let same_content = compose_observed_concepts(
+            &requested,
+            cache_read.clone(),
+            vec![ObservedConceptCacheWrite {
+                observation: same_boards_new_raw,
+            }],
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_eq!(first.completion, same_content.completion);
+        assert_ne!(first.sources, same_content.sources);
+        let reordered = compose_observed_concepts(
+            &[requested[1].clone(), requested[0].clone()],
+            cache_read,
+            writes,
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_ne!(first.completion, reordered.completion);
+    }
+
+    #[test]
+    fn observed_concept_projection_retains_partial_writes_without_complete_digest() {
+        let isolated = tempfile::tempdir().expect("isolated partial concept database");
+        let db = crate::database::DatabaseManager::open_isolated_for_test(
+            isolated.path().join("TEST_CODE_partial_concept.db"),
+        )
+        .expect("open isolated partial concept database");
+        let cache_read = db.get_cached_concepts_observed(7).unwrap();
+        let first =
+            parse_tool_boards_observed(&rendered_membership_raw(), "TEST_CODE_000001").unwrap();
+        let writes = vec![ObservedConceptCacheWrite {
+            observation: first.clone(),
+        }];
+        let failed_before_write = compose_observed_concepts(
+            &["TEST_CODE_000001".into()],
+            cache_read.clone(),
+            Vec::new(),
+            ConceptFetchTerminal::Failed,
+        )
+        .unwrap();
+        assert_eq!(
+            failed_before_write.completion,
+            ConceptProjectionCompletion::Incomplete {
+                reason: "fetch_failed_before_any_write"
+            }
+        );
+        let failed = compose_observed_concepts(
+            &["TEST_CODE_000001".into()],
+            cache_read.clone(),
+            writes.clone(),
+            ConceptFetchTerminal::Failed,
+        )
+        .unwrap();
+        assert_eq!(failed.successful_writes, writes);
+        assert_eq!(failed.concepts["TEST_CODE_000001"], first.boards);
+        assert_eq!(
+            failed.completion,
+            ConceptProjectionCompletion::Incomplete {
+                reason: "fetch_failed_after_partial_writes"
+            }
+        );
+
+        let uncovered = compose_observed_concepts(
+            &["TEST_CODE_000001".into(), "TEST_CODE_MISSING".into()],
+            cache_read.clone(),
+            writes.clone(),
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_eq!(
+            uncovered.completion,
+            ConceptProjectionCompletion::Incomplete {
+                reason: "requested_code_uncovered"
+            }
+        );
+
+        let duplicate_request = vec!["TEST_CODE_000001".into(), "TEST_CODE_000001".into()];
+        let missing_duplicate_write = compose_observed_concepts(
+            &duplicate_request,
+            cache_read.clone(),
+            writes.clone(),
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_duplicate_write.completion,
+            ConceptProjectionCompletion::Incomplete {
+                reason: "provider_write_cardinality_mismatch"
+            }
+        );
+
+        let mut changed: serde_json::Value =
+            serde_json::from_str(&rendered_membership_raw()).unwrap();
+        changed["all_boards"][0] = serde_json::json!("TEST_CODE_新概念");
+        let second = parse_tool_boards_observed(&changed.to_string(), "TEST_CODE_000001").unwrap();
+        let duplicate_writes = vec![
+            ObservedConceptCacheWrite { observation: first },
+            ObservedConceptCacheWrite {
+                observation: second.clone(),
+            },
+        ];
+        let unchanged = compose_observed_concepts(
+            &duplicate_request,
+            cache_read.clone(),
+            vec![writes[0].clone(), writes[0].clone()],
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        let duplicated = compose_observed_concepts(
+            &duplicate_request,
+            cache_read,
+            duplicate_writes.clone(),
+            ConceptFetchTerminal::Completed,
+        )
+        .unwrap();
+        assert_eq!(duplicated.successful_writes, duplicate_writes);
+        assert_eq!(duplicated.concepts["TEST_CODE_000001"], second.boards);
+        assert!(matches!(
+            duplicated.completion,
+            ConceptProjectionCompletion::Complete { .. }
+        ));
+        assert_ne!(unchanged.completion, duplicated.completion);
     }
 
     #[test]
