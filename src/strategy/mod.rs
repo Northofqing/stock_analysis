@@ -31,6 +31,7 @@ pub mod lot;
 pub mod multi_factor;
 pub mod multi_timeframe;
 pub mod research_fill_v2;
+pub mod research_portfolio_v2;
 pub mod rsi;
 // v16.4 Commit 2: 8 Strategy trait impl (替代 v16.3 8 enum 硬编码)
 pub mod v16_4;
