@@ -180,6 +180,7 @@ pub(crate) struct LockedAlertInputPrefix<'fence> {
     head: AlertInputHeadV1,
     head_canonical: Vec<u8>,
     raw_bytes: Vec<u8>,
+    max_bytes: Option<usize>,
 }
 
 /// An exact cutoff derived from a previously captured head and actual source
@@ -210,7 +211,12 @@ impl VerifiedAlertInputCutoff {
 
 impl LockedAlertInputPrefix<'_> {
     fn ensure_unchanged(&self) -> Result<(), AlertInputHeadUnknown> {
-        let (_, head, bytes) = inspect_locked(self.fence, self.head.business_date, self.origin)?;
+        let (_, head, bytes) = inspect_locked_with_limit(
+            self.fence,
+            self.head.business_date,
+            self.origin,
+            self.max_bytes,
+        )?;
         if head.bytes != self.head_canonical || bytes != self.raw_bytes {
             return Err(AlertInputHeadUnknown::ChangedDuringRead);
         }
@@ -476,6 +482,14 @@ fn read_regular(
     path: &Path,
     missing: AlertInputHeadUnknown,
 ) -> Result<(Vec<u8>, Metadata), AlertInputHeadUnknown> {
+    read_regular_with_limit(path, missing, None)
+}
+
+fn read_regular_with_limit(
+    path: &Path,
+    missing: AlertInputHeadUnknown,
+    max_bytes: Option<usize>,
+) -> Result<(Vec<u8>, Metadata), AlertInputHeadUnknown> {
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(missing),
@@ -483,6 +497,13 @@ fn read_regular(
     };
     if !before.file_type().is_file() {
         return Err(AlertInputHeadUnknown::NonRegular);
+    }
+    if max_bytes.is_some_and(|limit| before.len() > limit as u64) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input exceeds bounded reader limit",
+        )
+        .into());
     }
     let mut file = nofollow(OpenOptions::new().read(true))
         .open(path)
@@ -492,7 +513,21 @@ fn read_regular(
         return Err(AlertInputHeadUnknown::ChangedDuringRead);
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    match max_bytes {
+        Some(limit) => {
+            (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "input exceeds bounded reader limit",
+                )
+                .into());
+            }
+        }
+        None => {
+            file.read_to_end(&mut bytes)?;
+        }
+    }
     let after_path =
         fs::symlink_metadata(path).map_err(|_| AlertInputHeadUnknown::ChangedDuringRead)?;
     if !same_file_state(&before, &file.metadata()?)
@@ -544,9 +579,31 @@ fn inspect_locked(
     date: NaiveDate,
     origin: AlertRecordOrigin,
 ) -> Result<(VerifiedAlertInputPrefix, ReadHead, Vec<u8>), AlertInputHeadUnknown> {
+    inspect_locked_with_limit(guard, date, origin, None)
+}
+
+fn inspect_locked_with_limit(
+    guard: &DateFence,
+    date: NaiveDate,
+    origin: AlertRecordOrigin,
+    max_bytes: Option<usize>,
+) -> Result<(VerifiedAlertInputPrefix, ReadHead, Vec<u8>), AlertInputHeadUnknown> {
     guard.ensure_current()?;
     let head_file = head_path(&guard.dir, date);
-    let head = read_head(&head_file, date)?;
+    let head = if let Some(limit) = max_bytes {
+        let (bytes, metadata) = read_regular_with_limit(
+            &head_file,
+            AlertInputHeadUnknown::MissingHead,
+            Some(limit.min(64 * 1024)),
+        )?;
+        ReadHead {
+            value: validate_saved_input_head(date, &bytes)?,
+            bytes,
+            metadata,
+        }
+    } else {
+        read_head(&head_file, date)?
+    };
     let source_path = dated_file_for(&guard.dir, "jsonl", date);
     let (bytes, source_metadata) = if head.value.generation == 0 {
         match fs::symlink_metadata(&source_path) {
@@ -555,7 +612,11 @@ fn inspect_locked(
             Err(error) => return Err(error.into()),
         }
     } else {
-        let (bytes, metadata) = read_regular(&source_path, AlertInputHeadUnknown::MissingSource)?;
+        let (bytes, metadata) = read_regular_with_limit(
+            &source_path,
+            AlertInputHeadUnknown::MissingSource,
+            max_bytes,
+        )?;
         if head.value.source_identity.as_ref() != Some(&file_identity(&metadata)?) {
             return Err(AlertInputHeadUnknown::SourceIdentityMismatch);
         }
@@ -762,6 +823,31 @@ impl AlertLog {
         date: NaiveDate,
         fence: &'fence DateFence,
     ) -> Result<LockedAlertInputPrefix<'fence>, AlertInputHeadUnknown> {
+        self.inspect_date_input_prefix_locked_inner(date, fence, None)
+    }
+
+    /// Completion readers bound the entire current prefix, including suffixes.
+    pub(crate) fn inspect_date_input_prefix_locked_bounded<'fence>(
+        &self,
+        date: NaiveDate,
+        fence: &'fence DateFence,
+        max_bytes: usize,
+    ) -> Result<LockedAlertInputPrefix<'fence>, AlertInputHeadUnknown> {
+        if max_bytes == 0 || max_bytes > 32 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid completion prefix bound",
+            )
+            .into());
+        }
+        self.inspect_date_input_prefix_locked_inner(date, fence, Some(max_bytes))
+    }
+
+    fn validate_borrowed_fence(
+        &self,
+        date: NaiveDate,
+        fence: &DateFence,
+    ) -> Result<(), AlertInputHeadUnknown> {
         self.ensure_io_allowed().map_err(|error| {
             if error.kind() == io::ErrorKind::PermissionDenied {
                 AlertInputHeadUnknown::AccessDenied
@@ -777,13 +863,25 @@ impl AlertLog {
         {
             return Err(AlertInputHeadUnknown::SourceIdentityMismatch);
         }
-        let (snapshot, head, raw_bytes) = inspect_locked(fence, date, self.origin)?;
+        Ok(())
+    }
+
+    fn inspect_date_input_prefix_locked_inner<'fence>(
+        &self,
+        date: NaiveDate,
+        fence: &'fence DateFence,
+        max_bytes: Option<usize>,
+    ) -> Result<LockedAlertInputPrefix<'fence>, AlertInputHeadUnknown> {
+        self.validate_borrowed_fence(date, fence)?;
+        let (snapshot, head, raw_bytes) =
+            inspect_locked_with_limit(fence, date, self.origin, max_bytes)?;
         Ok(LockedAlertInputPrefix {
             fence,
             origin: self.origin,
             head: snapshot.head,
             head_canonical: head.bytes,
             raw_bytes,
+            max_bytes,
         })
     }
 
@@ -792,13 +890,24 @@ impl AlertLog {
     pub fn initialize_date_input_head(&self, date: NaiveDate) -> io::Result<AlertInputHeadV1> {
         self.ensure_io_allowed()?;
         let guard = DateFence::acquire(&self.dir, date, true).map_err(io_unknown)?;
-        match inspect_locked(&guard, date, self.origin) {
+        self.initialize_date_input_head_locked(date, &guard)
+    }
+
+    /// Same namespace/date validation as the reader, without a nested flock.
+    pub(crate) fn initialize_date_input_head_locked(
+        &self,
+        date: NaiveDate,
+        guard: &DateFence,
+    ) -> io::Result<AlertInputHeadV1> {
+        self.validate_borrowed_fence(date, guard)
+            .map_err(io_unknown)?;
+        match inspect_locked(guard, date, self.origin) {
             Ok((snapshot, _, _)) => Ok(snapshot.head),
             Err(AlertInputHeadUnknown::MissingHead) => {
                 reject_prehead_source(&guard.dir, date)?;
                 let head = AlertInputHeadV1::empty(date);
-                publish_head(&guard, date, &head, None)?;
-                inspect_locked(&guard, date, self.origin).map_err(io_unknown)?;
+                publish_head(guard, date, &head, None)?;
+                inspect_locked(guard, date, self.origin).map_err(io_unknown)?;
                 Ok(head)
             }
             Err(error) => Err(io_unknown(error)),

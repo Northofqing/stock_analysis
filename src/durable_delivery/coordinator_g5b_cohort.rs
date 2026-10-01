@@ -13,8 +13,11 @@ use std::sync::Arc;
 
 #[path = "coordinator_g5b_artifact.rs"]
 mod artifact;
+#[path = "coordinator_g5b_empty.rs"]
+mod empty;
 #[path = "coordinator_g5b_model_bundle.rs"]
 mod model_bundle;
+pub(crate) use empty::VerifiedG5bEmptySeal;
 pub(crate) use model_bundle::VerifiedG5bModelBundle;
 
 const ADMISSION_MATERIAL: &str = "g5b-configured-analysis-owner-v1";
@@ -426,7 +429,7 @@ impl G5bDaySession<'_> {
         let prefix = self
             .coordinator
             .g5b_input_log
-            .inspect_date_input_prefix_locked(self.date, &self.fence)
+            .inspect_date_input_prefix_locked_bounded(self.date, &self.fence, MAX_ARTIFACT_BYTES)
             .map_err(codec_error)?;
         let cutoff = prefix.current_cutoff().map_err(codec_error)?;
         if cutoff.head().generation() != 0
@@ -463,6 +466,20 @@ impl G5bDaySession<'_> {
         };
         let canonical = canonical_json(&witness)?;
         decode_prospective(&canonical)?;
+        let expected_sql = std::cell::RefCell::new(None::<Vec<u8>>);
+        let read_sql = |tx: &Transaction<'_>| -> Result<Vec<u8>> {
+            let row:(i64,String,Option<String>,Option<String>,Option<Vec<u8>>,Option<String>)=tx.query_row(
+                "SELECT revision,artifact_state,cohort_identity,current_seal_identity,prospective_canonical,prospective_sha256 FROM g5b_day_heads WHERE business_date=?1",[self.date.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
+            canonical_json(&row)
+        };
+        let validate_sql = |tx: &Transaction<'_>| {
+            if expected_sql.borrow().as_deref() != Some(read_sql(tx)?.as_slice()) {
+                return Err(mismatch(
+                    "prospective exact SQL head changed at transaction boundary",
+                ));
+            }
+            Ok(())
+        };
         let validate = || {
             self.validate()?;
             if artifact::inspect_bytes(self, &filename, &bytes)? != head_witness
@@ -470,9 +487,30 @@ impl G5bDaySession<'_> {
             {
                 return Err(mismatch("prospective head or guard changed"));
             }
+            let prefix = self
+                .coordinator
+                .g5b_input_log
+                .inspect_date_input_prefix_locked_bounded(
+                    self.date,
+                    &self.fence,
+                    MAX_ARTIFACT_BYTES,
+                )
+                .map_err(codec_error)?;
+            let current = prefix.current_cutoff().map_err(codec_error)?;
+            if current.head_canonical() != bytes
+                || current.source_identity().is_some()
+                || current.head().generation() != 0
+            {
+                return Err(mismatch("prospective head or guard changed"));
+            }
+            if !test_clock && !prospective_time(self.date, Utc::now()) {
+                return Err(mismatch(
+                    "prospective observation window expired at transaction boundary",
+                ));
+            }
             Ok(())
         };
-        self.coordinator.with_immediate_transaction_validated(SchemaVersionPolicy::Runtime,Some(&validate),|tx| {
+        self.coordinator.with_immediate_transaction_validated_sql(SchemaVersionPolicy::Runtime,Some(&validate),Some(&validate_sql),|tx| {
             if !test_clock && !prospective_time(self.date,Utc::now()) {return Err(mismatch("prospective window expired before SQL"));}
             let existing:Option<(i64,Option<String>,Option<Vec<u8>>)>=tx.query_row("SELECT revision,cohort_identity,prospective_canonical FROM g5b_day_heads WHERE business_date=?1",[self.date.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             match existing {
@@ -494,7 +532,9 @@ impl G5bDaySession<'_> {
                     tx.execute("INSERT INTO g5b_day_heads(business_date,revision,artifact_state,prospective_canonical,prospective_sha256) VALUES(?1,0,'Clean',?2,?3)",params![self.date.to_string(),canonical,sha256_hex(&canonical)])?;
                     Ok(())
                 }
-            }
+            }?;
+            *expected_sql.borrow_mut()=Some(read_sql(tx)?);
+            Ok(())
         })
     }
     fn environment(&self) -> String {
@@ -708,12 +748,29 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
             admission,
             admission_sha,
         ) = row;
-        // No production Empty factory exists in B. Arbitrary empty SQL/JSON
-        // therefore cannot gain a cohort receipt through this runtime.
+        // Empty has a separate closed-zero codec and actual guarded owner.
+        // Neither codec alone grants a completion or model capability.
         if kind != "NonEmpty" {
-            return Err(mismatch(
-                "empty cohort requires the later closed-window owner",
-            ));
+            if kind == "Empty" {
+                empty::validate_cohort_row(
+                    connection,
+                    &identity,
+                    &date,
+                    &bytes,
+                    &sha,
+                    &preimage,
+                    count,
+                    generation,
+                    offset,
+                    &prefix,
+                    device.as_deref(),
+                    inode.as_deref(),
+                    &admission,
+                    &admission_sha,
+                )?;
+                continue;
+            }
+            return Err(mismatch("unknown cohort selection kind"));
         }
         let evidence = G5bSelectionEvidence::decode(&bytes).map_err(codec_error)?;
         let encoded = evidence.encoded();
@@ -1066,14 +1123,21 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
         if (state == "Clean" && pending != 0) || revision < 0 {
             return Err(mismatch("clean head has uncommitted artifact"));
         }
-        if let Some(cohort) = published {
+        if let Some(cohort) = &published {
             let committed:i64=connection.query_row("SELECT COUNT(*) FROM g5b_artifact_events WHERE business_date=?1 AND cohort_identity=?2 AND artifact_role='Selection' AND phase='Committed'",params![date,cohort],|r|r.get(0))?;
             if committed != 1 {
                 return Err(mismatch("published cohort lacks exact committed selection"));
             }
         }
-        if seal.is_some() {
-            return Err(mismatch("seal pointer requires the later closed day owner"));
+        if let Some(seal) = seal {
+            empty::validate_current_pointer(
+                connection,
+                &date,
+                revision,
+                &state,
+                published.as_deref(),
+                &seal,
+            )?;
         }
         match (prospective, prospective_sha) {
             (None, None) => {}
@@ -1087,11 +1151,7 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
             _ => return Err(mismatch("partial prospective reference")),
         }
     }
-    let seals: i64 =
-        connection.query_row("SELECT COUNT(*) FROM g5b_day_seals", [], |row| row.get(0))?;
-    if seals != 0 {
-        return Err(mismatch("day seals require the later closed day owner"));
-    }
+    empty::validate_seals(connection)?;
     Ok(())
 }
 
@@ -1124,6 +1184,16 @@ fn prepare_artifact_tx(
             return Err(mismatch("intent identity conflicts with saved bytes"));
         }
         return Ok(saved);
+    }
+    let sealed: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM g5b_day_seals WHERE business_date=?1",
+        [date.to_string()],
+        |row| row.get(0),
+    )?;
+    if sealed != 0 {
+        return Err(mismatch(
+            "historically sealed date cannot open another artifact",
+        ));
     }
     let revision: i64 = tx.query_row(
         "SELECT revision FROM g5b_day_heads WHERE business_date=?1",
@@ -1190,6 +1260,47 @@ fn load_selection_intent(connection: &Connection, cohort: &str) -> Result<Prepar
         .ok_or_else(|| mismatch("selection has no exact saved intent"))
 }
 
+fn commit_exact_artifact_tx(
+    tx: &Transaction<'_>,
+    date: NaiveDate,
+    intent: &PreparedG5bArtifact,
+    witness: &artifact::FileWitness,
+) -> Result<()> {
+    let saved = load_intent(tx, &intent.logical_intent)?
+        .ok_or_else(|| mismatch("prepared intent disappeared"))?;
+    if saved.material != intent.material || saved.desired_bytes != intent.desired_bytes {
+        return Err(mismatch("prepared identity conflict at commit"));
+    }
+    let committed:Option<Vec<u8>>=tx.query_row("SELECT event_canonical FROM g5b_artifact_events WHERE logical_intent=?1 AND phase='Committed'",[&intent.logical_intent],|r|r.get(0)).optional()?;
+    if let Some(bytes) = committed {
+        let existing: EventMaterial = serde_json::from_slice(&bytes)?;
+        if existing.file_witness.as_ref() != Some(witness) {
+            return Err(mismatch("committed artifact changed; no healing"));
+        }
+        return Ok(());
+    }
+    // Fresh CAS allows legitimate late/audit changes since Prepared.
+    let revision: i64 = tx.query_row(
+        "SELECT revision FROM g5b_day_heads WHERE business_date=?1",
+        [date.to_string()],
+        |r| r.get(0),
+    )?;
+    let next = revision
+        .checked_add(1)
+        .ok_or_else(|| mismatch("revision exhausted"))?;
+    let mut material = intent.material.clone();
+    material.phase = "Committed".to_owned();
+    material.commit_revision = Some(next);
+    material.prepared_event_identity = Some(intent.event_identity.clone());
+    material.file_witness = Some(witness.clone());
+    let canonical = canonical_json(&material)?;
+    tx.execute("INSERT INTO g5b_artifact_events(event_identity,logical_intent,phase,business_date,cohort_identity,artifact_role,occurrence_identity,prepared_revision,commit_revision,before_kind,before_sha256,desired_bytes,desired_sha256,event_canonical,event_sha256,prepared_event_identity,file_witness_canonical,file_witness_sha256) VALUES(?1,?2,'Committed',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",params![domain_sha256_hex("g5b-artifact-event-v1",&canonical),intent.logical_intent,date.to_string(),material.intent.cohort_identity,material.intent.role.as_str(),material.intent.occurrence_identity,material.prepared_revision,next,material.before_kind,material.before_sha256,intent.desired_bytes,material.intent.desired_sha256,canonical,sha256_hex(&canonical),intent.event_identity,canonical_json(&witness)?,sha256_hex(&canonical_json(&witness)?)])?;
+    let pending:i64=tx.query_row("SELECT COUNT(*) FROM g5b_artifact_events p WHERE p.business_date=?1 AND p.phase='Prepared' AND NOT EXISTS(SELECT 1 FROM g5b_artifact_events c WHERE c.prepared_event_identity=p.event_identity AND c.phase='Committed')",[date.to_string()],|r|r.get(0))?;
+    let publish_cohort = material.intent.role == ArtifactRole::Selection;
+    let changed=tx.execute("UPDATE g5b_day_heads SET revision=?1,artifact_state=?2,current_seal_identity=NULL,cohort_identity=CASE WHEN ?3 THEN ?4 ELSE cohort_identity END WHERE business_date=?5 AND revision=?6",params![next,if pending==0{"Clean"}else{"Dirty"},publish_cohort,material.intent.cohort_identity,date.to_string(),revision])?;
+    super::require_single_cas_update(changed, "commit exact artifact")
+}
+
 impl G5bDaySession<'_> {
     fn validate_stored_admission(&self, admission: &Admission) -> Result<()> {
         let db = self.coordinator.database_binding()?.objects[0].identity;
@@ -1244,6 +1355,9 @@ impl G5bDaySession<'_> {
     }
 
     fn validate_saved_intent(&self, intent: &PreparedG5bArtifact) -> Result<()> {
+        if empty::is_empty_intent(self, intent)? {
+            return empty::validate_saved_intent(self, intent);
+        }
         self.validate()?;
         if intent.material.intent.business_date != self.date {
             return Err(mismatch("intent belongs to another date"));
@@ -1268,8 +1382,12 @@ impl G5bDaySession<'_> {
 
     /// Saved bytes only. No model, physical sink, or immutable-append callback.
     pub(crate) fn publish_prepared_artifact(&self, intent: &PreparedG5bArtifact) -> Result<()> {
+        let is_empty = empty::is_empty_intent(self, intent)?;
         self.validate_saved_intent(intent)?;
         artifact::publish(self, intent)?;
+        if is_empty {
+            empty::validate_saved_intent(self, intent)?;
+        }
         Ok(())
     }
 
@@ -1282,6 +1400,12 @@ impl G5bDaySession<'_> {
         extra_fs: Option<&dyn Fn() -> Result<()>>,
         extra_sql: Option<&dyn Fn(&Transaction<'_>) -> Result<()>>,
     ) -> Result<()> {
+        if empty::is_empty_intent(self, intent)? {
+            if extra_fs.is_some() || extra_sql.is_some() {
+                return Err(mismatch("model validators do not apply to Empty artifacts"));
+            }
+            return empty::commit_prepared(self, intent);
+        }
         self.validate_saved_intent(intent)?;
         // Fetch SQLite preimages before entering the validated write; the
         // validator itself must never reacquire the DB mutex/date guard.
@@ -1322,29 +1446,16 @@ impl G5bDaySession<'_> {
             }
             Ok(())
         };
-        self.coordinator.with_immediate_transaction_validated(SchemaVersionPolicy::Runtime,Some(&validate),|tx| {
-            if let Some(validate) = extra_sql { validate(tx)?; }
-            let saved=load_intent(tx,&intent.logical_intent)?.ok_or_else(||mismatch("prepared intent disappeared"))?;
-            if saved.material!=intent.material || saved.desired_bytes!=intent.desired_bytes {return Err(mismatch("prepared identity conflict at commit"));}
-            let committed:Option<Vec<u8>>=tx.query_row("SELECT event_canonical FROM g5b_artifact_events WHERE logical_intent=?1 AND phase='Committed'",[&intent.logical_intent],|r|r.get(0)).optional()?;
-            if let Some(bytes)=committed {
-                let existing:EventMaterial=serde_json::from_slice(&bytes)?;
-                if existing.file_witness.as_ref()!=Some(&witness) {return Err(mismatch("committed artifact changed; no healing"));}
-                return Ok(());
-            }
-            // Fresh CAS allows legitimate late/audit changes since Prepared.
-            let revision:i64=tx.query_row("SELECT revision FROM g5b_day_heads WHERE business_date=?1",[self.date.to_string()],|r|r.get(0))?;
-            let next=revision.checked_add(1).ok_or_else(||mismatch("revision exhausted"))?;
-            let mut material=intent.material.clone();
-            material.phase="Committed".to_owned();material.commit_revision=Some(next);
-            material.prepared_event_identity=Some(intent.event_identity.clone());material.file_witness=Some(witness.clone());
-            let canonical=canonical_json(&material)?;
-            tx.execute("INSERT INTO g5b_artifact_events(event_identity,logical_intent,phase,business_date,cohort_identity,artifact_role,occurrence_identity,prepared_revision,commit_revision,before_kind,before_sha256,desired_bytes,desired_sha256,event_canonical,event_sha256,prepared_event_identity,file_witness_canonical,file_witness_sha256) VALUES(?1,?2,'Committed',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",params![domain_sha256_hex("g5b-artifact-event-v1",&canonical),intent.logical_intent,self.date.to_string(),material.intent.cohort_identity,material.intent.role.as_str(),material.intent.occurrence_identity,material.prepared_revision,next,material.before_kind,material.before_sha256,intent.desired_bytes,material.intent.desired_sha256,canonical,sha256_hex(&canonical),intent.event_identity,canonical_json(&witness)?,sha256_hex(&canonical_json(&witness)?)])?;
-            let pending:i64=tx.query_row("SELECT COUNT(*) FROM g5b_artifact_events p WHERE p.business_date=?1 AND p.phase='Prepared' AND NOT EXISTS(SELECT 1 FROM g5b_artifact_events c WHERE c.prepared_event_identity=p.event_identity AND c.phase='Committed')",[self.date.to_string()],|r|r.get(0))?;
-            let publish_cohort=material.intent.role==ArtifactRole::Selection;
-            let changed=tx.execute("UPDATE g5b_day_heads SET revision=?1,artifact_state=?2,current_seal_identity=NULL,cohort_identity=CASE WHEN ?3 THEN ?4 ELSE cohort_identity END WHERE business_date=?5 AND revision=?6",params![next,if pending==0{"Clean"}else{"Dirty"},publish_cohort,material.intent.cohort_identity,self.date.to_string(),revision])?;
-            super::require_single_cas_update(changed,"commit exact artifact")
-        })
+        self.coordinator.with_immediate_transaction_validated(
+            SchemaVersionPolicy::Runtime,
+            Some(&validate),
+            |tx| {
+                if let Some(validate) = extra_sql {
+                    validate(tx)?;
+                }
+                commit_exact_artifact_tx(tx, self.date, intent, &witness)
+            },
+        )
     }
 
     pub(crate) fn recover_prepared_artifacts(&self) -> Result<usize> {
