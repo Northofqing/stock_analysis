@@ -541,7 +541,7 @@ pub(super) fn compose_observed_concepts(
     })
 }
 
-fn requested_concept_projection_sha256(
+pub(super) fn requested_concept_projection_sha256(
     requested_codes: &[String],
     concepts: &BTreeMap<String, Vec<String>>,
 ) -> String {

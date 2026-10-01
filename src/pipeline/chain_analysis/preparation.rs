@@ -500,7 +500,7 @@ pub struct ConceptProjectionObservation {
     completion: ConceptProjectionCompletion,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConceptProjectionOrigin {
     LocalCache {
         updated_at_local: String,
@@ -512,7 +512,7 @@ pub enum ConceptProjectionOrigin {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConceptToolObservation {
     requested_code: String,
@@ -580,6 +580,74 @@ impl ConceptProjectionObservation {
                     .get(*code)
                     .is_some_and(|boards| legacy.get(*code) == Some(boards))
                     && self.sources.contains_key(*code)
+            })
+    }
+
+    fn valid_complete_projection(
+        &self,
+        requested_codes: &[String],
+        legacy: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let ConceptProjectionCompletion::Complete { content_sha256 } = &self.completion else {
+            return false;
+        };
+        if requested_codes.is_empty()
+            || !self.matches_legacy_projection(requested_codes, legacy)
+            || chrono::NaiveDateTime::parse_from_str(&self.cache_cutoff_local, "%Y-%m-%d %H:%M:%S")
+                .is_err()
+            || crate::market_domain::EvidenceTimestamp::parse_instant(&self.cache_observed_at_utc)
+                .is_err()
+            || content_sha256
+                != &super::fetchers::requested_concept_projection_sha256(
+                    requested_codes,
+                    &self.concepts,
+                )
+        {
+            return false;
+        }
+
+        let mut expected_writes = BTreeMap::<&str, usize>::new();
+        for code in requested_codes {
+            match self.sources.get(code) {
+                Some(ConceptProjectionOrigin::LocalCache {
+                    updated_at_local,
+                    concepts_json_sha256,
+                }) if chrono::NaiveDateTime::parse_from_str(
+                    updated_at_local,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .is_ok()
+                    && updated_at_local >= &self.cache_cutoff_local
+                    && is_sha256_hex(concepts_json_sha256) => {}
+                Some(ConceptProjectionOrigin::ToolResponse(_)) => {
+                    *expected_writes.entry(code.as_str()).or_default() += 1;
+                }
+                _ => return false,
+            }
+        }
+
+        let mut actual_writes = BTreeMap::<&str, usize>::new();
+        let mut last_writes = BTreeMap::<&str, &ConceptProjectionWrite>::new();
+        for write in &self.successful_writes {
+            let ConceptProjectionOrigin::ToolResponse(tool) = &write.origin else {
+                return false;
+            };
+            if !expected_writes.contains_key(write.code.as_str())
+                || tool.requested_code != write.code
+                || !valid_tool_projection(tool, &write.boards)
+            {
+                return false;
+            }
+            *actual_writes.entry(write.code.as_str()).or_default() += 1;
+            last_writes.insert(write.code.as_str(), write);
+        }
+        expected_writes == actual_writes
+            && expected_writes.keys().all(|code| {
+                let Some(last) = last_writes.get(code) else {
+                    return false;
+                };
+                self.sources.get(*code) == Some(&last.origin)
+                    && self.concepts.get(*code) == Some(&last.boards)
             })
     }
 
@@ -656,6 +724,39 @@ impl ConceptProjectionObservation {
             completion,
         }
     }
+}
+
+fn is_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_tool_projection(tool: &ConceptToolObservation, boards: &[String]) -> bool {
+    if tool.all_boards.is_empty()
+        || tool.board_count != tool.all_boards.len()
+        || tool.provider_label.trim().is_empty()
+        || tool.source.trim().is_empty()
+        || tool.batch_id.trim().is_empty()
+        || !is_sha256_hex(&tool.raw_response_sha256)
+        || crate::market_domain::EvidenceTimestamp::parse_instant(&tool.observed_at).is_err()
+        || tool.source_at.as_ref().is_some_and(|source_at| {
+            crate::market_domain::EvidenceTimestamp::parse(source_at).is_err()
+        })
+    {
+        return false;
+    }
+    let mut distinct = Vec::<&str>::new();
+    for board in &tool.all_boards {
+        if board.trim().is_empty() {
+            return false;
+        }
+        if !distinct.contains(&board.as_str()) {
+            distinct.push(board.as_str());
+        }
+    }
+    distinct.into_iter().eq(boards.iter().map(String::as_str))
 }
 
 impl From<super::fetchers::ToolBoardsObservation> for ConceptToolObservation {
@@ -868,7 +969,16 @@ impl PreparedChainAnalysis {
     }
 }
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const ARTIFACT_SCHEMA_V1: u32 = 1;
+const ARTIFACT_SCHEMA_V2: u32 = 2;
+
+fn artifact_schema_version(data: &PreparedData) -> u32 {
+    if data.position_concept_projection.is_some() {
+        ARTIFACT_SCHEMA_V2
+    } else {
+        ARTIFACT_SCHEMA_V1
+    }
+}
 
 #[derive(Serialize)]
 struct ArtifactRef<'a> {
@@ -912,7 +1022,7 @@ impl PreparedChainAnalysis {
 
 fn encode_artifact_data(data: &PreparedData) -> Result<Vec<u8>> {
     serde_json::to_vec(&ArtifactRef {
-        schema_version: ARTIFACT_SCHEMA_VERSION,
+        schema_version: artifact_schema_version(data),
         data,
     })
     .map_err(|_| anyhow::anyhow!("产业链准备 artifact 编码失败"))
@@ -921,7 +1031,7 @@ fn encode_artifact_data(data: &PreparedData) -> Result<Vec<u8>> {
 fn decode_artifact_data(bytes: &[u8]) -> Result<PreparedData> {
     let artifact: ArtifactOwned = serde_json::from_slice(bytes)
         .map_err(|_| anyhow::anyhow!("产业链准备 artifact 输入无效"))?;
-    if artifact.schema_version != ARTIFACT_SCHEMA_VERSION {
+    if artifact.schema_version != artifact_schema_version(&artifact.data) {
         anyhow::bail!("产业链准备 artifact 版本不受支持");
     }
     validate_artifact_values(&artifact.data)?;
@@ -994,7 +1104,7 @@ fn validate_artifact_values(data: &PreparedData) -> Result<()> {
         if matches!(
             &projection.completion,
             ConceptProjectionCompletion::Complete { .. }
-        ) && !projection.matches_legacy_projection(
+        ) && !projection.valid_complete_projection(
             &data
                 .positions
                 .iter()
@@ -1002,7 +1112,7 @@ fn validate_artifact_values(data: &PreparedData) -> Result<()> {
                 .collect::<Vec<_>>(),
             &data.position_concepts,
         ) {
-            anyhow::bail!("产业链准备 artifact 持仓概念完整投影与消费结果不一致");
+            anyhow::bail!("产业链准备 artifact 持仓概念完整投影证据不一致");
         }
     }
     Ok(())
@@ -1656,6 +1766,17 @@ pub async fn prepare_chain_analysis_with_io(
             };
             prepared.data.position_concept_source.reason =
                 Some("position_concept_projection_conflicts_with_legacy_map".into());
+        } else if matches!(
+            &projection.completion,
+            ConceptProjectionCompletion::Complete { .. }
+        ) && !projection
+            .valid_complete_projection(&position_codes, &prepared.data.position_concepts)
+        {
+            projection.completion = ConceptProjectionCompletion::Incomplete {
+                reason: "complete_projection_evidence_inconsistent".into(),
+            };
+            prepared.data.position_concept_source.reason =
+                Some("position_concept_projection_evidence_inconsistent".into());
         }
     }
     let position_diags = super::match_position_diags(&positions, &clusters, &position_concepts);

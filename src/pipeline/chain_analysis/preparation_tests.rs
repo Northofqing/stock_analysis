@@ -404,6 +404,7 @@ async fn artifact_round_trip_preserves_owned_bytes_and_rejects_unsupported_or_lo
     let encoded = String::from_utf8(bytes.clone()).unwrap();
     for (needle, replacement) in [
         ("\"schema_version\":1", "\"schema_version\":99"),
+        ("\"schema_version\":1", "\"schema_version\":2"),
         (
             "\"schema_version\":1",
             "\"schema_version\":1,\"schema_version\":1",
@@ -745,6 +746,9 @@ async fn mixed_position_concept_projection_survives_prepared_artifact() {
         &SourceStatus::Unknown
     );
     let bytes = prepared.to_artifact_bytes().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert!(value["data"]["position_concept_projection"].is_object());
     let restored = PreparedChainAnalysis::from_artifact_bytes(&bytes).unwrap();
     assert_eq!(
         serde_json::to_value(restored.position_concept_projection().unwrap()).unwrap(),
@@ -755,6 +759,90 @@ async fn mixed_position_concept_projection_survives_prepared_artifact() {
         prepared.position_concepts(),
         "legacy report input remains the returned map"
     );
+}
+
+#[tokio::test]
+async fn complete_position_concept_artifact_rejects_canonical_byte_tampering() {
+    use super::fetchers::ConceptFetchTerminal;
+    use super::preparation::{
+        ConceptProjectionCompletion, ConceptProjectionOrigin, PreparedChainAnalysis,
+    };
+
+    let requested = vec!["TEST_CODE_协议持仓".into(), "TEST_CODE_工具持仓".into()];
+    let projection = observed_position_concept_fixture(&requested, ConceptFetchTerminal::Completed);
+    let (stocks, mut io) = position_concept_fixture_io(projection, None);
+    io.position_rows.pop();
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .unwrap();
+    let encoded = String::from_utf8(prepared.to_artifact_bytes().unwrap()).unwrap();
+    let observed = prepared.position_concept_projection().unwrap();
+    let ConceptProjectionCompletion::Complete { content_sha256 } = observed.completion() else {
+        panic!("fixture must be a complete local projection");
+    };
+    let hash_field = format!("\"content_sha256\":\"{content_sha256}\"");
+    let altered_hash = encoded.replacen(
+        &hash_field,
+        &format!("\"content_sha256\":\"{}\"", "0".repeat(64)),
+        1,
+    );
+
+    let source = observed.sources().get("TEST_CODE_工具持仓").unwrap();
+    let source_json = serde_json::to_string(source).unwrap();
+    let altered_source_json = source_json.replacen(
+        "\"batch_id\":\"TEST_CODE_TOOL_BATCH\"",
+        "\"batch_id\":\"TEST_CODE_CHANGED_BATCH\"",
+        1,
+    );
+    let altered_source = encoded.replacen(&source_json, &altered_source_json, 1);
+    let ConceptProjectionOrigin::ToolResponse(tool) = source else {
+        panic!("fixture must have a strict tool response");
+    };
+    let legacy_source = serde_json::to_string(&ConceptProjectionOrigin::LegacyToolProjection {
+        raw_response_sha256: tool.raw_response_sha256().to_owned(),
+    })
+    .unwrap();
+    let altered_legacy = encoded.replacen(&source_json, &legacy_source, 1);
+
+    let write_json = serde_json::to_string(&observed.successful_writes()[0]).unwrap();
+    let changed_write_json = write_json.replacen(
+        "\"boards\":[\"TEST_CODE_深度主线\"]",
+        "\"boards\":[\"TEST_CODE_篡改\"]",
+        1,
+    );
+    let altered_write = encoded.replacen(&write_json, &changed_write_json, 1);
+    let write_field = format!("\"successful_writes\":[{write_json}]");
+    let missing_write = encoded.replacen(&write_field, "\"successful_writes\":[]", 1);
+
+    let projection_field = format!(
+        ",\"position_concept_projection\":{}",
+        serde_json::to_string(observed).unwrap()
+    );
+    let v2_without_projection = encoded.replacen(&projection_field, "", 1);
+    let v1_with_projection = encoded.replacen("\"schema_version\":2", "\"schema_version\":1", 1);
+    for (name, changed) in [
+        ("content hash", altered_hash),
+        ("source/write mismatch", altered_source),
+        ("legacy source in Complete", altered_legacy),
+        ("last write boards", altered_write),
+        ("missing write", missing_write),
+        ("v2 missing projection", v2_without_projection),
+        ("v1 with projection", v1_with_projection),
+    ] {
+        assert_ne!(
+            changed, encoded,
+            "{name} fixture must alter the exact bytes"
+        );
+        assert!(
+            PreparedChainAnalysis::from_artifact_bytes(changed.as_bytes()).is_err(),
+            "{name} must be rejected"
+        );
+    }
 }
 
 #[tokio::test]
