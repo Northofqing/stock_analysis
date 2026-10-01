@@ -263,6 +263,15 @@ struct PinnedDirectoryChain {
     filesystem_root_identity: FileObjectIdentity,
     filesystem_root_link_count: Mutex<u64>,
     components: Vec<PinnedDirectoryComponent>,
+    #[cfg(test)]
+    rebind_test_hook: Mutex<Option<DirectoryChainRebindTestHook>>,
+}
+
+pub(crate) const MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS: usize = 4;
+
+enum DirectoryChainRebindEvidence {
+    Stable(Vec<u64>),
+    LinkCountDrift(String),
 }
 
 struct PinnedSqliteObject {
@@ -367,6 +376,19 @@ pub(crate) enum DatabaseOperationTestPhase {
     AfterSqlBeforePreCommitValidation,
     AfterSqlBeforePostValidation,
     AfterCommitBeforePostValidation,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryChainRebindTestPhase {
+    AfterRetainedTestParentMetadataBeforeReopen,
+}
+
+#[cfg(test)]
+struct DirectoryChainRebindTestHook {
+    phase: DirectoryChainRebindTestPhase,
+    remaining_calls: usize,
+    callback: Box<dyn FnMut() -> Result<()> + Send + 'static>,
 }
 
 #[cfg(test)]
@@ -945,6 +967,8 @@ impl PinnedDirectoryChain {
             filesystem_root_identity,
             filesystem_root_link_count: Mutex::new(filesystem_root_link_count),
             components,
+            #[cfg(test)]
+            rebind_test_hook: Mutex::new(None),
         })
     }
 
@@ -973,14 +997,25 @@ impl PinnedDirectoryChain {
     fn validate(&self) -> Result<()> {
         // Directory link count is a mutation detector, not identity. A legitimate
         // child-directory mkdir/rmdir can alter it without rebinding this
-        // retained chain. We therefore treat link-count drift as informational and
-        // only require successful rebind identity validation, then refresh the
-        // retained baseline from the observed chain.
-        let observed = self.validate_once()?;
-        self.refresh_link_count_baselines(&observed)
+        // retained chain. Retry only that typed drift after the entire chain's
+        // identity, no-follow, permissions and positive-link checks succeed.
+        // Baselines refresh only from one complete stable pass; persistent
+        // churn and every other validation failure still fail closed.
+        let mut last_drift = String::new();
+        for _ in 0..MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS {
+            match self.validate_once()? {
+                DirectoryChainRebindEvidence::Stable(observed) => {
+                    return self.refresh_link_count_baselines(&observed);
+                }
+                DirectoryChainRebindEvidence::LinkCountDrift(detail) => last_drift = detail,
+            }
+        }
+        Err(DurableDeliveryError::IsolationViolation(format!(
+            "database namespace link count remained unstable across {MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS} complete chain rebinds: {last_drift}"
+        )))
     }
 
-    fn validate_once(&self) -> Result<Vec<u64>> {
+    fn validate_once(&self) -> Result<DirectoryChainRebindEvidence> {
         let current_root =
             require_trusted_directory_identity(&self.filesystem_root, "filesystem root", false)?;
         if current_root != self.filesystem_root_identity {
@@ -1004,16 +1039,16 @@ impl PinnedDirectoryChain {
         }
         let reopened_root_link_count =
             require_directory_link_count(&reopened_root, "filesystem root")?;
-        if reopened_root_link_count != current_root_link_count {
-            return Err(DurableDeliveryError::IsolationViolation(
-                "filesystem-root link count changed during one chain rebind".to_owned(),
-            ));
-        }
+        let mut drift = (reopened_root_link_count != current_root_link_count).then(|| {
+            format!(
+                "filesystem root retained={current_root_link_count} reopened={reopened_root_link_count}"
+            )
+        });
 
         let mut current = reopened_root;
         let mut link_counts = Vec::with_capacity(self.components.len() + 1);
-        link_counts.push(current_root_link_count);
-        for component in &self.components {
+        link_counts.push(reopened_root_link_count);
+        for (component_index, component) in self.components.iter().enumerate() {
             let retained_metadata = component.anchor.metadata().map_err(|error| {
                 DurableDeliveryError::IsolationViolation(format!(
                     "cannot inspect retained database namespace component: {error}"
@@ -1032,6 +1067,12 @@ impl PinnedDirectoryChain {
                 return Err(DurableDeliveryError::IsolationViolation(
                     "retained database namespace component has zero links".to_owned(),
                 ));
+            }
+            #[cfg(test)]
+            if component_index + 1 == self.components.len() {
+                self.run_rebind_test_hook(
+                    DirectoryChainRebindTestPhase::AfterRetainedTestParentMetadataBeforeReopen,
+                )?;
             }
             let reopened = openat_component(
                 &current,
@@ -1052,15 +1093,38 @@ impl PinnedDirectoryChain {
             let reopened_link_count =
                 require_directory_link_count(&reopened, "fixed database namespace component")?;
             if reopened_link_count != retained_link_count {
-                return Err(DurableDeliveryError::IsolationViolation(
-                    "database namespace component link count changed during one chain rebind"
-                        .to_owned(),
-                ));
+                drift.get_or_insert_with(|| {
+                    format!(
+                        "component {component_index} ({}) retained={retained_link_count} reopened={reopened_link_count}",
+                        component.name.to_string_lossy()
+                    )
+                });
             }
-            link_counts.push(retained_link_count);
+            link_counts.push(reopened_link_count);
             current = reopened;
         }
-        Ok(link_counts)
+        Ok(match drift {
+            Some(detail) => DirectoryChainRebindEvidence::LinkCountDrift(detail),
+            None => DirectoryChainRebindEvidence::Stable(link_counts),
+        })
+    }
+
+    #[cfg(test)]
+    fn run_rebind_test_hook(&self, phase: DirectoryChainRebindTestPhase) -> Result<()> {
+        let mut installed = self.rebind_test_hook.lock().map_err(|_| {
+            DurableDeliveryError::IsolationViolation(
+                "directory-chain rebind test hook mutex is poisoned".to_owned(),
+            )
+        })?;
+        let Some(hook) = installed.as_mut().filter(|hook| hook.phase == phase) else {
+            return Ok(());
+        };
+        let outcome = (hook.callback)();
+        hook.remaining_calls -= 1;
+        if hook.remaining_calls == 0 {
+            *installed = None;
+        }
+        outcome
     }
 
     fn refresh_link_count_baselines(&self, stable_link_counts: &[u64]) -> Result<()> {
@@ -2659,6 +2723,42 @@ impl DurableDeliveryCoordinator {
                 )))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_directory_chain_rebind_test_hook(
+        &self,
+        phase: DirectoryChainRebindTestPhase,
+        calls: usize,
+        callback: impl FnMut() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        if !matches!(
+            &self.config.environment,
+            super::model::StoreEnvironment::Test { .. }
+        ) || !(1..=MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS).contains(&calls)
+        {
+            return Err(DurableDeliveryError::InvalidConfiguration(
+                "directory-chain rebind hooks require an isolated Test namespace and bounded calls"
+                    .to_owned(),
+            ));
+        }
+        let chain = &self.database_binding()?.directory_chain;
+        let mut hook = chain.rebind_test_hook.lock().map_err(|_| {
+            DurableDeliveryError::IsolationViolation(
+                "directory-chain rebind test hook mutex is poisoned".to_owned(),
+            )
+        })?;
+        if hook.is_some() {
+            return Err(DurableDeliveryError::InvalidConfiguration(
+                "a directory-chain rebind test hook is already installed".to_owned(),
+            ));
+        }
+        *hook = Some(DirectoryChainRebindTestHook {
+            phase,
+            remaining_calls: calls,
+            callback: Box::new(callback),
+        });
+        Ok(())
     }
 
     #[cfg(test)]

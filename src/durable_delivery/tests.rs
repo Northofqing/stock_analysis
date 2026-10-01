@@ -1,8 +1,9 @@
 use super::coordinator::{
     install_compound_commit_rollback_test_fault, install_database_bootstrap_test_hook,
     install_process_descriptor_snapshot_test_fault, AttemptLease, DatabaseBootstrapTestPhase,
-    DatabaseOperationTestPhase, DeliveredPrecommitTestFault, OpenFileDescriptionProof,
-    OperationPostvalidationTestFault, ProcessDescriptorSnapshotTestFault,
+    DatabaseOperationTestPhase, DeliveredPrecommitTestFault, DirectoryChainRebindTestPhase,
+    OpenFileDescriptionProof, OperationPostvalidationTestFault, ProcessDescriptorSnapshotTestFault,
+    MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS,
 };
 use super::correlation::CorrelationObservationV1;
 use super::model::sha256_hex;
@@ -4117,6 +4118,208 @@ fn br192_stable_ancestor_nlink_refresh_allows_legitimate_test_child_directory() 
         .inspect_pending_for_date("2026-07-30")
         .expect("stable rmdir nlink drift is refreshed after full chain rebind")
         .is_empty());
+}
+
+#[cfg(unix)]
+#[serial_test::serial(durable_physical_isolation)]
+#[test]
+fn br192_chain_rebind_retries_single_same_inode_directory_link_drift() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::new("CHAIN_REBIND_ONCE");
+    let parent = fixture.database_path.parent().unwrap().to_owned();
+    let child = parent.join("TEST_CODE_LEGITIMATE_DB_SIBLING");
+    let callback_child = child.clone();
+    let callback_parent = parent.clone();
+    let observed = Arc::new(Mutex::new(None));
+    let callback_observed = observed.clone();
+    fixture
+        .coordinator
+        .install_directory_chain_rebind_test_hook(
+            DirectoryChainRebindTestPhase::AfterRetainedTestParentMetadataBeforeReopen,
+            1,
+            move || {
+                let before = std::fs::metadata(&callback_parent)?;
+                std::fs::create_dir(&callback_child)?;
+                let after = std::fs::metadata(&callback_parent)?;
+                *callback_observed.lock().unwrap() = Some((
+                    before.dev(),
+                    before.ino(),
+                    before.nlink(),
+                    after.dev(),
+                    after.ino(),
+                    after.nlink(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let candidate = envelope(
+        "CHAIN_REBIND_ONCE",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let outcome = fixture.coordinator.prepare(&candidate, 1, now());
+    fixture.cleanup.record(&child, OwnedPathKind::Directory);
+    let (before_dev, before_ino, before_links, after_dev, after_ino, after_links) =
+        observed.lock().unwrap().unwrap();
+    assert_eq!((before_dev, before_ino), (after_dev, after_ino));
+    assert!(before_links > 0 && after_links > 0);
+    assert_ne!(
+        before_links, after_links,
+        "real sibling mkdir must exercise link-count drift"
+    );
+    assert_eq!(
+        outcome
+            .expect("one complete retry must rebind the unchanged inode")
+            .state,
+        DecisionState::Reserved
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[serial_test::serial(durable_physical_isolation)]
+#[test]
+fn br192_chain_rebind_rejects_bounded_persistent_link_drift_without_sql_writes() {
+    let fixture = Fixture::new("CHAIN_REBIND_PERSISTENT");
+    let child = fixture
+        .database_path
+        .parent()
+        .unwrap()
+        .join("TEST_CODE_LINK_CHURN");
+    let callback_child = child.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    let mut present = false;
+    fixture
+        .coordinator
+        .install_directory_chain_rebind_test_hook(
+            DirectoryChainRebindTestPhase::AfterRetainedTestParentMetadataBeforeReopen,
+            MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS,
+            move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                if present {
+                    std::fs::remove_dir(&callback_child)?;
+                } else {
+                    std::fs::create_dir(&callback_child)?;
+                }
+                present = !present;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let tables = [
+        "delivery_decisions",
+        "delivery_attempts",
+        "immutable_audit_outbox",
+        "delivery_state_events",
+        "daily_budget_reservations",
+        "cooldown_reservations",
+    ];
+    let before = authority_snapshot(&Connection::open(&fixture.database_path).unwrap(), &tables);
+    let candidate = envelope(
+        "CHAIN_REBIND_PERSISTENT",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let outcome = fixture.coordinator.prepare(&candidate, 1, now());
+    if child.exists() {
+        fixture.cleanup.record(&child, OwnedPathKind::Directory);
+    }
+    assert!(
+        matches!(outcome, Err(DurableDeliveryError::IsolationViolation(ref detail))
+        if detail.contains("link count remained unstable across"))
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS
+    );
+    assert_eq!(
+        authority_snapshot(&Connection::open(&fixture.database_path).unwrap(), &tables),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[serial_test::serial(durable_physical_isolation)]
+#[test]
+fn br192_chain_rebind_never_retries_real_ancestor_replacement_during_link_drift() {
+    let fixture = Fixture::new("CHAIN_REBIND_REAL_REPLACEMENT");
+    let parent = fixture.database_path.parent().unwrap().to_owned();
+    let retained = parent.with_file_name(format!(
+        "{}_retained",
+        parent.file_name().unwrap().to_string_lossy()
+    ));
+    let child = parent.join("TEST_CODE_LEGITIMATE_DB_SIBLING");
+    let callback_parent = parent.clone();
+    let callback_retained = retained.clone();
+    let callback_child = child.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    fixture
+        .coordinator
+        .install_directory_chain_rebind_test_hook(
+            DirectoryChainRebindTestPhase::AfterRetainedTestParentMetadataBeforeReopen,
+            MAX_DIRECTORY_CHAIN_REBIND_ATTEMPTS,
+            move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                std::fs::create_dir(&callback_child)?;
+                std::fs::rename(&callback_parent, &callback_retained)?;
+                std::fs::create_dir(&callback_parent)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let before = authority_snapshot(
+        &Connection::open(&fixture.database_path).unwrap(),
+        &[
+            "delivery_decisions",
+            "delivery_attempts",
+            "immutable_audit_outbox",
+        ],
+    );
+    let candidate = envelope(
+        "CHAIN_REBIND_REAL_REPLACEMENT",
+        PushKind::HoldingEvent,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let outcome = fixture.coordinator.prepare(&candidate, 1, now());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "identity replacement must fail on the first pass, never reach a retry callback"
+    );
+    assert!(
+        matches!(outcome, Err(DurableDeliveryError::IsolationViolation(ref detail))
+        if detail.contains("ancestor was renamed or replaced"))
+    );
+    // Restore only the known empty replacement and retained original. The
+    // fixture retains its original inode ownership and never adopts another DB.
+    fixture.cleanup.record(&parent, OwnedPathKind::Directory);
+    std::fs::remove_dir(&parent).unwrap();
+    std::fs::rename(&retained, &parent).unwrap();
+    fixture.cleanup.record(&child, OwnedPathKind::Directory);
+    assert_eq!(
+        authority_snapshot(
+            &Connection::open(&fixture.database_path).unwrap(),
+            &[
+                "delivery_decisions",
+                "delivery_attempts",
+                "immutable_audit_outbox"
+            ]
+        ),
+        before
+    );
 }
 
 #[cfg(unix)]
