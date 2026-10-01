@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 mod input_head;
+pub(crate) use input_head::DateFence as G5bDateFence;
 pub use input_head::{
     inspect_date_input_head, AlertInputHeadUnknown, AlertInputHeadV1, VerifiedAlertInputPrefix,
 };

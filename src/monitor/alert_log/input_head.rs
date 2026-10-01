@@ -1,6 +1,6 @@
 //! G5b alert input provenance. Every JSONL writer shares the date fence.
 //! A pre-head historical archive stays Unknown, even after a fenced append.
-//! A verified prefix is not a day seal; journal/DB writers still need a shared protocol.
+//! A verified prefix is not a day seal; durable DB writers still need a shared protocol.
 
 use super::{
     dated_file_for, same_file_state, write_jsonl, AlertLog, AlertRecord, AlertRecordOrigin,
@@ -192,7 +192,9 @@ fn same_identity(left: &Metadata, right: &Metadata) -> bool {
     }
 }
 
-struct DateFence {
+/// Opaque cooperative writer guard; it grants no input-head or day-seal authority.
+pub(crate) struct DateFence {
+    business_date: NaiveDate,
     requested_dir: PathBuf,
     dir: PathBuf,
     dir_file: File,
@@ -248,6 +250,7 @@ impl DateFence {
             FileExt::lock_shared(&lock_file)?;
         }
         let guard = Self {
+            business_date: date,
             requested_dir,
             dir,
             dir_file,
@@ -275,6 +278,16 @@ impl DateFence {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn ensure_date(&self, date: NaiveDate) -> io::Result<()> {
+        if self.business_date != date {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "G5b date fence does not match operation date",
+            ));
+        }
+        self.ensure_current()
     }
 }
 
@@ -545,6 +558,13 @@ fn append_prehead_locked(guard: &DateFence, date: NaiveDate, line: &[u8]) -> io:
 }
 
 impl AlertLog {
+    /// Cooperating journal writers use the same physical date lock as JSONL.
+    /// Acquiring this guard never creates or adopts an input head.
+    pub(crate) fn acquire_date_writer_fence(&self, date: NaiveDate) -> io::Result<DateFence> {
+        self.ensure_io_allowed()?;
+        DateFence::acquire(&self.dir, date, true).map_err(io_unknown)
+    }
+
     /// Start provenance only for a genuinely new date. A pre-head file, even
     /// if empty, is historical/unknown and is never silently adopted.
     pub fn initialize_date_input_head(&self, date: NaiveDate) -> io::Result<AlertInputHeadV1> {

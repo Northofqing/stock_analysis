@@ -17,7 +17,7 @@ use crate::durable_delivery::{
     DurableDeliveryCoordinator, DurableDeliveryError, G5bCountedTerminalV1,
 };
 use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
-use crate::monitor::alert_log::AlertRecord;
+use crate::monitor::alert_log::{AlertLog, AlertRecord, G5bDateFence};
 use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use fs2::FileExt;
@@ -93,6 +93,7 @@ pub struct DeepAttributionRow {
 pub struct DeepAttributionJournal {
     dir: PathBuf,
     production: bool,
+    input_log: AlertLog,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,15 +433,49 @@ impl DeepAttributionJournal {
         Self {
             dir: PathBuf::from("data/g5b/attempts"),
             production: true,
+            input_log: AlertLog::production(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn isolated_for_test(dir: PathBuf) -> Self {
+        let input_log = AlertLog::for_test(dir.parent().expect("test journal has parent"))
+            .expect("test journal parent is an isolated existing directory");
+        Self::isolated_with_alert_log_for_test(dir, input_log)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_with_alert_log_for_test(dir: PathBuf, input_log: AlertLog) -> Self {
         Self {
             dir,
             production: false,
+            input_log,
         }
+    }
+
+    fn validate_date_fence(
+        &self,
+        date: NaiveDate,
+        fence: &G5bDateFence,
+    ) -> Result<(), DeepAttributionError> {
+        fence
+            .ensure_date(date)
+            .map_err(|error| DeepAttributionError::Io(format!("G5b 日期 fence 无效: {error}")))
+    }
+
+    fn with_date_fence<T>(
+        &self,
+        date: NaiveDate,
+        operation: impl FnOnce(&G5bDateFence) -> Result<T, DeepAttributionError>,
+    ) -> Result<T, DeepAttributionError> {
+        self.ensure_allowed()?;
+        let fence = self
+            .input_log
+            .acquire_date_writer_fence(date)
+            .map_err(|error| DeepAttributionError::Io(format!("获取 G5b 日期 fence: {error}")))?;
+        let outcome = operation(&fence);
+        self.validate_date_fence(date, &fence)?;
+        outcome
     }
 
     fn ensure_allowed(&self) -> Result<(), DeepAttributionError> {
@@ -481,7 +516,18 @@ impl DeepAttributionJournal {
         date: NaiveDate,
         records: Vec<AlertRecord>,
     ) -> Result<Vec<AlertRecord>, DeepAttributionError> {
-        self.ensure_allowed()?;
+        self.with_date_fence(date, |fence| {
+            self.load_or_select_locked(date, records, fence)
+        })
+    }
+
+    fn load_or_select_locked(
+        &self,
+        date: NaiveDate,
+        records: Vec<AlertRecord>,
+        fence: &G5bDateFence,
+    ) -> Result<Vec<AlertRecord>, DeepAttributionError> {
+        self.validate_date_fence(date, fence)?;
         let path = self.selection_path(date);
         let selection = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<DeepAttributionSelection>(&bytes)
@@ -554,6 +600,7 @@ impl DeepAttributionJournal {
                 };
                 let bytes = serde_json::to_vec(&selection)
                     .map_err(|e| DeepAttributionError::Io(e.to_string()))?;
+                self.validate_date_fence(date, fence)?;
                 match write_new_synced(&path, &bytes) {
                     Ok(true) => selection,
                     Ok(false) => {
@@ -583,8 +630,19 @@ impl DeepAttributionJournal {
         date: NaiveDate,
         index: usize,
     ) -> Result<DeepAttributionClaim, DeepAttributionError> {
-        self.ensure_allowed()?;
-        let events = self.load_or_select(date, Vec::new())?;
+        self.with_date_fence(date, |fence| {
+            self.begin_assessment_locked(date, index, fence)
+        })
+    }
+
+    fn begin_assessment_locked(
+        &self,
+        date: NaiveDate,
+        index: usize,
+        fence: &G5bDateFence,
+    ) -> Result<DeepAttributionClaim, DeepAttributionError> {
+        self.validate_date_fence(date, fence)?;
+        let events = self.load_or_select_locked(date, Vec::new(), fence)?;
         let selected = events.get(index).ok_or_else(|| {
             DeepAttributionError::Io(format!(
                 "G5b attempt 不在已保存选集内: {date} index={index}"
@@ -616,6 +674,7 @@ impl DeepAttributionJournal {
                 )))
             }
         }
+        self.validate_date_fence(date, fence)?;
         match write_new_synced(&path, b"") {
             Ok(true) => Ok(DeepAttributionClaim::Fresh),
             Ok(false) => {
@@ -679,8 +738,21 @@ impl DeepAttributionJournal {
         row: &DeepAttributionRow,
         summary: &str,
     ) -> Result<DeepAttributionFrozenResult, DeepAttributionError> {
-        self.ensure_allowed()?;
-        let events = self.load_or_select(date, Vec::new())?;
+        self.with_date_fence(date, |fence| {
+            self.freeze_result_locked(date, index, row, summary, fence)
+        })
+    }
+
+    fn freeze_result_locked(
+        &self,
+        date: NaiveDate,
+        index: usize,
+        row: &DeepAttributionRow,
+        summary: &str,
+        fence: &G5bDateFence,
+    ) -> Result<DeepAttributionFrozenResult, DeepAttributionError> {
+        self.validate_date_fence(date, fence)?;
+        let events = self.load_or_select_locked(date, Vec::new(), fence)?;
         let selected = events.get(index).ok_or_else(|| {
             DeepAttributionError::Io(format!("G5b 结果不在已保存选集内: {date} index={index}"))
         })?;
@@ -710,6 +782,7 @@ impl DeepAttributionJournal {
         let path = self.result_path(date, index);
         let bytes = serde_json::to_vec(&frozen)
             .map_err(|error| DeepAttributionError::Io(error.to_string()))?;
+        self.validate_date_fence(date, fence)?;
         match write_new_synced(&path, &bytes) {
             Ok(true) => Ok(frozen),
             Ok(false) => Err(DeepAttributionError::Io(format!(
@@ -1053,8 +1126,19 @@ impl DeepAttributionJournal {
         date: NaiveDate,
         index: usize,
     ) -> Result<DeepAttributionArchiveOutcome, DeepAttributionError> {
-        self.ensure_allowed()?;
-        let events = self.load_or_select(date, Vec::new())?;
+        self.with_date_fence(date, |fence| {
+            self.archive_frozen_result_locked(date, index, fence)
+        })
+    }
+
+    fn archive_frozen_result_locked(
+        &self,
+        date: NaiveDate,
+        index: usize,
+        fence: &G5bDateFence,
+    ) -> Result<DeepAttributionArchiveOutcome, DeepAttributionError> {
+        self.validate_date_fence(date, fence)?;
+        let events = self.load_or_select_locked(date, Vec::new(), fence)?;
         let selected = events.get(index).ok_or_else(|| {
             DeepAttributionError::Io(format!("G5b 归档不在已保存选集内: {date} index={index}"))
         })?;
@@ -1075,6 +1159,7 @@ impl DeepAttributionJournal {
         let key = DeepAttributionEventKey::from(&row.record);
         let path = self.archive_path(date);
         let lock_path = self.archive_lock_path(date);
+        self.validate_date_fence(date, fence)?;
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1139,6 +1224,7 @@ impl DeepAttributionJournal {
         let mut projected = original;
         projected.extend_from_slice(frozen.row_json.as_bytes());
         projected.push(b'\n');
+        self.validate_date_fence(date, fence)?;
         write_atomic_archive(&path, &projected)?;
         Ok(DeepAttributionArchiveOutcome::Appended)
     }
@@ -1236,8 +1322,19 @@ impl DeepAttributionJournal {
         &self,
         date: NaiveDate,
     ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        self.with_date_fence(date, |fence| {
+            self.recover_frozen_archives_for_date_locked(date, fence)
+        })
+    }
+
+    fn recover_frozen_archives_for_date_locked(
+        &self,
+        date: NaiveDate,
+        fence: &G5bDateFence,
+    ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        self.validate_date_fence(date, fence)?;
         // 空输入只加载已存在选集；孤儿 attempt/result/lock 会 fail closed。
-        let events = self.load_or_select(date, Vec::new())?;
+        let events = self.load_or_select_locked(date, Vec::new(), fence)?;
         let mut recovery = DeepAttributionArchiveRecovery::default();
         for index in 0..events.len() {
             let result_path = self.result_path(date, index);
@@ -1247,7 +1344,7 @@ impl DeepAttributionJournal {
                         "G5b 冻结结果不是普通文件: {result_path:?}"
                     )))
                 }
-                Ok(_) => match self.archive_frozen_result(date, index)? {
+                Ok(_) => match self.archive_frozen_result_locked(date, index, fence)? {
                     DeepAttributionArchiveOutcome::Appended => recovery.appended += 1,
                     DeepAttributionArchiveOutcome::AlreadyPresent => recovery.already_present += 1,
                 },
@@ -1783,10 +1880,7 @@ mod tests {
         NaiveDate,
         DeepAttributionFrozenResult,
     ) {
-        let journal = DeepAttributionJournal {
-            dir: root.join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal = DeepAttributionJournal::isolated_for_test(root.join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
@@ -1797,6 +1891,210 @@ mod tests {
         let summary = render_deep_attribution_summary(&row);
         let frozen = journal.freeze_result(date, 0, &row, &summary).unwrap();
         (journal, date, frozen)
+    }
+
+    fn paired_fence_journal(root: &Path) -> (DeepAttributionJournal, AlertLog, PathBuf) {
+        let input_dir = root.join("isolated-alerts");
+        fs::create_dir(&input_dir).unwrap();
+        let input_log = AlertLog::for_test(&input_dir).unwrap();
+        let journal = DeepAttributionJournal::isolated_with_alert_log_for_test(
+            root.join("isolated-g5b-attempts"),
+            input_log.clone(),
+        );
+        (journal, input_log, input_dir)
+    }
+
+    #[test]
+    fn journal_mutators_wait_for_common_date_fence_without_writing() {
+        use crate::monitor::alert_log::AlertInputHeadUnknown;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        for mutation in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let (journal, input_log, input_dir) = paired_fence_journal(root.path());
+            let legacy_path = input_dir.join(format!("{}.jsonl", date.format("%Y%m%d")));
+            let legacy_bytes = b"unadopted legacy input\n";
+            fs::write(&legacy_path, legacy_bytes).unwrap();
+            let row = sample_row();
+            let summary = render_deep_attribution_summary(&row);
+            if mutation > 0 {
+                journal.load_or_select(date, vec![sample_record()]).unwrap();
+            }
+            if mutation > 1 {
+                assert!(matches!(
+                    journal.begin_assessment(date, 0).unwrap(),
+                    DeepAttributionClaim::Fresh
+                ));
+            }
+            if mutation > 2 {
+                journal.freeze_result(date, 0, &row, &summary).unwrap();
+            }
+            let target = match mutation {
+                0 => journal.selection_path(date),
+                1 => journal.attempt_path(date, 0),
+                2 => journal.result_path(date, 0),
+                3 => journal.archive_path(date),
+                _ => unreachable!(),
+            };
+            let fence = input_log.acquire_date_writer_fence(date).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let outcome = match mutation {
+                    0 => journal
+                        .load_or_select(date, vec![sample_record()])
+                        .map(|_| ()),
+                    1 => journal.begin_assessment(date, 0).map(|_| ()),
+                    2 => journal.freeze_result(date, 0, &row, &summary).map(|_| ()),
+                    3 => journal.archive_frozen_result(date, 0).map(|_| ()),
+                    _ => unreachable!(),
+                };
+                done_tx.send(outcome).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(!target.exists(), "mutation {mutation} wrote while fenced");
+            drop(fence);
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            assert!(target.exists());
+            assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+            assert!(matches!(
+                input_log.inspect_date_input_head(date),
+                Err(AlertInputHeadUnknown::MissingHead)
+            ));
+        }
+    }
+
+    #[test]
+    fn journal_date_fences_do_not_block_other_dates() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let (journal, input_log, _) = paired_fence_journal(root.path());
+        let first = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let second = first.succ_opt().unwrap();
+        let first_selection = journal.selection_path(first);
+        let second_selection = journal.selection_path(second);
+        let fence = input_log.acquire_date_writer_fence(first).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(journal.load_or_select(second, vec![sample_record()]))
+                .unwrap();
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(fence);
+        outcome.expect("an unrelated date must not wait").unwrap();
+        worker.join().unwrap();
+        assert!(!first_selection.exists());
+        assert!(second_selection.exists());
+    }
+
+    #[test]
+    fn journal_locked_helpers_reject_wrong_date_and_replaced_fence_identity() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        for replacement in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let (journal, input_log, input_dir) = paired_fence_journal(root.path());
+            let fence = input_log.acquire_date_writer_fence(date).unwrap();
+            let operation_date = if replacement == 0 {
+                date.succ_opt().unwrap()
+            } else {
+                date
+            };
+            if replacement == 1 {
+                let lock = input_dir.join(format!("{}.g5b-day.lock", date.format("%Y%m%d")));
+                fs::rename(&lock, input_dir.join("old-day-lock")).unwrap();
+                fs::write(lock, b"").unwrap();
+            } else if replacement == 2 {
+                fs::rename(&input_dir, root.path().join("old-alerts")).unwrap();
+                fs::create_dir(&input_dir).unwrap();
+            }
+            assert!(journal
+                .load_or_select_locked(operation_date, vec![sample_record()], &fence)
+                .is_err());
+            assert!(!journal.dir.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_symlink_date_fence_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let (journal, _, input_dir) = paired_fence_journal(root.path());
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let target = root.path().join("symlink-target");
+        fs::write(&target, b"preserve this file").unwrap();
+        symlink(
+            &target,
+            input_dir.join(format!("{}.g5b-day.lock", date.format("%Y%m%d"))),
+        )
+        .unwrap();
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.dir.exists());
+        assert_eq!(fs::read(target).unwrap(), b"preserve this file");
+    }
+
+    #[test]
+    fn nested_journal_recovery_reuses_one_fence_and_preserves_frozen_bytes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let (journal, _, _) = paired_fence_journal(root.path());
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), DeepAttributionError> {
+                journal.load_or_select(date, vec![sample_record()])?;
+                assert!(matches!(
+                    journal.begin_assessment(date, 0)?,
+                    DeepAttributionClaim::Fresh
+                ));
+                let row = sample_row();
+                let summary = render_deep_attribution_summary(&row);
+                let frozen = journal.freeze_result(date, 0, &row, &summary)?;
+                let frozen_bytes = fs::read(journal.result_path(date, 0)).unwrap();
+                let expected_archive = format!("{}\n", frozen.row_json).into_bytes();
+                // Recovery nests selection loading and archive writing under one guard.
+                let first = journal.recover_frozen_archives_for_dates([date, date])?;
+                assert!(first.failures.is_empty());
+                assert_eq!(first.appended, 1);
+                assert_eq!(first.already_present, 0);
+                let second = journal.recover_frozen_archives_for_dates([date])?;
+                assert!(second.failures.is_empty());
+                assert_eq!(second.appended, 0);
+                assert_eq!(second.already_present, 1);
+                assert_eq!(
+                    fs::read(journal.result_path(date, 0)).unwrap(),
+                    frozen_bytes
+                );
+                assert_eq!(
+                    fs::read(journal.archive_path(date)).unwrap(),
+                    expected_archive
+                );
+                Ok(())
+            })();
+            done_tx.send(outcome).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("nested recovery must not acquire its held date fence again")
+            .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1923,10 +2221,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("isolated-g5b-attempts");
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
-        let journal = DeepAttributionJournal {
-            dir: dir.clone(),
-            production: false,
-        };
+        let journal = DeepAttributionJournal::isolated_for_test(dir.clone());
         let mut second = sample_record();
         second.code = "600397".into();
         second.level = "参考".into();
@@ -1940,10 +2235,7 @@ mod tests {
         ));
 
         // 模拟重启后告警文件新增了更高优先级的记录。已开始的分析不可重选/重算。
-        let restarted = DeepAttributionJournal {
-            dir,
-            production: false,
-        };
+        let restarted = DeepAttributionJournal::isolated_for_test(dir);
         let mut newer = sample_record();
         newer.code = "600001".into();
         newer.level = "紧急".into();
@@ -1966,10 +2258,8 @@ mod tests {
         use crate::durable_delivery::CoordinatorConfig;
 
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         assert!(journal.inspect_existing_day(date).unwrap().is_none());
         assert!(!journal.dir.exists());
@@ -2188,10 +2478,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("isolated-g5b-attempts");
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
-        let journal = DeepAttributionJournal {
-            dir: dir.clone(),
-            production: false,
-        };
+        let journal = DeepAttributionJournal::isolated_for_test(dir.clone());
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
             journal.begin_assessment(date, 0).unwrap(),
@@ -2205,10 +2492,7 @@ mod tests {
         assert_eq!(frozen.row_sha256(), sha256_hex(frozen.row_json.as_bytes()));
         assert_eq!(frozen.summary_sha256(), sha256_hex(summary.as_bytes()));
 
-        let restarted = DeepAttributionJournal {
-            dir,
-            production: false,
-        };
+        let restarted = DeepAttributionJournal::isolated_for_test(dir);
         match restarted.begin_assessment(date, 0).unwrap() {
             DeepAttributionClaim::Frozen(replayed) => {
                 assert_eq!(replayed.row_json, frozen.row_json);
@@ -2221,10 +2505,8 @@ mod tests {
     #[test]
     fn frozen_summary_tampering_with_matching_hash_blocks_restart() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
@@ -2248,10 +2530,8 @@ mod tests {
     #[test]
     fn non_regular_attempt_marker_blocks_analysis() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         fs::create_dir(journal.attempt_path(date, 0)).unwrap();
@@ -2264,10 +2544,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
@@ -2289,10 +2567,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("isolated-g5b-attempts");
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
-        let journal = DeepAttributionJournal {
-            dir: dir.clone(),
-            production: false,
-        };
+        let journal = DeepAttributionJournal::isolated_for_test(dir.clone());
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
             journal.begin_assessment(date, 0).unwrap(),
@@ -2310,10 +2585,7 @@ mod tests {
         let expected = format!("{}\n", frozen.row_json);
         assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
 
-        let restarted = DeepAttributionJournal {
-            dir,
-            production: false,
-        };
+        let restarted = DeepAttributionJournal::isolated_for_test(dir);
         assert_eq!(
             restarted.archive_frozen_result(date, 0).unwrap(),
             DeepAttributionArchiveOutcome::AlreadyPresent
@@ -2446,10 +2718,8 @@ mod tests {
     #[test]
     fn archive_recovery_without_existing_selection_creates_nothing() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("never-created-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("never-created-attempts"));
         let after_window = NaiveDate::from_ymd_opt(2026, 9, 20)
             .unwrap()
             .and_hms_opt(15, 21, 0)
@@ -2468,10 +2738,8 @@ mod tests {
     #[test]
     fn archive_recovery_leaves_attempt_only_unresolved() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
@@ -2490,10 +2758,8 @@ mod tests {
     #[test]
     fn partial_frozen_result_blocks_reanalysis() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
@@ -2507,10 +2773,8 @@ mod tests {
     #[test]
     fn frozen_result_without_attempt_blocks_new_call() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         fs::write(journal.result_path(date, 0), b"{}").unwrap();
@@ -2521,10 +2785,8 @@ mod tests {
     #[test]
     fn incomplete_selection_fails_closed_without_reselection() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         fs::create_dir_all(&journal.dir).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(journal.selection_path(date), b"{\"schema_version\":1").unwrap();
@@ -2535,10 +2797,8 @@ mod tests {
     #[test]
     fn legacy_result_without_attempt_journal_blocks_new_analysis() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(root.path().join(format!("{date}.jsonl")), b"old result\n").unwrap();
         assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
@@ -2548,10 +2808,8 @@ mod tests {
     #[test]
     fn orphan_attempt_without_selection_blocks_reselection() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         fs::create_dir_all(&journal.dir).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(journal.attempt_path(date, 0), b"").unwrap();
@@ -2562,10 +2820,8 @@ mod tests {
     #[test]
     fn orphan_archive_lock_without_selection_blocks_reselection() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         fs::create_dir_all(&journal.dir).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(journal.dir.join(format!("{date}.archive.lock")), b"").unwrap();
@@ -2580,10 +2836,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         symlink(
             root.path().join("missing-target"),
@@ -2606,10 +2860,8 @@ mod tests {
     #[test]
     fn frozen_result_rejects_ineligible_record_before_archive_io() {
         let root = tempfile::tempdir().unwrap();
-        let journal = DeepAttributionJournal {
-            dir: root.path().join("isolated-g5b-attempts"),
-            production: false,
-        };
+        let journal =
+            DeepAttributionJournal::isolated_for_test(root.path().join("isolated-g5b-attempts"));
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         journal.load_or_select(date, vec![sample_record()]).unwrap();
         assert!(matches!(
