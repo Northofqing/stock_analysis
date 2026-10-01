@@ -141,8 +141,9 @@ be resolved to a different validated terminal; an operator acknowledgement of
 uncertainty alone cannot seal. Until the operator-closure contract is approved
 and implemented, only `PhysicalAccepted` and `EmptyInput` are eligible.
 
-Proposed durable schema migration: version 10 to 11 in
-`src/durable_delivery/schema.rs`, with `g5b_day_seals` keyed by business date,
+Proposed durable schema migration: version 11 to 12 in
+`src/durable_delivery/schema.rs` after the P-05 occurrence-owner v11 change,
+with `g5b_day_seals` keyed by business date,
 versioned evidence hashes/revisions, typed outcome, optional operator approval
 identity, immutable audit reference, and seal timestamp. Add
 `g5b_occurrence_owners` keyed by `(business_date, occurrence_identity)` and
@@ -174,7 +175,7 @@ these interfaces returns a generic delivery-success boolean.
    bytes and attempt-first semantics. Test each crash point, concurrent
    recovery versus selection, lock-order behavior, and no LLM/counted replay.
    Result: a clean exact file digest, or a fail-closed dirty state.
-3. **Durable owner and migration.** Add schema v11 day-seal and occurrence-owner
+3. **Durable owner and migration.** Add schema v12 day-seal and occurrence-owner
    tables, immutable guards, an activation-business-date gate, and G5b prepare
    admission check. Test duplicate historical rows stay Unknown without
    blocking unrelated kinds, mid-day activation refusal, same-occurrence
@@ -216,10 +217,10 @@ validation only during an authorized activation task.
 | Seal committed, later file/DB evidence differs | Raise integrity conflict; never silently rewrite the seal or claim physical delivery. |
 
 Do not activate seal writes while any alert, journal, or counted-admission
-writer can bypass the D fence. Deploy reader compatibility before the v11
-migration: the current binary rejects a schema newer than 10. The rollback
-path after migration is to disable new seal writes while preserving v11 rows
-and run a compatible binary; restoring an older binary needs a controlled DB
-restore and cannot reinterpret sealed days. Keep legacy v1 days and existing
-archive recovery intact throughout cutover. This document performs no
-deployment, migration, or production read/write.
+writer can bypass the D fence. Deploy reader compatibility before the v12
+migration: the current development source supports v11 and rejects a newer
+schema. The rollback path after migration is to disable new seal writes while
+preserving v12 rows and running a compatible binary; restoring an older binary
+needs a controlled DB restore and cannot reinterpret sealed days. Keep legacy
+v1 days and existing archive recovery intact throughout cutover. This document
+performs no deployment, migration, or production read/write.
