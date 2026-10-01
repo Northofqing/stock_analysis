@@ -10409,6 +10409,59 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
                 }
             }
+            // G5b 归档恢复不依赖模型、分析窗口或 LAST_RUN；只扫描已有冻结结果。
+            // 启动扫描一次；本进程归档失败再请求扫描，避免每 tick 重读全部历史归档。
+            struct G5bArchiveRecoveryState {
+                pending: bool,
+                last_attempt: Option<chrono::NaiveDateTime>,
+            }
+            static G5B_ARCHIVE_RECOVERY: std::sync::Mutex<G5bArchiveRecoveryState> =
+                std::sync::Mutex::new(G5bArchiveRecoveryState {
+                    pending: true,
+                    last_attempt: None,
+                });
+            let recovery_now = now.naive_local();
+            let recovery_due = {
+                let mut state = G5B_ARCHIVE_RECOVERY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.pending
+                    && state.last_attempt.is_none_or(|previous| {
+                        recovery_now < previous
+                            || recovery_now.signed_duration_since(previous)
+                                >= chrono::Duration::minutes(5)
+                    })
+                {
+                    state.last_attempt = Some(recovery_now);
+                    state.pending = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if recovery_due {
+                let journal =
+                    stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production();
+                match journal.recover_existing_frozen_archives(recovery_now) {
+                    Ok(report) => {
+                        if report.appended > 0 || report.completion_unproven > 0 {
+                            log::info!(
+                                "[g5b] 已有结果归档恢复: 新增 {}, 已存在 {}, attempt-only {} (不自动 counted)",
+                                report.appended,
+                                report.already_present,
+                                report.completion_unproven
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let mut state = G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.pending = true;
+                        log::error!("[g5b] 已有结果归档恢复失败, 五分钟后只重试补归档, 不自动重算或 counted: {error}");
+                    }
+                }
+            }
             // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
             // 窗口同 15:05-15:20; 空输入保留窗口内重查资格。选集与每次 LLM
             // attempt 先持久化, 重启后不会重选或重算已开始的非确定分析。
@@ -10494,11 +10547,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             record.triggered_at,
                                             frozen.row_sha256()
                                         ),
-                                        Err(error) => log::error!(
-                                            "[g5b] 已冻结结果归档无法确定, 不自动投递: {} {}: {error}",
-                                            record.code,
-                                            record.triggered_at
-                                        ),
+                                        Err(error) => {
+                                            log::error!(
+                                                "[g5b] 已冻结结果归档无法确定, 不自动投递: {} {}: {error}",
+                                                record.code,
+                                                record.triggered_at
+                                            );
+                                            let mut state = G5B_ARCHIVE_RECOVERY
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            state.pending = true;
+                                        }
                                     }
                                     continue;
                                 }
@@ -10555,6 +10614,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         }
                                         Err(error) => {
                                             log::warn!("[g5b] 深链归因归档失败, attempt 已记录且禁止自动重算, 需人工核对: {error}");
+                                            let mut state = G5B_ARCHIVE_RECOVERY
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            state.pending = true;
                                             failed += 1;
                                             continue;
                                         }
@@ -14209,6 +14272,40 @@ mod tests_post_session_review_scheduler {
             !scheduler[error_branch..review_window_gate].contains("continue;"),
             "selection failure must not suppress independent core review work"
         );
+    }
+
+    #[test]
+    fn g5b_archive_recovery_precedes_model_window_and_counted_handoff() {
+        let source = include_str!("main.rs");
+        let g5b = source
+            .split("// G5b 归档恢复不依赖模型、分析窗口或 LAST_RUN")
+            .nth(1)
+            .and_then(|tail| tail.split("// BR-226: 持仓快照").next())
+            .expect("G5b monitor phase");
+        let recovery = g5b
+            .find("journal.recover_existing_frozen_archives(recovery_now)")
+            .expect("read-only archive recovery");
+        let window = g5b
+            .find("if now.hour() == 15 && (5..=20).contains(&now.minute())")
+            .expect("fresh G5b analysis window");
+        let last_run = g5b
+            .find("if g5b_last_run != Some(today)")
+            .expect("fresh G5b daily gate");
+        let provider = g5b
+            .find("LlmRegistry::from_env().select(\"g5b\")")
+            .expect("fresh G5b model provider");
+        assert!(recovery < window && window < last_run && last_run < provider);
+        let no_provider_gate = g5b
+            .find("if !candidates.is_empty() && provider.is_none()")
+            .expect("fresh G5b no-provider gate");
+        let new_selection = g5b
+            .find(".load_or_select(today, candidates)")
+            .expect("fresh G5b selection");
+        assert!(provider < no_provider_gate && no_provider_gate < new_selection);
+        let recovery_phase = &g5b[..window];
+        assert!(!recovery_phase.contains("begin_assessment("));
+        assert!(!recovery_phase.contains("LlmRegistry::from_env()"));
+        assert!(!recovery_phase.contains("push_counted_with_binding("));
     }
 
     #[test]

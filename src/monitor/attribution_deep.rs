@@ -16,7 +16,7 @@
 use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
 use crate::monitor::alert_log::AlertRecord;
 use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -141,6 +141,13 @@ pub enum DeepAttributionArchiveOutcome {
     AlreadyPresent,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeepAttributionArchiveRecovery {
+    pub appended: usize,
+    pub already_present: usize,
+    pub completion_unproven: usize,
+}
+
 /// 与 G5b counted occurrence 的事件事实字段保持一致；业务日由归档路径约束。
 #[derive(PartialEq, Eq)]
 struct DeepAttributionEventKey {
@@ -254,7 +261,7 @@ impl DeepAttributionJournal {
                     .parent()
                     .expect("journal dir has parent")
                     .join(format!("{date}.jsonl"));
-                match fs::metadata(&legacy_archive) {
+                match fs::symlink_metadata(&legacy_archive) {
                     Ok(_) => {
                         return Err(DeepAttributionError::Io(format!(
                             "已有无 attempt 标记的 G5b 归档, 需人工裁定: {legacy_archive:?}"
@@ -582,6 +589,108 @@ impl DeepAttributionJournal {
         projected.push(b'\n');
         write_atomic_archive(&path, &projected)?;
         Ok(DeepAttributionArchiveOutcome::Appended)
+    }
+
+    /// 只扫描已有 journal；没有选集时不会冻结新选集或建立 Fresh attempt。
+    /// 归档可以从冻结结果补齐，counted/物理投递必须由独立权威裁定。
+    pub fn recover_existing_frozen_archives(
+        &self,
+        as_of: NaiveDateTime,
+    ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        self.ensure_allowed()?;
+        let dir_metadata = match fs::symlink_metadata(&self.dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(DeepAttributionArchiveRecovery::default())
+            }
+            Err(error) => {
+                return Err(DeepAttributionError::Io(format!(
+                    "检查 {:?}: {error}",
+                    self.dir
+                )))
+            }
+        };
+        if !dir_metadata.file_type().is_dir() {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b journal 不是目录: {:?}",
+                self.dir
+            )));
+        }
+        let mut dates = std::collections::BTreeSet::new();
+        for entry in fs::read_dir(&self.dir)
+            .map_err(|error| DeepAttributionError::Io(format!("读取 {:?}: {error}", self.dir)))?
+        {
+            let entry = entry.map_err(|error| DeepAttributionError::Io(error.to_string()))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                DeepAttributionError::Io("G5b journal 存在非 UTF-8 文件名".to_string())
+            })?;
+            let date_text = if let Some(date) = name.strip_suffix(".selection.json") {
+                Some(date)
+            } else if let Some(date) = name.strip_suffix(".archive.lock") {
+                Some(date)
+            } else if name.ends_with(".attempt") || name.ends_with(".result.json") {
+                name.get(..10)
+            } else {
+                None
+            };
+            let Some(date_text) = date_text else {
+                continue;
+            };
+            let date = NaiveDate::parse_from_str(date_text, "%Y-%m-%d").map_err(|error| {
+                DeepAttributionError::Io(format!("G5b journal 日期文件名无效 {name:?}: {error}"))
+            })?;
+            if date.to_string() != date_text {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b journal 日期文件名非标准格式: {name:?}"
+                )));
+            }
+            if date <= as_of.date() {
+                dates.insert(date);
+            }
+        }
+
+        let mut recovery = DeepAttributionArchiveRecovery::default();
+        for date in dates {
+            // 空输入只加载已存在选集；孤儿 attempt/result/lock 会 fail closed。
+            let events = self.load_or_select(date, Vec::new())?;
+            for index in 0..events.len() {
+                let result_path = self.result_path(date, index);
+                match fs::symlink_metadata(&result_path) {
+                    Ok(metadata) if !metadata.file_type().is_file() => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "G5b 冻结结果不是普通文件: {result_path:?}"
+                        )))
+                    }
+                    Ok(_) => match self.archive_frozen_result(date, index)? {
+                        DeepAttributionArchiveOutcome::Appended => recovery.appended += 1,
+                        DeepAttributionArchiveOutcome::AlreadyPresent => {
+                            recovery.already_present += 1
+                        }
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        let attempt = self.attempt_path(date, index);
+                        match fs::symlink_metadata(&attempt) {
+                            Ok(_) => {
+                                self.validate_attempt_marker(date, index)?;
+                                recovery.completion_unproven += 1;
+                            }
+                            Err(error) if error.kind() == ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(DeepAttributionError::Io(format!(
+                                    "检查 {attempt:?}: {error}"
+                                )))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "检查 {result_path:?}: {error}"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(recovery)
     }
 }
 
@@ -1393,6 +1502,75 @@ mod tests {
     }
 
     #[test]
+    fn archive_recovery_after_window_needs_no_provider_or_new_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, date, frozen) = prepared_archive_journal(root.path());
+        let after_window = date.and_hms_opt(15, 21, 0).unwrap();
+
+        let first = journal
+            .recover_existing_frozen_archives(after_window)
+            .unwrap();
+        assert_eq!(first.appended, 1);
+        assert_eq!(first.already_present, 0);
+        assert_eq!(first.completion_unproven, 0);
+        let archive = journal.archive_path(date);
+        let expected = format!("{}\n", frozen.row_json);
+        assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
+
+        let second = journal
+            .recover_existing_frozen_archives(after_window)
+            .unwrap();
+        assert_eq!(second.appended, 0);
+        assert_eq!(second.already_present, 1);
+        assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
+        assert!(!journal.attempt_path(date, 1).exists());
+    }
+
+    #[test]
+    fn archive_recovery_without_existing_selection_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("never-created-attempts"),
+            production: false,
+        };
+        let after_window = NaiveDate::from_ymd_opt(2026, 9, 20)
+            .unwrap()
+            .and_hms_opt(15, 21, 0)
+            .unwrap();
+
+        let report = journal
+            .recover_existing_frozen_archives(after_window)
+            .unwrap();
+        assert_eq!(report.appended, 0);
+        assert_eq!(report.already_present, 0);
+        assert_eq!(report.completion_unproven, 0);
+        assert!(!journal.dir.exists());
+        assert!(!journal.archive_path(after_window.date()).exists());
+    }
+
+    #[test]
+    fn archive_recovery_leaves_attempt_only_unresolved() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        journal.load_or_select(date, vec![sample_record()]).unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+
+        let report = journal
+            .recover_existing_frozen_archives(date.and_hms_opt(15, 21, 0).unwrap())
+            .unwrap();
+        assert_eq!(report.completion_unproven, 1);
+        assert!(!journal.result_path(date, 0).exists());
+        assert!(!journal.archive_path(date).exists());
+    }
+
+    #[test]
     fn partial_frozen_result_blocks_reanalysis() {
         let root = tempfile::tempdir().unwrap();
         let journal = DeepAttributionJournal {
@@ -1474,6 +1652,27 @@ mod tests {
         fs::create_dir_all(&journal.dir).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
         fs::write(journal.dir.join(format!("{date}.archive.lock")), b"").unwrap();
+
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.selection_path(date).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legacy_archive_blocks_new_selection() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        symlink(
+            root.path().join("missing-target"),
+            journal.archive_path(date),
+        )
+        .unwrap();
 
         assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
         assert!(!journal.selection_path(date).exists());
