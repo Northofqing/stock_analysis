@@ -233,7 +233,11 @@ fn validate_input(input: &P05ObservedDraftInput) -> Result<()> {
     Ok(())
 }
 fn ensure_no_legacy_family(connection: &Connection, date: &str) -> Result<()> {
-    let count:i64=connection.query_row("SELECT COUNT(*) FROM delivery_decisions WHERE business_date=?1 AND push_kind IN ('auction_repush_v1','candidate_board_v1','candidate_invalidated_v1')",[date],|r|r.get(0))?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM delivery_decisions WHERE business_date=?1 AND push_kind IN (?2,?3,?4)",
+        params![date, PushKind::AuctionRepush.as_str(), PushKind::CandidateBoard.as_str(), PushKind::CandidateInvalidated.as_str()],
+        |r| r.get(0),
+    )?;
     if count != 0 {
         return Err(invalid("same-day affected legacy decision or owner exists"));
     }

@@ -25,7 +25,7 @@ fn operational() -> (tempfile::TempDir, DatabaseManager) {
 }
 fn observed(strong: bool, second: u32) -> P05ObservedDraftInput {
     let entries = vec![CandidateEntry {
-        code: "600001".into(),
+        code: "TEST_CODE_P05_STRONG".into(),
         name: "TEST_CODE genuine observed row".into(),
         sources: vec![CandidateSource::StockPick],
         tier: if strong {
@@ -338,7 +338,7 @@ fn p05_unit_store_prospective_requires_verified_day_pre0920_and_absent_real_resi
         DATE,
         "2026-10-08",
         None,
-        Some("600001"),
+        Some("TEST_CODE_P05_STRONG"),
         "up",
         80.0,
         Some("candidate-strong"),
@@ -358,25 +358,43 @@ fn p05_unit_store_prospective_requires_verified_day_pre0920_and_absent_real_resi
 
 #[test]
 fn p05_unit_store_affected_legacy_decision_blocks_origin_but_unrelated_family_does_not() {
-    for kind in [PushKind::AuctionRepush, PushKind::HoldingEvent] {
+    for kind in [
+        PushKind::AuctionRepush,
+        PushKind::CandidateBoard,
+        PushKind::CandidateInvalidated,
+        PushKind::HoldingEvent,
+    ] {
         let fixture = Fixture::new("P05_PROSPECTIVE_LEGACY_OWNER");
         let (_dir, db) = operational();
-        let source = b"TEST_CODE existing legacy observational source".to_vec();
+        let rendered = b"TEST_CODE existing legacy rendered bytes".to_vec();
+        let source = if kind == PushKind::CandidateBoard {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"candidate-board-v1", "business_date":DATE,
+                "rendered_sha256":sha256_hex(&rendered)
+            }))
+            .unwrap()
+        } else {
+            b"TEST_CODE existing legacy observational source".to_vec()
+        };
         let hash = sha256_hex(&source);
         let envelope = DeliveryEnvelope::new(
             DATE,
             kind,
             super::super::super::model::DeliverySubKind::None,
-            if kind == PushKind::AuctionRepush {
+            if matches!(kind, PushKind::AuctionRepush | PushKind::CandidateBoard) {
                 "GLOBAL"
             } else {
                 "SSE:EQUITY:TEST_CODE_P05_LEGACY"
             },
-            "TEST_CODE legacy occurrence",
+            if kind == PushKind::CandidateBoard {
+                "candidate-board:2026-09-23:09:18"
+            } else {
+                "TEST_CODE legacy occurrence"
+            },
             &hash,
             source,
             &hash,
-            b"TEST_CODE existing legacy rendered bytes".to_vec(),
+            rendered,
             false,
             None,
         )
@@ -411,7 +429,7 @@ fn p05_unit_store_legacy_snapshot_exists_or_alias_blocks_prospective_without_ado
     let dir = parent.join("candidate_board_snapshot");
     fs::create_dir(&dir).unwrap();
     let leaf = dir.join(format!("{DATE}.jsonl"));
-    fs::write(&leaf, b"[\"600001\"]\n").unwrap();
+    fs::write(&leaf, b"[\"TEST_CODE_P05_STRONG\"]\n").unwrap();
     assert!(fixture
         .coordinator
         .initialize_prospective_p05_family_at(&db, at(9, 19, 0), Some(parent))
@@ -502,7 +520,7 @@ fn p05_unit_store_same_card_codes_different_actual_score_cannot_adopt_or_resave(
         DATE,
         "09:21",
         draft.board_rendered_bytes().to_vec(),
-        vec![("600001".into(), 81.0)],
+        vec![("TEST_CODE_P05_STRONG".into(), 81.0)],
     )
     .unwrap();
     let frozen = match prepare_candidate_board_on(&db, &request).unwrap() {
@@ -601,7 +619,7 @@ fn p05_unit_store_no_strong_cannot_bypass_existing_v2_freeze() {
         DATE,
         "09:21",
         draft.board_rendered_bytes().to_vec(),
-        vec![("600001".into(), 80.0)],
+        vec![("TEST_CODE_P05_STRONG".into(), 80.0)],
     )
     .unwrap();
     prepare_candidate_board_on(&db, &request).unwrap();
