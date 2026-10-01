@@ -292,6 +292,78 @@ impl G5bSelectedEventsObservation {
     }
 }
 
+/// Counts for one reconciled selected-event observation. Outcome counts are
+/// disjoint; `without_exact_archive` is an additional filesystem dimension.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct G5bCompletionCounts {
+    pub selected: usize,
+    pub not_started: usize,
+    pub completion_unproven: usize,
+    pub no_counted_decision: usize,
+    pub pending: usize,
+    /// Validated physical Accepted receipts only.
+    pub accepted: usize,
+    /// Manual resolution, never a physical Accepted receipt.
+    pub manual_accepted: usize,
+    pub rejected: usize,
+    pub uncertain: usize,
+    pub manual_not_delivered: usize,
+    /// Includes selected events that have no frozen result yet.
+    pub without_exact_archive: usize,
+}
+
+/// Point-in-time classification of reconciled G5b evidence. Even
+/// `TerminalOutcomesObserved` cannot authorize a day seal: journal files and
+/// SQLite do not share an atomic snapshot, and a selection is not an input
+/// cutoff. Reconciliation errors are returned by the inspector, not mapped to
+/// a verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum G5bCompletionVerdict {
+    NoSelection,
+    Incomplete(G5bCompletionCounts),
+    TerminalOutcomesObserved(G5bCompletionCounts),
+}
+
+fn classify_g5b_completion(
+    observation: Option<&G5bSelectedEventsObservation>,
+) -> G5bCompletionVerdict {
+    let Some(observation) = observation else {
+        return G5bCompletionVerdict::NoSelection;
+    };
+    let mut counts = G5bCompletionCounts {
+        selected: observation.events.len(),
+        ..G5bCompletionCounts::default()
+    };
+    for event in &observation.events {
+        match event.completion {
+            G5bSelectedEventState::NotStarted => counts.not_started += 1,
+            G5bSelectedEventState::CompletionUnproven => counts.completion_unproven += 1,
+            G5bSelectedEventState::NoCountedDecision => counts.no_counted_decision += 1,
+            G5bSelectedEventState::Pending => counts.pending += 1,
+            G5bSelectedEventState::Accepted => counts.accepted += 1,
+            G5bSelectedEventState::ManualAccepted => counts.manual_accepted += 1,
+            G5bSelectedEventState::Rejected => counts.rejected += 1,
+            G5bSelectedEventState::Uncertain => counts.uncertain += 1,
+            G5bSelectedEventState::ManualNotDelivered => counts.manual_not_delivered += 1,
+        }
+        if event.archived != Some(true) {
+            counts.without_exact_archive += 1;
+        }
+    }
+    if counts.selected == 0
+        || counts.not_started != 0
+        || counts.completion_unproven != 0
+        || counts.no_counted_decision != 0
+        || counts.pending != 0
+        || counts.uncertain != 0
+        || counts.without_exact_archive != 0
+    {
+        G5bCompletionVerdict::Incomplete(counts)
+    } else {
+        G5bCompletionVerdict::TerminalOutcomesObserved(counts)
+    }
+}
+
 #[derive(Debug)]
 pub enum G5bSelectedEventsObservationError {
     Journal(DeepAttributionError),
@@ -344,6 +416,18 @@ impl From<&AlertRecord> for DeepAttributionEventKey {
 }
 
 impl DeepAttributionJournal {
+    /// Classify the existing selected events and one validated counted-day DB
+    /// snapshot without changing journal, delivery, or day-gate state. This
+    /// verdict is observational and cannot seal `G5B_LAST_RUN`.
+    pub fn inspect_completion_verdict(
+        &self,
+        date: NaiveDate,
+        coordinator: &DurableDeliveryCoordinator,
+    ) -> Result<G5bCompletionVerdict, G5bSelectedEventsObservationError> {
+        let observation = self.inspect_selected_events_delivery(date, coordinator)?;
+        Ok(classify_g5b_completion(observation.as_ref()))
+    }
+
     pub fn production() -> Self {
         Self {
             dir: PathBuf::from("data/g5b/attempts"),
@@ -1986,6 +2070,80 @@ mod tests {
             selected_state_for_counted_terminal(Terminal::Accepted),
             selected_state_for_counted_terminal(Terminal::ManualAccepted)
         );
+    }
+
+    #[test]
+    fn g5b_completion_verdict_keeps_manual_and_negative_outcomes_distinct() {
+        use G5bCompletionVerdict as Verdict;
+        use G5bSelectedEventState as State;
+
+        assert_eq!(classify_g5b_completion(None), Verdict::NoSelection);
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let observation = |states: &[(State, Option<bool>)]| G5bSelectedEventsObservation {
+            business_date: date,
+            events: states
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (completion, archived))| G5bSelectedEventObservation {
+                        index,
+                        record: sample_record(),
+                        archived: *archived,
+                        completion: *completion,
+                        decision_identity: None,
+                    },
+                )
+                .collect(),
+        };
+
+        let terminal = observation(&[
+            (State::Accepted, Some(true)),
+            (State::ManualAccepted, Some(true)),
+            (State::Rejected, Some(true)),
+            (State::ManualNotDelivered, Some(true)),
+        ]);
+        assert_eq!(
+            classify_g5b_completion(Some(&terminal)),
+            Verdict::TerminalOutcomesObserved(G5bCompletionCounts {
+                selected: 4,
+                accepted: 1,
+                manual_accepted: 1,
+                rejected: 1,
+                manual_not_delivered: 1,
+                ..G5bCompletionCounts::default()
+            })
+        );
+
+        for incomplete_state in [
+            State::NotStarted,
+            State::CompletionUnproven,
+            State::NoCountedDecision,
+            State::Pending,
+            State::Uncertain,
+        ] {
+            let day = observation(&[
+                (State::Accepted, Some(true)),
+                (incomplete_state, Some(true)),
+            ]);
+            assert!(matches!(
+                classify_g5b_completion(Some(&day)),
+                Verdict::Incomplete(_)
+            ));
+        }
+        let missing_archive = observation(&[(State::Accepted, Some(false))]);
+        assert_eq!(
+            classify_g5b_completion(Some(&missing_archive)),
+            Verdict::Incomplete(G5bCompletionCounts {
+                selected: 1,
+                accepted: 1,
+                without_exact_archive: 1,
+                ..G5bCompletionCounts::default()
+            })
+        );
+        assert!(matches!(
+            classify_g5b_completion(Some(&observation(&[]))),
+            Verdict::Incomplete(_)
+        ));
     }
 
     #[test]
