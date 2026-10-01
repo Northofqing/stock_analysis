@@ -21,8 +21,8 @@ fn archive_email(subject: &str, markdown: &str, html: &str, image_path: Option<&
     use std::fs;
 
     let dir = PathBuf::from("reports").join("email_archive");
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("邮件归档目录创建失败: {}（跳过归档）", e);
+    if fs::create_dir_all(&dir).is_err() {
+        warn!("邮件归档目录创建失败（跳过归档）");
         return;
     }
 
@@ -50,13 +50,13 @@ fn archive_email(subject: &str, markdown: &str, html: &str, image_path: Option<&
         html,
     );
 
-    if let Err(e) = fs::write(&md_path, md_body) {
-        warn!("邮件原文（md）写入失败 {}: {}", md_path.display(), e);
+    if fs::write(&md_path, md_body).is_err() {
+        warn!("邮件原文（md）写入失败");
     } else {
-        info!("📥 邮件原文已归档: {}", md_path.display());
+        info!("📥 邮件原文（md）已归档");
     }
-    if let Err(e) = fs::write(&html_path, html_body) {
-        warn!("邮件原文（html）写入失败 {}: {}", html_path.display(), e);
+    if fs::write(&html_path, html_body).is_err() {
+        warn!("邮件原文（html）写入失败");
     }
 }
 
@@ -96,13 +96,7 @@ impl NotificationService {
         let primary = &self.config.email_receivers[0];
         let cc_list: Vec<&String> = self.config.email_receivers.iter().skip(1).collect();
 
-        info!(
-            "准备发送邮件到主收件人: {}，抄送 {} 位，SMTP: {}:{}",
-            primary,
-            cc_list.len(),
-            smtp_server,
-            smtp_port
-        );
+        info!("准备发送邮件：主收件人 1 位，抄送 {} 位", cc_list.len());
 
         // 转换 Markdown 为 HTML
         let html_content = self.markdown_to_html(content);
@@ -125,11 +119,7 @@ impl NotificationService {
             password,
         )?;
 
-        info!(
-            "邮件发送成功: 主收件人 {}，抄送 {} 位",
-            primary,
-            cc_list.len()
-        );
+        info!("邮件发送成功：主收件人 1 位，抄送 {} 位", cc_list.len());
         Ok(true)
     }
 
@@ -151,36 +141,50 @@ impl NotificationService {
         password: &str,
     ) -> Result<()> {
         // 构建邮件
-        let mut builder = Message::builder().from(from.parse()?).to(to.parse()?);
+        let mut builder = Message::builder()
+            .from(
+                from.parse()
+                    .map_err(|_| anyhow::anyhow!("邮件发送者地址无效"))?,
+            )
+            .to(to
+                .parse()
+                .map_err(|_| anyhow::anyhow!("邮件主收件人地址无效"))?);
 
         for cc in cc_list {
-            builder = builder.cc(cc.parse()?);
+            builder = builder.cc(cc
+                .parse()
+                .map_err(|_| anyhow::anyhow!("邮件抄送地址无效"))?);
         }
 
-        let email = builder.subject(subject).multipart(
-            MultiPart::alternative()
-                .singlepart(
-                    SinglePart::builder()
-                        .header(header::ContentType::TEXT_PLAIN)
-                        .body(text_content.to_string()),
-                )
-                .singlepart(
-                    SinglePart::builder()
-                        .header(header::ContentType::TEXT_HTML)
-                        .body(html_content.to_string()),
-                ),
-        )?;
+        let email = builder
+            .subject(subject)
+            .multipart(
+                MultiPart::alternative()
+                    .singlepart(
+                        SinglePart::builder()
+                            .header(header::ContentType::TEXT_PLAIN)
+                            .body(text_content.to_string()),
+                    )
+                    .singlepart(
+                        SinglePart::builder()
+                            .header(header::ContentType::TEXT_HTML)
+                            .body(html_content.to_string()),
+                    ),
+            )
+            .map_err(|_| anyhow::anyhow!("邮件内容构建失败"))?;
 
         // 配置 SMTP
         let creds = Credentials::new(from.to_string(), password.to_string());
 
         let mailer = if smtp_port == 465 {
-            SmtpTransport::relay(smtp_server)?
+            SmtpTransport::relay(smtp_server)
+                .map_err(|_| anyhow::anyhow!("SMTP 中继配置无效"))?
                 .credentials(creds)
                 .timeout(Some(Duration::from_secs(120)))
                 .build()
         } else {
-            SmtpTransport::starttls_relay(smtp_server)?
+            SmtpTransport::starttls_relay(smtp_server)
+                .map_err(|_| anyhow::anyhow!("SMTP STARTTLS 配置无效"))?
                 .port(smtp_port)
                 .credentials(creds)
                 .timeout(Some(Duration::from_secs(120)))
@@ -189,13 +193,11 @@ impl NotificationService {
 
         // 发送（带重试）
         let max_retries = 3;
-        let mut last_err = None;
         for attempt in 1..=max_retries {
             match mailer.send(&email) {
                 Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!("邮件发送第 {} 次尝试失败: {}", attempt, e);
-                    last_err = Some(e);
+                Err(_) => {
+                    warn!("邮件发送第 {} 次尝试失败", attempt);
                     if attempt < max_retries {
                         std::thread::sleep(Duration::from_secs(attempt as u64 * 3));
                     }
@@ -203,7 +205,7 @@ impl NotificationService {
             }
         }
 
-        Err(last_err.unwrap().into())
+        Err(anyhow::anyhow!("SMTP 发送失败，重试已耗尽"))
     }
 
     /// 发送带图片的邮件
@@ -236,8 +238,7 @@ impl NotificationService {
         let cc_list: Vec<&String> = self.config.email_receivers.iter().skip(1).collect();
 
         info!(
-            "准备发送带图片的邮件到主收件人: {}，抄送 {} 位",
-            primary,
+            "准备发送带图片的邮件：主收件人 1 位，抄送 {} 位",
             cc_list.len()
         );
 
@@ -245,7 +246,8 @@ impl NotificationService {
         let html_content = self.markdown_to_html(content);
 
         // 读取图片
-        let image_data = std::fs::read(image_path).context("读取图片文件失败")?;
+        let image_data =
+            std::fs::read(image_path).map_err(|_| anyhow::anyhow!("读取图片文件失败"))?;
         let image_filename = image_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -275,8 +277,7 @@ impl NotificationService {
         )?;
 
         info!(
-            "邮件（含图表）发送成功: 主收件人 {}，抄送 {} 位",
-            primary,
+            "邮件（含图表）发送成功：主收件人 1 位，抄送 {} 位",
             cc_list.len()
         );
         Ok(true)
@@ -311,43 +312,61 @@ impl NotificationService {
         );
 
         // 构建邮件
-        let mut builder = Message::builder().from(from.parse()?).to(to.parse()?);
+        let mut builder = Message::builder()
+            .from(
+                from.parse()
+                    .map_err(|_| anyhow::anyhow!("邮件发送者地址无效"))?,
+            )
+            .to(to
+                .parse()
+                .map_err(|_| anyhow::anyhow!("邮件主收件人地址无效"))?);
 
         for cc in cc_list {
-            builder = builder.cc(cc.parse()?);
+            builder = builder.cc(cc
+                .parse()
+                .map_err(|_| anyhow::anyhow!("邮件抄送地址无效"))?);
         }
 
-        let email = builder.subject(subject).multipart(
-            MultiPart::mixed()
-                .multipart(
-                    MultiPart::alternative()
-                        .singlepart(
-                            SinglePart::builder()
-                                .header(header::ContentType::TEXT_PLAIN)
-                                .body(text_content.to_string()),
-                        )
-                        .singlepart(
-                            SinglePart::builder()
-                                .header(header::ContentType::TEXT_HTML)
-                                .body(html_with_image),
+        let email = builder
+            .subject(subject)
+            .multipart(
+                MultiPart::mixed()
+                    .multipart(
+                        MultiPart::alternative()
+                            .singlepart(
+                                SinglePart::builder()
+                                    .header(header::ContentType::TEXT_PLAIN)
+                                    .body(text_content.to_string()),
+                            )
+                            .singlepart(
+                                SinglePart::builder()
+                                    .header(header::ContentType::TEXT_HTML)
+                                    .body(html_with_image),
+                            ),
+                    )
+                    .singlepart(
+                        Attachment::new_inline(image_filename.to_string()).body(
+                            image_data.to_vec(),
+                            "image/png"
+                                .parse()
+                                .map_err(|_| anyhow::anyhow!("邮件图片 MIME 类型无效"))?,
                         ),
-                )
-                .singlepart(
-                    Attachment::new_inline(image_filename.to_string())
-                        .body(image_data.to_vec(), "image/png".parse()?),
-                ),
-        )?;
+                    ),
+            )
+            .map_err(|_| anyhow::anyhow!("邮件图片内容构建失败"))?;
 
         // 配置 SMTP
         let creds = Credentials::new(from.to_string(), password.to_string());
 
         let mailer = if smtp_port == 465 {
-            SmtpTransport::relay(smtp_server)?
+            SmtpTransport::relay(smtp_server)
+                .map_err(|_| anyhow::anyhow!("SMTP 中继配置无效"))?
                 .credentials(creds)
                 .timeout(Some(Duration::from_secs(120)))
                 .build()
         } else {
-            SmtpTransport::starttls_relay(smtp_server)?
+            SmtpTransport::starttls_relay(smtp_server)
+                .map_err(|_| anyhow::anyhow!("SMTP STARTTLS 配置无效"))?
                 .port(smtp_port)
                 .credentials(creds)
                 .timeout(Some(Duration::from_secs(120)))
@@ -356,13 +375,11 @@ impl NotificationService {
 
         // 发送邮件（带重试）
         let max_retries = 3;
-        let mut last_err = None;
         for attempt in 1..=max_retries {
             match mailer.send(&email) {
                 Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!("邮件发送第 {} 次尝试失败: {}", attempt, e);
-                    last_err = Some(e);
+                Err(_) => {
+                    warn!("邮件发送第 {} 次尝试失败", attempt);
                     if attempt < max_retries {
                         std::thread::sleep(Duration::from_secs(attempt as u64 * 3));
                     }
@@ -370,7 +387,7 @@ impl NotificationService {
             }
         }
 
-        Err(last_err.unwrap().into())
+        Err(anyhow::anyhow!("SMTP 发送失败，重试已耗尽"))
     }
 }
 
@@ -397,5 +414,24 @@ mod gate_d_tests {
             )
             .unwrap_err();
         assert!(image_err.to_string().contains("EMAIL_SENDER"));
+    }
+
+    #[test]
+    fn invalid_recipient_address_does_not_escape_in_error() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let error = service
+            .send_single_email(
+                "sender@example.com",
+                "TEST_SECRET@@example.com",
+                &[],
+                "TEST_CODE subject",
+                "TEST_CODE body",
+                "TEST_CODE html",
+                "smtp.example.com",
+                465,
+                "TEST_SECRET_PASSWORD",
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "邮件主收件人地址无效");
     }
 }

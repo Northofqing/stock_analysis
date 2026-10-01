@@ -1380,6 +1380,51 @@ fn declare_test_catalog_v2(db: &DatabaseManager) {
 }
 
 #[test]
+fn staged_v2_fee_schema_preserves_v1_effective_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(
+        dir.path().join("TEST_CODE_staged_v2_fee_schema.db"),
+    )
+    .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "v1-before-v2",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(before.rows().unwrap().len(), 1);
+    let view_before = ledger.read(&binding).unwrap();
+
+    let policy =
+        crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+    let staged = crate::database::paper_book_v2_schema::stage_for_isolated_test(
+        &mut db.get_conn().unwrap(),
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(staged.policy_instance_id(), policy.instance_id());
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after.lineage(), before.lineage());
+    assert_eq!(ledger.read(&binding).unwrap(), view_before);
+}
+
+#[test]
 fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_catalog_v3.db"))
@@ -1432,6 +1477,729 @@ fn task8_catalog_v3_preserves_paper_projection_and_adjudication() {
         .rows()
         .unwrap()
         .is_empty());
+}
+
+fn catalog_v5_cutover_fixture() -> (
+    tempfile::TempDir,
+    DatabaseManager,
+    AccountBinding,
+    crate::trading::paper_book_v2::TestCutoverRequest,
+) {
+    use crate::trading::paper_book_v2::TestCutoverRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v5_cutover.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    ledger.apply(PaperCommand::Execute(order(
+        &ledger, &binding, "nonempty-lot", Direction::Buy, 10.0, instant(),
+    ))).unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy = crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        ).unwrap();
+        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(&mut conn).unwrap();
+    }
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    assert!(!ledger.read(&binding).unwrap().lots.is_empty());
+    let request = TestCutoverRequest {
+        old_binding: binding.clone(),
+        new_epoch_id: "TEST_CODE_EPOCH_V2".into(),
+        cutover_id: "TEST_CODE_CUTOVER_V2".into(),
+        command_id: "TEST_CODE_GENESIS_V2".into(),
+        expected_v1_version: snapshot.version,
+        expected_v1_head_hash: snapshot.event_hash,
+        expected_v1_projection_hash: snapshot.projection_hash,
+        reviewed_fee_policy: crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
+    };
+    (dir, db, binding, request)
+}
+
+#[test]
+fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+    assert!(matches!(read_v2_on(&db, &binding.account_id), Err(LedgerError::InactiveEpoch)));
+    let ledger = PaperLedger::open(&db, &instant);
+    let before = ledger.read(&binding).unwrap();
+    let effective_request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before_fills = ledger.verified_effective_fills(&effective_request).unwrap();
+    let before_bytes = {
+        let mut conn = db.get_conn().unwrap();
+        (events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(),
+         head(&mut conn, &binding).unwrap().unwrap().projection_bytes)
+    };
+    let receipt = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(!receipt.already_applied);
+    assert_eq!(receipt.epoch_id, request.new_epoch_id);
+    let genesis = read_v2_on(&db, &binding.account_id).unwrap();
+    assert_eq!(genesis.epoch_id, receipt.epoch_id);
+    assert_eq!(genesis.manifest_hash, receipt.manifest_hash);
+    assert_eq!(genesis.event_hash, receipt.event_hash);
+    assert_eq!(genesis.v1_head_version, request.expected_v1_version);
+    assert_eq!(genesis.v1_head_hash, request.expected_v1_head_hash);
+    assert_eq!(genesis.projection_bytes, before_bytes.1.as_bytes());
+    assert_eq!(ledger.read(&binding).unwrap(), before);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    let after_fills = ledger.verified_effective_fills(&effective_request).unwrap();
+    assert_eq!(before_fills.rows().unwrap(), after_fills.rows().unwrap());
+    assert_eq!(before_fills.lineage(), after_fills.lineage());
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(), before_bytes.0);
+        assert_eq!(head(&mut conn, &binding).unwrap().unwrap().projection_bytes, before_bytes.1);
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        for sql in [
+            "INSERT INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('TEST_CODE_ACCOUNT',3,'raw','prev','new','new')",
+            "INSERT OR REPLACE INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('TEST_CODE_ACCOUNT',1,'seed-v1','prev','new','new')",
+            "INSERT OR REPLACE INTO paper_ledger_head VALUES ('TEST_CODE_ACCOUNT',9,'new','new','new')",
+            "UPDATE paper_ledger_head SET version=9 WHERE account_id='TEST_CODE_ACCOUNT'",
+            "DELETE FROM paper_ledger_head WHERE account_id='TEST_CODE_ACCOUNT'",
+            "INSERT INTO paper_book_v2_event (account_id,seq,command_id,previous_hash,event_hash,kind,payload) VALUES ('TEST_CODE_ACCOUNT',2,'fill','x','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff','Fill','x')",
+        ] {
+            assert!(diesel::sql_query(sql).execute(&mut conn).is_err(), "{sql}");
+        }
+    }
+    assert!(matches!(ledger.apply(PaperCommand::Execute(order(
+        &ledger, &binding, "after-cutover", Direction::Buy, 10.0, instant(),
+    ))), Err(LedgerError::InactiveEpoch)));
+    let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(repeated.already_applied);
+    assert_eq!(repeated.event_hash, receipt.event_hash);
+    let mut different = request.clone();
+    different.cutover_id = "TEST_CODE_DIFFERENT_CUTOVER".into();
+    assert!(matches!(cutover_for_isolated_test(&db, &different, TestCutoverFault::None), Err(LedgerError::IdentityConflict)));
+}
+
+#[test]
+fn catalog_v5_cutover_replays_adjudicated_v1_without_catalog_recursion() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, binding, mut request) = catalog_v5_cutover_fixture();
+    let ledger = PaperLedger::open(&db, &instant);
+    let fill_id = ledger.effective_fills(&binding).unwrap()[0].paper_trade_id;
+    ledger.adjudicate(ruling_for(&ledger, &binding, fill_id, "TEST_CODE_v5_ruling")).unwrap();
+    let before = ledger.read(&binding).unwrap();
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    request.expected_v1_version = snapshot.version;
+    request.expected_v1_head_hash = snapshot.event_hash;
+    request.expected_v1_projection_hash = snapshot.projection_hash;
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert_eq!(ledger.read(&binding).unwrap(), before);
+}
+
+#[test]
+fn catalog_v5_owner_replay_validates_global_audit_chain_once_for_multiple_rulings() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    let (_dir, db, binding, mut request) = catalog_v5_cutover_fixture();
+    let ledger = PaperLedger::open(&db, &instant);
+    let fill_id = ledger.effective_fills(&binding).unwrap()[0].paper_trade_id;
+    let mut ruling = ruling_for(&ledger, &binding, fill_id, "TEST_CODE_v5_first_ruling");
+    let first = ledger.adjudicate(ruling.clone()).unwrap();
+    ruling.request_id = "TEST_CODE_v5_second_ruling".into();
+    ruling.expected_version = first.version;
+    ruling.expected_head = first.event_hash.clone();
+    ruling.expected_predecessor = Some(first.event_hash);
+    ruling.action = AdjudicationAction::CorrectionDeclared {
+        price: Money::from_cny(9.0).unwrap(),
+        quantity: 100,
+        fact_at: instant(),
+    };
+    ledger.adjudicate(ruling).unwrap();
+    let snapshot = {
+        let mut conn = db.get_conn().unwrap();
+        verified_v1_snapshot_on(&mut conn, &binding).unwrap()
+    };
+    request.expected_v1_version = snapshot.version;
+    request.expected_v1_head_hash = snapshot.event_hash;
+    request.expected_v1_projection_hash = snapshot.projection_hash;
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    crate::database::order_audit::take_order_audit_chain_validations_for_test();
+    read_v2_on(&db, &binding.account_id).unwrap();
+    assert_eq!(
+        crate::database::order_audit::take_order_audit_chain_validations_for_test(),
+        1,
+        "one full global audit replay per V5 owner verification"
+    );
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.batch_execute(
+            "DROP TRIGGER trg_order_audit_chain_no_update;
+             UPDATE order_audit_chain SET record_hash='TEST_CODE_TAMPERED';
+             CREATE TRIGGER IF NOT EXISTS trg_order_audit_chain_no_update
+             BEFORE UPDATE ON order_audit_chain
+             BEGIN SELECT RAISE(ABORT, 'BR-086 order audit hash chain is immutable'); END",
+        ).unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn)
+            .unwrap();
+    }
+    assert!(read_v2_on(&db, &binding.account_id).is_err());
+    assert_eq!(
+        crate::database::order_audit::take_order_audit_chain_validations_for_test(),
+        1,
+        "a new V5 read must revalidate the audit chain"
+    );
+}
+
+#[test]
+fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+    for fault in [TestCutoverFault::AfterGenesisWrites, TestCutoverFault::AfterOwnerCas] {
+        assert!(matches!(cutover_for_isolated_test(&db, &request, fault), Err(LedgerError::Database(_))));
+        let mut conn = db.get_conn().unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
+        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+        assert!(diesel::sql_query("UPDATE paper_book_owner_v2 SET active_generation=2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .execute(&mut conn).is_err());
+    }
+    assert_eq!(PaperLedger::open(&db, &instant).read(&binding).unwrap().version, request.expected_v1_version);
+    assert!(matches!(cutover_for_isolated_test(&db, &request, TestCutoverFault::AfterCommitOutcomeUnknown), Err(LedgerError::CommitOutcomeUnknown)));
+    let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(repeated.already_applied);
+}
+
+#[test]
+fn catalog_v5_cutover_reports_real_commit_failure_as_unknown_and_retries_same_identity() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    assert!(matches!(
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::DeferredForeignKeyOnCommit),
+        Err(LedgerError::CommitOutcomeUnknown)
+    ));
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+        assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
+        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+    }
+    let retried = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    assert!(!retried.already_applied);
+    assert!(cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap().already_applied);
+}
+
+#[test]
+fn catalog_v5_cutover_rejects_fee_head_and_epoch_claims_without_residue() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    use crate::performance::fee_policy::{AShareFeePolicyV2, FeeRate};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    let mut stale = request.clone();
+    stale.expected_v1_version += 1;
+    assert!(matches!(cutover_for_isolated_test(&db, &stale, TestCutoverFault::None), Err(LedgerError::VersionChanged)));
+    let mut reused = request.clone();
+    reused.new_epoch_id = request.old_binding.epoch_id.clone();
+    assert!(cutover_for_isolated_test(&db, &reused, TestCutoverFault::None).is_err());
+    let mut wrong_fee = request.clone();
+    wrong_fee.reviewed_fee_policy = AShareFeePolicyV2::new(
+        request.reviewed_fee_policy.scope(), FeeRate::new(4,10_000).unwrap(),
+        5_000_000, request.reviewed_fee_policy.coverage(), "TEST_CODE_other_review",
+    ).unwrap();
+    assert!(cutover_for_isolated_test(&db, &wrong_fee, TestCutoverFault::None).is_err());
+    let mut conn = db.get_conn().unwrap();
+    crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
+    assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+        .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+}
+
+#[test]
+fn catalog_v5_cutover_reader_rejects_projection_and_v1_anchor_tamper() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    for target in ["v2-projection", "v1-anchor"] {
+        let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+        let mut conn = db.get_conn().unwrap();
+        let (guard, update, statements) = if target == "v2-projection" {
+            ("paper_book_v2_head_no_update",
+             "UPDATE paper_book_v2_head SET projection_bytes=X'00' WHERE account_id='TEST_CODE_ACCOUNT'",
+             crate::database::paper_book_v2_ledger_schema_v1::STATEMENTS)
+        } else {
+            ("paper_book_owner_v2_head_update",
+             "UPDATE paper_ledger_head SET version=version+1 WHERE account_id='TEST_CODE_ACCOUNT'",
+             crate::database::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS)
+        };
+        diesel::sql_query(format!("DROP TRIGGER {guard}")).execute(&mut conn).unwrap();
+        diesel::sql_query(update).execute(&mut conn).unwrap();
+        let restore = statements.iter().find(|(_, name, _, _)| *name == guard).unwrap().3;
+        diesel::sql_query(restore).execute(&mut conn).unwrap();
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn).unwrap();
+        assert!(crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err(), "{target}");
+        drop(conn);
+        assert!(read_v2_on(&db, &binding.account_id).is_err(), "{target}");
+        assert!(PaperLedger::open(&db, &instant).read(&binding).is_err(), "{target}");
+    }
+}
+
+#[test]
+fn catalog_v5_cutover_reader_rejects_orphan_v2_account() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
+    let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    let mut conn = db.get_conn().unwrap();
+    conn.batch_execute("PRAGMA foreign_keys=OFF").unwrap();
+    diesel::sql_query("INSERT INTO paper_book_v2_account
+        (account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,
+         v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id)
+        SELECT 'ghost','ghost-epoch','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'ghost',policy_instance_id,'ghost-old',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ghost-cutover'
+        FROM paper_book_v2_fee_manifest WHERE singleton=1")
+        .execute(&mut conn).unwrap();
+    conn.batch_execute("PRAGMA foreign_keys=ON").unwrap();
+    crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn).unwrap();
+    assert!(crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err());
+}
+
+#[test]
+fn catalog_v5_prepared_upgrade_preserves_v1_history_and_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v5_v1_history.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed.clone())).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "before-v5",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+    let before_view = ledger.read(&binding).unwrap();
+    let (before_events, before_projection) = {
+        let mut conn = db.get_conn().unwrap();
+        (
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+        )
+    };
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn,
+            &crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
+        )
+        .unwrap();
+        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(
+            &mut conn,
+        )
+        .unwrap();
+    }
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after.lineage(), before.lineage());
+    assert_ne!(
+        after.snapshot_input_hash().unwrap(),
+        before.snapshot_input_hash().unwrap()
+    );
+    assert_eq!(ledger.read(&binding).unwrap(), before_view);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            before_events
+        );
+        assert_eq!(
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+            before_projection
+        );
+    }
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "after-v5",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .expect("V1Active account still writes");
+    let mut unowned_seed = seed;
+    unowned_seed.account_id = "TEST_CODE_V5_UNOWNED".into();
+    unowned_seed.epoch_id = "TEST_CODE_V5_UNOWNED_EPOCH".into();
+    assert!(matches!(
+        ledger.apply(PaperCommand::Seed(unowned_seed)),
+        Err(LedgerError::InactiveEpoch)
+    ));
+}
+
+#[test]
+fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_v1_history.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed.clone())).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "before-v4",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding.clone()),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before = ledger.verified_effective_fills(&request).unwrap();
+    let before_view = ledger.read(&binding).unwrap();
+    let (before_events, before_projection) = {
+        let mut conn = db.get_conn().unwrap();
+        (
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            head(&mut conn, &binding)
+                .unwrap()
+                .unwrap()
+                .projection_bytes,
+        )
+    };
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        )
+        .unwrap();
+    }
+
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before.rows().unwrap());
+    assert_eq!(after.lineage(), before.lineage());
+    assert_ne!(after.snapshot_input_hash().unwrap(), before.snapshot_input_hash().unwrap());
+    assert!(matches!(
+        ledger.verified_effective_fills(&EffectiveFillRequest {
+            scope: EffectiveFillScope::LegacyRaw,
+            history: EffectiveHistory::AsKnown {
+                ledger_version: None,
+            },
+            as_of: day(instant()),
+        }),
+        Err(LedgerError::InvalidInput(_))
+    ));
+    assert_eq!(ledger.read(&binding).unwrap(), before_view);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload)
+                .collect::<Vec<_>>(),
+            before_events,
+        );
+        assert_eq!(
+            head(&mut conn, &binding)
+                .unwrap()
+                .unwrap()
+                .projection_bytes,
+            before_projection,
+        );
+    }
+
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "after-v4",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .expect("backfilled V1 owner still writes through the locked fence");
+
+    let mut another_seed = seed;
+    another_seed.account_id = "TEST_CODE_V4_UNOWNED".into();
+    another_seed.epoch_id = "TEST_CODE_V4_UNOWNED_EPOCH".into();
+    assert!(matches!(
+        ledger.apply(PaperCommand::Seed(another_seed.clone())),
+        Err(LedgerError::InactiveEpoch)
+    ));
+    assert!(account(&mut db.get_conn().unwrap(), &another_seed.account_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn catalog_v4_historical_reads_reject_missing_owner_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_reads.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        )
+        .unwrap();
+    }
+    let intent = order(
+        &ledger,
+        &binding,
+        "read-probe",
+        Direction::Buy,
+        10.0,
+        instant(),
+    );
+    assert!(ledger
+        .recover_terminal(&binding, &intent.signal, intent.price_intent)
+        .unwrap()
+        .is_none());
+    assert_eq!(ledger.read(&binding).unwrap().version, 1);
+    assert_eq!(ledger.read_at_version(&binding, 1).unwrap().version, 1);
+    assert!(ledger.effective_fills(&binding).unwrap().is_empty());
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+    }
+    assert!(matches!(
+        ledger.read(&binding),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    db.get_conn()
+        .unwrap()
+        .batch_execute("PRAGMA user_version=4")
+        .unwrap();
+    assert_eq!(ledger.read(&binding).unwrap().version, 1);
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.batch_execute("DROP TRIGGER paper_book_owner_v1_no_delete")
+            .unwrap();
+        diesel::sql_query("DELETE FROM paper_book_owner_v1 WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .execute(&mut conn)
+            .unwrap();
+    }
+    assert!(matches!(
+        ledger.read(&binding),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    assert!(matches!(
+        ledger.read_at_version(&binding, 1),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    assert!(matches!(
+        ledger.recover_terminal(&binding, &intent.signal, intent.price_intent),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    assert!(matches!(
+        ledger.effective_fills(&binding),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+
+    db.get_conn()
+        .unwrap()
+        .batch_execute(
+            "DROP TRIGGER paper_book_owner_v1_account_insert;
+             DROP TRIGGER paper_book_owner_v1_event_insert;
+             DROP TRIGGER paper_book_owner_v1_head_insert;
+             DROP TRIGGER paper_book_owner_v1_head_update;
+             DROP TABLE paper_book_owner_v1;
+             PRAGMA user_version=3",
+        )
+        .unwrap();
+    assert!(matches!(
+        ledger.read(&binding),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+}
+
+#[test]
+fn catalog_v4_runtime_rejects_wrong_owner_before_quote_or_terminal_recovery() {
+    use crate::trading::paper_ledger_runtime::execute_checked_on;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_runtime.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        )
+        .unwrap();
+    }
+    let mut wrong = binding.clone();
+    wrong.epoch_id = "TEST_CODE_other_epoch".into();
+    let mut signal = order(&ledger, &binding, "wrong-owner", Direction::Buy, 10.0, instant())
+        .signal;
+    signal.plan_id = "TEST_CODE_wrong_owner_plan".into();
+    let quote = crate::broker::ExecutionQuote {
+        price: 10.0,
+        limit_up_price: 11.0,
+        limit_down_price: 9.0,
+        observed_at: instant(),
+    };
+    let quote_calls = std::sync::atomic::AtomicUsize::new(0);
+    let quotes = |_: &str| {
+        quote_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(quote.clone())
+    };
+    let result = execute_checked_on(
+        &db,
+        &wrong,
+        &signal,
+        &quote,
+        &instant,
+        &quotes,
+        &AtomicBool::new(false),
+        None,
+    );
+    assert!(
+        result.as_ref().is_err_and(|error| error.contains("inactive paper")),
+        "wrong owner entered runtime: {result:?}"
+    );
+    assert_eq!(quote_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        ledger.require_active_v1_owner(&wrong),
+        Err(LedgerError::InactiveEpoch)
+    ));
+    assert_eq!(ledger.read(&binding).unwrap().version, 1);
+}
+
+#[test]
+fn catalog_v4_all_v1_writer_paths_reject_unowned_binding_without_partial_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_writers.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+        conn.batch_execute("PRAGMA user_version=3").unwrap();
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+            &mut conn, &policy,
+        )
+        .unwrap();
+    }
+    let original = ledger.read(&binding).unwrap();
+    let mut wrong = binding.clone();
+    wrong.manifest_hash = "f".repeat(64);
+    let mut intent = order(&ledger, &binding, "blocked", Direction::Buy, 10.0, instant());
+    intent.binding = wrong.clone();
+    assert!(matches!(
+        ledger.apply(PaperCommand::Execute(intent)),
+        Err(LedgerError::InactiveEpoch)
+    ));
+    assert!(matches!(
+        ledger
+        .apply(PaperCommand::Mark(ValuationBatch {
+            binding: wrong.clone(),
+            command_id: "TEST_CODE_blocked_mark".into(),
+            expected_version: original.version,
+            inventory_fingerprint: original.inventory_fingerprint().unwrap(),
+            as_of: instant(),
+            closing: false,
+            marks: Vec::new(),
+        })),
+        Err(LedgerError::InactiveEpoch)
+    ));
+    assert!(matches!(
+        ledger.repair_missing_projection(&wrong),
+        Err(LedgerError::InactiveEpoch)
+    ));
+    assert!(matches!(
+        ledger
+        .settle_snapshot(&EffectiveFillRequest {
+            scope: EffectiveFillScope::Epoch(wrong),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: day(instant()),
+        }),
+        Err(LedgerError::InactiveEpoch)
+    ));
+
+    assert_eq!(ledger.read(&binding).unwrap(), original);
+    let mut conn = db.get_conn().unwrap();
+    assert_eq!(events(&mut conn, &binding.account_id).unwrap().len(), 1);
+    for table in ["paper_trades", "order_audit_chain"] {
+        let count = diesel::sql_query(format!("SELECT COUNT(*) AS value FROM {table}"))
+            .get_result::<IntegerRow>(&mut conn)
+            .unwrap()
+            .value;
+        assert_eq!(count, 0, "forbidden writer changed {table}");
+    }
 }
 
 #[test]
@@ -1870,6 +2638,194 @@ fn paper_ledger_two_buys_partial_sell_and_next_day_mark() {
     assert_eq!(view.cash, Money::from_cny(98_883.90).unwrap());
     assert_eq!(view.equity().unwrap(), Money::from_cny(100_183.90).unwrap());
     assert_eq!(view.daily_pnl(), Some(Money::from_cny(-6.10).unwrap()));
+}
+
+#[derive(diesel::QueryableByName)]
+struct GoldenTextValue {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct GoldenCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    value: i64,
+}
+
+fn golden_order_fees(db: &DatabaseManager, account_id: &str, command_id: &str) -> (Money, Money) {
+    let payload = diesel::sql_query(
+        "SELECT payload AS value FROM paper_ledger_event WHERE account_id=? AND command_id=?",
+    )
+    .bind::<diesel::sql_types::Text, _>(account_id)
+    .bind::<diesel::sql_types::Text, _>(command_id)
+    .get_result::<GoldenTextValue>(&mut db.get_conn().unwrap())
+    .unwrap()
+    .value;
+    match serde_json::from_str::<Fact>(&payload).unwrap() {
+        Fact::Order(order) => (order.commission, order.stamp),
+        _ => panic!("golden sale event must be an order"),
+    }
+}
+
+fn golden_filled_trade_count(db: &DatabaseManager) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM paper_trades WHERE status='Filled'",
+    )
+    .get_result::<GoldenCount>(&mut db.get_conn().unwrap())
+    .unwrap()
+    .value
+}
+
+#[test]
+fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    #[derive(Debug, diesel::QueryableByName)]
+    struct TextValue {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("TEST_CODE_v1_golden_minimum.db");
+    let now = AtomicI64::new(instant().timestamp());
+    let clock = || Utc.timestamp_opt(now.load(Ordering::SeqCst), 0).unwrap();
+    let mut seed = manifest();
+    seed.account_id = "TEST_CODE_V1_GOLDEN_MINIMUM".into();
+    seed.epoch_id = "TEST_CODE_V1_GOLDEN_MINIMUM_EPOCH".into();
+    seed.source_reference = "TEST_CODE_v1_golden_minimum_snapshot".into();
+    let binding = seed.binding().unwrap();
+    let (commands, hashes, old_report) = {
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let ledger = PaperLedger::open(&db, &clock);
+        let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        let buy_one = order(&ledger, &binding, "v1-golden-buy-10", Direction::Buy, 10.0, clock());
+        let bought_one = ledger.apply(PaperCommand::Execute(buy_one.clone())).unwrap();
+        let buy_two = order(&ledger, &binding, "v1-golden-buy-12", Direction::Buy, 12.0, clock());
+        let bought_two = ledger.apply(PaperCommand::Execute(buy_two.clone())).unwrap();
+        now.store(instant().timestamp() + 86400, Ordering::SeqCst);
+        let sell = order(&ledger, &binding, "v1-golden-sell-11", Direction::Sell, 11.0, clock());
+        let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
+        let view = ledger.read(&binding).unwrap();
+        let report = serde_json::to_string(&*view).unwrap();
+        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        assert_eq!(model.value, "lot-rates-v1");
+        assert_eq!(binding.manifest_hash, "1e660132eccbbdeb97f032c4563da29cf6f0c551c59223f430ce97966d8806e6");
+        assert_eq!(seeded.event_hash, "122741b580f8da54f096a8bb0df8da9e4ec242229548f8a02551f92bc5f39770");
+        assert_ne!(bought_one.event_hash, bought_two.event_hash);
+        assert_ne!(bought_two.event_hash, sold.event_hash);
+        assert_eq!(head.value, "6c63fb6457630277f623bb2a16af312c88a416cc473818898e6d8357a2fcaed2");
+        assert_eq!(report, r#"{"cash":98883900000,"lots":[{"lot_id":"fill:v1-golden-buy-12","code":"TEST_CODE_000001","name":"fixture","quantity":100,"basis_price":12000000,"buy_fee_remaining":5000000,"acquired_on":"2026-09-14","sellable_from":"2026-09-15","reported_cost":null}],"marks":{"TEST_CODE_000001":{"code":"TEST_CODE_000001","price":11000000,"observed_at":"2026-09-15T02:00:00Z","source":"TEST_CODE_realtime"}},"fees":16100000,"realized_pnl":88900000,"seed_equity":100000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
+        assert_eq!([bought_one.fee, bought_two.fee, sold.fee], [Money::from_cny(5.0).unwrap(), Money::from_cny(5.0).unwrap(), Money::from_cny(6.10).unwrap()]);
+        assert_eq!(
+            golden_order_fees(&db, &binding.account_id, "v1-golden-sell-11"),
+            (Money::from_cny(5.0).unwrap(), Money::from_cny(1.10).unwrap())
+        );
+        assert_eq!(golden_filled_trade_count(&db), 3);
+        assert_eq!(view.cash, Money::from_cny(98_883.90).unwrap());
+        assert_eq!(view.fees, Money::from_cny(16.10).unwrap());
+        assert_eq!(view.realized_pnl, Money::from_cny(88.90).unwrap());
+        assert_eq!(view.lots.len(), 1);
+        assert_eq!(view.lots[0].basis_price, Money::from_cny(12.0).unwrap());
+        assert_eq!(view.lots[0].quantity, 100);
+        assert_eq!(view.lots[0].buy_fee_remaining, Money::from_cny(5.0).unwrap());
+        assert_eq!(FEE_MODEL, "lot-rates-v1");
+        let rejected = diesel::sql_query("INSERT INTO paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes,money_model,fee_model) SELECT 'TEST_CODE_V1_GOLDEN_REJECT_V2','TEST_CODE_V1_GOLDEN_REJECT_V2_EPOCH',manifest_hash,manifest_bytes,money_model,'lot-rates-v2' FROM paper_ledger_account WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .execute(&mut db.get_conn().unwrap());
+        assert!(
+            matches!(&rejected, Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, info)) if info.message().contains("fee_model")),
+            "v1 fee_model CHECK must reject a v2 identity: {rejected:?}"
+        );
+        ((buy_one, buy_two, sell), [seeded.event_hash, bought_one.event_hash, bought_two.event_hash, sold.event_hash], report)
+    };
+    let db = DatabaseManager::open_isolated_for_test(path).unwrap();
+    let ledger = PaperLedger::open(&db, &clock);
+    for (command, expected) in [(commands.0, &hashes[1]), (commands.1, &hashes[2]), (commands.2, &hashes[3])] {
+        let receipt = ledger.apply(PaperCommand::Execute(command)).unwrap();
+        assert!(receipt.already_applied);
+        assert_eq!(&receipt.event_hash, expected);
+    }
+    let reopened = ledger.read(&binding).unwrap();
+    assert_eq!(reopened.version, 4);
+    assert_eq!(golden_filled_trade_count(&db), 3);
+    assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
+    assert_eq!(reopened.event_hash, hashes[3]);
+}
+
+#[test]
+fn paper_ledger_v1_golden_percentage_fees_replay() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    #[derive(Debug, diesel::QueryableByName)]
+    struct TextValue {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("TEST_CODE_v1_golden_percentage.db");
+    let now = AtomicI64::new(instant().timestamp());
+    let clock = || Utc.timestamp_opt(now.load(Ordering::SeqCst), 0).unwrap();
+    let mut seed = manifest();
+    seed.account_id = "TEST_CODE_V1_GOLDEN_PERCENTAGE".into();
+    seed.epoch_id = "TEST_CODE_V1_GOLDEN_PERCENTAGE_EPOCH".into();
+    seed.source_reference = "TEST_CODE_v1_golden_percentage_snapshot".into();
+    seed.cash = Money::from_cny(1_000_000.0).unwrap();
+    seed.original_total = seed.cash;
+    let binding = seed.binding().unwrap();
+    let (commands, hashes, old_report) = {
+        let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
+        let ledger = PaperLedger::open(&db, &clock);
+        let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        let buy = order(&ledger, &binding, "v1-golden-buy-200", Direction::Buy, 200.0, clock());
+        let bought = ledger.apply(PaperCommand::Execute(buy.clone())).unwrap();
+        now.store(instant().timestamp() + 86400, Ordering::SeqCst);
+        let sell = order(&ledger, &binding, "v1-golden-sell-210", Direction::Sell, 210.0, clock());
+        let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
+        let view = ledger.read(&binding).unwrap();
+        let report = serde_json::to_string(&*view).unwrap();
+        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
+            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        assert_eq!(model.value, "lot-rates-v1");
+        assert_eq!(binding.manifest_hash, "9b25b982eb2218fc661995dbe1de70663c3ab45f186159ef782230e8622523dd");
+        assert_eq!(seeded.event_hash, "e5f6c5340a5ec7e96e939491e3a8e63b4451b6ed4e62fb7991997a41a80e3b3f");
+        assert_ne!(bought.event_hash, sold.event_hash);
+        assert_eq!(head.value, "0ce46e10ee317b7d133047c4b178351f87221e259e4f00628c03f5e615b74aa7");
+        assert_eq!(report, r#"{"cash":1000966700000,"lots":[],"marks":{},"fees":33300000,"realized_pnl":966700000,"seed_equity":1000000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
+        assert_eq!(bought.status, LedgerStatus::Filled);
+        assert_eq!(sold.status, LedgerStatus::Filled);
+        assert_eq!(bought.fee, Money::from_cny(6.0).unwrap());
+        assert_eq!(sold.fee, Money::from_cny(27.30).unwrap());
+        assert_eq!(
+            golden_order_fees(&db, &binding.account_id, "v1-golden-sell-210"),
+            (Money::from_cny(6.30).unwrap(), Money::from_cny(21.0).unwrap())
+        );
+        assert_eq!(golden_filled_trade_count(&db), 2);
+        assert_eq!(view.cash, Money::from_cny(1_000_966.70).unwrap());
+        assert_eq!(view.fees, Money::from_cny(33.30).unwrap());
+        assert_eq!(view.realized_pnl, Money::from_cny(966.70).unwrap());
+        assert!(view.lots.is_empty());
+        assert_eq!(FEE_MODEL, "lot-rates-v1");
+        ((buy, sell), [seeded.event_hash, bought.event_hash, sold.event_hash], report)
+    };
+    let db = DatabaseManager::open_isolated_for_test(path).unwrap();
+    let ledger = PaperLedger::open(&db, &clock);
+    for (command, expected) in [(commands.0, &hashes[1]), (commands.1, &hashes[2])] {
+        let receipt = ledger.apply(PaperCommand::Execute(command)).unwrap();
+        assert!(receipt.already_applied);
+        assert_eq!(&receipt.event_hash, expected);
+    }
+    let reopened = ledger.read(&binding).unwrap();
+    assert_eq!(reopened.version, 3);
+    assert_eq!(golden_filled_trade_count(&db), 2);
+    assert_eq!(serde_json::to_string(&*reopened).unwrap(), old_report);
+    assert_eq!(reopened.event_hash, hashes[2]);
 }
 
 #[test]

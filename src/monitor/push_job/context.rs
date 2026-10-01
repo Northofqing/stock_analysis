@@ -852,6 +852,43 @@ pub(super) fn capture_capability_fixture() -> Result<PreparationCapture> {
     factory.begin_capture(input)
 }
 
+/// Test-only catalog binding for the development N02 source contract. This
+/// exercises the normal capture transition without registering a producer.
+#[cfg(test)]
+pub(crate) fn n02_source_capture_fixture() -> Result<PreparationCapture> {
+    let run_id = RunId::try_new("TEST_CODE_N02_SOURCE_RUN".to_owned())?;
+    let source_contract_id =
+        SourceContractId::try_new(super::n02_source::N02_SOURCE_CONTRACT_ID.to_owned())?;
+    let source_contract_version =
+        SourceContractVersion::try_new(super::n02_source::N02_SOURCE_CONTRACT_VERSION.to_owned())?;
+    let occurrence_family = OccurrenceFamily::try_new("news-flash-window".to_owned())?;
+    let schedule_id = ScheduleId::try_new("TEST_CODE_N02_SOURCE_SCHEDULE".to_owned())?;
+    let factory = RunContextFactory::new(CatalogRunBinding {
+        namespace: Namespace::test(run_id.clone()),
+        unit_id: UnitId::try_new("MU-news-flash-aggregate".to_owned())?,
+        trigger: RegisteredTrigger::Scheduled(schedule_id.clone()),
+        occurrence_family: occurrence_family.clone(),
+        activation_generation: 1,
+        build_commit: GitSha40::parse("0123456789abcdef0123456789abcdef01234567")?,
+        catalog_sha256: Sha256Digest::parse("TEST_CODE N02 catalog", &"c".repeat(64))?,
+        source_contract_id,
+        source_contract_version,
+        template_version: TemplateVersion::try_new("TEST_CODE_N02_CARD_V1".to_owned())?,
+    });
+    factory.begin_capture(RunContextInput {
+        run_id,
+        calendar_date: CalendarDate::parse("2026-09-28")?,
+        phase: PhaseEpic::Intraday,
+        trigger: Trigger::scheduled(schedule_id),
+        occurrence: OccurrenceIdentityMaterial::new(
+            BusinessDate::parse("2026-09-28")?,
+            occurrence_family,
+            super::OccurrenceKey::try_new("09:30".to_owned())?,
+        ),
+        captured_business_time: UtcMicros::try_new(1_801_000_000_000_000)?,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn run_context_preimage_fixture(context: &RunContext) -> Vec<u8> {
     canonical_preimage("RunContext/v1", &run_context_fields(context))

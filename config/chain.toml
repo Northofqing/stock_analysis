@@ -541,16 +541,16 @@ keywords = [
 # 历史归类不一致兜底: prediction_tracker 历史上有"新能源-电池" theme_name
 # (10 推送 0%), 是早期 AI 兜底用的粗分类, 后续 config 已细化为
 # 锂电池 / 钠离子 / 固态 / 储能. 2026-09-21 系统评估 (docs/audits/
-# 2026-09-21-系统评估.md §4.9) 指出此注释与实际不符: 实际 enabled=true
-# priority=100, 该兜底桩**正在生产中参与匹配**。若意图是仅审计,
-# 应将 enabled 与 priority 改为注释所述值; 当前保留行为并修正注释为
-# 实情 (行为变更需单独决策, 见评估 §8 B 档)。
+# 2026-09-21-系统评估.md §4.9) 指出原“仅 audit”描述与配置不符。
+# 本规则仍 enabled=true、priority=100，进入启用规则目录；关键词“锂电池”
+# 与上方更具体的“新能源-锂电池”重复。当前关键词映射同优先级按文件顺序
+# 先取具体规则，不能把本规则称为仅审计或据源码推断生产命中。
 [[rules]]
 chain = "新能源-电池"
 category = "新能源"
 priority = 100
 enabled = true
-logic = "历史归类不一致兜底 (prediction_tracker 历史 theme_name, config 已细化). 仅 audit."
+logic = "历史宽泛电池主题，保留启用以兼容历史归类；关键词映射优先使用具体锂电池规则"
 board_keyword = "锂电池"
 keywords = ["锂电池"]
 

@@ -6242,6 +6242,12 @@ mod tests {
             .expect("TEST_CODE exact reader");
         assert_eq!(snapshot.manifest, manifest);
         assert_eq!(snapshot.bars, bars);
+        let verified = reader
+            .read_verified_exact(&manifest.manifest_hash, &request)
+            .expect("TEST_CODE exact verified reader");
+        assert_eq!(verified.request(), &request);
+        assert_eq!(verified.manifest_hash(), manifest.manifest_hash);
+        assert_eq!(verified.snapshot(), &snapshot);
 
         let series = reader
             .to_daily_series(&snapshot, "TEST_CODE HS300")
@@ -6261,6 +6267,12 @@ mod tests {
                 code: "benchmark_expected_request_mismatch"
             })
         );
+        assert!(matches!(
+            reader.read_verified_exact(&manifest.manifest_hash, &wrong),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_expected_request_mismatch"
+            })
+        ));
         let wrong_range = BenchmarkRequest {
             instrument: request.instrument.clone(),
             range: BenchmarkRange::Daily {
@@ -6274,6 +6286,12 @@ mod tests {
                 code: "benchmark_expected_request_mismatch"
             })
         );
+        assert!(matches!(
+            reader.read_verified_exact(&manifest.manifest_hash, &wrong_range),
+            Err(BenchmarkError::FailedIntegrity {
+                code: "benchmark_expected_request_mismatch"
+            })
+        ));
         let minute = DateTime::parse_from_rfc3339("2026-03-31T09:31:00+08:00")
             .expect("TEST_CODE wrong expected minute");
         let wrong_granularity = BenchmarkRequest {
@@ -6292,6 +6310,7 @@ mod tests {
 
         let mut tampered = snapshot;
         tampered.bars.pop();
+        assert_eq!(verified.snapshot().bars, bars);
         assert!(matches!(
             reader.to_daily_series(&tampered, "TEST_CODE HS300"),
             Err(BenchmarkError::FailedIntegrity {

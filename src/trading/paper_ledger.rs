@@ -124,6 +124,24 @@ impl From<diesel::result::Error> for LedgerError {
         }
     }
 }
+
+/// Reuse a full audit-chain proof only while replaying one database snapshot.
+/// The V5 owner verifier holds a transaction around all uses of this guard.
+#[derive(Default)]
+pub(crate) struct V1AuditReplayGuard {
+    validated: bool,
+}
+
+impl V1AuditReplayGuard {
+    fn ensure_validated(&mut self, conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+        if !self.validated {
+            crate::database::order_audit::validate_order_audit_chain(conn)?;
+            self.validated = true;
+        }
+        Ok(())
+    }
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<String, LedgerError> {
     serde_json::to_string(value).map_err(|error| LedgerError::IntegrityFailure(error.to_string()))
 }
@@ -424,6 +442,13 @@ impl<'a> PaperLedger<'a> {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(LedgerError::Cancelled);
             }
+            let binding = match &command {
+                PaperCommand::Seed(seed) => seed.binding()?,
+                PaperCommand::Execute(intent) => intent.binding.clone(),
+                PaperCommand::Mark(batch) => batch.binding.clone(),
+                PaperCommand::Adjudicate(request) => request.binding.clone(),
+            };
+            require_v1_owner_on(conn, &binding)?;
             let at = (self.clock)();
             if cancelled.load(Ordering::SeqCst) {
                 return Err(LedgerError::Cancelled);
@@ -461,10 +486,23 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             let view = load(conn, binding)?;
             view.require_available()?;
             Ok(view)
         })
+    }
+    /// Runtime admission check before fetching quotes or recovering a terminal.
+    /// The locked writer checks the same owner again before any mutation.
+    pub(crate) fn require_active_v1_owner(
+        &self,
+        binding: &AccountBinding,
+    ) -> Result<(), LedgerError> {
+        let mut conn = self
+            .db
+            .get_conn()
+            .map_err(|error| LedgerError::Database(error.to_string()))?;
+        conn.transaction(|conn| require_v1_owner_on(conn, binding))
     }
     /// Recover a committed business terminal without obtaining new market
     /// evidence. This is read-only, validates the same chain and intent as
@@ -480,6 +518,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             load(conn, binding)?;
             let hash = execution::order_intent_hash(binding, signal, price_intent)?;
             replay_command(conn, binding, None, Some((&signal.plan_id, &hash)), None)
@@ -495,6 +534,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             let head = load(conn, binding)?;
             if version < 1 || version > head.version {
                 return Err(LedgerError::InvalidInput(
@@ -519,6 +559,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.transaction(|conn| {
+            verify_v4_read_catalog_on(conn)?;
             load(conn, binding)?.require_available()?;
             let rulings = adjudication::latest_rulings(&events(conn, &binding.account_id)?)?;
             let mut fills = Vec::new();
@@ -576,6 +617,7 @@ impl<'a> PaperLedger<'a> {
             .get_conn()
             .map_err(|error| LedgerError::Database(error.to_string()))?;
         conn.immediate_transaction(|conn| {
+            require_v1_owner_on(conn, binding)?;
             if head(conn, binding)?.is_some() { return load(conn,binding); }
             let view = replay(conn,binding)?;
             let bytes = encode(&view.projection)?;
@@ -625,6 +667,50 @@ impl<'a> PaperLedger<'a> {
             .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&hash).bind::<Text,_>(&bytes).bind::<Text,_>(digest(&bytes)).execute(conn)?;
         Ok(receipt(1, hash, &decode(&payload)?, false))
     }
+}
+pub(super) fn require_v1_owner_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<(), LedgerError> {
+    crate::database::paper_book_owner_schema_v1::require_v1_owner_on(
+        conn,
+        &binding.account_id,
+        &binding.epoch_id,
+        &binding.manifest_hash,
+    )
+    .map_err(|error| match error {
+        crate::database::paper_book_owner_schema_v1::PaperBookOwnerError::InactiveOwner => {
+            LedgerError::InactiveEpoch
+        }
+        error => LedgerError::IntegrityFailure(error.to_string()),
+    })
+}
+/// Historical reads retain V1-V3 behavior; V4/V5 views require the complete
+/// owner/catalog namespace in the same read transaction.
+fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    let generation = diesel::sql_query("SELECT user_version AS value FROM pragma_user_version()")
+        .get_result::<IntegerRow>(conn)?
+        .value;
+    let owner_objects = diesel::sql_query(
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')) AS value",
+    )
+    .get_result::<IntegerRow>(conn)?
+    .value;
+    let fee_objects = diesel::sql_query(
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')) AS value",
+    )
+    .get_result::<IntegerRow>(conn)?
+    .value;
+    if generation == 5 {
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(conn)
+            .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+    } else if generation >= 4 || owner_objects != 0 || (generation != 2 && fee_objects != 0) {
+        crate::database::paper_book_owner_schema_v1::verify_catalog_v4_on(conn)
+            .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+    }
+    Ok(())
 }
 fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
     if [
@@ -815,6 +901,16 @@ fn replay_through(
     binding: &AccountBinding,
     until: Option<i64>,
 ) -> Result<PaperView, LedgerError> {
+    replay_through_inner(conn, binding, until, false, None)
+}
+
+fn replay_through_inner(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    until: Option<i64>,
+    catalog_already_verified: bool,
+    mut audit_guard: Option<&mut V1AuditReplayGuard>,
+) -> Result<PaperView, LedgerError> {
     let account = account(conn, &binding.account_id)?.ok_or(LedgerError::NotSeeded)?;
     let manifest: SeedManifest = decode(&account.manifest_bytes)?;
     if account.epoch_id != binding.epoch_id
@@ -865,6 +961,8 @@ fn replay_through(
                 row.seq,
                 &row.previous_hash,
                 ruling,
+                catalog_already_verified,
+                audit_guard.as_deref_mut(),
                 state
                     .as_ref()
                     .ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
@@ -903,7 +1001,24 @@ fn head(
     Ok(diesel::sql_query("SELECT version,event_hash,projection_bytes,projection_hash FROM paper_ledger_head WHERE account_id=?").bind::<Text,_>(&binding.account_id).get_result::<HeadRow>(conn).optional()?)
 }
 fn load(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<PaperView, LedgerError> {
-    let view = replay(conn, binding)?;
+    load_inner(conn, binding, false)
+}
+
+fn load_inner(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    catalog_already_verified: bool,
+) -> Result<PaperView, LedgerError> {
+    load_inner_with_audit_guard(conn, binding, catalog_already_verified, None)
+}
+
+fn load_inner_with_audit_guard(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    catalog_already_verified: bool,
+    audit_guard: Option<&mut V1AuditReplayGuard>,
+) -> Result<PaperView, LedgerError> {
+    let view = replay_through_inner(conn, binding, None, catalog_already_verified, audit_guard)?;
     let head = head(conn, binding)?.ok_or_else(|| {
         LedgerError::IntegrityFailure("missing projection; explicit repair required".into())
     })?;
@@ -917,6 +1032,52 @@ fn load(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<PaperVi
         ));
     }
     Ok(view)
+}
+
+/// Replays V1 and compares the exact persisted head and economic projection.
+/// V2 cutover and V2Active read verification use this without reopening a
+/// connection or granting V1 write authority. Its caller must first verify
+/// the catalog on this same connection; that check is omitted from nested
+/// adjudication replay to avoid recursively entering the V2 owner verifier.
+pub(crate) fn verified_v1_snapshot_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<VerifiedV1Snapshot, LedgerError> {
+    conn.transaction(|conn| {
+        verified_v1_snapshot_with_audit_guard_on(
+            conn,
+            binding,
+            &mut V1AuditReplayGuard::default(),
+        )
+    })
+}
+
+/// Caller owns one transaction covering every reuse of `audit_guard`.
+pub(crate) fn verified_v1_snapshot_with_audit_guard_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    audit_guard: &mut V1AuditReplayGuard,
+) -> Result<VerifiedV1Snapshot, LedgerError> {
+    let view = load_inner_with_audit_guard(conn, binding, true, Some(audit_guard))?;
+    view.require_available()?;
+    let equity = view.equity()?;
+    let stored = head(conn, binding)?
+        .ok_or_else(|| LedgerError::IntegrityFailure("missing V1 projection head".into()))?;
+    Ok(VerifiedV1Snapshot {
+        version: view.version,
+        event_hash: view.event_hash,
+        projection_bytes: stored.projection_bytes,
+        projection_hash: stored.projection_hash,
+        equity,
+    })
+}
+
+pub(crate) struct VerifiedV1Snapshot {
+    pub(crate) version: i64,
+    pub(crate) event_hash: String,
+    pub(crate) projection_bytes: String,
+    pub(crate) projection_hash: String,
+    pub(crate) equity: Money,
 }
 
 fn append(

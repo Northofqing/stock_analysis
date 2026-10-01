@@ -9,7 +9,9 @@ use stock_analysis::data_gateway::{
     BatchEvidence, GatewayBatch, MarketCapabilitiesGateway, SinaInstrumentNewsGateway,
     SinaInstrumentNewsRecord,
 };
+use stock_analysis::durable_delivery::P01OriginProducer;
 use stock_analysis::market_domain::ProviderId;
+use stock_analysis::monitor::push_job::{MachineCatalog, MonitorKind, ProducerId};
 use stock_analysis::pipeline::chain_analysis::p01_projection::{
     acquire_and_persist_p01_chain, P01CompletedDayEvidence,
 };
@@ -373,15 +375,6 @@ impl P01InputBinding {
             .map(|bytes| domain_sha256_hex(P01_DELIVERY_SUBJECT_DOMAIN, &bytes))
     }
 
-    fn source_evidence_fingerprint(
-        &self,
-        mode: P01RenderMode,
-        rendered_text: &str,
-    ) -> Result<String, P01Failure> {
-        self.canonical_source_bytes(mode, rendered_text)
-            .map(|bytes| sha256_hex(&bytes))
-    }
-
     #[cfg(test)]
     pub(crate) fn complete_test_input() -> Self {
         let context = P01BusinessContext::new(
@@ -473,6 +466,38 @@ impl P01InputBinding {
             }],
             excluded_limit_pool_records: vec![],
         }
+    }
+}
+
+/// One owned preparation is shared by diagnostics and the sole legacy sender.
+/// The source binding is serialized once from the text that is actually sent.
+struct P01PreparedAttempt {
+    mode: P01RenderMode,
+    input: P01InputBinding,
+    rendered_text: String,
+    canonical_source_bytes: Vec<u8>,
+    source_evidence_sha256: String,
+    delivery_subject_hash: String,
+}
+
+impl P01PreparedAttempt {
+    fn new(
+        mode: P01RenderMode,
+        input: P01InputBinding,
+        rendered_text: String,
+    ) -> Result<Self, P01Failure> {
+        let canonical_source_bytes = input.canonical_source_bytes(mode, &rendered_text)?;
+        let source_evidence_sha256 = sha256_hex(&canonical_source_bytes);
+        let delivery_subject_hash =
+            domain_sha256_hex(P01_DELIVERY_SUBJECT_DOMAIN, &canonical_source_bytes);
+        Ok(Self {
+            mode,
+            input,
+            rendered_text,
+            canonical_source_bytes,
+            source_evidence_sha256,
+            delivery_subject_hash,
+        })
     }
 }
 
@@ -1091,13 +1116,141 @@ trait P01Ports: Sync {
 
     async fn push(
         &self,
-        mode: P01RenderMode,
-        input: P01InputBinding,
-        text: String,
+        prepared: P01PreparedAttempt,
     ) -> Result<crate::notify::PushOutcome, P01Failure>;
 }
 
 struct ProductionP01Ports;
+
+/// Only this module can mint an Origin capability from the actual P01 new
+/// admission. Generic counted callers and startup replay cannot create it.
+pub(crate) struct P01OriginDispatch {
+    producer: P01OriginProducer,
+    mode: P01RenderMode,
+    business_date: NaiveDate,
+    occurrence_identity: String,
+}
+
+impl P01OriginDispatch {
+    fn new(
+        mode: P01RenderMode,
+        binding: &crate::durable_delivery_runtime::CountedDeliveryBinding,
+        text: &str,
+        context: P01BusinessContext,
+    ) -> Result<Self, P01Failure> {
+        let invalid = || {
+            P01Failure::for_context(
+                "p01_origin_binding_invalid",
+                false,
+                "durable_binding",
+                context,
+            )
+        };
+        binding.validate_p01_text(text).map_err(|_| invalid())?;
+        let canonical: serde_json::Value =
+            serde_json::from_slice(binding.source_binding_canonical()).map_err(|_| invalid())?;
+        let (producer, mode_label) = match mode {
+            P01RenderMode::Scheduled => (P01OriginProducer::Scheduled, "Scheduled"),
+            P01RenderMode::Compensation => (P01OriginProducer::Compensation, "Compensation"),
+        };
+        let business_date = context.business_date.format("%Y-%m-%d").to_string();
+        let occurrence_identity = format!("p01:{business_date}");
+        if binding.business_date() != context.business_date
+            || binding.schedule_occurrence_identity() != occurrence_identity
+            || canonical
+                .get("render_mode")
+                .and_then(serde_json::Value::as_str)
+                != Some(mode_label)
+            || canonical
+                .get("business_date")
+                .and_then(serde_json::Value::as_str)
+                != Some(business_date.as_str())
+            || canonical
+                .get("schedule_occurrence_identity")
+                .and_then(serde_json::Value::as_str)
+                != Some(occurrence_identity.as_str())
+        {
+            return Err(invalid());
+        }
+        verify_p01_origin_catalog().map_err(|_| {
+            P01Failure::for_context(
+                "p01_origin_catalog_invalid",
+                false,
+                "durable_binding",
+                context,
+            )
+        })?;
+        Ok(Self {
+            producer,
+            mode,
+            business_date: context.business_date,
+            occurrence_identity,
+        })
+    }
+
+    pub(crate) fn producer(&self) -> P01OriginProducer {
+        self.producer
+    }
+
+    pub(crate) fn mode(&self) -> P01RenderMode {
+        self.mode
+    }
+
+    pub(crate) fn business_date(&self) -> NaiveDate {
+        self.business_date
+    }
+
+    pub(crate) fn occurrence_identity(&self) -> &str {
+        &self.occurrence_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_binding_for_test(
+        mode: P01RenderMode,
+        binding: &crate::durable_delivery_runtime::CountedDeliveryBinding,
+        text: &str,
+    ) -> Self {
+        let context = P01BusinessContext::new(binding.business_date())
+            .expect("TEST_CODE P01 context has verified trading day");
+        Self::new(mode, binding, text, context).expect("TEST_CODE P01 origin capability is valid")
+    }
+}
+
+fn verify_p01_origin_catalog() -> Result<(), &'static str> {
+    const OWNER: &str = "business_date_once_claims(business_date,PreopenNewsHot,None,GLOBAL) → immutable decision / occurrence=p01:{business_date}";
+    let catalog = MachineCatalog::bundled().map_err(|_| "p01_catalog_unavailable")?;
+    let kind = catalog
+        .kind(MonitorKind::PreopenNewsHot)
+        .ok_or("p01_catalog_kind_missing")?;
+    for expected in [
+        P01OriginProducer::Scheduled,
+        P01OriginProducer::Compensation,
+    ] {
+        let id = ProducerId::try_new(expected.as_str().to_owned())
+            .map_err(|_| "p01_catalog_producer_id_invalid")?;
+        let registration = catalog
+            .producer(&id)
+            .ok_or("p01_catalog_producer_missing")?;
+        let unit = catalog
+            .unit_for_producer(&id)
+            .ok_or("p01_catalog_unit_missing")?;
+        if registration.monitor_kind() != Some(MonitorKind::PreopenNewsHot)
+            || !kind.producer_ids().contains(&id)
+            || registration.unit_id().as_str() != "MU-p01"
+            || unit.id().as_str() != "MU-p01"
+            || !unit.producer_ids().contains(&id)
+            || registration.occurrence_family().as_str() != "p01:{business_date}"
+            || !unit
+                .occurrence_families()
+                .contains(registration.occurrence_family())
+            || registration.completion_owner().as_str() != OWNER
+            || unit.completion_owner() != registration.completion_owner()
+        {
+            return Err("p01_catalog_registration_mismatch");
+        }
+    }
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl P01Ports for ProductionP01Ports {
@@ -1161,18 +1314,15 @@ impl P01Ports for ProductionP01Ports {
 
     async fn push(
         &self,
-        mode: P01RenderMode,
-        input: P01InputBinding,
-        text: String,
+        prepared: P01PreparedAttempt,
     ) -> Result<crate::notify::PushOutcome, P01Failure> {
-        let context = input.context;
-        let source_binding = input.canonical_source_bytes(mode, &text)?;
+        let context = prepared.input.context;
         let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
             context.business_date,
-            input.schedule_occurrence_identity(),
-            source_binding,
+            prepared.input.schedule_occurrence_identity(),
+            prepared.canonical_source_bytes,
             crate::durable_delivery_runtime::CountedDeliveryScope::Global,
-            input.delivery_subject_hash(mode, &text)?,
+            prepared.delivery_subject_hash,
             crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
             None,
             false,
@@ -1185,6 +1335,8 @@ impl P01Ports for ProductionP01Ports {
                 context,
             )
         })?;
+        let origin =
+            P01OriginDispatch::new(prepared.mode, &binding, &prepared.rendered_text, context)?;
         let token = crate::presentation_registry::acquire_token(
             "P-01-preopen-news-hot",
             crate::notify::PushKind::PreopenNewsHot,
@@ -1199,7 +1351,13 @@ impl P01Ports for ProductionP01Ports {
                 context,
             )
         })?;
-        Ok(crate::notify::push_counted_with_binding(token, &text, None, binding).await)
+        Ok(crate::notify::push_p01_origin_with_binding(
+            token,
+            &prepared.rendered_text,
+            binding,
+            origin,
+        )
+        .await)
     }
 }
 
@@ -1348,11 +1506,12 @@ async fn run_p01_once_with_ports<P: P01Ports>(
         Ok(text) => text,
         Err(failure) => return failure_outcome(failure),
     };
-    let source_evidence_sha256 = match input.source_evidence_fingerprint(mode, &text) {
-        Ok(source_evidence_sha256) => source_evidence_sha256,
+    let prepared = match P01PreparedAttempt::new(mode, input, text) {
+        Ok(prepared) => prepared,
         Err(failure) => return failure_outcome(failure),
     };
-    let push_outcome = match ports.push(mode, input, text).await {
+    let source_evidence_sha256 = prepared.source_evidence_sha256.clone();
+    let push_outcome = match ports.push(prepared).await {
         Ok(outcome) => outcome,
         Err(failure) => {
             return failure_outcome(failure.with_source_evidence_sha256(source_evidence_sha256));
@@ -1896,9 +2055,7 @@ mod tests {
 
         async fn push(
             &self,
-            _mode: P01RenderMode,
-            _input: P01InputBinding,
-            _text: String,
+            _prepared: P01PreparedAttempt,
         ) -> Result<crate::notify::PushOutcome, P01Failure> {
             self.p01_sink_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.push_outcome.clone())
@@ -2149,20 +2306,76 @@ mod tests {
         let input = P01InputBinding::complete_test_input();
         let mode = P01RenderMode::Compensation;
         let text = crate::push_templates::render_bound_preopen_news_hot(mode, &input).unwrap();
-        let source_binding = input.canonical_source_bytes(mode, &text).unwrap();
+        let prepared = P01PreparedAttempt::new(mode, input, text.clone()).unwrap();
+        assert_eq!(prepared.rendered_text, text);
+        assert_eq!(
+            prepared.source_evidence_sha256,
+            sha256_hex(&prepared.canonical_source_bytes)
+        );
         let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
-            input.context.business_date,
-            input.schedule_occurrence_identity(),
-            source_binding,
+            prepared.input.context.business_date,
+            prepared.input.schedule_occurrence_identity(),
+            prepared.canonical_source_bytes.clone(),
             crate::durable_delivery_runtime::CountedDeliveryScope::Global,
-            input.delivery_subject_hash(mode, &text).unwrap(),
+            prepared.delivery_subject_hash,
             crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
             None,
             false,
         )
         .unwrap();
 
-        assert_eq!(binding.validate_p01_text(&text), Ok(()));
+        assert_eq!(
+            binding.source_binding_canonical(),
+            prepared.canonical_source_bytes
+        );
+        assert_eq!(binding.validate_p01_text(&prepared.rendered_text), Ok(()));
+    }
+
+    #[test]
+    fn m0_p01_origin_catalog_and_capability_bind_exact_mode_date_and_occurrence() {
+        verify_p01_origin_catalog().expect("both P01 producers retain their exact catalog owner");
+        let input = P01InputBinding::complete_test_input();
+        for (mode, expected_producer) in [
+            (P01RenderMode::Scheduled, P01OriginProducer::Scheduled),
+            (P01RenderMode::Compensation, P01OriginProducer::Compensation),
+        ] {
+            let text = crate::push_templates::render_bound_preopen_news_hot(mode, &input).unwrap();
+            let canonical = input.canonical_source_bytes(mode, &text).unwrap();
+            let binding = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+                input.context.business_date,
+                input.schedule_occurrence_identity(),
+                canonical.clone(),
+                crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+                input.delivery_subject_hash(mode, &text).unwrap(),
+                crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+                None,
+                false,
+            )
+            .unwrap();
+            let dispatch = P01OriginDispatch::new(mode, &binding, &text, input.context)
+                .expect("only exact P01 source mints Origin");
+            assert_eq!(dispatch.producer(), expected_producer);
+            assert_eq!(dispatch.business_date(), input.context.business_date);
+            assert_eq!(dispatch.occurrence_identity(), "p01:2026-08-18");
+
+            let opposite = match mode {
+                P01RenderMode::Scheduled => P01RenderMode::Compensation,
+                P01RenderMode::Compensation => P01RenderMode::Scheduled,
+            };
+            assert!(P01OriginDispatch::new(opposite, &binding, &text, input.context).is_err());
+            let wrong_occurrence = crate::durable_delivery_runtime::CountedDeliveryBinding::new(
+                input.context.business_date,
+                "p01:2026-08-17",
+                canonical,
+                crate::durable_delivery_runtime::CountedDeliveryScope::Global,
+                input.delivery_subject_hash(mode, &text).unwrap(),
+                crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(P01OriginDispatch::new(mode, &wrong_occurrence, &text, input.context).is_err());
+        }
     }
 
     #[tokio::test]

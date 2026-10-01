@@ -432,6 +432,31 @@ pub struct DatabaseManager {
     selection_schema_authority: Option<Box<global_schema_v1::VerifiedAmendedSelectionSchema>>,
 }
 
+/// Recorded prediction outcomes in a checked-in trading-day window.
+/// These are signal samples, with no delivery-terminal correlation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedPredictionSampleHitRate {
+    pub as_of: NaiveDate,
+    pub window_start: NaiveDate,
+    pub trading_days: usize,
+    pub samples: i64,
+    pub hits: i64,
+    pub rate: f64,
+}
+
+/// Candidate promotion cannot treat an unaudited legacy horizon as a settled sample.
+#[derive(Debug, thiserror::Error)]
+pub enum CandidatePromotionEvidenceError {
+    #[error("candidate_promotion_invalid_input: {0}")]
+    InvalidInput(String),
+    #[error("candidate_promotion_storage_unavailable: {0}")]
+    StorageUnavailable(String),
+    #[error("candidate_promotion_calendar_unavailable: {0}")]
+    CalendarUnavailable(String),
+    #[error("candidate_promotion_ineligible_first_sample id={id} reason={reason}")]
+    IneligibleFirstSample { id: i32, reason: &'static str },
+}
+
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 #[cfg(test)]
@@ -2622,6 +2647,11 @@ mod kline;
 mod lhb;
 pub mod news_ai;
 pub mod order_audit;
+pub mod p05_prediction_freeze;
+pub(crate) mod paper_book_owner_schema_v1;
+pub(crate) mod paper_book_owner_schema_v2;
+pub(crate) mod paper_book_v2_ledger_schema_v1;
+pub(crate) mod paper_book_v2_schema;
 pub(crate) mod paper_inventory_failure_audit;
 pub(crate) mod paper_ledger_schema_v1;
 pub mod position_chain;
@@ -2882,6 +2912,32 @@ impl DatabaseManager {
             "#,
         )
         .execute(&mut *conn)?;
+
+        // Only a new P-01 exact-date write creates this binding. Historical
+        // chain_daily rows receive no backfill, and every legacy row mutation
+        // invalidates the date's binding before another reader can see it.
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS chain_daily_p01_generation (\
+             date TEXT PRIMARY KEY NOT NULL, \
+             generation_sha256 TEXT NOT NULL CHECK(length(generation_sha256) = 64), \
+             canonical_bytes BLOB NOT NULL CHECK(length(canonical_bytes) > 0), \
+             stored_rows_sha256 TEXT NOT NULL CHECK(length(stored_rows_sha256) = 64))",
+        )
+        .execute(&mut *conn)?;
+        for statement in [
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_insert \
+             AFTER INSERT ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = NEW.date; END",
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_update \
+             AFTER UPDATE ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = NEW.date; \
+             DELETE FROM chain_daily_p01_generation WHERE date = OLD.date; END",
+            "CREATE TRIGGER IF NOT EXISTS chain_daily_p01_generation_delete \
+             AFTER DELETE ON chain_daily BEGIN \
+             DELETE FROM chain_daily_p01_generation WHERE date = OLD.date; END",
+        ] {
+            diesel::sql_query(statement).execute(&mut *conn)?;
+        }
 
         // B-002 板块联动归因 (Board hit) 落库表 — 与 chain_daily 并列,
         //       供 NewsCatalyst 推送读取今日 top cluster.
@@ -3745,6 +3801,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             "CREATE INDEX IF NOT EXISTS ix_pred_date ON prediction_tracker(pred_date)",
         )
         .execute(&mut *conn)?;
+        p05_prediction_freeze::create_schema(conn).map_err(std::io::Error::other)?;
 
         // 2026-08-07 BR-192 收尾 (T-07): P-03 候选触发选中决策持久化 —
         // counted binding 的真实证据 (见 record_candidate_trigger 文档)。
@@ -4071,6 +4128,38 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         reason: Option<&str>,
         reason_secondary: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_prediction_with_id(
+            pred_date,
+            target_date,
+            theme_name,
+            stock_code,
+            direction,
+            score,
+            detail,
+            reason,
+            reason_secondary,
+        )
+        .map(|_| ())
+    }
+
+    /// Insert one prediction and return its actual row identity. This is a
+    /// producer identity only; it does not establish a counted delivery.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "stable audit persistence boundary mirrors prediction_tracker columns"
+    )]
+    pub fn save_prediction_with_id(
+        &self,
+        pred_date: &str,
+        target_date: &str,
+        theme_name: Option<&str>,
+        stock_code: Option<&str>,
+        direction: &str,
+        score: f64,
+        detail: Option<&str>,
+        reason: Option<&str>,
+        reason_secondary: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
         validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
         validate_date_text("target_date", target_date).map_err(invalid_input)?;
         validate_required_text("pred_direction", direction).map_err(invalid_input)?;
@@ -4092,22 +4181,40 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             validate_required_text("reason_secondary", reason_secondary).map_err(invalid_input)?;
         }
 
-        use diesel::sql_types::{Double, Nullable, Text};
+        use diesel::sql_types::{BigInt, Double, Nullable, Text};
+        #[derive(diesel::QueryableByName)]
+        struct InsertedId {
+            #[diesel(sql_type = BigInt)]
+            id: i64,
+        }
         let mut conn = self.get_conn()?;
-        diesel::sql_query(
-            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )
-        .bind::<Text, _>(pred_date)
-        .bind::<Text, _>(target_date)
-        .bind::<Nullable<Text>, _>(theme_name)
-        .bind::<Nullable<Text>, _>(stock_code)
-        .bind::<Text, _>(direction)
-        .bind::<Double, _>(score)
-        .bind::<Nullable<Text>, _>(detail)
-        .bind::<Nullable<Text>, _>(reason)
-        .bind::<Nullable<Text>, _>(reason_secondary)
-        .execute(&mut *conn)?;
-        Ok(())
+        conn.transaction::<i64, diesel::result::Error, _>(|conn| {
+            let inserted_count = diesel::sql_query(
+                "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind::<Text, _>(pred_date)
+            .bind::<Text, _>(target_date)
+            .bind::<Nullable<Text>, _>(theme_name)
+            .bind::<Nullable<Text>, _>(stock_code)
+            .bind::<Text, _>(direction)
+            .bind::<Double, _>(score)
+            .bind::<Nullable<Text>, _>(detail)
+            .bind::<Nullable<Text>, _>(reason)
+            .bind::<Nullable<Text>, _>(reason_secondary)
+            .execute(conn)?;
+            // A BEFORE INSERT trigger may ignore the row without an error.
+            // In that case last_insert_rowid() would name an older row on the
+            // same connection, so no identity may be reported.
+            if inserted_count != 1 {
+                return Err(diesel::result::Error::NotFound);
+            }
+            // Keep the ID read on the INSERT connection. A read failure rolls
+            // back the insertion, so callers never receive an ambiguous row.
+            let inserted: InsertedId = diesel::sql_query("SELECT last_insert_rowid() AS id")
+                .get_result(conn)?;
+            Ok(inserted.id)
+        })
+        .map_err(Into::into)
     }
 
     /// v10 P0.2 便捷重载: 不带 reason (旧调用路径, 走 v9 旧行为)
@@ -4330,33 +4437,134 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
 
     /// BR-232: 候选样本证据聚合 (SignalTracker, pred_detail='candidate-strong')。
     /// 返回 (去重样本数, 命中数); 按 (pred_date, stock_code) 去重取首行,
-    /// 只统计已回填 (actual_change NOT NULL) 且 pred_date <= business_date 的行。
+    /// 只统计已完成观察交易日、且收益与命中结果均完整的行。
     pub fn candidate_promotion_samples(
         &self,
         business_date: &str,
-    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-        validate_date_text("business_date", business_date).map_err(invalid_input)?;
-        let mut conn = self.get_conn()?;
-        #[derive(QueryableByName, Debug)]
-        struct SampleCounts {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            sample_count: i64,
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            hit_sum: i64,
+    ) -> Result<(usize, usize), CandidatePromotionEvidenceError> {
+        use CandidatePromotionEvidenceError as EvidenceError;
+
+        validate_date_text("business_date", business_date).map_err(EvidenceError::InvalidInput)?;
+        let business_date = NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
+            .map_err(|error| EvidenceError::InvalidInput(error.to_string()))?;
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| EvidenceError::StorageUnavailable(error.to_string()))?;
+        #[derive(QueryableByName)]
+        struct FirstSample {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_date: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            target_date: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            stock_code: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_direction: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            actual_change: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+            hit: Option<i32>,
         }
-        let row = diesel::sql_query(
-            "SELECT COUNT(*) AS sample_count, COALESCE(SUM(hit), 0) AS hit_sum \
+        // One read freezes the earliest row and its completion state per key.
+        // Legacy natural-day targets and unchecked calendar years cannot
+        // contribute to the promotion denominator.
+        let first_samples = diesel::sql_query(
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, actual_change, hit \
              FROM prediction_tracker \
              WHERE id IN ( \
                SELECT MIN(id) FROM prediction_tracker \
-               WHERE pred_detail = 'candidate-strong' AND actual_change IS NOT NULL \
-                 AND pred_date <= ?1 \
+               WHERE pred_detail = 'candidate-strong' \
                GROUP BY pred_date, stock_code \
-             )",
+             ) ORDER BY id ASC",
         )
-        .bind::<diesel::sql_types::Text, _>(business_date)
-        .get_result::<SampleCounts>(&mut *conn)?;
-        Ok((row.sample_count as usize, row.hit_sum as usize))
+        .load::<FirstSample>(&mut *conn)
+        .map_err(|error| EvidenceError::StorageUnavailable(error.to_string()))?;
+        let mut sample_count = 0;
+        let mut hit_sum = 0;
+        for row in first_samples {
+            let parse_canonical = |text: &str, reason: &'static str| {
+                NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                    .ok()
+                    .filter(|date| date.format("%Y-%m-%d").to_string() == text)
+                    .ok_or(EvidenceError::IneligibleFirstSample { id: row.id, reason })
+            };
+            let pred_date = parse_canonical(&row.pred_date, "pred_date_invalid")?;
+            if pred_date > business_date {
+                continue;
+            }
+            let target_date = parse_canonical(&row.target_date, "target_date_invalid")?;
+            if !crate::calendar::verified_a_share_trading_day(pred_date)
+                .map_err(EvidenceError::CalendarUnavailable)?
+            {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "pred_date_not_trading",
+                });
+            }
+            let mut expected_target = pred_date;
+            for _ in 0..5 {
+                expected_target =
+                    crate::calendar::verified_next_a_share_trading_day(expected_target)
+                        .map_err(EvidenceError::CalendarUnavailable)?;
+            }
+            if target_date != expected_target {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "target_not_fifth_trading_day",
+                });
+            }
+            if target_date > business_date {
+                continue;
+            }
+            let code = row
+                .stock_code
+                .as_deref()
+                .filter(|code| !code.trim().is_empty())
+                .ok_or(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "stock_code_missing",
+                })?;
+            validate_evidence_code(code).map_err(|_| EvidenceError::IneligibleFirstSample {
+                id: row.id,
+                reason: "stock_code_invalid",
+            })?;
+            // BR-232 candidate producer writes only "up"; the verifier marks
+            // it hit only when the actual return is strictly greater than 0.5%.
+            if row.pred_direction != "up" {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "pred_direction_not_up",
+                });
+            }
+            if row
+                .actual_change
+                .is_some_and(|change| !change.is_finite() || change < -100.0)
+            {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "actual_change_invalid",
+                });
+            }
+            if row.hit.is_some_and(|hit| hit != 0 && hit != 1) {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "hit_invalid",
+                });
+            }
+            if let (Some(change), Some(hit)) = (row.actual_change, row.hit) {
+                if (change > 0.5) != (hit == 1) {
+                    return Err(EvidenceError::IneligibleFirstSample {
+                        id: row.id,
+                        reason: "hit_outcome_mismatch",
+                    });
+                }
+                sample_count += 1;
+                hit_sum += hit as usize;
+            }
+        }
+        Ok((sample_count, hit_sum))
     }
 
     /// BR-192 收尾 (2026-08-07): P-03/T-07 候选触发的选中决策持久化。
@@ -4420,36 +4628,85 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Ok(row.map(|r| (r.name, r.basis)))
     }
 
-    /// 获取近 `days` 天已验证预测的真实命中率。
-    pub fn get_prediction_hit_rate(&self, days: i32) -> Result<f64, Box<dyn std::error::Error>> {
-        if days <= 0 {
-            return Err("命中率窗口 days 必须 > 0".into());
+    /// Read recorded, verified prediction signal samples for the inclusive last
+    /// `trading_days` checked-in A-share trading dates ending at `as_of`.
+    /// Frozen target dates after `as_of` are excluded even if a result was
+    /// prematurely recorded. A recorded hit without a valid return fails the
+    /// summary instead of entering the verified-sample denominator. A prediction
+    /// row does not prove its push was delivered.
+    pub fn get_verified_prediction_sample_hit_rate(
+        &self,
+        as_of: NaiveDate,
+        trading_days: usize,
+    ) -> Result<VerifiedPredictionSampleHitRate, Box<dyn std::error::Error>> {
+        if trading_days == 0 {
+            return Err("命中率交易日窗口必须 > 0".into());
         }
-        let mut conn = self.get_conn()?;
-        #[derive(QueryableByName, Debug)]
-        struct HitRate {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            sample_count: i64,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
-            hit_sum: Option<f64>,
+        if !crate::calendar::verified_a_share_trading_day(as_of)? {
+            return Err(format!("as_of 不是已核验 A 股交易日: {as_of}").into());
         }
 
-        let row = diesel::sql_query(
-            "SELECT COUNT(*) AS sample_count, SUM(CAST(hit AS REAL)) AS hit_sum \
-             FROM prediction_tracker \
-             WHERE hit IS NOT NULL AND date(pred_date) >= date('now', '-' || ? || ' days')",
+        let mut dates = std::collections::BTreeSet::new();
+        let mut cursor = as_of;
+        for index in 0..trading_days {
+            dates.insert(cursor.format("%Y-%m-%d").to_string());
+            if index + 1 < trading_days {
+                cursor = crate::calendar::verified_prev_a_share_trading_day(cursor)?;
+            }
+        }
+        let window_start = cursor;
+        let mut conn = self.get_conn()?;
+        #[derive(QueryableByName)]
+        struct RecordedOutcome {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_date: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            actual_change: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            hit: i32,
+        }
+        let rows = diesel::sql_query(
+            "SELECT id, pred_date, actual_change, hit FROM prediction_tracker \
+             WHERE hit IS NOT NULL AND pred_date >= ?1 AND pred_date <= ?2 \
+             AND target_date <= ?3",
         )
-        .bind::<diesel::sql_types::Integer, _>(days)
-        .get_result::<HitRate>(&mut *conn)?;
-        if row.sample_count <= 0 {
-            return Err(format!("近 {days} 天没有已验证预测样本").into());
+        .bind::<diesel::sql_types::Text, _>(window_start.format("%Y-%m-%d").to_string())
+        .bind::<diesel::sql_types::Text, _>(as_of.format("%Y-%m-%d").to_string())
+        .bind::<diesel::sql_types::Text, _>(as_of.format("%Y-%m-%d").to_string())
+        .load::<RecordedOutcome>(&mut *conn)?;
+        let mut samples = 0_i64;
+        let mut hits = 0_i64;
+        for row in rows {
+            if !dates.contains(&row.pred_date) {
+                continue;
+            }
+            if !row
+                .actual_change
+                .is_some_and(|change| change.is_finite() && change >= -100.0)
+            {
+                return Err(format!("预测样本 id={} 缺少有效实际收益", row.id).into());
+            }
+            if !matches!(row.hit, 0 | 1) {
+                return Err(format!("预测样本 hit 超出 0/1: {}", row.hit).into());
+            }
+            samples = samples.checked_add(1).ok_or("预测样本计数溢出")?;
+            hits = hits
+                .checked_add(i64::from(row.hit))
+                .ok_or("预测命中计数溢出")?;
         }
-        let hit_sum = row.hit_sum.ok_or("命中数聚合结果缺失")?;
-        let rate = hit_sum / row.sample_count as f64;
-        if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
-            return Err(format!("命中率超出有效域: {rate}").into());
+        if samples == 0 {
+            return Err(format!("{window_start}..={as_of} 没有已验证预测信号样本").into());
         }
-        Ok(rate)
+        Ok(VerifiedPredictionSampleHitRate {
+            as_of,
+            window_start,
+            trading_days,
+            samples,
+            hits,
+            rate: hits as f64 / samples as f64,
+        })
     }
 
     /// 保存主题签名用于去同质化（重复签名更新 created_at）
@@ -5757,7 +6014,6 @@ mod tests {
             1,
             "result backfill must update one immutable prediction row, not every same-day model"
         );
-        assert!((0.0..=1.0).contains(&db.get_prediction_hit_rate(1).unwrap()));
         assert_eq!(
             db.update_prediction_result(&today, Some("TEST_CODE_MISSING"), 0.5, false)
                 .unwrap(),
@@ -5827,7 +6083,12 @@ mod tests {
         assert!(db.get_pending_predictions("x' OR 1=1 --").is_err());
         assert!(db.count_recent_pushes(&code, 0).is_err());
         assert!(db.count_predictions_by_reason(" ").is_err());
-        assert!(db.get_prediction_hit_rate(0).is_err());
+        assert!(db
+            .get_verified_prediction_sample_hit_rate(
+                NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+                0,
+            )
+            .is_err());
         assert!(db
             .save_prediction(
                 &today,

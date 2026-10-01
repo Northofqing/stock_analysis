@@ -165,10 +165,7 @@ impl NotificationConfig {
         // SMTP_PORT 若 env 有值但解析失败 → 报错
         if let Ok(raw) = std::env::var("SMTP_PORT") {
             if !raw.trim().is_empty() && self.smtp_port.is_none() {
-                errors.push(format!(
-                    "SMTP_PORT 配置无效: \"{}\"（必须是 1-65535 的整数，如 465 或 587）",
-                    raw
-                ));
+                errors.push("SMTP_PORT 配置无效（必须是 1-65535 的整数，如 465 或 587）".into());
             }
         }
 

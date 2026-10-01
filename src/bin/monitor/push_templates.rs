@@ -4604,61 +4604,7 @@ fn load_p5_source_items_from_dir(
     )>,
     String,
 > {
-    use std::fs;
-    use std::io::ErrorKind;
-    use stock_analysis::opportunity::candidate_panel::CandidateSource;
-    let path = base_dir.join(format!("{source_name}.jsonl"));
-    let source = match source_name {
-        "stock_pick" => CandidateSource::StockPick,
-        "optimal_close" => CandidateSource::OptimalClose,
-        "volume_watchlist" => CandidateSource::VolumeWatchlist,
-        "volume_real_trade" => CandidateSource::VolumeRealTrade,
-        _ => return Err(format!("未知 P5 候选来源: {source_name}")),
-    };
-    let mut items = Vec::new();
-    let raw = match fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!("读取 P5 候选源 {} 失败: {error}", path.display()));
-        }
-    };
-    for (line_index, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        #[derive(serde::Deserialize)]
-        struct P5Item {
-            code: String,
-            name: String,
-        }
-        let item = serde_json::from_str::<P5Item>(line).map_err(|error| {
-            format!(
-                "P5 候选源 {path} 第 {} 行 JSON 非法: {error}",
-                line_index + 1,
-                path = path.display()
-            )
-        })?;
-        let code = item.code.trim();
-        let name = item.name.trim();
-        if !valid_source_stock_code(code) {
-            return Err(format!(
-                "P5 候选源 {} 第 {} 行 code 非法: {}",
-                path.display(),
-                line_index + 1,
-                item.code
-            ));
-        }
-        if name.is_empty() {
-            return Err(format!(
-                "P5 候选源 {} 第 {} 行 name 为空",
-                path.display(),
-                line_index + 1
-            ));
-        }
-        items.push((source, code.to_string(), name.to_string()));
-    }
-    Ok(items)
+    p05_file_witness::load_one_from_dir(source_name, base_dir).map(|loaded| loaded.items)
 }
 
 #[derive(Debug)]
@@ -4668,7 +4614,15 @@ struct RealCandidateBatch {
     themes: std::collections::HashMap<String, String>,
     quote_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
     statistics_evidence: Option<stock_analysis::data_gateway::BatchEvidence>,
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 }
+
+mod p05_chain_witness;
+mod p05_file_witness;
+mod p05_source_cohort;
 
 #[derive(Debug, Clone, PartialEq)]
 struct CandidateStatisticsRow {
@@ -4687,6 +4641,10 @@ struct CandidateSourceContext {
     entries: Vec<stock_analysis::opportunity::candidate_panel::CandidateEntry>,
     themes: std::collections::HashMap<String, String>,
     held_codes: Vec<String>,
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 }
 
 fn native_candidate_code(code: &str) -> &str {
@@ -4757,6 +4715,10 @@ fn assemble_real_candidate_batch(
     statistics_batch: CandidateStatisticsBatch,
     themes: std::collections::HashMap<String, String>,
     held_codes: &[String],
+    p5_files: Vec<p05_file_witness::P5SourceFileWitness>,
+    p5_candidate_refs: Vec<p05_file_witness::P5CandidateFileRef>,
+    chain_query: p05_chain_witness::P05ChainQueryWitness,
+    chain_candidate_refs: Vec<p05_chain_witness::P05ChainCandidateRef>,
 ) -> Result<RealCandidateBatch, String> {
     use stock_analysis::opportunity::candidate_panel::{
         classify_tier, filter_hard_gates, sort_candidates_by_heat, CandidateSource,
@@ -4822,6 +4784,8 @@ fn assemble_real_candidate_batch(
 
     entries = filter_hard_gates(entries, held_codes);
     entries = sort_candidates_by_heat(entries);
+    let p5_candidate_refs = p05_file_witness::selected_refs(&entries, p5_candidate_refs);
+    let chain_candidate_refs = p05_chain_witness::selected_refs(&entries, chain_candidate_refs);
 
     Ok(RealCandidateBatch {
         entries,
@@ -4829,64 +4793,61 @@ fn assemble_real_candidate_batch(
         themes,
         quote_evidence: Some(quote_batch.evidence),
         statistics_evidence: Some(statistics_batch.evidence),
+        p5_files,
+        p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
     })
 }
 
 fn load_candidate_source_context() -> Result<CandidateSourceContext, String> {
     use stock_analysis::database::DatabaseManager;
-    use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
 
-    let clusters = DatabaseManager::get().get_latest_chain_clusters_strict()?;
-    let mut items: Vec<(CandidateSource, String, String)> = Vec::new();
-    let mut themes = std::collections::HashMap::new();
-
-    for (cluster_index, cluster) in clusters.iter().take(5).enumerate() {
-        let codes = serde_json::from_str::<Vec<String>>(&cluster.stocks).map_err(|error| {
-            format!(
-                "chain_daily 第 {} 个主线 {} stocks JSON 非法: {error}",
-                cluster_index + 1,
-                cluster.concept
-            )
-        })?;
-        let Some(code) = codes.first().map(|value| value.trim()) else {
-            continue;
-        };
-        if !valid_source_stock_code(code) {
-            return Err(format!(
-                "chain_daily 主线 {} 头部 code 非法: {code}",
-                cluster.concept
-            ));
-        }
-        if cluster.concept.trim().is_empty() {
-            return Err(format!("chain_daily 主线 {code} concept 为空"));
-        }
-        items.push((
-            CandidateSource::IndustryChain,
-            code.to_string(),
-            cluster.concept.clone(),
-        ));
-        themes.insert(code.to_string(), cluster.concept.clone());
-    }
-
-    for source in [
-        "stock_pick",
-        "optimal_close",
-        "volume_watchlist",
-        "volume_real_trade",
-    ] {
-        items.extend(load_p5_source_items(source)?);
-    }
-
-    let entries = merge_candidates(items);
+    let chain = p05_chain_witness::project_snapshot_read(
+        DatabaseManager::get().get_p05_latest_chain_snapshot_strict(),
+    )?;
+    log::info!(
+        "[P-05][chain-origin][unqualified] date={} reason_code={} generation_sha256={} ordered_rows_sha256={}",
+        chain.witness.latest_date.as_deref().unwrap_or("absent"),
+        chain.witness.generation.reason_code(),
+        chain
+            .witness
+            .generation
+            .generation_sha256()
+            .unwrap_or("absent"),
+        chain.witness.ordered_rows_sha256,
+    );
+    let p5_sources = p05_file_witness::load_all_from_dir(std::path::Path::new("data/p5_sources"))?;
     let held_codes = stock_analysis::portfolio::get_positions()
         .map_err(|error| format!("候选台读取持仓失败: {error}"))?
         .into_iter()
         .map(|position| position.code)
         .collect();
+    assemble_candidate_source_context(chain, p5_sources, held_codes)
+}
+
+fn assemble_candidate_source_context(
+    chain: p05_chain_witness::P05ChainProjection,
+    p5_sources: p05_file_witness::P5SourceFiles,
+    held_codes: Vec<String>,
+) -> Result<CandidateSourceContext, String> {
+    use stock_analysis::opportunity::candidate_panel::merge_candidates;
+
+    let mut items = chain.items;
+    let themes = chain.themes;
+    items.extend(p5_sources.items);
+
+    let entries = merge_candidates(items);
+    let p5_candidate_refs = p05_file_witness::link_candidates(&entries, &p5_sources.witnesses)?;
+    let chain_candidate_refs = p05_chain_witness::link_candidates(&entries, chain.candidate_refs)?;
     Ok(CandidateSourceContext {
         entries,
         themes,
         held_codes,
+        p5_files: p5_sources.witnesses,
+        p5_candidate_refs,
+        chain_query: chain.witness,
+        chain_candidate_refs,
     })
 }
 
@@ -4895,6 +4856,10 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         entries,
         themes,
         held_codes,
+        p5_files,
+        p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
     } = crate::blocking_market_data::run_blocking_market_data(
         "BR-099 candidate source context",
         load_candidate_source_context,
@@ -4907,6 +4872,10 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
             themes,
             quote_evidence: None,
             statistics_evidence: None,
+            p5_files,
+            p5_candidate_refs,
+            chain_query,
+            chain_candidate_refs,
         });
     }
 
@@ -4946,7 +4915,17 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
         statistics_batch.evidence.observed_at,
         statistics_batch.evidence.batch_id
     );
-    assemble_real_candidate_batch(entries, quote_batch, statistics_batch, themes, &held_codes)
+    assemble_real_candidate_batch(
+        entries,
+        quote_batch,
+        statistics_batch,
+        themes,
+        &held_codes,
+        p5_files,
+        p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
+    )
 }
 
 /// v16.4+v13.6.2+v14.2: 真实数据集成 — 从候选台取 top 1 candidate
@@ -6115,35 +6094,17 @@ pub fn build_g5b_counted_binding(
     record: &stock_analysis::monitor::alert_log::AlertRecord,
     summary: &str,
 ) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
-    use sha2::{Digest, Sha256};
-
-    let event_facts = format!(
-        "{}|{}|{}|{}",
-        record.triggered_at, record.code, record.category, record.message
+    let facts = stock_analysis::monitor::attribution_deep::g5b_counted_source_facts(
+        business_date,
+        record,
+        summary,
     );
-    let event_hash = hex::encode(Sha256::digest(event_facts.as_bytes()));
-    let rendered_sha256 = hex::encode(Sha256::digest(summary.as_bytes()));
-    let canonical = serde_json::json!({
-        "schema": "g5b-attribution-v1",
-        "business_date": business_date.format("%Y-%m-%d").to_string(),
-        "code": record.code,
-        "triggered_at": record.triggered_at,
-        "category": record.category,
-        "level": record.level,
-        "message": record.message,
-        "rendered_sha256": rendered_sha256,
-    });
-    let canonical_bytes = canonical.to_string().into_bytes();
-    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
-        format!(
-            "g5b-attribution:{business_date}:{}:{event_hash}",
-            record.code
-        ),
-        canonical_bytes,
+        facts.occurrence_identity(),
+        facts.canonical_source().to_vec(),
         crate::durable_delivery_runtime::CountedDeliveryScope::Global,
-        subject_hash,
+        facts.source_sha256(),
         crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
         None,
         true,
@@ -7976,8 +7937,10 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
     let promotion_evidence = match tokio::task::spawn_blocking(|| {
         use stock_analysis::database::DatabaseManager;
         let db = DatabaseManager::get();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        db.candidate_promotion_samples(&today)
+        let completed_session = stock_analysis::monitor::prediction::completed_session_as_of_at(
+            stock_analysis::monitor::prediction::shanghai_now(),
+        )?;
+        db.candidate_promotion_samples(&completed_session.to_string())
             .map_err(|e| e.to_string())
     })
     .await
@@ -12704,6 +12667,18 @@ fn r08_is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn r08_market_announcement_source_allowed(source: &str) -> bool {
+    source == "cninfo-market"
+        || source
+            .strip_prefix("grpc-mtls:")
+            .is_some_and(|server_name| {
+                !server_name.is_empty()
+                    && server_name.trim() == server_name
+                    && !server_name.chars().any(char::is_whitespace)
+                    && url::Host::parse(server_name).is_ok()
+            })
+}
+
 fn validate_r08_public_binding_fields(
     binding: R08PublicSourceBinding,
 ) -> Result<ValidatedR08PublicBinding, &'static str> {
@@ -12748,9 +12723,14 @@ fn validate_r08_public_binding_fields(
             .position(|(component, _, _)| *component == evidence.component)
             .ok_or(INVALID)?;
         let observed_at = parse_r08_observed_at(&evidence.observed_at).map_err(|_| INVALID)?;
+        let source_allowed = if evidence.component == "market_announcements" {
+            r08_market_announcement_source_allowed(&evidence.source)
+        } else {
+            evidence.source == allowed[position].2
+        };
         if previous_position.is_some_and(|previous| position <= previous)
             || evidence.provider != allowed[position].1
-            || evidence.source != allowed[position].2
+            || !source_allowed
             || evidence.batch_id.trim().is_empty()
             || !matches!(evidence.status.as_str(), "available" | "verified_empty")
             || (evidence.status == "available"
@@ -12999,9 +12979,14 @@ fn r08_provider_evidence_binding<T>(
             evidence.provider
         ));
     }
-    if evidence.source != expected_source {
+    let source_allowed = if component == "market_announcements" {
+        r08_market_announcement_source_allowed(&evidence.source)
+    } else {
+        evidence.source == expected_source
+    };
+    if !source_allowed {
         return Err(format!(
-            "R-08 {component} source mismatch: expected={expected_source} actual={}",
+            "R-08 {component} source mismatch: expected={expected_source} or qualified announcement mTLS authority actual={}",
             evidence.source
         ));
     }
@@ -14390,6 +14375,55 @@ mod tests_br140_r08_partial_components {
             serde_json::from_slice(&prepared.task_transition_basis_canonical).unwrap();
         assert_eq!(task_basis["task"], "R-08");
         assert_eq!(task_basis["batch_ids"][3], "TEST_CODE_fx_batch");
+    }
+
+    #[test]
+    fn br161_r08_external_announcement_authority_survives_durable_binding() {
+        let business_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let reminder_date = r08_reminder_trading_date(business_date);
+        let mut announcements = announcement_batch(business_date);
+        match &mut announcements {
+            stock_analysis::data_gateway::GatewayBatch::Available { evidence, .. } => {
+                evidence.source = "grpc-mtls:magic-market.local".to_string();
+            }
+            stock_analysis::data_gateway::GatewayBatch::VerifiedEmpty(_) => unreachable!(),
+        }
+        let futures = cffex_batch(reminder_date);
+        let prepared = prepare_r08_counted_delivery(
+            business_date,
+            reminder_date,
+            prepared_calendar(),
+            Some(&announcements),
+            Some(&futures),
+            Some(&indices_batch()),
+            Some(&fx_batch()),
+        )
+        .expect("qualified ExternalV1 announcement source is accepted");
+        let binding =
+            counted_binding_from_r08(&prepared, prepared.source_binding_canonical.clone());
+        assert_eq!(
+            binding.validate_r08_public_source_only_text(&prepared.rendered),
+            Ok(())
+        );
+        let mut recorded: R08PublicSourceBinding =
+            serde_json::from_slice(&prepared.source_binding_canonical).unwrap();
+        assert_eq!(
+            recorded.provider_batches[0].source,
+            "grpc-mtls:magic-market.local"
+        );
+
+        for invalid in [
+            "grpc-mtls:",
+            "grpc-mtls: bad.local",
+            "grpc-mtls:https://bad.local",
+        ] {
+            recorded.provider_batches[0].source = invalid.to_string();
+            let canonical = serde_json::to_vec(&recorded).unwrap();
+            assert!(matches!(
+                validate_r08_public_source_binding_canonical_bytes(&canonical),
+                Err("counted_r08_source_only_binding_invalid")
+            ));
+        }
     }
 
     #[test]
@@ -19674,6 +19708,12 @@ mod tests {
             statistics_batch,
             std::collections::HashMap::new(),
             &["TEST_CODE_600001".to_string()],
+            Vec::new(),
+            Vec::new(),
+            p05_chain_witness::project_same_query(Vec::new())
+                .unwrap()
+                .witness,
+            Vec::new(),
         )
         .unwrap();
 
@@ -23147,9 +23187,20 @@ mod tests {
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
         assert!(binding.retry_authorized());
-        assert!(binding
-            .schedule_occurrence_identity()
-            .starts_with("g5b-attribution:2026-09-20:600001:"));
+        // Golden from the original producer algorithm: extraction into the
+        // shared read-only source facts must not change a counted identity.
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "g5b-attribution:2026-09-20:600001:7d9b56e1997d5cbbaec85f2db8e278a240a3384753ec008c13bf15316b0d4b45"
+        );
+        assert_eq!(
+            binding.source_binding_canonical(),
+            r#"{"business_date":"2026-09-20","category":"资金","code":"600001","level":"important","message":"主力净流入","rendered_sha256":"efed6b6ebadc213d4e9ec4b9eb2a84d29abaadecd5973efc76ddf7c9e8c8727e","schema":"g5b-attribution-v1","triggered_at":"2026-09-20T15:02:00"}"#.as_bytes()
+        );
+        assert_eq!(
+            binding.source_evidence_fingerprint(),
+            "bf802626d1dc19ab78135d70f5e0da7967af091ee99d38b5c4811e8461663919"
+        );
         // 同事件同日 → 同 occurrence; 同票不同事件 → 不同 occurrence (不互杀)
         let again = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
         assert_eq!(

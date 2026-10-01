@@ -1094,10 +1094,27 @@ impl AnalysisPipeline {
     }
 
     /// 处理单只股票的完整流程（含 120s 超时保护）
+    #[cfg(test)]
     pub(super) async fn process_stock(
         &self,
         code: String,
         macro_context: Arc<str>,
+    ) -> super::StockAnalysisOutcome {
+        self.process_stock_in_invocation(
+            code,
+            0,
+            macro_context,
+            super::CliInvocationIdentity::new(super::CliProducer::Direct),
+        )
+        .await
+    }
+
+    pub(super) async fn process_stock_in_invocation(
+        &self,
+        code: String,
+        input_ordinal: usize,
+        macro_context: Arc<str>,
+        invocation: super::CliInvocationIdentity,
     ) -> super::StockAnalysisOutcome {
         let start = std::time::Instant::now();
         info!("========== [{}] 开始处理 ==========", code);
@@ -1105,7 +1122,9 @@ impl AnalysisPipeline {
         // 整体超时保护：单只股票最多处理 120 秒，避免任何环节卡死拖垮全局
         let mut outcome = super::StockAnalysisOutcome::new(
             code.clone(),
+            input_ordinal,
             self.config.single_notify && self.config.send_notification && !self.config.dry_run,
+            &invocation,
         );
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
@@ -1267,9 +1286,47 @@ impl AnalysisPipeline {
         if self.config.single_notify && self.config.send_notification {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
+            outcome.report_snapshot = Some(super::CliReportSnapshot::new(
+                outcome.business_identity.matching_notification(),
+                report,
+            ));
             outcome.notification =
                 super::AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
-            let delivery = self.notifier.send_report(&report).await;
+            let sent = super::cli_target_receipt::send_cli_report_audited(
+                &self.notifier,
+                outcome.report_snapshot.as_ref().expect("just set").clone(),
+                &self.cli_send_audit_dir(),
+            )
+            .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(super::cli_target_receipt::CliAuditSendError::BeforeSend(error)) => {
+                    outcome.notification = super::AnalysisNotification::NotAttempted;
+                    outcome.failure = Some(format!("CLI 发送前意图落盘失败: {error:#}"));
+                    error!("[{}] {}", code_clone, outcome.failure.as_deref().unwrap());
+                    return Some(result);
+                }
+                Err(super::cli_target_receipt::CliAuditSendError::AfterSend(error)) => {
+                    outcome.failure = Some(format!("CLI 发送后弱观察落盘失败: {error:#}"));
+                    error!(
+                        "[{}] {}；结果未知，不自动重发",
+                        code_clone,
+                        outcome.failure.as_deref().unwrap()
+                    );
+                    return Some(result);
+                }
+            };
+            if sent.has_custom_attempts() {
+                let directory = self.cli_target_receipt_dir();
+                if let Err(error) =
+                    super::cli_target_receipt::persist_custom_target_receipts(&sent, &directory)
+                {
+                    let failure = format!("Custom 逐目标弱回执落盘失败: {error:#}");
+                    error!("[{}] {}；不自动重发", code_clone, failure);
+                    outcome.failure = Some(failure);
+                }
+            }
+            let delivery = sent.into_report();
             match delivery.completion() {
                 crate::notification::NotificationCompletion::AllAccepted => {
                     info!("[{}] 单股推送全部渠道弱接受", code_clone)
@@ -1293,6 +1350,22 @@ impl AnalysisPipeline {
         }
 
         Some(result)
+    }
+
+    fn cli_target_receipt_dir(&self) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.test_backtest_output_dir {
+            return directory.join("cli_target_receipts");
+        }
+        std::path::PathBuf::from("reports/cli_target_receipts")
+    }
+
+    fn cli_send_audit_dir(&self) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = &self.test_backtest_output_dir {
+            return directory.join("cli_send_audit");
+        }
+        std::path::PathBuf::from("reports/cli_send_audit")
     }
 }
 
@@ -2145,6 +2218,8 @@ mod tests {
                 Ok(None),
             );
             let mut pipeline = test_pipeline(context, false);
+            let receipt_root = tempfile::tempdir().expect("isolated receipt directory");
+            pipeline.test_backtest_output_dir = Some(receipt_root.path().to_path_buf());
             pipeline.test_fetched_data = Some(Ok(analysis_bars()));
             pipeline.config.single_notify = true;
             pipeline.config.send_notification = true;
@@ -2160,8 +2235,35 @@ mod tests {
                 .await;
             assert_eq!(outcome.saved, crate::pipeline::AnalysisSaveStatus::Saved);
             assert!(outcome.analysis.is_some());
+            let snapshot = outcome
+                .report_snapshot
+                .as_ref()
+                .expect("single report snapshot");
+            assert_eq!(
+                snapshot.identity().invocation(),
+                outcome.business_identity.invocation()
+            );
+            assert_eq!(
+                snapshot.report_bytes().as_bytes(),
+                pipeline
+                    .generate_single_report(outcome.analysis.as_ref().unwrap())
+                    .as_bytes()
+            );
+            let handed_report = snapshot.report().to_owned();
             assert_eq!(outcome.notification.completion(), Some(expected));
             assert_eq!(outcome.ensure_cli_success().is_ok(), cli_ok);
+            let receipt_dir = receipt_root.path().join("cli_target_receipts");
+            let stored = std::fs::read_dir(receipt_dir)
+                .expect("Custom target receipt directory")
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            let receipts: Vec<crate::pipeline::cli_target_receipt::CliTargetWeakReceipt> =
+                serde_json::from_slice(&std::fs::read(stored[0].path()).unwrap()).unwrap();
+            assert_eq!(receipts.len(), responses.len());
+            assert!(receipts
+                .iter()
+                .all(|receipt| receipt.invocation_id == snapshot.identity().invocation().id()));
             let run = crate::pipeline::AnalysisRunReport {
                 results: vec![outcome.analysis.clone().unwrap()],
                 stocks: vec![outcome],
@@ -2173,9 +2275,106 @@ mod tests {
                 expected == NotificationCompletion::AllAccepted
             );
             for fixture in fixtures {
-                assert_eq!(fixture.finish().len(), 1);
+                let requests = fixture.finish();
+                assert_eq!(requests.len(), 1);
+                let body_start = requests[0]
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("HTTP body delimiter")
+                    + 4;
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests[0][body_start..]).expect("custom body");
+                assert_eq!(body["content"].as_str(), Some(handed_report.as_str()));
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn repeated_input_code_keeps_two_single_sends_and_distinct_occurrences() {
+        use crate::notification::send_report_tests::{
+            spawn_webhook_fixture, test_service, ScriptedResponse,
+        };
+        use crate::notification::{NotificationChannel, NotificationConfig};
+
+        crate::database::DatabaseManager::init(None).expect("test database initialization");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let code = format!("TEST_CODE_DUPLICATE_{suffix}");
+        let output_dir = std::env::temp_dir().join(format!(
+            "stock-analysis-duplicate-{}-{suffix}",
+            std::process::id()
+        ));
+        let _guard = FullPipelineGuard {
+            code: code.clone(),
+            output_dir: output_dir.clone(),
+        };
+        let fixture = spawn_webhook_fixture(vec![
+            ScriptedResponse::Http(r#"{"ok":true}"#),
+            ScriptedResponse::Http(r#"{"ok":true}"#),
+        ]);
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.config.max_workers = 1;
+        pipeline.config.single_notify = true;
+        pipeline.config.send_notification = true;
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.test_backtest_output_dir = Some(output_dir);
+        pipeline.notifier = Arc::new(test_service(
+            NotificationConfig {
+                custom_webhook_urls: vec![fixture.url()],
+                ..Default::default()
+            },
+            vec![NotificationChannel::Custom],
+        ));
+
+        let report = pipeline
+            .run_with_producer(
+                &[code.clone(), code.clone()],
+                Some("TEST_CODE_本地宏观证据".into()),
+                super::super::CliProducer::Default,
+            )
+            .await
+            .expect("duplicate stock run");
+        assert_eq!(report.stocks.len(), 2);
+        let invocation = report.invocation.as_ref().expect("invocation");
+        for (input_ordinal, stock) in report.stocks.iter().enumerate() {
+            assert_eq!(stock.business_identity.invocation(), invocation);
+            assert_eq!(
+                stock.business_identity.subject(),
+                &super::super::CliSubject::Stock {
+                    code: code.clone(),
+                    input_ordinal,
+                }
+            );
+            assert_eq!(
+                stock
+                    .report_snapshot
+                    .as_ref()
+                    .expect("single send")
+                    .identity()
+                    .subject(),
+                stock.business_identity.subject()
+            );
+            assert_eq!(
+                stock.notification.completion(),
+                Some(crate::notification::NotificationCompletion::AllAccepted)
+            );
+        }
+        assert_ne!(
+            report.stocks[0].business_identity,
+            report.stocks[1].business_identity
+        );
+        assert!(report.summary.business_identity.is_none());
+        assert_eq!(fixture.finish().len(), 2);
     }
 
     #[tokio::test]
@@ -2202,6 +2401,7 @@ mod tests {
         );
         assert!(outcome.ensure_cli_success().is_err());
         assert!(outcome.analysis.is_some());
+        assert!(outcome.report_snapshot.is_some());
         pipeline.config.send_notification = false;
         let outcome = pipeline
             .process_stock("TEST_CODE_TASK2_NOTIFICATION".into(), Arc::from(""))
@@ -2210,6 +2410,7 @@ mod tests {
             outcome.notification,
             crate::pipeline::AnalysisNotification::NotRequested
         ));
+        assert!(outcome.report_snapshot.is_none());
         assert!(outcome.ensure_cli_success().is_ok());
     }
 
@@ -2253,11 +2454,15 @@ mod tests {
         let mut dry_run = test_pipeline(context.clone(), false);
         dry_run.test_fetched_data = Some(Ok(analysis_bars()));
         dry_run.config.dry_run = true;
-        assert!(dry_run
+        let dry_outcome = dry_run
             .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
-            .await
-            .analysis
-            .is_none());
+            .await;
+        assert!(dry_outcome.analysis.is_none());
+        assert!(dry_outcome.report_snapshot.is_none());
+        assert!(matches!(
+            dry_outcome.notification,
+            crate::pipeline::AnalysisNotification::NotRequested
+        ));
 
         let mut analysis_failure = test_pipeline(
             resolved_context(Err("TEST_CODE_上下文失败".to_string()), Ok(None)),
@@ -2333,11 +2538,76 @@ mod tests {
 
         let results = pipeline
             .run(
-                std::slice::from_ref(&code),
+                &[code.clone(), code.clone()],
                 Some("TEST_CODE_本地宏观证据".to_string()),
             )
             .await
             .expect("resolved full pipeline run");
+        let invocation = results.invocation.as_ref().expect("run invocation");
+        assert_eq!(results.stocks.len(), 2);
+        assert_eq!(results.stocks[0].business_identity.invocation(), invocation);
+        assert_eq!(results.stocks[1].business_identity.invocation(), invocation);
+        assert_ne!(
+            results.stocks[0].business_identity,
+            results.stocks[1].business_identity
+        );
+        let mut stock_ordinals = results
+            .stocks
+            .iter()
+            .map(|stock| match stock.business_identity.subject() {
+                super::super::CliSubject::Stock {
+                    code: subject_code,
+                    input_ordinal,
+                } if subject_code == &code => *input_ordinal,
+                subject => panic!("unexpected stock subject: {subject:?}"),
+            })
+            .collect::<Vec<_>>();
+        stock_ordinals.sort_unstable();
+        assert_eq!(stock_ordinals, [0, 1]);
+        assert_eq!(
+            results
+                .summary
+                .business_identity
+                .as_ref()
+                .unwrap()
+                .invocation(),
+            invocation
+        );
+        assert_eq!(
+            results
+                .summary
+                .report_snapshot
+                .as_ref()
+                .unwrap()
+                .identity()
+                .invocation(),
+            invocation
+        );
+        assert_eq!(
+            results
+                .summary
+                .business_identity
+                .as_ref()
+                .unwrap()
+                .subject(),
+            &super::super::CliSubject::Summary
+        );
+        assert_eq!(
+            results
+                .summary
+                .saved_paths
+                .iter()
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("stock_analysis_")
+                })
+                .count(),
+            1
+        );
+        assert!(results.stocks[0].report_snapshot.is_none());
+        assert!(results.stocks[1].report_snapshot.is_none());
         assert!(!results.is_complete());
         assert!(results.ensure_cli_success().is_err());
         assert_eq!(
@@ -2345,7 +2615,7 @@ mod tests {
             Some(crate::notification::NotificationCompletion::NoTargets)
         );
         let results = results.results;
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].code, code);
         assert_eq!(
             results[0]

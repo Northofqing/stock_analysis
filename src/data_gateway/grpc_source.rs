@@ -37,7 +37,7 @@ pub(crate) use crate::grpc_client::client::board_attempt::{
     BoardAttemptCompletion, BoardContinuation, BoardQuerySession, BoardTrailerMaterial,
 };
 use crate::grpc_client::client::{ContractProfile, GrpcMarketClient};
-use crate::grpc_client::envelope::QueryResult;
+use crate::grpc_client::envelope::{AcquisitionProvenance, QueryResult};
 use crate::grpc_client::errors::GrpcError;
 use crate::grpc_client::external_pb::magic::market::v1::{
     AdmissionState as ExternalAdmissionState, Capability as ExternalCapability,
@@ -748,6 +748,26 @@ fn map_current_routed_query_error(op: Operation, error: &GrpcError) -> GatewayEr
     // Dedicated outcome transport/receipt is not an ordinary routed product.
     if op == Operation::OutcomeDailyBars {
         return legacy;
+    }
+    // An explicit, non-retryable server contract refusal is distinct from a
+    // temporarily unavailable provider. The frozen durable v1 projection above
+    // is unchanged; only current ordinary acquisitions use this typed detail.
+    if matches!(error, GrpcError::Internal { .. })
+        && error.details().reason_code.as_deref() == Some("unsupported_contract")
+        && error.details().retryable == Some(false)
+    {
+        return GatewayError::classified(
+            legacy.capability(),
+            error
+                .details()
+                .provider
+                .as_deref()
+                .and_then(|name| convert::parse_provider(name).ok()),
+            "unsupported",
+            "unsupported_contract",
+            false,
+            legacy.message(),
+        );
     }
     GatewayError::classified(
         legacy.capability(),
@@ -3580,7 +3600,31 @@ impl GrpcSource {
         limit: u32,
     ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
         let (operation, params) = market_announcements_request(trading_date, limit);
-        let q = self.query_op(operation, params).await?;
+        let external = self.external_bundle.is_some();
+        let q = if external {
+            self.query_external_op(operation, params).await?
+        } else {
+            self.query_op(operation, params).await?
+        };
+        let provenance_matches_route = match (&q.provenance, external) {
+            (AcquisitionProvenance::ExternalMtlsAuthority(authority), true) => authority
+                .strip_prefix("grpc-mtls:")
+                .is_some_and(|server_name| {
+                    !server_name.is_empty()
+                        && server_name.trim() == server_name
+                        && !server_name.chars().any(char::is_whitespace)
+                        && url::Host::parse(server_name).is_ok()
+                }),
+            (AcquisitionProvenance::LocalWireSource(source), false) => source == "cninfo-market",
+            _ => false,
+        };
+        if !provenance_matches_route {
+            return Err(GatewayError::invalid_evidence(
+                "MarketAnnouncements",
+                None,
+                "acquisition provenance does not match selected route",
+            ));
+        }
         let batch = convert::market_announcements(&q)?;
         if batch.records().len() > limit as usize {
             return Err(GatewayError::invalid_evidence(
@@ -3589,6 +3633,15 @@ impl GrpcSource {
                 format!(
                     "market announcement record count {} exceeds requested limit {limit}",
                     batch.records().len()
+                ),
+            ));
+        }
+        if external && batch.records().len() == limit as usize {
+            return Err(GatewayError::invalid_evidence(
+                "MarketAnnouncements",
+                Some(batch.evidence().provider),
+                format!(
+                    "external market announcement coverage unverified: response saturated requested limit {limit}"
                 ),
             ));
         }
@@ -4678,6 +4731,56 @@ mod tests {
         assert_eq!(g.audit_outcome(), "unavailable");
         assert!(g.retryable());
         assert!(g.message().contains("BoardConstituents"));
+    }
+
+    #[test]
+    fn current_money_flow_keeps_typed_unsupported_contract_without_retry() {
+        let detail = ErrorDetail {
+            code: "internal".to_owned(),
+            provider: Some("Eastmoney".to_owned()),
+            reason_code: Some("unsupported_contract".to_owned()),
+            retryable: Some(false),
+            ..Default::default()
+        };
+        let error = GrpcError::Internal {
+            details: Box::new(detail.clone()),
+        };
+        let current = map_current_routed_query_error(Operation::MoneyFlows, &error);
+        assert_eq!(current.provider(), Some(ProviderId::Eastmoney));
+        assert_eq!(current.audit_outcome(), "unsupported");
+        assert_eq!(current.reason_code(), "unsupported_contract");
+        assert!(!current.retryable());
+
+        let legacy = map_legacy_durable_query_error(Operation::MoneyFlows, &error);
+        assert_eq!(legacy.audit_outcome(), "unavailable");
+        assert_eq!(legacy.reason_code(), "internal");
+
+        let missing_detail = GrpcError::Internal {
+            details: Box::default(),
+        };
+        let unproven = map_current_routed_query_error(Operation::MoneyFlows, &missing_detail);
+        assert_eq!(unproven.reason_code(), "no_verified_batch");
+        assert_eq!(unproven.audit_outcome(), "unavailable");
+
+        let contradictory = GrpcError::Internal {
+            details: Box::new(ErrorDetail {
+                retryable: Some(true),
+                ..detail
+            }),
+        };
+        let unproven = map_current_routed_query_error(Operation::MoneyFlows, &contradictory);
+        assert_ne!(unproven.audit_outcome(), "unsupported");
+
+        let permission_denied = GrpcError::PermissionDenied {
+            details: Box::new(ErrorDetail {
+                reason_code: Some("unsupported_contract".to_owned()),
+                retryable: Some(false),
+                ..Default::default()
+            }),
+        };
+        let rejected = map_current_routed_query_error(Operation::MoneyFlows, &permission_denied);
+        assert_eq!(rejected.audit_outcome(), "invalid_request");
+        assert_ne!(rejected.reason_code(), "unsupported_contract");
     }
 
     #[test]
@@ -6371,6 +6474,150 @@ mod tests {
         std::env::remove_var("GRPC_MARKET_ADDR");
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
+    }
+
+    #[test]
+    fn br161_configured_market_announcements_never_falls_back_to_local_bridge() {
+        let _env = test_grpc_env_guard();
+        std::env::set_var("GRPC_MARKET_ADDR", "http://127.0.0.1:1");
+        std::env::set_var(
+            "GRPC_MARKET_CLIENT_BUNDLE",
+            "/TEST_CODE_missing_market_announcements_bundle",
+        );
+        reset_bridge();
+
+        let bridge = bridge_for("MarketAnnouncements").expect("bridge config");
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let error = block_on(bridge.market_announcements_async(date, 300))
+            .expect_err("configured ExternalV1 failure must not fall back to LocalBridgeV1");
+        assert_eq!(error.capability(), "GrpcExternalV1");
+        assert_eq!(error.reason_code(), "external_bundle_invalid");
+        assert!(!error.retryable());
+
+        std::env::remove_var("GRPC_MARKET_ADDR");
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+    }
+
+    #[test]
+    fn br161_market_announcements_route_requires_typed_provenance() {
+        let _env = test_grpc_env_guard();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let response = |provenance| QueryResult {
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
+            selected_provider: "Cninfo".to_string(),
+            batch_id: "TEST_CODE_market_announcements".to_string(),
+            complete: true,
+            observed_at: "2026-09-23T18:01:00+08:00".to_string(),
+            source_at: "2026-09-23T18:00:00+08:00".to_string(),
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "magic.market.announcement".to_string(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: serde_json::json!({
+                    "announcement_id": "TEST_CODE_announcement",
+                    "code": "600000",
+                    "category": "重大合同",
+                    "title": "TEST_CODE 公告",
+                    "published_at": "2026-09-23T18:00:00+08:00",
+                    "url": "https://example.invalid/TEST_CODE_announcement"
+                })
+                .to_string()
+                .into_bytes(),
+            }],
+            provenance,
+            diagnostic_blocker: String::new(),
+        };
+
+        std::env::set_var(
+            "GRPC_MARKET_CLIENT_BUNDLE",
+            "/TEST_CODE_market_announcements_bundle",
+        );
+        reset_bridge();
+        let bridge = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(
+            AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:magic-market.local".to_string(),
+            ),
+        ))]);
+        let batch = block_on(bridge.market_announcements_async(date, 300)).unwrap();
+        assert_eq!(batch.records().len(), 1);
+        assert_eq!(batch.evidence().source, "grpc-mtls:magic-market.local");
+
+        set_test_query_responses(vec![Ok(response(AcquisitionProvenance::LocalWireSource(
+            "grpc-mtls:magic-market.local".to_string(),
+        )))]);
+        let error = block_on(bridge.market_announcements_async(date, 300)).unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+        let bridge = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(AcquisitionProvenance::LocalWireSource(
+            "grpc-mtls:evil.local".to_string(),
+        )))]);
+        let error = block_on(bridge.market_announcements_async(date, 300)).unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+    }
+
+    #[test]
+    fn br161_saturated_external_market_announcements_fail_closed() {
+        let _env = test_grpc_env_guard();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let response = |provenance| QueryResult {
+            admission: crate::grpc_client::envelope::QueryAdmission::Admitted,
+            selected_provider: "Cninfo".to_string(),
+            batch_id: "TEST_CODE_market_announcements".to_string(),
+            complete: true,
+            observed_at: "2026-09-23T18:01:00+08:00".to_string(),
+            source_at: "2026-09-23T18:00:00+08:00".to_string(),
+            records: vec![crate::grpc_client::envelope::CanonicalRecord {
+                schema: "magic.market.announcement".to_string(),
+                schema_version: 1,
+                content_type: "application/json; charset=utf-8".to_string(),
+                data: serde_json::json!({
+                    "announcement_id": "TEST_CODE_announcement",
+                    "code": "600000",
+                    "category": "重大合同",
+                    "title": "TEST_CODE 公告",
+                    "published_at": "2026-09-23T18:00:00+08:00",
+                    "url": "https://example.invalid/TEST_CODE_announcement"
+                })
+                .to_string()
+                .into_bytes(),
+            }],
+            provenance,
+            diagnostic_blocker: String::new(),
+        };
+
+        std::env::set_var(
+            "GRPC_MARKET_CLIENT_BUNDLE",
+            "/TEST_CODE_market_announcements_bundle",
+        );
+        reset_bridge();
+        let external = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(
+            AcquisitionProvenance::ExternalMtlsAuthority(
+                "grpc-mtls:magic-market.local".to_string(),
+            ),
+        ))]);
+        let error = block_on(external.market_announcements_async(date, 1)).unwrap_err();
+        assert_eq!(error.reason_code(), "invalid_evidence");
+        assert!(error.message().contains("coverage unverified"));
+
+        std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
+        reset_bridge();
+        let local = bridge_for("MarketAnnouncements").unwrap();
+        set_test_query_responses(vec![Ok(response(AcquisitionProvenance::LocalWireSource(
+            "cninfo-market".to_string(),
+        )))]);
+        assert_eq!(
+            block_on(local.market_announcements_async(date, 1))
+                .unwrap()
+                .records()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -231,7 +231,7 @@ impl<'a> StatusErrorContext<'a> {
     }
 }
 
-fn request_id_correlation(value: &str) -> Option<String> {
+pub(crate) fn request_id_correlation(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
@@ -297,6 +297,8 @@ enum KnownReasonCode {
     Unavailable,
     Partial,
     Internal,
+    UnsupportedContract,
+    ProviderTransport,
     TdxBoardMembershipUnsupported,
     UpperLimitStreakMissing,
     ManualConfirmationContractUnavailable,
@@ -323,6 +325,8 @@ impl KnownReasonCode {
             "unavailable" => Self::Unavailable,
             "partial" => Self::Partial,
             "internal" => Self::Internal,
+            "unsupported_contract" => Self::UnsupportedContract,
+            "provider_transport" => Self::ProviderTransport,
             "tdx_board_membership_unsupported" => Self::TdxBoardMembershipUnsupported,
             "upper_limit_streak_missing" => Self::UpperLimitStreakMissing,
             "manual_confirmation_contract_unavailable" => {
@@ -352,6 +356,8 @@ impl KnownReasonCode {
             Self::Unavailable => "unavailable",
             Self::Partial => "partial",
             Self::Internal => "internal",
+            Self::UnsupportedContract => "unsupported_contract",
+            Self::ProviderTransport => "provider_transport",
             Self::TdxBoardMembershipUnsupported => "tdx_board_membership_unsupported",
             Self::UpperLimitStreakMissing => "upper_limit_streak_missing",
             Self::ManualConfirmationContractUnavailable => {
@@ -937,6 +943,31 @@ mod tests {
             Some("no_current_reports")
         );
         assert_eq!(err.details().retryable, Some(false));
+    }
+
+    #[test]
+    fn observed_flow_reasons_survive_wire_decode_without_opening_unknown_codes() {
+        for (wire_reason, expected) in [
+            ("unsupported_contract", "unsupported_contract"),
+            ("provider_transport", "provider_transport"),
+            ("unrecognized_flow_reason", "internal"),
+        ] {
+            let detail = crate::grpc_client::pb::magic::market::v1::ErrorDetail {
+                request_id: "TEST_CODE_flow_request".to_owned(),
+                operation: crate::grpc_client::pb::magic::market::v1::Operation::MoneyFlows as i32,
+                provider: "Eastmoney".to_owned(),
+                reason_code: wire_reason.to_owned(),
+                retryable: false,
+                ..Default::default()
+            };
+            let status = tonic::Status::with_details(
+                Code::Internal,
+                "TEST_CODE flow failure",
+                detail.encode_to_vec().into(),
+            );
+            let error = GrpcError::from(status);
+            assert_eq!(error.details().reason_code.as_deref(), Some(expected));
+        }
     }
 
     #[test]

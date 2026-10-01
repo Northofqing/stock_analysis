@@ -35,9 +35,11 @@ pub fn active_binding() -> Result<AccountBinding, String> {
         return Err("invalid paper account/epoch/manifest identity".into());
     }
     let db = DatabaseManager::try_get().ok_or("DB not initialized")?;
-    PaperLedger::open(db, &Utc::now)
-        .read(&binding)
+    let ledger = PaperLedger::open(db, &Utc::now);
+    ledger
+        .require_active_v1_owner(&binding)
         .map_err(|error| error.to_string())?;
+    ledger.read(&binding).map_err(|error| error.to_string())?;
     Ok(binding)
 }
 
@@ -109,6 +111,9 @@ pub(crate) fn execute_checked_on(
         return Err("producer must supply a stable unqualified plan identity".into());
     }
     let ledger = PaperLedger::open(db, clock);
+    ledger
+        .require_active_v1_owner(binding)
+        .map_err(|error| error.to_string())?;
     let mut signal = signal.clone();
     signal.plan_id = format!("paper:{}:{}", binding.epoch_id, signal.plan_id);
     if let Some(receipt) = ledger
@@ -227,7 +232,11 @@ pub(crate) fn sellable_positions_on(
     binding: &AccountBinding,
     today: chrono::NaiveDate,
 ) -> Result<Vec<super::paper_sell::PaperPosition>, String> {
-    let set = PaperLedger::open(db, &Utc::now)
+    let ledger = PaperLedger::open(db, &Utc::now);
+    ledger
+        .require_active_v1_owner(binding)
+        .map_err(|error| error.to_string())?;
+    let set = ledger
         .verified_effective_fills(&EffectiveFillRequest {
             scope: EffectiveFillScope::Epoch(binding.clone()),
             history: EffectiveHistory::RestatedLatest,
@@ -274,6 +283,8 @@ pub(crate) fn already_sold_on(
         n: i64,
     }
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    super::paper_ledger::require_v1_owner_on(&mut conn, binding)
+        .map_err(|error| error.to_string())?;
     let count:Count = diesel::sql_query("SELECT COUNT(*) AS n FROM paper_trades p JOIN paper_ledger_event e ON e.paper_trade_id=p.id WHERE e.account_id=? AND p.code=? AND p.direction='sell' AND p.status='Filled' AND date(p.ts)=?")
         .bind::<diesel::sql_types::Text,_>(&binding.account_id).bind::<diesel::sql_types::Text,_>(code).bind::<diesel::sql_types::Text,_>(today).get_result(&mut conn).map_err(|error|error.to_string())?;
     Ok(count.n > 0)

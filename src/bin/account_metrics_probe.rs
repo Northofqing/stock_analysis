@@ -7,6 +7,38 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+fn current_day_pnl_pct(
+    snapshot_at: chrono::DateTime<chrono::FixedOffset>,
+    evaluated_at: chrono::DateTime<chrono::FixedOffset>,
+    daily_pnl: f64,
+    total_assets: f64,
+) -> Result<f64, String> {
+    if total_assets <= 0.0 {
+        return Err("total assets must be positive for account mode".to_owned());
+    }
+    let pnl_pct = daily_pnl / total_assets * 100.0;
+    if !pnl_pct.is_finite() {
+        return Err("daily PnL ratio is non-finite".to_owned());
+    }
+    let china_offset = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("China offset");
+    if snapshot_at.with_timezone(&china_offset).date_naive()
+        != evaluated_at.with_timezone(&china_offset).date_naive()
+    {
+        return Err("account summary does not contain today's PnL".to_owned());
+    }
+    Ok(pnl_pct)
+}
+
+fn available_net_pnl(
+    net: &stock_analysis::performance::economic_position::NetMetrics,
+) -> Result<f64, String> {
+    use stock_analysis::performance::economic_position::NetMetrics;
+    match net {
+        NetMetrics::Available { net_pnl, .. } => Ok(*net_pnl),
+        NetMetrics::Unavailable { .. } => Err("closed position net PnL is unavailable".to_owned()),
+    }
+}
+
 fn parse_args() -> Result<PathBuf, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -51,7 +83,15 @@ fn main() -> ExitCode {
         if age > chrono::Duration::hours(96) {
             return Err(format!("summary stale: age={age}"));
         }
-        let today_pnl_pct = summary.daily_pnl / summary.total_assets * 100.0;
+        if summary.source.trim().is_empty() {
+            return Err("account summary source is empty".to_owned());
+        }
+        let today_pnl_pct = current_day_pnl_pct(
+            effective_at,
+            observed_at,
+            summary.daily_pnl,
+            summary.total_assets,
+        )?;
         let total_pos_cheng = (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
         let report = {
@@ -73,18 +113,13 @@ fn main() -> ExitCode {
             .closed_positions
             .iter()
             .map(|position| {
-                use stock_analysis::performance::economic_position::NetMetrics;
-                let pnl = match &position.net {
-                    NetMetrics::Available { net_pnl, .. } => *net_pnl,
-                    _ => position.gross_pnl,
-                };
-                (
+                Ok((
                     position.closed_at,
                     format!("economic-cycle-{}", position.cycle_open_fill_id),
-                    pnl,
-                )
+                    available_net_pnl(&position.net)?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         realized.sort_by(|left, right| right.0.cmp(&left.0));
         println!("recent closed cycles (newest first):");
         for (closed_at, identity, pnl) in realized.iter().take(8) {
@@ -107,5 +142,27 @@ fn main() -> ExitCode {
             eprintln!("account metrics probe failed: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stock_analysis::performance::economic_position::NetMetrics;
+
+    #[test]
+    fn previous_day_summary_cannot_be_reported_as_today_pnl() {
+        let yesterday = chrono::DateTime::parse_from_rfc3339("2026-09-28T16:00:00+08:00").unwrap();
+        let today = chrono::DateTime::parse_from_rfc3339("2026-09-29T10:00:00+08:00").unwrap();
+        assert!(current_day_pnl_pct(yesterday, today, 10.0, 1000.0).is_err());
+        assert_eq!(current_day_pnl_pct(today, today, 10.0, 1000.0), Ok(1.0));
+    }
+
+    #[test]
+    fn unavailable_net_cost_cannot_fall_back_to_gross_pnl() {
+        assert!(available_net_pnl(&NetMetrics::Unavailable {
+            reason: "missing fee evidence".to_owned(),
+        })
+        .is_err());
     }
 }

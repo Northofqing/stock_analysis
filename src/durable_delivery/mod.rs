@@ -6,10 +6,16 @@
 //! all-or-nothing follow-up after every counted caller has migrated.
 
 mod coordinator;
+mod correlation;
 mod model;
 mod schema;
 
-pub use coordinator::DurableDeliveryCoordinator;
+pub use coordinator::{
+    CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
+    CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2, DurableDeliveryCoordinator,
+    G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+};
+pub use correlation::P01OriginProducer;
 pub use model::{
     compiled_policy_catalog, AuthoritativeDeliveryRequest, AuthoritativeSink,
     AuthoritativeSinkPort, AuthoritativeSinkResult, AuthorityWatermark,

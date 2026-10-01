@@ -405,6 +405,13 @@ pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String
     let application = diesel::sql_query("PRAGMA application_id")
         .get_result::<Application>(conn)?
         .application_id;
+    if generation < 4
+        && diesel::sql_query("SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')
+            + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')) AS value")
+            .get_result::<IntegerRow>(conn)?.value != 0
+    {
+        return Err(LedgerError::IntegrityFailure("unexpected owner namespace before CatalogV4".into()));
+    }
     let mut objects=diesel::sql_query("SELECT type AS kind,name,tbl_name AS owner,sql FROM sqlite_master WHERE (name GLOB 'paper_ledger_*' OR tbl_name GLOB 'paper_ledger_*') AND sql IS NOT NULL ORDER BY type,name,tbl_name,sql").load::<CatalogObject>(conn)?;
     objects.sort();
     if objects.is_empty() {
@@ -425,11 +432,47 @@ pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String
                 sql: sql.replace("IF NOT EXISTS ", ""),
             })
             .collect::<Vec<_>>();
+        if generation == 4 {
+            expected.extend(
+                crate::database::paper_book_owner_schema_v1::V1_GUARD_STATEMENTS
+                    .iter()
+                    .map(|(kind, name, owner, sql)| CatalogObject {
+                        kind: (*kind).into(),
+                        name: (*name).into(),
+                        owner: (*owner).into(),
+                        sql: sql.replace("IF NOT EXISTS ", ""),
+                    }),
+            );
+        }
+        if generation == 5 {
+            expected.extend(
+                crate::database::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS
+                    .iter()
+                    .map(|(kind, name, owner, sql)| CatalogObject {
+                        kind: (*kind).into(),
+                        name: (*name).into(),
+                        owner: (*owner).into(),
+                        sql: sql.replace("IF NOT EXISTS ", ""),
+                    }),
+            );
+        }
         expected.sort();
         let supported_generation = match generation {
             2 => true,
             3 => crate::database::daily_change_review_schema_v1::is_present(conn)
                 .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?,
+            4 => {
+                let review = crate::database::daily_change_review_schema_v1::is_present(conn)
+                    .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+                crate::database::paper_book_owner_schema_v1::verify_catalog_v4_on(conn)
+                    .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+                review
+            }
+            5 => {
+                crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(conn)
+                    .map_err(|error| LedgerError::IntegrityFailure(error.to_string()))?;
+                true
+            }
             _ => false,
         };
         if !supported_generation || application != 1398035265 || objects != expected {
@@ -656,7 +699,7 @@ fn legacy_verified_on(
                     "LegacyRaw permits only current raw as-known".into(),
                 ));
             }
-            if catalog.0 == 2
+            if matches!(catalog.0, 2 | 4)
                 && diesel::sql_query("SELECT COUNT(*) AS value FROM paper_ledger_account")
                     .get_result::<IntegerRow>(conn)?
                     .value

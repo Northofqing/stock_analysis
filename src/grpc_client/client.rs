@@ -52,6 +52,8 @@ mod external_control_attempt_tests;
 #[cfg(test)]
 #[path = "external_control_loopback_fixture.rs"]
 pub(crate) mod external_control_loopback_fixture;
+#[path = "external_flow_read.rs"]
+pub(crate) mod external_flow_read;
 #[cfg(test)]
 #[path = "external_mtls_attempt_tests.rs"]
 mod external_mtls_attempt_tests;
@@ -167,6 +169,23 @@ pub struct GrpcMarketClient {
     endpoint_uri: Option<String>,
     external_provider_catalog: Option<ExternalProviderCatalog>,
     connection_generation: Option<super::connection_qualification::ConnectionGeneration>,
+}
+
+/// The one local RPC's result and the same request ID used for status-detail
+/// validation. The request ID is exposed only as a domain-separated digest.
+pub struct OneShotQueryObservation {
+    request_id_correlation: String,
+    result: Result<QueryResult, GrpcError>,
+}
+
+impl OneShotQueryObservation {
+    pub fn request_id_correlation(&self) -> &str {
+        &self.request_id_correlation
+    }
+
+    pub fn into_result(self) -> Result<QueryResult, GrpcError> {
+        self.result
+    }
 }
 
 impl GrpcMarketClient {
@@ -539,6 +558,14 @@ impl GrpcMarketClient {
     }
 
     pub async fn get_external_health(&mut self) -> Result<ExternalHealthResponse, GrpcError> {
+        self.get_external_health_observed()
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn get_external_health_observed(
+        &mut self,
+    ) -> Result<(ExternalHealthResponse, Vec<u8>), GrpcError> {
         if !matches!(&self.system, SystemTransport::External(_)) {
             return Err(system_profile_mismatch());
         }
@@ -551,9 +578,9 @@ impl GrpcMarketClient {
         });
         self.attach_request_auth(&mut request)?;
         match self.execute_external_health(request).await {
-            ExternalSystemCall::Response(response, _) => {
+            ExternalSystemCall::Response(response, bytes) => {
                 self.observe_external_health(&request_id, &response)?;
-                Ok(response)
+                Ok((response, bytes))
             }
             ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
                 status,
@@ -566,6 +593,14 @@ impl GrpcMarketClient {
         &mut self,
     ) -> Result<Vec<crate::grpc_client::external_pb::magic::market::v1::Capability>, GrpcError>
     {
+        self.get_external_capabilities_observed()
+            .await
+            .map(|(response, _)| response.capabilities)
+    }
+
+    async fn get_external_capabilities_observed(
+        &mut self,
+    ) -> Result<(ExternalCapabilitiesResponse, Vec<u8>), GrpcError> {
         if !matches!(&self.system, SystemTransport::External(_)) {
             return Err(system_profile_mismatch());
         }
@@ -579,9 +614,9 @@ impl GrpcMarketClient {
         });
         self.attach_request_auth(&mut request)?;
         match self.execute_external_capabilities(request).await {
-            ExternalSystemCall::Response(response, _) => {
+            ExternalSystemCall::Response(response, bytes) => {
                 self.accept_external_capabilities(&request_id, &response)?;
-                Ok(response.capabilities)
+                Ok((response, bytes))
             }
             ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
                 status,
@@ -703,6 +738,33 @@ impl GrpcMarketClient {
                 },
             }
         }
+    }
+
+    /// Operator diagnostic for the two ordinary local flow routes. It uses the
+    /// existing request builder and status decoder, with exactly one data_call:
+    /// the ordinary query retry policy is deliberately not entered.
+    pub async fn query_local_flow_once_observed(
+        &mut self,
+        op: Operation,
+        payload: serde_json::Value,
+    ) -> Result<OneShotQueryObservation, GrpcError> {
+        if self.profile != ContractProfile::LocalBridgeV1
+            || !matches!(op, Operation::MoneyFlows | Operation::BoardFlows)
+        {
+            return Err(GrpcError::Unimplemented {
+                details: Box::default(),
+            });
+        }
+        let request = build_native_profile_query_request(self.profile, op, payload)?;
+        let request_id_correlation = super::errors::request_id_correlation(request.request_id())
+            .ok_or_else(|| GrpcError::InvalidArgument {
+                details: Box::default(),
+            })?;
+        let result = self.data_call(op, request).await;
+        Ok(OneShotQueryObservation {
+            request_id_correlation,
+            result,
+        })
     }
 
     /// Query a method that exists only in ExternalV1. Its operation identity
@@ -1353,8 +1415,13 @@ mod tests {
     use crate::grpc_client::pb::magic::market::v1::{
         market_data_service_server::{MarketDataService, MarketDataServiceServer},
         system_service_server::{SystemService, SystemServiceServer},
-        AdmissionState, CanonicalPayload, CapabilitiesResponse, HealthResponse, QueryRequest,
-        QueryResponse,
+        AdmissionState, CanonicalPayload, CapabilitiesResponse, ErrorDetail as WireErrorDetail,
+        HealthResponse, QueryRequest, QueryResponse,
+    };
+    use prost::Message;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use tonic::{Request, Response, Status};
     use zeroize::Zeroizing;
@@ -1384,13 +1451,54 @@ mod tests {
         }
     }
 
-    struct MockData;
+    struct MockData {
+        money_flow_calls: Arc<AtomicUsize>,
+        board_flow_calls: Arc<AtomicUsize>,
+    }
+
+    fn flow_failure(
+        request: Request<QueryRequest>,
+        operation: Operation,
+        provider: &str,
+        code: tonic::Code,
+        retryable: bool,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let request_id = request.into_inner().context.unwrap().request_id;
+        let detail = WireErrorDetail {
+            request_id,
+            operation: operation as i32,
+            provider: provider.to_owned(),
+            reason_code: if retryable {
+                "provider_transport"
+            } else {
+                "unsupported_contract"
+            }
+            .to_owned(),
+            retryable,
+            ..Default::default()
+        };
+        Err(Status::with_details(
+            code,
+            "TEST_CODE flow failure",
+            detail.encode_to_vec().into(),
+        ))
+    }
 
     // macro_rules! 不能在 impl 块内定义 → 模块级宏生成整个 trait impl。
     macro_rules! impl_mock_market_data {
         ($($stub:ident),* $(,)?) => {
             #[tonic::async_trait]
             impl MarketDataService for MockData {
+                async fn money_flows(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+                    self.money_flow_calls.fetch_add(1, Ordering::SeqCst);
+                    flow_failure(req, Operation::MoneyFlows, "Eastmoney", tonic::Code::Internal, false)
+                }
+
+                async fn board_flows(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+                    self.board_flow_calls.fetch_add(1, Ordering::SeqCst);
+                    flow_failure(req, Operation::BoardFlows, "Tdx", tonic::Code::Unavailable, true)
+                }
+
                 async fn realtime_quotes(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
             let inner = req.into_inner();
             let request_id = inner.context.unwrap().request_id;
@@ -1458,7 +1566,6 @@ mod tests {
     impl_mock_market_data!(
         historical_bars,
         minute_data,
-        money_flows,
         order_books,
         auctions,
         trades,
@@ -1489,7 +1596,6 @@ mod tests {
         target_prices,
         semantic_search,
         fund_flow_series,
-        board_flows,
         margin_data,
         block_trades,
         holder_counts,
@@ -1518,19 +1624,80 @@ mod tests {
         benchmark_bars,
     );
 
-    async fn spawn_mock() -> String {
+    async fn spawn_mock_with_counts() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let addr = "127.0.0.1:0";
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let local = listener.local_addr().unwrap();
+        let money_flow_calls = Arc::new(AtomicUsize::new(0));
+        let board_flow_calls = Arc::new(AtomicUsize::new(0));
+        let data = MockData {
+            money_flow_calls: Arc::clone(&money_flow_calls),
+            board_flow_calls: Arc::clone(&board_flow_calls),
+        };
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(SystemServiceServer::new(MockSystem))
-                .add_service(MarketDataServiceServer::new(MockData))
+                .add_service(MarketDataServiceServer::new(data))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        format!("http://{local}")
+        (
+            format!("http://{local}"),
+            money_flow_calls,
+            board_flow_calls,
+        )
+    }
+
+    async fn spawn_mock() -> String {
+        spawn_mock_with_counts().await.0
+    }
+
+    #[tokio::test]
+    async fn local_flow_probe_preserves_same_request_id_and_never_retries() {
+        let (addr, money_calls, board_calls) = spawn_mock_with_counts().await;
+        let mut client = GrpcMarketClient::connect(&addr).await.unwrap();
+        let money = client
+            .query_local_flow_once_observed(
+                Operation::MoneyFlows,
+                serde_json::json!({"codes":["600519"]}),
+            )
+            .await
+            .unwrap();
+        let correlation = money.request_id_correlation().to_owned();
+        assert!(correlation.starts_with("sha256:"));
+        let error = money.into_result().unwrap_err();
+        assert!(matches!(error, GrpcError::Internal { .. }));
+        assert_eq!(
+            error.details().request_id.as_deref(),
+            Some(correlation.as_str())
+        );
+        assert_eq!(error.details().provider.as_deref(), Some("Eastmoney"));
+        assert_eq!(
+            error.details().reason_code.as_deref(),
+            Some("unsupported_contract")
+        );
+        assert_eq!(money_calls.load(Ordering::SeqCst), 1);
+
+        let board = client
+            .query_local_flow_once_observed(
+                Operation::BoardFlows,
+                serde_json::json!({"kind":"Industry","limit":1}),
+            )
+            .await
+            .unwrap();
+        let correlation = board.request_id_correlation().to_owned();
+        let error = board.into_result().unwrap_err();
+        assert!(matches!(error, GrpcError::Unavailable { .. }));
+        assert_eq!(
+            error.details().request_id.as_deref(),
+            Some(correlation.as_str())
+        );
+        assert_eq!(
+            error.details().reason_code.as_deref(),
+            Some("provider_transport")
+        );
+        assert_eq!(board_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

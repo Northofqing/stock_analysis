@@ -1,4 +1,4 @@
-//! Read-only W14 policy comparison for the legacy 09:05 chain report.
+//! Read-only policy comparison for the legacy scheduled chain reports.
 //!
 //! The legacy schedule store remains the only production owner. This module
 //! does not persist a Foundation occurrence or invoke a producer/finalizer.
@@ -47,6 +47,12 @@ impl ChainPreopenShadowReport {
             || self.legacy_miss_due != self.foundation_miss_due
             || self.legacy_closed != self.foundation_closed
     }
+
+    /// Compare only the send gate. The caller may have captured the legacy
+    /// state before the physical sender changed it.
+    pub fn has_send_gate_diff(&self) -> bool {
+        self.legacy_due != self.foundation_due
+    }
 }
 
 /// Reads the old store and evaluates the new scheduler against the same clock.
@@ -58,13 +64,20 @@ pub fn observe_chain_preopen_shadow(
     observed_at: DateTime<FixedOffset>,
     trading_day: bool,
 ) -> Result<ChainPreopenShadowReport> {
+    observe_chain_schedule_shadow(store, observed_at, trading_day, ChainPhase::Preopen)
+}
+
+pub(super) fn observe_chain_schedule_shadow(
+    store: &ChainScheduleStore,
+    observed_at: DateTime<FixedOffset>,
+    trading_day: bool,
+    phase: ChainPhase,
+) -> Result<ChainPreopenShadowReport> {
     let calendar_date = observed_at.date_naive();
     let (legacy_status, legacy_miss_recorded) = match std::fs::metadata(store.path()) {
         Ok(_) => {
-            let (status, _) = store.inspect(ChainPhase::Preopen, calendar_date)?;
-            let miss = store
-                .inspect_miss(ChainPhase::Preopen, calendar_date)?
-                .is_some();
+            let (status, _) = store.inspect(phase, calendar_date)?;
+            let miss = store.inspect_miss(phase, calendar_date)?.is_some();
             (status, miss)
         }
         Err(error) if error.kind() == ErrorKind::NotFound => (ChainScheduleStatus::Ready, false),
@@ -75,22 +88,75 @@ pub fn observe_chain_preopen_shadow(
         }
     };
 
+    project_chain_schedule_snapshot(
+        phase,
+        calendar_date,
+        observed_at,
+        trading_day,
+        legacy_status,
+        legacy_miss_recorded,
+    )
+}
+
+/// Pure diagnostic projection over the legacy status and clock supplied by a
+/// caller's gate. Foundation starts from no occurrence; this is not admission,
+/// a completion decision, or full shadow parity. No schedule-store read or
+/// Foundation persistence occurs.
+pub fn project_chain_schedule_snapshot(
+    phase: ChainPhase,
+    calendar_date: NaiveDate,
+    observed_at: DateTime<FixedOffset>,
+    trading_day: bool,
+    legacy_status: ChainScheduleStatus,
+    legacy_miss_recorded: bool,
+) -> Result<ChainPreopenShadowReport> {
     let catalog = MachineCatalog::bundled()?;
-    let producer_id = ProducerId::try_new("chain-preopen-timer".to_owned())?;
+    let (
+        producer_name,
+        schedule_name,
+        occurrence_name,
+        epic,
+        start_hour,
+        start_minute,
+        end_hour,
+        end_minute,
+    ) = match phase {
+        ChainPhase::Preopen => (
+            "chain-preopen-timer",
+            "chain-preopen-0905",
+            "chain-preopen",
+            PhaseEpic::Preopen,
+            9,
+            5,
+            9,
+            15,
+        ),
+        ChainPhase::Postclose => (
+            "chain-post-close-timer",
+            "chain-post-close-1530",
+            "chain-post-close",
+            PhaseEpic::Postclose,
+            15,
+            30,
+            15,
+            35,
+        ),
+    };
+    let producer_id = ProducerId::try_new(producer_name.to_owned())?;
     let producer = catalog
         .producer(&producer_id)
-        .context("chain preopen producer missing from bundled catalog")?;
+        .with_context(|| format!("{producer_name} producer missing from bundled catalog"))?;
     let business_date = BusinessDate::parse(&calendar_date.to_string())?;
     let identity = ScheduleOccurrenceIdentityMaterial::new(
         Namespace::Production,
         producer.unit_id().clone(),
         producer_id,
-        ScheduleOrTriggerId::try_new("chain-preopen-0905".to_owned())?,
+        ScheduleOrTriggerId::try_new(schedule_name.to_owned())?,
         CalendarId::try_new("a-share-trading-calendar-v1".to_owned())?,
         OccurrenceIdentityMaterial::new(
             business_date.clone(),
             producer.occurrence_family().clone(),
-            OccurrenceKey::try_new(format!("chain-preopen:{calendar_date}"))?,
+            OccurrenceKey::try_new(format!("{occurrence_name}:{calendar_date}"))?,
         ),
         producer.completion_owner().clone(),
         SourceContractId::try_new("legacy-chain-report-v1".to_owned())?,
@@ -98,13 +164,21 @@ pub fn observe_chain_preopen_shadow(
 
     let offset = observed_at.offset();
     let start = offset
-        .from_local_datetime(&calendar_date.and_hms_opt(9, 5, 0).context("09:05 time")?)
+        .from_local_datetime(
+            &calendar_date
+                .and_hms_opt(start_hour, start_minute, 0)
+                .context("chain window start time")?,
+        )
         .single()
-        .context("ambiguous chain preopen window start")?;
+        .context("ambiguous chain window start")?;
     let end = offset
-        .from_local_datetime(&calendar_date.and_hms_opt(9, 15, 0).context("09:15 time")?)
+        .from_local_datetime(
+            &calendar_date
+                .and_hms_opt(end_hour, end_minute, 0)
+                .context("chain window end time")?,
+        )
         .single()
-        .context("ambiguous chain preopen window end")?;
+        .context("ambiguous chain window end")?;
     let window = ScheduleWindow::try_new(
         UtcMicros::try_new(start.timestamp_micros())?,
         UtcMicros::try_new(end.timestamp_micros())?,
@@ -112,7 +186,7 @@ pub fn observe_chain_preopen_shadow(
     let schedule = PhaseSchedule::try_bind(
         &catalog,
         identity,
-        PhaseEpic::Preopen,
+        epic,
         window,
         CatchUpPolicy::ExpireWithoutCatchUp,
     )?;
@@ -133,6 +207,7 @@ pub fn observe_chain_preopen_shadow(
                     ScheduleStep::NoChange { reason, .. } => {
                         return Ok(build_report(
                             observed_at,
+                            phase,
                             calendar_date,
                             legacy_status,
                             legacy_miss_recorded,
@@ -143,7 +218,7 @@ pub fn observe_chain_preopen_shadow(
                             Some(schedule.occurrence_id().as_str().to_owned()),
                         ));
                     }
-                    other => bail!("unexpected chain preopen shadow scheduler step: {other:?}"),
+                    other => bail!("unexpected chain shadow scheduler step: {other:?}"),
                 };
                 (
                     Some(next.status()),
@@ -151,11 +226,12 @@ pub fn observe_chain_preopen_shadow(
                     Some(schedule.occurrence_id().as_str().to_owned()),
                 )
             }
-            other => bail!("unexpected chain preopen shadow scheduler step: {other:?}"),
+            other => bail!("unexpected chain shadow scheduler step: {other:?}"),
         };
 
     Ok(build_report(
         observed_at,
+        phase,
         calendar_date,
         legacy_status,
         legacy_miss_recorded,
@@ -170,6 +246,7 @@ pub fn observe_chain_preopen_shadow(
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     observed_at: DateTime<FixedOffset>,
+    phase: ChainPhase,
     calendar_date: NaiveDate,
     legacy_status: ChainScheduleStatus,
     legacy_miss_recorded: bool,
@@ -180,7 +257,7 @@ fn build_report(
     foundation_occurrence_id: Option<String>,
 ) -> ChainPreopenShadowReport {
     let local_time = observed_at.naive_local();
-    let legacy_window_open = ChainPhase::Preopen.starts_in_window(calendar_date, local_time);
+    let legacy_window_open = phase.starts_in_window(calendar_date, local_time);
     let foundation_window_open = window.position(
         UtcMicros::try_new(observed_at.timestamp_micros())
             .expect("validated observation timestamp"),
@@ -189,7 +266,7 @@ fn build_report(
     ChainPreopenShadowReport {
         observed_at,
         calendar_date,
-        legacy_occurrence_key: format!("preopen:{calendar_date}"),
+        legacy_occurrence_key: format!("{}:{calendar_date}", phase.as_str()),
         foundation_occurrence_id,
         legacy_status,
         legacy_miss_recorded,
@@ -211,7 +288,7 @@ fn build_report(
         legacy_miss_due: trading_day
             && legacy_ready
             && !legacy_miss_recorded
-            && ChainPhase::Preopen.is_overdue(calendar_date, local_time),
+            && phase.is_overdue(calendar_date, local_time),
         foundation_miss_due: foundation_status == Some(ScheduleStatus::Missed),
         legacy_closed: legacy_status == ChainScheduleStatus::Closed,
         foundation_closed: foundation_status == Some(ScheduleStatus::Closed),

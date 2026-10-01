@@ -29,6 +29,7 @@
 use diesel::RunQueryDsl;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
+use stock_analysis::monitor::push_job::{N02SourceChainV1, N02SourceError};
 use stock_analysis::news::aggregator::projection_v2::{
     NotificationProjectionError, NotificationProjectionState, ReceiptedRawNewsBatch,
 };
@@ -103,9 +104,10 @@ fn sha256_domain(domain: &str, payload: &[u8]) -> String {
 /// Fetch the complete registered real-provider set without constructing
 /// notification events or mutating simhash.
 pub async fn fetch_raw_global_news_batch(
+    registry: &raw_v2::GlobalNewsSourceRegistry,
     per_feed_limit: u32,
 ) -> Result<RawNewsAggregationBatch, RawNewsAcquisitionError> {
-    let batch = raw_v2::fetch_raw_global_news_batch(per_feed_limit).await?;
+    let batch = raw_v2::fetch_raw_global_news_batch(registry, per_feed_limit).await?;
     log::info!(
         "[NewsAggregator][BR-174] raw batch acquired attempts={} records={} sources_complete={} per_feed_limit={}",
         batch.attempts().len(),
@@ -185,6 +187,7 @@ pub struct FlashReservation {
     evidence_sha256: String,
     render_sha256: String,
     sources: Vec<stock_analysis::news::aggregator::raw_v2::NewsFlashSourceIdentity>,
+    selected_projected: Vec<stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent>,
     decision: Option<FlashDecision>,
 }
 
@@ -249,6 +252,48 @@ impl FlashReservation {
                 batch_id: source.batch_id().to_owned(),
             })
             .collect()
+    }
+
+    /// Bind the already rendered aggregate reservation without changing gate ownership.
+    pub fn foundation_n02_binding(
+        &self,
+    ) -> Result<
+        stock_analysis::push_foundation::N02ReservationBindingV1,
+        stock_analysis::push_foundation::N02BindingError,
+    > {
+        use stock_analysis::push_foundation::{N02BindingError, N02ReservationMaterial};
+
+        let FlashDecision::Aggregated { text, .. } = self.decision() else {
+            return Err(N02BindingError::ReservationMismatch { field: "push_kind" });
+        };
+        let material = N02ReservationMaterial {
+            business_date: self.business_date(),
+            window: self.window().unwrap_or_default().to_owned(),
+            push_kind: self.push_kind().to_owned(),
+            decision_key: self.decision_key().to_owned(),
+            event_id: self.event_id().map(str::to_owned),
+            reservation_sha256: self.reservation_identity_sha256().to_owned(),
+            sources: self.audit_sources(),
+            evidence_sha256: self.evidence_sha256().to_owned(),
+            news_flash_render_sha256: self.render_sha256().to_owned(),
+            rendered_len: self.rendered_len() as u64,
+        };
+        stock_analysis::push_foundation::N02ReservationBindingV1::try_from_reservation_material(
+            material,
+            text.as_bytes(),
+        )
+    }
+
+    /// Validate the same selected objects as the legacy reservation without
+    /// reading a provider, changing gate state, or cloning canonical content.
+    fn n02_capture(&self) -> Result<N02SourceChainV1<'_>, N02SourceError> {
+        let binding = self
+            .foundation_n02_binding()
+            .map_err(N02SourceError::Binding)?;
+        let FlashDecision::Aggregated { text, .. } = self.decision() else {
+            unreachable!("validated N02 binding requires an aggregate decision")
+        };
+        N02SourceChainV1::try_capture(binding, &self.selected_projected, text.as_bytes())
     }
 
     fn matches_attempt(&self, attempt: &stock_analysis::event::NewsFlashAttemptReceipt) -> bool {
@@ -484,6 +529,11 @@ impl NewsFlashGate {
     ) -> Vec<FlashReservation> {
         self.rollover(now.date_naive());
         let mut out = Vec::new();
+        let mut buffered = 0usize;
+        let mut duplicates = 0usize;
+        let mut capacity_drops = 0usize;
+        let mut audit_failures = 0usize;
+        let mut rejection_reasons = std::collections::BTreeMap::<&str, usize>::new();
 
         for projected in events {
             let e = projected.event();
@@ -518,23 +568,56 @@ impl NewsFlashGate {
                 None
             };
             if let Some(reason) = validation_error {
+                *rejection_reasons.entry(reason).or_default() += 1;
                 // 2026-09-21 (系统评估 §4.3): gate 层丢弃此前仅 log::warn!
                 // + continue, 无审计记录 (~11,300 条/月静默丢弃)。现在把
                 // 拒绝计数与原因写审计: event_bus 的 gate-rejection 审计
                 // 域, 失败可见性不改变 fail-closed 语义。
-                let _ = stock_analysis::event::record_gate_rejection(
+                if let Err(error) = stock_analysis::event::record_gate_rejection(
                     "news_flash_gate",
                     reason,
                     &e.event_id,
-                );
+                ) {
+                    audit_failures += 1;
+                    log::error!(
+                        "[NewsFlashGate][BR-137] rejection audit unavailable reason={reason} event_id_sha256={} error={error}",
+                        sha256_domain(
+                            "stock_analysis.news_flash.rejection_event_id.v1",
+                            e.event_id.as_bytes(),
+                        )
+                    );
+                }
                 log::warn!(
                     "[NewsFlashGate][BR-137] source event rejected before critical and aggregate governance: {reason}"
                 );
                 continue;
             }
-            if self.buffer.len() < 200 && self.buffered_ids.insert(e.event_id.clone()) {
+            if self.buffer.len() >= 200 {
+                capacity_drops += 1;
+            } else if self.buffered_ids.insert(e.event_id.clone()) {
                 self.buffer.push(projected.clone());
+                buffered += 1;
+            } else {
+                duplicates += 1;
             }
+        }
+        let validation_rejected = rejection_reasons.values().sum::<usize>();
+        debug_assert_eq!(
+            events.len(),
+            buffered + duplicates + capacity_drops + validation_rejected
+        );
+        if !events.is_empty() {
+            log::info!(
+                "[NewsFlashGate][BR-137] intake business_date={} input={} buffered={} duplicate={} capacity_drop={} validation_rejected={} audit_failed={} reasons={:?} coverage=process_tick_only",
+                now.date_naive(),
+                events.len(),
+                buffered,
+                duplicates,
+                capacity_drops,
+                validation_rejected,
+                audit_failures,
+                rejection_reasons,
+            );
         }
 
         let _critical_concurrency_capacity =
@@ -798,25 +881,20 @@ fn make_reservation(
             crate::notify::PushKind::NewsFlashAggregated.stable_template_id()
         }
     };
-    let render_sha256 = sha256_domain("stock_analysis.news_flash_render.v1", text.as_bytes());
-    let business_date = day.to_string();
-    let mut reservation_hasher = Sha256::new();
-    reservation_hasher.update(b"stock_analysis.news_flash_reservation.v2");
-    for value in [
-        push_kind.as_str(),
-        business_date.as_str(),
-        decision_key,
-        event_id.as_deref().unwrap_or("<absent>"),
-        window.as_deref().unwrap_or("<absent>"),
-        evidence_sha256.as_str(),
-        render_sha256.as_str(),
-    ] {
-        reservation_hasher.update((value.len() as u64).to_be_bytes());
-        reservation_hasher.update(value.as_bytes());
-    }
-    let reservation_identity_sha256 = format!("{:x}", reservation_hasher.finalize());
+    let render_sha256 = stock_analysis::event::news_flash_render_sha256(text.as_bytes());
+    let reservation_identity_sha256 = stock_analysis::event::news_flash_reservation_sha256(
+        &stock_analysis::event::NewsFlashReservationIdentityFields {
+            push_kind: &push_kind,
+            business_date: day,
+            decision_key,
+            event_id: event_id.as_deref(),
+            window: window.as_deref(),
+            evidence_sha256: &evidence_sha256,
+            render_sha256: &render_sha256,
+        },
+    );
     let sources = projected
-        .into_iter()
+        .iter()
         .map(|event| event.source().clone())
         .collect();
     FlashReservation {
@@ -832,6 +910,7 @@ fn make_reservation(
         evidence_sha256,
         render_sha256,
         sources,
+        selected_projected: projected,
         decision: Some(decision),
     }
 }
@@ -1323,7 +1402,1228 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stock_analysis::data_gateway::{BatchEvidence, GlobalNewsProvider, GlobalNewsRecord};
+    use stock_analysis::market_domain::SourceEvidence;
+    use stock_analysis::news::aggregator::raw_v2::{
+        self, NewsFlashProjectedEvent, NewsFlashProjectionTestCapability,
+        NewsFlashRecordEvidenceError,
+    };
     use stock_analysis::signal::market_event::{Direction, EventType};
+
+    fn n02_selected_local_at(
+        day: chrono::NaiveDate,
+        hour: u32,
+        minute: u32,
+    ) -> chrono::DateTime<chrono::Local> {
+        day.and_hms_opt(hour, minute, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+    }
+
+    fn n02_selected_record(
+        item_id: &str,
+        title: &str,
+        summary: &str,
+        batch_id: &str,
+        day: chrono::NaiveDate,
+        observed_minute: u32,
+    ) -> (GlobalNewsRecord, BatchEvidence) {
+        let published_at = n02_selected_local_at(day, 9, 0).with_timezone(&chrono::Utc);
+        let observed_at =
+            n02_selected_local_at(day, 9, observed_minute).with_timezone(&chrono::Utc);
+        let source_at = day.format("%Y-%m-%d 09:00").to_string();
+        let observed_wire = observed_at.to_rfc3339();
+        let evidence = BatchEvidence {
+            provider: GlobalNewsProvider::Eastmoney.provider_id(),
+            source: GlobalNewsProvider::Eastmoney.source().to_owned(),
+            source_at: Some(source_at.clone()),
+            observed_at: observed_wire.clone(),
+            batch_id: batch_id.to_owned(),
+        };
+        let record = GlobalNewsRecord {
+            item_id: item_id.to_owned(),
+            title: title.to_owned(),
+            summary: Some(summary.to_owned()),
+            content: None,
+            publisher: "TEST_CODE_PUBLISHER".to_owned(),
+            canonical_url: format!("https://example.com/{item_id}"),
+            published_at,
+            observed_at,
+            instruments: Vec::new(),
+            topics: Vec::new(),
+            language: "zh-CN".to_owned(),
+            evidence: SourceEvidence::new(
+                GlobalNewsProvider::Eastmoney.provider_id(),
+                observed_wire,
+                batch_id,
+            )
+            .unwrap()
+            .with_source_at(source_at)
+            .unwrap(),
+        };
+        (record, evidence)
+    }
+
+    fn n02_selected_projected(
+        item_id: &str,
+        title: &str,
+        summary: &str,
+        batch_id: &str,
+        day: chrono::NaiveDate,
+        observed_minute: u32,
+    ) -> NewsFlashProjectedEvent {
+        let (record, evidence) =
+            n02_selected_record(item_id, title, summary, batch_id, day, observed_minute);
+        let capability = NewsFlashProjectionTestCapability::bind().unwrap();
+        let projection = raw_v2::test_project_news_flash_record(
+            &capability,
+            GlobalNewsProvider::Eastmoney,
+            record,
+            evidence,
+        );
+        assert_eq!(projection.available_feed_count(), 1);
+        assert_eq!(projection.verified_empty_feed_count(), 0);
+        assert_eq!(projection.failures().len(), 3);
+        let (mut events, _) = projection.into_parts();
+        assert_eq!(events.len(), 1);
+        events.pop().unwrap()
+    }
+
+    #[test]
+    fn n02_capture_cross_tick_borrows_origin_and_settles_real_accepted_terminal() {
+        let _test_namespace = crate::TestEnvGuard::dry_run_non_quiet();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary A",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary B",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let reservation = gate
+            .reserve(&[b], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        let capture = reservation.n02_capture().unwrap();
+        assert_eq!(capture.records().len(), 2);
+        assert_eq!(capture.records()[0].item_id(), "TEST_CODE_A");
+        assert_eq!(
+            capture.records()[0].source().batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+        assert_eq!(
+            capture.records()[0].source().observed_at(),
+            a.source().observed_at()
+        );
+        assert_eq!(
+            capture.records()[0].content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(capture.records()[1].item_id(), "TEST_CODE_B");
+        assert_eq!(capture.source_refs().len(), 2);
+        assert_eq!(capture.source_refs()[0].provider().as_str(), "Eastmoney");
+        assert_eq!(
+            capture.source_refs()[0].external_id().as_str(),
+            "TEST_CODE_A"
+        );
+        assert_eq!(
+            capture.source_refs()[0].content_sha256().as_str(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            capture.source_times()[0].source_ref_id(),
+            capture.source_refs()[0].source_ref_id()
+        );
+        assert_eq!(
+            capture.binding().material().sources,
+            reservation.audit_sources()
+        );
+        assert_eq!(
+            capture.binding().material().reservation_sha256,
+            reservation.reservation_identity_sha256()
+        );
+
+        let attempt_at = n02_selected_local_at(day, 9, 32).fixed_offset();
+        let channel = "TEST_CODE_DRY_RUN";
+        let attempt = stock_analysis::event::publish_news_flash_attempt(
+            stock_analysis::event::NewsFlashAttemptAuditInput {
+                push_kind: reservation.push_kind().to_owned(),
+                business_date: day,
+                decision_key: reservation.decision_key().to_owned(),
+                channel: channel.to_owned(),
+                rendered_len: reservation.rendered_len(),
+                reservation_sha256: reservation.reservation_identity_sha256().to_owned(),
+                sources: reservation.audit_sources(),
+                evidence_sha256: reservation.evidence_sha256().to_owned(),
+                render_sha256: reservation.render_sha256().to_owned(),
+                attempt_ordinal: reservation.attempt_ordinal(),
+                observed_at: attempt_at,
+            },
+        )
+        .unwrap();
+        let accepted_at = attempt_at + chrono::Duration::seconds(1);
+        let terminal = stock_analysis::event::publish_news_flash_terminal(
+            &attempt,
+            stock_analysis::event::NewsFlashTerminalAuditInput {
+                disposition: stock_analysis::event::NewsFlashTerminalDisposition::Accepted {
+                    remote_receipt: stock_analysis::event::envelope::NewsFlashRemoteReceipt {
+                        channel: channel.to_owned(),
+                        provider: "TEST_CODE_LOCAL_SINK".to_owned(),
+                        message_id: "TEST_CODE_LOCAL_MESSAGE".to_owned(),
+                        platform_message_id: "TEST_CODE_REMOTE_MESSAGE".to_owned(),
+                        accepted_at,
+                        latency_ms: 7,
+                    },
+                },
+                observed_at: accepted_at,
+                latency_ms: 7,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &terminal,
+            stock_analysis::event::NewsFlashTerminalReceipt::Accepted(_)
+        ));
+        gate.settle(reservation, FlashSettlement::Terminal(Box::new(terminal)))
+            .unwrap();
+        assert_eq!(gate.window_state[0], WindowState::Committed);
+        assert!(gate
+            .reserve(&[], n02_selected_local_at(day, 9, 33), 80, 20)
+            .is_empty());
+    }
+
+    #[test]
+    fn n02_capture_content_only_distinction_keeps_legacy_identity() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let reserve = |summary| {
+            let projected = n02_selected_projected(
+                "TEST_CODE_SAME",
+                "TEST_CODE_TITLE",
+                summary,
+                "TEST_CODE_BATCH",
+                day,
+                1,
+            );
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&[projected], n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let a = reserve("summary A");
+        let b = reserve("summary B");
+        let captured_a = a.n02_capture().unwrap();
+        let captured_b = b.n02_capture().unwrap();
+        assert_eq!(captured_a.binding(), captured_b.binding());
+        assert_eq!(a.decision(), b.decision());
+        assert_eq!(a.evidence_sha256(), b.evidence_sha256());
+        assert_ne!(
+            captured_a.records()[0].content_sha256(),
+            captured_b.records()[0].content_sha256()
+        );
+        assert_ne!(
+            captured_a.records()[0].canonical_bytes(),
+            captured_b.records()[0].canonical_bytes()
+        );
+        assert_ne!(
+            captured_a.source_refs()[0].source_ref_id(),
+            captured_b.source_refs()[0].source_ref_id()
+        );
+        assert_ne!(
+            captured_a.canonical_facts().sha256(),
+            captured_b.canonical_facts().sha256()
+        );
+    }
+
+    #[test]
+    fn n02_capture_errors_leave_rollback_and_uncertain_legacy_settlement() {
+        let (synthetic, _, mut gate) = n02_legacy_identity_reservation("A");
+        assert_eq!(
+            synthetic.n02_capture().unwrap_err(),
+            N02SourceError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
+            }
+        );
+        let identity = synthetic.reservation_identity_sha256().to_owned();
+        gate.settle(
+            synthetic,
+            FlashSettlement::RolledBack {
+                reason: "TEST_CODE_ROLLBACK".to_owned(),
+            },
+        )
+        .unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let retry = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 32), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(retry.reservation_identity_sha256(), identity);
+        assert_eq!(
+            retry.n02_capture().unwrap_err(),
+            N02SourceError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::MissingAdmittedRecord,
+            }
+        );
+        gate.settle(
+            retry,
+            FlashSettlement::Uncertain {
+                reason: "TEST_CODE_UNKNOWN".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(gate
+            .reserve(&[], n02_selected_local_at(day, 9, 33), 80, 20)
+            .is_empty());
+
+        let oversized = n02_selected_projected(
+            "TEST_CODE_LARGE",
+            "TEST_CODE_TITLE",
+            &"x".repeat(raw_v2::MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES),
+            "TEST_CODE_BATCH",
+            day,
+            1,
+        );
+        let mut oversized_gate = NewsFlashGate::new(day);
+        assert!(oversized_gate
+            .reserve(&[oversized], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let oversized_reservation = oversized_gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            oversized_reservation.n02_capture().unwrap_err(),
+            N02SourceError::RecordEvidence {
+                index: 0,
+                error: NewsFlashRecordEvidenceError::CanonicalBytesLimitExceeded,
+            }
+        );
+        oversized_gate
+            .settle(
+                oversized_reservation,
+                FlashSettlement::RolledBack {
+                    reason: "TEST_CODE_CAPTURE_REJECTED".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(oversized_gate.window_state[0], WindowState::Eligible);
+    }
+
+    #[test]
+    fn n02_capture_rejects_critical_before_inspecting_missing_record() {
+        let (aggregate, source, _) = n02_legacy_identity_reservation("A");
+        let day = aggregate.business_date();
+        let now = n02_selected_local_at(day, 9, 31);
+        let critical = make_reservation(
+            2,
+            day,
+            "event:TEST_CODE_EVENT_A",
+            Some("TEST_CODE_EVENT_A".to_owned()),
+            None,
+            vec![source],
+            FlashDecision::Critical {
+                event_id: "TEST_CODE_EVENT_A".to_owned(),
+                headline: "TEST_CODE_TITLE_A".to_owned(),
+                source: "TEST_CODE_SOURCE".to_owned(),
+                observed_at: now,
+                source_published_on: day,
+                stale: false,
+                strength: 100,
+                certainty: 100,
+                text: match aggregate.decision() {
+                    FlashDecision::Aggregated { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                },
+            },
+        );
+        assert_eq!(
+            critical.n02_capture().unwrap_err(),
+            N02SourceError::Binding(
+                stock_analysis::push_foundation::N02BindingError::ReservationMismatch {
+                    field: "push_kind"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn n02_capture_first_duplicate_and_top_three_stay_in_selected_order() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "original",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let changed = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "changed",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        let mut duplicate_gate = NewsFlashGate::new(day);
+        assert!(duplicate_gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let duplicate = duplicate_gate
+            .reserve(
+                &[changed.clone()],
+                n02_selected_local_at(day, 9, 31),
+                80,
+                20,
+            )
+            .pop()
+            .unwrap();
+        let duplicate_capture = duplicate.n02_capture().unwrap();
+        assert_eq!(duplicate_capture.records().len(), 1);
+        assert_eq!(
+            duplicate_capture.records()[0].source().batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+        assert_eq!(
+            duplicate_capture.records()[0].content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_ne!(
+            duplicate_capture.records()[0].content_sha256(),
+            changed.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            duplicate_capture.source_refs()[0].content_sha256().as_str(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+
+        let events = ["A", "B", "C", "D"].map(|suffix| {
+            n02_selected_projected(
+                &format!("TEST_CODE_{suffix}"),
+                &format!("TEST_CODE_TITLE_{suffix}"),
+                "summary",
+                &format!("TEST_CODE_BATCH_{suffix}"),
+                day,
+                1,
+            )
+        });
+        let reserve = |ordered: Vec<NewsFlashProjectedEvent>| {
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&ordered, n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let forward = reserve(events.to_vec());
+        let reverse = reserve(events.into_iter().rev().collect());
+        let captured_ids = |reservation: &FlashReservation| {
+            reservation
+                .n02_capture()
+                .unwrap()
+                .records()
+                .iter()
+                .map(|record| record.item_id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            captured_ids(&forward),
+            ["TEST_CODE_A", "TEST_CODE_B", "TEST_CODE_C"]
+        );
+        assert_eq!(
+            captured_ids(&reverse),
+            ["TEST_CODE_D", "TEST_CODE_C", "TEST_CODE_B"]
+        );
+        assert_eq!(
+            forward.n02_capture().unwrap().binding().material().sources,
+            forward.audit_sources()
+        );
+        assert_eq!(
+            reverse.n02_capture().unwrap().binding().material().sources,
+            reverse.audit_sources()
+        );
+    }
+
+    #[test]
+    fn n02_capture_rejects_selected_order_or_count_drift() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary",
+            "TEST_CODE_BATCH_B",
+            day,
+            1,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a, b], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let mut reservation = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert!(reservation.n02_capture().is_ok());
+        reservation.selected_projected.reverse();
+        assert_eq!(
+            reservation.n02_capture().unwrap_err(),
+            N02SourceError::EvidenceDigestMismatch
+        );
+        reservation.selected_projected.clear();
+        assert_eq!(
+            reservation.n02_capture().unwrap_err(),
+            N02SourceError::SelectedCount(0)
+        );
+    }
+
+    #[test]
+    fn n02_selected_cross_tick_and_empty_tick_keep_origin() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary A",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary B",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let reservation = gate
+            .reserve(&[b.clone()], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(reservation.selected_projected.len(), 2);
+        let selected_a = &reservation.selected_projected[0];
+        assert_eq!(selected_a.source(), a.source());
+        assert_eq!(
+            selected_a.record_evidence().unwrap().item_id(),
+            "TEST_CODE_A"
+        );
+        assert_eq!(
+            selected_a
+                .record_evidence()
+                .unwrap()
+                .registration()
+                .provider,
+            GlobalNewsProvider::Eastmoney
+        );
+        assert_eq!(
+            selected_a.record_evidence().unwrap().source().batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+        assert_eq!(
+            selected_a.record_evidence().unwrap().content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            reservation.selected_projected[1]
+                .record_evidence()
+                .unwrap()
+                .item_id(),
+            "TEST_CODE_B"
+        );
+        assert_eq!(
+            reservation.sources(),
+            &[a.source().clone(), b.source().clone()]
+        );
+        assert_eq!(
+            reservation.evidence_sha256(),
+            raw_v2::ordered_news_flash_evidence_sha256(&reservation.selected_projected)
+        );
+        assert_eq!(
+            reservation
+                .foundation_n02_binding()
+                .unwrap()
+                .material()
+                .sources,
+            reservation.audit_sources()
+        );
+
+        let mut empty_tick_gate = NewsFlashGate::new(day);
+        assert!(empty_tick_gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let empty_tick = empty_tick_gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(empty_tick.selected_projected.len(), 1);
+        assert_eq!(
+            empty_tick.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(empty_tick.sources(), &[a.source().clone()]);
+    }
+
+    #[test]
+    fn n02_selected_first_duplicate_keeps_whole_original_object() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "first",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_DUP",
+            "TEST_CODE_TITLE",
+            "changed",
+            "TEST_CODE_BATCH_B",
+            day,
+            10,
+        );
+        assert_eq!(a.event().event_id, b.event().event_id);
+        assert_ne!(
+            a.record_evidence().unwrap().content_sha256(),
+            b.record_evidence().unwrap().content_sha256()
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a.clone()], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let old = gate
+            .reserve(&[b.clone()], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(old.selected_projected.len(), 1);
+        assert_eq!(old.selected_projected[0].source(), a.source());
+        assert_eq!(
+            old.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .content_sha256(),
+            a.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            old.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .source()
+                .batch_id(),
+            "TEST_CODE_BATCH_A"
+        );
+
+        let mut fresh = NewsFlashGate::new(day);
+        assert!(fresh
+            .reserve(&[b.clone()], n02_selected_local_at(day, 9, 11), 80, 20)
+            .is_empty());
+        let new = fresh
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            new.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .content_sha256(),
+            b.record_evidence().unwrap().content_sha256()
+        );
+        assert_eq!(
+            new.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .source()
+                .batch_id(),
+            "TEST_CODE_BATCH_B"
+        );
+        assert_eq!(old.decision(), new.decision());
+    }
+
+    #[test]
+    fn n02_selected_content_only_change_does_not_rewrite_legacy_identity() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let reserve = |summary| {
+            let projected = n02_selected_projected(
+                "TEST_CODE_SAME",
+                "TEST_CODE_TITLE",
+                summary,
+                "TEST_CODE_BATCH",
+                day,
+                1,
+            );
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&[projected], n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let a = reserve("summary A");
+        let b = reserve("summary B");
+        assert_eq!(
+            a.selected_projected[0].event().event_id,
+            b.selected_projected[0].event().event_id
+        );
+        assert_eq!(a.sources(), b.sources());
+        assert_eq!(a.evidence_sha256(), b.evidence_sha256());
+        assert_eq!(a.render_sha256(), b.render_sha256());
+        assert_eq!(
+            a.reservation_identity_sha256(),
+            b.reservation_identity_sha256()
+        );
+        assert_eq!(a.decision(), b.decision());
+        let a_content = a.selected_projected[0].record_evidence().unwrap();
+        let b_content = b.selected_projected[0].record_evidence().unwrap();
+        assert_ne!(a_content.content_sha256(), b_content.content_sha256());
+        assert_ne!(a_content.canonical_bytes(), b_content.canonical_bytes());
+    }
+
+    #[test]
+    fn n02_selected_top_three_preserve_stable_display_order() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let events = ["A", "B", "C", "D"].map(|suffix| {
+            n02_selected_projected(
+                &format!("TEST_CODE_{suffix}"),
+                &format!("TEST_CODE_TITLE_{suffix}"),
+                "same summary",
+                &format!("TEST_CODE_BATCH_{suffix}"),
+                day,
+                1,
+            )
+        });
+        let reserve = |ordered: Vec<NewsFlashProjectedEvent>| {
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&ordered, n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let forward = reserve(events.to_vec());
+        let reverse = reserve(events.into_iter().rev().collect());
+        let selected_ids = |reservation: &FlashReservation| {
+            reservation
+                .selected_projected
+                .iter()
+                .map(|event| event.record_evidence().unwrap().item_id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected_ids(&forward),
+            ["TEST_CODE_A", "TEST_CODE_B", "TEST_CODE_C"]
+        );
+        assert_eq!(
+            selected_ids(&reverse),
+            ["TEST_CODE_D", "TEST_CODE_C", "TEST_CODE_B"]
+        );
+        for reservation in [&forward, &reverse] {
+            assert_eq!(reservation.selected_projected.len(), 3);
+            assert_eq!(
+                reservation.sources(),
+                reservation
+                    .selected_projected
+                    .iter()
+                    .map(|event| event.source().clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                reservation.evidence_sha256(),
+                raw_v2::ordered_news_flash_evidence_sha256(&reservation.selected_projected)
+            );
+            assert_eq!(
+                reservation
+                    .foundation_n02_binding()
+                    .unwrap()
+                    .material()
+                    .sources,
+                reservation.audit_sources()
+            );
+            let FlashDecision::Aggregated { text, .. } = reservation.decision() else {
+                unreachable!()
+            };
+            for (rank, event) in reservation.selected_projected.iter().enumerate() {
+                assert!(text.contains(&format!(
+                    "{}. [其他] {}",
+                    rank + 1,
+                    event.event().full_title
+                )));
+            }
+        }
+        assert_ne!(forward.evidence_sha256(), reverse.evidence_sha256());
+        let FlashDecision::Aggregated { text, .. } = forward.decision() else {
+            unreachable!()
+        };
+        assert!(!text.contains("TEST_CODE_TITLE_D"));
+        let FlashDecision::Aggregated { text, .. } = reverse.decision() else {
+            unreachable!()
+        };
+        assert!(!text.contains("TEST_CODE_TITLE_A"));
+    }
+
+    #[test]
+    fn n02_selected_capture_errors_leave_legacy_reservations_intact() {
+        let (synthetic, _, _) = n02_legacy_identity_reservation("A");
+        assert_eq!(
+            synthetic.selected_projected[0].record_evidence(),
+            Err(&NewsFlashRecordEvidenceError::MissingAdmittedRecord)
+        );
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let reserve = |summary: String| {
+            let projected = n02_selected_projected(
+                "TEST_CODE_LARGE",
+                "TEST_CODE_TITLE",
+                &summary,
+                "TEST_CODE_BATCH",
+                day,
+                1,
+            );
+            let mut gate = NewsFlashGate::new(day);
+            assert!(gate
+                .reserve(&[projected], n02_selected_local_at(day, 9, 5), 80, 20)
+                .is_empty());
+            gate.reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+                .pop()
+                .unwrap()
+        };
+        let ordinary = reserve("small".to_owned());
+        let oversized = reserve("x".repeat(raw_v2::MAX_NEWS_FLASH_RECORD_EVIDENCE_BYTES));
+        assert!(ordinary.selected_projected[0].record_evidence().is_ok());
+        assert_eq!(
+            oversized.selected_projected[0].record_evidence(),
+            Err(&NewsFlashRecordEvidenceError::CanonicalBytesLimitExceeded)
+        );
+        assert_eq!(ordinary.sources(), oversized.sources());
+        assert_eq!(ordinary.evidence_sha256(), oversized.evidence_sha256());
+        assert_eq!(ordinary.render_sha256(), oversized.render_sha256());
+        assert_eq!(
+            ordinary.reservation_identity_sha256(),
+            oversized.reservation_identity_sha256()
+        );
+        assert_eq!(ordinary.decision(), oversized.decision());
+    }
+
+    #[test]
+    fn n02_selected_rollover_and_settlement_keep_token_ownership() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let next = day.succ_opt().unwrap();
+        let a = n02_selected_projected(
+            "TEST_CODE_A",
+            "TEST_CODE_TITLE_A",
+            "summary A",
+            "TEST_CODE_BATCH_A",
+            day,
+            1,
+        );
+        let b = n02_selected_projected(
+            "TEST_CODE_B",
+            "TEST_CODE_TITLE_B",
+            "summary B",
+            "TEST_CODE_BATCH_B",
+            next,
+            1,
+        );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[a], n02_selected_local_at(day, 9, 5), 80, 20)
+            .is_empty());
+        let reservation = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        let identity = reservation.reservation_identity_sha256().to_owned();
+        assert_eq!(
+            reservation.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .item_id(),
+            "TEST_CODE_A"
+        );
+        assert_eq!(
+            reservation
+                .foundation_n02_binding()
+                .unwrap()
+                .material()
+                .reservation_sha256,
+            identity
+        );
+        assert_eq!(gate.window_state[0], WindowState::Pending);
+        gate.settle(
+            reservation,
+            FlashSettlement::RolledBack {
+                reason: "TEST_CODE_ROLLBACK".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(gate.window_state[0], WindowState::Eligible);
+        let retry = gate
+            .reserve(&[], n02_selected_local_at(day, 9, 32), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(retry.reservation_identity_sha256(), identity);
+        assert_eq!(
+            retry.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .item_id(),
+            "TEST_CODE_A"
+        );
+        gate.settle(
+            retry,
+            FlashSettlement::Uncertain {
+                reason: "TEST_CODE_UNCERTAIN".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(gate
+            .reserve(&[], n02_selected_local_at(day, 9, 33), 80, 20)
+            .is_empty());
+
+        assert!(gate
+            .reserve(&[b], n02_selected_local_at(next, 9, 5), 80, 20)
+            .is_empty());
+        let next_reservation = gate
+            .reserve(&[], n02_selected_local_at(next, 9, 31), 80, 20)
+            .pop()
+            .unwrap();
+        assert_eq!(next_reservation.selected_projected.len(), 1);
+        assert_eq!(
+            next_reservation.selected_projected[0]
+                .record_evidence()
+                .unwrap()
+                .item_id(),
+            "TEST_CODE_B"
+        );
+        assert_ne!(next_reservation.reservation_identity_sha256(), identity);
+    }
+
+    fn n02_legacy_identity_reservation(
+        suffix: &str,
+    ) -> (
+        FlashReservation,
+        stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent,
+        NewsFlashGate,
+    ) {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let local_at = |hour, minute| {
+            day.and_hms_opt(hour, minute, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+        };
+        let published_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T00:01:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut event = MarketEvent::new(
+            EventType::Policy,
+            "TEST_CODE_TITLE_A".to_owned(),
+            None,
+            Direction::Bull,
+            0,
+            100,
+        );
+        event.event_id = format!("TEST_CODE_EVENT_{suffix}");
+        event.occurred_at = published_at.with_timezone(&chrono::Local);
+        event
+            .provenance
+            .push(stock_analysis::signal::market_event::SourceRef {
+                provider: "TEST_CODE_PROVIDER".to_owned(),
+                url: None,
+                fetched_at: observed_at.with_timezone(&chrono::Local),
+            });
+        let capability =
+            stock_analysis::news::aggregator::raw_v2::NewsFlashProjectionTestCapability::bind()
+                .unwrap();
+        let source =
+            stock_analysis::news::aggregator::raw_v2::NewsFlashProjectedEvent::test_fixture(
+                &capability,
+                event,
+                "TEST_CODE_PROVIDER",
+                "TEST_CODE_SOURCE",
+                published_at,
+                observed_at,
+                &format!("TEST_CODE_BATCH_{suffix}"),
+            );
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[source.clone()], local_at(9, 0), 80, 20)
+            .is_empty());
+        let mut reservations = gate.reserve(&[], local_at(9, 31), 80, 20);
+        assert_eq!(reservations.len(), 1);
+        (reservations.pop().unwrap(), source, gate)
+    }
+
+    #[test]
+    fn n02_legacy_identity_real_gate_vectors() {
+        let expected_text =
+            "📰 新闻时段聚合 (09:30) Top3:\n1. [政策] TEST_CODE_TITLE_A (强度0 确定性100)\n";
+        let expected = [
+            (
+                "A",
+                "23ed3f279f099164d2fb8c9d577c21b3c1d37d0197f250bf8e94e048d33131e6",
+                "eba6d8e675bcfa34f1823268099f2244856cf9ab0df9d67e5245d28d8916b05f",
+            ),
+            (
+                "B",
+                "9e27d4895f5e794cc2b862e7ef9fe4d0fdab4c83b59ddff5bcbb9d514f97bb90",
+                "774799317c09db050295597009fe1695320178654b8f6b2ec628ed4a5c1f8507",
+            ),
+        ];
+        for (suffix, evidence, identity) in expected {
+            let (reservation, projected, _) = n02_legacy_identity_reservation(suffix);
+            let text = match reservation.decision() {
+                FlashDecision::Aggregated { window, text } => {
+                    assert_eq!(window, "09:30");
+                    text
+                }
+                FlashDecision::Critical { .. } => panic!("expected aggregate"),
+            };
+            assert_eq!(text, expected_text);
+            assert_eq!(text.len(), 91);
+            let raw_render = format!("{:x}", Sha256::digest(text.as_bytes()));
+            assert_eq!(
+                raw_render,
+                "5f12437bce75ac811b8279dcfc7f9bed5e2ace0daeb414e1c56342bb98d09f76"
+            );
+            assert_eq!(
+                reservation.render_sha256(),
+                "c212620d768a5e70d91f2254dc0007b5a1cfa932220c81acfa3f19989613ce6f"
+            );
+            assert_ne!(raw_render, reservation.render_sha256());
+            assert_eq!(reservation.rendered_len(), 91);
+            assert_eq!(reservation.push_kind(), "news_flash_aggregated_v1");
+            assert_eq!(
+                reservation.business_date(),
+                chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap()
+            );
+            assert_eq!(reservation.decision_key(), "window:09:30");
+            assert_eq!(reservation.event_id(), None);
+            assert_eq!(reservation.window(), Some("09:30"));
+            assert_eq!(reservation.attempt_ordinal(), 1);
+            let published_at =
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00+00:00").unwrap();
+            let observed_at =
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T00:01:00+00:00").unwrap();
+            assert_eq!(
+                reservation.audit_sources(),
+                vec![stock_analysis::event::NewsFlashAuditSource {
+                    event_id: format!("TEST_CODE_EVENT_{suffix}"),
+                    provider: "TEST_CODE_PROVIDER".to_owned(),
+                    source: "TEST_CODE_SOURCE".to_owned(),
+                    published_at,
+                    observed_at,
+                    batch_id: format!("TEST_CODE_BATCH_{suffix}"),
+                }]
+            );
+            assert_eq!(
+                stock_analysis::news::aggregator::raw_v2::ordered_news_flash_evidence_sha256(&[
+                    projected
+                ]),
+                evidence
+            );
+            assert_eq!(
+                stock_analysis::event::envelope::news_flash_evidence_sha256(
+                    &reservation.audit_sources()
+                ),
+                evidence
+            );
+            assert_eq!(reservation.evidence_sha256(), evidence);
+            assert_eq!(reservation.reservation_identity_sha256(), identity);
+        }
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_real_reservation_and_bytes() {
+        let (reservation, _, _) = n02_legacy_identity_reservation("A");
+        let text = match reservation.decision() {
+            FlashDecision::Aggregated { text, .. } => text,
+            _ => unreachable!(),
+        };
+        let binding = reservation.foundation_n02_binding().unwrap();
+        let material = binding.material();
+        assert_eq!(material.business_date, reservation.business_date());
+        assert_eq!(material.window, reservation.window().unwrap());
+        assert_eq!(material.push_kind, reservation.push_kind());
+        assert_eq!(material.decision_key, reservation.decision_key());
+        assert_eq!(material.event_id.as_deref(), reservation.event_id());
+        assert_eq!(material.sources, reservation.audit_sources());
+        assert_eq!(material.evidence_sha256, reservation.evidence_sha256());
+        assert_eq!(
+            material.reservation_sha256,
+            reservation.reservation_identity_sha256()
+        );
+        assert_eq!(
+            material.news_flash_render_sha256,
+            reservation.render_sha256()
+        );
+        assert_eq!(material.rendered_len, text.as_bytes().len() as u64);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(text.as_bytes())),
+            "5f12437bce75ac811b8279dcfc7f9bed5e2ace0daeb414e1c56342bb98d09f76"
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_same_text_distinct_sources() {
+        let (a, _, _) = n02_legacy_identity_reservation("A");
+        let (b, _, _) = n02_legacy_identity_reservation("B");
+        let a_binding = a.foundation_n02_binding().unwrap();
+        let b_binding = b.foundation_n02_binding().unwrap();
+        assert_eq!(a.decision(), b.decision());
+        assert_eq!(
+            a_binding.material().news_flash_render_sha256,
+            b_binding.material().news_flash_render_sha256
+        );
+        assert_ne!(a_binding.material().sources, b_binding.material().sources);
+        assert_ne!(
+            a_binding.material().evidence_sha256,
+            b_binding.material().evidence_sha256
+        );
+        assert_ne!(
+            a_binding.material().reservation_sha256,
+            b_binding.material().reservation_sha256
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_preserves_full_source_order() {
+        let (_, source_a, _) = n02_legacy_identity_reservation("A");
+        let (_, source_b, _) = n02_legacy_identity_reservation("B");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let local_at = |minute| {
+            day.and_hms_opt(9, minute, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+        };
+        let mut gate = NewsFlashGate::new(day);
+        assert!(gate
+            .reserve(&[source_b, source_a], local_at(0), 80, 20)
+            .is_empty());
+        let reservation = gate.reserve(&[], local_at(31), 80, 20).pop().unwrap();
+        let ordered_sources = reservation.audit_sources();
+        assert_eq!(ordered_sources.len(), 2);
+        assert_eq!(ordered_sources[0].event_id, "TEST_CODE_EVENT_B");
+        assert_eq!(ordered_sources[1].event_id, "TEST_CODE_EVENT_A");
+        assert_eq!(
+            reservation
+                .foundation_n02_binding()
+                .unwrap()
+                .material()
+                .sources,
+            ordered_sources
+        );
+    }
+
+    #[test]
+    fn n02_foundation_binding_rejects_critical() {
+        let (aggregate, source, _) = n02_legacy_identity_reservation("A");
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 28)
+            .unwrap()
+            .and_hms_opt(9, 31, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap();
+        let critical = make_reservation(
+            2,
+            now.date_naive(),
+            "event:TEST_CODE_EVENT_A",
+            Some("TEST_CODE_EVENT_A".to_owned()),
+            None,
+            vec![source],
+            FlashDecision::Critical {
+                event_id: "TEST_CODE_EVENT_A".to_owned(),
+                headline: "TEST_CODE_TITLE_A".to_owned(),
+                source: "TEST_CODE_SOURCE".to_owned(),
+                observed_at: now,
+                source_published_on: now.date_naive(),
+                stale: false,
+                strength: 100,
+                certainty: 100,
+                text: match aggregate.decision() {
+                    FlashDecision::Aggregated { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                },
+            },
+        );
+        assert!(matches!(
+            critical.foundation_n02_binding(),
+            Err(
+                stock_analysis::push_foundation::N02BindingError::ReservationMismatch {
+                    field: "push_kind"
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn n02_foundation_binding_does_not_consume_reservation() {
+        let (reservation, _, mut gate) = n02_legacy_identity_reservation("A");
+        let binding = reservation.foundation_n02_binding().unwrap();
+        let original_identity = reservation.reservation_identity_sha256().to_owned();
+        assert_eq!(binding.material().reservation_sha256, original_identity);
+        assert_eq!(gate.window_state[0], WindowState::Pending);
+        gate.settle(
+            reservation,
+            FlashSettlement::RolledBack {
+                reason: "TEST_CODE_BINDING_OBSERVED".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(gate.window_state[0], WindowState::Eligible);
+        let retry_at = chrono::NaiveDate::from_ymd_opt(2026, 9, 28)
+            .unwrap()
+            .and_hms_opt(9, 32, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap();
+        let retry = gate.reserve(&[], retry_at, 80, 20);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].reservation_identity_sha256(), original_identity);
+    }
 
     fn ev(id_seed: &str, strength: u8, certainty: u8) -> MarketEvent {
         let mut e = MarketEvent::new(
@@ -1877,7 +3177,8 @@ mod tests {
 
     #[tokio::test]
     async fn raw_fetch_rejects_zero_limit_before_provider_work() {
-        let error = fetch_raw_global_news_batch(0)
+        let registry = raw_v2::GlobalNewsSourceRegistry::new();
+        let error = fetch_raw_global_news_batch(&registry, 0)
             .await
             .expect_err("TEST_CODE zero limit must fail before provider work");
         assert!(matches!(error, RawNewsAcquisitionError::InvalidLimit(0)));

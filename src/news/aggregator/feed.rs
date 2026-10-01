@@ -1,5 +1,6 @@
 //! BR-166 typed global-news feeds backed only by the unified data Gateway.
 
+use super::raw_v2::br166_global_news_event_id;
 use super::{NewsFeed, NewsFeedOutput, SourceKind};
 use crate::data_gateway::{GatewayBatch, GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord};
 use crate::signal::market_event::{
@@ -8,7 +9,6 @@ use crate::signal::market_event::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Local;
-use sha2::{Digest, Sha256};
 
 /// One thin registered feed over a released typed upstream provider.
 #[derive(Debug, Clone, Copy)]
@@ -88,12 +88,7 @@ pub(super) fn record_to_market_event(
         .or(record.content.as_deref())
         .unwrap_or("");
     let simhash = compute_simhash(&record.title, body);
-    let mut event_hasher = Sha256::new();
-    event_hasher.update(b"BR166_GLOBAL_NEWS_EVENT_V1\0");
-    event_hasher.update(provider.source().as_bytes());
-    event_hasher.update(b"\0");
-    event_hasher.update(record.item_id.as_bytes());
-    let event_id = hex::encode(event_hasher.finalize());
+    let event_id = br166_global_news_event_id(provider, &record.item_id);
     let stale = occurred_at.date_naive() != fetched_at.date_naive();
     // 2026-09-22 判别日志 (上游回复要求, 9/20 排查指引 2 未落地项):
     // fetched_at = record.observed_at (上游客证时刻), 非本机抓取时刻;

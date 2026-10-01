@@ -41,7 +41,7 @@ The project is an event-driven live A-share trading monitor. Its main bounded co
   - ⚠️ **禁止把 `nohup` 直跑当常规部署手段**：会话进程退出时会对自己的子进程做进程组 teardown（SIGKILL），`nohup` 只挡 SIGHUP、挡不住这个 → 进程跟着会话一起**静默消失**（无 crash report、无 panic）。2026-09-23 实测：monitor 08:14 被启动它的会话带走，停摆 46 分钟
   - 2026-09-28 的 Desktop 版 launchd 实例在 dyld 打开 binary 时触发 macOS Desktop TCC 授权延迟；迁至 Desktop 外真实运行根后，shadow 与正式实例都已进入程序。旧 Desktop plist 不是有效回退方案。主库约 343 万条采集审计及链记录，启动校验可能持续数分钟；必须等数据库初始化日志、桥接 `127.0.0.1:18082` 与 monitor 重连记录，不能只看 PID。
 - **counted 持久投递**：22 个 PushKind 已接线（durable_delivery catalog 45 kinds）；counted kind 走 `push_counted_with_binding`，generic governor 对 counted kind 拒绝（fail-closed）
-- **交易能力边界**：无真实券商接入（虚拟盘 paper 交易）；买入门由 `compute_account_mode_metrics_blocking` 桩函数关闭（BR-103 水位未接线）；T-14/T-15 等真实券商回报 feed 缺失
+- **交易能力边界**：无真实券商接入（虚拟盘 paper 交易）。`compute_account_mode_metrics_blocking` 已读取用户账户摘要及 paper 账本并校验时效，缺失或过期时拒绝；生产 PaperLedger 仍需显式 seed/cutover binding 才能激活。T-14/T-15 等依赖真实券商回报的 feed 缺失，保持禁用。
 - **上游数据问题记录**：`grpc_handoffs/`（竞价期数据源、VM 时钟、新闻时间戳等交接文档）
 - **已知缺陷清单**：`docs/audits/2026-09-21-系统评估.md`（含修复优先级 A/B 档；B 档需产品决策）
 

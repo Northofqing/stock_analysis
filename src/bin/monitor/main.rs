@@ -36,7 +36,9 @@ use stock_analysis::calendar::{self, current_session, is_market_active, MarketSe
 use stock_analysis::app::chain_schedule::{
     run_scheduled_chain_analysis, ChainPhase, ChainScheduleOutcome, ChainScheduleStore,
 };
-use stock_analysis::push_foundation::observe_chain_preopen_shadow;
+use stock_analysis::push_foundation::{
+    observe_chain_post_close_shadow, observe_chain_preopen_shadow,
+};
 
 use stock_analysis::monitor::detector::{
     AlertCategory, AlertDetail, AlertEvent, AlertLevel, Detector, DetectorConfig, StockSnapshot,
@@ -148,6 +150,7 @@ mod dryrun_report; // v26: dry-run 自动报告
 
 mod v13_diag; // v13.27: 端到端诊断
 
+mod attribution_daily_intent;
 mod attribution_epoch_runtime;
 mod blocking_market_data;
 #[cfg(test)]
@@ -170,6 +173,363 @@ const PAPER_DECISION_TICK: std::time::Duration = std::time::Duration::from_secs(
 async fn g5b_no_provider_backoff() {
     log::warn!("[g5b] 深链归因: 无可用 LLM provider (未配置 DeepSeek/MiniMax?), 本次跳过");
     tokio::time::sleep(PAPER_DECISION_TICK).await;
+}
+
+/// Empty input never seals the day: a production alert may arrive at any later
+/// tick, including the last minute of the attribution window.
+fn g5b_should_analyze(
+    local_now: chrono::NaiveDateTime,
+    last_run: Option<chrono::NaiveDate>,
+    eligible_events: usize,
+) -> bool {
+    use chrono::Timelike;
+    local_now.hour() == 15
+        && (5..=20).contains(&local_now.minute())
+        && last_run != Some(local_now.date())
+        && eligible_events > 0
+}
+
+const G5B_RECOVERY_BATCH_DATES: usize = 8;
+
+enum G5bRecoveryTaskOutput {
+    Discovered(Vec<chrono::NaiveDate>),
+    Recovered(stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery),
+}
+
+type G5bRecoveryTask = tokio::task::JoinHandle<
+    Result<G5bRecoveryTaskOutput, stock_analysis::monitor::attribution_deep::DeepAttributionError>,
+>;
+
+struct G5bArchiveRecoveryState {
+    pending: bool,
+    ready: bool,
+    discovered: bool,
+    last_attempt: Option<chrono::NaiveDateTime>,
+    remaining_dates: std::collections::VecDeque<chrono::NaiveDate>,
+    failed_dates: Vec<chrono::NaiveDate>,
+    in_flight_dates: Vec<chrono::NaiveDate>,
+    task: Option<G5bRecoveryTask>,
+}
+
+impl G5bArchiveRecoveryState {
+    const fn new() -> Self {
+        Self {
+            pending: true,
+            ready: false,
+            discovered: false,
+            last_attempt: None,
+            remaining_dates: std::collections::VecDeque::new(),
+            failed_dates: Vec::new(),
+            in_flight_dates: Vec::new(),
+            task: None,
+        }
+    }
+
+    fn fresh_allowed(&self) -> bool {
+        self.ready
+            && !self.pending
+            && self.task.is_none()
+            && self.remaining_dates.is_empty()
+            && self.failed_dates.is_empty()
+    }
+
+    fn retry_due(&self, now: chrono::NaiveDateTime) -> bool {
+        self.pending
+            && self.task.is_none()
+            && self.last_attempt.is_none_or(|previous| {
+                now < previous
+                    || now.signed_duration_since(previous) >= chrono::Duration::minutes(5)
+            })
+    }
+
+    fn discovered_dates(&mut self, dates: Vec<chrono::NaiveDate>) {
+        self.discovered = true;
+        self.remaining_dates = dates.into();
+        self.last_attempt = None;
+        self.pending = !self.remaining_dates.is_empty();
+        self.ready = !self.pending;
+    }
+
+    fn take_batch(&mut self) -> Vec<chrono::NaiveDate> {
+        let dates = (0..G5B_RECOVERY_BATCH_DATES)
+            .filter_map(|_| self.remaining_dates.pop_front())
+            .collect::<Vec<_>>();
+        self.in_flight_dates = dates.clone();
+        dates
+    }
+
+    fn finish_batch(
+        &mut self,
+        report: &stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery,
+        now: chrono::NaiveDateTime,
+    ) {
+        self.in_flight_dates.clear();
+        for (date, _) in &report.failures {
+            if !self.failed_dates.contains(date) {
+                self.failed_dates.push(*date);
+            }
+        }
+        if !self.remaining_dates.is_empty() {
+            self.ready = false;
+            self.pending = true;
+            self.last_attempt = None;
+        } else if self.failed_dates.is_empty() {
+            self.ready = true;
+            self.pending = false;
+        } else {
+            self.ready = false;
+            self.pending = true;
+            self.last_attempt = Some(now);
+            self.remaining_dates = self.failed_dates.drain(..).collect();
+        }
+    }
+
+    fn fail(&mut self, now: chrono::NaiveDateTime) {
+        for date in self.in_flight_dates.drain(..).rev() {
+            self.remaining_dates.push_front(date);
+        }
+        self.ready = false;
+        self.pending = true;
+        self.last_attempt = Some(now);
+    }
+
+    fn retry_date(&mut self, date: chrono::NaiveDate, now: chrono::NaiveDateTime) {
+        self.ready = false;
+        self.pending = true;
+        self.last_attempt = Some(now);
+        if !self.remaining_dates.contains(&date) {
+            self.remaining_dates.push_back(date);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttributionDailyPreflight {
+    Prepare,
+    ExistingClaim {
+        decision_identity: String,
+        state: stock_analysis::durable_delivery::DecisionState,
+    },
+    Unavailable(String),
+}
+
+fn classify_attribution_daily_preflight(
+    claim: Result<
+        Option<crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence>,
+        String,
+    >,
+) -> AttributionDailyPreflight {
+    match claim {
+        Ok(None) => AttributionDailyPreflight::Prepare,
+        Ok(Some(evidence))
+            if evidence.state == stock_analysis::durable_delivery::DecisionState::Delivered
+                && evidence.authoritative_receipt_sha256.is_none() =>
+        {
+            AttributionDailyPreflight::Unavailable(
+                "Delivered attribution claim has no authoritative receipt".to_owned(),
+            )
+        }
+        Ok(Some(evidence)) => AttributionDailyPreflight::ExistingClaim {
+            decision_identity: evidence.decision_identity,
+            state: evidence.state,
+        },
+        Err(error) => AttributionDailyPreflight::Unavailable(error),
+    }
+}
+
+fn attribution_daily_may_retry_frozen(
+    outcome: &crate::notify::PushOutcome,
+    postflight: &AttributionDailyPreflight,
+) -> bool {
+    matches!(postflight, AttributionDailyPreflight::Prepare)
+        && matches!(
+            outcome,
+            crate::notify::PushOutcome::Denied(_) | crate::notify::PushOutcome::SinkError(_)
+        )
+}
+
+#[cfg(test)]
+mod attribution_daily_preflight_tests {
+    use super::{
+        attribution_daily_may_retry_frozen, classify_attribution_daily_preflight,
+        AttributionDailyPreflight,
+    };
+    use crate::notify::PushOutcome;
+    use stock_analysis::durable_delivery::DecisionState;
+
+    fn claim(
+        state: DecisionState,
+        receipt: Option<&str>,
+    ) -> crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+        crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+            decision_identity: "TEST_CODE_attribution_daily_decision".to_owned(),
+            state,
+            sink_calls: 0,
+            current_attempt_identity: None,
+            authoritative_receipt_sha256: receipt.map(str::to_owned),
+            source_binding_mode: None,
+            schedule_hydration: None,
+        }
+    }
+
+    #[test]
+    fn unclaimed_day_can_prepare_but_any_persisted_attempt_blocks_recomputation() {
+        assert_eq!(
+            classify_attribution_daily_preflight(Ok(None)),
+            AttributionDailyPreflight::Prepare
+        );
+        for state in [
+            DecisionState::Reserved,
+            DecisionState::AttemptInFlight,
+            DecisionState::RejectedDurable,
+            DecisionState::UncertainManualReview,
+        ] {
+            assert!(matches!(
+                classify_attribution_daily_preflight(Ok(Some(claim(state, None)))),
+                AttributionDailyPreflight::ExistingClaim { state: found, .. } if found == state
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_requires_authoritative_receipt_and_read_error_fails_closed() {
+        assert!(matches!(
+            classify_attribution_daily_preflight(Ok(Some(claim(
+                DecisionState::Delivered,
+                Some("TEST_CODE_authoritative_receipt_hash"),
+            )))),
+            AttributionDailyPreflight::ExistingClaim {
+                state: DecisionState::Delivered,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_attribution_daily_preflight(Ok(Some(claim(DecisionState::Delivered, None)))),
+            AttributionDailyPreflight::Unavailable(_)
+        ));
+        assert_eq!(
+            classify_attribution_daily_preflight(Err("TEST_CODE storage unavailable".to_owned())),
+            AttributionDailyPreflight::Unavailable("TEST_CODE storage unavailable".to_owned())
+        );
+    }
+
+    #[test]
+    fn retry_requires_failed_dispatch_and_proven_absence_of_a_claim() {
+        for outcome in [
+            PushOutcome::Denied("TEST_CODE_preclaim_gate".to_owned()),
+            PushOutcome::SinkError("TEST_CODE_prepare_error".to_owned()),
+        ] {
+            assert!(attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Prepare,
+            ));
+            for state in [
+                DecisionState::Reserved,
+                DecisionState::AttemptInFlight,
+                DecisionState::UncertainManualReview,
+                DecisionState::RejectedDurable,
+                DecisionState::Delivered,
+            ] {
+                let receipt = (state == DecisionState::Delivered)
+                    .then_some("TEST_CODE_authoritative_receipt_hash");
+                let postflight =
+                    classify_attribution_daily_preflight(Ok(Some(claim(state, receipt))));
+                assert!(!attribution_daily_may_retry_frozen(&outcome, &postflight));
+            }
+            assert!(!attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Unavailable("TEST_CODE_read_error".to_owned()),
+            ));
+        }
+        for outcome in [PushOutcome::Pushed, PushOutcome::Deduped] {
+            assert!(!attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Prepare,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod g5b_input_gate_tests {
+    use super::g5b_should_analyze;
+
+    #[test]
+    fn empty_ticks_leave_the_full_window_open_for_a_late_alert() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let at = |minute, second| day.and_hms_opt(15, minute, second).unwrap();
+        assert!(!g5b_should_analyze(at(5, 0), None, 0));
+        assert!(!g5b_should_analyze(at(20, 0), None, 0));
+        assert!(g5b_should_analyze(at(20, 45), None, 1));
+        assert!(!g5b_should_analyze(at(20, 45), Some(day), 1));
+        assert!(!g5b_should_analyze(
+            day.and_hms_opt(15, 21, 0).unwrap(),
+            None,
+            1
+        ));
+    }
+}
+
+#[cfg(test)]
+mod g5b_archive_recovery_state_tests {
+    use super::{G5bArchiveRecoveryState, G5B_RECOVERY_BATCH_DATES};
+    use stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery;
+
+    #[test]
+    fn fresh_stays_closed_until_failed_dates_are_recovered() {
+        let older = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let newer = older.succ_opt().unwrap();
+        let failed = older + chrono::Duration::days(G5B_RECOVERY_BATCH_DATES as i64);
+        let now = newer.and_hms_opt(15, 5, 0).unwrap();
+        let mut state = G5bArchiveRecoveryState::new();
+        assert!(!state.fresh_allowed());
+        let dates = (0..G5B_RECOVERY_BATCH_DATES + 2)
+            .map(|offset| older + chrono::Duration::days(offset as i64))
+            .collect::<Vec<_>>();
+        state.discovered_dates(dates);
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.take_batch().len(), G5B_RECOVERY_BATCH_DATES);
+        state.finish_batch(&DeepAttributionArchiveRecovery::default(), now);
+        assert_eq!(state.remaining_dates.len(), 2);
+        assert!(!state.fresh_allowed());
+
+        assert_eq!(state.take_batch().len(), 2);
+        state.finish_batch(
+            &DeepAttributionArchiveRecovery {
+                appended: 1,
+                failures: vec![(failed, "damaged archive".to_string())],
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.remaining_dates.front(), Some(&failed));
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
+
+        assert_eq!(state.take_batch(), vec![failed]);
+        state.finish_batch(&DeepAttributionArchiveRecovery::default(), now);
+        assert!(state.fresh_allowed());
+        state.retry_date(newer, now);
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.remaining_dates.front(), Some(&newer));
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn worker_failure_restores_its_batch_and_keeps_fresh_closed() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let now = day.and_hms_opt(15, 5, 0).unwrap();
+        let mut state = G5bArchiveRecoveryState::new();
+        state.discovered_dates(vec![day]);
+        assert_eq!(state.take_batch(), vec![day]);
+        state.fail(now);
+        assert_eq!(state.remaining_dates.front(), Some(&day));
+        assert!(!state.fresh_allowed());
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
+    }
 }
 
 #[cfg(test)]
@@ -1592,8 +1952,8 @@ pub static LATEST_BANNER: Lazy<std::sync::Mutex<Option<push_templates::BannerCtx
 // main and therefore cannot publish a production operational health snapshot.
 static HEALTH_SNAPSHOT_OWNER: Lazy<std::sync::Mutex<Option<(bool, String)>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
-static HEALTH_SNAPSHOT_WRITE_LOCK: Lazy<std::sync::Mutex<()>> =
-    Lazy::new(|| std::sync::Mutex::new(()));
+static HEALTH_SNAPSHOT_WRITE_LOCK: Lazy<std::sync::Mutex<health_cmd::EvaluationTimes>> =
+    Lazy::new(|| std::sync::Mutex::new(health_cmd::EvaluationTimes::default()));
 
 /// Read the latest fully evaluated banner.
 ///
@@ -1882,13 +2242,21 @@ mod tests_account_banner_values {
     }
 }
 
-fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
-    let _write_guard = HEALTH_SNAPSHOT_WRITE_LOCK
+fn store_banner(
+    banner: push_templates::BannerCtx,
+    evaluation: health_cmd::EvaluationUpdate,
+) -> Result<(), String> {
+    let mut times = HEALTH_SNAPSHOT_WRITE_LOCK
         .lock()
         .map_err(|_| "health snapshot write lock poisoned".to_string())?;
-    *LATEST_BANNER
-        .lock()
-        .map_err(|_| "latest banner lock poisoned".to_string())? = Some(banner.clone());
+    let banner = {
+        let mut latest = LATEST_BANNER
+            .lock()
+            .map_err(|_| "latest banner lock poisoned".to_string())?;
+        let merged = times.merge_banner(latest.as_ref(), banner, evaluation);
+        *latest = Some(merged.clone());
+        merged
+    };
     let owner = match HEALTH_SNAPSHOT_OWNER.lock() {
         Ok(owner) => owner.clone(),
         Err(_) => {
@@ -1897,11 +2265,31 @@ fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
         }
     };
     if let Some((test_mode, boot_id)) = owner {
-        if let Err(error) = health_cmd::write_banner_snapshot(test_mode, &boot_id, &banner) {
+        if let Err(error) = health_cmd::write_banner_snapshot(test_mode, &boot_id, &banner, *times)
+        {
             log::error!("[health] operational banner snapshot unavailable: {error}");
         }
     }
     Ok(())
+}
+
+fn publish_raw_news_source_recovery(
+    registry: &stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry,
+) {
+    let owner = match HEALTH_SNAPSHOT_OWNER.lock() {
+        Ok(owner) => owner.clone(),
+        Err(_) => {
+            log::error!("[health] raw news source snapshot owner lock poisoned");
+            return;
+        }
+    };
+    if let Some((test_mode, boot_id)) = owner {
+        if let Err(error) =
+            health_cmd::write_raw_news_source_snapshot(test_mode, &boot_id, registry)
+        {
+            log::error!("[health] raw news source recovery snapshot unavailable: {error}");
+        }
+    }
 }
 
 /// 最近交易日（今天若周一至五则为今天，否则回溯到上一工作日）。
@@ -1951,10 +2339,80 @@ impl SnapshotReminderGate {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotReminderAttempt {
+    AlreadyHandled,
+    ExistingClaim {
+        decision_identity: String,
+        state: stock_analysis::durable_delivery::DecisionState,
+    },
+    PreflightFailed(String),
+    Sent(notify::PushOutcome),
+}
+
+/// The in-process gate serializes startup and timer. The durable claim check
+/// follows that reservation. An existing claim blocks a second preparation,
+/// including after restart when the in-process gate has been reset.
+async fn dispatch_snapshot_reminder_with_claim<Inspect, InspectFuture, Send, SendFuture>(
+    gate: &std::sync::Mutex<SnapshotReminderGate>,
+    today: chrono::NaiveDate,
+    inspect: Inspect,
+    send: Send,
+) -> SnapshotReminderAttempt
+where
+    Inspect: FnOnce() -> InspectFuture,
+    InspectFuture: std::future::Future<
+        Output = Result<
+            Option<crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence>,
+            String,
+        >,
+    >,
+    Send: FnOnce() -> SendFuture,
+    SendFuture: std::future::Future<Output = notify::PushOutcome>,
+{
+    if !gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .try_begin(today)
+    {
+        return SnapshotReminderAttempt::AlreadyHandled;
+    }
+    let claim = match inspect().await {
+        Ok(claim) => claim,
+        Err(error) => {
+            gate.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .finish(today, false);
+            return SnapshotReminderAttempt::PreflightFailed(error);
+        }
+    };
+    if let Some(claim) = claim {
+        let confirmed = claim.state == stock_analysis::durable_delivery::DecisionState::Delivered
+            && claim.authoritative_receipt_sha256.is_some();
+        gate.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish(today, confirmed);
+        if claim.state == stock_analysis::durable_delivery::DecisionState::Delivered && !confirmed {
+            return SnapshotReminderAttempt::PreflightFailed(
+                "Delivered snapshot reminder claim has no authoritative receipt".to_owned(),
+            );
+        }
+        return SnapshotReminderAttempt::ExistingClaim {
+            decision_identity: claim.decision_identity,
+            state: claim.state,
+        };
+    }
+    let outcome = send().await;
+    gate.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(today, periodic_delivery_confirmed(&outcome));
+    SnapshotReminderAttempt::Sent(outcome)
+}
+
 /// 任务#3: 持仓快照过期检查 — BR-234b 后快照过期时系统自动估值（持仓×实时价），
 /// 快照的唯一用途是反映真实持仓变动。连续 5 个交易日无新快照 → 推送提醒
 /// （低频率交易者一周一检；1-4 个交易日仅日志）。触发点: 启动时 + 每日 15:10。
-/// 每日最多推 1 次（静态日期去重）；快照新鲜或无记录时仅日志，不出声推送。
+/// 每日最多推 1 次（静态日期和 durable claim 去重）；快照新鲜或无记录时仅日志，不出声推送。
 async fn check_snapshot_staleness_and_notify() {
     use stock_analysis::database::user_account_summary;
     let Some(summary) = user_account_summary::latest().ok().flatten() else {
@@ -1984,60 +2442,80 @@ async fn check_snapshot_staleness_and_notify() {
         );
         return;
     }
-    // BR-116: 短锁预约本次投递，确认后才提交日期；失败清除预约并保留重试资格。
+    // BR-116: 短锁串行化启动与定时入口，随后只读检查当日 durable claim。
+    // 只有尚无 claim 才准备投递；已持久化的失败或不确定结果必须留待人工裁定。
     static LAST: std::sync::Mutex<SnapshotReminderGate> =
         std::sync::Mutex::new(SnapshotReminderGate {
             last_confirmed: None,
             in_flight: None,
         });
-    let should_attempt = {
-        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
-        gate.try_begin(today)
-    };
-    if !should_attempt {
-        return;
-    }
-    let text = crate::push_templates::render_snapshot_stale(
-        days_behind,
-        &summary.effective_at,
-        summary.total_assets,
-    );
-    log::warn!("[快照提醒] {}", text);
-    // 2026-09-20: 快照提醒升级 counted (MU-snapshot-stale)。健康提醒类每日
-    // 一次 (进程内 SnapshotReminderGate 语义保留); counted 门取
-    // CountedCombinedAccount (requires_banner=true, 门内部取 banner — T-16
-    // 同形态)。BusinessDateOnce 幂等 + 豁免日预算; retry_authorized=false
-    // (days_behind 时刻锚定 + 进程内 gate 失败保留重试资格补偿)。
-    let outcome = match crate::push_templates::build_snapshot_stale_counted_binding(
+    let occurrence_identity = format!("snapshot-stale:{today}");
+    let attempt = dispatch_snapshot_reminder_with_claim(
+        &LAST,
         today,
-        days_behind,
-        &summary.effective_at,
-        summary.total_assets,
+        || async {
+            crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                today,
+                stock_analysis::durable_delivery::PushKind::SnapshotStale,
+                stock_analysis::durable_delivery::DeliverySubKind::None,
+                "GLOBAL",
+                &occurrence_identity,
+            )
+            .await
+        },
+        || async {
+            let text = crate::push_templates::render_snapshot_stale(
+                days_behind,
+                &summary.effective_at,
+                summary.total_assets,
+            );
+            log::warn!("[快照提醒] {}", text);
+            // Counted BusinessDateOnce, retry_authorized=false. The durable claim
+            // preflight above keeps a later entry from preparing a second intent.
+            match crate::push_templates::build_snapshot_stale_counted_binding(
+                today,
+                days_behind,
+                &summary.effective_at,
+                summary.total_assets,
+            )
+            .and_then(|binding| {
+                crate::presentation_registry::acquire_token(
+                    "T-20-snapshot-stale",
+                    PushKind::SnapshotStale,
+                    "snapshot_stale_dispatcher",
+                    "render_snapshot_stale",
+                )
+                .map(|token| (token, binding))
+            }) {
+                Ok((token, binding)) => {
+                    crate::notify::push_counted_with_binding(token, &text, None, binding).await
+                }
+                Err(reason) => {
+                    log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
+                    crate::notify::PushOutcome::Denied(reason)
+                }
+            }
+        },
     )
-    .and_then(|binding| {
-        crate::presentation_registry::acquire_token(
-            "T-20-snapshot-stale",
-            PushKind::SnapshotStale,
-            "snapshot_stale_dispatcher",
-            "render_snapshot_stale",
-        )
-        .map(|token| (token, binding))
-    }) {
-        Ok((token, binding)) => {
-            crate::notify::push_counted_with_binding(token, &text, None, binding).await
+    .await;
+    match attempt {
+        SnapshotReminderAttempt::AlreadyHandled => {}
+        SnapshotReminderAttempt::ExistingClaim {
+            decision_identity,
+            state,
+        } => {
+            log::info!(
+                "[快照提醒] 当日 durable claim 已存在，跳过重复准备: decision={decision_identity} state={state:?}"
+            );
         }
-        Err(reason) => {
-            log::error!("[快照提醒][BR-196] counted 准备失败: {reason}");
-            crate::notify::PushOutcome::Denied(reason)
+        SnapshotReminderAttempt::PreflightFailed(error) => {
+            log::error!("[快照提醒] durable claim 只读检查失败，跳过投递: {error}");
         }
-    };
-    let confirmed = periodic_delivery_confirmed(&outcome);
-    {
-        let mut gate = LAST.lock().unwrap_or_else(|error| error.into_inner());
-        gate.finish(today, confirmed);
-    }
-    if !confirmed {
-        log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
+        SnapshotReminderAttempt::Sent(outcome) => {
+            if !periodic_delivery_confirmed(&outcome) {
+                log::warn!("[快照提醒] 推送未投递: {:?}", outcome);
+            }
+        }
     }
 }
 
@@ -2320,11 +2798,19 @@ pub async fn refresh_banner_state() -> Result<(), String> {
         .to_thresholds();
     let account_mode =
         stock_analysis::risk::account_mode::evaluate(&batch.metrics, prev_mode, &thresholds).mode;
+    let account_at = chrono::Utc::now();
     let data_health = evaluated_data_health()?;
+    let data_at = chrono::Utc::now();
     if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(&batch, account_mode, &data_health))?;
+    store_banner(
+        build_banner(&batch, account_mode, &data_health),
+        health_cmd::EvaluationUpdate::AccountAndData {
+            account_at,
+            data_at,
+        },
+    )?;
     Ok(())
 }
 
@@ -2340,8 +2826,10 @@ async fn refresh_banner_state_with_metrics(
     batch: &AccountModeMetricsBatch,
 
     lib_mode: stock_analysis::risk::action_gate::AccountMode,
+    account_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let data_health = evaluated_data_health()?;
+    let data_at = chrono::Utc::now();
     // BR-147: this is the only banner path the live monitor and `--review`
     // actually take. Without refreshing the note here the cached slot stays
     // None for the whole process, so a persisted valuation is rendered as
@@ -2349,7 +2837,13 @@ async fn refresh_banner_state_with_metrics(
     if !batch.metrics.is_complete() {
         refresh_closing_valuation_note();
     }
-    store_banner(build_banner(batch, lib_mode, &data_health))
+    store_banner(
+        build_banner(batch, lib_mode, &data_health),
+        health_cmd::EvaluationUpdate::AccountAndData {
+            account_at,
+            data_at,
+        },
+    )
 }
 
 /// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
@@ -2440,8 +2934,10 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         now_local,
     );
     let evaluated_mode = evaluation.mode;
+    let account_at = chrono::Utc::now();
 
-    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode, account_at).await
+    {
         log::error!("[AccountMode-hook] banner evaluation failed: {error}");
         return false;
     }
@@ -2490,7 +2986,8 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
 
     // Refresh once more after the orchestration so the shared state remains
     // aligned even when a reset transition was persisted during this call.
-    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode).await {
+    if let Err(error) = refresh_banner_state_with_metrics(&batch, evaluated_mode, account_at).await
+    {
         log::error!("[AccountMode-hook] final banner refresh failed: {error}");
         return false;
     }
@@ -2521,7 +3018,7 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// 纸面账本: economic engine 重建成功即账本一致; summary 缺 / 未来 / >4 天
 
-/// → 保守 Err (旧事实不得用于重开交易门).
+/// → 保守 Err (旧事实不得用于账户指标和常规 paper 风控上下文).
 
 fn current_day_pnl_pct(
     snapshot_at: chrono::DateTime<chrono::FixedOffset>,
@@ -2532,6 +3029,30 @@ fn current_day_pnl_pct(
     (snapshot_at.with_timezone(&china_offset).date_naive()
         == evaluated_at.with_timezone(&china_offset).date_naive())
     .then_some(pnl_pct)
+}
+
+fn account_mode_net_pnl(
+    net: &stock_analysis::performance::economic_position::NetMetrics,
+    cycle_open_fill_id: i64,
+) -> Result<f64, String> {
+    use stock_analysis::performance::economic_position::NetMetrics;
+
+    match net {
+        NetMetrics::Available { net_pnl, .. } => Ok(*net_pnl),
+        NetMetrics::Unavailable { reason } => {
+            let mut safe_reason = String::new();
+            for ch in reason.chars() {
+                let ch = if ch.is_control() { ' ' } else { ch };
+                if safe_reason.len() + ch.len_utf8() > 160 {
+                    break;
+                }
+                safe_reason.push(ch);
+            }
+            Err(format!(
+                "BR-103 economic cycle {cycle_open_fill_id} net PnL unavailable: {safe_reason}"
+            ))
+        }
+    }
 }
 
 fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, String> {
@@ -2570,7 +3091,7 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
 
     // 完备性锚: paper_trades 账本 (评估 #12). 连续止损计数从账本闭环仓位
     // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
-    // 账本重建失败 → Err (不允许放行交易门).
+    // 账本重建或闭环仓位净值不可用 → Err (账户指标与常规 paper 风控上下文不完整).
     let as_of = observed_at.date_naive();
     let report =
         stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
@@ -2579,20 +3100,14 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
         .closed_positions
         .iter()
         .map(|position| {
-            let pnl = match &position.net {
-                stock_analysis::performance::economic_position::NetMetrics::Available {
-                    net_pnl,
-                    ..
-                } => *net_pnl,
-                _ => position.gross_pnl,
-            };
-            (
+            let pnl = account_mode_net_pnl(&position.net, position.cycle_open_fill_id)?;
+            Ok((
                 position.closed_at,
                 format!("economic-cycle-{}", position.cycle_open_fill_id),
                 pnl,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let consecutive_stop_loss_n = count_consecutive_realized_losses(&realized)?;
 
     Ok(AccountModeMetricsBatch {
@@ -2646,6 +3161,67 @@ fn count_consecutive_realized_losses(
 #[cfg(test)]
 mod account_mode_metric_tests {
     use super::*;
+    use stock_analysis::monitor::data_mode::{DataHealth, DataMode};
+    use stock_analysis::performance::economic_position::{
+        CostBasisKind, NetMetrics, NetOutcomeClass,
+    };
+    use stock_analysis::risk::action_gate::AccountMode;
+
+    #[test]
+    fn br103_consecutive_losses_use_net_pnl_even_when_gross_is_positive() {
+        let gross_pnl = 4.0;
+        let net = NetMetrics::Available {
+            basis_id: "TEST_CODE_cost_basis".to_string(),
+            kind: CostBasisKind::Observed,
+            total_adverse_cost: 6.0,
+            net_pnl: -2.0,
+            return_on_buy_notional: -0.02,
+            outcome: NetOutcomeClass::Loss,
+        };
+        let pnl = account_mode_net_pnl(&net, 42).unwrap();
+        assert!(gross_pnl > 0.0);
+        assert_eq!(pnl, -2.0);
+
+        let closed_at = chrono::NaiveDate::from_ymd_opt(2026, 9, 29)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap();
+        assert_eq!(
+            count_consecutive_realized_losses(&[(closed_at, "economic-cycle-42".into(), pnl)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(count_consecutive_realized_losses(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn br103_unavailable_net_pnl_makes_banner_incomplete() {
+        let gross_pnl = 4.0;
+        let net = NetMetrics::Unavailable {
+            reason: format!("missing cost evidence\n{}", "证".repeat(100)),
+        };
+        let error = account_mode_net_pnl(&net, 42).unwrap_err();
+        assert!(gross_pnl > 0.0);
+        assert!(error.contains("cycle 42"), "{error}");
+        assert!(error.contains("missing cost evidence"), "{error}");
+        assert!(!error.contains('\n'), "{error}");
+        let prefix = "BR-103 economic cycle 42 net PnL unavailable: ";
+        assert!(error.len() <= prefix.len() + 160, "{error}");
+
+        let batch = AccountModeMetricsBatch::incomplete();
+        let banner = build_banner(
+            &batch,
+            AccountMode::ReduceOnly,
+            &DataHealth {
+                mode: DataMode::Full,
+                missing: Vec::new(),
+                prev_mode: None,
+                eta: None,
+            },
+        );
+        assert!(!banner.account_metrics_complete);
+        assert!(banner.account_fact.is_none());
+    }
 
     #[test]
     fn br108_consecutive_losses_use_latest_distinct_realized_sales() {
@@ -2774,6 +3350,7 @@ async fn evaluate_data_mode_hook() {
     };
 
     let health = dm_evaluate(&input, prev);
+    let data_at = chrono::Utc::now();
     let unsafe_action = match DATA_MODE_UNSAFE_REMINDER.lock() {
         Ok(state) => match state.action(health.mode, &health.missing, std::time::Instant::now()) {
             Ok(action) => action,
@@ -2825,7 +3402,7 @@ async fn evaluate_data_mode_hook() {
     let Some(banner) = banner else {
         return;
     };
-    if let Err(error) = store_banner(banner.clone()) {
+    if let Err(error) = store_banner(banner.clone(), health_cmd::EvaluationUpdate::Data(data_at)) {
         log::error!("[DataMode-hook] banner store failed: {error}");
         return;
     }
@@ -4407,6 +4984,155 @@ async fn quiesce_background_tasks(
         })?
 }
 
+// Own the timer until service supervision takes it. An ordinary startup return
+// aborts it before the monitor lease can be dropped.
+struct OperationalHeartbeatTask(Option<tokio::task::JoinHandle<()>>);
+
+impl OperationalHeartbeatTask {
+    fn take(&mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("resident heartbeat task was started")
+    }
+}
+
+impl Drop for OperationalHeartbeatTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+fn record_operational_heartbeat_result(result: Result<(), String>, consecutive_failures: &mut u64) {
+    match result {
+        Ok(()) => *consecutive_failures = 0,
+        Err(error) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures == 1 || *consecutive_failures % 10 == 0 {
+                log::error!(
+                    "[health][operational_heartbeat] write_failed consecutive_failures={} error={}",
+                    consecutive_failures,
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn operational_heartbeat_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn run_operational_heartbeat_scheduler<Now, Write>(
+    mut interval: tokio::time::Interval,
+    mut now: Now,
+    mut write: Write,
+    mut consecutive_failures: u64,
+) where
+    Now: FnMut() -> chrono::DateTime<chrono::Utc>,
+    Write: FnMut(chrono::DateTime<chrono::Utc>) -> Result<(), String>,
+{
+    loop {
+        interval.tick().await;
+        record_operational_heartbeat_result(write(now()), &mut consecutive_failures);
+    }
+}
+
+#[cfg(test)]
+mod operational_heartbeat_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(start_paused = true)]
+    async fn operational_heartbeat_advances_while_evaluation_waits_or_fails_and_write_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data/test/health/heartbeat.json");
+        let boot_id = "123:456:1";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::clone(&calls);
+        let write_path = path.clone();
+        let anchor = chrono::Utc::now();
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let tick_clock = Arc::clone(&clock_calls);
+        let interval = operational_heartbeat_interval(std::time::Duration::from_secs(60));
+        let task = tokio::spawn(run_operational_heartbeat_scheduler(
+            interval,
+            move || {
+                anchor
+                    + chrono::Duration::seconds(
+                        60 * (tick_clock.fetch_add(1, Ordering::SeqCst) as i64 + 1),
+                    )
+            },
+            move |now| {
+                let call = write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 2 {
+                    return Err("injected_write_failure".to_owned());
+                }
+                health_cmd::write_heartbeat_at(&write_path, boot_id, now)
+            },
+            0,
+        ));
+        let pending_evaluation = tokio::spawn(std::future::pending::<()>());
+        let failed_evaluation = tokio::spawn(async { Err::<(), _>("injected_evaluation_failure") });
+        assert_eq!(
+            failed_evaluation.await.unwrap(),
+            Err("injected_evaluation_failure")
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let first: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(first["boot_id"], boot_id);
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            first,
+            "failed replacement preserves the previous heartbeat"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let latest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(latest["boot_id"], boot_id);
+        assert!(latest["observed_at"].as_str().unwrap() > first["observed_at"].as_str().unwrap());
+        assert!(!pending_evaluation.is_finished());
+
+        pending_evaluation.abort();
+        task.abort();
+        task.await.unwrap_err();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operational_heartbeat_startup_guard_aborts_before_supervision() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let interval = operational_heartbeat_interval(std::time::Duration::from_secs(60));
+        let guard =
+            OperationalHeartbeatTask(Some(tokio::spawn(run_operational_heartbeat_scheduler(
+                interval,
+                chrono::Utc::now,
+                move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                0,
+            ))));
+        drop(guard);
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 async fn shutdown_jsonl_writer(
     bus: &stock_analysis::event::EventBus,
     handle: &mut Option<JsonlWriterTask>,
@@ -4756,8 +5482,27 @@ fn parse_br194_terminal_replay_command(
     }))
 }
 
+/// Monotonic timings for diagnosing startup cost. A stage result is an
+/// observation, never a checkpoint that permits skipping integrity work.
+fn log_startup_profile(
+    stage: &'static str,
+    stage_started: std::time::Instant,
+    process_started: std::time::Instant,
+    status: &'static str,
+) {
+    log::info!(
+        "[startup-profile] pid={} stage={} status={} elapsed_ms={} since_process_start_ms={}",
+        std::process::id(),
+        stage,
+        status,
+        stage_started.elapsed().as_millis(),
+        process_started.elapsed().as_millis()
+    );
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    let process_started = std::time::Instant::now();
     let process_stock_list = std::env::var("STOCK_LIST").ok();
     dotenvy::dotenv().ok();
 
@@ -4879,6 +5624,32 @@ async fn main() {
             Err(_) => log::error!("[health] snapshot owner lock poisoned"),
         }
     }
+    // The startup health check and webhook can await indefinitely. Start
+    // process liveness before either, but only for the leased resident entry.
+    let mut operational_heartbeat = if selection_cli.requires_service_enablement() {
+        let boot_id = _monitor_instance_lease
+            .as_ref()
+            .expect("resident monitor holds the singleton lease")
+            .boot_id
+            .clone();
+        let mut consecutive_failures = 0;
+        record_operational_heartbeat_result(
+            health_cmd::write_process_heartbeat(test_mode, &boot_id, chrono::Utc::now()),
+            &mut consecutive_failures,
+        );
+        let interval = operational_heartbeat_interval(health_cmd::HEARTBEAT_INTERVAL);
+        Some(OperationalHeartbeatTask(Some(tokio::spawn(
+            run_operational_heartbeat_scheduler(
+                interval,
+                chrono::Utc::now,
+                move |now| health_cmd::write_process_heartbeat(test_mode, &boot_id, now),
+                consecutive_failures,
+            ),
+        ))))
+    } else {
+        None
+    };
+
     // BR-241: reject an invalid P-01 compensation command after acquiring the
     // production singleton lease, but before audit/sink initialization or the
     // global durable startup barrier can resume an unrelated PushKind.
@@ -4966,32 +5737,66 @@ async fn main() {
     }
     // BR-144/145: prove the delivery audit chain is readable and writable
     // before warming any sink. A failed preflight blocks ordinary pushes.
+    let audit_preflight_started = std::time::Instant::now();
     let audit_preflight =
         tokio::task::spawn_blocking(stock_analysis::event::preflight_runtime_delivery_audit).await;
     match audit_preflight {
-        Ok(Ok(receipt)) => log::info!(
-            "[AuditDegraded][BR-144] delivery audit preflight healthy: year={} previous_hash={:?}",
-            receipt.year,
-            receipt.previous_hash
-        ),
+        Ok(Ok(receipt)) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "ok",
+            );
+            log::info!(
+                "[AuditDegraded][BR-144] delivery audit preflight healthy: year={} previous_hash={:?}",
+                receipt.year,
+                receipt.previous_hash
+            );
+        }
         Ok(Err(error)) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "failed",
+            );
             log::error!(
                 "[event_bus.jsonl] initialization failed [AuditDegraded][BR-144] delivery audit preflight: {error}"
             );
             std::process::exit(2);
         }
         Err(error) => {
+            log_startup_profile(
+                "delivery_audit_preflight",
+                audit_preflight_started,
+                process_started,
+                "worker_failed",
+            );
             log::error!("[AuditDegraded][BR-144] delivery audit preflight worker failed: {error}");
             std::process::exit(2);
         }
     }
+    let artifact_bind_started = std::time::Instant::now();
     if let Err(error) = durable_delivery_runtime::eager_bind_runtime_artifacts() {
+        log_startup_profile(
+            "durable_artifact_bind",
+            artifact_bind_started,
+            process_started,
+            "failed",
+        );
         log::error!(
             "[DurableDelivery][BR-192] eager artifact capability binding failed before sink initialization: {error}"
         );
         log::logger().flush();
         std::process::exit(2);
     }
+    log_startup_profile(
+        "durable_artifact_bind",
+        artifact_bind_started,
+        process_started,
+        "ok",
+    );
 
     // 修复 F20 (2026-06-29 codex review): 启动 banner 显示当前 LaunchStage
 
@@ -5064,6 +5869,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let jsonl_writer_started = std::time::Instant::now();
     let mut jsonl_writer_handle = Some(
         match stock_analysis::event::JsonlWriter::spawn(
             event_receiver,
@@ -5074,11 +5880,23 @@ async fn main() {
         {
             Ok(handle) => handle,
             Err(error) => {
+                log_startup_profile(
+                    "jsonl_writer_init",
+                    jsonl_writer_started,
+                    process_started,
+                    "failed",
+                );
                 log::error!("[event_bus.jsonl] initialization failed: {error}");
                 log::logger().flush();
                 std::process::exit(2);
             }
         },
+    );
+    log_startup_profile(
+        "jsonl_writer_init",
+        jsonl_writer_started,
+        process_started,
+        "ok",
     );
     log::info!(
         "[event_bus.jsonl] mode=enabled retention_days=1827 isolated_test={}",
@@ -5244,9 +6062,24 @@ async fn main() {
         }
     }
 
+    let core_database_started = std::time::Instant::now();
     let core_database_path = match install_mode_owned_core_database(test_mode) {
-        Ok(path) => path,
+        Ok(path) => {
+            log_startup_profile(
+                "core_database_bind",
+                core_database_started,
+                process_started,
+                "ok",
+            );
+            path
+        }
         Err(error) => {
+            log_startup_profile(
+                "core_database_bind",
+                core_database_started,
+                process_started,
+                "failed",
+            );
             log::error!("[DB init][BR-051][BR-183] {error}");
             exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
@@ -5262,8 +6095,15 @@ async fn main() {
     // exclusive single-kind command, so it deliberately skips this global
     // barrier and uses the P-01 stored-envelope reconcile seam instead.
     if p01_compensation.is_none() {
+        let reconcile_started = std::time::Instant::now();
         match durable_delivery_runtime::ensure_startup_reconciled().await {
             Ok(evidence) => {
+                log_startup_profile(
+                    "durable_reconcile",
+                    reconcile_started,
+                    process_started,
+                    "ok",
+                );
                 log::info!(
                     "[DurableDelivery][BR-192] startup fixed point reached progress={} resumed_sink_calls={} foreign_lease_boundaries={} manual_review_boundaries={} schedule_hydrations={}",
                     evidence.progress_count,
@@ -5286,6 +6126,12 @@ async fn main() {
                 }
             }
             Err(error) => {
+                log_startup_profile(
+                    "durable_reconcile",
+                    reconcile_started,
+                    process_started,
+                    "failed",
+                );
                 log::error!("[DurableDelivery][BR-192] producer activation blocked: {error}");
                 exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
             }
@@ -5391,9 +6237,21 @@ async fn main() {
 
     stock_analysis::strategy::v16_4::register_all();
 
+    let health_check_started = std::time::Instant::now();
     let startup_health = health::health_check().await;
+    log_startup_profile(
+        "startup_health_check",
+        health_check_started,
+        process_started,
+        if startup_health.all_ok() {
+            "ok"
+        } else {
+            "degraded"
+        },
+    );
     if !startup_health.all_ok() {
         log::error!("[health] 启动健康检查失败: {:?}", startup_health);
+        let health_alert_started = std::time::Instant::now();
         match webhook_alert::on_health_fail(&startup_health).await {
             Ok(webhook_alert::WebhookDelivery::Delivered) => {
                 log::info!("[health] 失败告警已投递")
@@ -5406,6 +6264,12 @@ async fn main() {
             }
             Err(error) => log::error!("[health] 失败告警投递失败: {}", error),
         }
+        log_startup_profile(
+            "startup_health_alert",
+            health_alert_started,
+            process_started,
+            "completed",
+        );
     }
 
     // BR-164: 盘中/盘后共用同一完整批次路由，不保留消费端旧源或第二套协议。
@@ -5836,6 +6700,13 @@ async fn main() {
         let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
         let background_tasks = vec![
+            (
+                "operational_heartbeat",
+                operational_heartbeat
+                    .as_mut()
+                    .expect("resident heartbeat task was started")
+                    .take(),
+            ),
             ("dryrun_reporter", dryrun_reporter),
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),
@@ -7024,7 +7895,7 @@ async fn e2e_all_templates_run(
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     };
-    store_banner(banner_e2e.clone())
+    store_banner(banner_e2e.clone(), health_cmd::EvaluationUpdate::Synthetic)
         .map_err(|error| format!("BR-196 TEST_CODE governance banner commit failed: {error}"))?;
     let smoke_context = br196_test_delivery::GovernanceSmokeContext::for_review_date(review_date)?;
     let mut smoke = push_e2e_14x_templates(&today_str, &hhmm, &smoke_context).await?;
@@ -7900,6 +8771,62 @@ fn announcement_alert_action(
     }
 }
 
+async fn initialize_news_monitor<T, F>(initialize: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(initialize)
+        .await
+        .expect("NewsMonitor initialization worker panicked")
+}
+
+#[cfg(test)]
+mod news_monitor_startup_tests {
+    use super::initialize_news_monitor;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_news_startup_steps_do_not_delay_data_mode_tick() {
+        for blocked_step in 0..4 {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
+
+            let main_loops = tokio::spawn(async move {
+                tokio::join!(
+                    initialize_news_monitor(move || {
+                        let mut entered_tx = Some(entered_tx);
+                        // Model audience read, metadata, news dedup, and signal state.
+                        for step in 0..4 {
+                            if step == blocked_step {
+                                let _ = entered_tx.take().unwrap().send(());
+                                release_rx.recv().expect("release blocked startup step");
+                            }
+                        }
+                    }),
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        let _ = tick_tx.send(());
+                    }
+                );
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+                .await
+                .expect("news startup step must start")
+                .expect("news startup step signal");
+            let tick = tokio::time::timeout(std::time::Duration::from_secs(1), tick_rx).await;
+            release_tx.send(()).expect("release news startup step");
+            tick.expect("data mode tick must run while news startup waits")
+                .expect("data mode tick signal");
+            tokio::time::timeout(std::time::Duration::from_secs(1), main_loops)
+                .await
+                .expect("main loops must finish")
+                .expect("main loops task must succeed");
+        }
+    }
+}
+
 async fn news_monitor_loop(selection_v2_enabled: bool) {
     use stock_analysis::monitor::detector::AlertEvent;
 
@@ -7913,49 +8840,53 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
-    // BR-226: 启动时声明持仓受众证据状态 (用户确认快照 vs 券商批次)
-    match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
-        Ok(Some(snapshot)) => {
-            let age_hours = chrono::Local::now()
-                .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
-                .num_hours();
-            if age_hours <= 24 {
-                log::info!(
-                    "[NewsMonitor][BR-226] 持仓受众证据: 用户确认快照 ({} 只, effective_at {}, {}h 内)",
-                    snapshot.items.len(),
-                    snapshot.effective_at,
-                    age_hours
-                );
-            } else {
-                log::warn!(
-                    "[NewsMonitor][BR-226] 持仓受众证据过期: 快照 effective_at {} 已 {age_hours}h; 持仓身份排除, 自选受众继续",
-                    snapshot.effective_at
-                );
+    // Startup reads metadata and SQLite, including dedup and signal restoration.
+    // Keep the ordered blocking work off the joined DataMode timer task.
+    let (mut nm, mut sm, news_ai_producer) = initialize_news_monitor(move || {
+        // BR-226: 启动时声明持仓受众证据状态 (用户确认快照 vs 券商批次)
+        match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+            Ok(Some(snapshot)) => {
+                let age_hours = chrono::Local::now()
+                    .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                    .num_hours();
+                if age_hours <= 24 {
+                    log::info!(
+                        "[NewsMonitor][BR-226] 持仓受众证据: 用户确认快照 ({} 只, effective_at {}, {}h 内)",
+                        snapshot.items.len(),
+                        snapshot.effective_at,
+                        age_hours
+                    );
+                } else {
+                    log::warn!(
+                        "[NewsMonitor][BR-226] 持仓受众证据过期: 快照 effective_at {} 已 {age_hours}h; 持仓身份排除, 自选受众继续",
+                        snapshot.effective_at
+                    );
+                }
             }
+            Ok(None) => log::warn!(
+                "[NewsMonitor][BR-226] 持仓受众证据缺失: 未提供用户持仓快照; 持仓身份排除, 自选受众继续"
+            ),
+            Err(error) => log::warn!(
+                "[NewsMonitor][BR-226] 持仓受众证据读取失败: {error}; 持仓身份排除, 自选受众继续"
+            ),
         }
-        Ok(None) => log::warn!(
-            "[NewsMonitor][BR-226] 持仓受众证据缺失: 未提供用户持仓快照; 持仓身份排除, 自选受众继续"
-        ),
-        Err(error) => log::warn!(
-            "[NewsMonitor][BR-226] 持仓受众证据读取失败: {error}; 持仓身份排除, 自选受众继续"
-        ),
-    }
 
-    let mut nm = NewsMonitor::new();
+        let mut nm = NewsMonitor::new();
+        nm.restore_dedup();
 
-    nm.restore_dedup();
+        let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
+        news_ai_producer.log_startup_banner();
+        news_ai_producer.schedule_tick(
+            selection_v2_enabled,
+            stock_analysis::calendar::current_session(),
+            None,
+        );
 
-    let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
-    news_ai_producer.log_startup_banner();
-    news_ai_producer.schedule_tick(
-        selection_v2_enabled,
-        stock_analysis::calendar::current_session(),
-        None,
-    );
-
-    let mut sm = SignalStateMachine::default();
-
-    sm.restore_state();
+        let mut sm = SignalStateMachine::default();
+        sm.restore_state();
+        (nm, sm, news_ai_producer)
+    })
+    .await;
 
     let mut last_concept_refresh = std::time::Instant::now();
 
@@ -7977,36 +8908,46 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     // BR-244: one process-local owner preserves event/window dedup across all
     // news ticks. It carries no selection-ingress capability.
-    let mut news_flash_gate =
+    let news_flash_gate =
         crate::news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
-    log::warn!(
-        "{}",
-        crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
-    );
-    push_templates::log_dispatcher_attempt(
-        "N-01",
-        false,
-        0,
-        "disabled=no_authoritative_strength_provider",
-    );
-    let news_flash_startup_date = chrono::Local::now().date_naive();
-    match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
-        Ok(snapshot) => {
-            if let Err(error) = news_flash_gate.recover(&snapshot) {
+    // Retain the four raw-feed breaker slots across every resident news tick.
+    // Source recovery here does not claim coverage of other gateway callers.
+    let raw_news_sources =
+        stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
+    let mut news_flash_gate = initialize_news_monitor(move || {
+        let mut news_flash_gate = news_flash_gate;
+        log::warn!(
+            "{}",
+            crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
+        );
+        push_templates::log_dispatcher_attempt(
+            "N-01",
+            false,
+            0,
+            "disabled=no_authoritative_strength_provider",
+        );
+        let news_flash_startup_date = chrono::Local::now().date_naive();
+        match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
+            Ok(snapshot) => {
+                if let Err(error) = news_flash_gate.recover(&snapshot) {
+                    log::error!(
+                        "[GlobalNews][BR-244] startup NewsFlash authority recovery failed: {error:?}"
+                    );
+                }
+            }
+            Err(error) => {
                 log::error!(
-                    "[GlobalNews][BR-244] startup NewsFlash authority recovery failed: {error:?}"
+                    "[GlobalNews][BR-244] startup NewsFlash authority unavailable; sink disabled until recovery: {error}"
                 );
             }
         }
-        Err(error) => {
-            log::error!(
-                "[GlobalNews][BR-244] startup NewsFlash authority unavailable; sink disabled until recovery: {error}"
-            );
-        }
-    }
+        news_flash_gate
+    })
+    .await;
 
     loop {
         if !NewsMonitor::should_run() {
+            publish_raw_news_source_recovery(&raw_news_sources);
             news_ai_producer.schedule_tick(
                 selection_v2_enabled,
                 stock_analysis::calendar::current_session(),
@@ -8044,8 +8985,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             let mut raw_batch = None;
             let mut failure_audit_ready = authority_preflight.is_some();
             if authority_preflight.is_some() {
-                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(20)
-                    .await
+                match stock_analysis::news::aggregator::raw_v2::fetch_raw_global_news_batch(
+                    &raw_news_sources,
+                    20,
+                )
+                .await
                 {
                     Ok(batch) => {
                         let projection =
@@ -8089,6 +9033,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     }
                 }
             }
+            publish_raw_news_source_recovery(&raw_news_sources);
 
             let monitor_config = stock_analysis::config::get_monitor_config();
             // BR-244: projection and every immutable failure audit complete
@@ -9295,6 +10240,45 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     ),
                 }
             }
+            // Compare policies after the legacy send and missed-window paths.
+            let postclose_shadow_at =
+                chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+            let postclose_shadow_now = postclose_shadow_at.naive_local();
+            if postclose_shadow_now.time() >= chrono::NaiveTime::from_hms_opt(15, 29, 0).unwrap()
+                && postclose_shadow_now.time() < chrono::NaiveTime::from_hms_opt(15, 36, 0).unwrap()
+            {
+                match observe_chain_post_close_shadow(
+                    &ChainScheduleStore::production(),
+                    postclose_shadow_at.clone(),
+                    calendar::is_trading_day(postclose_shadow_now.date()),
+                ) {
+                    Ok(shadow) => log::info!(
+                        "[chain-postclose-shadow] date={} observed_at={} old_occurrence={} new_occurrence={:?} old_status={:?} new_status={} new_reason={} old_window_open={} new_window_open={} old_due={} new_due={} old_miss_due={} new_miss_due={} old_miss_recorded={} old_closed={} new_closed={} diff={} foundation_persisted=false",
+                        shadow.calendar_date,
+                        shadow.observed_at,
+                        shadow.legacy_occurrence_key,
+                        shadow.foundation_occurrence_id,
+                        shadow.legacy_status,
+                        shadow.foundation_status,
+                        shadow.foundation_reason,
+                        shadow.legacy_window_open,
+                        shadow.foundation_window_open,
+                        shadow.legacy_due,
+                        shadow.foundation_due,
+                        shadow.legacy_miss_due,
+                        shadow.foundation_miss_due,
+                        shadow.legacy_miss_recorded,
+                        shadow.legacy_closed,
+                        shadow.foundation_closed,
+                        shadow.has_decision_diff(),
+                    ),
+                    Err(error) => log::warn!(
+                        "[chain-postclose-shadow] read-only comparison unavailable date={} observed_at={}: {error:#}",
+                        postclose_shadow_now.date(),
+                        postclose_shadow_at,
+                    ),
+                }
+            }
             // Fix 4 (review): PerformanceEngine 15:05 cron 接入 (写 paper_performance_snapshot)
             // 用 OnceLock<NaiveDate> 防当日重复, 失败可重试
             // v17.4 §5.2 (BR-083): 13:00 午盘虚拟仓快照 (AC38) — 当日一次, 13:00-13:05 首个 tick 触发
@@ -9358,8 +10342,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 与 PerformanceEngine 同点运行, 当日一次, 失败出声。
             // 重试窗口 15:05-15:20: 失败后每个 tick 重试直到成功 (2026-08-22 实测
             // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
-            // 计算成功 (Ok(text)) 即记 ATTRIBUTION_LAST_RUN — 推送结果不门控
-            // (推送失败由 durable 决策补偿, 见 Ok 臂注释); 计算失败窗口内持续重试。
+            // 计算前只读检查当日 durable claim，避免重启后重算已投递或状态不明的报告。
+            // 首次无 claim 时，先冻结不可逆 DB 准备边界，再冻结精确摘要和报告 revision。
+            // 仅冻结成功且再次确认无 claim 时，才可重试通知准备失败。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::performance::attribution::{
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
@@ -9374,8 +10359,53 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     .unwrap_or_else(|e| e.into_inner())
                     .map(|d| d == today)
                     .unwrap_or(false);
-                if !already_run {
-                    match (|| -> Result<String, AttributionEpochRuntimeError> {
+                let should_prepare = if already_run {
+                    false
+                } else {
+                    let occurrence_identity = format!("attribution-daily:{today}");
+                    match classify_attribution_daily_preflight(
+                        crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                            today,
+                            stock_analysis::durable_delivery::PushKind::AttributionDaily,
+                            stock_analysis::durable_delivery::DeliverySubKind::None,
+                            "GLOBAL",
+                            &occurrence_identity,
+                        )
+                        .await,
+                    ) {
+                        AttributionDailyPreflight::Prepare => true,
+                        AttributionDailyPreflight::ExistingClaim {
+                            decision_identity,
+                            state,
+                        } => {
+                            log::info!(
+                                "[attribution] 当日 durable claim 已存在，跳过重算/重复准备: decision={decision_identity} state={state:?}"
+                            );
+                            *ATTRIBUTION_LAST_RUN
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                            false
+                        }
+                        AttributionDailyPreflight::Unavailable(error) => {
+                            log::error!(
+                                "[attribution] durable claim 只读检查失败，跳过本 tick: {error}"
+                            );
+                            false
+                        }
+                    }
+                };
+                if should_prepare {
+                    use crate::attribution_daily_intent::{
+                        AttributionDailyIntentStore, FreezeError, PreparedAttributionDaily,
+                    };
+                    let store = AttributionDailyIntentStore::new(std::path::Path::new(
+                        "data/attribution",
+                    ));
+                    type AttributionPreparation = Result<
+                        PreparedAttributionDaily,
+                        FreezeError<AttributionEpochRuntimeError>,
+                    >;
+                    match store.load_or_freeze(today, |store| -> AttributionPreparation {
                         let database = stock_analysis::database::DatabaseManager::get();
                         if std::env::var_os(
                             stock_analysis::trading::paper_ledger_runtime::BINDING_ENV,
@@ -9390,64 +10420,121 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 };
                             let binding =
                                 stock_analysis::trading::paper_ledger_runtime::active_binding()
-                                    .map_err(map_effective)?;
-                            let (prepared,_receipt)=stock_analysis::performance::attribution_replay::commit_effective_window(database,binding,today,30,chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap())).map_err(|error| {
+                                    .map_err(map_effective)
+                                    .map_err(FreezeError::Prepare)?;
+                            store
+                                .reserve_before_commit(today)
+                                .map_err(FreezeError::Storage)?;
+                            let invoked_at = chrono::Utc::now().with_timezone(
+                                &chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
+                            );
+                            let (prepared, _receipt) = stock_analysis::performance::attribution_replay::commit_effective_window(
+                                database,
+                                binding,
+                                today,
+                                30,
+                                invoked_at,
+                            )
+                            .map_err(|error| {
                                 use stock_analysis::performance::attribution_replay::ReplayErrorClass;
                                 match error.class() {
-                                    ReplayErrorClass::FailedIntegrity=>AttributionEpochRuntimeError::FailedIntegrity{reason_code:error.code(),detail:error.to_string()},
-                                    ReplayErrorClass::Unavailable|ReplayErrorClass::Storage=>AttributionEpochRuntimeError::Unavailable{reason_code:error.code(),retryable:error.retryable(),detail:error.to_string()},
+                                    ReplayErrorClass::FailedIntegrity => {
+                                        AttributionEpochRuntimeError::FailedIntegrity {
+                                            reason_code: error.code(),
+                                            detail: error.to_string(),
+                                        }
+                                    }
+                                    ReplayErrorClass::Unavailable | ReplayErrorClass::Storage => {
+                                        AttributionEpochRuntimeError::Unavailable {
+                                            reason_code: error.code(),
+                                            retryable: error.retryable(),
+                                            detail: error.to_string(),
+                                        }
+                                    }
                                 }
-                            })?;
-                            let md = prepared.report().render_markdown().map_err(map_effective)?;
+                            })
+                            .map_err(FreezeError::Prepare)?;
+                            let md = prepared
+                                .report()
+                                .render_markdown()
+                                .map_err(map_effective)
+                                .map_err(FreezeError::Prepare)?;
+                            let report_revision_path =
+                                stock_analysis::performance::report::persist_report_revision(
+                                    std::path::Path::new("data/attribution"),
+                                    today,
+                                    md.as_bytes(),
+                                )
+                            .map_err(map_effective)
+                            .map_err(FreezeError::Prepare)?;
+                            return Ok(PreparedAttributionDaily {
+                                summary: prepared.report().render_summary(),
+                                report_revision_path,
+                            });
+                        }
+                        // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
+                        // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
+                        // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
+                        // bar 缺失返回 Err → 在尚无不可逆写入时允许窗口内重试。
+                        let prices = market_data::fetch_attribution_close_prices(today)
+                            .map_err(|detail| AttributionEpochRuntimeError::Unavailable {
+                                reason_code: "attribution_market_prices_unavailable",
+                                retryable: true,
+                                detail,
+                            })
+                            .map_err(FreezeError::Prepare)?;
+                        let daily = compute_epoch_daily(database, today, &prices)
+                            .map_err(FreezeError::Prepare)?;
+                        let window = compute_epoch_window(database, today, 30, &prices)
+                            .map_err(FreezeError::Prepare)?;
+                        store
+                            .reserve_before_commit(today)
+                            .map_err(FreezeError::Storage)?;
+                        persist_epoch_daily(database, &daily).map_err(FreezeError::Prepare)?;
+                        let md = render_full_markdown(daily.daily(), window.window());
+                        let report_revision_path =
                             stock_analysis::performance::report::persist_report_revision(
                                 std::path::Path::new("data/attribution"),
                                 today,
                                 md.as_bytes(),
                             )
-                            .map_err(map_effective)?;
-                            return Ok(prepared.report().render_summary());
-                        }
-                        // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
-                        // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
-                        // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
-                        // bar 缺失返回 Err → Unavailable retryable, 15:05-15:20
-                        // 窗口内每 tick 重试 (成功才记 ATTRIBUTION_LAST_RUN)。
-                        let prices = market_data::fetch_attribution_close_prices(today).map_err(
-                            |detail| AttributionEpochRuntimeError::Unavailable {
-                                reason_code: "attribution_market_prices_unavailable",
-                                retryable: true,
-                                detail,
-                            },
-                        )?;
-                        let daily = compute_epoch_daily(database, today, &prices)?;
-                        let window = compute_epoch_window(database, today, 30, &prices)?;
-                        persist_epoch_daily(database, &daily)?;
-                        let md = render_full_markdown(daily.daily(), window.window());
-                        stock_analysis::performance::report::persist_report_revision(
-                            std::path::Path::new("data/attribution"),
-                            today,
-                            md.as_bytes(),
-                        )
                         .map_err(|error| {
                             AttributionEpochRuntimeError::Unavailable {
                                 reason_code: "attribution_report_storage_unavailable",
                                 retryable: true,
                                 detail: format!("write attribution md: {error}"),
                             }
-                        })?;
-                        Ok(render_summary(daily.daily(), window.window()))
-                    })() {
-                        Ok(text) => {
-                            // 2026-09-20: A-12 升级 counted 持久投递 (MU-attribution-daily 接线)。
-                            // 业务计算 (compute_epoch_daily/persist/md 落盘) 与 LAST_RUN 语义
-                            // 均不变; 仅投递层增加 durable 决策 owner — sink 失败落盘
-                            // RejectedDurable(retry)/Uncertain, 下次启动对账重发
-                            // Reserved/Rejected-retry (可跨日补发原 15:05 文本);
-                            // Uncertain 需人工裁定; binding/token 准备失败无 durable 行
-                            // 与原路径等价。原路径推送失败即永久丢, 新路径可补偿。
+                        })
+                        .map_err(FreezeError::Prepare)?;
+                        Ok(PreparedAttributionDaily {
+                            summary: render_summary(daily.daily(), window.window()),
+                            report_revision_path,
+                        })
+                    }) {
+                        Ok(frozen) => {
+                            let text = frozen.summary();
+                            log::info!(
+                                "[attribution] 使用冻结报告准备: revision={} summary_bytes={}",
+                                frozen.report_revision_file(),
+                                text.len(),
+                            );
+                            let attempt_ordinal = match store.reserve_dispatch_attempt(today, &frozen) {
+                                Ok(ordinal) => Some(ordinal),
+                                Err(error) => {
+                                    log::error!("[attribution] 持久发送尝试记录失败，封日待核对: {error}");
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
+                                    None
+                                }
+                            };
+                            if let Some(attempt_ordinal) = attempt_ordinal {
+                            // 继续使用原 counted 物理投递 owner。sink 失败由 durable
+                            // claim 对账；Unknown 留待人工裁定。无 claim 的前置失败仅
+                            // 复用本次冻结的摘要，绝不重新计算行情或改写报告 revision。
                             let outcome =
                                 match push_templates::build_attribution_daily_counted_binding(
-                                    today, &text,
+                                    today, text,
                                 )
                                 .and_then(|binding| {
                                     crate::presentation_registry::acquire_token(
@@ -9460,7 +10547,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 }) {
                                     Ok((token, binding)) => {
                                         crate::notify::push_counted_with_binding(
-                                            token, &text, None, binding,
+                                            token, text, None, binding,
                                         )
                                         .await
                                     }
@@ -9470,57 +10557,243 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                 };
                             log::info!("[attribution] 15:05 归因推送完成: {:?}", outcome);
-                            *ATTRIBUTION_LAST_RUN
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                            let occurrence_identity = format!("attribution-daily:{today}");
+                            let postflight = classify_attribution_daily_preflight(
+                                crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                                    today,
+                                    stock_analysis::durable_delivery::PushKind::AttributionDaily,
+                                    stock_analysis::durable_delivery::DeliverySubKind::None,
+                                    "GLOBAL",
+                                    &occurrence_identity,
+                                )
+                                .await,
+                            );
+                            let may_retry =
+                                attribution_daily_may_retry_frozen(&outcome, &postflight);
+                            match postflight {
+                                AttributionDailyPreflight::Prepare if may_retry => {
+                                    // prepare() persists the exact claim before any sink call.
+                                    // No claim after this failure proves there was no physical
+                                    // attempt; persist authorization before another tick may
+                                    // reuse the frozen summary, including after a restart.
+                                    match store.authorize_no_claim_retry(
+                                        today,
+                                        &frozen,
+                                        attempt_ordinal,
+                                    ) {
+                                        Ok(()) => log::warn!(
+                                            "[attribution] 无 durable claim/物理尝试，已持久授权下个 tick 复用冻结摘要"
+                                        ),
+                                        Err(error) => {
+                                            log::error!(
+                                                "[attribution] 无 claim 重试授权落盘失败，封日待核对: {error}"
+                                            );
+                                            *ATTRIBUTION_LAST_RUN
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
+                                        }
+                                    }
+                                }
+                                AttributionDailyPreflight::Prepare => {
+                                    log::error!(
+                                        "[attribution] 推送结果与缺失 durable claim 不一致，封日待核对"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                                AttributionDailyPreflight::ExistingClaim {
+                                    decision_identity,
+                                    state,
+                                } => {
+                                    log::info!(
+                                        "[attribution] durable claim 已接管后续处理: decision={decision_identity} state={state:?}"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                                AttributionDailyPreflight::Unavailable(error) => {
+                                    log::error!(
+                                        "[attribution] 推送后 claim 检查失败，封日待核对: {error}"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                            }
+                            }
                         }
-                        Err(AttributionEpochRuntimeError::Unavailable {
+                        Err(FreezeError::Prepare(AttributionEpochRuntimeError::Unavailable {
                             reason_code,
                             retryable,
                             detail,
-                        }) => {
+                        })) => {
                             log::warn!(
-                                "[attribution] 15:05 归因 unavailable code={reason_code} retryable={retryable} (允许 30s 后重试): {detail}"
+                                "[attribution] 15:05 归因 unavailable code={reason_code} retryable={retryable} (仅未进入持久准备边界可重试): {detail}"
                             );
                         }
-                        Err(AttributionEpochRuntimeError::FailedIntegrity {
+                        Err(FreezeError::Prepare(AttributionEpochRuntimeError::FailedIntegrity {
                             reason_code,
                             detail,
-                        }) => {
+                        })) => {
                             log::error!(
-                                "[attribution] 15:05 归因 failed_integrity code={reason_code} (允许 30s 后重试): {detail}"
+                                "[attribution] 15:05 归因 failed_integrity code={reason_code} (后续由持久准备标记决定是否可重试): {detail}"
                             );
+                        }
+                        Err(FreezeError::Storage(error)) => {
+                            log::error!("[attribution] 冻结报告准备失败，封日待核对: {error}");
+                            *ATTRIBUTION_LAST_RUN
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
                         }
                     }
                 }
             }
+            // G5b 只在阻塞线程扫描已有 journal。扫描未完成或失败时，
+            // 当前 tick 继续运行其他 monitor 工作，但不建立新 LLM attempt。
+            static G5B_ARCHIVE_RECOVERY: std::sync::Mutex<G5bArchiveRecoveryState> =
+                std::sync::Mutex::new(G5bArchiveRecoveryState::new());
+            let recovery_now = now.naive_local();
+            let finished_recovery = {
+                let mut state = G5B_ARCHIVE_RECOVERY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.task.as_ref().is_some_and(|task| task.is_finished()) {
+                    state.task.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(task) = finished_recovery {
+                match task.await {
+                    Ok(Ok(G5bRecoveryTaskOutput::Discovered(dates))) => {
+                        let count = dates.len();
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .discovered_dates(dates);
+                        log::info!("[g5b] 已发现 {count} 个历史归档日期; 每批最多恢复 {G5B_RECOVERY_BATCH_DATES} 日");
+                    }
+                    Ok(Ok(G5bRecoveryTaskOutput::Recovered(report))) => {
+                        let mut state = G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.finish_batch(&report, recovery_now);
+                        let remaining = state.remaining_dates.len();
+                        if report.failures.is_empty() {
+                            log::info!(
+                                "[g5b] 已有结果归档批次: 新增 {}, 已存在 {}, attempt-only {}, 待处理日期 {} (不自动 counted)",
+                                report.appended,
+                                report.already_present,
+                                report.completion_unproven,
+                                remaining
+                            );
+                        } else {
+                            let examples = report
+                                .failures
+                                .iter()
+                                .take(3)
+                                .map(|(date, error)| format!("{date}: {error}"))
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            log::error!(
+                                "[g5b] 已有结果归档部分失败: 新增 {}, 失败日期 {} (五分钟后仅重试失败日期; 不自动 counted): {}",
+                                report.appended,
+                                report.failures.len(),
+                                examples
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .fail(recovery_now);
+                        log::error!("[g5b] 已有结果归档扫描失败, 五分钟后重试; 不开始新 LLM attempt: {error}");
+                    }
+                    Err(error) => {
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .fail(recovery_now);
+                        log::error!("[g5b] 已有结果归档线程失败, 五分钟后重试; 不开始新 LLM attempt: {error}");
+                    }
+                }
+            }
+            let recovery_ready = {
+                let mut state = G5B_ARCHIVE_RECOVERY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.retry_due(recovery_now) {
+                    state.last_attempt = Some(recovery_now);
+                    state.pending = false;
+                    state.task = Some(if state.discovered {
+                        let dates = state.take_batch();
+                        tokio::task::spawn_blocking(move || {
+                            stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production()
+                                .recover_frozen_archives_for_dates(dates)
+                                .map(G5bRecoveryTaskOutput::Recovered)
+                        })
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production()
+                                .existing_recovery_dates(recovery_now)
+                                .map(G5bRecoveryTaskOutput::Discovered)
+                        })
+                    });
+                }
+                state.fresh_allowed()
+            };
             // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
-            // 窗口同 15:05-15:20; 当日一次 (G5B_LAST_RUN 成功路径才记, 失败下 tick 重试);
-            // 无告警 / 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
-            if now.hour() == 15 && (5..=20).contains(&now.minute()) {
+            // 窗口同 15:05-15:20; 空输入保留窗口内重查资格。选集与每次 LLM
+            // attempt 先持久化, 重启后不会重选或重算已开始的非确定分析。
+            // 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
+            if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
-                    append_deep_attribution_row, render_deep_attribution_summary,
-                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionRequest,
-                    DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
+                    render_deep_attribution_summary, top_events_for_deep, DeepAttributionAnalyzer,
+                    DeepAttributionArchiveOutcome, DeepAttributionClaim, DeepAttributionJournal,
+                    DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
-                let g5b_done = G5B_LAST_RUN
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map(|d| d == today)
-                    .unwrap_or(false);
-                if !g5b_done {
-                    let records = read_today_records();
-                    if records.is_empty() {
-                        log::info!("[g5b] 深链归因: 今日无告警记录, 跳过 (当日仅此一次)");
-                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                let g5b_last_run = *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+                if g5b_last_run != Some(today) {
+                    let candidates =
+                        top_events_for_deep(read_today_records(), DEEP_ATTRIBUTION_MAX_EVENTS);
+                    let provider = if candidates.is_empty() {
+                        None
                     } else {
-                        let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
-                        let Some(provider) = LlmRegistry::from_env().select("g5b") else {
+                        LlmRegistry::from_env().select("g5b")
+                    };
+                    if !candidates.is_empty() && provider.is_none() {
+                        // 尚未开始分析时不冻结选集，provider 恢复后仍可纳入新告警。
+                        g5b_no_provider_backoff().await;
+                        continue;
+                    }
+                    let journal = DeepAttributionJournal::production();
+                    let mut selection_failed = false;
+                    let events =
+                        journal
+                            .load_or_select(today, candidates)
+                            .unwrap_or_else(|error| {
+                                log::error!(
+                                    "[g5b] 深链归因选集不可用, 本 tick fail closed: {error}"
+                                );
+                                selection_failed = true;
+                                Vec::new()
+                            });
+                    if !selection_failed
+                        && !g5b_should_analyze(now.naive_local(), g5b_last_run, events.len())
+                    {
+                        log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
+                    } else if !selection_failed {
+                        let Some(provider) =
+                            provider.or_else(|| LlmRegistry::from_env().select("g5b"))
+                        else {
                             // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
                             // 以便用户补配 provider 后窗口内自愈。退避消耗一个 tick:
                             // 裸 continue 会绕过循环尾部的 sleep, 造成无退避空转。
@@ -9530,7 +10803,60 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let analyzer = DeepAttributionAnalyzer::new(provider);
                         let mut done = 0usize;
                         let mut failed = 0usize;
-                        for record in events {
+                        let mut journal_failed = false;
+                        for (index, record) in events.into_iter().enumerate() {
+                            match journal.begin_assessment(today, index) {
+                                Ok(DeepAttributionClaim::Fresh) => {}
+                                Ok(DeepAttributionClaim::CompletionUnproven) => {
+                                    log::warn!(
+                                        "[g5b] 已有 attempt 但 LLM 完成状态无持久证据, 不重算或重发: {} {}",
+                                        record.code,
+                                        record.triggered_at
+                                    );
+                                    continue;
+                                }
+                                Ok(DeepAttributionClaim::Frozen(frozen)) => {
+                                    match journal.archive_frozen_result(today, index) {
+                                        Ok(DeepAttributionArchiveOutcome::Appended) => log::warn!(
+                                            "[g5b] 已冻结结果的缺失归档已恢复; counted/物理状态未知, 不自动投递: {} {} row_sha256={} summary_sha256={}",
+                                            record.code,
+                                            record.triggered_at,
+                                            frozen.row_sha256(),
+                                            frozen.summary_sha256()
+                                        ),
+                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => log::info!(
+                                            "[g5b] 已冻结结果归档完整; counted/物理状态未知, 不自动投递: {} {} row_sha256={}",
+                                            record.code,
+                                            record.triggered_at,
+                                            frozen.row_sha256()
+                                        ),
+                                        Err(error) => {
+                                            log::error!(
+                                                "[g5b] 已冻结结果归档无法确定, 不自动投递: {} {}: {error}",
+                                                record.code,
+                                                record.triggered_at
+                                            );
+                                            G5B_ARCHIVE_RECOVERY
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .retry_date(today, recovery_now);
+                                            journal_failed = true;
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    log::error!(
+                                        "[g5b] 分析前 attempt 标记失败, 本事件 fail closed: {} {}: {error}",
+                                        record.code,
+                                        record.triggered_at
+                                    );
+                                    journal_failed = true;
+                                    failed += 1;
+                                    continue;
+                                }
+                            }
                             let request = DeepAttributionRequest {
                                 record,
                                 as_of: chrono::Utc::now(),
@@ -9553,10 +10879,34 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             .map(str::to_owned),
                                         elapsed_ms: outcome.elapsed_ms,
                                     };
-                                    if let Err(e) = append_deep_attribution_row(&row) {
-                                        log::warn!("[g5b] 深链归因落库失败: {e}");
-                                        failed += 1;
-                                        continue;
+                                    let summary = render_deep_attribution_summary(&row);
+                                    let frozen = match journal
+                                        .freeze_result(today, index, &row, &summary)
+                                    {
+                                        Ok(frozen) => frozen,
+                                        Err(error) => {
+                                            log::error!("[g5b] LLM 完成但结果冻结失败, 禁止归档和投递: {} {}: {error}", row.record.code, row.record.triggered_at);
+                                            failed += 1;
+                                            continue;
+                                        }
+                                    };
+                                    match journal.archive_frozen_result(today, index) {
+                                        Ok(DeepAttributionArchiveOutcome::Appended) => {}
+                                        Ok(DeepAttributionArchiveOutcome::AlreadyPresent) => {
+                                            log::warn!("[g5b] 深链归因同事件已归档, counted/物理状态未知, 禁止自动投递: {} {}", row.record.code, row.record.triggered_at);
+                                            failed += 1;
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            log::warn!("[g5b] 深链归因归档失败, attempt 已记录且禁止自动重算, 需人工核对: {error}");
+                                            G5B_ARCHIVE_RECOVERY
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .retry_date(today, recovery_now);
+                                            journal_failed = true;
+                                            failed += 1;
+                                            break;
+                                        }
                                     }
                                     log::info!(
                                         "[g5b] 深链归因完成 {}/{}: {} {} ({}ms)",
@@ -9566,14 +10916,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         row.record.name,
                                         row.elapsed_ms
                                     );
-                                    let summary = render_deep_attribution_summary(&row);
                                     // 2026-09-20: G5b 升级 counted 持久投递 (MU-g5b-attribution)。
-                                    // binding 在分析后构造 (LLM 结果非确定, 重试分析=新事件);
-                                    // 推送失败决策落盘, 启动对账补发原文本。
+                                    // 冻结结果已持久化; counted handoff 只消费其原摘要字节。
                                     let outcome = match push_templates::build_g5b_counted_binding(
                                         today,
                                         &row.record,
-                                        &summary,
+                                        frozen.summary(),
                                     )
                                     .and_then(|binding| {
                                         crate::presentation_registry::acquire_token(
@@ -9586,7 +10934,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }) {
                                         Ok((token, binding)) => {
                                             crate::notify::push_counted_with_binding(
-                                                token, &summary, None, binding,
+                                                token,
+                                                frozen.summary(),
+                                                None,
+                                                binding,
                                             )
                                             .await
                                         }
@@ -9597,12 +10948,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             crate::notify::PushOutcome::Denied(reason)
                                         }
                                     };
+                                    if matches!(
+                                        &outcome,
+                                        crate::notify::PushOutcome::Denied(_)
+                                            | crate::notify::PushOutcome::SinkError(_)
+                                    ) {
+                                        log::warn!("[g5b] counted 未确认, attempt 已记录且禁止自动重算, 需人工核对: {:?}", outcome);
+                                    }
                                     log::info!("[g5b] 深链归因推送完成: {:?}", outcome);
                                     done += 1;
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "[g5b] 深链归因分析失败 ({}): {e}",
+                                        "[g5b] 深链归因分析失败 ({}), attempt 已记录且禁止自动重算: {e}",
                                         request.record.code
                                     );
                                     failed += 1;
@@ -9613,8 +10971,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             "[g5b] 深链归因当日批次结束: 成功 {done}, 失败 {failed} (上限 {})",
                             DEEP_ATTRIBUTION_MAX_EVENTS
                         );
-                        // 全部事件已尝试 (成功/失败均已出声) → 记 LAST_RUN, 避免窗口内重计费
-                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                        // 标记 IO 故障可在下 tick 重试; 已标记事件不会重复调用 LLM。
+                        if !journal_failed {
+                            *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                        }
                     }
                 }
             }
@@ -9947,9 +11307,11 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 log::warn!("[预测] 本轮未完成，继续盘前调度: {error}");
             }
 
-            match prediction::recent_hit_rate(7) {
-                Ok(hit_rate) => log::info!("[预测] 近7天命中率: {:.0}%", hit_rate * 100.0),
-                Err(error) => log::warn!("[预测] 近7天命中率不可用: {}", error),
+            match prediction::hit_rate_summary_at(prediction::shanghai_now(), 7) {
+                Ok(summary) => log::info!("[预测] {summary}"),
+                Err(error) => {
+                    log::warn!("[预测] 近7个已完成交易日已验证信号样本命中率不可用: {error}")
+                }
             }
 
             // 构建实体过滤集合（只关注9只标的）
@@ -11811,12 +13173,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 这里不再调用旧的全量抓取入口，避免重复拉 250 日 K 线、财报和六类工具数据。
             log::info!("[收盘] 多轮 AI 转由 post_session_review_scheduler 统一调度");
 
+            let prediction_summary = prediction::hit_rate_summary_at(prediction::shanghai_now(), 7)
+                .unwrap_or_else(|error| {
+                    format!("近7个已完成交易日已验证信号样本命中率不可用: {error}")
+                });
             log::info!(
                 "[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
                 signal_count,
                 alert_count,
                 scanner.dq_summary(),
-                prediction::hit_rate_summary(7)
+                prediction_summary
             );
 
             // 收盘后继续循环，等待下一个交易日
@@ -12374,6 +13740,21 @@ fn snapshot_portfolio_value() -> Result<(), String> {
 mod tests_v17_4_d {
     use super::*;
 
+    fn snapshot_reminder_claim(
+        state: stock_analysis::durable_delivery::DecisionState,
+        receipt: Option<&str>,
+    ) -> crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+        crate::durable_delivery_runtime::BusinessDateOnceDispatchEvidence {
+            decision_identity: "TEST_CODE_snapshot_stale_decision".to_owned(),
+            state,
+            sink_calls: 1,
+            current_attempt_identity: Some("TEST_CODE_attempt".to_owned()),
+            authoritative_receipt_sha256: receipt.map(str::to_owned),
+            source_binding_mode: None,
+            schedule_hydration: None,
+        }
+    }
+
     fn board_flow_batch(
         records: Vec<stock_analysis::data_gateway::BoardFlowFact>,
     ) -> stock_analysis::data_gateway::GatewayBatch<stock_analysis::data_gateway::BoardFlowFact>
@@ -12481,7 +13862,7 @@ mod tests_v17_4_d {
     }
 
     #[test]
-    fn br116_snapshot_reminder_gate_serializes_attempts_and_retries_unconfirmed() {
+    fn br116_snapshot_reminder_gate_serializes_attempts_and_reinspects_unconfirmed() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let mut gate = SnapshotReminderGate::default();
 
@@ -12494,11 +13875,210 @@ mod tests_v17_4_d {
         gate.finish(today, false);
         assert!(
             gate.try_begin(today),
-            "unconfirmed attempt must remain retryable"
+            "unconfirmed attempt must allow a durable claim reinspection"
         );
 
         gate.finish(today, true);
         assert!(!gate.try_begin(today), "confirmed attempt closes the day");
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_startup_then_timer_prepares_once() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let inspect_calls = std::sync::atomic::AtomicUsize::new(0);
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let startup = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || {
+                inspect_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(None))
+            },
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(
+            startup,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::Pushed)
+        );
+
+        let timer = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || {
+                inspect_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(None))
+            },
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(timer, SnapshotReminderAttempt::AlreadyHandled);
+        assert_eq!(inspect_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_uncertain_claim_blocks_same_day_retry() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        let first = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Ok(None)),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::SinkError(
+                    "TEST_CODE timeout".to_owned(),
+                ))
+            },
+        )
+        .await;
+        assert!(matches!(
+            first,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::SinkError(_))
+        ));
+
+        for _ in 0..2 {
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &gate,
+                today,
+                || {
+                    std::future::ready(Ok(Some(snapshot_reminder_claim(
+                        DecisionState::UncertainManualReview,
+                        None,
+                    ))))
+                },
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(
+                attempt,
+                SnapshotReminderAttempt::ExistingClaim {
+                    state: DecisionState::UncertainManualReview,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_restarted_gate_honors_durable_claim_and_receipt() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        for (state, receipt) in [
+            (DecisionState::Delivered, Some("TEST_CODE_receipt")),
+            (DecisionState::RejectedDurable, None),
+            (DecisionState::AttemptInFlight, None),
+        ] {
+            let restarted_gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &restarted_gate,
+                today,
+                || std::future::ready(Ok(Some(snapshot_reminder_claim(state, receipt)))),
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(attempt, SnapshotReminderAttempt::ExistingClaim {
+                state: found,
+                ..
+            } if found == state));
+            let confirmed = restarted_gate.lock().unwrap().last_confirmed;
+            assert_eq!(
+                confirmed,
+                (state == DecisionState::Delivered).then_some(today)
+            );
+        }
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_preflight_failure_fails_closed_until_clean_read() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        let unavailable = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Err("TEST_CODE claim read unavailable".to_owned())),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert!(matches!(
+            unavailable,
+            SnapshotReminderAttempt::PreflightFailed(_)
+        ));
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let clean_read = dispatch_snapshot_reminder_with_claim(
+            &gate,
+            today,
+            || std::future::ready(Ok(None)),
+            || {
+                send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(notify::PushOutcome::Pushed)
+            },
+        )
+        .await;
+        assert_eq!(
+            clean_read,
+            SnapshotReminderAttempt::Sent(notify::PushOutcome::Pushed)
+        );
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn br116_snapshot_reminder_delivered_without_receipt_stays_unconfirmed() {
+        use stock_analysis::durable_delivery::DecisionState;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let gate = std::sync::Mutex::new(SnapshotReminderGate::default());
+        let send_calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let attempt = dispatch_snapshot_reminder_with_claim(
+                &gate,
+                today,
+                || {
+                    std::future::ready(Ok(Some(snapshot_reminder_claim(
+                        DecisionState::Delivered,
+                        None,
+                    ))))
+                },
+                || {
+                    send_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(notify::PushOutcome::Pushed)
+                },
+            )
+            .await;
+            assert!(matches!(
+                attempt,
+                SnapshotReminderAttempt::PreflightFailed(_)
+            ));
+        }
+        assert_eq!(gate.lock().unwrap().last_confirmed, None);
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
 
@@ -12817,8 +14397,16 @@ mod tests_post_session_review_scheduler {
             .find("project_news_flash_events(")
             .expect("BR-244 source projection caller");
         let acquisition = production[..projection]
-            .rfind("fetch_raw_global_news_batch(20)")
+            .rfind("fetch_raw_global_news_batch(")
             .expect("BR-244 raw acquisition caller");
+        assert!(production[acquisition..projection].contains("&raw_news_sources"));
+        let registry = production[..acquisition]
+            .rfind("GlobalNewsSourceRegistry::new()")
+            .expect("resident news owner retains raw source state");
+        let tick_loop = production[registry..acquisition]
+            .find("loop {")
+            .expect("raw source registry must be created before the resident tick loop");
+        assert!(registry + tick_loop < acquisition);
         let tick_authority = production[..acquisition]
             .rfind("reconcile_news_flash_business_date(")
             .expect("BR-244 tick authority caller");
@@ -12970,6 +14558,41 @@ mod tests_post_session_review_scheduler {
             !scheduler[error_branch..review_window_gate].contains("continue;"),
             "selection failure must not suppress independent core review work"
         );
+    }
+
+    #[test]
+    fn g5b_archive_recovery_precedes_model_window_and_counted_handoff() {
+        let source = include_str!("main.rs");
+        let g5b = source
+            .split("// G5b 只在阻塞线程扫描已有 journal")
+            .nth(1)
+            .and_then(|tail| tail.split("// BR-226: 持仓快照").next())
+            .expect("G5b monitor phase");
+        let recovery = g5b
+            .find(".existing_recovery_dates(recovery_now)")
+            .expect("read-only archive discovery");
+        let window = g5b
+            .find("if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute())")
+            .expect("fresh G5b analysis window");
+        let last_run = g5b
+            .find("if g5b_last_run != Some(today)")
+            .expect("fresh G5b daily gate");
+        let provider = g5b
+            .find("LlmRegistry::from_env().select(\"g5b\")")
+            .expect("fresh G5b model provider");
+        assert!(recovery < window && window < last_run && last_run < provider);
+        let no_provider_gate = g5b
+            .find("if !candidates.is_empty() && provider.is_none()")
+            .expect("fresh G5b no-provider gate");
+        let new_selection = g5b
+            .find(".load_or_select(today, candidates)")
+            .expect("fresh G5b selection");
+        assert!(provider < no_provider_gate && no_provider_gate < new_selection);
+        let recovery_phase = &g5b[..window];
+        assert!(!recovery_phase.contains("begin_assessment("));
+        assert!(!recovery_phase.contains("LlmRegistry::from_env()"));
+        assert!(!recovery_phase.contains("push_counted_with_binding("));
+        assert!(recovery_phase.contains("tokio::task::spawn_blocking"));
     }
 
     #[test]

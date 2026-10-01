@@ -1442,6 +1442,17 @@ fn closed_feed_error_mapping(
     diagnostic_code: &str,
 ) -> Result<(ProviderErrorKind, &'static str, Option<&'static str>), IngressPreparationError> {
     match diagnostic_code {
+        "circuit_open" => Ok((ProviderErrorKind::Transport, "circuit_open", None)),
+        "breaker_state_unavailable" => Ok((
+            ProviderErrorKind::Integrity,
+            "breaker_state_unavailable",
+            Some("global-news-source-breaker-v1"),
+        )),
+        "batch_evidence_invalid" => Ok((
+            ProviderErrorKind::InvalidData,
+            "batch_evidence_invalid",
+            None,
+        )),
         "provider_batch_unavailable" => Ok((
             ProviderErrorKind::Transport,
             "provider_batch_unavailable",
@@ -1807,6 +1818,79 @@ mod tests {
             prepared.recovery_envelope.payload_json_hash,
             sha256_bytes(prepared.recovery_envelope.payload_json.as_bytes())
         );
+    }
+
+    #[test]
+    fn breaker_skips_stage_as_typed_unavailable_without_source_facts() {
+        for (diagnostic_code, reason_code, retryable) in [
+            ("circuit_open", "circuit_open", true),
+            (
+                "breaker_state_unavailable",
+                "breaker_state_unavailable",
+                true,
+            ),
+        ] {
+            let attempts = registered_global_news_feeds()
+                .into_iter()
+                .map(|registration| {
+                    let terminal = if registration.provider == GlobalNewsProvider::Eastmoney {
+                        TestRawGlobalNewsTerminal::Unavailable {
+                            failed_stage: "global_news_source_breaker",
+                            diagnostic_code,
+                            reason_code,
+                            retryable,
+                            available_evidence: None,
+                        }
+                    } else {
+                        TestRawGlobalNewsTerminal::VerifiedEmpty {
+                            evidence: evidence(registration.provider, "2026-07-28T02:00:00Z"),
+                        }
+                    };
+                    RawGlobalNewsFeedAttempt::test_fixture(
+                        "TEST_CODE_breaker_ingress",
+                        registration,
+                        utc("2026-07-28T02:00:04Z"),
+                        terminal,
+                    )
+                })
+                .collect();
+            let batch = RawNewsAggregationBatch::test_fixture(
+                "TEST_CODE_breaker_batch",
+                attempts,
+                utc("2026-07-28T02:00:06Z"),
+            );
+            let prepared = prepare_source_ingress(&batch, &test_context(), &[])
+                .expect("TEST_CODE breaker skip must remain stageable");
+            assert_eq!(
+                prepared
+                    .stage_input
+                    .source_batch_attempt_rows
+                    .iter()
+                    .filter(|row| row.status_kind == FeedStatusKind::Unavailable)
+                    .count(),
+                1
+            );
+            let row = prepared
+                .stage_input
+                .source_batch_attempt_rows
+                .iter()
+                .find(|row| row.status_kind == FeedStatusKind::Unavailable)
+                .expect("TEST_CODE breaker skip must remain unavailable");
+            assert_eq!(row.status_kind, FeedStatusKind::Unavailable);
+            assert_eq!(row.reason_code.as_deref(), Some(reason_code));
+            assert_eq!(row.retryable, Some(retryable));
+            assert!(row.available_evidence_json.is_none());
+            assert!(row.batch_content_hash.is_none());
+            assert!(prepared.stage_input.source_fact_rows.is_empty());
+            let detail: serde_json::Value = serde_json::from_str(
+                row.error_detail_json
+                    .as_deref()
+                    .expect("TEST_CODE typed error"),
+            )
+            .expect("TEST_CODE canonical error detail");
+            assert_eq!(detail["diagnostic_code"], diagnostic_code);
+            row.validate().expect("TEST_CODE typed unavailable row");
+        }
     }
 
     #[test]

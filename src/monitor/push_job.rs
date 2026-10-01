@@ -6,6 +6,7 @@ mod context;
 mod delivery;
 mod facts;
 mod identity;
+mod n02_source;
 mod policy;
 mod projection;
 mod shadow;
@@ -35,6 +36,7 @@ pub use delivery::{
     DeliveryResultView, DurableSchemaVersion, DurableStateProjection, TemplateId, TemplateVersion,
     TerminalDisposition, TerminalRefId, VerifiedTerminalRef, WeakOutcome, WeakOutcomeKind,
 };
+pub(crate) use facts::{n02_replay_prepared_facts_sha256, source_ref_value, source_time_value};
 pub use facts::{
     CaptureStateView, CapturedFacts, ExactBytes, ExternalId, FactsPresence, ModelId,
     ModelOutputRef, ModelVersion, PreparationCapture, PreparationError, PreparedFacts,
@@ -48,6 +50,10 @@ pub use identity::{
     ScheduleOccurrenceId, ScheduleOccurrenceIdentityMaterial, ScheduleOrTriggerId, Sha256Digest,
     SourceContractId, SourceContractVersion, SubjectId, SubjectValue, UnitId, UtcMicros,
 };
+pub(crate) use n02_source::{
+    N02SelectedProofV1, N02_SOURCE_CONTRACT_ID, N02_SOURCE_CONTRACT_VERSION,
+};
+pub use n02_source::{N02SourceChainV1, N02SourceError};
 pub use policy::{
     evaluate_completion, AdvanceEvent, AlreadyTerminalPolicy, CatalogOwnerRef, CompletionDirective,
     CompletionFact, CompletionPolicy, CompletionPolicyId, CompletionPolicyVersion, CursorDirective,
@@ -70,12 +76,15 @@ pub use shadow::{
 };
 
 #[cfg(test)]
+pub(crate) use context::n02_source_capture_fixture;
+#[cfg(test)]
 pub(crate) use policy::w09_completion_policy_fixture;
 pub(crate) use projection::derive_decision_id;
+pub(crate) use projection::n02_replay_evidence_fingerprint;
 #[cfg(test)]
 pub(crate) use projection::{
-    w08_prepared_push_fixture, w08_prepared_push_fixture_for_namespace,
-    w16_prepared_push_fixture_for_identity,
+    n02_prepared_push_fixture, n02_prepared_push_from_facts_fixture, w08_prepared_push_fixture,
+    w08_prepared_push_fixture_for_namespace, w16_prepared_push_fixture_for_identity,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

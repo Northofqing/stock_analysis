@@ -11,7 +11,9 @@ use log::{error, info, warn};
 use reqwest::Client;
 
 use super::config::{NotificationChannel, NotificationConfig};
-use super::send_report::{NotificationAttempt, NotificationSendReport};
+use super::feishu::FeishuHttpBodyObservation;
+use super::send_report::{NotificationAttempt, NotificationRequestEntity, NotificationSendReport};
+use super::wechat::WechatHttpBodyObservation;
 use crate::monitor::push_job::WeakOutcomeKind;
 
 /// 股票分析结果（与 `pipeline::AnalysisResult` 共用同一类型，避免重复定义）。
@@ -29,31 +31,46 @@ fn observe_attempt(
     channel: NotificationChannel,
     result: Result<bool>,
 ) {
+    observe_attempt_with_entity(attempts, channel, result, None);
+}
+
+fn observe_attempt_with_entity(
+    attempts: &mut Vec<NotificationAttempt>,
+    channel: NotificationChannel,
+    result: Result<bool>,
+    request_entity: Option<NotificationRequestEntity>,
+) {
     let outcome = match result {
         Ok(true) => WeakOutcomeKind::Accepted,
         Ok(false) => {
             error!("[{}] 渠道方法返回 false，投递状态未知", channel.name());
             WeakOutcomeKind::Unknown
         }
-        Err(error) => {
+        Err(_error) => {
             error!(
-                "[{}] 渠道方法返回错误，投递状态未知: {}",
+                "[{}] 渠道方法返回错误，投递状态未知；target_sha256={}",
                 channel.name(),
-                error
+                request_entity
+                    .as_ref()
+                    .map(NotificationRequestEntity::target_sha256)
+                    .unwrap_or("unavailable")
             );
             WeakOutcomeKind::Unknown
         }
     };
-    attempts.push(NotificationAttempt::new(channel, attempts.len(), outcome));
+    attempts.push(NotificationAttempt::new(
+        channel,
+        attempts.len(),
+        outcome,
+        request_entity,
+    ));
 }
 
 impl NotificationService {
     /// 创建新的通知服务
     pub fn new(config: NotificationConfig) -> Self {
-        // review #14: 改用 SHARED_HTTP_CLIENT 共享 client (30s timeout + Arc 内核),
-        // 替代每次 new Client. 多 NotificationService 实例 + 频繁 new 会浪费
-        // TLS handshake. SHARED_HTTP_CLIENT 是 Lazy static, 进程生命周期单例.
-        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+        // 复用连接，并禁止自动跳转：一次渠道尝试只对应初始目标的一个请求。
+        let client = crate::http_client::SHARED_NOTIFICATION_HTTP_CLIENT.clone();
 
         let available_channels = Self::detect_channels(&config);
 
@@ -154,6 +171,37 @@ impl NotificationService {
 
     /// Send through every configured target and retain invocation-local weak outcomes.
     pub async fn send_report(&self, content: &str) -> NotificationSendReport {
+        self.send_report_inner(content, None, None).await
+    }
+
+    /// Observe only WeChat's exact built HTTP entity bodies within this send.
+    /// The observer has no transport authority and cannot change weak outcomes.
+    pub async fn send_report_observing_wechat(
+        &self,
+        content: &str,
+        observation: &mut WechatHttpBodyObservation,
+    ) -> NotificationSendReport {
+        self.send_report_inner(content, Some(observation), None)
+            .await
+    }
+
+    /// Observe built WeChat and Feishu HTTP entity bodies in this same send.
+    pub async fn send_report_observing_http_bodies(
+        &self,
+        content: &str,
+        wechat_observation: &mut WechatHttpBodyObservation,
+        feishu_observation: &mut FeishuHttpBodyObservation,
+    ) -> NotificationSendReport {
+        self.send_report_inner(content, Some(wechat_observation), Some(feishu_observation))
+            .await
+    }
+
+    async fn send_report_inner(
+        &self,
+        content: &str,
+        mut wechat_observation: Option<&mut WechatHttpBodyObservation>,
+        mut feishu_observation: Option<&mut FeishuHttpBodyObservation>,
+    ) -> NotificationSendReport {
         if !self.is_available() {
             warn!("通知服务不可用，跳过推送");
             return NotificationSendReport::default();
@@ -169,49 +217,82 @@ impl NotificationService {
 
         for channel in &self.available_channels {
             match channel {
-                NotificationChannel::Wechat => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_wechat(content).await)
-                }
-                NotificationChannel::Feishu => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_feishu(content).await)
-                }
+                NotificationChannel::Wechat => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_wechat_with_observation(
+                        content,
+                        wechat_observation.as_deref_mut(),
+                    )
+                    .await,
+                ),
+                NotificationChannel::Feishu => observe_attempt(
+                    &mut attempts,
+                    *channel,
+                    self.send_to_feishu_with_observation(
+                        content,
+                        feishu_observation.as_deref_mut(),
+                    )
+                    .await,
+                ),
                 NotificationChannel::Email => {
                     observe_attempt(&mut attempts, *channel, self.send_to_email(content))
                 }
-                NotificationChannel::ServerChan => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_server_chan(content).await,
-                ),
+                NotificationChannel::ServerChan => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_server_chan_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
-                NotificationChannel::DingTalk => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_dingtalk(content).await,
-                ),
-                NotificationChannel::Telegram => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_telegram(content).await,
-                ),
+                NotificationChannel::DingTalk => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_dingtalk_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
+                NotificationChannel::Telegram => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_telegram_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 NotificationChannel::Slack => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_slack(content).await)
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_slack_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
                 }
                 NotificationChannel::Discord => {
-                    observe_attempt(&mut attempts, *channel, self.send_to_discord(content).await)
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_discord_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
                 }
-                NotificationChannel::Pushover => observe_attempt(
-                    &mut attempts,
-                    *channel,
-                    self.send_to_pushover(content).await,
-                ),
+                NotificationChannel::Pushover => {
+                    let mut request_entity = None;
+                    let result = self
+                        .send_to_pushover_observing_entity(content, &mut request_entity)
+                        .await;
+                    observe_attempt_with_entity(&mut attempts, *channel, result, request_entity);
+                }
                 NotificationChannel::Custom => {
                     // 修复 P0-0: Custom 多个 webhook URL 都发送
                     for url in &self.config.custom_webhook_urls {
-                        observe_attempt(
+                        let mut request_entity = None;
+                        let result = self
+                            .send_to_custom_url_observing_entity(url, content, &mut request_entity)
+                            .await;
+                        observe_attempt_with_entity(
                             &mut attempts,
                             *channel,
-                            self.send_to_custom_url(url, content).await,
+                            result,
+                            request_entity,
                         );
                     }
                     if self.config.custom_webhook_urls.is_empty() {
@@ -258,8 +339,8 @@ impl NotificationService {
                             error!("[邮件] 发送失败");
                             fail_count += 1;
                         }
-                        Err(e) => {
-                            error!("[邮件] 发送出错: {}", e);
+                        Err(_error) => {
+                            error!("[邮件] 发送出错，投递状态未知");
                             fail_count += 1;
                         }
                     }
@@ -315,12 +396,17 @@ impl NotificationService {
                                 warn!("[Custom] 未配置 webhook_urls, 跳过");
                                 fail_count += 1;
                             }
-                            for url in &self.config.custom_webhook_urls {
+                            for (target_index, url) in
+                                self.config.custom_webhook_urls.iter().enumerate()
+                            {
                                 match self.send_to_custom_url(url, content).await {
                                     Ok(true) => success_count += 1,
                                     Ok(false) => fail_count += 1,
-                                    Err(error) => {
-                                        warn!("[Custom] {} 出错: {}", url, error);
+                                    Err(_error) => {
+                                        warn!(
+                                            "[Custom] target_index={} 渠道方法出错，投递状态未知",
+                                            target_index
+                                        );
                                         fail_count += 1;
                                     }
                                 }
@@ -371,11 +457,30 @@ impl NotificationService {
     /// Server酱推送（普通微信）。
     /// 文档: https://sct.ftqq.com/
     pub async fn send_to_server_chan(&self, content: &str) -> Result<bool> {
+        self.send_to_server_chan_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_server_chan_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let key = match &self.config.server_chan_key {
             Some(k) => k,
             None => return Ok(false),
         };
         let url = format!("https://sctapi.ftqq.com/{}.send", key);
+        self.send_to_server_chan_at(&url, content, request_entity)
+            .await
+    }
+
+    async fn send_to_server_chan_at(
+        &self,
+        url: &str,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         // 取第一行作为标题
         let title = content.lines().next().unwrap_or("监控告警");
         let title = if title.starts_with('#') {
@@ -386,23 +491,39 @@ impl NotificationService {
         let title = truncate(title, 32);
         let desp = truncate(content, 4096);
 
+        let request = self
+            .client
+            .post(url)
+            .form(&[("title", title.as_str()), ("desp", desp.as_str())])
+            .build()
+            .map_err(|_| anyhow::anyhow!("Server酱请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
         let resp = self
             .client
-            .post(&url)
-            .form(&[("title", title.as_str()), ("desp", desp.as_str())])
-            .send()
-            .await?;
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Server酱 HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
 
         let status = resp.status();
-        let body = resp.text().await?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|_| anyhow::anyhow!("Server酱响应读取失败"))?;
         if status.is_success() && serverchan_business_accepted(&body)? {
             Ok(true)
         } else {
-            log::warn!(
-                "[Server酱] 推送失败: HTTP {} body={}",
-                status,
-                truncate(&body, 200)
-            );
+            if status.is_success() {
+                log::warn!(
+                    "[Server酱] 推送失败: HTTP {} code={}",
+                    status,
+                    serverchan_response_code(&body)?
+                );
+            } else {
+                log::warn!("[Server酱] 推送失败: HTTP {}", status);
+            }
             Ok(false)
         }
     }
@@ -423,26 +544,59 @@ impl NotificationService {
             .client
             .post("https://api.pushover.net/1/messages.json")
             .form(&[("token", token), ("user", user), ("message", content)])
-            .build()?)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Pushover 请求构建失败"))?)
     }
 
     /// Pushover Message API 推送。
     /// 官方契约: POST /1/messages.json，HTTP 成功且 JSON status=1 才算成功。
     pub async fn send_to_pushover(&self, content: &str) -> Result<bool> {
+        self.send_to_pushover_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_pushover_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let request = match self.build_pushover_request(content) {
             Ok(request) => request,
-            Err(error) => {
-                log::warn!("[Pushover] 配置无效: {}", error);
+            Err(_error) => {
+                log::warn!("[Pushover] 配置无效");
                 return Ok(false);
             }
         };
-        let response = self.client.execute(request).await?;
+        self.execute_pushover_request(request, request_entity).await
+    }
+
+    async fn execute_pushover_request(
+        &self,
+        request: reqwest::Request,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Pushover HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(response.url());
+        }
         let status = response.status();
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("Pushover 响应解析失败"))?;
         let accepted =
             status.is_success() && body.get("status").and_then(|v| v.as_i64()) == Some(1);
         if !accepted {
-            log::warn!("[Pushover] 推送失败: HTTP {} body={}", status, body);
+            log::warn!(
+                "[Pushover] 推送失败: HTTP {} status_code={:?}",
+                status,
+                body.get("status").and_then(serde_json::Value::as_i64)
+            );
         }
         Ok(accepted)
     }
@@ -450,6 +604,15 @@ impl NotificationService {
     /// 修复 P0-0: 钉钉 webhook 推送
     /// 文档: https://open.dingtalk.com/document/orgapp/custom-robots-send-group-messages
     pub async fn send_to_dingtalk(&self, content: &str) -> Result<bool> {
+        self.send_to_dingtalk_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_dingtalk_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.dingtalk_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -461,14 +624,36 @@ impl NotificationService {
             "msgtype": "text",
             "text": { "content": content }
         });
-        let resp = self.client.post(url).json(&body).send().await?;
-        if !resp.status().is_success() {
-            log::warn!("[钉钉] 推送失败: HTTP {}", resp.status());
+        let request = self
+            .client
+            .post(url)
+            .json(&body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("钉钉请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("钉钉 HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            log::warn!("[钉钉] 推送失败: HTTP {}", status);
             return Ok(false);
         }
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("钉钉响应解析失败"))?;
         if !dingtalk_business_accepted(&body)? {
-            log::warn!("[钉钉] 业务错误: {}", body);
+            log::warn!(
+                "[钉钉] 业务错误: HTTP {} errcode={:?}",
+                status,
+                body.get("errcode").and_then(serde_json::Value::as_i64)
+            );
             return Ok(false);
         }
         log::info!("[钉钉] 推送成功");
@@ -479,6 +664,15 @@ impl NotificationService {
     /// 文档: https://core.telegram.org/bots/api#sendmessage
     /// 之前 enum 里有但未实现, 走 _ => 死代码分支
     pub async fn send_to_telegram(&self, content: &str) -> Result<bool> {
+        self.send_to_telegram_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_telegram_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let token = match self.config.telegram_bot_token.as_ref() {
             Some(t) => t,
             None => {
@@ -501,19 +695,49 @@ impl NotificationService {
             .replace('[', r"\[")
             .replace('`', r"\`");
         let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        self.send_to_telegram_at(&url, chat_id, &escaped, request_entity)
+            .await
+    }
+
+    async fn send_to_telegram_at(
+        &self,
+        url: &str,
+        chat_id: &str,
+        escaped_content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let body = serde_json::json!({
             "chat_id": chat_id,
-            "text": escaped,
+            "text": escaped_content,
             "parse_mode": "MarkdownV2",
         });
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let request = self
+            .client
+            .post(url)
+            .json(&body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Telegram 请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Telegram HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         let status = resp.status();
-        let response_body: serde_json::Value = resp.json().await?;
+        let response_body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("Telegram 响应解析失败"))?;
         if !status.is_success() || !telegram_business_accepted(&response_body)? {
             log::warn!(
-                "[Telegram] 推送失败: HTTP {} body={}",
+                "[Telegram] 推送失败: HTTP {} error_code={:?}",
                 status,
                 response_body
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_i64)
             );
             return Ok(false);
         }
@@ -524,6 +748,15 @@ impl NotificationService {
     /// 修复 P0-0: Slack Incoming Webhook 推送
     /// 文档: https://api.slack.com/messaging/webhooks
     pub async fn send_to_slack(&self, content: &str) -> Result<bool> {
+        self.send_to_slack_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_slack_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.slack_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -534,11 +767,28 @@ impl NotificationService {
         let body = serde_json::json!({
             "text": content
         });
-        let resp = self.client.post(url).json(&body).send().await?;
+        let request = self
+            .client
+            .post(url)
+            .json(&body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Slack 请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Slack HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         let status = resp.status();
-        let response_body = resp.text().await?;
+        let response_body = resp
+            .text()
+            .await
+            .map_err(|_| anyhow::anyhow!("Slack 响应读取失败"))?;
         if !status.is_success() || !slack_business_accepted(&response_body)? {
-            log::warn!("[Slack] 推送失败: HTTP {} body={:?}", status, response_body);
+            log::warn!("[Slack] 推送失败: HTTP {}", status);
             return Ok(false);
         }
         log::info!("[Slack] 推送成功");
@@ -546,21 +796,40 @@ impl NotificationService {
     }
 
     async fn send_to_custom_url(&self, url: &str, content: &str) -> Result<bool> {
+        self.send_to_custom_url_observing_entity(url, content, &mut None)
+            .await
+    }
+
+    async fn send_to_custom_url_observing_entity(
+        &self,
+        url: &str,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let body = serde_json::json!({ "content": content });
         let mut request = self.client.post(url).json(&body);
         if let Some(token) = self.config.custom_webhook_bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await?;
+        let request = request
+            .build()
+            .map_err(|_| anyhow::anyhow!("Custom webhook 请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Custom webhook HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(response.url());
+        }
         let status = response.status();
-        let response_body = response.text().await?;
+        let response_body = response
+            .text()
+            .await
+            .map_err(|_| anyhow::anyhow!("Custom webhook 响应读取失败"))?;
         if !status.is_success() || !custom_business_accepted(&response_body)? {
-            log::warn!(
-                "[Custom] {} 推送失败: HTTP {} body={:?}",
-                url,
-                status,
-                response_body
-            );
+            log::warn!("[Custom] 推送未获业务接受: HTTP {}", status);
             return Ok(false);
         }
         Ok(true)
@@ -569,6 +838,15 @@ impl NotificationService {
     /// 修复 P0-0: Discord Webhook 推送
     /// 文档: https://discord.com/developers/docs/resources/webhook
     pub async fn send_to_discord(&self, content: &str) -> Result<bool> {
+        self.send_to_discord_observing_entity(content, &mut None)
+            .await
+    }
+
+    async fn send_to_discord_observing_entity(
+        &self,
+        content: &str,
+        request_entity: &mut Option<NotificationRequestEntity>,
+    ) -> Result<bool> {
         let url = match self.config.discord_webhook_url.as_ref() {
             Some(u) => u,
             None => {
@@ -591,7 +869,21 @@ impl NotificationService {
         let body = serde_json::json!({
             "content": truncated
         });
-        let resp = self.client.post(url).json(&body).send().await?;
+        let request = self
+            .client
+            .post(url)
+            .json(&body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("Discord 请求构建失败"))?;
+        *request_entity = NotificationRequestEntity::from_built_request(&request);
+        let resp = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Discord HTTP 请求失败"))?;
+        if let Some(entity) = request_entity.as_mut() {
+            entity.observe_response_url(resp.url());
+        }
         if !resp.status().is_success() {
             log::warn!("[Discord] 推送失败: HTTP {}", resp.status());
             return Ok(false);
@@ -606,19 +898,22 @@ fn dingtalk_business_accepted(body: &serde_json::Value) -> Result<bool> {
         Some(0) => Ok(true),
         Some(_) => Ok(false),
         None => Err(anyhow::anyhow!(
-            "钉钉响应缺少整数 errcode，不能确认投递成功: {body}"
+            "钉钉响应缺少整数 errcode，不能确认投递成功"
         )),
     }
 }
 
 fn serverchan_business_accepted(body: &str) -> Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| anyhow::anyhow!("Server酱响应不是合法 JSON: {error}"))?;
+    Ok(serverchan_response_code(body)? == 0)
+}
+
+fn serverchan_response_code(body: &str) -> Result<i64> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| anyhow::anyhow!("Server酱响应不是合法 JSON"))?;
     match value.get("code").and_then(serde_json::Value::as_i64) {
-        Some(0) => Ok(true),
-        Some(_) => Ok(false),
+        Some(code) => Ok(code),
         None => Err(anyhow::anyhow!(
-            "Server酱响应缺少整数 code，不能确认投递成功: {value}"
+            "Server酱响应缺少整数 code，不能确认投递成功"
         )),
     }
 }
@@ -627,7 +922,7 @@ fn telegram_business_accepted(body: &serde_json::Value) -> Result<bool> {
     match body.get("ok").and_then(serde_json::Value::as_bool) {
         Some(accepted) => Ok(accepted),
         None => Err(anyhow::anyhow!(
-            "Telegram 响应缺少布尔 ok，不能确认投递成功: {body}"
+            "Telegram 响应缺少布尔 ok，不能确认投递成功"
         )),
     }
 }
@@ -647,11 +942,11 @@ fn slack_business_accepted(body: &str) -> Result<bool> {
 
 fn custom_business_accepted(body: &str) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| anyhow::anyhow!("Custom webhook 响应不是合法 JSON: {error}"))?;
+        .map_err(|_| anyhow::anyhow!("Custom webhook 响应不是合法 JSON"))?;
     match value.get("ok").and_then(serde_json::Value::as_bool) {
         Some(accepted) => Ok(accepted),
         None => Err(anyhow::anyhow!(
-            "Custom webhook 响应缺少布尔 ok，不能确认投递成功: {value}"
+            "Custom webhook 响应缺少布尔 ok，不能确认投递成功"
         )),
     }
 }
@@ -678,6 +973,10 @@ pub async fn send_daily_report(results: &[AnalysisResult]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notification::send_report_tests::{
+        spawn_webhook_fixture as spawn_scripted_webhook_fixture, ScriptedResponse,
+    };
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -754,6 +1053,205 @@ mod tests {
         assert!(form.contains("token=TEST_CODE_TOKEN"));
         assert!(form.contains("user=TEST_CODE_USER"));
         assert!(form.contains("message=TEST_CODE+alert"));
+    }
+
+    #[tokio::test]
+    async fn pushover_observation_binds_sent_form_and_keeps_disconnect_unknown() {
+        let service = NotificationService {
+            config: NotificationConfig::default(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            available_channels: vec![NotificationChannel::Pushover],
+        };
+        for (script, accepted) in [
+            (ScriptedResponse::Http(r#"{"status":1}"#), true),
+            (ScriptedResponse::Http(r#"{"status":0}"#), false),
+        ] {
+            let fixture = spawn_scripted_webhook_fixture(vec![script]);
+            let request = service
+                .client
+                .post(fixture.url())
+                .form(&[
+                    ("token", "TEST_CODE_TOKEN"),
+                    ("user", "TEST_CODE_USER"),
+                    ("message", "TEST_CODE alert"),
+                ])
+                .build()
+                .unwrap();
+            let body = request.body().unwrap().as_bytes().unwrap().to_vec();
+            let mut entity = None;
+            assert_eq!(
+                service
+                    .execute_pushover_request(request, &mut entity)
+                    .await
+                    .unwrap(),
+                accepted
+            );
+            let entity = entity.unwrap();
+            assert_eq!(entity.body_len(), body.len());
+            let mut digest = Sha256::new();
+            digest.update(b"stock_analysis.notification_http_entity.v1\0");
+            digest.update(&body);
+            assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+            assert_eq!(entity.response_target_differs(), Some(false));
+            let requests = fixture.finish();
+            assert_eq!(requests.len(), 1);
+            let body_start = requests[0]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            assert_eq!(&requests[0][body_start..], body);
+        }
+
+        let fixture =
+            spawn_scripted_webhook_fixture(vec![ScriptedResponse::Http("TEST_SECRET_RESPONSE")]);
+        let request = service
+            .client
+            .post(fixture.url())
+            .form(&[("message", "TEST_CODE invalid response")])
+            .build()
+            .unwrap();
+        let error = service
+            .execute_pushover_request(request, &mut None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Pushover 响应解析失败");
+        assert_eq!(fixture.finish().len(), 1);
+
+        let fixture = spawn_scripted_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+        let request = service
+            .client
+            .post(fixture.url())
+            .form(&[("message", "TEST_CODE uncertain")])
+            .build()
+            .unwrap();
+        let mut entity = None;
+        let error = service
+            .execute_pushover_request(request, &mut entity)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Pushover HTTP 请求失败");
+        assert!(entity.unwrap().response_url_sha256().is_none());
+        assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_webhook_transport_errors_do_not_expose_target_or_token() {
+        let bad_url = "http://[TEST_SECRET_TARGET_TOKEN";
+        let service = NotificationService::new(NotificationConfig {
+            dingtalk_webhook_url: Some(bad_url.to_string()),
+            slack_webhook_url: Some(bad_url.to_string()),
+            discord_webhook_url: Some(bad_url.to_string()),
+            custom_webhook_bearer_token: Some("TEST_SECRET_BEARER".to_string()),
+            ..NotificationConfig::default()
+        });
+        let errors = [
+            service
+                .send_to_server_chan_at(bad_url, "TEST_SECRET_CONTENT", &mut None)
+                .await
+                .unwrap_err(),
+            service
+                .send_to_dingtalk("TEST_SECRET_CONTENT")
+                .await
+                .unwrap_err(),
+            service
+                .send_to_telegram_at(
+                    bad_url,
+                    "TEST_SECRET_CHAT",
+                    "TEST_SECRET_CONTENT",
+                    &mut None,
+                )
+                .await
+                .unwrap_err(),
+            service
+                .send_to_slack("TEST_SECRET_CONTENT")
+                .await
+                .unwrap_err(),
+            service
+                .send_to_custom_url_observing_entity(bad_url, "TEST_SECRET_CONTENT", &mut None)
+                .await
+                .unwrap_err(),
+            service
+                .send_to_discord("TEST_SECRET_CONTENT")
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let text = error.to_string();
+            assert!(text.contains("请求构建失败"), "{text}");
+            assert!(!text.contains("TEST_SECRET"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_chan_and_telegram_observe_the_sent_entity() {
+        fn body_of(request: &[u8]) -> &[u8] {
+            let start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            &request[start..]
+        }
+
+        let service = NotificationService {
+            config: NotificationConfig::default(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            available_channels: vec![
+                NotificationChannel::ServerChan,
+                NotificationChannel::Telegram,
+            ],
+        };
+        let server_chan =
+            spawn_scripted_webhook_fixture(vec![ScriptedResponse::Http(r#"{"code":0}"#)]);
+        let mut server_chan_entity = None;
+        assert!(service
+            .send_to_server_chan_at(
+                &server_chan.url(),
+                "# TEST_CODE title\nTEST_CODE detail",
+                &mut server_chan_entity,
+            )
+            .await
+            .unwrap());
+        let server_chan_request = server_chan.finish();
+        assert_eq!(server_chan_request.len(), 1);
+        let server_chan_body = body_of(&server_chan_request[0]);
+        assert!(server_chan_body
+            .windows(b"title=TEST_CODE+title".len())
+            .any(|part| { part == b"title=TEST_CODE+title" }));
+
+        let telegram =
+            spawn_scripted_webhook_fixture(vec![ScriptedResponse::Http(r#"{"ok":true}"#)]);
+        let mut telegram_entity = None;
+        assert!(service
+            .send_to_telegram_at(
+                &telegram.url(),
+                "TEST_CODE_CHAT",
+                "TEST_CODE escaped\\_message",
+                &mut telegram_entity,
+            )
+            .await
+            .unwrap());
+        let telegram_request = telegram.finish();
+        assert_eq!(telegram_request.len(), 1);
+        let telegram_body: serde_json::Value =
+            serde_json::from_slice(body_of(&telegram_request[0])).unwrap();
+        assert_eq!(telegram_body["chat_id"], "TEST_CODE_CHAT");
+        assert_eq!(telegram_body["text"], "TEST_CODE escaped\\_message");
+        assert_eq!(telegram_body["parse_mode"], "MarkdownV2");
+
+        for (entity, request) in [
+            (server_chan_entity.unwrap(), &server_chan_request[0]),
+            (telegram_entity.unwrap(), &telegram_request[0]),
+        ] {
+            let body = body_of(request);
+            let mut digest = Sha256::new();
+            digest.update(b"stock_analysis.notification_http_entity.v1\0");
+            digest.update(body);
+            assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+            assert_eq!(entity.body_len(), body.len());
+            assert_eq!(entity.response_target_differs(), Some(false));
+        }
     }
 
     #[test]

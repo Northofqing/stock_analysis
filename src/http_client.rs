@@ -4,8 +4,9 @@
 //! 调用新建 client = TCP 1 RTT + TLS 2 RTT + DNS + Arc 分配. 200 只股票批量查询
 //! = 额外 ~1000 次握手.
 //!
-//! 修法: 在 src/lib.rs 通过 `Lazy<Client>` 共享两个仍有调用方的预配置 client:
+//! 修法: 在 src/lib.rs 通过 `Lazy<Client>` 共享预配置 client:
 //!   - `SHARED_HTTP_CLIENT`: 默认 30s timeout（非行情 HTTP 业务）
+//!   - `SHARED_NOTIFICATION_HTTP_CLIENT`: 通知发送，禁用自动跳转
 //!   - `SHARED_FAST_HTTP_CLIENT`: 5s timeout (e.g. flash news)
 //!
 //! 调用方: `use crate::http_client::SHARED_HTTP_CLIENT;` 然后 `SHARED_HTTP_CLIENT.get(...)`
@@ -24,6 +25,19 @@ pub static SHARED_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .expect("SHARED_HTTP_CLIENT: 创建 reqwest Client 失败")
+});
+
+/// 通知发送一次只允许一个目标请求。3xx 由渠道方法判为未知，不能让后续跳转
+/// 改变请求方法或目标后仍把响应算作初始目标的弱成功。
+pub static SHARED_NOTIFICATION_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .expect("SHARED_NOTIFICATION_HTTP_CLIENT: 创建 reqwest Client 失败")
 });
 
 /// 5s timeout, 快讯/news 短调用

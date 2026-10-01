@@ -4,11 +4,68 @@ use anyhow::{Context, Result};
 use log::{error, info};
 use serde_json::json;
 
+use super::http_body_observation::{HttpBodyObservation, HttpBodySummary};
 use super::service::NotificationService;
+
+const BODY_SEQUENCE_DOMAIN: &[u8] = b"stock_analysis.wechat_http_entity_body_sequence.v1\0";
+
+/// The exact JSON entity bodies taken from the Reqwest requests submitted by
+/// one WeChat send. This does not observe HTTP headers, framing, TLS, or receipt.
+pub struct WechatHttpBodyObservation {
+    inner: HttpBodyObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WechatHttpBodySummary {
+    inner: HttpBodySummary,
+}
+
+impl WechatHttpBodySummary {
+    pub const fn request_count(&self) -> usize {
+        self.inner.request_count()
+    }
+
+    pub const fn total_body_bytes(&self) -> usize {
+        self.inner.total_body_bytes()
+    }
+
+    pub fn sequence_sha256(&self) -> &str {
+        self.inner.sequence_sha256()
+    }
+}
+
+impl Default for WechatHttpBodyObservation {
+    fn default() -> Self {
+        Self {
+            inner: HttpBodyObservation::new(BODY_SEQUENCE_DOMAIN),
+        }
+    }
+}
+
+impl WechatHttpBodyObservation {
+    fn observe_request(&mut self, request: &reqwest::Request) {
+        self.inner.observe_request(request);
+    }
+
+    /// None means no WeChat request was built or at least one body was opaque.
+    pub fn finish(self) -> Option<WechatHttpBodySummary> {
+        self.inner
+            .finish()
+            .map(|inner| WechatHttpBodySummary { inner })
+    }
+}
 
 impl NotificationService {
     /// 发送到企业微信
     pub async fn send_to_wechat(&self, content: &str) -> Result<bool> {
+        self.send_to_wechat_with_observation(content, None).await
+    }
+
+    pub(super) async fn send_to_wechat_with_observation(
+        &self,
+        content: &str,
+        observation: Option<&mut WechatHttpBodyObservation>,
+    ) -> Result<bool> {
         let url = self
             .config
             .wechat_webhook_url
@@ -20,14 +77,21 @@ impl NotificationService {
 
         if content_bytes > max_bytes {
             info!("消息内容超长({}字节)，将分批发送", content_bytes);
-            return self.send_wechat_chunked(url, content, max_bytes).await;
+            return self
+                .send_wechat_chunked(url, content, max_bytes, observation)
+                .await;
         }
 
-        self.send_wechat_message(url, content).await
+        self.send_wechat_message(url, content, observation).await
     }
 
     /// 发送单条企业微信消息
-    pub(super) async fn send_wechat_message(&self, url: &str, content: &str) -> Result<bool> {
+    pub(super) async fn send_wechat_message(
+        &self,
+        url: &str,
+        content: &str,
+        observation: Option<&mut WechatHttpBodyObservation>,
+    ) -> Result<bool> {
         let payload = json!({
             "msgtype": "markdown",
             "markdown": {
@@ -35,19 +99,40 @@ impl NotificationService {
             }
         });
 
-        let response = self.client.post(url).json(&payload).send().await?;
+        let request = self
+            .client
+            .post(url)
+            .json(&payload)
+            .build()
+            .map_err(|_| anyhow::anyhow!("企业微信请求构建失败"))?;
+        if let Some(observation) = observation {
+            observation.observe_request(&request);
+        }
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("企业微信 HTTP 请求失败"))?;
 
-        if response.status().is_success() {
-            let result: serde_json::Value = response.json().await?;
+        let status = response.status();
+        if status.is_success() {
+            let result: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| anyhow::anyhow!("企业微信响应解析失败"))?;
             if result.get("errcode").and_then(|v| v.as_i64()) == Some(0) {
                 info!("企业微信消息发送成功");
                 Ok(true)
             } else {
-                error!("企业微信返回错误: {:?}", result);
+                error!(
+                    "企业微信返回错误: HTTP {} errcode={:?}",
+                    status,
+                    result.get("errcode").and_then(serde_json::Value::as_i64)
+                );
                 Ok(false)
             }
         } else {
-            error!("企业微信请求失败: {}", response.status());
+            error!("企业微信请求失败: HTTP {}", status);
             Ok(false)
         }
     }
@@ -58,6 +143,7 @@ impl NotificationService {
         url: &str,
         content: &str,
         max_bytes: usize,
+        mut observation: Option<&mut WechatHttpBodyObservation>,
     ) -> Result<bool> {
         let chunks = self.chunk_by_sections(content, max_bytes);
         let total_chunks = chunks.len();
@@ -74,7 +160,10 @@ impl NotificationService {
 
             let chunk_with_marker = format!("{}{}", chunk, page_marker);
 
-            if self.send_wechat_message(url, &chunk_with_marker).await? {
+            if self
+                .send_wechat_message(url, &chunk_with_marker, observation.as_deref_mut())
+                .await?
+            {
                 success_count += 1;
                 info!("企业微信第 {}/{} 批发送成功", i + 1, total_chunks);
             } else {
@@ -201,5 +290,15 @@ mod tests {
         let service = NotificationService::new(NotificationConfig::default());
         let error = service.send_to_wechat("TEST_CODE local").await.unwrap_err();
         assert!(error.to_string().contains("Webhook 未配置"));
+    }
+
+    #[tokio::test]
+    async fn malformed_webhook_url_is_not_returned_in_error() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let error = service
+            .send_wechat_message("http://[TEST_SECRET_TOKEN", "TEST_CODE local", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "企业微信请求构建失败");
     }
 }

@@ -181,7 +181,16 @@ pub(super) fn fingerprint(
     binding: &AccountBinding,
     id: i64,
 ) -> Result<FillFingerprint, LedgerError> {
-    crate::database::order_audit::validate_order_audit_chain(conn)?;
+    fingerprint_with_audit_guard(conn, binding, id, &mut V1AuditReplayGuard::default())
+}
+
+fn fingerprint_with_audit_guard(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+    id: i64,
+    audit_guard: &mut V1AuditReplayGuard,
+) -> Result<FillFingerprint, LedgerError> {
+    audit_guard.ensure_validated(conn)?;
     for row in events(conn, &binding.account_id)? {
         if let Fact::Order(order) = decode(&row.payload)? {
             if order.paper_trade_id == Some(id) && order.status == LedgerStatus::Filled {
@@ -358,16 +367,33 @@ pub(super) fn verify_ruling(
     seq: i64,
     previous: &str,
     fact: &AdjudicatedFact,
+    catalog_already_verified: bool,
+    audit_guard: Option<&mut V1AuditReplayGuard>,
     before: &Projection,
 ) -> Result<(), LedgerError> {
-    effective::verify_catalog(conn)?;
+    if !catalog_already_verified {
+        effective::verify_catalog(conn)?;
+    }
     let request = &fact.request;
     validate_fact_time(request)?;
     if request.binding != *binding
         || request.expected_version != seq - 1
         || request.expected_head != previous
-        || request.original != fingerprint(conn, binding, request.original.paper_trade_id)?
     {
+        return Err(LedgerError::IntegrityFailure(
+            "ruling binding/source/predecessor mismatch".into(),
+        ));
+    }
+    let original = match audit_guard {
+        Some(guard) => fingerprint_with_audit_guard(
+            conn,
+            binding,
+            request.original.paper_trade_id,
+            guard,
+        )?,
+        None => fingerprint(conn, binding, request.original.paper_trade_id)?,
+    };
+    if request.original != original {
         return Err(LedgerError::IntegrityFailure(
             "ruling binding/source/predecessor mismatch".into(),
         ));

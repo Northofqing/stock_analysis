@@ -3,6 +3,8 @@ use super::{
     NotificationService,
 };
 use crate::monitor::push_job::WeakOutcomeKind;
+use crate::notification::{FeishuHttpBodyObservation, WechatHttpBodyObservation};
+use sha2::{Digest, Sha256};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) enum ScriptedResponse {
     Http(&'static str),
+    Redirect(&'static str),
     Disconnect,
 }
 
@@ -125,6 +128,17 @@ fn spawn_webhook_fixture_with_lifetime(
                         .flush()
                         .map_err(|error| format!("flush fixture response: {error}"))?;
                 }
+                ScriptedResponse::Redirect(location) => {
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream
+                        .set_write_timeout(Some(remaining_until(deadline, "write redirect")?))
+                        .map_err(|error| format!("set redirect write timeout: {error}"))?;
+                    stream
+                        .write_all(response.as_bytes())
+                        .map_err(|error| format!("write fixture redirect: {error}"))?;
+                }
                 ScriptedResponse::Disconnect => {}
             }
         }
@@ -210,6 +224,7 @@ pub(crate) fn test_service(
         config,
         client: reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
             .build()
             .expect("build no-proxy test client"),
@@ -237,6 +252,40 @@ fn feishu_payload(request: &[u8]) -> serde_json::Value {
         .map(|position| position + 4)
         .expect("captured request must contain an HTTP body");
     serde_json::from_slice(&request[body_start..]).expect("Feishu request body must be JSON")
+}
+
+fn received_http_body(request: &[u8]) -> &[u8] {
+    let body_start = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("captured request must contain an HTTP body");
+    &request[body_start..]
+}
+
+fn received_body_sequence_sha256(requests: &[Vec<u8>], domain: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for request in requests {
+        let body = received_http_body(request);
+        hasher.update((body.len() as u64).to_be_bytes());
+        hasher.update(body);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn received_wechat_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+    received_body_sequence_sha256(
+        requests,
+        b"stock_analysis.wechat_http_entity_body_sequence.v1\0",
+    )
+}
+
+fn received_feishu_body_sequence_sha256(requests: &[Vec<u8>]) -> String {
+    received_body_sequence_sha256(
+        requests,
+        b"stock_analysis.feishu_http_entity_body_sequence.v1\0",
+    )
 }
 
 fn feishu_payload_content(request: &[u8]) -> String {
@@ -286,8 +335,49 @@ async fn custom_success_and_false_are_distinct_weak_observations() {
         ],
     );
     assert!(report.has_success());
+    assert_eq!(
+        report.attempts()[0]
+            .request_entity()
+            .unwrap()
+            .response_target_differs(),
+        Some(false)
+    );
     assert_eq!(accepted.finish().len(), 1);
     assert_eq!(declined.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn custom_redirect_is_unknown_and_does_not_send_second_request() {
+    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Redirect("/TEST_CODE_redirected")]);
+    let initial_url = fixture.url();
+    let service = NotificationService::new(NotificationConfig {
+        custom_webhook_urls: vec![initial_url.clone()],
+        ..NotificationConfig::default()
+    });
+
+    let report = service.send_report("TEST_CODE redirect").await;
+
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Custom, 0, WeakOutcomeKind::Unknown)],
+    );
+    let entity = report.attempts()[0].request_entity().unwrap();
+    assert!(entity.matches_custom_content("TEST_CODE redirect"));
+    assert_eq!(entity.response_target_differs(), Some(false));
+    let target_digest = |url: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"stock_analysis.notification_target_url.v1\0");
+        hasher.update(url.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(entity.target_sha256(), target_digest(&initial_url));
+    assert_eq!(
+        entity.response_url_sha256(),
+        Some(target_digest(&initial_url).as_str())
+    );
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(b"POST /TEST_CODE_fixture HTTP/1.1"));
 }
 
 #[tokio::test]
@@ -313,6 +403,11 @@ async fn custom_unknown_results_do_not_stop_later_targets_or_retry() {
         ],
     );
     assert!(!report.has_success());
+    assert!(report.attempts()[2]
+        .request_entity()
+        .unwrap()
+        .response_url_sha256()
+        .is_none());
     assert_eq!(declined.finish().len(), 1);
     assert_eq!(malformed.finish().len(), 1);
     assert_eq!(disconnected.finish().len(), 1);
@@ -365,10 +460,61 @@ async fn mixed_builtin_channels_keep_target_order_and_protocol_success() {
     assert!(report.has_success());
     assert_eq!(wechat.finish().len(), 1);
     assert_eq!(feishu.finish().len(), 1);
+    for (index, requests) in [
+        (2, dingtalk.finish()),
+        (3, slack.finish()),
+        (4, discord.finish()),
+    ] {
+        assert_eq!(requests.len(), 1);
+        let body = received_http_body(&requests[0]);
+        let mut digest = Sha256::new();
+        digest.update(b"stock_analysis.notification_http_entity.v1\0");
+        digest.update(body);
+        let entity = report.attempts()[index].request_entity().unwrap();
+        assert_eq!(entity.body_sha256(), format!("{:x}", digest.finalize()));
+        assert_eq!(entity.body_len(), body.len());
+        assert_eq!(entity.response_target_differs(), Some(false));
+    }
+    assert_eq!(custom.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn webhook_disconnects_retain_built_entities_without_response_targets() {
+    let dingtalk = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let slack = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let discord = spawn_webhook_fixture(vec![ScriptedResponse::Disconnect]);
+    let service = test_service(
+        NotificationConfig {
+            dingtalk_webhook_url: Some(dingtalk.url()),
+            slack_webhook_url: Some(slack.url()),
+            discord_webhook_url: Some(discord.url()),
+            ..NotificationConfig::default()
+        },
+        vec![
+            NotificationChannel::DingTalk,
+            NotificationChannel::Slack,
+            NotificationChannel::Discord,
+        ],
+    );
+
+    let report = service.send_report("TEST_CODE uncertain webhooks").await;
+
+    assert_attempts(
+        &report,
+        &[
+            (NotificationChannel::DingTalk, 0, WeakOutcomeKind::Unknown),
+            (NotificationChannel::Slack, 1, WeakOutcomeKind::Unknown),
+            (NotificationChannel::Discord, 2, WeakOutcomeKind::Unknown),
+        ],
+    );
+    for attempt in report.attempts() {
+        let entity = attempt.request_entity().unwrap();
+        assert!(entity.body_len() > 0);
+        assert!(entity.response_url_sha256().is_none());
+    }
     assert_eq!(dingtalk.finish().len(), 1);
     assert_eq!(slack.finish().len(), 1);
     assert_eq!(discord.finish().len(), 1);
-    assert_eq!(custom.finish().len(), 1);
 }
 
 #[tokio::test]
@@ -415,6 +561,85 @@ async fn wechat_partial_chunks_remain_one_unknown_target_for_false_and_error() {
 }
 
 #[tokio::test]
+async fn wechat_observation_matches_the_same_single_request_body_received_on_loopback() {
+    let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"errcode":0}"#)]);
+    let service = test_service(
+        NotificationConfig {
+            wechat_webhook_url: Some(fixture.url()),
+            wechat_max_bytes: 4_000,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Wechat],
+    );
+    let mut observation = WechatHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_wechat("TEST_CODE one request", &mut observation)
+        .await;
+    assert!(report.has_success());
+    let requests = fixture.finish();
+    let summary = observation.finish().expect("built WeChat request body");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(summary.request_count(), 1);
+    assert_eq!(
+        summary.total_body_bytes(),
+        received_http_body(&requests[0]).len()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_wechat_body_sequence_sha256(&requests)
+    );
+}
+
+#[tokio::test]
+async fn wechat_observation_keeps_both_sent_chunk_bodies_after_later_failure() {
+    let content = format!("TEST_CODE {}\n---\n{}", "A".repeat(120), "B".repeat(120));
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"errcode":0}"#),
+        ScriptedResponse::Http("TEST_CODE_INVALID_JSON"),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            wechat_webhook_url: Some(fixture.url()),
+            wechat_max_bytes: 220,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Wechat],
+    );
+    let mut observation = WechatHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_wechat(&content, &mut observation)
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Wechat, 0, WeakOutcomeKind::Unknown)],
+    );
+    let requests = fixture.finish();
+    let summary = observation
+        .finish()
+        .expect("both built WeChat chunk bodies");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(summary.request_count(), 2);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_wechat_body_sequence_sha256(&requests)
+    );
+    for (index, request) in requests.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(received_http_body(request)).unwrap();
+        assert!(body["markdown"]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("({}/2)", index + 1)));
+    }
+}
+
+#[tokio::test]
 async fn feishu_fallback_is_internal_to_one_observed_target() {
     let fallback_false = spawn_webhook_fixture(vec![
         ScriptedResponse::Http(r#"{"code":1}"#),
@@ -455,6 +680,105 @@ async fn feishu_fallback_is_internal_to_one_observed_target() {
         &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
     );
     assert_eq!(fallback_success.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn feishu_observation_matches_card_and_text_fallback_bodies_received_on_loopback() {
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"code":1}"#),
+        ScriptedResponse::Http(r#"{"code":0}"#),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: 20_000,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+    let mut wechat_observation = WechatHttpBodyObservation::default();
+    let mut feishu_observation = FeishuHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_http_bodies(
+            "TEST_CODE card fallback",
+            &mut wechat_observation,
+            &mut feishu_observation,
+        )
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Accepted)],
+    );
+    assert!(wechat_observation.finish().is_none());
+    let requests = fixture.finish();
+    let summary = feishu_observation.finish().expect("both Feishu bodies");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(feishu_payload(&requests[0])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[1])["msg_type"], "text");
+    assert_eq!(summary.request_count(), 2);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_feishu_body_sequence_sha256(&requests)
+    );
+}
+
+#[tokio::test]
+async fn feishu_observation_keeps_prior_chunk_and_fallback_bodies_after_parse_failure() {
+    let fixture = spawn_webhook_fixture(vec![
+        ScriptedResponse::Http(r#"{"code":0}"#),
+        ScriptedResponse::Http(r#"{"code":1}"#),
+        ScriptedResponse::Http("TEST_CODE_INVALID_JSON"),
+    ]);
+    let service = test_service(
+        NotificationConfig {
+            feishu_webhook_url: Some(fixture.url()),
+            feishu_max_bytes: 512,
+            ..NotificationConfig::default()
+        },
+        vec![NotificationChannel::Feishu],
+    );
+    let content = format!("TEST_CODE {}\n### \n", "A".repeat(600));
+    let mut wechat_observation = WechatHttpBodyObservation::default();
+    let mut feishu_observation = FeishuHttpBodyObservation::default();
+    let report = service
+        .send_report_observing_http_bodies(
+            &content,
+            &mut wechat_observation,
+            &mut feishu_observation,
+        )
+        .await;
+    assert_attempts(
+        &report,
+        &[(NotificationChannel::Feishu, 0, WeakOutcomeKind::Unknown)],
+    );
+    assert!(wechat_observation.finish().is_none());
+    let requests = fixture.finish();
+    let summary = feishu_observation
+        .finish()
+        .expect("all built Feishu bodies before the parse failure");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(feishu_payload(&requests[0])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[1])["msg_type"], "interactive");
+    assert_eq!(feishu_payload(&requests[2])["msg_type"], "text");
+    assert_eq!(summary.request_count(), 3);
+    assert_eq!(
+        summary.total_body_bytes(),
+        requests
+            .iter()
+            .map(|request| received_http_body(request).len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        summary.sequence_sha256(),
+        received_feishu_body_sequence_sha256(&requests)
+    );
 }
 
 #[tokio::test]

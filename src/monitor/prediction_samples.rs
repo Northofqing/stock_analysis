@@ -7,10 +7,19 @@ pub struct CandidateSampleFailure {
     pub error: String,
 }
 
+/// Identity of a prediction row actually committed by this save attempt.
+/// This is not evidence that the candidate card reached a physical sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedCandidateSample {
+    pub code: String,
+    pub prediction_row_id: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CandidateSampleSaveReport {
     pub attempted: usize,
     pub saved: usize,
+    pub saved_rows: Vec<SavedCandidateSample>,
     /// A failed worker may already have committed rows. Never claim they all failed.
     pub unknown: usize,
     pub failures: Vec<CandidateSampleFailure>,
@@ -18,7 +27,10 @@ pub struct CandidateSampleSaveReport {
 }
 impl CandidateSampleSaveReport {
     pub fn is_complete(&self) -> bool {
-        self.saved == self.attempted && self.failures.is_empty() && self.worker_error.is_none()
+        self.saved == self.attempted
+            && self.saved_rows.len() == self.saved
+            && self.failures.is_empty()
+            && self.worker_error.is_none()
     }
     pub fn log(&self) {
         if self.is_complete() {
@@ -40,7 +52,7 @@ pub fn save_candidate_samples(
         ..Default::default()
     };
     for (code, score) in samples {
-        match db.save_prediction(
+        match db.save_prediction_with_id(
             pred_date,
             target_date,
             None,
@@ -51,7 +63,13 @@ pub fn save_candidate_samples(
             None,
             None,
         ) {
-            Ok(()) => report.saved += 1,
+            Ok(prediction_row_id) => {
+                report.saved += 1;
+                report.saved_rows.push(SavedCandidateSample {
+                    code: code.clone(),
+                    prediction_row_id,
+                });
+            }
             Err(error) => report.failures.push(CandidateSampleFailure {
                 code: code.clone(),
                 error: error.to_string(),

@@ -4,8 +4,9 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use log::info;
+use std::path::Path;
 use stock_analysis::config;
-use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
+use stock_analysis::pipeline::{AnalysisPipeline, CliProducer, PipelineConfig};
 
 use crate::app::get_max_workers;
 use crate::cli::Args;
@@ -56,7 +57,9 @@ pub async fn run_analysis(
     } else {
         Some(macro_context.to_string())
     };
-    let outcome = pipeline.run(stock_codes, mc).await?;
+    let outcome = pipeline
+        .run_with_producer(stock_codes, mc, CliProducer::Default)
+        .await?;
     outcome.log_completion();
     let completion = outcome.ensure_cli_success();
     let results = outcome.results;
@@ -107,7 +110,14 @@ pub async fn run_market_review_only() -> Result<()> {
 
 /// 产业链联动分析模式：涨停池 → 概念聚类 → 产业链上下游定位（LLM）→ 报告 + 推送。
 pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
-    run_chain_analysis_mode_with_send_guard(send_notify, None, |_| Ok(())).await
+    run_chain_analysis_mode_with_observation_inner(
+        send_notify,
+        None,
+        |_| Ok(()),
+        Some(Path::new("reports/chain_cli_send_audit")),
+    )
+    .await?
+    .legacy_result
 }
 
 /// The scheduler uses the guard to record a durable attempt after the report is
@@ -118,64 +128,145 @@ pub async fn run_chain_analysis_mode_with_send_guard(
     scheduled_filename: Option<&str>,
     before_send: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
+    run_chain_analysis_mode_with_observation(send_notify, scheduled_filename, before_send)
+        .await?
+        .legacy_result
+}
+
+/// Data retained for a scheduled, read-only observation. It grants no delivery authority.
+pub(super) struct ChainDeliveryEnvelope {
+    pub prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    pub acquisition: Option<super::chain_acquisition::ChainAcquisitionEvidence>,
+    pub send_attempted: bool,
+    pub report_input: Vec<u8>,
+    pub notification_report: Option<stock_analysis::notification::NotificationSendReport>,
+    pub wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
+    pub feishu_http_body: Option<stock_analysis::notification::FeishuHttpBodySummary>,
+    pub suppression: Option<ChainSendSuppression>,
+    pub legacy_result: Result<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ChainSendSuppression {
+    NotificationDisabled,
+    NoConfiguredChannel,
+    BeforeSendRejected,
+}
+
+impl ChainSendSuppression {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotificationDisabled => "notification_disabled",
+            Self::NoConfiguredChannel => "no_configured_channel",
+            Self::BeforeSendRejected => "before_send_rejected",
+        }
+    }
+}
+
+struct ChainSendResult {
+    weak_completion: stock_analysis::notification::NotificationCompletion,
+    notification_report: Option<stock_analysis::notification::NotificationSendReport>,
+    wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
+    feishu_http_body: Option<stock_analysis::notification::FeishuHttpBodySummary>,
+}
+
+impl ChainSendResult {
+    fn from_report(
+        report: stock_analysis::notification::NotificationSendReport,
+        wechat_http_body: Option<stock_analysis::notification::WechatHttpBodySummary>,
+        feishu_http_body: Option<stock_analysis::notification::FeishuHttpBodySummary>,
+    ) -> Self {
+        Self {
+            weak_completion: report.completion(),
+            notification_report: Some(report),
+            wechat_http_body,
+            feishu_http_body,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_weak_result(weak_success: bool) -> Self {
+        Self::test_weak_completion(if weak_success {
+            stock_analysis::notification::NotificationCompletion::AllAccepted
+        } else {
+            stock_analysis::notification::NotificationCompletion::AllFailed
+        })
+    }
+
+    #[cfg(test)]
+    fn test_weak_completion(
+        weak_completion: stock_analysis::notification::NotificationCompletion,
+    ) -> Self {
+        Self {
+            weak_completion,
+            notification_report: None,
+            wechat_http_body: None,
+            feishu_http_body: None,
+        }
+    }
+}
+
+pub(super) async fn run_chain_analysis_mode_with_observation(
+    send_notify: bool,
+    scheduled_filename: Option<&str>,
+    before_send: impl FnOnce(&str) -> Result<()>,
+) -> Result<ChainDeliveryEnvelope> {
+    run_chain_analysis_mode_with_observation_inner(
+        send_notify,
+        scheduled_filename,
+        before_send,
+        None,
+    )
+    .await
+}
+
+async fn run_chain_analysis_mode_with_observation_inner(
+    send_notify: bool,
+    scheduled_filename: Option<&str>,
+    before_send: impl FnOnce(&str) -> Result<()>,
+    cli_audit_directory: Option<&Path>,
+) -> Result<ChainDeliveryEnvelope> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
     info!("模式: 产业链联动分析");
 
-    let observed_at = Local::now().naive_local();
-    let business_date = stock_analysis::calendar::latest_completed_trading_day_at(observed_at);
-
-    // 涨停池获取使用阻塞 HTTP 客户端，通过 spawn_blocking 离线程
-    let (_analyzer, limit_ups) = tokio::task::spawn_blocking(move || {
-        let analyzer = MarketAnalyzer::new(None)?;
-        let limit_ups = analyzer.get_limit_up_stocks(business_date)?;
-        Ok::<(MarketAnalyzer, Vec<_>), anyhow::Error>((analyzer, limit_ups))
-    })
-    .await??;
-    info!("今日涨停池共 {} 只", limit_ups.len());
-
     // 2026-08-06: 新闻收集 → AI 产业链分析。拉取主流快讯源今日新闻摘要,
     // 作为 LLM 产业链分析的宏背景 (macro_news)。任一源失败 → 显式 warn,
     // 不阻塞链分析 (聚类/落库照常, 仅 LLM 无新闻背景)。
-    use stock_analysis::data_gateway::{GatewayBatch, GlobalNewsGateway, GlobalNewsProvider};
-    let macro_news = match GlobalNewsGateway::new()
-        .global_news(GlobalNewsProvider::Cailianpress, 20)
-        .await
-    {
-        Ok(GatewayBatch::Available { records, .. }) if !records.is_empty() => {
-            info!("[产业链] 已收集 {} 条快讯进 LLM 背景", records.len());
-            Some(
-                records
-                    .iter()
-                    .take(15)
-                    .map(|r| r.title.clone())
-                    .collect::<Vec<_>>()
-                    .join("; "),
+    use stock_analysis::data_gateway::{GlobalNewsGateway, GlobalNewsProvider};
+    let observed_at = Local::now().fixed_offset();
+    let (prepared, acquisition) = super::chain_acquisition::prepare_with_acquisition(
+        observed_at,
+        |business_date| async move {
+            // The blocking gateway and its audit run once on their existing worker.
+            let observation = tokio::task::spawn_blocking(move || {
+                let analyzer = MarketAnalyzer::new(None)?;
+                analyzer.get_limit_up_observation(business_date)
+            })
+            .await??;
+            Ok(super::chain_acquisition::ChainLimitAcquisition::from_observation(observation))
+        },
+        || async {
+            GlobalNewsGateway::new()
+                .global_news(GlobalNewsProvider::Cailianpress, 20)
+                .await
+        },
+        |business_date, limit_ups, macro_news| async move {
+            stock_analysis::pipeline::chain_analysis::preparation::prepare_chain_analysis(
+                business_date,
+                limit_ups,
+                macro_news,
             )
-        }
-        Ok(GatewayBatch::Available { .. }) => {
-            log::warn!("[产业链] 快讯批次为空, LLM 无新闻背景");
-            None
-        }
-        Ok(GatewayBatch::VerifiedEmpty(evidence)) => {
-            log::warn!("[产业链] 快讯已验证为空: {:?}", evidence.batch_id);
-            None
-        }
-        Err(error) => {
-            log::warn!("[产业链] 快讯收集失败, LLM 无新闻背景: {error}");
-            None
-        }
-    };
-
-    let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(
-        business_date,
-        limit_ups,
-        macro_news,
+            .await
+        },
     )
     .await?;
+    let business_date = acquisition.business_date;
 
-    let notifier = NotificationService::from_env();
+    let notifier = std::sync::Arc::new(NotificationService::from_env());
+    let save_notifier = notifier.clone();
+    let available = notifier.is_available();
     // 文件名带时段: 9:05 盘前 (business_date=昨日) / 15:30 盘后 (当日) / CLI
     // 各时段独立文件, 避免 9:05 盘前报告覆盖昨日盘后报告 (2026-08-07 接入时间线)。
     let default_filename = format!(
@@ -184,42 +275,755 @@ pub async fn run_chain_analysis_mode_with_send_guard(
         chrono::Local::now().format("%H%M")
     );
     let filename = scheduled_filename.unwrap_or(&default_filename);
-    let path = notifier.save_report_to_file(&report, Some(filename))?;
-    info!("产业链联动分析报告已保存: {}", path);
-
-    if send_notify {
-        anyhow::ensure!(
-            notifier.is_available(),
-            "产业链联动分析报告没有可用通知渠道"
-        );
-        before_send(&path)?;
-        require_chain_notification_success(notifier.send(&report).await)?;
-    }
-    Ok(())
+    deliver_prepared(
+        prepared,
+        Some(acquisition),
+        move |report| save_notifier.save_report_to_file(report, Some(filename)),
+        available,
+        before_send,
+        move |report| {
+            Box::pin(async move {
+                let mut wechat_observation =
+                    stock_analysis::notification::WechatHttpBodyObservation::default();
+                let mut feishu_observation =
+                    stock_analysis::notification::FeishuHttpBodyObservation::default();
+                let result = notifier
+                    .send_report_observing_http_bodies(
+                        report,
+                        &mut wechat_observation,
+                        &mut feishu_observation,
+                    )
+                    .await;
+                Ok(ChainSendResult::from_report(
+                    result,
+                    wechat_observation.finish(),
+                    feishu_observation.finish(),
+                ))
+            })
+        },
+        send_notify,
+        cli_audit_directory,
+    )
+    .await
 }
 
-fn require_chain_notification_success(result: Result<bool>) -> Result<()> {
+async fn deliver_prepared<S, G, T>(
+    prepared: stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis,
+    acquisition: Option<super::chain_acquisition::ChainAcquisitionEvidence>,
+    save: S,
+    available: bool,
+    before_send: G,
+    send: T,
+    send_notify: bool,
+    cli_audit_directory: Option<&Path>,
+) -> Result<ChainDeliveryEnvelope>
+where
+    S: FnOnce(&str) -> Result<String>,
+    G: FnOnce(&str) -> Result<()>,
+    T: for<'a> FnOnce(&'a str) -> futures::future::LocalBoxFuture<'a, Result<ChainSendResult>>,
+{
+    let path = save(prepared.report())?;
+    info!("产业链联动分析报告已保存: {}", path);
+    let mut envelope = ChainDeliveryEnvelope {
+        report_input: prepared.report().as_bytes().to_vec(),
+        prepared,
+        acquisition,
+        send_attempted: false,
+        notification_report: None,
+        wechat_http_body: None,
+        feishu_http_body: None,
+        suppression: (!send_notify).then_some(ChainSendSuppression::NotificationDisabled),
+        legacy_result: Ok(()),
+    };
+    if send_notify {
+        if !available {
+            envelope.suppression = Some(ChainSendSuppression::NoConfiguredChannel);
+            envelope.legacy_result = Err(anyhow::anyhow!("产业链联动分析报告没有可用通知渠道"));
+        } else if let Err(error) = before_send(&path) {
+            envelope.suppression = Some(ChainSendSuppression::BeforeSendRejected);
+            envelope.legacy_result = Err(error);
+        } else {
+            let pending = if let Some(directory) = cli_audit_directory {
+                match super::chain_cli_send_audit::begin(
+                    &envelope.prepared,
+                    &envelope.report_input,
+                    directory,
+                ) {
+                    Ok(pending) => Some(pending),
+                    Err(error) => {
+                        envelope.suppression = Some(ChainSendSuppression::BeforeSendRejected);
+                        envelope.legacy_result =
+                            Err(error.context("产业链 CLI 通知意图未持久化，未启动渠道发送"));
+                        return Ok(envelope);
+                    }
+                }
+            } else {
+                None
+            };
+            envelope.send_attempted = true;
+            envelope.legacy_result = match send(envelope.prepared.report()).await {
+                Ok(sent) => {
+                    envelope.notification_report = sent.notification_report;
+                    envelope.wechat_http_body = sent.wechat_http_body;
+                    envelope.feishu_http_body = sent.feishu_http_body;
+                    require_chain_notification_success(Ok(sent.weak_completion))
+                }
+                Err(error) => require_chain_notification_success(Err(error)),
+            };
+            if let (Some(pending), Some(report)) = (pending, envelope.notification_report.as_ref())
+            {
+                if let Err(error) = pending.observe(&envelope.report_input, report) {
+                    envelope.legacy_result =
+                        Err(error
+                            .context("产业链 CLI 通知已尝试发送，但弱结果未持久化；物理结果未知"));
+                }
+            }
+        }
+    }
+    Ok(envelope)
+}
+
+fn require_chain_notification_success(
+    result: Result<stock_analysis::notification::NotificationCompletion>,
+) -> Result<()> {
     match result.context("产业链联动分析报告推送异常")? {
-        true => {
-            info!("产业链联动分析报告已推送");
+        stock_analysis::notification::NotificationCompletion::AllAccepted => {
+            info!("产业链联动分析报告所有目标均本地弱接受");
             Ok(())
         }
-        false => anyhow::bail!("产业链联动分析报告推送失败（所有渠道均未成功）"),
+        stock_analysis::notification::NotificationCompletion::Partial => {
+            anyhow::bail!("产业链联动分析报告部分渠道弱接受，其余结果未知；需人工裁定")
+        }
+        stock_analysis::notification::NotificationCompletion::AllFailed => {
+            anyhow::bail!("产业链联动分析报告推送失败（所有渠道均未成功）")
+        }
+        stock_analysis::notification::NotificationCompletion::NoTargets => {
+            anyhow::bail!("产业链联动分析报告没有通知目标")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests_chain_delivery {
-    use super::require_chain_notification_success;
+    use super::{
+        deliver_prepared, require_chain_notification_success, ChainDeliveryEnvelope,
+        ChainSendResult, ChainSendSuppression,
+    };
+    use crate::app::chain_schedule::{
+        finish_scheduled_delivery, ChainPhase, ChainScheduleStatus, ChainScheduleStore,
+    };
+    use crate::app::chain_shadow_input::{
+        observe, observe_prepared_decision, test_prepared, ChainGateCapture, ChainPreparedDecision,
+    };
+    use chrono::{DateTime, NaiveDate};
+    use sha2::{Digest, Sha256};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     #[test]
     fn chain_send_rejects_weak_failure() {
-        assert!(require_chain_notification_success(Ok(true)).is_ok());
-        assert!(require_chain_notification_success(Ok(false)).is_err());
+        use stock_analysis::notification::NotificationCompletion;
+        assert!(
+            require_chain_notification_success(Ok(NotificationCompletion::AllAccepted)).is_ok()
+        );
+        assert!(require_chain_notification_success(Ok(NotificationCompletion::Partial)).is_err());
+        assert!(require_chain_notification_success(Ok(NotificationCompletion::AllFailed)).is_err());
+        assert_eq!(
+            require_chain_notification_success(Ok(NotificationCompletion::NoTargets))
+                .unwrap_err()
+                .to_string(),
+            "产业链联动分析报告没有通知目标"
+        );
         assert!(
             require_chain_notification_success(Err(anyhow::anyhow!("TEST_CODE_SEND_DOWN")))
                 .is_err()
         );
+    }
+
+    fn ready_gate(phase: ChainPhase, date: NaiveDate) -> ChainGateCapture {
+        let at = match phase {
+            ChainPhase::Preopen => "09:05:00",
+            ChainPhase::Postclose => "15:30:00",
+        };
+        ChainGateCapture::new(
+            phase,
+            date,
+            DateTime::parse_from_rfc3339(&format!("{date}T{at}+08:00")).unwrap(),
+            true,
+            ChainScheduleStatus::Ready,
+        )
+    }
+
+    async fn scripted_delivery(
+        guard_ok: bool,
+        send_ok: bool,
+        observer_ok: bool,
+    ) -> (Vec<&'static str>, String, Vec<u8>, bool, bool) {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let preparations = Rc::new(Cell::new(0));
+        let prepared = test_prepared(date, preparations.clone()).await;
+        let expected_report = prepared.report().to_owned();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            {
+                let events = events.clone();
+                let saved = saved.clone();
+                move |report| {
+                    events.borrow_mut().push("save");
+                    saved.borrow_mut().extend_from_slice(report.as_bytes());
+                    Ok("test-report.md".into())
+                }
+            },
+            true,
+            {
+                let events = events.clone();
+                move |_| {
+                    events.borrow_mut().push("guard");
+                    if guard_ok {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("guard failed")
+                    }
+                }
+            },
+            {
+                let events = events.clone();
+                let sent = sent.clone();
+                move |report| {
+                    Box::pin(async move {
+                        events.borrow_mut().push("send");
+                        sent.borrow_mut().extend_from_slice(report.as_bytes());
+                        Ok(ChainSendResult::test_weak_result(send_ok))
+                    })
+                }
+            },
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preparations.get(), 1);
+        assert_eq!(&*saved.borrow(), expected_report.as_bytes());
+        let attempted = envelope.send_attempted;
+        assert_eq!(
+            envelope.suppression,
+            (!guard_ok).then_some(ChainSendSuppression::BeforeSendRejected)
+        );
+        assert!(envelope.notification_report.is_none());
+        assert!(envelope.wechat_http_body.is_none());
+        assert!(envelope.feishu_http_body.is_none());
+        assert_eq!(&envelope.report_input, &*saved.borrow());
+        if envelope.send_attempted {
+            assert_eq!(&envelope.report_input, &*sent.borrow());
+        }
+        let result = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            &ready_gate(ChainPhase::Postclose, date),
+            {
+                let events = events.clone();
+                move || {
+                    events.borrow_mut().push("mark");
+                    Ok(())
+                }
+            },
+            {
+                let events = events.clone();
+                move |phase, date, prepared, report_input, acquisition| {
+                    events.borrow_mut().push("observe");
+                    if observer_ok {
+                        observe(phase, date, prepared, report_input, acquisition)
+                    } else {
+                        anyhow::bail!("observer failed")
+                    }
+                }
+            },
+        );
+        let events = events.borrow().clone();
+        let sent = sent.borrow().clone();
+        (events, expected_report, sent, attempted, result.is_ok())
+    }
+
+    #[tokio::test]
+    async fn one_preparation_and_exact_order_and_report_bytes() {
+        let (events, report, sent, attempted, success) = scripted_delivery(true, true, true).await;
+        assert_eq!(events, ["save", "guard", "send", "mark", "observe"]);
+        assert_eq!(sent, report.as_bytes());
+        assert!(attempted && success);
+    }
+
+    #[tokio::test]
+    async fn send_failure_and_guard_rejection_both_observe_prepared_input() {
+        let (events, _, _, attempted, success) = scripted_delivery(true, false, true).await;
+        assert_eq!(events, ["save", "guard", "send", "observe"]);
+        assert!(attempted && !success);
+        let (events, _, sent, attempted, success) = scripted_delivery(false, true, true).await;
+        assert_eq!(events, ["save", "guard", "observe"]);
+        assert!(sent.is_empty() && !attempted && !success);
+    }
+
+    #[tokio::test]
+    async fn partial_weak_acceptance_keeps_scheduled_attempt_uncertain() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let phase = ChainPhase::Postclose;
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ChainScheduleStore::new(directory.path().join("chain.sqlite3"));
+        let attempt_no = Cell::new(0);
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |path| {
+                attempt_no.set(store.begin_send(phase, date, path)?);
+                Ok(())
+            },
+            |_| {
+                Box::pin(async {
+                    Ok(ChainSendResult::test_weak_completion(
+                        stock_analysis::notification::NotificationCompletion::Partial,
+                    ))
+                })
+            },
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        let result = finish_scheduled_delivery(
+            envelope,
+            phase,
+            date,
+            &ready_gate(phase, date),
+            || store.mark_weak_accepted(phase, date, attempt_no.get()),
+            |observed_phase, observed_date, prepared, input, acquisition| {
+                let _ = observe(observed_phase, observed_date, prepared, input, acquisition)?;
+                anyhow::bail!("post-send observation unavailable")
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("部分渠道弱接受"));
+        let (status, evidence) = store.inspect(phase, date).unwrap();
+        assert_eq!(status, ChainScheduleStatus::Uncertain);
+        assert_eq!(evidence.unwrap().state, "sending");
+        assert!(store.begin_send(phase, date, "retry.md").is_err());
+    }
+
+    #[tokio::test]
+    async fn observer_failure_preserves_legacy_success_and_failure() {
+        let (events, _, _, _, success) = scripted_delivery(true, true, false).await;
+        assert_eq!(events, ["save", "guard", "send", "mark", "observe"]);
+        assert!(success);
+        let (events, _, _, _, success) = scripted_delivery(true, false, false).await;
+        assert_eq!(events, ["save", "guard", "send", "observe"]);
+        assert!(!success);
+        let (events, _, _, attempted, success) = scripted_delivery(false, true, false).await;
+        assert_eq!(events, ["save", "guard", "observe"]);
+        assert!(!attempted && !success);
+    }
+
+    #[tokio::test]
+    async fn decision_binding_failure_after_send_cannot_change_mark_or_legacy_result() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let wrong_gate = ready_gate(ChainPhase::Preopen, date);
+        let input = observe(
+            ChainPhase::Postclose,
+            date,
+            &prepared,
+            prepared.report().as_bytes(),
+            None,
+        )
+        .unwrap();
+        assert!(observe_prepared_decision(
+            &wrong_gate,
+            ChainPreparedDecision {
+                input: &input,
+                suppression: None,
+                send_attempted: true,
+                report_observed: false,
+                send_id: None,
+                targets: &[],
+                mark_attempted: true,
+                legacy_succeeded: true,
+            },
+        )
+        .is_err());
+        let envelope = ChainDeliveryEnvelope {
+            report_input: prepared.report().as_bytes().to_vec(),
+            prepared,
+            acquisition: None,
+            send_attempted: true,
+            notification_report: None,
+            wechat_http_body: None,
+            feishu_http_body: None,
+            suppression: None,
+            legacy_result: Ok(()),
+        };
+        let events = RefCell::new(Vec::new());
+        let result = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            &wrong_gate,
+            || {
+                events.borrow_mut().push("mark");
+                Ok(())
+            },
+            |phase, date, prepared, report, acquisition| {
+                events.borrow_mut().push("observe");
+                observe(phase, date, prepared, report, acquisition)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            crate::app::chain_schedule::ChainScheduleOutcome::WeakAccepted
+        );
+        assert_eq!(&*events.borrow(), &["mark", "observe"]);
+    }
+
+    #[tokio::test]
+    async fn no_channel_suppression_observes_exact_prepared_bytes_for_both_phases() {
+        let business_date = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let schedule_date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        for phase in [ChainPhase::Preopen, ChainPhase::Postclose] {
+            let preparations = Rc::new(Cell::new(0));
+            let prepared = test_prepared(business_date, preparations.clone()).await;
+            let exact_report = prepared.report().as_bytes().to_vec();
+            let envelope = deliver_prepared(
+                prepared,
+                None,
+                |_| Ok("test-report.md".to_owned()),
+                false,
+                |_| panic!("no channel must not invoke the send guard"),
+                |_| panic!("no channel must not invoke a sender"),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                envelope.suppression,
+                Some(ChainSendSuppression::NoConfiguredChannel)
+            );
+            assert!(!envelope.send_attempted);
+            let error = finish_scheduled_delivery(
+                envelope,
+                phase,
+                schedule_date,
+                &ready_gate(phase, schedule_date),
+                || panic!("suppressed delivery must not mark weak acceptance"),
+                |observed_phase, observed_date, prepared, input, acquisition| {
+                    assert_eq!(observed_phase, phase);
+                    assert_eq!(observed_date, schedule_date);
+                    assert_eq!(prepared.business_date(), business_date);
+                    assert_eq!(input, exact_report);
+                    assert!(acquisition.is_none());
+                    let observed =
+                        observe(observed_phase, observed_date, prepared, input, acquisition)?;
+                    assert!(observed.prepared_report_equals_input);
+                    assert_eq!(
+                        observed.report_input_sha256,
+                        format!("{:x}", Sha256::digest(input))
+                    );
+                    Ok(observed)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "产业链联动分析报告没有可用通知渠道");
+            assert_eq!(preparations.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_weak_mark_is_observed_without_changing_its_error() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let envelope = ChainDeliveryEnvelope {
+            report_input: prepared.report().as_bytes().to_vec(),
+            prepared,
+            acquisition: None,
+            send_attempted: true,
+            notification_report: None,
+            wechat_http_body: None,
+            feishu_http_body: None,
+            suppression: None,
+            legacy_result: Ok(()),
+        };
+        let events = RefCell::new(Vec::new());
+        let error = finish_scheduled_delivery(
+            envelope,
+            ChainPhase::Postclose,
+            date,
+            &ready_gate(ChainPhase::Postclose, date),
+            || {
+                events.borrow_mut().push("mark");
+                anyhow::bail!("weak mark failed")
+            },
+            |phase, date, prepared, input, acquisition| {
+                events.borrow_mut().push("observe");
+                observe(phase, date, prepared, input, acquisition)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(&*events.borrow(), &["mark", "observe"]);
+        assert_eq!(error.to_string(), "weak mark failed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_disabled_channels_keep_distinct_no_send_reasons() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        for (send_notify, available, expected) in [
+            (true, false, ChainSendSuppression::NoConfiguredChannel),
+            (false, true, ChainSendSuppression::NotificationDisabled),
+        ] {
+            let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+            let envelope = deliver_prepared(
+                prepared,
+                None,
+                |_| Ok("test-report.md".to_owned()),
+                available,
+                |_| panic!("no-send path must not invoke the guard"),
+                |_| panic!("no-send path must not invoke a channel"),
+                send_notify,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(envelope.suppression, Some(expected));
+            assert!(!envelope.send_attempted);
+            assert!(envelope.notification_report.is_none());
+            assert!(envelope.wechat_http_body.is_none());
+            assert!(envelope.feishu_http_body.is_none());
+            assert_eq!(envelope.legacy_result.is_ok(), !send_notify);
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_send_report_is_retained_without_changing_weak_failure() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let config = stock_analysis::notification::NotificationConfig {
+            email_sender: Some("TEST_CODE_sender@example.invalid".to_owned()),
+            email_password: Some("TEST_CODE_password".to_owned()),
+            ..Default::default()
+        };
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            move |report| {
+                Box::pin(async move {
+                    // Missing SMTP configuration fails before any archive or network call.
+                    let notifier = stock_analysis::notification::NotificationService::new(config);
+                    Ok(ChainSendResult::from_report(
+                        notifier.send_report(report).await,
+                        None,
+                        None,
+                    ))
+                })
+            },
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        assert!(envelope.suppression.is_none());
+        assert!(envelope.wechat_http_body.is_none());
+        assert!(envelope.feishu_http_body.is_none());
+        let report = envelope.notification_report.unwrap();
+        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(
+            report.attempts()[0].channel(),
+            stock_analysis::notification::NotificationChannel::Email
+        );
+        assert_eq!(
+            report.attempts()[0].outcome(),
+            stock_analysis::monitor::push_job::WeakOutcomeKind::Unknown
+        );
+        assert_eq!(
+            envelope.legacy_result.unwrap_err().to_string(),
+            "产业链联动分析报告推送失败（所有渠道均未成功）"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_chain_intent_precedes_send_and_binds_weak_result() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let prepared = test_prepared(date, Rc::new(Cell::new(0))).await;
+        let audit_root = tempfile::tempdir().unwrap();
+        let audit_dir = audit_root.path().join("chain_cli_send_audit");
+        let send_dir = audit_dir.clone();
+        let config = stock_analysis::notification::NotificationConfig {
+            email_sender: Some("TEST_CODE_sender@example.invalid".to_owned()),
+            email_password: Some("TEST_CODE_password".to_owned()),
+            ..Default::default()
+        };
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            move |report| {
+                Box::pin(async move {
+                    let intent_path = std::fs::read_dir(&send_dir)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+                    assert_eq!(
+                        intent["report_sha256"],
+                        format!("{:x}", Sha256::digest(report.as_bytes()))
+                    );
+                    let notifier = stock_analysis::notification::NotificationService::new(config);
+                    Ok(ChainSendResult::from_report(
+                        notifier.send_report(report).await,
+                        None,
+                        None,
+                    ))
+                })
+            },
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        let report = envelope.notification_report.as_ref().unwrap();
+        assert_eq!(report.attempts().len(), 1);
+        let paths = std::fs::read_dir(&audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        let intent_path = paths
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".intent.json"))
+            .unwrap();
+        let observation_path = paths
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".observation.json"))
+            .unwrap();
+        let intent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+        let observation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(observation_path).unwrap()).unwrap();
+        assert_eq!(intent["notification_id"], observation["notification_id"]);
+        assert_eq!(intent["invocation_id"], observation["invocation_id"]);
+        assert_eq!(intent["report_sha256"], observation["report_sha256"]);
+        assert_eq!(observation["send_id"], report.send_id());
+        assert_eq!(observation["attempts"][0]["outcome"], "unknown");
+        assert!(envelope.legacy_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cli_chain_intent_failure_prevents_send() {
+        let prepared = test_prepared(
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            Rc::new(Cell::new(0)),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let audit_dir = blocked.join("audit");
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            |_| panic!("undurable intent must prevent physical send"),
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(!envelope.send_attempted);
+        assert_eq!(
+            envelope.suppression,
+            Some(ChainSendSuppression::BeforeSendRejected)
+        );
+        assert!(envelope
+            .legacy_result
+            .unwrap_err()
+            .to_string()
+            .contains("通知意图未持久化"));
+    }
+
+    #[tokio::test]
+    async fn cli_chain_observation_collision_leaves_sent_attempt_unknown() {
+        let prepared = test_prepared(
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            Rc::new(Cell::new(0)),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let audit_dir = root.path().join("audit");
+        let send_dir = audit_dir.clone();
+        let envelope = deliver_prepared(
+            prepared,
+            None,
+            |_| Ok("test-report.md".to_owned()),
+            true,
+            |_| Ok(()),
+            move |_| {
+                Box::pin(async move {
+                    let intent_path = std::fs::read_dir(&send_dir)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(intent_path).unwrap()).unwrap();
+                    let key = intent["notification_id"].as_str().unwrap();
+                    std::fs::write(
+                        send_dir.join(format!("{key}.observation.json")),
+                        b"collision",
+                    )
+                    .unwrap();
+                    Ok(ChainSendResult::from_report(
+                        stock_analysis::notification::NotificationSendReport::default(),
+                        None,
+                        None,
+                    ))
+                })
+            },
+            true,
+            Some(&audit_dir),
+        )
+        .await
+        .unwrap();
+        assert!(envelope.send_attempted);
+        assert!(envelope.notification_report.is_some());
+        assert!(envelope
+            .legacy_result
+            .unwrap_err()
+            .to_string()
+            .contains("弱结果未持久化"));
+        let collision = std::fs::read_dir(&audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".observation.json"))
+            .unwrap();
+        assert_eq!(std::fs::read(collision).unwrap(), b"collision");
     }
 }
 
@@ -331,7 +1135,9 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
         dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
     let pipeline = AnalysisPipeline::new(config)?;
-    let outcome = pipeline.run(&stock_codes, None).await?;
+    let outcome = pipeline
+        .run_with_producer(&stock_codes, None, CliProducer::Lhb)
+        .await?;
     outcome.log_completion();
     let completion = outcome.ensure_cli_success();
     let results = outcome.results;

@@ -35,6 +35,8 @@ enum Direction {
     Down,
     Neutral,
 }
+const DIRECTION_MOVE_THRESHOLD_PERCENT: f64 = 0.5;
+
 fn direction(value: &str) -> Result<Direction, String> {
     match value.trim().to_lowercase().as_str() {
         "up" | "bullish" | "long" | "看多" | "上涨" => Ok(Direction::Up),
@@ -93,9 +95,9 @@ fn verify_exact(
         return Err("累计收益不符合有限数/非负价格合同".into());
     }
     let hit = match direction {
-        Direction::Up => actual_change > 0.5,
-        Direction::Down => actual_change < -0.5,
-        Direction::Neutral => false,
+        Direction::Up => actual_change > DIRECTION_MOVE_THRESHOLD_PERCENT,
+        Direction::Down => actual_change < -DIRECTION_MOVE_THRESHOLD_PERCENT,
+        Direction::Neutral => actual_change.abs() <= DIRECTION_MOVE_THRESHOLD_PERCENT,
     };
     Ok(Some(VerifyOutcome { actual_change, hit }))
 }

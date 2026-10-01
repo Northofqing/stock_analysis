@@ -7,7 +7,10 @@ use crate::chart_generator::ChartGenerator;
 use crate::notification::NotificationService;
 use crate::strategy::core::BacktestSummary;
 
-use super::{reporting, AnalysisNotification, AnalysisResult, SummaryCompletion};
+use super::{
+    reporting, AnalysisNotification, AnalysisResult, CliInvocationIdentity, CliReportSnapshot,
+    SummaryCompletion,
+};
 
 struct SummaryArtifacts {
     report: String,
@@ -48,6 +51,7 @@ pub(super) async fn send_summary_notification(
     backtest_summary: Option<&BacktestSummary>,
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
+    invocation: &CliInvocationIdentity,
 ) -> SummaryCompletion {
     send_summary_notification_to(
         notifier,
@@ -56,6 +60,7 @@ pub(super) async fn send_summary_notification(
         regime_section,
         chain_analysis_section,
         Path::new("reports"),
+        invocation,
     )
     .await
 }
@@ -67,8 +72,10 @@ pub(super) async fn send_summary_notification_to(
     regime_section: Option<&str>,
     chain_analysis_section: Option<&str>,
     output_dir: &Path,
+    invocation: &CliInvocationIdentity,
 ) -> SummaryCompletion {
     let mut outcome = SummaryCompletion {
+        business_identity: Some(invocation.summary_business()),
         notification: AnalysisNotification::NotAttempted,
         ..Default::default()
     };
@@ -125,7 +132,43 @@ pub(super) async fn send_summary_notification_to(
         .saved_paths
         .push(output_dir.join(&artifacts.filename));
 
-    let delivery = notifier.send_report(&artifacts.report).await;
+    let snapshot = CliReportSnapshot::new(invocation.summary_notification(), artifacts.report);
+    outcome.report_snapshot = Some(snapshot);
+    outcome.notification = AnalysisNotification::Unknown("发送已开始，尚无完整返回".into());
+    let sent = super::cli_target_receipt::send_cli_report_audited(
+        notifier,
+        outcome.report_snapshot.as_ref().expect("just set").clone(),
+        &output_dir.join("cli_send_audit"),
+    )
+    .await;
+    let sent = match sent {
+        Ok(sent) => sent,
+        Err(super::cli_target_receipt::CliAuditSendError::BeforeSend(error)) => {
+            outcome.notification = AnalysisNotification::NotAttempted;
+            outcome.failure = Some(format!("CLI 发送前意图落盘失败: {error:#}"));
+            error!("{}", outcome.failure.as_deref().unwrap());
+            return outcome;
+        }
+        Err(super::cli_target_receipt::CliAuditSendError::AfterSend(error)) => {
+            outcome.failure = Some(format!("CLI 发送后弱观察落盘失败: {error:#}"));
+            error!(
+                "{}；结果未知，不自动重发",
+                outcome.failure.as_deref().unwrap()
+            );
+            return outcome;
+        }
+    };
+    if sent.has_custom_attempts() {
+        let directory = output_dir.join("cli_target_receipts");
+        if let Err(error) =
+            super::cli_target_receipt::persist_custom_target_receipts(&sent, &directory)
+        {
+            let failure = format!("Custom 逐目标弱回执落盘失败: {error:#}");
+            error!("{}；不自动重发", failure);
+            outcome.failure = Some(failure);
+        }
+    }
+    let delivery = sent.into_report();
     match delivery.completion() {
         crate::notification::NotificationCompletion::AllAccepted => {
             info!("✓ 股票分析报告全部渠道弱接受")
@@ -257,6 +300,7 @@ mod tests {
         let notifier = crate::notification::NotificationService::new(Default::default());
         let value = result();
         let summary = backtest();
+        let invocation = super::CliInvocationIdentity::new(super::super::CliProducer::Direct);
 
         let outcome = send_summary_notification_to(
             &notifier,
@@ -265,6 +309,7 @@ mod tests {
             Some("TEST_CODE_市场状态"),
             Some("TEST_CODE_产业链"),
             &output_dir,
+            &invocation,
         )
         .await;
         assert_eq!(
@@ -273,6 +318,26 @@ mod tests {
         );
         assert!(outcome.notification.ensure_cli_success().is_err());
         assert_eq!(outcome.saved_paths.len(), 2);
+        assert_eq!(
+            outcome.business_identity.as_ref().unwrap().invocation(),
+            &invocation
+        );
+        let snapshot = outcome.report_snapshot.as_ref().expect("summary snapshot");
+        assert_eq!(snapshot.identity().invocation(), &invocation);
+        let summary_path = outcome
+            .saved_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stock_analysis_")
+            })
+            .expect("saved summary path");
+        assert_eq!(
+            std::fs::read(summary_path).expect("saved summary"),
+            snapshot.report_bytes().as_bytes()
+        );
 
         let names = std::fs::read_dir(&output_dir)
             .expect("summary output directory")
@@ -291,5 +356,55 @@ mod tests {
         // Chart rendering is intentionally best-effort (for example a CI host may
         // not have a CJK font); mandatory Markdown artifacts must still commit.
         std::fs::remove_dir_all(output_dir).expect("remove isolated summary artifacts");
+    }
+
+    #[tokio::test]
+    async fn summary_receipt_write_failure_keeps_one_physical_send_and_reports_error() {
+        use crate::notification::send_report_tests::{
+            spawn_webhook_fixture, test_service, ScriptedResponse,
+        };
+        use crate::notification::{NotificationChannel, NotificationConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("cli_target_receipts"),
+            b"block directory",
+        )
+        .unwrap();
+        let fixture = spawn_webhook_fixture(vec![ScriptedResponse::Http(r#"{"ok":true}"#)]);
+        let notifier = test_service(
+            NotificationConfig {
+                custom_webhook_urls: vec![fixture.url()],
+                ..NotificationConfig::default()
+            },
+            vec![NotificationChannel::Custom],
+        );
+        let invocation = super::CliInvocationIdentity::new(super::super::CliProducer::Direct);
+        let outcome = send_summary_notification_to(
+            &notifier,
+            &[result()],
+            None,
+            None,
+            None,
+            directory.path(),
+            &invocation,
+        )
+        .await;
+        assert_eq!(fixture.finish().len(), 1);
+        assert!(outcome
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("弱回执落盘失败"));
+        assert_eq!(
+            outcome.notification.completion(),
+            Some(crate::notification::NotificationCompletion::AllAccepted)
+        );
+        assert!(crate::pipeline::AnalysisRunReport {
+            summary: outcome,
+            ..Default::default()
+        }
+        .ensure_cli_success()
+        .is_err());
     }
 }

@@ -1,8 +1,9 @@
 //! Fixed in-memory preparation of the actual chain report. This is not a durable checkpoint.
 
 use anyhow::Result;
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -328,6 +329,24 @@ pub struct SourceObservation {
 }
 
 impl SourceObservation {
+    /// This is a content-addressed local projection, not a broker snapshot or
+    /// an upstream batch. `source_at` stays absent because the open-row query
+    /// supplies no single authoritative source timestamp.
+    pub(super) fn local_positions(positions: &[PositionInput], observed_at: DateTime<Utc>) -> Self {
+        Self {
+            status: if positions.is_empty() {
+                SourceStatus::VerifiedEmpty
+            } else {
+                SourceStatus::Available
+            },
+            batch_id: Some(format!("sha256:{}", position_projection_sha256(positions))),
+            provider: Some(crate::market_domain::ProviderId::LocalAnalysis),
+            source: Some(LOCAL_POSITIONS_SOURCE.into()),
+            observed_at: Some(observed_at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+            ..Self::unknown()
+        }
+    }
+
     pub(crate) fn from_batch_for_request(
         status: SourceStatus,
         evidence: BatchEvidence,
@@ -438,6 +457,366 @@ impl PositionInput {
     }
 }
 
+const LOCAL_POSITIONS_SOURCE: &str =
+    "local:stock_position/open/buy_date_desc/chain_consumed_projection/sha256-v1";
+
+/// The domain tag and length-delimited fields bind the ordered rows actually
+/// used by this report. Float bits preserve distinct finite values, including
+/// `-0.0`; no raw position field is written to diagnostic logs.
+fn position_projection_sha256(positions: &[PositionInput]) -> String {
+    fn text_field(hash: &mut Sha256, value: &str) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+
+    let mut hash = Sha256::new();
+    hash.update(b"chain-consumed-stock-position-projection-v1\0");
+    hash.update((positions.len() as u64).to_be_bytes());
+    for position in positions {
+        text_field(&mut hash, &position.code);
+        text_field(&mut hash, &position.name);
+        match position.return_rate {
+            Some(rate) => {
+                hash.update([1]);
+                hash.update(rate.to_bits().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Requested position-code projection from one cache read and its completed
+/// tool writes. This is protected artifact material, not upstream admission.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptProjectionObservation {
+    requested_codes: Vec<String>,
+    cache_cutoff_local: String,
+    cache_observed_at_utc: String,
+    concepts: BTreeMap<String, Vec<String>>,
+    sources: BTreeMap<String, ConceptProjectionOrigin>,
+    successful_writes: Vec<ConceptProjectionWrite>,
+    completion: ConceptProjectionCompletion,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConceptProjectionOrigin {
+    LocalCache {
+        updated_at_local: String,
+        concepts_json_sha256: String,
+    },
+    ToolResponse(ConceptToolObservation),
+    LegacyToolProjection {
+        raw_response_sha256: String,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptToolObservation {
+    requested_code: String,
+    all_boards: Vec<String>,
+    board_count: usize,
+    provider_label: String,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+    raw_response_sha256: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptProjectionWrite {
+    code: String,
+    boards: Vec<String>,
+    origin: ConceptProjectionOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConceptProjectionCompletion {
+    Complete { content_sha256: String },
+    Incomplete { reason: String },
+}
+
+impl ConceptProjectionObservation {
+    pub fn requested_codes(&self) -> &[String] {
+        &self.requested_codes
+    }
+    pub fn cache_cutoff_local(&self) -> &str {
+        &self.cache_cutoff_local
+    }
+    pub fn cache_observed_at_utc(&self) -> &str {
+        &self.cache_observed_at_utc
+    }
+    pub fn concepts(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.concepts
+    }
+    pub fn sources(&self) -> &BTreeMap<String, ConceptProjectionOrigin> {
+        &self.sources
+    }
+    pub fn successful_writes(&self) -> &[ConceptProjectionWrite] {
+        &self.successful_writes
+    }
+    pub fn completion(&self) -> &ConceptProjectionCompletion {
+        &self.completion
+    }
+
+    fn matches_legacy_projection(
+        &self,
+        requested_codes: &[String],
+        legacy: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let requested = requested_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.requested_codes.as_slice() == requested_codes
+            && self.concepts.len() == requested.len()
+            && self.sources.len() == requested.len()
+            && requested.iter().all(|code| {
+                self.concepts
+                    .get(*code)
+                    .is_some_and(|boards| legacy.get(*code) == Some(boards))
+                    && self.sources.contains_key(*code)
+            })
+    }
+
+    fn valid_complete_projection(
+        &self,
+        requested_codes: &[String],
+        legacy: &BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let ConceptProjectionCompletion::Complete { content_sha256 } = &self.completion else {
+            return false;
+        };
+        if requested_codes.is_empty()
+            || !self.matches_legacy_projection(requested_codes, legacy)
+            || chrono::NaiveDateTime::parse_from_str(&self.cache_cutoff_local, "%Y-%m-%d %H:%M:%S")
+                .is_err()
+            || crate::market_domain::EvidenceTimestamp::parse_instant(&self.cache_observed_at_utc)
+                .is_err()
+            || content_sha256
+                != &super::fetchers::requested_concept_projection_sha256(
+                    requested_codes,
+                    &self.concepts,
+                )
+        {
+            return false;
+        }
+
+        let mut expected_writes = BTreeMap::<&str, usize>::new();
+        for code in requested_codes {
+            match self.sources.get(code) {
+                Some(ConceptProjectionOrigin::LocalCache {
+                    updated_at_local,
+                    concepts_json_sha256,
+                }) if chrono::NaiveDateTime::parse_from_str(
+                    updated_at_local,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .is_ok()
+                    && updated_at_local >= &self.cache_cutoff_local
+                    && is_sha256_hex(concepts_json_sha256) => {}
+                Some(ConceptProjectionOrigin::ToolResponse(_)) => {
+                    *expected_writes.entry(code.as_str()).or_default() += 1;
+                }
+                _ => return false,
+            }
+        }
+
+        let mut actual_writes = BTreeMap::<&str, usize>::new();
+        let mut last_writes = BTreeMap::<&str, &ConceptProjectionWrite>::new();
+        for write in &self.successful_writes {
+            let ConceptProjectionOrigin::ToolResponse(tool) = &write.origin else {
+                return false;
+            };
+            if !expected_writes.contains_key(write.code.as_str())
+                || tool.requested_code != write.code
+                || !valid_tool_projection(tool, &write.boards)
+            {
+                return false;
+            }
+            *actual_writes.entry(write.code.as_str()).or_default() += 1;
+            last_writes.insert(write.code.as_str(), write);
+        }
+        expected_writes == actual_writes
+            && expected_writes.keys().all(|code| {
+                let Some(last) = last_writes.get(code) else {
+                    return false;
+                };
+                self.sources.get(*code) == Some(&last.origin)
+                    && self.concepts.get(*code) == Some(&last.boards)
+            })
+    }
+
+    pub(super) fn from_fetch(projection: super::fetchers::ObservedConceptProjection) -> Self {
+        use super::fetchers::{
+            ConceptCodeEvidence, ConceptProjectionCompletion as FetchCompletion,
+            ObservedConceptCacheWrite,
+        };
+
+        let sources = projection
+            .sources
+            .into_iter()
+            .map(|(code, source)| {
+                let origin = match source {
+                    ConceptCodeEvidence::LocalCache(row) => ConceptProjectionOrigin::LocalCache {
+                        updated_at_local: row.updated_at().to_owned(),
+                        concepts_json_sha256: format!(
+                            "{:x}",
+                            Sha256::digest(row.concepts_json().as_bytes())
+                        ),
+                    },
+                    ConceptCodeEvidence::ToolResponse(tool) => {
+                        ConceptProjectionOrigin::ToolResponse(tool.into())
+                    }
+                    ConceptCodeEvidence::LegacyToolProjection {
+                        raw_response_sha256,
+                    } => ConceptProjectionOrigin::LegacyToolProjection {
+                        raw_response_sha256,
+                    },
+                };
+                (code, origin)
+            })
+            .collect();
+        let successful_writes = projection
+            .successful_writes
+            .into_iter()
+            .map(|write| match write {
+                ObservedConceptCacheWrite::ToolObservation(tool) => ConceptProjectionWrite {
+                    code: tool.requested_code.clone(),
+                    boards: tool.boards.clone(),
+                    origin: ConceptProjectionOrigin::ToolResponse(tool.into()),
+                },
+                ObservedConceptCacheWrite::LegacyProjection {
+                    code,
+                    boards,
+                    raw_response_sha256,
+                } => ConceptProjectionWrite {
+                    code,
+                    boards,
+                    origin: ConceptProjectionOrigin::LegacyToolProjection {
+                        raw_response_sha256,
+                    },
+                },
+            })
+            .collect();
+        let completion = match projection.completion {
+            FetchCompletion::Complete { content_sha256 } => {
+                ConceptProjectionCompletion::Complete { content_sha256 }
+            }
+            FetchCompletion::Incomplete { reason } => ConceptProjectionCompletion::Incomplete {
+                reason: reason.to_owned(),
+            },
+        };
+        Self {
+            requested_codes: projection.requested_codes,
+            cache_cutoff_local: projection.cache_read.cutoff_local().to_owned(),
+            cache_observed_at_utc: projection
+                .cache_read
+                .observed_at_utc()
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+            concepts: projection.concepts,
+            sources,
+            successful_writes,
+            completion,
+        }
+    }
+}
+
+fn is_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_tool_projection(tool: &ConceptToolObservation, boards: &[String]) -> bool {
+    if tool.all_boards.is_empty()
+        || tool.board_count != tool.all_boards.len()
+        || tool.provider_label.trim().is_empty()
+        || tool.source.trim().is_empty()
+        || tool.batch_id.trim().is_empty()
+        || !is_sha256_hex(&tool.raw_response_sha256)
+        || crate::market_domain::EvidenceTimestamp::parse_instant(&tool.observed_at).is_err()
+        || tool.source_at.as_ref().is_some_and(|source_at| {
+            crate::market_domain::EvidenceTimestamp::parse(source_at).is_err()
+        })
+    {
+        return false;
+    }
+    let mut distinct = Vec::<&str>::new();
+    for board in &tool.all_boards {
+        if board.trim().is_empty() {
+            return false;
+        }
+        if !distinct.contains(&board.as_str()) {
+            distinct.push(board.as_str());
+        }
+    }
+    distinct.into_iter().eq(boards.iter().map(String::as_str))
+}
+
+impl From<super::fetchers::ToolBoardsObservation> for ConceptToolObservation {
+    fn from(tool: super::fetchers::ToolBoardsObservation) -> Self {
+        Self {
+            requested_code: tool.requested_code,
+            all_boards: tool.all_boards,
+            board_count: tool.board_count,
+            provider_label: tool.evidence.provider_label,
+            source: tool.evidence.source,
+            source_at: tool.evidence.source_at,
+            observed_at: tool.evidence.observed_at,
+            batch_id: tool.evidence.batch_id,
+            raw_response_sha256: tool.raw_response_sha256,
+        }
+    }
+}
+
+impl ConceptProjectionWrite {
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+    pub fn boards(&self) -> &[String] {
+        &self.boards
+    }
+    pub fn origin(&self) -> &ConceptProjectionOrigin {
+        &self.origin
+    }
+}
+
+impl ConceptToolObservation {
+    pub fn requested_code(&self) -> &str {
+        &self.requested_code
+    }
+    pub fn all_boards(&self) -> &[String] {
+        &self.all_boards
+    }
+    pub fn board_count(&self) -> usize {
+        self.board_count
+    }
+    pub fn provider_label(&self) -> &str {
+        &self.provider_label
+    }
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn source_at(&self) -> Option<&str> {
+        self.source_at.as_deref()
+    }
+    pub fn observed_at(&self) -> &str {
+        &self.observed_at
+    }
+    pub fn batch_id(&self) -> &str {
+        &self.batch_id
+    }
+    pub fn raw_response_sha256(&self) -> &str {
+        &self.raw_response_sha256
+    }
+}
+
 /// Owns the caller inputs and original report bytes; getters only lend immutable views.
 #[derive(Clone)]
 pub struct PreparedChainAnalysis {
@@ -480,6 +859,8 @@ struct PreparedData {
     concept_source: SourceObservation,
     positions_source: SourceObservation,
     position_concept_source: SourceObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    position_concept_projection: Option<ConceptProjectionObservation>,
 }
 
 impl PreparedChainAnalysis {
@@ -583,9 +964,21 @@ impl PreparedChainAnalysis {
     pub fn position_concept_source(&self) -> &SourceObservation {
         &self.data.position_concept_source
     }
+    pub fn position_concept_projection(&self) -> Option<&ConceptProjectionObservation> {
+        self.data.position_concept_projection.as_ref()
+    }
 }
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const ARTIFACT_SCHEMA_V1: u32 = 1;
+const ARTIFACT_SCHEMA_V2: u32 = 2;
+
+fn artifact_schema_version(data: &PreparedData) -> u32 {
+    if data.position_concept_projection.is_some() {
+        ARTIFACT_SCHEMA_V2
+    } else {
+        ARTIFACT_SCHEMA_V1
+    }
+}
 
 #[derive(Serialize)]
 struct ArtifactRef<'a> {
@@ -629,7 +1022,7 @@ impl PreparedChainAnalysis {
 
 fn encode_artifact_data(data: &PreparedData) -> Result<Vec<u8>> {
     serde_json::to_vec(&ArtifactRef {
-        schema_version: ARTIFACT_SCHEMA_VERSION,
+        schema_version: artifact_schema_version(data),
         data,
     })
     .map_err(|_| anyhow::anyhow!("产业链准备 artifact 编码失败"))
@@ -638,7 +1031,7 @@ fn encode_artifact_data(data: &PreparedData) -> Result<Vec<u8>> {
 fn decode_artifact_data(bytes: &[u8]) -> Result<PreparedData> {
     let artifact: ArtifactOwned = serde_json::from_slice(bytes)
         .map_err(|_| anyhow::anyhow!("产业链准备 artifact 输入无效"))?;
-    if artifact.schema_version != ARTIFACT_SCHEMA_VERSION {
+    if artifact.schema_version != artifact_schema_version(&artifact.data) {
         anyhow::bail!("产业链准备 artifact 版本不受支持");
     }
     validate_artifact_values(&artifact.data)?;
@@ -706,6 +1099,21 @@ fn validate_artifact_values(data: &PreparedData) -> Result<()> {
         .any(|call| call.provider_identity.is_some() || call.model_identity.is_some())
     {
         anyhow::bail!("产业链准备 artifact 包含本版本未提供的模型身份");
+    }
+    if let Some(projection) = &data.position_concept_projection {
+        if matches!(
+            &projection.completion,
+            ConceptProjectionCompletion::Complete { .. }
+        ) && !projection.valid_complete_projection(
+            &data
+                .positions
+                .iter()
+                .map(|position| position.code.clone())
+                .collect::<Vec<_>>(),
+            &data.position_concepts,
+        ) {
+            anyhow::bail!("产业链准备 artifact 持仓概念完整投影证据不一致");
+        }
     }
     Ok(())
 }
@@ -809,8 +1217,17 @@ impl PreparationFailure {
     pub fn positions(&self) -> &[PositionInput] {
         self.observed.positions()
     }
+    pub fn positions_source(&self) -> &SourceObservation {
+        self.observed.positions_source()
+    }
     pub fn position_concepts(&self) -> &BTreeMap<String, Vec<String>> {
         self.observed.position_concepts()
+    }
+    pub fn position_concept_projection(&self) -> Option<&ConceptProjectionObservation> {
+        self.observed.position_concept_projection()
+    }
+    pub fn position_concept_source(&self) -> &SourceObservation {
+        self.observed.position_concept_source()
     }
     pub fn position_diags(&self) -> &[PositionDiag] {
         self.observed.position_diags()
@@ -902,6 +1319,12 @@ pub trait ChainPreparationIo {
     ) -> Result<HashMap<String, Vec<String>>> {
         self.concepts(codes).await
     }
+    /// Drains evidence from the same `position_concepts` call, including any
+    /// successful cache-write prefix before an error. Default adapters have no
+    /// source evidence; this method performs no I/O.
+    fn take_position_concept_projection(&mut self) -> Option<ConceptProjectionObservation> {
+        None
+    }
     fn before_cluster_configuration(
         &mut self,
         _concepts: &HashMap<String, Vec<String>>,
@@ -949,6 +1372,11 @@ pub trait ChainPreparationIo {
     }
     async fn positions(&mut self) -> Result<Vec<PositionInput>> {
         panic!("position database I/O not supplied")
+    }
+    /// The default preserves existing controlled adapters without inventing
+    /// source authority. Production observes its existing single query below.
+    async fn positions_observed(&mut self) -> Result<(Vec<PositionInput>, SourceObservation)> {
+        Ok((self.positions().await?, SourceObservation::unknown()))
     }
     async fn lhb(&mut self) -> Result<(HashMap<String, f64>, SourceObservation)> {
         panic!("dragon-tiger I/O not supplied")
@@ -1016,8 +1444,50 @@ pub struct ModelEffect<'a> {
     pub concept: Option<&'a str>,
 }
 
-struct ProductionIo {
+pub(super) struct ProductionIo {
     analyzer: Option<GeminiAnalyzer>,
+    position_concept_projection: Option<ConceptProjectionObservation>,
+}
+
+impl ProductionIo {
+    pub(super) fn new() -> Self {
+        Self {
+            analyzer: None,
+            position_concept_projection: None,
+        }
+    }
+
+    /// Split the one observed fetch into the legacy return and optional
+    /// evidence. This function performs no further cache or Tool I/O.
+    pub(super) fn apply_position_concept_fetch(
+        &mut self,
+        result: std::result::Result<
+            super::fetchers::ObservedConceptFetch,
+            super::fetchers::ObservedConceptFetchError,
+        >,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        use super::fetchers::ObservedConceptFetchError;
+
+        self.position_concept_projection = None;
+        match result {
+            Ok(fetch) => {
+                self.position_concept_projection =
+                    Some(ConceptProjectionObservation::from_fetch(fetch.observation));
+                Ok(fetch.legacy_map)
+            }
+            Err(ObservedConceptFetchError::BeforeCache { legacy_error }) => {
+                Err(anyhow::Error::msg(legacy_error))
+            }
+            Err(ObservedConceptFetchError::AfterCache {
+                legacy_error,
+                observation,
+            }) => {
+                self.position_concept_projection =
+                    Some(ConceptProjectionObservation::from_fetch(observation));
+                Err(anyhow::Error::msg(legacy_error))
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1026,6 +1496,17 @@ impl ChainPreparationIo for ProductionIo {
         super::fetch_concepts_cached(codes)
             .await
             .map_err(anyhow::Error::msg)
+    }
+    async fn position_concepts(
+        &mut self,
+        codes: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        self.apply_position_concept_fetch(
+            super::fetchers::fetch_concepts_cached_observed(codes).await,
+        )
+    }
+    fn take_position_concept_projection(&mut self) -> Option<ConceptProjectionObservation> {
+        self.position_concept_projection.take()
     }
     fn min_cluster_size(&mut self) -> usize {
         super::min_cluster_size()
@@ -1074,6 +1555,11 @@ impl ChainPreparationIo for ProductionIo {
             .map(|p| PositionInput::new(p.code, p.name, p.return_rate))
             .collect())
     }
+    async fn positions_observed(&mut self) -> Result<(Vec<PositionInput>, SourceObservation)> {
+        let positions = self.positions().await?;
+        let source = SourceObservation::local_positions(&positions, Utc::now());
+        Ok((positions, source))
+    }
     async fn lhb(&mut self) -> Result<(HashMap<String, f64>, SourceObservation)> {
         super::fetchers::fetch_lhb_observed()
             .await
@@ -1117,7 +1603,7 @@ pub async fn prepare_chain_analysis(
         business_date,
         limit_ups,
         macro_news,
-        &mut ProductionIo { analyzer: None },
+        &mut ProductionIo::new(),
     )
     .await
 }
@@ -1182,6 +1668,7 @@ pub async fn prepare_chain_analysis_with_io(
                 status: SourceStatus::NotRequested,
                 ..SourceObservation::unknown()
             },
+            position_concept_projection: None,
         },
     };
     if prepared.data.limit_ups.is_empty() {
@@ -1252,26 +1739,65 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.board_directory = candidates.board_directory;
     prepared.data.board_source = candidates.board_source;
     prepared.data.candidate_board_codes = candidates.selected_boards;
-    let positions = observe_stage(
-        io.positions().await,
-        PreparationStage::Positions,
-        &mut prepared,
-    )?;
+    let positions_result = io.positions_observed().await;
+    if let Err(error) = &positions_result {
+        // A durable adapter may stop before any source read or after an
+        // unconfirmed effect. Its typed stop cannot certify a failed query.
+        // Neither branch persists a database error that may contain row data.
+        prepared.data.positions_source = if error.downcast_ref::<PreparationStop>().is_some() {
+            SourceObservation {
+                reason: Some("positions_stage_stopped_before_verified_observation".into()),
+                ..SourceObservation::unknown()
+            }
+        } else {
+            SourceObservation::unavailable("positions_read_failed".into())
+        };
+    }
+    let (positions, positions_source) =
+        observe_stage(positions_result, PreparationStage::Positions, &mut prepared)?;
     prepared.data.positions = positions.clone();
-    prepared.data.positions_source = SourceObservation::unknown();
+    prepared.data.positions_source = positions_source;
+    let position_codes = positions.iter().map(|p| p.code.clone()).collect::<Vec<_>>();
     let position_concepts = if positions.is_empty() {
         HashMap::new()
     } else {
-        observe_stage(
-            io.position_concepts(&positions.iter().map(|p| p.code.clone()).collect::<Vec<_>>())
-                .await,
-            PreparationStage::PositionConcepts,
-            &mut prepared,
-        )?
+        let result = io.position_concepts(&position_codes).await;
+        prepared.data.position_concept_projection = io.take_position_concept_projection();
+        prepared.data.position_concept_source = match &result {
+            Err(error) if error.downcast_ref::<PreparationStop>().is_some() => SourceObservation {
+                reason: Some("position_concept_stage_stopped_before_verified_observation".into()),
+                ..SourceObservation::unknown()
+            },
+            Err(_) => SourceObservation::unavailable("position_concept_fetch_failed".into()),
+            Ok(_) if prepared.data.position_concept_projection.is_some() => SourceObservation {
+                reason: Some("position_concept_projection_not_upstream_admitted".into()),
+                ..SourceObservation::unknown()
+            },
+            Ok(_) => SourceObservation::unknown(),
+        };
+        observe_stage(result, PreparationStage::PositionConcepts, &mut prepared)?
     };
     prepared.data.position_concepts = position_concepts.clone().into_iter().collect();
-    if !positions.is_empty() {
-        prepared.data.position_concept_source = SourceObservation::unknown();
+    if let Some(projection) = prepared.data.position_concept_projection.as_mut() {
+        if !projection.matches_legacy_projection(&position_codes, &prepared.data.position_concepts)
+        {
+            projection.completion = ConceptProjectionCompletion::Incomplete {
+                reason: "projection_legacy_map_mismatch".into(),
+            };
+            prepared.data.position_concept_source.reason =
+                Some("position_concept_projection_conflicts_with_legacy_map".into());
+        } else if matches!(
+            &projection.completion,
+            ConceptProjectionCompletion::Complete { .. }
+        ) && !projection
+            .valid_complete_projection(&position_codes, &prepared.data.position_concepts)
+        {
+            projection.completion = ConceptProjectionCompletion::Incomplete {
+                reason: "complete_projection_evidence_inconsistent".into(),
+            };
+            prepared.data.position_concept_source.reason =
+                Some("position_concept_projection_evidence_inconsistent".into());
+        }
     }
     let position_diags = super::match_position_diags(&positions, &clusters, &position_concepts);
     prepared.data.position_diags = position_diags.clone();
