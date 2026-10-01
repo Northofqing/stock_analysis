@@ -76,6 +76,8 @@ async fn model_commit_failures_remain_missing_sections_instead_of_fake_analysis(
         )],
         position_reads: 0,
         observe_positions: false,
+        position_concept_projection: None,
+        position_concept_error: None,
     };
 
     let prepared = preparation::prepare_chain_analysis_with_io(

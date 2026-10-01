@@ -16,6 +16,9 @@ pub(super) struct ProtocolIo {
     pub(super) position_rows: Vec<PositionInput>,
     pub(super) position_reads: usize,
     pub(super) observe_positions: bool,
+    pub(super) position_concept_projection:
+        Option<super::preparation::ConceptProjectionObservation>,
+    pub(super) position_concept_error: Option<String>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -33,6 +36,20 @@ impl ChainPreparationIo for ProtocolIo {
                 ))
             })
             .collect()
+    }
+    async fn position_concepts(
+        &mut self,
+        codes: &[String],
+    ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        if let Some(error) = &self.position_concept_error {
+            return Err(anyhow::Error::msg(error.clone()));
+        }
+        self.concepts(codes).await
+    }
+    fn take_position_concept_projection(
+        &mut self,
+    ) -> Option<super::preparation::ConceptProjectionObservation> {
+        self.position_concept_projection.take()
     }
     fn min_cluster_size(&mut self) -> usize {
         3
@@ -209,6 +226,8 @@ async fn model_preparation_records_real_prompts_search_and_original_responses() 
         position_rows: protocol_position_rows(),
         position_reads: 0,
         observe_positions: false,
+        position_concept_projection: None,
+        position_concept_error: None,
     };
     let prepared = prepare_chain_analysis_with_io(
         chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
@@ -299,6 +318,8 @@ async fn artifact_round_trip_preserves_owned_bytes_and_rejects_unsupported_or_lo
             position_rows: protocol_position_rows(),
             position_reads: 0,
             observe_positions: false,
+            position_concept_projection: None,
+            position_concept_error: None,
         }
     }
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
@@ -357,6 +378,7 @@ async fn artifact_round_trip_preserves_owned_bytes_and_rejects_unsupported_or_lo
     .contains("TEST_CODE"));
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["schema_version"], 1);
+    assert!(value["data"].get("position_concept_projection").is_none());
     assert!(value["data"]["model_calls"][0]
         .get("provider_identity")
         .expect("explicit missing identity")
@@ -524,6 +546,8 @@ async fn position_preparation_retains_one_local_query_observation_and_verified_e
             position_rows: rows,
             position_reads: 0,
             observe_positions: observed,
+            position_concept_projection: None,
+            position_concept_error: None,
         }
     }
 
@@ -587,6 +611,248 @@ async fn position_preparation_retains_one_local_query_observation_and_verified_e
         empty.positions_source().batch_id(),
         prepared.positions_source().batch_id()
     );
+}
+
+fn observed_position_concept_fixture(
+    requested_codes: &[String],
+    terminal: super::fetchers::ConceptFetchTerminal,
+) -> super::preparation::ConceptProjectionObservation {
+    use super::fetchers::{
+        compose_observed_concepts, parse_tool_boards_observed, ObservedConceptCacheWrite,
+    };
+
+    let isolated = tempfile::tempdir().expect("isolated concept evidence cache");
+    let db = crate::database::DatabaseManager::open_isolated_for_test(
+        isolated.path().join("TEST_CODE_position_concepts.db"),
+    )
+    .expect("open isolated concept evidence cache");
+    db.save_stock_concepts("TEST_CODE_协议持仓", &["TEST_CODE_深度主线".to_string()])
+        .unwrap();
+    db.save_stock_concepts("TEST_CODE_UNRELATED", &["TEST_CODE_无关".to_string()])
+        .unwrap();
+    let cache_read = db.get_cached_concepts_observed(7).unwrap();
+    let raw = serde_json::json!({
+        "fetched": true,
+        "secucode": "TEST_CODE_工具持仓",
+        "all_boards": ["TEST_CODE_深度主线"],
+        "board_count": 1,
+        "evidence": {
+            "provider": "TEST_CODE_OPAQUE_PROVIDER",
+            "source": "TEST_CODE_TOOL_SOURCE",
+            "source_at": null,
+            "observed_at": "2026-07-22T00:30:00Z",
+            "batch_id": "TEST_CODE_TOOL_BATCH"
+        }
+    })
+    .to_string();
+    let tool = parse_tool_boards_observed(&raw, "TEST_CODE_工具持仓").unwrap();
+    db.save_stock_concepts("TEST_CODE_工具持仓", &tool.boards)
+        .unwrap();
+    let projection = compose_observed_concepts(
+        requested_codes,
+        cache_read,
+        vec![ObservedConceptCacheWrite::ToolObservation(tool)],
+        terminal,
+    )
+    .unwrap();
+    super::preparation::ConceptProjectionObservation::from_fetch(projection)
+}
+
+fn position_concept_fixture_io(
+    projection: super::preparation::ConceptProjectionObservation,
+    failure: Option<&str>,
+) -> (Vec<TopStock>, ProtocolIo) {
+    let (stocks, mut concepts) = protocol_inputs();
+    for code in ["TEST_CODE_工具持仓", "TEST_CODE_失败持仓"] {
+        concepts.insert(code.to_string(), vec!["TEST_CODE_深度主线".to_string()]);
+    }
+    let mut position_rows = protocol_position_rows();
+    for code in ["TEST_CODE_工具持仓", "TEST_CODE_失败持仓"] {
+        position_rows.push(PositionInput::new(code.to_string(), code.to_string(), None));
+    }
+    (
+        stocks,
+        ProtocolIo {
+            analyzer: None,
+            scripted: None,
+            concepts,
+            search_enabled: false,
+            queries: Vec::new(),
+            position_rows,
+            position_reads: 0,
+            observe_positions: false,
+            position_concept_projection: Some(projection),
+            position_concept_error: failure.map(str::to_owned),
+        },
+    )
+}
+
+#[tokio::test]
+async fn mixed_position_concept_projection_survives_prepared_artifact() {
+    use super::fetchers::ConceptFetchTerminal;
+    use super::preparation::{
+        ConceptProjectionCompletion, ConceptProjectionOrigin, PreparedChainAnalysis,
+    };
+
+    let requested = vec!["TEST_CODE_协议持仓".into(), "TEST_CODE_工具持仓".into()];
+    let projection = observed_position_concept_fixture(&requested, ConceptFetchTerminal::Completed);
+    let (stocks, mut io) = position_concept_fixture_io(projection, None);
+    io.position_rows.pop();
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(io.position_reads, 1);
+    assert!(io.position_concept_projection.is_none());
+    let observed = prepared.position_concept_projection().unwrap();
+    assert_eq!(observed.requested_codes(), requested.as_slice());
+    assert!(!observed.cache_cutoff_local().is_empty());
+    assert!(!observed.cache_observed_at_utc().is_empty());
+    assert!(!observed.concepts().contains_key("TEST_CODE_UNRELATED"));
+    let Some(ConceptProjectionOrigin::LocalCache {
+        updated_at_local,
+        concepts_json_sha256,
+    }) = observed.sources().get("TEST_CODE_协议持仓")
+    else {
+        panic!("requested cached row must retain local provenance");
+    };
+    assert!(!updated_at_local.is_empty());
+    assert_eq!(concepts_json_sha256.len(), 64);
+    let Some(ConceptProjectionOrigin::ToolResponse(tool)) =
+        observed.sources().get("TEST_CODE_工具持仓")
+    else {
+        panic!("requested tool row must retain raw response provenance");
+    };
+    assert_eq!(tool.provider_label(), "TEST_CODE_OPAQUE_PROVIDER");
+    assert_eq!(tool.batch_id(), "TEST_CODE_TOOL_BATCH");
+    assert_eq!(tool.board_count(), 1);
+    assert_eq!(
+        tool.all_boards().first().map(String::as_str),
+        Some("TEST_CODE_深度主线")
+    );
+    assert_eq!(tool.raw_response_sha256().len(), 64);
+    assert!(matches!(
+        observed.completion(),
+        ConceptProjectionCompletion::Complete { .. }
+    ));
+    assert_eq!(observed.successful_writes().len(), 1);
+    assert_eq!(
+        prepared.position_concept_source().status(),
+        &SourceStatus::Unknown
+    );
+    let bytes = prepared.to_artifact_bytes().unwrap();
+    let restored = PreparedChainAnalysis::from_artifact_bytes(&bytes).unwrap();
+    assert_eq!(
+        serde_json::to_value(restored.position_concept_projection().unwrap()).unwrap(),
+        serde_json::to_value(observed).unwrap()
+    );
+    assert_eq!(
+        restored.position_concepts(),
+        prepared.position_concepts(),
+        "legacy report input remains the returned map"
+    );
+}
+
+#[tokio::test]
+async fn conflicting_position_concept_projection_keeps_legacy_map_but_loses_completion() {
+    use super::fetchers::ConceptFetchTerminal;
+    use super::preparation::{ConceptProjectionCompletion, PreparedChainAnalysis};
+
+    let requested = vec!["TEST_CODE_协议持仓".into(), "TEST_CODE_工具持仓".into()];
+    let projection = observed_position_concept_fixture(&requested, ConceptFetchTerminal::Completed);
+    let (stocks, mut io) = position_concept_fixture_io(projection, None);
+    io.position_rows.pop();
+    io.concepts.insert(
+        "TEST_CODE_工具持仓".into(),
+        vec!["TEST_CODE_旧报告实际消费".into()],
+    );
+    let prepared = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        prepared.position_concepts()["TEST_CODE_工具持仓"]
+            .first()
+            .map(String::as_str),
+        Some("TEST_CODE_旧报告实际消费")
+    );
+    assert_eq!(
+        prepared.position_concept_source().status(),
+        &SourceStatus::Unknown
+    );
+    assert_eq!(
+        prepared.position_concept_source().reason(),
+        Some("position_concept_projection_conflicts_with_legacy_map")
+    );
+    assert_eq!(
+        prepared.position_concept_projection().unwrap().completion(),
+        &ConceptProjectionCompletion::Incomplete {
+            reason: "projection_legacy_map_mismatch".into()
+        }
+    );
+    let restored =
+        PreparedChainAnalysis::from_artifact_bytes(&prepared.to_artifact_bytes().unwrap()).unwrap();
+    assert_eq!(
+        restored.position_concepts()["TEST_CODE_工具持仓"]
+            .first()
+            .map(String::as_str),
+        Some("TEST_CODE_旧报告实际消费")
+    );
+}
+
+#[tokio::test]
+async fn failed_position_concept_stage_retains_written_prefix_and_original_error() {
+    use super::fetchers::ConceptFetchTerminal;
+    use super::preparation::{ConceptProjectionCompletion, PreparationFailure, PreparationStage};
+
+    let requested = vec![
+        "TEST_CODE_协议持仓".into(),
+        "TEST_CODE_工具持仓".into(),
+        "TEST_CODE_失败持仓".into(),
+    ];
+    let projection = observed_position_concept_fixture(&requested, ConceptFetchTerminal::Failed);
+    let (stocks, mut io) =
+        position_concept_fixture_io(projection, Some("TEST_CODE_original_provider_error"));
+    let error = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        stocks,
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .expect_err("position concept fetch failure stops preparation");
+    let failure = error.downcast_ref::<PreparationFailure>().unwrap();
+    assert_eq!(failure.stage(), PreparationStage::PositionConcepts);
+    assert_eq!(failure.reason(), "TEST_CODE_original_provider_error");
+    assert_eq!(
+        failure.position_concept_source().status(),
+        &SourceStatus::Unavailable
+    );
+    assert_eq!(
+        failure.position_concept_source().reason(),
+        Some("position_concept_fetch_failed")
+    );
+    assert_eq!(io.position_reads, 1);
+    let observed = failure.position_concept_projection().unwrap();
+    assert_eq!(observed.requested_codes(), requested.as_slice());
+    assert_eq!(observed.successful_writes().len(), 1);
+    assert_eq!(observed.successful_writes()[0].code(), "TEST_CODE_工具持仓");
+    assert!(!observed.concepts().contains_key("TEST_CODE_失败持仓"));
+    assert_eq!(
+        observed.completion(),
+        &ConceptProjectionCompletion::Incomplete {
+            reason: "fetch_failed_after_partial_writes".into()
+        }
+    );
+    assert_eq!(failure.position_concepts().len(), 0);
 }
 
 // Only external effects vary here; clustering, selection, prompts and rendering stay real.
@@ -696,6 +962,8 @@ fn coverage_io(
             position_rows: protocol_position_rows(),
             position_reads: 0,
             observe_positions: false,
+            position_concept_projection: None,
+            position_concept_error: None,
         },
         macro_result: Ok(String::new()),
         macro_calls: 0,
@@ -1199,6 +1467,20 @@ impl ChainPreparationIo for SyntheticIo {
             .collect())
     }
 
+    async fn position_concepts(
+        &mut self,
+        codes: &[String],
+    ) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        if self.fail_at == Some("position_concepts_stop") {
+            self.events.push("position_concepts");
+            return Err(PreparationStop::StageNotMigrated {
+                next: super::preparation::UnmigratedStage::PositionConceptProvider,
+            }
+            .into());
+        }
+        self.concepts(codes).await
+    }
+
     fn min_cluster_size(&mut self) -> usize {
         3
     }
@@ -1524,6 +1806,52 @@ async fn typed_position_stop_does_not_claim_an_ordinary_failed_read() {
     assert_eq!(
         io.events,
         ["concepts", "chain_daily", "board_codes", "positions"]
+    );
+}
+
+#[tokio::test]
+async fn typed_position_concept_stop_keeps_unconfirmed_source_without_extra_calls() {
+    use super::preparation::{PreparationFailure, PreparationStage, UnmigratedStage};
+
+    let mut io = SyntheticIo {
+        events: Vec::new(),
+        fail_at: Some("position_concepts_stop"),
+        candidate_batch: None,
+    };
+    let error = prepare_chain_analysis_with_io(
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+        synthetic_input(),
+        Some("TEST_CODE_固定宏观".into()),
+        &mut io,
+    )
+    .await
+    .expect_err("typed position concept stop must halt preparation");
+    assert!(matches!(
+        error.downcast_ref::<PreparationStop>(),
+        Some(PreparationStop::StageNotMigrated {
+            next: UnmigratedStage::PositionConceptProvider
+        })
+    ));
+    let failure = error.downcast_ref::<PreparationFailure>().unwrap();
+    assert_eq!(failure.stage(), PreparationStage::PositionConcepts);
+    assert_eq!(
+        failure.position_concept_source().status(),
+        &SourceStatus::Unknown
+    );
+    assert_eq!(
+        failure.position_concept_source().reason(),
+        Some("position_concept_stage_stopped_before_verified_observation")
+    );
+    assert!(failure.position_concept_projection().is_none());
+    assert_eq!(
+        io.events,
+        [
+            "concepts",
+            "chain_daily",
+            "board_codes",
+            "positions",
+            "position_concepts"
+        ]
     );
 }
 
