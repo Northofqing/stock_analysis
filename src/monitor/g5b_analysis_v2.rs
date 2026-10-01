@@ -454,7 +454,7 @@ pub(crate) fn owner_bytes_from_model_rows(
     load: &dyn Fn(usize) -> Result<Option<(String, Vec<u8>, String, Vec<u8>)>>,
     archives: &[(String, Vec<u8>, bool)],
 ) -> Result<G5bV2OwnerBytes> {
-    g5b_model_archive_v2::validate_archived_member(selection, index, load, archives)?;
+    model_archive::validate_archived_member(selection, index, load, archives)?;
     let (attempt_id, attempt, _, frozen) = load(index)?
         .ok_or_else(|| invalid("counted member has no Committed original Attempt/Frozen"))?;
     let core = validate_handoff(&frozen, &attempt, &attempt_id)?;

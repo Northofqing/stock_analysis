@@ -19,7 +19,7 @@ pub(super) struct Admission<'a> {
     bytes: G5bV2OwnerBytes,
 }
 fn bundle_owner(bundle: &VerifiedG5bModelBundle, index: usize) -> Result<Admission<'_>> {
-    let load = |index| {
+    let load = |index: usize| {
         let saved = bundle.members().get(index).ok_or_else(|| {
             crate::monitor::g5b_analysis_v2::G5bAnalysisV2Error::Codec("member absent".to_owned())
         })?;
