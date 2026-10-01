@@ -9,6 +9,35 @@ use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 #[test]
+fn wg06_exact_window_historical_route_is_external_only_and_method_bound() {
+    let method = ExternalQueryMethod::from_external_operation(
+        crate::grpc_client::external_pb::magic::market::v1::Operation::HistoricalBars,
+    )
+    .expect("TEST_CODE HistoricalBars External route");
+    assert_eq!(method, ExternalQueryMethod::HistoricalBars);
+    assert_eq!(
+        ExternalQueryMethod::from_local_operation(
+            crate::grpc_client::pb::magic::market::v1::Operation::HistoricalBars,
+        ),
+        None
+    );
+    assert!(method.matches_binding(
+        "/magic.market.v1.MarketDataService/HistoricalBars",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "HistoricalBars"
+        )),
+    ));
+    assert!(!method.matches_binding(
+        "/magic.market.v1.MarketDataService/HistoricalBars",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "MoneyFlows"
+        )),
+    ));
+}
+
+#[test]
 fn flow_routes_use_external_operation_and_exact_generated_method() {
     use crate::grpc_client::external_pb::magic::market::v1::Operation as ExternalOperation;
     use crate::grpc_client::pb::magic::market::v1::Operation as LocalOperation;

@@ -107,6 +107,28 @@ enum ExternalQueryWireReply {
     FlowUnavailableStatus,
     FlowIncomplete,
     FlowRecordUnavailable,
+    Historical(HistoricalQueryReply),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoricalQueryReply {
+    Success,
+    Incomplete,
+    Unadmitted,
+    ProviderMismatch,
+    OperationMismatch,
+    RequestIdMismatch,
+    StatusWithTrailer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoricalCapabilityBehavior {
+    Ready,
+    Missing,
+    Duplicate,
+    Unadmitted,
+    Unavailable,
+    Blocked,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,6 +144,7 @@ enum ExternalCapabilitiesBehavior {
     ReleaseSchedule,
     FuturesDelivery,
     Flows,
+    Historical(HistoricalCapabilityBehavior),
 }
 
 #[derive(Default)]
@@ -343,6 +366,10 @@ impl SystemService for ExternalQueryWireService {
                     })
                     .collect(),
             },
+            ExternalCapabilitiesBehavior::Historical(behavior) => CapabilitiesResponse {
+                request_id,
+                capabilities: historical_capabilities(behavior),
+            },
         };
         self.state
             .lock()
@@ -363,6 +390,35 @@ fn catalog_capability(provider: &str) -> Capability {
         exact_scope: format!("TEST_CODE_GLOBAL_NEWS_{provider}"),
         blocker: String::new(),
         diagnostic_available: true,
+    }
+}
+
+fn historical_capabilities(behavior: HistoricalCapabilityBehavior) -> Vec<Capability> {
+    let mut capability = Capability {
+        operation: Operation::HistoricalBars as i32,
+        repository_admission: AdmissionState::Admitted as i32,
+        runtime_available: true,
+        provider: "HithinkFinance".to_owned(),
+        exact_scope: "TEST_CODE_HISTORICAL_EXPLICIT_DAY_WINDOW".to_owned(),
+        blocker: String::new(),
+        diagnostic_available: false,
+    };
+    match behavior {
+        HistoricalCapabilityBehavior::Ready => vec![capability],
+        HistoricalCapabilityBehavior::Missing => vec![],
+        HistoricalCapabilityBehavior::Duplicate => vec![capability.clone(), capability],
+        HistoricalCapabilityBehavior::Unadmitted => {
+            capability.repository_admission = AdmissionState::Unadmitted as i32;
+            vec![capability]
+        }
+        HistoricalCapabilityBehavior::Unavailable => {
+            capability.runtime_available = false;
+            vec![capability]
+        }
+        HistoricalCapabilityBehavior::Blocked => {
+            capability.blocker = "TEST_CODE contradictory HistoricalBars capability".to_owned();
+            vec![capability]
+        }
     }
 }
 
@@ -413,6 +469,88 @@ impl ExternalQueryWireService {
             .lock()
             .expect("TEST_CODE External query wire reply mode")
             .reply;
+        if let ExternalQueryWireReply::Historical(reply) = reply {
+            let payload = request
+                .payload
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("TEST_CODE historical payload missing"))?;
+            let body: serde_json::Value = serde_json::from_slice(&payload.data)
+                .map_err(|_| Status::invalid_argument("TEST_CODE historical JSON invalid"))?;
+            if operation != Operation::HistoricalBars
+                || payload.schema != "magic.market.historical_bars.request"
+                || payload.schema_version != 1
+                || payload.content_type != "application/json; charset=utf-8"
+                || requested_provider != "HithinkFinance"
+                || request.allow_unadmitted
+                || body
+                    != serde_json::json!({
+                        "instrument":{"exchange":"Shanghai","code":"600519","asset_class":"Equity"},
+                        "interval":"Day","start":"2026-09-11","end":"2026-09-15","limit":3
+                    })
+            {
+                return Err(Status::invalid_argument(
+                    "TEST_CODE historical request contract",
+                ));
+            }
+            if reply == HistoricalQueryReply::StatusWithTrailer {
+                let details = ErrorDetail {
+                    request_id,
+                    operation: Operation::HistoricalBars as i32,
+                    provider: "HithinkFinance".to_owned(),
+                    reason_code: "unavailable".to_owned(),
+                    retryable: true,
+                    admission: AdmissionState::Admitted as i32,
+                    ..ErrorDetail::default()
+                }
+                .encode_to_vec();
+                let mut status = Status::with_details(
+                    tonic::Code::Unavailable,
+                    "TEST_CODE historical provider unavailable",
+                    details.clone().into(),
+                );
+                status.metadata_mut().insert_bin(
+                    "magic-error-detail-bin",
+                    tonic::metadata::MetadataValue::from_bytes(&details),
+                );
+                return Err(status);
+            }
+            return Ok(Response::new(QueryResponse {
+                request_id: if reply == HistoricalQueryReply::RequestIdMismatch {
+                    "TEST_CODE_DIFFERENT_HISTORICAL_REQUEST".to_owned()
+                } else {
+                    request_id
+                },
+                operation: if reply == HistoricalQueryReply::OperationMismatch {
+                    Operation::MoneyFlows as i32
+                } else {
+                    Operation::HistoricalBars as i32
+                },
+                admission: if reply == HistoricalQueryReply::Unadmitted {
+                    AdmissionState::Unadmitted as i32
+                } else {
+                    AdmissionState::Admitted as i32
+                },
+                selected_provider: if reply == HistoricalQueryReply::ProviderMismatch {
+                    "EmQuant"
+                } else {
+                    "HithinkFinance"
+                }
+                .to_owned(),
+                batch_id: "TEST_CODE_HISTORICAL_BATCH".to_owned(),
+                complete: reply != HistoricalQueryReply::Incomplete,
+                observed_at: "2026-09-16T15:31:00+08:00".to_owned(),
+                source_at: String::new(),
+                // Transport-only opaque bytes intentionally do not invent a
+                // provider HistoricalBars record schema or date coverage.
+                records: vec![CanonicalPayload {
+                    schema: "TEST_CODE_OPAQUE_HISTORICAL_RECORD".to_owned(),
+                    schema_version: 1,
+                    content_type: "application/octet-stream".to_owned(),
+                    data: b"TEST_CODE_RAW_HISTORICAL_RECORD".to_vec(),
+                }],
+                diagnostic_blocker: String::new(),
+            }));
+        }
         if reply == ExternalQueryWireReply::FlowUnavailableStatus {
             let details = ErrorDetail {
                 request_id,
@@ -483,6 +621,7 @@ impl ExternalQueryWireService {
             ExternalQueryWireReply::FlowUnavailableStatus => unreachable!(),
             ExternalQueryWireReply::FlowIncomplete => None,
             ExternalQueryWireReply::FlowRecordUnavailable => None,
+            ExternalQueryWireReply::Historical(_) => unreachable!(),
         };
         if let Some((provider_attempts, provider)) = attempt_status {
             let details = ErrorDetail {
@@ -781,6 +920,13 @@ macro_rules! external_query_wire_service {
                 self.respond(request, "money_flows", Operation::MoneyFlows).await
             }
 
+            async fn historical_bars(
+                &self,
+                request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                self.respond(request, "historical_bars", Operation::HistoricalBars).await
+            }
+
             async fn board_flows(
                 &self,
                 request: Request<QueryRequest>,
@@ -862,7 +1008,6 @@ macro_rules! external_query_wire_service {
 }
 
 external_query_wire_service!(
-    historical_bars,
     minute_data,
     realtime_quotes,
     order_books,
@@ -1075,6 +1220,18 @@ pub(crate) struct ExternalQueryWireFixture {
 }
 
 impl ExternalQueryWireFixture {
+    pub(crate) async fn bind_historical(
+        reply: HistoricalQueryReply,
+        capabilities: HistoricalCapabilityBehavior,
+    ) -> Result<Self, String> {
+        Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::Historical(reply),
+            ExternalCapabilitiesBehavior::Historical(capabilities),
+        )
+        .await
+    }
+
     pub(crate) async fn bind() -> Result<Self, String> {
         Self::bind_with_route(ExternalQueryWireRoute::Mutated(
             ExternalResponseSuffix::ZeroLengthSource,

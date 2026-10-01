@@ -23,6 +23,49 @@ pub enum ExternalContractError {
     Serialize,
 }
 
+/// Closed request type used only by the exact-date External HistoricalBars
+/// reader. The Gateway fixes its limit from the verified trading-date vector.
+pub(crate) struct ExternalHistoricalBarsQuery(QueryRequest);
+
+impl ExternalHistoricalBarsQuery {
+    pub(crate) fn into_request(self) -> QueryRequest {
+        self.0
+    }
+}
+
+pub(crate) fn build_external_historical_bars_query_request(
+    instrument: &InstrumentId,
+    start: NaiveDate,
+    end: NaiveDate,
+    limit: u32,
+) -> Result<ExternalHistoricalBarsQuery, ExternalContractError> {
+    if instrument.asset_class() != AssetClass::Equity
+        || !matches!(
+            instrument.exchange(),
+            crate::market_domain::Exchange::Shanghai | crate::market_domain::Exchange::Shenzhen
+        )
+        || instrument.code().len() != 6
+        || !instrument.code().bytes().all(|byte| byte.is_ascii_digit())
+        || start > end
+        || limit == 0
+    {
+        return Err(ExternalContractError::InvalidParameters);
+    }
+    assemble_request(
+        "magic.market.historical_bars.request",
+        1,
+        "HithinkFinance".to_owned(),
+        serde_json::json!({
+            "instrument":instrument,
+            "interval":"Day",
+            "start":start.to_string(),
+            "end":end.to_string(),
+            "limit":limit
+        }),
+    )
+    .map(ExternalHistoricalBarsQuery)
+}
+
 /// Flow-only ExternalV1 entry point. The two profile catalogs are kept
 /// distinct even though their request JSON happens to have the same shape.
 pub fn build_external_flow_query_request(

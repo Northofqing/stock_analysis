@@ -19,6 +19,7 @@ pub mod evidence_time;
 pub mod exchange_calendar_authority;
 pub mod external_flow;
 pub(crate) mod external_flow_read;
+pub(crate) mod external_historical_bars;
 pub mod futures_delivery;
 pub mod general_web_research;
 pub mod global_market;

@@ -26,6 +26,8 @@ pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ExternalQueryMethod {
+    #[serde(rename = "OPERATION_HISTORICAL_BARS")]
+    HistoricalBars,
     #[serde(rename = "OPERATION_MONEY_FLOWS")]
     MoneyFlows,
     #[serde(rename = "OPERATION_BOARD_FLOWS")]
@@ -53,6 +55,7 @@ impl ExternalQueryMethod {
 
     fn generated_method(self) -> &'static str {
         match self {
+            Self::HistoricalBars => "HistoricalBars",
             Self::MoneyFlows => "MoneyFlows",
             Self::BoardFlows => "BoardFlows",
             Self::FuturesDelivery => "FuturesDelivery",
@@ -68,6 +71,7 @@ impl ExternalQueryMethod {
 
     fn path(self) -> &'static str {
         match self {
+            Self::HistoricalBars => "/magic.market.v1.MarketDataService/HistoricalBars",
             Self::MoneyFlows => "/magic.market.v1.MarketDataService/MoneyFlows",
             Self::BoardFlows => "/magic.market.v1.MarketDataService/BoardFlows",
             Self::FuturesDelivery => "/magic.market.v1.MarketDataService/FuturesDelivery",
@@ -113,6 +117,7 @@ impl ExternalQueryMethod {
     ) -> Option<Self> {
         use crate::grpc_client::external_pb::magic::market::v1::Operation;
         match operation {
+            Operation::HistoricalBars => Some(Self::HistoricalBars),
             Operation::MoneyFlows => Some(Self::MoneyFlows),
             Operation::BoardFlows => Some(Self::BoardFlows),
             Operation::FuturesDelivery => Some(Self::FuturesDelivery),
@@ -329,6 +334,7 @@ impl ExternalQueryTransport {
         let capture = CaptureHandle::new(method);
         request.extensions_mut().insert(capture.clone());
         let response = match method {
+            ExternalQueryMethod::HistoricalBars => self.client.historical_bars(request).await,
             ExternalQueryMethod::MoneyFlows => self.client.money_flows(request).await,
             ExternalQueryMethod::BoardFlows => self.client.board_flows(request).await,
             ExternalQueryMethod::FuturesDelivery => self.client.futures_delivery(request).await,
