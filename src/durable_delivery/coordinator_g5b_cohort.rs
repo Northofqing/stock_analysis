@@ -157,6 +157,10 @@ impl G5bConfiguredAnalysis {
     pub(crate) fn provider(&self) -> Arc<dyn LlmProvider> {
         Arc::clone(&self.provider)
     }
+    #[cfg(test)]
+    pub(crate) fn test_clock(&self) -> Option<DateTime<Utc>> {
+        self.test_now
+    }
     fn now(&self) -> DateTime<Utc> {
         #[cfg(test)]
         if let Some(now) = self.test_now {
@@ -246,6 +250,9 @@ impl PreparedG5bArtifact {
     pub(crate) fn identity(&self) -> &str {
         &self.logical_intent
     }
+    pub(crate) fn desired_bytes(&self) -> &[u8] {
+        &self.desired_bytes
+    }
 }
 
 impl DurableDeliveryCoordinator {
@@ -312,6 +319,58 @@ impl G5bDaySession<'_> {
             #[cfg(test)]
             test_now: None,
         })
+    }
+
+    /// Fresh local owner clock; never accepts a caller supplied production time.
+    pub(crate) fn analysis_request_time(
+        &self,
+        ready: &G5bConfiguredAnalysis,
+    ) -> Result<DateTime<Utc>> {
+        self.validate()?;
+        let now = ready.now();
+        if ready.date != self.date
+            || ready.namespace_identity != self.namespace_identity
+            || !analysis_window(self.date, now)
+        {
+            return Err(mismatch("fresh analysis owner/window unavailable"));
+        }
+        Ok(now)
+    }
+
+    pub(crate) fn validate_analysis_call_time(&self) -> Result<()> {
+        self.validate_analysis_call_time_at(Utc::now(), false)
+    }
+    fn validate_analysis_call_time_at(&self, now: DateTime<Utc>, test_clock: bool) -> Result<()> {
+        self.validate()?;
+        if test_clock
+            && !matches!(
+                self.coordinator.config.environment,
+                crate::durable_delivery::StoreEnvironment::Test { .. }
+            )
+        {
+            return Err(mismatch("test model clock is unavailable in production"));
+        }
+        if !analysis_window(self.date, now) {
+            return Err(mismatch(
+                "original attempt consumed; model invocation window closed",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn validate_analysis_test_owner(&self) -> Result<()> {
+        self.validate()?;
+        if !matches!(
+            self.coordinator.config.environment,
+            crate::durable_delivery::StoreEnvironment::Test { .. }
+        ) {
+            return Err(mismatch("test model clock is unavailable in production"));
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn validate_analysis_call_time_for_test(&self, now: DateTime<Utc>) -> Result<()> {
+        self.validate_analysis_call_time_at(now, true)
     }
 
     /// A present-day observation, not a claimed file creation time or Empty.
@@ -1280,6 +1339,36 @@ impl G5bDaySession<'_> {
         index: Option<usize>,
         bytes: &[u8],
     ) -> Result<PreparedG5bArtifact> {
+        self.prepare_snapshot_inner(cohort, kind, index, bytes, None)
+    }
+
+    /// Only a newly inserted original attempt can authorize a live model call.
+    /// Existing Prepared and Committed attempts both consume that opportunity.
+    pub(crate) fn prepare_new_analysis_attempt(
+        &self,
+        cohort: &VerifiedStoredG5bCohort,
+        index: usize,
+        bytes: &[u8],
+        ready: &G5bConfiguredAnalysis,
+    ) -> Result<PreparedG5bArtifact> {
+        self.analysis_request_time(ready)?;
+        self.prepare_snapshot_inner(
+            cohort,
+            G5bSnapshotKind::Attempt,
+            Some(index),
+            bytes,
+            Some(ready),
+        )
+    }
+
+    fn prepare_snapshot_inner(
+        &self,
+        cohort: &VerifiedStoredG5bCohort,
+        kind: G5bSnapshotKind,
+        index: Option<usize>,
+        bytes: &[u8],
+        original_ready: Option<&G5bConfiguredAnalysis>,
+    ) -> Result<PreparedG5bArtifact> {
         self.validate_stored_admission(&cohort.admission)?;
         cohort
             .evidence
@@ -1327,8 +1416,92 @@ impl G5bDaySession<'_> {
             return Err(mismatch("snapshot receipt differs from stored owner"));
         }
         self.transaction(|tx| {
+            if let Some(ready) = original_ready { self.analysis_request_time(ready)?; }
+            if role == ArtifactRole::Attempt {
+                let mut query = tx.prepare("SELECT logical_intent,desired_bytes FROM g5b_artifact_events WHERE cohort_identity=?1 AND occurrence_identity=?2 AND artifact_role='Attempt' AND phase='Prepared'")?;
+                let existing = query.query_map(params![cohort.identity(), occurrence], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                if !existing.is_empty() {
+                    if original_ready.is_some() || existing.len() != 1 || existing[0].1 != bytes {
+                        return Err(mismatch("one original analysis attempt already consumes this member"));
+                    }
+                    return load_intent(tx, &existing[0].0)?.ok_or_else(|| mismatch("original attempt missing"));
+                }
+            }
             prepare_artifact_tx(tx, self.date, &cohort.identity(), role, occurrence, bytes)
         })
+    }
+
+    pub(crate) fn has_member_snapshot(
+        &self,
+        cohort: &VerifiedStoredG5bCohort,
+        kind: G5bSnapshotKind,
+        index: usize,
+    ) -> Result<bool> {
+        self.validate_stored_admission(&cohort.admission)?;
+        let occurrence = cohort
+            .evidence
+            .occurrences()
+            .get(index)
+            .ok_or_else(|| mismatch("snapshot member index absent"))?
+            .0
+            .clone();
+        let role = match kind {
+            G5bSnapshotKind::Attempt => "Attempt",
+            G5bSnapshotKind::Frozen => "Frozen",
+            G5bSnapshotKind::Archive => return Err(mismatch("archive has no member slot")),
+        };
+        self.transaction(|tx| {
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM g5b_artifact_events WHERE cohort_identity=?1 AND occurrence_identity=?2 AND artifact_role=?3 AND phase='Prepared'", params![cohort.identity(), occurrence, role], |row| row.get(0))?;
+            if count > 1 { return Err(mismatch("ambiguous member snapshots")); }
+            Ok(count != 0)
+        })
+    }
+
+    /// Read only a single actual Committed snapshot, not arbitrary saved JSON.
+    pub(crate) fn read_committed_member_snapshot(
+        &self,
+        cohort: &VerifiedStoredG5bCohort,
+        kind: G5bSnapshotKind,
+        index: usize,
+    ) -> Result<Option<PreparedG5bArtifact>> {
+        self.validate_stored_admission(&cohort.admission)?;
+        let occurrence = cohort
+            .evidence
+            .occurrences()
+            .get(index)
+            .ok_or_else(|| mismatch("snapshot member index absent"))?
+            .0
+            .clone();
+        let role = match kind {
+            G5bSnapshotKind::Attempt => "Attempt",
+            G5bSnapshotKind::Frozen => "Frozen",
+            G5bSnapshotKind::Archive => return Err(mismatch("archive has no member slot")),
+        };
+        let stored = self.transaction(|tx| {
+            let mut query = tx.prepare("SELECT logical_intent FROM g5b_artifact_events WHERE cohort_identity=?1 AND occurrence_identity=?2 AND artifact_role=?3 AND phase='Prepared'")?;
+            let ids = query.query_map(params![cohort.identity(), occurrence, role], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if ids.len() > 1 { return Err(mismatch("ambiguous member snapshots")); }
+            let Some(id) = ids.first() else { return Ok(None); };
+            let intent = load_intent(tx, id)?.ok_or_else(|| mismatch("member intent missing"))?;
+            let witness: Option<Vec<u8>> = tx.query_row("SELECT file_witness_canonical FROM g5b_artifact_events WHERE logical_intent=?1 AND phase='Committed'", [id], |row| row.get(0)).optional()?;
+            let expected: artifact::FileWitness = serde_json::from_slice(&witness.ok_or_else(|| mismatch("member snapshot is Prepared, completion unproven"))?)?;
+            Ok(Some((intent, expected)))
+        })?;
+        let Some((intent, expected)) = stored else {
+            return Ok(None);
+        };
+        self.validate_saved_intent(&intent)?;
+        let current = self
+            .read_cohort()?
+            .ok_or_else(|| mismatch("member cohort not published"))?;
+        if current.identity() != cohort.identity() || current.admission != cohort.admission {
+            return Err(mismatch("member cohort differs from stored owner"));
+        }
+        if artifact::inspect(self, &intent)? != expected {
+            return Err(mismatch("committed member snapshot witness changed"));
+        }
+        self.verify_actual_prefix(&cohort.evidence)?;
+        Ok(Some(intent))
     }
 
     #[cfg(test)]
