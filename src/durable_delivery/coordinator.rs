@@ -41,7 +41,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 #[path = "coordinator_candidate_board.rs"]
 mod candidate_board;
-pub use candidate_board::{CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1};
+pub use candidate_board::{
+    CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
+    CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2,
+};
 #[path = "coordinator_g5b.rs"]
 mod g5b;
 pub use g5b::{
@@ -2962,6 +2965,15 @@ impl DurableDeliveryCoordinator {
                     && existing.envelope_sha256 == raw_sha256
                 {
                     envelope.validate()?;
+                    if envelope.push_kind == PushKind::CandidateBoard {
+                        candidate_board::validate_candidate_board_source(envelope)?;
+                        let owners = candidate_board_occurrence_owners(transaction, envelope)?;
+                        if owners.len() != 1 || owners[0] != envelope.decision_identity {
+                            return Err(DurableDeliveryError::PolicyMismatch(
+                                "P-05 exact occurrence has ambiguous counted owners".to_owned(),
+                            ));
+                        }
+                    }
                     let hydration =
                         load_schedule_hydration(transaction, &envelope.decision_identity)?;
                     if let Some(observation) = origin_observation {
@@ -2993,6 +3005,16 @@ impl DurableDeliveryCoordinator {
             }
 
             envelope.validate()?;
+            if envelope.push_kind == PushKind::CandidateBoard {
+                candidate_board::validate_candidate_board_source(envelope)?;
+                // BEGIN IMMEDIATE holds the writer slot across this lookup and
+                // insert. The schema trigger fences direct SQL writers too.
+                if !candidate_board_occurrence_owners(transaction, envelope)?.is_empty() {
+                    return Err(DurableDeliveryError::PolicyMismatch(
+                        "P-05 exact occurrence already has a counted decision".to_owned(),
+                    ));
+                }
+            }
             let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
             let denial = self.evaluate_prepare_denial(
                 transaction,
@@ -8208,6 +8230,32 @@ fn validate_authoritative_accepted_delivery_evidence(
         ));
     }
     Ok((disposition_payload, receipt.clone()))
+}
+
+fn candidate_board_occurrence_owners(
+    transaction: &Transaction<'_>,
+    envelope: &DeliveryEnvelope,
+) -> Result<Vec<String>> {
+    let mut query = transaction.prepare(
+        "SELECT decision_identity FROM delivery_decisions
+         WHERE business_date=?1 AND push_kind=?2 AND sub_kind=?3 AND scope_key=?4
+           AND json_extract(CAST(envelope_canonical AS TEXT),
+                 '$.schedule_occurrence_identity')=?5
+         ORDER BY decision_identity LIMIT 2",
+    )?;
+    let owners = query
+        .query_map(
+            params![
+                envelope.business_date,
+                envelope.push_kind.as_str(),
+                envelope.sub_kind.as_str(),
+                envelope.scope_key,
+                envelope.schedule_occurrence_identity,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(owners)
 }
 
 fn insert_new_decision(

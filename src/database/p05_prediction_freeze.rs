@@ -475,17 +475,15 @@ fn verify_saved_rows(
         return Err(invalid("Strong prediction membership is empty"));
     }
     let mut seen = BTreeSet::new();
-    let mut previous_id = 0;
+    let mut row_ids = BTreeSet::new();
     for member in rows {
-        if member.prediction_row_id <= previous_id
+        if member.prediction_row_id <= 0
+            || !row_ids.insert(member.prediction_row_id)
             || !seen.insert(member.code.as_str())
             || super::validate_evidence_code(&member.code).is_err()
         {
-            return Err(invalid(
-                "Strong prediction membership order/code is invalid",
-            ));
+            return Err(invalid("Strong prediction membership ID/code is invalid"));
         }
-        previous_id = member.prediction_row_id;
         let row = diesel::sql_query(
             "SELECT pred_date,target_date,stock_code,pred_direction,pred_detail
              FROM prediction_tracker WHERE id=?1",

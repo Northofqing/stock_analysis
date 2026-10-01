@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+pub(crate) const SCHEMA_VERSION: i64 = 11;
 
 #[cfg(test)]
 thread_local! {
@@ -575,6 +575,51 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS immutable_decision_delete
         BEFORE DELETE ON delivery_decisions
         BEGIN SELECT RAISE(ABORT,'delivery decisions are retained'); END;
+
+        -- SQLite's implicit DELETE for INSERT OR REPLACE does not fire the
+        -- delete trigger with recursive_triggers=OFF. Protect an existing
+        -- P-05 identity even when the replacement changes occurrence or kind.
+        CREATE TRIGGER IF NOT EXISTS candidate_board_identity_no_replace_insert
+        BEFORE INSERT ON delivery_decisions
+        WHEN EXISTS (
+          SELECT 1 FROM delivery_decisions AS existing
+          WHERE existing.decision_identity=NEW.decision_identity
+            AND (existing.push_kind='CandidateBoard'
+                 OR NEW.push_kind='CandidateBoard')
+        )
+        BEGIN
+          SELECT RAISE(ABORT,'P05 candidate board decision identity is immutable');
+        END;
+
+        -- P-05's exact occurrence is a producer identity, independent of the
+        -- rolling cooldown claim and of the source schema. Historical v1
+        -- duplicates are retained; this trigger fences every new v1/v2
+        -- admission in the same SQLite write transaction as the decision.
+        -- RAISE(ABORT) also defeats INSERT OR IGNORE/REPLACE.
+        CREATE TRIGGER IF NOT EXISTS candidate_board_exact_occurrence_owner_insert
+        BEFORE INSERT ON delivery_decisions
+        WHEN NEW.push_kind='CandidateBoard'
+        BEGIN
+          SELECT RAISE(ABORT,'P05 candidate board envelope is not JSON')
+          WHERE json_valid(CAST(NEW.envelope_canonical AS TEXT)) != 1;
+          SELECT RAISE(ABORT,'P05 candidate board occurrence is missing')
+          WHERE json_type(CAST(NEW.envelope_canonical AS TEXT),
+                    '$.schedule_occurrence_identity') IS NOT 'text'
+             OR trim(json_extract(CAST(NEW.envelope_canonical AS TEXT),
+                    '$.schedule_occurrence_identity')) = '';
+          SELECT RAISE(ABORT,'P05 candidate board exact occurrence already owned')
+          WHERE EXISTS (
+            SELECT 1 FROM delivery_decisions AS existing
+            WHERE existing.business_date=NEW.business_date
+              AND existing.push_kind=NEW.push_kind
+              AND existing.sub_kind=NEW.sub_kind
+              AND existing.scope_key=NEW.scope_key
+              AND json_extract(CAST(existing.envelope_canonical AS TEXT),
+                    '$.schedule_occurrence_identity')
+                  = json_extract(CAST(NEW.envelope_canonical AS TEXT),
+                    '$.schedule_occurrence_identity')
+          );
+        END;
 
         CREATE TRIGGER IF NOT EXISTS immutable_claim_update
         BEFORE UPDATE ON business_date_once_claims

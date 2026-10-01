@@ -1,8 +1,8 @@
 # P-05 prediction row → counted occurrence: v2 cutover gate
 
-This follows the [identity seam](2026-10-01-p05-prediction-delivery-link-seam.md). It is an implementation gate, not a delivered-sample result. No production or test database was changed for this audit.
+This follows the [identity seam](2026-10-01-p05-prediction-delivery-link-seam.md). It is an implementation gate, not a delivered-sample result. No production database was changed; implementation tests use isolated `TEST_CODE` databases.
 
-## Exact current boundaries
+## Boundaries recorded before the v2 development slices
 
 - `src/bin/monitor/push_templates.rs:10345` (`dispatch_candidate_board`) saves Strong rows before it captures `hhmm` and builds the counted binding at lines 10421–10443. A retry in the same minute can save new rows and render different card bytes.
 - `src/monitor/prediction_samples.rs:44,97` saves samples one at a time. `src/database/mod.rs:4149` returns each actual inserted ID only after its SQLite insert transaction commits. A worker failure can leave committed rows whose IDs are unknown to the caller.
@@ -34,4 +34,9 @@ Joining by date and stock code, or attaching today's saved IDs to a v1 card afte
 | Counted terminal is `ManualAccepted` or nonaccepted | Do not count physical delivery. |
 | Existing v1 occurrence during cutover | Never graft new row IDs onto that decision; fail closed until explicit owner handling is implemented. |
 
-The next executable slice is the prediction-DB frozen v2 record and its first-writer-wins/retry tests, without any delivery claim or production send change. The following slice must add atomic counted occurrence ownership plus v1/v2 read validation. Only then should the dispatcher be switched to require the committed freeze before `push_counted_with_binding`, followed by cross-DB crash-window tests.
+## Development status and remaining cutover
+
+- The prediction DB now persists the first occurrence's exact card, canonical source and ordered `(row ID, code)` members. It rechecks actual rows on read. IDs must be positive and unique; card order does not imply SQLite ID order. This remains producer evidence only.
+- Durable schema v11 adds a `CandidateBoard` exact-occurrence insert trigger. Counted `prepare` checks the owner in the same `BEGIN IMMEDIATE` transaction. A repeated identical decision resumes its stored state only while it is the sole owner; a new decision identity for that occurrence is rejected across v1/v2. The trigger also rejects direct `INSERT OR IGNORE/REPLACE` conflicts and absent occurrence text. A v10 database with historical duplicate owners is retained, but reads and retries return an error instead of selecting one.
+- The counted read accepts strict canonical v1 and v2 sources in one snapshot. V1 is explicitly `UnlinkedV1`. V2 is `DeclaredV2`: its ordered IDs are only the durable source's claim. This read does **not** verify prediction-DB rows or claim that any row was delivered.
+- The dispatcher still uses v1 and saves rows before fixing the occurrence. It must next capture the occurrence before saving, require the verified prediction-DB freeze before counted admission, and replay only persisted bytes. A delivered-sample view then needs a separate cross-DB join with terminal `Accepted` receipt and crash-window tests. Existing sample-hit and promotion denominators remain unchanged.

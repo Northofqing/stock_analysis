@@ -6665,7 +6665,20 @@ fn candidate_board_policy_is_global_rolling_1800_and_budget_counted() {
 }
 
 fn p05_card_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope {
-    let business_date = "2026-08-18";
+    p05_v1_envelope_at(
+        "2026-08-18",
+        "candidate-board:2026-08-18:10:30",
+        label,
+        extra_source_field,
+    )
+}
+
+fn p05_v1_envelope_at(
+    business_date: &str,
+    occurrence_identity: &str,
+    label: &str,
+    extra_source_field: bool,
+) -> DeliveryEnvelope {
     let rendered = format!("TEST_CODE_P05_RENDERED_{label}").into_bytes();
     let rendered_sha256 = sha256_hex(&rendered);
     let mut source = serde_json::json!({
@@ -6683,7 +6696,7 @@ fn p05_card_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope 
         PushKind::CandidateBoard,
         DeliverySubKind::None,
         "GLOBAL",
-        format!("candidate-board:{business_date}:10:30"),
+        occurrence_identity,
         source_sha256.clone(),
         source_canonical,
         source_sha256,
@@ -6692,6 +6705,116 @@ fn p05_card_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope 
         None,
     )
     .expect("TEST_CODE P-05 card envelope")
+}
+
+fn p05_v2_frozen_source() -> (
+    tempfile::TempDir,
+    crate::database::p05_prediction_freeze::FrozenCandidateBoardV2,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let database = crate::database::DatabaseManager::open_isolated_for_test(
+        directory.path().join("TEST_CODE_p05_counted_source.db"),
+    )
+    .unwrap();
+    let codes = vec!["TEST_CODE_p05_a".to_owned(), "TEST_CODE_p05_b".to_owned()];
+    // The save order need not equal the card's Strong code order. The frozen
+    // source preserves the latter without inventing an ID sort invariant.
+    let samples: Vec<(String, f64)> = codes
+        .iter()
+        .rev()
+        .map(|code| (code.clone(), 80.0))
+        .collect();
+    let mut report = crate::monitor::prediction::save_candidate_samples(
+        &database,
+        "2026-09-23",
+        "2026-10-08",
+        &samples,
+    );
+    report.saved_rows.reverse();
+    let frozen = database
+        .freeze_candidate_board_v2(
+            "2026-09-23",
+            "candidate-board:2026-09-23:10:30",
+            "2026-10-08",
+            b"TEST_CODE_P05_V2_CARD",
+            &codes,
+            &report,
+        )
+        .unwrap()
+        .into_record();
+    assert_eq!(
+        database
+            .read_candidate_board_v2_freeze(frozen.occurrence_identity())
+            .unwrap(),
+        Some(frozen.clone()),
+        "out-of-order row IDs must round-trip through the prediction DB freeze"
+    );
+    (directory, frozen)
+}
+
+fn p05_v2_envelope(
+    frozen: &crate::database::p05_prediction_freeze::FrozenCandidateBoardV2,
+    source_canonical: Vec<u8>,
+) -> DeliveryEnvelope {
+    let source_sha256 = sha256_hex(&source_canonical);
+    DeliveryEnvelope::new(
+        frozen.business_date(),
+        PushKind::CandidateBoard,
+        DeliverySubKind::None,
+        "GLOBAL",
+        frozen.occurrence_identity(),
+        &source_sha256,
+        source_canonical,
+        source_sha256.clone(),
+        frozen.rendered_bytes().to_vec(),
+        false,
+        None,
+    )
+    .unwrap()
+}
+
+fn p05_direct_decision_insert(
+    connection: &Connection,
+    envelope: &DeliveryEnvelope,
+    conflict_mode: &str,
+) -> rusqlite::Result<usize> {
+    let canonical = envelope.canonical_bytes().unwrap();
+    p05_direct_decision_insert_raw(connection, envelope, conflict_mode, &canonical)
+}
+
+fn p05_direct_decision_insert_raw(
+    connection: &Connection,
+    envelope: &DeliveryEnvelope,
+    conflict_mode: &str,
+    canonical: &[u8],
+) -> rusqlite::Result<usize> {
+    assert!(matches!(conflict_mode, "" | "OR IGNORE" | "OR REPLACE"));
+    let sql = format!(
+        "INSERT {conflict_mode} INTO delivery_decisions(
+           decision_identity,business_date,push_kind,sub_kind,cooldown_scope,scope_key,
+           state,envelope_version,envelope_canonical,envelope_sha256,
+           task_binding_present,transition_basis_canonical,transition_basis_sha256,
+           reservation_generation,current_budget_reservation_identity,
+           current_cooldown_reservation_identity,current_attempt_identity,
+           current_disposition_identity,fence_generation,retry_authorized,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,'Reserved',?7,?8,?9,0,NULL,NULL,0,
+                   NULL,NULL,NULL,NULL,0,0,?10,?10)"
+    );
+    connection.execute(
+        &sql,
+        params![
+            envelope.decision_identity,
+            envelope.business_date,
+            envelope.push_kind.as_str(),
+            envelope.sub_kind.as_str(),
+            envelope.cooldown_scope.as_str(),
+            envelope.scope_key,
+            envelope.envelope_version,
+            canonical,
+            sha256_hex(canonical),
+            now().to_rfc3339(),
+        ],
+    )
 }
 
 #[test]
@@ -6820,13 +6943,325 @@ fn p05_card_observation_keeps_rejected_and_unbound_source_out_of_accepted_count(
 
     let forged = Fixture::new("P05_CARD_EXTRA_SOURCE");
     let forged_envelope = p05_card_envelope("EXTRA_SOURCE", true);
-    prepare_reserved(&forged, &forged_envelope, &append);
+    assert!(matches!(
+        forged.coordinator.prepare(&forged_envelope, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    let connection = Connection::open(&forged.database_path).unwrap();
+    p05_direct_decision_insert(&connection, &forged_envelope, "").unwrap();
     assert!(matches!(
         forged
             .coordinator
             .candidate_board_card_observations_for_date("2026-08-18"),
         Err(DurableDeliveryError::PolicyMismatch(_))
     ));
+}
+
+#[test]
+fn p05_counted_occurrence_reuses_exact_v1_retry_and_fences_competing_identity() {
+    let fixture = Fixture::new("P05_COUNTED_OCCURRENCE_OWNER");
+    let first = p05_card_envelope("OWNER_FIRST", false);
+    let competitor = p05_card_envelope("OWNER_SECOND", false);
+    let first_outcome = fixture.coordinator.prepare(&first, 1, now()).unwrap();
+    let retry = fixture.coordinator.prepare(&first, 1, now()).unwrap();
+    assert_eq!(retry, first_outcome);
+    assert!(matches!(
+        fixture.coordinator.prepare(&competitor, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("exact occurrence")
+    ));
+    let observed = fixture
+        .coordinator
+        .candidate_board_card_observations_with_source_for_date("2026-08-18")
+        .unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].source_link(),
+        &CandidateBoardSourceLinkV1::UnlinkedV1
+    );
+
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let original: (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT envelope_canonical,envelope_sha256 FROM delivery_decisions
+             WHERE decision_identity=?1",
+            [&first.decision_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    for mode in ["OR IGNORE", "OR REPLACE"] {
+        assert!(
+            p05_direct_decision_insert(&connection, &competitor, mode).is_err(),
+            "{mode} must not bypass the occurrence trigger"
+        );
+    }
+    let changed_occurrence = p05_v1_envelope_at(
+        "2026-08-18",
+        "candidate-board:2026-08-18:10:31",
+        "REPLACE_CHANGED_OCCURRENCE",
+        false,
+    );
+    let mut replacement = changed_occurrence.clone();
+    replacement
+        .decision_identity
+        .clone_from(&first.decision_identity);
+    let recursive_triggers: i64 = connection
+        .pragma_query_value(None, "recursive_triggers", |row| row.get(0))
+        .unwrap();
+    assert_eq!(recursive_triggers, 0);
+    assert!(p05_direct_decision_insert_raw(
+        &connection,
+        &replacement,
+        "OR REPLACE",
+        &changed_occurrence.canonical_bytes().unwrap(),
+    )
+    .is_err());
+    let preserved: (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT envelope_canonical,envelope_sha256 FROM delivery_decisions
+             WHERE decision_identity=?1",
+            [&first.decision_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(preserved, original);
+    let still_owned = fixture
+        .coordinator
+        .candidate_board_card_observations_for_date("2026-08-18")
+        .expect("original occurrence owner remains readable");
+    assert_eq!(still_owned.len(), 1);
+    assert_eq!(
+        still_owned[0].occurrence_identity(),
+        "candidate-board:2026-08-18:10:30"
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        1
+    );
+}
+
+#[test]
+fn p05_counted_trigger_rejects_missing_null_and_empty_occurrence_direct_sql() {
+    let fixture = Fixture::new("P05_DIRECT_MISSING_OCCURRENCE");
+    let envelope = p05_card_envelope("DIRECT_MISSING", false);
+    let connection = Connection::open(&fixture.database_path).unwrap();
+    let canonical: serde_json::Value =
+        serde_json::from_slice(&envelope.canonical_bytes().unwrap()).unwrap();
+    for replacement in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!("")),
+    ] {
+        let mut payload = canonical.clone();
+        match replacement {
+            None => {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("schedule_occurrence_identity");
+            }
+            Some(value) => {
+                payload["schedule_occurrence_identity"] = value;
+            }
+        }
+        let raw = serde_json::to_vec(&payload).unwrap();
+        for mode in ["", "OR IGNORE", "OR REPLACE"] {
+            assert!(
+                p05_direct_decision_insert_raw(&connection, &envelope, mode, &raw).is_err(),
+                "{mode} must reject a missing, null, or empty P-05 occurrence"
+            );
+        }
+    }
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        0
+    );
+}
+
+#[test]
+fn p05_two_counted_connections_admit_only_one_exact_occurrence() {
+    let fixture = Fixture::new("P05_TWO_CONNECTION_OWNER_RACE");
+    let second = fixture.second_coordinator("P05_TWO_CONNECTION_OWNER_RACE");
+    let first_envelope = p05_card_envelope("RACE_FIRST", false);
+    let second_envelope = p05_card_envelope("RACE_SECOND", false);
+    let start = Arc::new(Barrier::new(3));
+    let first = {
+        let coordinator = fixture.coordinator.clone();
+        let start = start.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            coordinator.prepare(&first_envelope, 1, now())
+        })
+    };
+    let second = {
+        let start = start.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            second.prepare(&second_envelope, 1, now())
+        })
+    };
+    start.wait();
+    let results = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(DurableDeliveryError::PolicyMismatch(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        1
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .candidate_board_card_observations_for_date("2026-08-18")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn p05_v1_and_frozen_v2_compete_for_one_counted_occurrence_without_row_delivery_claim() {
+    let (_prediction_directory, frozen) = p05_v2_frozen_source();
+    let v2 = p05_v2_envelope(&frozen, frozen.source_canonical().to_vec());
+    let v1 = p05_v1_envelope_at(
+        frozen.business_date(),
+        frozen.occurrence_identity(),
+        "LEGACY_V1",
+        false,
+    );
+
+    let legacy_first = Fixture::new("P05_LEGACY_FIRST");
+    legacy_first.coordinator.prepare(&v1, 1, now()).unwrap();
+    assert!(matches!(
+        legacy_first.coordinator.prepare(&v2, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    let legacy_read = legacy_first
+        .coordinator
+        .candidate_board_card_observations_with_source_for_date(frozen.business_date())
+        .unwrap();
+    assert_eq!(legacy_read.len(), 1);
+    assert_eq!(
+        legacy_read[0].source_link(),
+        &CandidateBoardSourceLinkV1::UnlinkedV1
+    );
+
+    let frozen_first = Fixture::new("P05_FROZEN_FIRST");
+    let first_outcome = frozen_first.coordinator.prepare(&v2, 1, now()).unwrap();
+    assert_eq!(
+        frozen_first.coordinator.prepare(&v2, 1, now()).unwrap(),
+        first_outcome
+    );
+    assert!(matches!(
+        frozen_first.coordinator.prepare(&v1, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    let frozen_read = frozen_first
+        .coordinator
+        .candidate_board_card_observations_with_source_for_date(frozen.business_date())
+        .unwrap();
+    assert_eq!(frozen_read.len(), 1);
+    assert_eq!(
+        frozen_read[0].card().terminal(),
+        CandidateBoardCardTerminalV1::Pending
+    );
+    let CandidateBoardSourceLinkV1::DeclaredV2 { ordered_rows } = frozen_read[0].source_link()
+    else {
+        panic!("committed v2 source must remain labelled as declared membership");
+    };
+    assert_eq!(ordered_rows.len(), frozen.ordered_rows().len());
+    assert!(ordered_rows[0].prediction_row_id() > ordered_rows[1].prediction_row_id());
+    assert_eq!(ordered_rows[0].code(), "TEST_CODE_p05_a");
+    assert_eq!(ordered_rows[1].code(), "TEST_CODE_p05_b");
+    for (observed, producer) in ordered_rows.iter().zip(frozen.ordered_rows()) {
+        assert_eq!(observed.prediction_row_id(), producer.prediction_row_id());
+        assert_eq!(observed.code(), producer.code());
+    }
+    assert_eq!(
+        frozen_read[0].card().source_binding_sha256(),
+        frozen.source_sha256()
+    );
+}
+
+#[test]
+fn p05_counted_v2_admission_rejects_source_with_wrong_trading_dates_or_row_identity() {
+    let (_prediction_directory, frozen) = p05_v2_frozen_source();
+    let fixture = Fixture::new("P05_V2_BAD_SOURCE");
+    let source = std::str::from_utf8(frozen.source_canonical()).unwrap();
+    let wrong_date = source.replace("2026-09-24", "2026-09-25");
+    assert_ne!(wrong_date, source);
+    let wrong_date_envelope = p05_v2_envelope(&frozen, wrong_date.into_bytes());
+    assert!(matches!(
+        fixture.coordinator.prepare(&wrong_date_envelope, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    let first_id = frozen.ordered_rows()[0].prediction_row_id();
+    let wrong_member = source.replacen(
+        &format!("\"prediction_row_id\":{first_id}"),
+        "\"prediction_row_id\":0",
+        1,
+    );
+    assert_ne!(wrong_member, source);
+    let wrong_member_envelope = p05_v2_envelope(&frozen, wrong_member.into_bytes());
+    assert!(matches!(
+        fixture
+            .coordinator
+            .prepare(&wrong_member_envelope, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        0
+    );
+}
+
+#[test]
+fn p05_v10_upgrade_retains_historical_duplicate_but_reader_rejects_ambiguous_owner() {
+    let fixture = Fixture::new("P05_LEGACY_DUPLICATE_UPGRADE");
+    let first = p05_card_envelope("LEGACY_DUPLICATE_FIRST", false);
+    let second = p05_card_envelope("LEGACY_DUPLICATE_SECOND", false);
+    fixture.coordinator.prepare(&first, 1, now()).unwrap();
+
+    let mut connection = Connection::open(&fixture.database_path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER candidate_board_exact_occurrence_owner_insert")
+        .unwrap();
+    p05_direct_decision_insert(&connection, &second, "").unwrap();
+    connection
+        .pragma_update(None, "user_version", 10_i64)
+        .unwrap();
+    initialize_test_schema(&mut connection).unwrap();
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions"),
+        2
+    );
+    assert_eq!(
+        fixture.query_i64("PRAGMA user_version"),
+        super::schema::SCHEMA_VERSION
+    );
+    assert!(matches!(
+        fixture
+            .coordinator
+            .candidate_board_card_observations_with_source_for_date("2026-08-18"),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("multiple decisions own exact occurrence")
+    ));
+    assert!(matches!(
+        fixture.coordinator.prepare(&first, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(reason))
+            if reason.contains("ambiguous counted owners")
+    ));
+    let third = p05_card_envelope("LEGACY_DUPLICATE_THIRD", false);
+    assert!(matches!(
+        fixture.coordinator.prepare(&third, 1, now()),
+        Err(DurableDeliveryError::PolicyMismatch(_))
+    ));
+    assert!(p05_direct_decision_insert(&connection, &third, "OR IGNORE").is_err());
 }
 
 #[test]
