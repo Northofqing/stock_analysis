@@ -4126,6 +4126,38 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         reason: Option<&str>,
         reason_secondary: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_prediction_with_id(
+            pred_date,
+            target_date,
+            theme_name,
+            stock_code,
+            direction,
+            score,
+            detail,
+            reason,
+            reason_secondary,
+        )
+        .map(|_| ())
+    }
+
+    /// Insert one prediction and return its actual row identity. This is a
+    /// producer identity only; it does not establish a counted delivery.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "stable audit persistence boundary mirrors prediction_tracker columns"
+    )]
+    pub fn save_prediction_with_id(
+        &self,
+        pred_date: &str,
+        target_date: &str,
+        theme_name: Option<&str>,
+        stock_code: Option<&str>,
+        direction: &str,
+        score: f64,
+        detail: Option<&str>,
+        reason: Option<&str>,
+        reason_secondary: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
         validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
         validate_date_text("target_date", target_date).map_err(invalid_input)?;
         validate_required_text("pred_direction", direction).map_err(invalid_input)?;
@@ -4147,22 +4179,40 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             validate_required_text("reason_secondary", reason_secondary).map_err(invalid_input)?;
         }
 
-        use diesel::sql_types::{Double, Nullable, Text};
+        use diesel::sql_types::{BigInt, Double, Nullable, Text};
+        #[derive(diesel::QueryableByName)]
+        struct InsertedId {
+            #[diesel(sql_type = BigInt)]
+            id: i64,
+        }
         let mut conn = self.get_conn()?;
-        diesel::sql_query(
-            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )
-        .bind::<Text, _>(pred_date)
-        .bind::<Text, _>(target_date)
-        .bind::<Nullable<Text>, _>(theme_name)
-        .bind::<Nullable<Text>, _>(stock_code)
-        .bind::<Text, _>(direction)
-        .bind::<Double, _>(score)
-        .bind::<Nullable<Text>, _>(detail)
-        .bind::<Nullable<Text>, _>(reason)
-        .bind::<Nullable<Text>, _>(reason_secondary)
-        .execute(&mut *conn)?;
-        Ok(())
+        conn.transaction::<i64, diesel::result::Error, _>(|conn| {
+            let inserted_count = diesel::sql_query(
+                "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind::<Text, _>(pred_date)
+            .bind::<Text, _>(target_date)
+            .bind::<Nullable<Text>, _>(theme_name)
+            .bind::<Nullable<Text>, _>(stock_code)
+            .bind::<Text, _>(direction)
+            .bind::<Double, _>(score)
+            .bind::<Nullable<Text>, _>(detail)
+            .bind::<Nullable<Text>, _>(reason)
+            .bind::<Nullable<Text>, _>(reason_secondary)
+            .execute(conn)?;
+            // A BEFORE INSERT trigger may ignore the row without an error.
+            // In that case last_insert_rowid() would name an older row on the
+            // same connection, so no identity may be reported.
+            if inserted_count != 1 {
+                return Err(diesel::result::Error::NotFound);
+            }
+            // Keep the ID read on the INSERT connection. A read failure rolls
+            // back the insertion, so callers never receive an ambiguous row.
+            let inserted: InsertedId = diesel::sql_query("SELECT last_insert_rowid() AS id")
+                .get_result(conn)?;
+            Ok(inserted.id)
+        })
+        .map_err(Into::into)
     }
 
     /// v10 P0.2 便捷重载: 不带 reason (旧调用路径, 走 v9 旧行为)

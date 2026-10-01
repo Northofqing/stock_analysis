@@ -603,22 +603,97 @@ async fn task2_candidate_save_reports_each_row_and_worker_failure() {
         ("TEST_CODE_valid1".into(), 70.),
         ("TEST_CODE_invalid".into(), 75.),
         ("TEST_CODE_valid2".into(), 80.),
+        ("TEST_CODE_valid1".into(), 71.),
     ];
-    let report = save_candidate_samples(&db, "2026-02-02", "2026-02-25", &samples);
-    assert_eq!((report.attempted, report.saved, report.unknown), (3, 2, 0));
+    let report = save_candidate_samples(&db, "2026-09-23", "2026-10-08", &samples);
+    assert_eq!((report.attempted, report.saved, report.unknown), (4, 3, 0));
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].code, "TEST_CODE_invalid");
     assert!(report.failures[0]
         .error
         .contains("injected row storage failure"));
     assert!(!report.is_complete());
-    assert_eq!(db.get_pending_predictions("2026-02-02").unwrap().len(), 2);
+    let rows = db.get_pending_predictions("2026-09-23").unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "each successful save remains a prediction row"
+    );
+    assert_eq!(report.saved_rows.len(), rows.len());
+    for saved in &report.saved_rows {
+        let row = rows
+            .iter()
+            .find(|row| i64::from(row.id) == saved.prediction_row_id)
+            .expect("reported ID must be the row actually inserted");
+        assert_eq!(row.stock_code.as_deref(), Some(saved.code.as_str()));
+        assert_eq!(row.pred_date, "2026-09-23");
+        assert_eq!(row.target_date, "2026-10-08");
+    }
+    assert_ne!(
+        report.saved_rows[0].prediction_row_id, report.saved_rows[2].prediction_row_id,
+        "same-code resampling remains distinct in the historical ledger"
+    );
+    for (saved, actual_change, hit) in [
+        (&report.saved_rows[0], 1.0, true),
+        (&report.saved_rows[1], -1.0, false),
+        (&report.saved_rows[2], -1.0, false),
+    ] {
+        let row_id = i32::try_from(saved.prediction_row_id).unwrap();
+        assert_eq!(
+            db.update_prediction_result_by_id(row_id, actual_change, hit)
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        db.candidate_promotion_samples("2026-10-08").unwrap(),
+        (2, 1),
+        "the later same-code row retains its ID but cannot change the promotion denominator"
+    );
     let worker = tokio::task::spawn_blocking(|| -> CandidateSampleSaveReport {
         panic!("injected worker failure")
     });
     let report = collect_candidate_save_worker(worker, 3).await;
     assert_eq!((report.saved, report.unknown), (0, 3));
+    assert!(report.saved_rows.is_empty());
     assert!(report.worker_error.as_deref().unwrap().contains("panic"));
+}
+
+#[test]
+fn candidate_sample_id_is_not_reused_when_insert_is_ignored() {
+    let (_dir, db) = private_db();
+    let first_id = db
+        .save_prediction_with_id(
+            "2026-02-02",
+            "2026-02-25",
+            None,
+            Some("TEST_CODE_first"),
+            "up",
+            70.,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    diesel::sql_query("CREATE TRIGGER ignore_candidate BEFORE INSERT ON prediction_tracker WHEN NEW.stock_code = 'TEST_CODE_ignored' BEGIN SELECT RAISE(IGNORE); END")
+        .execute(&mut db.get_conn().unwrap())
+        .unwrap();
+    assert!(db
+        .save_prediction_with_id(
+            "2026-02-02",
+            "2026-02-25",
+            None,
+            Some("TEST_CODE_ignored"),
+            "up",
+            75.,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    let rows = db.get_pending_predictions("2026-02-02").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(i64::from(rows[0].id), first_id);
 }
 
 #[test]

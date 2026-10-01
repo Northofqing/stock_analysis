@@ -4,7 +4,10 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
 
 #[path = "prediction_samples.rs"]
 mod samples;
-pub use samples::{persist_candidate_samples, save_candidate_samples, CandidateSampleSaveReport};
+pub use samples::{
+    persist_candidate_samples, save_candidate_samples, CandidateSampleSaveReport,
+    SavedCandidateSample,
+};
 #[path = "prediction_verifier.rs"]
 mod verifier;
 pub use verifier::{
