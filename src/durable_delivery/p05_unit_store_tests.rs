@@ -837,3 +837,23 @@ fn p05_unit_store_closed_codec_unknown_completed_and_tampered_bytes_fail() {
         "matching hashes cannot authorize changed closed policy"
     );
 }
+
+#[test]
+fn p05_unit_store_schema13_temp_shadow_fails_before_any_local_operation() {
+    let fixture = Fixture::new("P05_SCHEMA13_TEMP_SHADOW");
+    assert!(fixture
+        .coordinator
+        .with_connection(|connection| {
+            connection.execute_batch("CREATE TEMP TABLE p05_unit_drafts(foreign_payload BLOB);")?;
+            Ok(())
+        })
+        .is_err());
+    assert!(fixture
+        .coordinator
+        .read_p05_unit_draft("2026-09-23")
+        .is_err());
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM main.p05_unit_drafts"),
+        0
+    );
+}

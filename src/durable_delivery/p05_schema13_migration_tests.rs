@@ -267,26 +267,6 @@ fn p05_unit_store_schema13_current_missing_table_or_trigger_is_not_healed() {
 }
 
 #[test]
-fn p05_unit_store_schema13_temp_shadow_fails_before_any_local_operation() {
-    let fixture = Fixture::new("P05_SCHEMA13_TEMP_SHADOW");
-    assert!(fixture
-        .coordinator
-        .with_connection(|connection| {
-            connection.execute_batch("CREATE TEMP TABLE p05_unit_drafts(foreign_payload BLOB);")?;
-            Ok(())
-        })
-        .is_err());
-    assert!(fixture
-        .coordinator
-        .read_p05_unit_draft("2026-09-23")
-        .is_err());
-    assert_eq!(
-        fixture.query_i64("SELECT COUNT(*) FROM main.p05_unit_drafts"),
-        0
-    );
-}
-
-#[test]
 fn p05_unit_store_schema13_bootstrap_post_sql_failure_rolls_back_both_extensions_and_version() {
     let mut fixture = Fixture::new("P05_SCHEMA13_ROLLBACK");
     let config = release_shape(&mut fixture, 11);
