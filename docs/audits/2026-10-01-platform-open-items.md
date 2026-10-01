@@ -1,4 +1,4 @@
-# 平台剩余工作与上线门禁（2026-10-01 21:55 CST）
+# 平台剩余工作与上线门禁（2026-10-01 22:45 CST）
 
 本文按**生产事实、开发验证、外部依赖**分层记录当前欠项。完整目标和阶段依赖见[平台路线图](../superpowers/plans/2026-09-28-platform-complete-roadmap.md)；单次上线的制品与运行证据见[Wave 0 切换记录](../ops/2026-10-01-wave0-monitor-cutover.md)。本文不是上线批准，也不将源码测试等同于真实接收、账本或交易日观察。
 
@@ -12,11 +12,11 @@
 
 | 工作 | 当前证据 | 下一道门 |
 | --- | --- | --- |
-| R-08/NewsMonitor/A-11 公告路由 | 开发提交 `c91be0e1` 走 ExternalV1 并核对 typed mTLS provenance；相关库测试 9/9、monitor R-08 binding 1/1 通过。 | 冻结生产基线专属测试、饱和批次拒绝、release 制品、新 activation、人审和生产观察。全量分页仍需上游修复。 |
-| NewsMonitor 启动隔离 | `14be9462` 将阻塞构造放入 worker，开发目标测试 1/1；Wave 1 候选正扩至其他同步启动读取和 NewsFlash 审计恢复。 | 候选专属测试与 release 构建；生产启动时计时器和健康快照观察。每轮同步审计恢复仍需单独治理。 |
-| M1 产业链 Custom 输入影子 | `55a006ba` 把首个已建 HTTP 请求体与同次保留的 `report_input` 直接比较，隔离 worktree 定向测试 3/3。 | 继续同事实抑制/决策和其他渠道的 exact bytes；本片没有物理 owner、权威回执或 Foundation 晋级。 |
+| R-08/NewsMonitor/A-11 公告路由 | 冻结生产基线 Wave 1 候选 `3a3a48f8` 走 ExternalV1、核对 typed mTLS provenance，并拒绝触及 300 条上限的批次；候选定向库/monitor 测试及 release dry-run 通过。市场公告组 9 个用例通过，另 1 个 RPC fixture 因沙箱禁止监听本机端口而未取得测试结果。 | 用户已批准精确 activation，但尚未安装；2026-10-02 09:00 CST 后按切换门禁部署并观察。全量分页及 R-08 强制 CFFEX 仍需上游修复。 |
+| NewsMonitor 启动隔离 | 同一 Wave 1 候选将同步受众/元数据/去重/信号状态和 NewsFlash 启动审计恢复放入 blocking worker；启动计时器目标测试 1/1、release 构建通过。 | 生产新 PID 的启动计时器和健康快照观察；每轮同步 NewsFlash 审计恢复仍需单独治理。 |
+| M1 产业链输入/决策影子 | `55a006ba` 把 Custom 首个已建 HTTP 请求体与同次 `report_input` 核对（隔离定向 3/3）；`071324ac` 类型化记录两 timer 的抑制/发送决策和报告输入相等证据（隔离定向 2/2，旧投递回归 13/13）。 | 继续全渠道 exact bytes 和完整同事实语义；尚无物理 owner、权威回执或 Foundation 晋级。 |
 
-开发分支与生产二进制不是同一版本。Wave 1 候选从已上线的冻结源码单独取最小改动，目前仍在测试、构建和激活材料准备中；Wave 0 的人审只批准了 Wave 0 的精确 activation，不能复用。
+开发分支与生产二进制不是同一版本。Wave 1 的隔离候选从已上线冻结源码只取三个可执行输入变更；735 项清单 SHA-256 `a63f6f71212c5138d087f70ae6a1cd7719dfdfa039d8d915f4231d909f28915d`、release monitor SHA-256 `54efbc4c5b2ac8c772f13ddd9f1f25e628bc6a82e012c7386282f3d1263f1d57`、配置哈希 `8c89a6aa1c0baf9f6b3a7891c5cd05e9781150eb8b951f6f7478872ccf0a6d17`、activation SHA-256 `1e7f92b7c26d89559817ea6eab43c6b92e0becf9d057b9a0b934f60a2942efe6` 已复核，用户在本聊天批准该精确候选，生效为 2026-10-02 09:00 CST。22:38 CST 只读生产预检仍为 Wave 0，`Frozen/Unsafe`。切换前必须重查动态门禁和实际生产根配置哈希；未到生效时刻不得启动新进程。详细材料保存在隔离 worktree `.worktrees/wave1-narrow-20261001/.planning/wave1-narrow-20261001/activation-review.md`。
 
 ## 尚未完成的阶段
 
