@@ -26,6 +26,7 @@ pub mod global_market;
 pub mod global_news;
 pub mod grpc_source;
 pub mod historical_bars;
+pub(crate) mod historical_record_projection;
 pub mod index;
 pub mod instrument_identity;
 pub mod intraday_shape;
