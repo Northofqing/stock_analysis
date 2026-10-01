@@ -9,16 +9,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stock_analysis::monitor::push_job::WeakOutcomeKind;
-use stock_analysis::notification::NotificationSendReport;
+use stock_analysis::notification::{NotificationChannel, NotificationSendReport};
 use stock_analysis::pipeline::chain_analysis::preparation::PreparedChainAnalysis;
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendIntent {
     schema: String,
     notification_id: String,
@@ -30,7 +31,8 @@ struct SendIntent {
     prepared_artifact_sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WeakAttempt {
     channel: String,
     target_index: usize,
@@ -40,7 +42,8 @@ struct WeakAttempt {
     initial_body_bytes: Option<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendObservation {
     schema: String,
     notification_id: String,
@@ -59,6 +62,13 @@ pub(super) struct PendingSend {
     prepared_artifact_sha256: String,
 }
 
+/// Local disk evidence only; neither variant is a remote receipt or a retry permit.
+#[derive(Debug, Eq, PartialEq)]
+enum AuditReadback {
+    IntentOnly(SendIntent),
+    WeakObserved(SendIntent, SendObservation),
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -71,6 +81,128 @@ fn notification_id(invocation_id: &str, business_date: &str) -> String {
         hash.update(field.as_bytes());
     }
     format!("{:x}", hash.finalize())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_channel(channel: &str) -> bool {
+    [
+        NotificationChannel::Wechat,
+        NotificationChannel::Feishu,
+        NotificationChannel::Telegram,
+        NotificationChannel::Email,
+        NotificationChannel::Pushover,
+        NotificationChannel::Custom,
+        NotificationChannel::ServerChan,
+        NotificationChannel::DingTalk,
+        NotificationChannel::Slack,
+        NotificationChannel::Discord,
+    ]
+    .iter()
+    .any(|known| known.name() == channel)
+}
+
+/// Read one persisted invocation after restart. A missing observation means
+/// unknown physical outcome, including a crash before the sender returned.
+fn readback(directory: &Path, key: &str) -> Result<AuditReadback> {
+    ensure!(is_sha256(key), "invalid chain CLI notification id");
+    let intent_path = directory.join(format!("{key}.intent.json"));
+    let intent: SendIntent = serde_json::from_slice(
+        &fs::read(&intent_path).with_context(|| format!("read {}", intent_path.display()))?,
+    )
+    .with_context(|| format!("decode {}", intent_path.display()))?;
+    ensure!(
+        intent.schema == "chain-cli-send-intent-v1",
+        "unknown chain CLI intent schema"
+    );
+    ensure!(
+        intent.notification_id == key,
+        "chain CLI intent file identity mismatch"
+    );
+    ensure!(
+        intent.producer == "cli-chain",
+        "unexpected chain CLI producer"
+    );
+    ensure!(
+        intent.invocation_id.starts_with("cli-chain-")
+            && intent.invocation_id.len() > "cli-chain-".len(),
+        "invalid chain CLI invocation id"
+    );
+    ensure!(
+        chrono::NaiveDate::parse_from_str(&intent.business_date, "%Y-%m-%d")?.to_string()
+            == intent.business_date,
+        "invalid chain CLI business date"
+    );
+    ensure!(
+        notification_id(&intent.invocation_id, &intent.business_date) == key,
+        "chain CLI notification id does not bind invocation and business date"
+    );
+    ensure!(
+        is_sha256(&intent.report_sha256) && is_sha256(&intent.prepared_artifact_sha256),
+        "invalid chain CLI report or artifact digest"
+    );
+    ensure!(intent.report_bytes > 0, "empty chain CLI report");
+
+    let observation_path = directory.join(format!("{key}.observation.json"));
+    let bytes = match fs::read(&observation_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuditReadback::IntentOnly(intent));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", observation_path.display()));
+        }
+    };
+    let observation: SendObservation = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode {}", observation_path.display()))?;
+    ensure!(
+        observation.schema == "chain-cli-send-weak-observation-v1",
+        "unknown chain CLI observation schema"
+    );
+    ensure!(
+        observation.notification_id == intent.notification_id
+            && observation.invocation_id == intent.invocation_id
+            && observation.report_sha256 == intent.report_sha256
+            && observation.prepared_artifact_sha256 == intent.prepared_artifact_sha256,
+        "chain CLI observation does not match its intent"
+    );
+    ensure!(
+        observation.send_id.starts_with("notification-send-")
+            && observation.send_id.len() > "notification-send-".len(),
+        "invalid chain CLI send id"
+    );
+    for (index, attempt) in observation.attempts.iter().enumerate() {
+        ensure!(
+            attempt.target_index == index,
+            "chain CLI target order mismatch"
+        );
+        ensure!(
+            valid_channel(&attempt.channel),
+            "unknown chain CLI target channel"
+        );
+        ensure!(
+            matches!(
+                attempt.outcome.as_str(),
+                "weak_accepted" | "weak_rejected" | "unknown"
+            ),
+            "unknown chain CLI weak outcome"
+        );
+        match (
+            &attempt.initial_target_sha256,
+            &attempt.initial_body_sha256,
+            attempt.initial_body_bytes,
+        ) {
+            (None, None, None) => {}
+            (Some(target), Some(body), Some(_)) if is_sha256(target) && is_sha256(body) => {}
+            _ => bail!("incomplete chain CLI initial request evidence"),
+        }
+    }
+    Ok(AuditReadback::WeakObserved(intent, observation))
 }
 
 fn create_once_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -137,6 +269,10 @@ fn begin_with_invocation(
         &directory.join(format!("{notification_id}.intent.json")),
         &serde_json::to_vec(&intent)?,
     )?;
+    ensure!(
+        readback(directory, &notification_id)? == AuditReadback::IntentOnly(intent),
+        "chain CLI intent readback differs from the prepared send"
+    );
     Ok(PendingSend {
         directory: directory.to_owned(),
         notification_id,
@@ -151,6 +287,16 @@ impl PendingSend {
         anyhow::ensure!(
             digest(report_input) == self.report_sha256,
             "chain CLI observed report differs from its durable intent"
+        );
+        let AuditReadback::IntentOnly(intent) = readback(&self.directory, &self.notification_id)?
+        else {
+            bail!("chain CLI observation already exists; physical outcome requires review");
+        };
+        ensure!(
+            intent.invocation_id == self.invocation_id
+                && intent.report_sha256 == self.report_sha256
+                && intent.prepared_artifact_sha256 == self.prepared_artifact_sha256,
+            "chain CLI intent changed after physical send"
         );
         let observation = SendObservation {
             schema: "chain-cli-send-weak-observation-v1".into(),
@@ -186,7 +332,13 @@ impl PendingSend {
                 .directory
                 .join(format!("{}.observation.json", self.notification_id)),
             &serde_json::to_vec(&observation)?,
-        )
+        )?;
+        ensure!(
+            readback(&self.directory, &self.notification_id)?
+                == AuditReadback::WeakObserved(intent, observation),
+            "chain CLI weak observation readback differs from the sent report"
+        );
+        Ok(())
     }
 }
 
@@ -198,7 +350,7 @@ mod tests {
     use chrono::NaiveDate;
     use stock_analysis::notification::NotificationSendReport;
 
-    use super::{begin_with_invocation, SendIntent, SendObservation};
+    use super::{begin_with_invocation, readback, AuditReadback, SendIntent, SendObservation};
     use crate::app::chain_shadow_input::test_prepared;
 
     #[tokio::test]
@@ -218,6 +370,10 @@ mod tests {
         )
         .unwrap();
         let key = pending.notification_id.clone();
+        assert!(matches!(
+            readback(directory.path(), &key).unwrap(),
+            AuditReadback::IntentOnly(_)
+        ));
         assert!(begin_with_invocation(
             &prepared,
             bytes,
@@ -227,6 +383,10 @@ mod tests {
         .is_err());
         let report = NotificationSendReport::default();
         pending.observe(bytes, &report).unwrap();
+        assert!(matches!(
+            readback(directory.path(), &key).unwrap(),
+            AuditReadback::WeakObserved(_, _)
+        ));
         let intent_bytes =
             std::fs::read(directory.path().join(format!("{key}.intent.json"))).unwrap();
         let observation_bytes =
@@ -278,5 +438,66 @@ mod tests {
             .path()
             .join(format!("{key}.observation.json"))
             .exists());
+    }
+
+    #[tokio::test]
+    async fn readback_rejects_changed_identity_and_invalid_target_evidence() {
+        let prepared = test_prepared(
+            NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+            Rc::new(Cell::new(0)),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = prepared.report().as_bytes();
+        let pending = begin_with_invocation(
+            &prepared,
+            bytes,
+            directory.path(),
+            "cli-chain-reopen-test".into(),
+        )
+        .unwrap();
+        let key = pending.notification_id.clone();
+        let intent_path = directory.path().join(format!("{key}.intent.json"));
+        let observation_path = directory.path().join(format!("{key}.observation.json"));
+        let original_intent = std::fs::read(&intent_path).unwrap();
+        pending
+            .observe(bytes, &NotificationSendReport::default())
+            .unwrap();
+        let original_observation = std::fs::read(&observation_path).unwrap();
+
+        let mut changed: serde_json::Value = serde_json::from_slice(&original_observation).unwrap();
+        changed["report_sha256"] = serde_json::json!("0".repeat(64));
+        std::fs::write(&observation_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(readback(directory.path(), &key).is_err());
+
+        changed = serde_json::from_slice(&original_observation).unwrap();
+        changed["attempts"] = serde_json::json!([{
+            "channel": "自定义Webhook",
+            "target_index": 0,
+            "outcome": "unknown",
+            "initial_target_sha256": "0".repeat(64),
+            "initial_body_sha256": "1".repeat(64),
+            "initial_body_bytes": 1
+        }]);
+        std::fs::write(&observation_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            readback(directory.path(), &key).unwrap(),
+            AuditReadback::WeakObserved(_, _)
+        ));
+
+        changed["attempts"][0]["target_index"] = serde_json::json!(1);
+        std::fs::write(&observation_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(readback(directory.path(), &key).is_err());
+
+        changed["attempts"][0]["target_index"] = serde_json::json!(0);
+        changed["attempts"][0]["initial_body_sha256"] = serde_json::Value::Null;
+        std::fs::write(&observation_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(readback(directory.path(), &key).is_err());
+
+        std::fs::write(&observation_path, &original_observation).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original_intent).unwrap();
+        changed["business_date"] = serde_json::json!("2026-09-30");
+        std::fs::write(&intent_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(readback(directory.path(), &key).is_err());
     }
 }
