@@ -4,9 +4,9 @@
 
 use crate::monitor::detector::AlertEvent;
 use crate::risk::env_guard::{current_env, is_test_code, runtime_is_test_process, TradingEnv};
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 fn alerts_dir() -> PathBuf {
@@ -16,6 +16,65 @@ fn alerts_dir() -> PathBuf {
 fn dated_file(dir: &Path, ext: &str) -> PathBuf {
     let date = Local::now().format("%Y%m%d").to_string();
     dir.join(format!("{}.{}", date, ext))
+}
+
+fn dated_file_for(dir: &Path, ext: &str, date: NaiveDate) -> PathBuf {
+    dir.join(format!("{}.{}", date.format("%Y%m%d"), ext))
+}
+
+/// A strict parse of one dated alert file, without a writer fence or a durable input head.
+/// Even these rows cannot prove a stable day cutoff or authorize an empty-day seal.
+#[derive(Debug)]
+pub struct UnfencedAlertRecords {
+    date: NaiveDate,
+    records: Vec<AlertRecord>,
+}
+
+impl UnfencedAlertRecords {
+    pub fn date(&self) -> NaiveDate {
+        self.date
+    }
+
+    pub fn records(&self) -> &[AlertRecord] {
+        &self.records
+    }
+}
+
+/// A dated alert file whose complete contents cannot be established by the strict reader.
+#[derive(Debug)]
+pub enum AlertInputUnknown {
+    AccessDenied,
+    Missing,
+    NonRegular,
+    ChangedDuringRead,
+    EmptyWithoutHead,
+    TruncatedFinalLine,
+    MalformedLine {
+        line: usize,
+        source: serde_json::Error,
+    },
+    IneligibleRecord {
+        line: usize,
+    },
+    Io(std::io::Error),
+}
+
+fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left.dev() != right.dev()
+            || left.ino() != right.ino()
+            || left.ctime() != right.ctime()
+            || left.ctime_nsec() != right.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    left.is_file()
+        && right.is_file()
+        && left.len() == right.len()
+        && matches!((left.modified(), right.modified()), (Ok(a), Ok(b)) if a == b)
 }
 
 fn write_jsonl(mut writer: impl Write, record: &AlertRecord) -> std::io::Result<()> {
@@ -194,6 +253,78 @@ impl AlertLog {
             })
             .collect()
     }
+
+    /// Parse every line of an explicit business-date JSONL file. This is an unfenced
+    /// observation: concurrent appends or later replacement remain possible. In particular,
+    /// missing or empty input is Unknown until a durable input head exists.
+    pub fn inspect_date_records_strict(
+        &self,
+        date: NaiveDate,
+    ) -> Result<UnfencedAlertRecords, AlertInputUnknown> {
+        self.ensure_io_allowed().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                AlertInputUnknown::AccessDenied
+            } else {
+                AlertInputUnknown::Io(error)
+            }
+        })?;
+
+        let path = dated_file_for(&self.dir, "jsonl", date);
+        let before = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AlertInputUnknown::Missing);
+            }
+            Err(error) => return Err(AlertInputUnknown::Io(error)),
+        };
+        if !before.is_file() {
+            return Err(AlertInputUnknown::NonRegular);
+        }
+
+        let mut file = fs::File::open(&path).map_err(AlertInputUnknown::Io)?;
+        let opened = file.metadata().map_err(AlertInputUnknown::Io)?;
+        if !same_file_state(&before, &opened) {
+            return Err(AlertInputUnknown::ChangedDuringRead);
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(AlertInputUnknown::Io)?;
+        let after_file = file.metadata().map_err(AlertInputUnknown::Io)?;
+        let after_path =
+            fs::symlink_metadata(&path).map_err(|_| AlertInputUnknown::ChangedDuringRead)?;
+        if !same_file_state(&before, &after_file)
+            || !same_file_state(&before, &after_path)
+            || bytes.len() as u64 != before.len()
+        {
+            return Err(AlertInputUnknown::ChangedDuringRead);
+        }
+
+        if bytes.is_empty() {
+            return Err(AlertInputUnknown::EmptyWithoutHead);
+        }
+        if bytes.last() != Some(&b'\n') {
+            return Err(AlertInputUnknown::TruncatedFinalLine);
+        }
+
+        let mut records = Vec::new();
+        for (index, line) in bytes[..bytes.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            let line_number = index + 1;
+            let record: AlertRecord = serde_json::from_slice(line).map_err(|source| {
+                AlertInputUnknown::MalformedLine {
+                    line: line_number,
+                    source,
+                }
+            })?;
+            if self.origin == AlertRecordOrigin::Production && !record.is_production_eligible() {
+                return Err(AlertInputUnknown::IneligibleRecord { line: line_number });
+            }
+            records.push(record);
+        }
+        Ok(UnfencedAlertRecords { date, records })
+    }
 }
 
 fn write_markdown(mut writer: impl Write, event: &AlertEvent) -> std::io::Result<()> {
@@ -230,6 +361,13 @@ pub fn today_stats() -> (usize, usize, usize) {
 /// 文件缺失或行解析失败 → 该行跳过 (出声: 返回错误行计数由调用方日志体现)。
 pub fn read_today_records() -> Vec<AlertRecord> {
     AlertLog::production().read_today_records()
+}
+
+/// Strict explicit-date read for future fenced G5b input provenance work.
+pub fn inspect_date_records_strict(
+    date: NaiveDate,
+) -> Result<UnfencedAlertRecords, AlertInputUnknown> {
+    AlertLog::production().inspect_date_records_strict(date)
 }
 
 // ── JSON 记录 ──
@@ -293,6 +431,10 @@ impl AlertRecord {
 mod tests {
     use super::*;
     use crate::monitor::detector::{AlertCategory, AlertDetail, AlertLevel};
+
+    fn past_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, 5).unwrap()
+    }
 
     fn e() -> AlertEvent {
         AlertEvent {
@@ -471,5 +613,129 @@ mod tests {
         assert_eq!(records[0].code, "600396");
         assert_eq!(records[1].origin, AlertRecordOrigin::Production);
         assert_eq!(records[1].code, "000001");
+    }
+
+    #[test]
+    fn strict_date_reader_never_proves_an_empty_day_without_a_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::for_test(temp.path()).unwrap();
+        let date = past_date();
+        assert!(matches!(
+            archive.inspect_date_records_strict(date),
+            Err(AlertInputUnknown::Missing)
+        ));
+
+        let path = dated_file_for(temp.path(), "jsonl", date);
+        fs::write(&path, []).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(date),
+            Err(AlertInputUnknown::EmptyWithoutHead)
+        ));
+
+        let mut first = AlertRecord::from_event(&e(), AlertRecordOrigin::Test);
+        first.code = "TEST_CODE_FIRST".into();
+        let mut second = first.clone();
+        second.code = "TEST_CODE_SECOND".into();
+        let mut bytes = Vec::new();
+        write_jsonl(&mut bytes, &first).unwrap();
+        write_jsonl(&mut bytes, &second).unwrap();
+        fs::write(path, bytes).unwrap();
+
+        let observed = archive.inspect_date_records_strict(date).unwrap();
+        assert_eq!(observed.date(), date);
+        assert_eq!(observed.records().len(), 2);
+        assert_eq!(observed.records()[0].code, "TEST_CODE_FIRST");
+        assert_eq!(observed.records()[1].code, "TEST_CODE_SECOND");
+    }
+
+    #[test]
+    fn strict_date_reader_rejects_partial_and_malformed_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::for_test(temp.path()).unwrap();
+        let path = dated_file_for(temp.path(), "jsonl", past_date());
+        let mut valid = Vec::new();
+        write_jsonl(
+            &mut valid,
+            &AlertRecord::from_event(&e(), AlertRecordOrigin::Test),
+        )
+        .unwrap();
+
+        let mut partial = valid.clone();
+        partial.extend_from_slice(b"{\"code\":");
+        fs::write(&path, partial).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::TruncatedFinalLine)
+        ));
+
+        let mut malformed = valid.clone();
+        malformed.extend_from_slice(b"{\"code\":}\n");
+        fs::write(&path, malformed).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::MalformedLine { line: 2, .. })
+        ));
+
+        valid.push(b'\n');
+        fs::write(path, valid).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::MalformedLine { line: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn strict_date_reader_rejects_nonregular_and_ineligible_production_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::production_at(temp.path());
+        let path = dated_file_for(temp.path(), "jsonl", past_date());
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::NonRegular)
+        ));
+        fs::remove_dir(&path).unwrap();
+
+        let mut record = AlertRecord::from_event(&e(), AlertRecordOrigin::Production);
+        let mut bytes = Vec::new();
+        write_jsonl(&mut bytes, &record).unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            archive.inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::IneligibleRecord { line: 1 })
+        ));
+
+        record.code = "600396".into();
+        let mut bytes = Vec::new();
+        write_jsonl(&mut bytes, &record).unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            archive
+                .inspect_date_records_strict(past_date())
+                .unwrap()
+                .records()[0]
+                .code,
+            "600396"
+        );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            let target = temp.path().join("target.jsonl");
+            fs::write(&target, b"{}\n").unwrap();
+            std::os::unix::fs::symlink(target, path).unwrap();
+            assert!(matches!(
+                archive.inspect_date_records_strict(past_date()),
+                Err(AlertInputUnknown::NonRegular)
+            ));
+        }
+    }
+
+    #[test]
+    fn strict_date_reader_respects_production_test_runtime_guard() {
+        assert!(matches!(
+            AlertLog::production().inspect_date_records_strict(past_date()),
+            Err(AlertInputUnknown::AccessDenied)
+        ));
     }
 }
