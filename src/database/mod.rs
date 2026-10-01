@@ -4579,7 +4579,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
     /// Read recorded, verified prediction signal samples for the inclusive last
     /// `trading_days` checked-in A-share trading dates ending at `as_of`.
     /// Frozen target dates after `as_of` are excluded even if a result was
-    /// prematurely recorded. A prediction row does not prove its push was delivered.
+    /// prematurely recorded. A recorded hit without a valid return fails the
+    /// summary instead of entering the verified-sample denominator. A prediction
+    /// row does not prove its push was delivered.
     pub fn get_verified_prediction_sample_hit_rate(
         &self,
         as_of: NaiveDate,
@@ -4604,13 +4606,17 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         let mut conn = self.get_conn()?;
         #[derive(QueryableByName)]
         struct RecordedOutcome {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
             #[diesel(sql_type = diesel::sql_types::Text)]
             pred_date: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            actual_change: Option<f64>,
             #[diesel(sql_type = diesel::sql_types::Integer)]
             hit: i32,
         }
         let rows = diesel::sql_query(
-            "SELECT pred_date, hit FROM prediction_tracker \
+            "SELECT id, pred_date, actual_change, hit FROM prediction_tracker \
              WHERE hit IS NOT NULL AND pred_date >= ?1 AND pred_date <= ?2 \
              AND target_date <= ?3",
         )
@@ -4623,6 +4629,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         for row in rows {
             if !dates.contains(&row.pred_date) {
                 continue;
+            }
+            if !row
+                .actual_change
+                .is_some_and(|change| change.is_finite() && change >= -100.0)
+            {
+                return Err(format!("预测样本 id={} 缺少有效实际收益", row.id).into());
             }
             if !matches!(row.hit, 0 | 1) {
                 return Err(format!("预测样本 hit 超出 0/1: {}", row.hit).into());

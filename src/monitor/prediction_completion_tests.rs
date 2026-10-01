@@ -137,6 +137,46 @@ fn hit_rate_window_counts_only_due_rows_on_verified_trading_dates() {
 }
 
 #[test]
+fn hit_rate_rejects_a_recorded_hit_without_a_valid_return() {
+    let (_dir, db) = private_db();
+    let code = "TEST_CODE_incomplete_outcome";
+    db.save_prediction_legacy(
+        "2026-10-08",
+        "2026-10-09",
+        None,
+        Some(code),
+        "up",
+        75.,
+        None,
+    )
+    .unwrap();
+    let id = db
+        .get_prediction_by_code_date(code, "2026-10-08")
+        .unwrap()
+        .id;
+    db.update_prediction_result_by_id(id, 1.0, true).unwrap();
+    let as_of = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+    assert_eq!(
+        db.get_verified_prediction_sample_hit_rate(as_of, 2)
+            .unwrap()
+            .samples,
+        1
+    );
+
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query("UPDATE prediction_tracker SET actual_change = NULL WHERE id = ?")
+        .bind::<diesel::sql_types::Integer, _>(id)
+        .execute(&mut conn)
+        .unwrap();
+    drop(conn);
+    let error = db
+        .get_verified_prediction_sample_hit_rate(as_of, 2)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("缺少有效实际收益"), "{error}");
+}
+
+#[test]
 fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
     let (_dir, db) = private_db();
     for (code, pred_date, target_date, detail, hit) in [
