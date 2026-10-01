@@ -134,6 +134,161 @@ pub struct VerifiedAlertInputPrefix {
     records: Vec<AlertRecord>,
 }
 
+/// An original LF-terminated source occurrence, constructed only by the
+/// strict prefix reader. Its ordinal is independent of decoded event facts.
+#[derive(Debug)]
+pub(crate) struct VerifiedAlertInputLine {
+    ordinal: u64,
+    start_offset: u64,
+    end_offset: u64,
+    raw_bytes: Vec<u8>,
+    raw_sha256: String,
+    record: AlertRecord,
+}
+
+impl VerifiedAlertInputLine {
+    pub(crate) fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+    pub(crate) fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+    pub(crate) fn end_offset(&self) -> u64 {
+        self.end_offset
+    }
+    pub(crate) fn raw_bytes(&self) -> &[u8] {
+        &self.raw_bytes
+    }
+    pub(crate) fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+    pub(crate) fn record(&self) -> &AlertRecord {
+        &self.record
+    }
+}
+
+/// A captured prefix borrowing the correct physical date guard. No serde
+/// constructor or caller-provided raw/hash/inode can create this capability.
+pub(crate) struct LockedAlertInputPrefix<'fence> {
+    fence: &'fence DateFence,
+    origin: AlertRecordOrigin,
+    head: AlertInputHeadV1,
+    head_canonical: Vec<u8>,
+    raw_bytes: Vec<u8>,
+}
+
+/// An exact cutoff derived from a previously captured head and actual source
+/// bytes. It is a prefix observation, not a provider/window or day-seal proof.
+pub(crate) struct VerifiedAlertInputCutoff {
+    head: AlertInputHeadV1,
+    head_canonical: Vec<u8>,
+    lines: Vec<VerifiedAlertInputLine>,
+}
+
+impl VerifiedAlertInputCutoff {
+    pub(crate) fn head(&self) -> &AlertInputHeadV1 {
+        &self.head
+    }
+    pub(crate) fn head_canonical(&self) -> &[u8] {
+        &self.head_canonical
+    }
+    pub(crate) fn source_identity(&self) -> Option<(u64, u64)> {
+        self.head
+            .source_identity
+            .as_ref()
+            .map(|id| (id.device, id.inode))
+    }
+    pub(crate) fn lines(&self) -> &[VerifiedAlertInputLine] {
+        &self.lines
+    }
+}
+
+impl LockedAlertInputPrefix<'_> {
+    fn ensure_unchanged(&self) -> Result<(), AlertInputHeadUnknown> {
+        let (_, head, bytes) = inspect_locked(self.fence, self.head.business_date, self.origin)?;
+        if head.bytes != self.head_canonical || bytes != self.raw_bytes {
+            return Err(AlertInputHeadUnknown::ChangedDuringRead);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn current_cutoff(&self) -> Result<VerifiedAlertInputCutoff, AlertInputHeadUnknown> {
+        self.cutoff_for_captured_head(&self.head_canonical)
+    }
+
+    /// The supplied head is an expected binding from an existing private
+    /// candidate. The actual line ranges, hashes and identity are recomputed.
+    pub(crate) fn cutoff_for_captured_head(
+        &self,
+        captured_head: &[u8],
+    ) -> Result<VerifiedAlertInputCutoff, AlertInputHeadUnknown> {
+        self.ensure_unchanged()?;
+        let declared: AlertInputHeadV1 = serde_json::from_slice(captured_head)
+            .map_err(|_| AlertInputHeadUnknown::InvalidHead)?;
+        if !declared.valid_for(self.head.business_date)
+            || head_bytes(&declared)? != captured_head
+            || declared.generation > self.head.generation
+            || declared.committed_offset > self.head.committed_offset
+            || (declared.generation > 0 && declared.source_identity != self.head.source_identity)
+        {
+            return Err(AlertInputHeadUnknown::InvalidHead);
+        }
+        let offset = usize::try_from(declared.committed_offset)
+            .map_err(|_| AlertInputHeadUnknown::InvalidHead)?;
+        let bytes = self
+            .raw_bytes
+            .get(..offset)
+            .ok_or(AlertInputHeadUnknown::InvalidHead)?;
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(AlertInputHeadUnknown::TruncatedFinalLine);
+        }
+        let mut lines = Vec::new();
+        let mut start = 0usize;
+        for (index, raw) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+            let end = start
+                .checked_add(raw.len())
+                .ok_or(AlertInputHeadUnknown::InvalidHead)?;
+            let record = serde_json::from_slice(&raw[..raw.len() - 1]).map_err(|source| {
+                AlertInputHeadUnknown::MalformedLine {
+                    line: index + 1,
+                    source,
+                }
+            })?;
+            lines.push(VerifiedAlertInputLine {
+                ordinal: (index as u64) + 1,
+                start_offset: start as u64,
+                end_offset: end as u64,
+                raw_bytes: raw.to_vec(),
+                raw_sha256: hash(raw),
+                record,
+            });
+            start = end;
+        }
+        let actual = AlertInputHeadV1 {
+            version: HEAD_VERSION,
+            business_date: self.head.business_date,
+            generation: lines.len() as u64,
+            committed_offset: bytes.len() as u64,
+            prefix_sha256: hash(bytes),
+            source_identity: if bytes.is_empty() {
+                None
+            } else {
+                self.head.source_identity.clone()
+            },
+        };
+        let canonical = head_bytes(&actual)?;
+        if canonical != captured_head || actual != declared {
+            return Err(AlertInputHeadUnknown::InvalidHead);
+        }
+        self.fence.ensure_date(actual.business_date)?;
+        Ok(VerifiedAlertInputCutoff {
+            head: actual,
+            head_canonical: canonical,
+            lines,
+        })
+    }
+}
+
 impl VerifiedAlertInputPrefix {
     pub fn head(&self) -> &AlertInputHeadV1 {
         &self.head
@@ -565,6 +720,38 @@ impl AlertLog {
         DateFence::acquire(&self.dir, date, true).map_err(io_unknown)
     }
 
+    /// Borrow an already-held guard without taking a nested flock. The guard
+    /// must belong to this exact AlertLog namespace, not merely the same date.
+    pub(crate) fn inspect_date_input_prefix_locked<'fence>(
+        &self,
+        date: NaiveDate,
+        fence: &'fence DateFence,
+    ) -> Result<LockedAlertInputPrefix<'fence>, AlertInputHeadUnknown> {
+        self.ensure_io_allowed().map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                AlertInputHeadUnknown::AccessDenied
+            } else {
+                error.into()
+            }
+        })?;
+        fence.ensure_date(date)?;
+        let namespace = fs::symlink_metadata(&self.dir)?;
+        if !namespace.file_type().is_dir()
+            || !same_identity(&namespace, &fence.dir_file.metadata()?)
+            || fs::canonicalize(&self.dir)? != fence.dir
+        {
+            return Err(AlertInputHeadUnknown::SourceIdentityMismatch);
+        }
+        let (snapshot, head, raw_bytes) = inspect_locked(fence, date, self.origin)?;
+        Ok(LockedAlertInputPrefix {
+            fence,
+            origin: self.origin,
+            head: snapshot.head,
+            head_canonical: head.bytes,
+            raw_bytes,
+        })
+    }
+
     /// Start provenance only for a genuinely new date. A pre-head file, even
     /// if empty, is historical/unknown and is never silently adopted.
     pub fn initialize_date_input_head(&self, date: NaiveDate) -> io::Result<AlertInputHeadV1> {
@@ -614,13 +801,55 @@ impl AlertLog {
         }
         let mut line = Vec::new();
         write_jsonl(&mut line, &record)?;
+        self.append_date_jsonl_line_inner(date, &line, allow_prehead)
+    }
+
+    /// Isolated test input with original bytes, using the real append/head
+    /// publisher. This seam cannot be used by a production AlertLog.
+    #[cfg(test)]
+    pub(crate) fn append_test_date_raw_production_fixture(
+        &self,
+        date: NaiveDate,
+        line: &[u8],
+    ) -> io::Result<AlertInputHeadV1> {
+        if self.origin != AlertRecordOrigin::Test || self.default_production {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "raw fixture append requires an isolated Test alert archive",
+            ));
+        }
+        if line.last() != Some(&b'\n') || line[..line.len() - 1].contains(&b'\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "raw fixture must be one LF-terminated record",
+            ));
+        }
+        let record: AlertRecord =
+            serde_json::from_slice(&line[..line.len() - 1]).map_err(io::Error::other)?;
+        if record.origin != AlertRecordOrigin::Production || !record.is_production_eligible() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "raw fixture requires a Production-tag record with a non-test code",
+            ));
+        }
+        self.ensure_io_allowed()?;
+        self.append_date_jsonl_line_inner(date, line, false)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "input head unavailable"))
+    }
+
+    fn append_date_jsonl_line_inner(
+        &self,
+        date: NaiveDate,
+        line: &[u8],
+        allow_prehead: bool,
+    ) -> io::Result<Option<AlertInputHeadV1>> {
         let guard = DateFence::acquire(&self.dir, date, true).map_err(io_unknown)?;
         let (snapshot, old_head, old_bytes) = match inspect_locked(&guard, date, self.origin) {
             Ok(state) => state,
             Err(AlertInputHeadUnknown::MissingHead) => {
                 match fs::symlink_metadata(dated_file_for(&guard.dir, "jsonl", date)) {
                     Ok(_) if allow_prehead => {
-                        append_prehead_locked(&guard, date, &line)?;
+                        append_prehead_locked(&guard, date, line)?;
                         return Ok(None);
                     }
                     Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -649,7 +878,7 @@ impl AlertLog {
                 "source changed before append",
             ));
         }
-        file.write_all(&line)?;
+        file.write_all(line)?;
         file.sync_all()?;
         // A crash before the head rename must leave the new source name/suffix
         // durable, so a zero or older head cannot be read as complete.
@@ -657,7 +886,7 @@ impl AlertLog {
         let (actual, after) =
             read_regular(&path, AlertInputHeadUnknown::MissingSource).map_err(io_unknown)?;
         let mut expected = old_bytes;
-        expected.extend_from_slice(&line);
+        expected.extend_from_slice(line);
         if !same_identity(&before, &after) || actual != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

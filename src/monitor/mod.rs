@@ -25,6 +25,7 @@ pub mod data_quality;
 pub mod detector;
 pub mod entity_linker;
 pub mod event_bus;
+pub(crate) mod g5b_selection_v2;
 mod integration;
 pub mod news_ai;
 pub mod news_monitor;

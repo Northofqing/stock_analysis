@@ -14,6 +14,9 @@ pub(crate) use input_head::DateFence as G5bDateFence;
 pub use input_head::{
     inspect_date_input_head, AlertInputHeadUnknown, AlertInputHeadV1, VerifiedAlertInputPrefix,
 };
+pub(crate) use input_head::{
+    LockedAlertInputPrefix, VerifiedAlertInputCutoff, VerifiedAlertInputLine,
+};
 
 fn alerts_dir() -> PathBuf {
     crate::production_root::production_root().join("reports/alerts")
