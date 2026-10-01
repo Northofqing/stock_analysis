@@ -4406,6 +4406,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             pred_date: String,
             #[diesel(sql_type = diesel::sql_types::Text)]
             target_date: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            stock_code: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pred_direction: String,
             #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
             actual_change: Option<f64>,
             #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
@@ -4415,7 +4419,8 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // Legacy natural-day targets and unchecked calendar years cannot
         // contribute to the promotion denominator.
         let first_samples = diesel::sql_query(
-            "SELECT id, pred_date, target_date, actual_change, hit FROM prediction_tracker \
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, actual_change, hit \
+             FROM prediction_tracker \
              WHERE id IN ( \
                SELECT MIN(id) FROM prediction_tracker \
                WHERE pred_detail = 'candidate-strong' \
@@ -4458,12 +4463,53 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
                     reason: "target_not_fifth_trading_day",
                 });
             }
-            if target_date <= business_date
-                && row.actual_change.is_some()
-                && matches!(row.hit, Some(0 | 1))
+            if target_date > business_date {
+                continue;
+            }
+            let code = row
+                .stock_code
+                .as_deref()
+                .filter(|code| !code.trim().is_empty())
+                .ok_or(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "stock_code_missing",
+                })?;
+            validate_evidence_code(code).map_err(|_| EvidenceError::IneligibleFirstSample {
+                id: row.id,
+                reason: "stock_code_invalid",
+            })?;
+            // BR-232 candidate producer writes only "up"; the verifier marks
+            // it hit only when the actual return is strictly greater than 0.5%.
+            if row.pred_direction != "up" {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "pred_direction_not_up",
+                });
+            }
+            if row
+                .actual_change
+                .is_some_and(|change| !change.is_finite() || change < -100.0)
             {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "actual_change_invalid",
+                });
+            }
+            if row.hit.is_some_and(|hit| hit != 0 && hit != 1) {
+                return Err(EvidenceError::IneligibleFirstSample {
+                    id: row.id,
+                    reason: "hit_invalid",
+                });
+            }
+            if let (Some(change), Some(hit)) = (row.actual_change, row.hit) {
+                if (change > 0.5) != (hit == 1) {
+                    return Err(EvidenceError::IneligibleFirstSample {
+                        id: row.id,
+                        reason: "hit_outcome_mismatch",
+                    });
+                }
                 sample_count += 1;
-                hit_sum += usize::from(row.hit == Some(1));
+                hit_sum += hit as usize;
             }
         }
         Ok((sample_count, hit_sum))

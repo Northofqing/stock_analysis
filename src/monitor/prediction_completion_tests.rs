@@ -202,29 +202,23 @@ fn candidate_promotion_counts_only_complete_outcomes_after_their_session() {
             );
         }
     }
-    for (code, hit) in [
-        ("TEST_CODE_partial", None),
-        ("TEST_CODE_invalid_hit", Some(2)),
-    ] {
-        db.save_prediction_legacy(
-            "2026-09-23",
-            "2026-10-08",
-            None,
-            Some(code),
-            "up",
-            75.,
-            Some("candidate-strong"),
-        )
-        .unwrap();
-        let mut conn = db.get_conn().unwrap();
-        diesel::sql_query(
-            "UPDATE prediction_tracker SET actual_change = 1.0, hit = ?1 WHERE stock_code = ?2",
-        )
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(hit)
-        .bind::<diesel::sql_types::Text, _>(code)
-        .execute(&mut conn)
-        .unwrap();
-    }
+    db.save_prediction_legacy(
+        "2026-09-23",
+        "2026-10-08",
+        None,
+        Some("TEST_CODE_partial"),
+        "up",
+        75.,
+        Some("candidate-strong"),
+    )
+    .unwrap();
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query(
+        "UPDATE prediction_tracker SET actual_change = 1.0 WHERE stock_code = 'TEST_CODE_partial'",
+    )
+    .execute(&mut conn)
+    .unwrap();
+    drop(conn);
 
     let before_close = "2026-10-09T14:59:59+08:00"
         .parse::<DateTime<FixedOffset>>()
@@ -419,6 +413,114 @@ fn candidate_promotion_requires_first_row_fifth_trading_day_authority() {
             ..
         })
     ));
+}
+
+#[test]
+fn candidate_promotion_rejects_invalid_due_first_row_outcomes() {
+    use crate::database::CandidatePromotionEvidenceError;
+    use diesel::sql_types::{Double, Integer, Nullable, Text};
+
+    for (case, code, direction, actual_change, hit, expected_reason) in [
+        (
+            "theme_only",
+            None,
+            "up",
+            Some(1.0),
+            Some(1),
+            "stock_code_missing",
+        ),
+        (
+            "invalid_code",
+            Some("INVALID SYMBOL"),
+            "up",
+            Some(1.0),
+            Some(1),
+            "stock_code_invalid",
+        ),
+        (
+            "infinite_return",
+            Some("TEST_CODE_inf"),
+            "up",
+            Some(f64::INFINITY),
+            Some(1),
+            "actual_change_invalid",
+        ),
+        (
+            "below_return_floor",
+            Some("TEST_CODE_floor"),
+            "up",
+            Some(-101.0),
+            Some(0),
+            "actual_change_invalid",
+        ),
+        (
+            "hit_above_boolean",
+            Some("TEST_CODE_hit_two"),
+            "up",
+            Some(1.0),
+            Some(2),
+            "hit_invalid",
+        ),
+        (
+            "negative_hit",
+            Some("TEST_CODE_hit_negative"),
+            "up",
+            Some(1.0),
+            Some(-1),
+            "hit_invalid",
+        ),
+        (
+            "wrong_direction",
+            Some("TEST_CODE_direction"),
+            "down",
+            Some(1.0),
+            Some(1),
+            "pred_direction_not_up",
+        ),
+        (
+            "false_win_at_threshold",
+            Some("TEST_CODE_threshold"),
+            "up",
+            Some(0.5),
+            Some(1),
+            "hit_outcome_mismatch",
+        ),
+        (
+            "false_miss_above_threshold",
+            Some("TEST_CODE_false_miss"),
+            "up",
+            Some(1.0),
+            Some(0),
+            "hit_outcome_mismatch",
+        ),
+    ] {
+        let (_dir, db) = private_db();
+        let mut conn = db.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO prediction_tracker \
+             (pred_date,target_date,theme_name,stock_code,pred_direction,pred_score,pred_detail,actual_change,hit) \
+             VALUES ('2026-09-23','2026-10-08','candidate-test',?1,?2,75,'candidate-strong',?3,?4)",
+        )
+        .bind::<Nullable<Text>, _>(code)
+        .bind::<Text, _>(direction)
+        .bind::<Nullable<Double>, _>(actual_change)
+        .bind::<Nullable<Integer>, _>(hit)
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+
+        let observed = db.candidate_promotion_samples("2026-10-08");
+        assert!(
+            matches!(
+                &observed,
+                Err(CandidatePromotionEvidenceError::IneligibleFirstSample {
+                    reason: found,
+                    ..
+                }) if *found == expected_reason
+            ),
+            "{case}: {observed:?}"
+        );
+    }
 }
 
 fn close(db: &DatabaseManager, code: &str, date: &str, value: f64) {
