@@ -54,3 +54,31 @@ Gateway unit test and `git diff --check`. It must not be passed to a v2 run
 descriptor as a verified persisted snapshot. Steps 2 and 3 are required before
 that capability and its persisted fixture can be added. Point-in-time
 membership, adjustment and factor provenance remain separate M4 gates.
+
+## Step 2 follow-up: request contract gap (2026-10-01)
+
+Step 1's observed capture landed in `42ffb84d`; it retains the actual `days`
+request and a bounded ordered row projection. A read-only Step 2 audit found
+that `VerifiedReplayCalendar` in `src/calendar.rs` can return an authoritative
+closed trading-date vector and authority hash from checked-in SSE data, but
+that data covers only 2025 and 2026. Unsupported years fail admission.
+
+The general `HistoricalBarsGateway` still sends only `{codes:[code],days}`
+through `GrpcSource` to `market.historical_bars` v1. The response converter
+parses rows without a request-bound date window. Even if a Mac-side helper
+compares returned dates to a calendar vector, it can prove only that the
+observed rows match that vector; it cannot prove that the provider was asked
+for those exact dates. A safe local observation API may retain a per-symbol
+`ObservedIncluded` or typed `Skipped` result and reject missing, duplicate,
+or extra symbols. It cannot construct `VerifiedHistoricalBarsSnapshot` or a
+v2 run identity.
+
+The next admission contract requires a versioned VM/bridge HistoricalBars
+request carrying `from/to` or the exact date vector, plus a response receipt
+bound to its request ID/hash and calendar authority, complete batch/time
+evidence, and an explicit per-symbol coverage or failure result. The provider
+must implement the window semantics; a latest-N-only provider must reject an
+exact-window request. Adding fields to the v1 JSON locally would not establish
+that behavior. Once this contract has real same-version RPC evidence, Step 2
+can compare every returned date against the verified calendar before the
+immutable persisted-read work in Step 3.
