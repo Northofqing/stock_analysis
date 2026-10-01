@@ -117,3 +117,30 @@ Mac 第三批已保存共享 `client-bundle/mac-evidence-20261002.3/`，6 项文
 复用上述实际 Cargo 生成的不可变 lib harness，既有 P05 freeze/link 19 项、candidate save/worker 1 项与实际 prediction row ID 1 项全通过；没有重复编译或重跑本轮新 9 项。原始日志及 harness SHA 在 `validation/dev-d951-p05-tests.json` 与 `dev-d951-p05-existing-tests.json`。验证后停止本切片检查。
 
 下一 S1 统一实际 main caller 的一次 batch/clock 与三个通知 preparation；完整 S2 仍需持久 parent/child intent、A02/T08 原子 owner、权威 receipt finalizer 和 snapshot revision CAS。当前 legacy snapshot 提前推进、partial 后重新采集与共享完成游标仍未关闭，不能把本次 producer 关联称作完整 Unit 迁移。
+
+## 06:45 CST：schema12、共享采集、模型与持久 revision 的实际验证
+
+以下是后继实测结果，更新前文各时点尚待验证的状态。没有修改生产制品、运行进程、配置或 activation。
+
+- **G5b B schema12**：独立原提交 `f4c08a6a` 的限定 `cargo test --locked --offline --lib durable_delivery::` 编译通过。第一次执行 50/249，通过前的 199 个失败均发生于未改变的 production snapshot fixture：新隔离 worktree 缺 ignored `data/`，而非业务断言。核对全部 panic 后仅创建空 ignored 目录，封存并复用同实际 harness，默认并行 **249/249、EXIT 0**。原失败和通过日志保留；主树已整合至 `bb56c3fc`。这不是初始化生产目录或修补生产数据库。
+- **P05 S1**：`2b5d3854` 实际限定 monitor `p05_shared_unit_` **8/8**，包含真实双进程用例；同编译产物的 5 个受影响原有 producer/render/invalidation 用例也通过。三个 child 使用一次实际源采集和固定上海日/时钟，保留原各自投递结果；持久 parent/child Unit、快照 CAS 和权威完成判定尚未由 S1 实现。
+- **CLAUDE 接线 dry-run**：`bb56c3fc` 实际 debug monitor 构建成功，封存 binary SHA `4f0fca7e02b1c8e860ae52d21b6fdc6ce1ad74e2fe5b62a1c7ced339a253d898`；`monitor --test --push-dry-run` **EXIT 0**，使用 CLI 所有的独立 Test core/durable namespace。它不证明真实物理推送、外部源资格或生产上线。
+- **G5b C1**：主树 `f33d8556` 限定 lib `g5b_analysis_v2_` **14/14**，包括 5 个 closed codec 和 9 个实际 owner/file/receipt/control-flow 用例。实际 SDK 原 content UTF-8 与 receipt hash、原 Attempt consume-once、短锁释放、调用前 fresh window 和原文件重查得到验证。Test 延迟 work 用例实际调用生产 assess 控制流，不在测试 shim 提前返回来掩盖窗口检查。保存成功模型观察尚不授 counted owner 或日封资格。
+- **G5b D1**：主树 `8afe4d7c` 的 8 个新真实 mutation/revision 用例通过；首次默认并行 durable 为 **265/266**，旧 finalizer 用例最初 5 秒握手 Timeout，未到业务断言。封存同实际 harness，精确该用例通过后，默认并行整组 **266/266、EXIT 0、129.94 s**。未改业务或测试等待上限，原失败证据保留。原 prepare 逻辑为唯一私有 body，各真实 mutation 按 Changed/NoChange 只在实际 COMMIT 边界推进 revision，保留 distinct late 原始结果和审计；这一轮还不包含真实 Physical/Empty seal。
+- **G5b C3**：主树 `fe72e4a6` 限定 lib `g5b_model_archive_v2_` **10/10、EXIT 0**。单 SQL snapshot 加全部原 Selection/Attempt/Frozen/Archive 实际文件见证统一重查；Partial→Full 追加独立 immutable 版本，原字节/原 intent 恢复不再调用 provider，已 Committed 文件缺失或同 bytes 换 inode 拒绝恢复。实际 reader/prepare/commit 的最后 SQL hook 文件与输入变动均拒绝并保留相应回滚边界。Full 只表示已选记录全部模型归档，不能代称真实投递或全天完成。
+
+上述实际原始日志、限定命令、退出码和 source HEAD 在 `.planning/2026-10-02-platform-continued-implementation/validation/` 的 `dev-f4c-schema12-durable-prerequisite-rerun.json`、`dev-2b5-p05-shared-unit-tests.json`、`dev-2b5-p05-s1-existing-tests.json`、`dev-bb56-monitor-test-dryrun.json`、`dev-f33-g5b-analysis-v2-tests.json`、`dev-8afe-durable-parallel-diagnostic-rerun.json` 与 `dev-fe72-g5b-model-archive-v2-tests.json`。实际 harness 均封存在用户本地候选目录，后继编译不会覆盖本轮证据。已充分验证的切片停止追加重复 check/build/clippy/release。
+
+## Windows 第六批审查与第四批 Mac 续办反馈
+
+Windows `.6` manifest SHA `7f47b61cfadce5d7ef0cfb5ea1fbea66d7585267a6b8d147791d4da7afa05aee`，全部 25 项原 bytes/长度/路径核验通过。实际 Day1 `push2his/daykline` 与固定 `emProbe` data-only JSONP 改动及 public `FundFlowSeries` 回归成立；原日志为 provider219 + composition67 + contracts6 + server26 = **318 通过**，另 1 live test ignored。候选 source `1bd1ae7fe8be0d15b68d8e49e37349c0d18d59d4`、release SHA `d047570ad3eb885611f21b283c0afc269c51dde7a47d919932c0c3a4c81190dd` 保持 **SourceOnlyNotDeployed**，没有 candidate Health/business RPC 验收。
+
+两次正常 RustProvider `limit=1/2` 均在 HTTP status line 前失败、缺失 TLS `close_notify`、EXIT 1，没有正文或正常化成功 batch；源码修复与编译不表示 TLS 已恢复。审查还发现 parser 未接 limit、处理所有返回行，现仅请求参数有界，需补 `limit=1 + 上游两行` 合同回归并明确响应上界，不能静默截断升级完整性。Mac 旧 Cargo Git cache/bare DB 均缺 delta bundle prerequisite `67c832e`，此前 `.1/.2` 无完整源码，不能用旧缓存冒称精确候选；已要求自包含公开源码包、locked Cargo inputs/path 依赖闭包和逐输入 SHA/bytes，排除运行凭据与私有配置。
+
+Mac `.4` 已公开 3 文件、manifest SHA `db81314929092ba4958e6cf03592f1f2d14220dca797be2cdfe8b71f047b983f`，逐文件复核通过。原生发送成功后，实际 native wait **revision22 / active / inProgress**；Windows commentary 明确开始核验本反馈、补返回数量回归和可独立构建归档。此前 host unavailable 只代表那一时点不可访问，不推翻本轮发送和实际 active 证据。正常 TLS/代理保留，未绕过此前被审批拒绝的监听启动。D14/D17/D20、正式 R08、公告截断合同与覆盖/sourceRevision/PIT 剩余任务继续原任务处理，不凭 complete=true 或合法日期晋升。
+
+## 正在实施的后继闭合
+
+C2 正在独立树实现 actual bundle→closed handoff→原 prepare body→immutable occurrence owner 的同事务登记及 begin/startup 物理发送前实际验证；通用 fresh v2 与同日新增 v1 旁路必须拒绝，旧 existing/conflict/late/audit 保真。D3 正在独立树实现真实 prospective 零头与窗口关闭 Empty seal，含合法晚到 input suffix 和当前 reader 的完整重查；Physical seal 仍等待 C2。P05 P1 在独立树实现 schema13 的真实 Draft/Started/IntentComplete/storage 与跨库预测 freeze 验证，明确为后继 owner/results/finalizer 和 Completed baseline 留窄 revision/CAS 结构，当前未授它们能力。它们未完成运行验证时不列为 Code Ready。
+
+完整 M0–M7 仍需 bin 纵向接线、真实 Delivered/seal/finalizer、统一健康/评价、paper/schema cutover、WORM/Gate P 及外部资格和真实观察。Wave2 精确激活批准和动态生产门禁未闭合；前次 Wave0/Wave1 批准不会被套用于后继二进制。
