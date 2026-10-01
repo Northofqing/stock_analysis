@@ -16,7 +16,7 @@ pub use input_head::{
 };
 
 fn alerts_dir() -> PathBuf {
-    PathBuf::from("reports/alerts")
+    crate::production_root::production_root().join("reports/alerts")
 }
 
 fn dated_file(dir: &Path, ext: &str) -> PathBuf {
@@ -115,9 +115,13 @@ impl AlertLog {
             cwd.join(dir)
         };
         let resolved = fs::canonicalize(unresolved)?;
-        let production_path = cwd.join(alerts_dir());
+        let production_path = alerts_dir();
         let production = fs::canonicalize(&production_path).unwrap_or(production_path);
-        if resolved.starts_with(&production) {
+        // Keep the old CWD-relative isolation boundary too: a build-root
+        // override must not make a formerly forbidden archive a test fixture.
+        let legacy_path = cwd.join("reports/alerts");
+        let legacy_production = fs::canonicalize(&legacy_path).unwrap_or(legacy_path);
+        if resolved.starts_with(&production) || resolved.starts_with(&legacy_production) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "test alert archive must be outside reports/alerts",
@@ -608,6 +612,76 @@ mod tests {
         );
         assert!(archive.read_today().is_empty());
         assert!(archive.read_today_records().is_empty());
+    }
+
+    #[test]
+    fn production_namespace_is_fixed_across_process_cwd() {
+        const CHILD_ENV: &str = "STOCK_ANALYSIS_TEST_ALERT_LOG_FIXED_ROOT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let archive = AlertLog::production();
+            assert_eq!(
+                archive.dir,
+                crate::production_root::production_root().join("reports/alerts")
+            );
+            assert!(archive.dir.is_absolute());
+            assert_ne!(
+                archive.dir,
+                std::env::current_dir().unwrap().join("reports/alerts")
+            );
+            assert_eq!(
+                archive.append_jsonl(&e()).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                archive.append_md(&e()).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(matches!(
+                archive.acquire_date_writer_fence(Local::now().date_naive()),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+            ));
+            for forbidden in ["reports/alerts", "reports/../reports/alerts"] {
+                assert_eq!(
+                    AlertLog::for_test(forbidden).unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+            }
+            #[cfg(unix)]
+            assert_eq!(
+                AlertLog::for_test("legacy-alerts-alias")
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            println!("fixed-root-alert-child-verified");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let legacy_dir = root.path().join("reports/alerts");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&legacy_dir, root.path().join("legacy-alerts-alias")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "monitor::alert_log::tests::production_namespace_is_fixed_across_process_cwd",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT", root.path())
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixed-root child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixed-root-alert-child-verified"));
+        assert!(fs::read_dir(&legacy_dir).unwrap().next().is_none());
+        assert!(!root.path().join("data").exists());
     }
 
     #[test]

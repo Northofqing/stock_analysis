@@ -431,7 +431,7 @@ impl DeepAttributionJournal {
 
     pub fn production() -> Self {
         Self {
-            dir: PathBuf::from("data/g5b/attempts"),
+            dir: crate::production_root::production_root().join("data/g5b/attempts"),
             production: true,
             input_log: AlertLog::production(),
         }
@@ -2855,6 +2855,59 @@ mod tests {
         assert!(DeepAttributionJournal::production()
             .load_or_select(date, vec![sample_record()])
             .is_err());
+    }
+
+    #[test]
+    fn production_journal_namespace_is_fixed_across_process_cwd() {
+        const CHILD_ENV: &str = "STOCK_ANALYSIS_TEST_G5B_FIXED_ROOT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let journal = DeepAttributionJournal::production();
+            assert_eq!(
+                journal.dir,
+                crate::production_root::production_root().join("data/g5b/attempts")
+            );
+            assert!(journal.dir.is_absolute());
+            assert_ne!(
+                journal.dir,
+                std::env::current_dir().unwrap().join("data/g5b/attempts")
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+            let error = journal
+                .load_or_select(date, vec![sample_record()])
+                .unwrap_err();
+            assert!(error.to_string().contains("test runtime cannot write"));
+            assert!(matches!(
+                journal.input_log.acquire_date_writer_fence(date),
+                Err(error) if error.kind() == ErrorKind::PermissionDenied
+            ));
+            assert!(fs::read_dir(std::env::current_dir().unwrap())
+                .unwrap()
+                .next()
+                .is_none());
+            println!("fixed-root-g5b-child-verified");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "monitor::attribution_deep::tests::production_journal_namespace_is_fixed_across_process_cwd",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT", root.path())
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixed-root journal child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixed-root-g5b-child-verified"));
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
 
     #[test]
