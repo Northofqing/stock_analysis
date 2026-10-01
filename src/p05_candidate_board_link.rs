@@ -4,7 +4,9 @@
 //! envelope identities are immutable; a terminal may advance after this read,
 //! in which case a pending result is conservative and can be read again.
 
-use crate::database::p05_prediction_freeze::{CandidateBoardFreezeError, FrozenCandidateRow};
+use crate::database::p05_prediction_freeze::{
+    CandidateBoardFreezeError, FrozenCandidateBoardV2, FrozenCandidateRow,
+};
 use crate::database::DatabaseManager;
 use crate::durable_delivery::{
     CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1, CandidateBoardSourceLinkV1,
@@ -127,19 +129,7 @@ pub fn read_candidate_board_occurrence_link(
                     "v2 counted source differs from prediction freeze",
                 ));
             }
-            let expected = DeliveryEnvelope::new(
-                freeze.business_date(),
-                PushKind::CandidateBoard,
-                DeliverySubKind::None,
-                "GLOBAL",
-                freeze.occurrence_identity(),
-                freeze.source_sha256(),
-                freeze.source_canonical().to_vec(),
-                freeze.source_sha256(),
-                freeze.rendered_bytes().to_vec(),
-                false,
-                None,
-            )?;
+            let expected = frozen_candidate_board_envelope(&freeze)?;
             if expected.cooldown_scope != CooldownScope::Global
                 || expected.decision_identity != card.decision_identity()
                 || expected.canonical_sha256()? != card.envelope_sha256()
@@ -154,4 +144,24 @@ pub fn read_candidate_board_occurrence_link(
             })
         }
     }
+}
+
+/// Shared exact factory consumes the actual owned freeze reader's opaque value.
+/// It does not grant counted admission or physical receipt authority.
+pub(crate) fn frozen_candidate_board_envelope(
+    freeze: &FrozenCandidateBoardV2,
+) -> Result<DeliveryEnvelope, DurableDeliveryError> {
+    DeliveryEnvelope::new(
+        freeze.business_date(),
+        PushKind::CandidateBoard,
+        DeliverySubKind::None,
+        "GLOBAL",
+        freeze.occurrence_identity(),
+        freeze.source_sha256(),
+        freeze.source_canonical().to_vec(),
+        freeze.source_sha256(),
+        freeze.rendered_bytes().to_vec(),
+        false,
+        None,
+    )
 }

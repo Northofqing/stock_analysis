@@ -8,7 +8,7 @@ use crate::monitor::prediction::CandidateSampleSaveReport;
 use chrono::{NaiveDate, NaiveTime};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Binary, Nullable, Text};
+use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -74,6 +74,21 @@ pub struct FrozenCandidateBoardV2 {
     source_canonical: Vec<u8>,
     source_sha256: String,
     ordered_rows: Vec<FrozenCandidateRow>,
+}
+
+/// Actual row scores observed with the existing strict freeze in one read
+/// snapshot. No Deserialize/constructor; this is preparation evidence only.
+pub(crate) struct P05UnitFreezeWithScores {
+    freeze: FrozenCandidateBoardV2,
+    ordered_score_bits: Vec<(i64, u64)>,
+}
+impl P05UnitFreezeWithScores {
+    pub(crate) fn freeze(&self) -> &FrozenCandidateBoardV2 {
+        &self.freeze
+    }
+    pub(crate) fn ordered_score_bits(&self) -> &[(i64, u64)] {
+        &self.ordered_score_bits
+    }
 }
 
 impl FrozenCandidateBoardV2 {
@@ -199,6 +214,31 @@ pub(super) fn create_schema(conn: &mut diesel::sqlite::SqliteConnection) -> Resu
 }
 
 impl DatabaseManager {
+    /// Negative preparation observation only. The read snapshot is released
+    /// before a caller enters the independent durable database transaction.
+    pub(crate) fn p05_preparation_residue_for_date(
+        &self,
+        business_date: &str,
+    ) -> FreezeResult<bool> {
+        let date = NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
+            .map_err(|_| invalid("prospective date invalid"))?;
+        if date.format("%Y-%m-%d").to_string() != business_date {
+            return Err(invalid("prospective date not canonical"));
+        }
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            count: i64,
+        }
+        let mut conn = self
+            .get_conn()
+            .map_err(|_| invalid("prospective DB unavailable"))?;
+        conn.transaction::<_, CandidateBoardFreezeError, _>(|conn| {
+            let row = diesel::sql_query("SELECT (SELECT COUNT(*) FROM candidate_board_prediction_freeze_v2 WHERE business_date=?1 OR occurrence_identity GLOB ('candidate-board:' || ?1 || ':*'))+(SELECT COUNT(*) FROM prediction_tracker WHERE pred_date=?1 AND pred_detail='candidate-strong') AS count")
+                .bind::<Text,_>(business_date).get_result::<Count>(conn)?;
+            Ok(row.count != 0)
+        })
+    }
     /// First committed occurrence owns its row IDs and exact card/source bytes.
     /// A retry must present a complete save report with DB-matching rows and the same Strong
     /// code sequence and card; its newly saved IDs remain ordinary samples.
@@ -325,6 +365,43 @@ impl DatabaseManager {
         })?;
         conn.transaction::<_, CandidateBoardFreezeError, _>(|conn| {
             load_verified(conn, occurrence_identity)
+        })
+    }
+
+    pub(crate) fn read_p05_unit_freeze_with_scores(
+        &self,
+        occurrence_identity: &str,
+    ) -> FreezeResult<Option<P05UnitFreezeWithScores>> {
+        validate_occurrence(occurrence_identity)?;
+        let mut conn = self
+            .get_conn()
+            .map_err(|_| invalid("P05 score read DB unavailable"))?;
+        conn.transaction::<_, CandidateBoardFreezeError, _>(|conn| {
+            let Some(freeze) = load_verified(conn, occurrence_identity)? else {
+                return Ok(None);
+            };
+            #[derive(QueryableByName)]
+            struct Score {
+                #[diesel(sql_type=Nullable<Double>)]
+                pred_score: Option<f64>,
+            }
+            let mut ordered_score_bits = Vec::with_capacity(freeze.ordered_rows.len());
+            for row in &freeze.ordered_rows {
+                let score =
+                    diesel::sql_query("SELECT pred_score FROM prediction_tracker WHERE id=?1")
+                        .bind::<BigInt, _>(row.prediction_row_id)
+                        .get_result::<Score>(conn)?
+                        .pred_score
+                        .ok_or_else(|| invalid("P05 prediction score is unknown"))?;
+                if !score.is_finite() {
+                    return Err(invalid("P05 prediction score invalid"));
+                }
+                ordered_score_bits.push((row.prediction_row_id, score.to_bits()));
+            }
+            Ok(Some(P05UnitFreezeWithScores {
+                freeze,
+                ordered_score_bits,
+            }))
         })
     }
 }

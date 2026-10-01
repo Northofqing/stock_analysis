@@ -46,6 +46,12 @@ pub use candidate_board::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
     CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2,
 };
+#[path = "coordinator_p05_unit.rs"]
+mod p05_unit;
+pub(crate) use p05_unit::{
+    P05ObservedDraftInput, P05ObservedSourceBytes, P05PredictionStart, StoredP05Draft,
+    StoredP05Intent,
+};
 #[path = "coordinator_g5b.rs"]
 mod g5b;
 #[path = "coordinator_g5b_cohort.rs"]
@@ -10278,11 +10284,16 @@ fn require_current_schema_version(connection: &Connection) -> Result<()> {
     }
     super::schema_g5b_cohort::verify_catalog(connection)?;
     validate_g5b_cohort_rows(connection)?;
+    validate_p05_unit_rows(connection)?;
     Ok(())
 }
 
 pub(super) fn validate_g5b_cohort_rows(connection: &Connection) -> Result<()> {
     g5b_cohort::validate_rows(connection)
+}
+
+pub(super) fn validate_p05_unit_rows(connection: &Connection) -> Result<()> {
+    p05_unit::validate_rows(connection)
 }
 
 fn validate_persisted_immutable_references(connection: &Connection) -> Result<()> {
@@ -10291,6 +10302,8 @@ fn validate_persisted_immutable_references(connection: &Connection) -> Result<()
     if schema_version != SCHEMA_VERSION {
         return Ok(());
     }
+
+    validate_p05_unit_rows(connection)?;
 
     const INVALID_REFERENCE_QUERIES: [(&str, &str); 6] = [
         (

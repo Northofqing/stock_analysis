@@ -46,7 +46,7 @@ fn legacy_snapshot(connection: &Connection) -> LegacySnapshot {
     let mut query = connection
         .prepare(
             "SELECT type,name,tbl_name,sql FROM main.sqlite_master
-         WHERE lower(name) NOT GLOB 'g5b_*' AND lower(tbl_name) NOT GLOB 'g5b_*'
+         WHERE lower(name) NOT GLOB 'g5b_*' AND lower(tbl_name) NOT GLOB 'g5b_*' AND lower(name) NOT GLOB 'p05_*' AND lower(tbl_name) NOT GLOB 'p05_*'
          ORDER BY type,name,tbl_name",
         )
         .unwrap();
@@ -60,7 +60,7 @@ fn legacy_snapshot(connection: &Connection) -> LegacySnapshot {
     let tables = connection
         .prepare(
             "SELECT name FROM main.sqlite_master WHERE type='table'
-         AND lower(name) NOT GLOB 'g5b_*' ORDER BY name",
+         AND lower(name) NOT GLOB 'g5b_*' AND lower(name) NOT GLOB 'p05_*' ORDER BY name",
         )
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
@@ -88,6 +88,7 @@ fn release_and_shape_v11(fixture: &mut Fixture) -> (CoordinatorConfig, LegacySna
         .unwrap();
     // The extension must be empty. This removes only newly added test schema,
     // never any old table or actual cohort/intent/member evidence.
+    super::super::schema_p05_unit::remove_empty_extension_for_legacy_test(&connection);
     super::super::schema_g5b_cohort::remove_empty_extension_for_legacy_test(&connection);
     connection
         .pragma_update(None, "user_version", 11_i64)
@@ -127,7 +128,10 @@ fn version(path: &Path) -> i64 {
 #[test]
 fn schema12_migration_fresh_attested_open_has_six_empty_tables_and_exact_version() {
     let fixture = Fixture::new("SCHEMA12_FRESH_ATTESTED");
-    assert_eq!(version(&fixture.database_path), 12);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     let connection = Connection::open(&fixture.database_path).unwrap();
     super::super::schema_g5b_cohort::verify_catalog(&connection).unwrap();
     for table in super::super::schema_g5b_cohort::TABLES {
@@ -218,7 +222,10 @@ fn schema12_migration_populated_v11_preserves_every_legacy_typed_value_and_catal
 
     let (config, before) = release_and_shape_v11(&mut fixture);
     let reopened = DurableDeliveryCoordinator::open(config).unwrap();
-    assert_eq!(version(&fixture.database_path), 12);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     let connection = Connection::open(&fixture.database_path).unwrap();
     assert_eq!(legacy_snapshot(&connection),before,"additive migration must preserve DDL, TEXT/BLOB bytes, numeric types, and row ordering facts");
     assert_eq!(
@@ -348,7 +355,10 @@ fn schema12_migration_current_version_missing_guard_is_never_healed() {
     );
     assert!(DurableDeliveryCoordinator::open(config).is_err());
     let after = Connection::open(&fixture.database_path).unwrap();
-    assert_eq!(version(&fixture.database_path), 12);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     assert_eq!(legacy_snapshot(&after), before);
     assert_eq!(
         after
