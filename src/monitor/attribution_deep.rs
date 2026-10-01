@@ -13,6 +13,9 @@
 //! 与 G5a 的关系: G5a 的 attribution_decision 作为输入上下文喂给 LLM,
 //! 深链验证/深化规则结论, 不是取代。
 
+use crate::durable_delivery::{
+    DurableDeliveryCoordinator, DurableDeliveryError, G5bCountedTerminalV1,
+};
 use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
 use crate::monitor::alert_log::AlertRecord;
 use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
@@ -148,6 +151,169 @@ pub struct DeepAttributionArchiveRecovery {
     pub completion_unproven: usize,
     /// A damaged date does not prevent later dates from being inspected.
     pub failures: Vec<(NaiveDate, String)>,
+}
+
+/// One selected event as observed from existing files. A frozen result and an
+/// exact JSONL row are analysis/archive facts, not counted delivery evidence.
+#[derive(Debug)]
+pub struct DeepAttributionEventInspection {
+    pub index: usize,
+    pub record: AlertRecord,
+    pub progress: DeepAttributionEventProgress,
+}
+
+#[derive(Debug)]
+pub enum DeepAttributionEventProgress {
+    NotStarted,
+    CompletionUnproven,
+    Frozen {
+        result: DeepAttributionFrozenResult,
+        archived: bool,
+    },
+}
+
+/// The same canonical G5b source bytes used by the counted producer and the
+/// read-only day inspection. The rendered hash binds the exact frozen summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct G5bCountedSourceFacts {
+    occurrence_identity: String,
+    canonical_source: Vec<u8>,
+    source_sha256: String,
+    rendered_sha256: String,
+}
+
+impl G5bCountedSourceFacts {
+    pub fn occurrence_identity(&self) -> &str {
+        &self.occurrence_identity
+    }
+
+    pub fn canonical_source(&self) -> &[u8] {
+        &self.canonical_source
+    }
+
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
+    pub fn rendered_sha256(&self) -> &str {
+        &self.rendered_sha256
+    }
+}
+
+pub fn g5b_counted_source_facts(
+    business_date: NaiveDate,
+    record: &AlertRecord,
+    summary: &str,
+) -> G5bCountedSourceFacts {
+    let event_facts = format!(
+        "{}|{}|{}|{}",
+        record.triggered_at, record.code, record.category, record.message
+    );
+    let rendered_sha256 = sha256_hex(summary.as_bytes());
+    let canonical = serde_json::json!({
+        "schema": "g5b-attribution-v1",
+        "business_date": business_date.format("%Y-%m-%d").to_string(),
+        "code": record.code,
+        "triggered_at": record.triggered_at,
+        "category": record.category,
+        "level": record.level,
+        "message": record.message,
+        "rendered_sha256": rendered_sha256,
+    });
+    let canonical_source = canonical.to_string().into_bytes();
+    G5bCountedSourceFacts {
+        occurrence_identity: format!(
+            "g5b-attribution:{business_date}:{}:{}",
+            record.code,
+            sha256_hex(event_facts.as_bytes())
+        ),
+        source_sha256: sha256_hex(&canonical_source),
+        canonical_source,
+        rendered_sha256,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum G5bSelectedEventState {
+    NotStarted,
+    CompletionUnproven,
+    NoCountedDecision,
+    Pending,
+    /// Validated physical Accepted receipt.
+    Accepted,
+    /// Manual resolution; distinct from a physical Accepted receipt.
+    ManualAccepted,
+    Rejected,
+    Uncertain,
+    ManualNotDelivered,
+}
+
+fn selected_state_for_counted_terminal(terminal: G5bCountedTerminalV1) -> G5bSelectedEventState {
+    match terminal {
+        G5bCountedTerminalV1::Pending => G5bSelectedEventState::Pending,
+        G5bCountedTerminalV1::Accepted => G5bSelectedEventState::Accepted,
+        G5bCountedTerminalV1::ManualAccepted => G5bSelectedEventState::ManualAccepted,
+        G5bCountedTerminalV1::Rejected => G5bSelectedEventState::Rejected,
+        G5bCountedTerminalV1::Uncertain => G5bSelectedEventState::Uncertain,
+        G5bCountedTerminalV1::ManualNotDelivered => G5bSelectedEventState::ManualNotDelivered,
+    }
+}
+
+#[derive(Debug)]
+pub struct G5bSelectedEventObservation {
+    pub index: usize,
+    pub record: AlertRecord,
+    /// `None` means no validated frozen result; JSONL is never delivery proof.
+    pub archived: Option<bool>,
+    pub completion: G5bSelectedEventState,
+    pub decision_identity: Option<String>,
+}
+
+/// Counts and rows cover only the saved G5b selection. Durable decisions or
+/// receipts with no matching selected row are outside this observation.
+#[derive(Debug)]
+pub struct G5bSelectedEventsObservation {
+    pub business_date: NaiveDate,
+    pub events: Vec<G5bSelectedEventObservation>,
+}
+
+impl G5bSelectedEventsObservation {
+    /// Number of selected rows in this state, not a whole-day completion count.
+    pub fn count(&self, completion: G5bSelectedEventState) -> usize {
+        self.events
+            .iter()
+            .filter(|event| event.completion == completion)
+            .count()
+    }
+}
+
+#[derive(Debug)]
+pub enum G5bSelectedEventsObservationError {
+    Journal(DeepAttributionError),
+    Counted(DurableDeliveryError),
+}
+
+impl std::fmt::Display for G5bSelectedEventsObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(error) => write!(f, "G5b selected journal inspection: {error}"),
+            Self::Counted(error) => write!(f, "G5b selected counted observation: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for G5bSelectedEventsObservationError {}
+
+impl From<DeepAttributionError> for G5bSelectedEventsObservationError {
+    fn from(error: DeepAttributionError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl From<DurableDeliveryError> for G5bSelectedEventsObservationError {
+    fn from(error: DurableDeliveryError) -> Self {
+        Self::Counted(error)
+    }
 }
 
 /// 与 G5b counted occurrence 的事件事实字段保持一致；业务日由归档路径约束。
@@ -304,19 +470,7 @@ impl DeepAttributionJournal {
             }
             Err(error) => return Err(DeepAttributionError::Io(format!("读取 {path:?}: {error}"))),
         };
-        if selection.schema_version != 1
-            || selection.business_date != date
-            || selection.events.is_empty()
-            || selection.events.len() > DEEP_ATTRIBUTION_MAX_EVENTS
-            || selection
-                .events
-                .iter()
-                .any(|event| !event.is_production_eligible())
-        {
-            return Err(DeepAttributionError::Io(format!(
-                "G5b 选集完整性检查失败: {path:?}"
-            )));
-        }
+        validate_selection(&selection, date, &path)?;
         fs::File::open(&path)
             .and_then(|file| file.sync_all())
             .and_then(|()| sync_parent(&path))
@@ -381,7 +535,27 @@ impl DeepAttributionJournal {
         date: NaiveDate,
         index: usize,
     ) -> Result<(), DeepAttributionError> {
+        self.inspect_attempt_marker(date, index, true)
+    }
+
+    fn inspect_attempt_marker(
+        &self,
+        date: NaiveDate,
+        index: usize,
+        sync: bool,
+    ) -> Result<(), DeepAttributionError> {
         let path = self.attempt_path(date, index);
+        if !sync {
+            let bytes = read_regular_bytes_for_inspection(&path)?.ok_or_else(|| {
+                DeepAttributionError::Io(format!("G5b attempt 标记读取中消失: {path:?}"))
+            })?;
+            if !bytes.is_empty() {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b attempt 标记无效: {path:?}"
+                )));
+            }
+            return Ok(());
+        }
         let marker = fs::symlink_metadata(&path)
             .map_err(|error| DeepAttributionError::Io(format!("检查 {path:?}: {error}")))?;
         if !marker.file_type().is_file() || marker.len() != 0 {
@@ -389,10 +563,13 @@ impl DeepAttributionJournal {
                 "G5b attempt 标记无效: {path:?}"
             )));
         }
-        fs::File::open(&path)
-            .and_then(|file| file.sync_all())
-            .and_then(|()| sync_parent(&path))
-            .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))
+        if sync {
+            fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .and_then(|()| sync_parent(&path))
+                .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
+        }
+        Ok(())
     }
 
     /// 必须在首次 JSONL 归档或 counted 调用前执行；已存在结果绝不覆盖。
@@ -451,6 +628,16 @@ impl DeepAttributionJournal {
         index: usize,
         selected: &AlertRecord,
     ) -> Result<Option<DeepAttributionFrozenResult>, DeepAttributionError> {
+        self.inspect_frozen_result(date, index, selected, true)
+    }
+
+    fn inspect_frozen_result(
+        &self,
+        date: NaiveDate,
+        index: usize,
+        selected: &AlertRecord,
+        sync: bool,
+    ) -> Result<Option<DeepAttributionFrozenResult>, DeepAttributionError> {
         let path = self.result_path(date, index);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.file_type().is_file() => {
@@ -462,10 +649,19 @@ impl DeepAttributionJournal {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(DeepAttributionError::Io(format!("检查 {path:?}: {error}"))),
         }
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(DeepAttributionError::Io(format!("读取 {path:?}: {error}"))),
+        let bytes = if sync {
+            match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(DeepAttributionError::Io(format!("读取 {path:?}: {error}")))
+                }
+            }
+        } else {
+            let Some(bytes) = read_regular_bytes_for_inspection(&path)? else {
+                return Ok(None);
+            };
+            bytes
         };
         let frozen: DeepAttributionFrozenResult = serde_json::from_slice(&bytes)
             .map_err(|error| DeepAttributionError::Io(format!("解析 {path:?}: {error}")))?;
@@ -489,11 +685,227 @@ impl DeepAttributionJournal {
                 "G5b 冻结结果完整性检查失败: {path:?}"
             )));
         }
-        fs::File::open(&path)
-            .and_then(|file| file.sync_all())
-            .and_then(|()| sync_parent(&path))
-            .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
+        if sync {
+            fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .and_then(|()| sync_parent(&path))
+                .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
+        }
         Ok(Some(frozen))
+    }
+
+    /// Inspect an existing selection and its event files without creating,
+    /// syncing, locking, archiving, or starting an attempt. A missing selection
+    /// is `None` only when this date has no known journal/archive artifacts;
+    /// this does not inspect orphan counted decisions in SQLite.
+    pub fn inspect_existing_day(
+        &self,
+        date: NaiveDate,
+    ) -> Result<Option<Vec<DeepAttributionEventInspection>>, DeepAttributionError> {
+        let selection_path = self.selection_path(date);
+        match fs::symlink_metadata(&selection_path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 选集不是普通文件: {selection_path:?}"
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let mut artifacts = vec![self.archive_lock_path(date), self.archive_path(date)];
+                for index in 0..DEEP_ATTRIBUTION_MAX_EVENTS {
+                    artifacts.push(self.attempt_path(date, index));
+                    artifacts.push(self.result_path(date, index));
+                }
+                for artifact in artifacts {
+                    match fs::symlink_metadata(&artifact) {
+                        Ok(_) => {
+                            return Err(DeepAttributionError::Io(format!(
+                                "G5b 选集缺失但状态留存: {artifact:?}"
+                            )))
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(DeepAttributionError::Io(format!(
+                                "检查 {artifact:?}: {error}"
+                            )))
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(DeepAttributionError::Io(format!(
+                    "检查 {selection_path:?}: {error}"
+                )))
+            }
+        }
+        let selection_bytes =
+            read_regular_bytes_for_inspection(&selection_path)?.ok_or_else(|| {
+                DeepAttributionError::Io(format!("选集读取中消失: {selection_path:?}"))
+            })?;
+        let selection: DeepAttributionSelection = serde_json::from_slice(&selection_bytes)
+            .map_err(|error| {
+                DeepAttributionError::Io(format!("解析 {selection_path:?}: {error}"))
+            })?;
+        validate_selection(&selection, date, &selection_path)?;
+        let mut selected_keys = Vec::with_capacity(selection.events.len());
+        for record in &selection.events {
+            let key = DeepAttributionEventKey::from(record);
+            if selected_keys.contains(&key) {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 选集事件身份重复: {selection_path:?}"
+                )));
+            }
+            selected_keys.push(key);
+        }
+
+        let archive_path = self.archive_path(date);
+        let archive = inspect_archive_bytes(&archive_path)?;
+        let mut archived_rows: Vec<(DeepAttributionEventKey, Vec<u8>)> = Vec::new();
+        if !archive.is_empty() {
+            if archive.last() != Some(&b'\n') {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 历史归档末行不完整: {archive_path:?}"
+                )));
+            }
+            for (line_number, line) in archive[..archive.len() - 1]
+                .split(|byte| *byte == b'\n')
+                .enumerate()
+            {
+                let row: DeepAttributionRow = serde_json::from_slice(line).map_err(|error| {
+                    DeepAttributionError::Io(format!(
+                        "G5b 历史归档第 {} 行无效 {archive_path:?}: {error}",
+                        line_number + 1
+                    ))
+                })?;
+                let key = DeepAttributionEventKey::from(&row.record);
+                if !selected_keys.contains(&key) {
+                    return Err(DeepAttributionError::Io(format!(
+                        "G5b 历史归档含选集外事件: {archive_path:?} line={}",
+                        line_number + 1
+                    )));
+                }
+                if archived_rows.iter().any(|(seen, _)| *seen == key) {
+                    return Err(DeepAttributionError::Io(format!(
+                        "G5b 历史归档事件身份重复: {archive_path:?} line={}",
+                        line_number + 1
+                    )));
+                }
+                archived_rows.push((key, line.to_vec()));
+            }
+        }
+
+        let mut inspections = Vec::with_capacity(selection.events.len());
+        for (index, record) in selection.events.into_iter().enumerate() {
+            let attempt_path = self.attempt_path(date, index);
+            let has_attempt = match fs::symlink_metadata(&attempt_path) {
+                Ok(_) => {
+                    self.inspect_attempt_marker(date, index, false)?;
+                    true
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(DeepAttributionError::Io(format!(
+                        "检查 {attempt_path:?}: {error}"
+                    )))
+                }
+            };
+            let frozen = self.inspect_frozen_result(date, index, &record, false)?;
+            if frozen.is_some() && !has_attempt {
+                return Err(DeepAttributionError::Io(format!(
+                    "G5b 冻结结果缺少前置 attempt: {:?}",
+                    self.result_path(date, index)
+                )));
+            }
+            let archived = archived_rows
+                .iter()
+                .find(|(key, _)| *key == DeepAttributionEventKey::from(&record));
+            let progress = match (has_attempt, frozen, archived) {
+                (false, None, None) => DeepAttributionEventProgress::NotStarted,
+                (true, None, None) => DeepAttributionEventProgress::CompletionUnproven,
+                (true, Some(result), archived) => {
+                    if let Some((_, bytes)) = archived {
+                        if bytes.as_slice() != result.row_json.as_bytes() {
+                            return Err(DeepAttributionError::Io(format!(
+                                "G5b 同事件归档字节冲突: {archive_path:?} index={index}"
+                            )));
+                        }
+                    }
+                    DeepAttributionEventProgress::Frozen {
+                        result,
+                        archived: archived.is_some(),
+                    }
+                }
+                (_, None, Some(_)) => {
+                    return Err(DeepAttributionError::Io(format!(
+                        "G5b 归档事件缺少冻结结果: {archive_path:?} index={index}"
+                    )))
+                }
+                (false, Some(_), _) => unreachable!("checked frozen attempt above"),
+            };
+            inspections.push(DeepAttributionEventInspection {
+                index,
+                record,
+                progress,
+            });
+        }
+        Ok(Some(inspections))
+    }
+
+    /// Observe only events in the saved selection. `None` means no selection
+    /// artifact, not absence of orphan counted decisions or receipts. Each
+    /// frozen event uses a separate read-only DB snapshot; this is not one
+    /// atomic day snapshot and cannot seal G5B_LAST_RUN. This never prepares
+    /// or retries a decision. Run it off the async monitor tick.
+    pub fn inspect_selected_events_delivery(
+        &self,
+        date: NaiveDate,
+        coordinator: &DurableDeliveryCoordinator,
+    ) -> Result<Option<G5bSelectedEventsObservation>, G5bSelectedEventsObservationError> {
+        let Some(inspections) = self.inspect_existing_day(date)? else {
+            return Ok(None);
+        };
+        let mut events = Vec::with_capacity(inspections.len());
+        for inspection in inspections {
+            let (completion, archived, decision_identity) = match inspection.progress {
+                DeepAttributionEventProgress::NotStarted => {
+                    (G5bSelectedEventState::NotStarted, None, None)
+                }
+                DeepAttributionEventProgress::CompletionUnproven => {
+                    (G5bSelectedEventState::CompletionUnproven, None, None)
+                }
+                DeepAttributionEventProgress::Frozen { result, archived } => {
+                    let facts =
+                        g5b_counted_source_facts(date, &inspection.record, result.summary());
+                    let counted = coordinator.g5b_counted_observation_for_frozen(
+                        &date.to_string(),
+                        facts.occurrence_identity(),
+                        facts.source_sha256(),
+                        result.summary_sha256(),
+                    )?;
+                    let completion = counted
+                        .as_ref()
+                        .map(|item| selected_state_for_counted_terminal(item.terminal()))
+                        .unwrap_or(G5bSelectedEventState::NoCountedDecision);
+                    (
+                        completion,
+                        Some(archived),
+                        counted.map(|item| item.decision_identity().to_string()),
+                    )
+                }
+            };
+            events.push(G5bSelectedEventObservation {
+                index: inspection.index,
+                record: inspection.record,
+                archived,
+                completion,
+                decision_identity,
+            });
+        }
+        Ok(Some(G5bSelectedEventsObservation {
+            business_date: date,
+            events,
+        }))
     }
 
     /// 将已冻结的精确行字节投影到旧 JSONL。只证明归档完成，不授权 counted 重发。
@@ -727,6 +1139,27 @@ impl DeepAttributionJournal {
     }
 }
 
+fn validate_selection(
+    selection: &DeepAttributionSelection,
+    date: NaiveDate,
+    path: &Path,
+) -> Result<(), DeepAttributionError> {
+    if selection.schema_version != 1
+        || selection.business_date != date
+        || selection.events.is_empty()
+        || selection.events.len() > DEEP_ATTRIBUTION_MAX_EVENTS
+        || selection
+            .events
+            .iter()
+            .any(|event| !event.is_production_eligible())
+    {
+        return Err(DeepAttributionError::Io(format!(
+            "G5b 选集完整性检查失败: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn read_archive_bytes(path: &Path) -> Result<Vec<u8>, DeepAttributionError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -751,10 +1184,62 @@ fn read_archive_bytes(path: &Path) -> Result<Vec<u8>, DeepAttributionError> {
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
-        .and_then(|_| file.sync_all())
-        .and_then(|_| sync_parent(path))
-        .map_err(|error| DeepAttributionError::Io(format!("读取/同步 {path:?}: {error}")))?;
+        .map_err(|error| DeepAttributionError::Io(format!("读取 {path:?}: {error}")))?;
+    file.sync_all()
+        .and_then(|()| sync_parent(path))
+        .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
     Ok(bytes)
+}
+
+fn inspect_archive_bytes(path: &Path) -> Result<Vec<u8>, DeepAttributionError> {
+    Ok(read_regular_bytes_for_inspection(path)?.unwrap_or_default())
+}
+
+/// Pin a regular file before reading so a changed pathname cannot redirect
+/// inspection to a different object between symlink_metadata and open.
+fn read_regular_bytes_for_inspection(path: &Path) -> Result<Option<Vec<u8>>, DeepAttributionError> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b inspection 文件不是普通文件: {path:?}"
+            )))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DeepAttributionError::Io(format!("检查 {path:?}: {error}"))),
+    };
+    let mut file = fs::File::open(path)
+        .map_err(|error| DeepAttributionError::Io(format!("打开 {path:?}: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| DeepAttributionError::Io(format!("检查已打开 {path:?}: {error}")))?;
+    if !opened.is_file() || !same_file_identity(&before, &opened) {
+        return Err(DeepAttributionError::Io(format!(
+            "G5b inspection 文件在打开时被替换: {path:?}"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| DeepAttributionError::Io(format!("读取 {path:?}: {error}")))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| DeepAttributionError::Io(format!("复查 {path:?}: {error}")))?;
+    if !after.file_type().is_file() || !same_file_identity(&opened, &after) {
+        return Err(DeepAttributionError::Io(format!(
+            "G5b inspection 文件在读取时被替换: {path:?}"
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn write_atomic_archive(path: &Path, bytes: &[u8]) -> Result<(), DeepAttributionError> {
@@ -1336,6 +1821,154 @@ mod tests {
             restarted.begin_assessment(date, 1).unwrap(),
             DeepAttributionClaim::Fresh
         ));
+    }
+
+    #[test]
+    fn g5b_selected_events_read_existing_facts_without_creating_or_delivering() {
+        use crate::durable_delivery::CoordinatorConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        assert!(journal.inspect_existing_day(date).unwrap().is_none());
+        assert!(!journal.dir.exists());
+
+        let mut attempt_only = sample_record();
+        attempt_only.code = "600397".into();
+        let mut not_started = sample_record();
+        not_started.code = "600398".into();
+        let selected = journal
+            .load_or_select(date, vec![sample_record(), attempt_only, not_started])
+            .unwrap();
+        let frozen_index = selected
+            .iter()
+            .position(|row| row.code == "600396")
+            .unwrap();
+        let attempt_index = selected
+            .iter()
+            .position(|row| row.code == "600397")
+            .unwrap();
+        assert!(matches!(
+            journal.begin_assessment(date, frozen_index).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        assert!(matches!(
+            journal.begin_assessment(date, attempt_index).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let summary = render_deep_attribution_summary(&row);
+        let frozen = journal
+            .freeze_result(date, frozen_index, &row, &summary)
+            .unwrap();
+        let selection_bytes = fs::read(journal.selection_path(date)).unwrap();
+        let result_bytes = fs::read(journal.result_path(date, frozen_index)).unwrap();
+
+        fs::create_dir_all("data/test").unwrap();
+        let database_dir = tempfile::Builder::new()
+            .prefix("TEST_CODE_G5B_DAY_")
+            .tempdir_in("data/test")
+            .unwrap();
+        let test_code = database_dir.path().file_name().unwrap().to_str().unwrap();
+        let coordinator = DurableDeliveryCoordinator::open(CoordinatorConfig::test(
+            database_dir.path().join("durable_delivery.sqlite3"),
+            test_code,
+            "owner-g5b-day-read-0123456789abcdef",
+        ))
+        .unwrap();
+
+        let day = journal
+            .inspect_selected_events_delivery(date, &coordinator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(day.events.len(), 3);
+        assert_eq!(day.count(G5bSelectedEventState::NoCountedDecision), 1);
+        assert_eq!(day.count(G5bSelectedEventState::CompletionUnproven), 1);
+        assert_eq!(day.count(G5bSelectedEventState::NotStarted), 1);
+        assert_eq!(day.events[frozen_index].archived, Some(false));
+        assert!(day.events[frozen_index].decision_identity.is_none());
+        assert!(!journal.archive_path(date).exists());
+        assert_eq!(
+            fs::read(journal.selection_path(date)).unwrap(),
+            selection_bytes
+        );
+        assert_eq!(
+            fs::read(journal.result_path(date, frozen_index)).unwrap(),
+            result_bytes
+        );
+
+        journal.archive_frozen_result(date, frozen_index).unwrap();
+        let archived = journal
+            .inspect_selected_events_delivery(date, &coordinator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.events[frozen_index].archived, Some(true));
+        assert_eq!(
+            archived.events[frozen_index].completion,
+            G5bSelectedEventState::NoCountedDecision
+        );
+        assert_eq!(frozen.summary_sha256(), sha256_hex(summary.as_bytes()));
+    }
+
+    #[test]
+    fn g5b_selected_events_preserve_counted_terminal_distinctions() {
+        use G5bCountedTerminalV1 as Terminal;
+        use G5bSelectedEventState as Selected;
+
+        for (terminal, expected) in [
+            (Terminal::Pending, Selected::Pending),
+            (Terminal::Accepted, Selected::Accepted),
+            (Terminal::ManualAccepted, Selected::ManualAccepted),
+            (Terminal::Rejected, Selected::Rejected),
+            (Terminal::Uncertain, Selected::Uncertain),
+            (Terminal::ManualNotDelivered, Selected::ManualNotDelivered),
+        ] {
+            assert_eq!(selected_state_for_counted_terminal(terminal), expected);
+        }
+        assert_ne!(
+            selected_state_for_counted_terminal(Terminal::Accepted),
+            selected_state_for_counted_terminal(Terminal::ManualAccepted)
+        );
+    }
+
+    #[test]
+    fn g5b_selected_events_reject_archive_without_matching_frozen_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, date, frozen) = prepared_archive_journal(root.path());
+        let archive = journal.archive_path(date);
+        let mut conflicting = sample_row();
+        conflicting.result.main_reason = "另一份模型输出".into();
+        fs::write(
+            &archive,
+            format!("{}\n", serde_json::to_string(&conflicting).unwrap()),
+        )
+        .unwrap();
+        assert!(journal.inspect_existing_day(date).is_err());
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            format!("{}\n", serde_json::to_string(&conflicting).unwrap()).as_bytes()
+        );
+
+        fs::write(&archive, format!("{}\n", frozen.row_json)).unwrap();
+        let inspected = journal.inspect_existing_day(date).unwrap().unwrap();
+        assert!(matches!(
+            inspected[0].progress,
+            DeepAttributionEventProgress::Frozen { archived: true, .. }
+        ));
+        fs::write(&archive, b"partial").unwrap();
+        assert!(journal.inspect_existing_day(date).is_err());
+
+        let mut orphan = sample_row();
+        orphan.record.code = "600999".into();
+        fs::write(
+            &archive,
+            format!("{}\n", serde_json::to_string(&orphan).unwrap()),
+        )
+        .unwrap();
+        assert!(journal.inspect_existing_day(date).is_err());
     }
 
     #[test]

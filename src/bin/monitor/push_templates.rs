@@ -6094,35 +6094,17 @@ pub fn build_g5b_counted_binding(
     record: &stock_analysis::monitor::alert_log::AlertRecord,
     summary: &str,
 ) -> Result<crate::durable_delivery_runtime::CountedDeliveryBinding, String> {
-    use sha2::{Digest, Sha256};
-
-    let event_facts = format!(
-        "{}|{}|{}|{}",
-        record.triggered_at, record.code, record.category, record.message
+    let facts = stock_analysis::monitor::attribution_deep::g5b_counted_source_facts(
+        business_date,
+        record,
+        summary,
     );
-    let event_hash = hex::encode(Sha256::digest(event_facts.as_bytes()));
-    let rendered_sha256 = hex::encode(Sha256::digest(summary.as_bytes()));
-    let canonical = serde_json::json!({
-        "schema": "g5b-attribution-v1",
-        "business_date": business_date.format("%Y-%m-%d").to_string(),
-        "code": record.code,
-        "triggered_at": record.triggered_at,
-        "category": record.category,
-        "level": record.level,
-        "message": record.message,
-        "rendered_sha256": rendered_sha256,
-    });
-    let canonical_bytes = canonical.to_string().into_bytes();
-    let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
     crate::durable_delivery_runtime::CountedDeliveryBinding::new(
         business_date,
-        format!(
-            "g5b-attribution:{business_date}:{}:{event_hash}",
-            record.code
-        ),
-        canonical_bytes,
+        facts.occurrence_identity(),
+        facts.canonical_source().to_vec(),
         crate::durable_delivery_runtime::CountedDeliveryScope::Global,
-        subject_hash,
+        facts.source_sha256(),
         crate::durable_delivery_runtime::CountedDeliveryOrigin::InternalDurable,
         None,
         true,
@@ -23134,9 +23116,20 @@ mod tests {
             &crate::durable_delivery_runtime::CountedDeliveryScope::Global
         );
         assert!(binding.retry_authorized());
-        assert!(binding
-            .schedule_occurrence_identity()
-            .starts_with("g5b-attribution:2026-09-20:600001:"));
+        // Golden from the original producer algorithm: extraction into the
+        // shared read-only source facts must not change a counted identity.
+        assert_eq!(
+            binding.schedule_occurrence_identity(),
+            "g5b-attribution:2026-09-20:600001:7d9b56e1997d5cbbaec85f2db8e278a240a3384753ec008c13bf15316b0d4b45"
+        );
+        assert_eq!(
+            binding.source_binding_canonical(),
+            r#"{"business_date":"2026-09-20","category":"资金","code":"600001","level":"important","message":"主力净流入","rendered_sha256":"efed6b6ebadc213d4e9ec4b9eb2a84d29abaadecd5973efc76ddf7c9e8c8727e","schema":"g5b-attribution-v1","triggered_at":"2026-09-20T15:02:00"}"#.as_bytes()
+        );
+        assert_eq!(
+            binding.source_evidence_fingerprint(),
+            "bf802626d1dc19ab78135d70f5e0da7967af091ee99d38b5c4811e8461663919"
+        );
         // 同事件同日 → 同 occurrence; 同票不同事件 → 不同 occurrence (不互杀)
         let again = build_g5b_counted_binding(date, &record, summary).expect("valid binding");
         assert_eq!(
