@@ -29,3 +29,9 @@ PID 4371 在 20:34 CST 完成 core DB 初始化，migrations 用时 427764 ms。
 - `selection-v2` 的 GlobalSchema authority 尚未接线；PaperLedger 仍要求显式 seed/cutover。Wave 0 的激活与启动不等于全平台上线。52 个 Unit 的逐项 owner、外部回执、finalizer 和自然运行窗、VM 数据合同、研究与 Gate P 证据仍按平台路线图逐项验收。
 
 下一批若修改 `src/` 或 `config/`，重新生成完整可执行输入哈希和 activation，完成要求的人工复核后才重启生产实例。执行前使用 `scripts/verify_executable_input_manifest.py --activation-ready` 严格检查；activation 自身另核批准的 SHA-256。回退时先停新实例、核对持久写入和 Uncertain 水位，只恢复匹配的 binary/source/activation，不覆盖数据库或重发已接纳投递。
+
+## 21:36 CST 后续开发状态
+
+开发分支 `c91be0e1` 将配置了 client bundle 的全市场 `MarketAnnouncements` 路由到已发布的 ExternalV1，并在转换前核对 mTLS/LocalBridge 的 typed provenance；R-08 的来源绑定保留真实来源字节。相关库测试 9/9、monitor R-08 持久绑定测试 1/1 通过，独立复核无剩余高优先级阻断。`14be9462` 将 `NewsMonitor::new` 的同步元数据读取移到 blocking worker，启动期间 DataMode 同级计时器可继续推进；monitor 定向测试 1/1 通过。这两个提交**尚未进入生产**，须单独构建、生成并复核新 activation。
+
+21:33 CST 使用当前生产 bundle 做只读上游探针，ExternalV1 Health 为 live/ready 且构建身份匹配；`MarketAnnouncements` 对 2026-10-01 返回 Cninfo `ADMITTED/complete` 300 条，provider 报告总量 722。该结果证明有界 RPC 可用，不证明全天 722 条全部覆盖，也不证明新 monitor 消费路径或 R-08 强制 CFFEX 来源通过。完整覆盖合同与公告 consumer 的生产观察仍开放。
