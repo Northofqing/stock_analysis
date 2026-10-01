@@ -254,6 +254,7 @@ fn known_provider(value: &str) -> Option<crate::market_domain::ProviderId> {
         "Baostock" => ProviderId::Baostock,
         "Baidu" => ProviderId::Baidu,
         "Tonghuashun" => ProviderId::Tonghuashun,
+        "HithinkFinance" => ProviderId::HithinkFinance,
         "Iwencai" => ProviderId::Iwencai,
         "Cninfo" => ProviderId::Cninfo,
         "Cailianpress" => ProviderId::Cailianpress,
@@ -777,6 +778,52 @@ impl From<crate::grpc_client::envelope::EnvelopeError> for GrpcError {
 mod tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn wg06_exact_window_status_keeps_hithink_and_rejects_unknown_provider_or_wrong_request() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            AdmissionState, ErrorDetail as ExternalErrorDetail, Operation,
+        };
+        let request_id = "TEST_CODE_HISTORICAL_STATUS_REQUEST";
+        let method = ExternalMethod::try_from_operation(Operation::HistoricalBars).unwrap();
+        for (provider, returned_request_id, expected_provider) in [
+            ("HithinkFinance", request_id, Some("HithinkFinance")),
+            ("TEST_CODE_UNKNOWN_PROVIDER", request_id, None),
+            ("HithinkFinance", "TEST_CODE_DIFFERENT_REQUEST", None),
+        ] {
+            let wire = ExternalErrorDetail {
+                request_id: returned_request_id.to_owned(),
+                operation: Operation::HistoricalBars as i32,
+                provider: provider.to_owned(),
+                reason_code: "unavailable".to_owned(),
+                retryable: true,
+                admission: AdmissionState::Admitted as i32,
+                ..ExternalErrorDetail::default()
+            };
+            let error = GrpcError::from_status(
+                tonic::Status::with_details(
+                    Code::Unavailable,
+                    "TEST_CODE status",
+                    wire.encode_to_vec().into(),
+                ),
+                StatusErrorContext::data(MethodIdentity::External(method), request_id),
+            );
+            assert!(matches!(error, GrpcError::Unavailable { .. }));
+            assert_eq!(error.details().provider.as_deref(), expected_provider);
+            if returned_request_id == request_id {
+                assert_eq!(error.details().reason_code.as_deref(), Some("unavailable"));
+                assert_eq!(error.details().retryable, Some(true));
+                assert_eq!(
+                    error.details().method,
+                    Some(MethodIdentity::External(method))
+                );
+            } else {
+                assert!(error.details().reason_code.is_none());
+                assert!(error.details().retryable.is_none());
+                assert!(error.details().method.is_none());
+            }
+        }
+    }
 
     fn detail_for(code: Code) -> ErrorDetail {
         ErrorDetail {
