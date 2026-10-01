@@ -82,6 +82,41 @@ pub struct BenchmarkSnapshotRef {
     pub evidence: Vec<BatchEvidence>,
 }
 
+/// An exact persisted snapshot verified against a request at read time.
+///
+/// Only `BenchmarkReader::read_verified_exact` constructs this capability.
+/// Borrowing or cloning its public snapshot does not transfer verification.
+///
+/// ```compile_fail
+/// use stock_analysis::data_gateway::{BenchmarkSnapshotRef, VerifiedBenchmarkSnapshot};
+/// fn promote(snapshot: BenchmarkSnapshotRef) -> VerifiedBenchmarkSnapshot {
+///     snapshot.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct VerifiedBenchmarkSnapshot {
+    request: BenchmarkRequest,
+    manifest_hash: String,
+    snapshot: BenchmarkSnapshotRef,
+}
+
+impl VerifiedBenchmarkSnapshot {
+    #[must_use]
+    pub fn request(&self) -> &BenchmarkRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &BenchmarkSnapshotRef {
+        &self.snapshot
+    }
+}
+
 /// Provider request identity carried by a raw diagnostic.
 ///
 /// TDX index-bar rows do not echo an instrument identifier, so the requested
@@ -264,6 +299,25 @@ impl<'a> BenchmarkReader<'a> {
             manifest,
             bars,
             evidence,
+        })
+    }
+
+    /// Verify one retained manifest and its complete bars for the exact request.
+    pub fn read_verified_exact(
+        &self,
+        manifest_hash: &str,
+        expected: &BenchmarkRequest,
+    ) -> Result<VerifiedBenchmarkSnapshot, BenchmarkError> {
+        let snapshot = self.read_exact(manifest_hash, expected)?;
+        if snapshot.manifest.manifest_hash != manifest_hash {
+            return Err(failed_integrity(
+                "benchmark_verified_manifest_hash_mismatch",
+            ));
+        }
+        Ok(VerifiedBenchmarkSnapshot {
+            request: expected.clone(),
+            manifest_hash: manifest_hash.to_owned(),
+            snapshot,
         })
     }
 

@@ -48,7 +48,8 @@ pub use benchmark::{
     BenchmarkGranularity, BenchmarkProbeReport, BenchmarkRange, BenchmarkRawIdentityAnchor,
     BenchmarkRawIdentityVerification, BenchmarkRawMinuteLabelSemantics, BenchmarkRawPageTrace,
     BenchmarkRawTimeSample, BenchmarkReader, BenchmarkRegistry, BenchmarkRequest,
-    BenchmarkSnapshotRef, BenchmarkUnsupported, CapturePreview, HS300_CANONICAL,
+    BenchmarkSnapshotRef, BenchmarkUnsupported, CapturePreview, VerifiedBenchmarkSnapshot,
+    HS300_CANONICAL,
 };
 pub use block_trade::{BlockTradeReview, BlockTradesGateway};
 pub use board::{
