@@ -189,6 +189,120 @@ fn g5b_should_analyze(
         && eligible_events > 0
 }
 
+const G5B_RECOVERY_BATCH_DATES: usize = 8;
+
+enum G5bRecoveryTaskOutput {
+    Discovered(Vec<chrono::NaiveDate>),
+    Recovered(stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery),
+}
+
+type G5bRecoveryTask = tokio::task::JoinHandle<
+    Result<G5bRecoveryTaskOutput, stock_analysis::monitor::attribution_deep::DeepAttributionError>,
+>;
+
+struct G5bArchiveRecoveryState {
+    pending: bool,
+    ready: bool,
+    discovered: bool,
+    last_attempt: Option<chrono::NaiveDateTime>,
+    remaining_dates: std::collections::VecDeque<chrono::NaiveDate>,
+    failed_dates: Vec<chrono::NaiveDate>,
+    in_flight_dates: Vec<chrono::NaiveDate>,
+    task: Option<G5bRecoveryTask>,
+}
+
+impl G5bArchiveRecoveryState {
+    const fn new() -> Self {
+        Self {
+            pending: true,
+            ready: false,
+            discovered: false,
+            last_attempt: None,
+            remaining_dates: std::collections::VecDeque::new(),
+            failed_dates: Vec::new(),
+            in_flight_dates: Vec::new(),
+            task: None,
+        }
+    }
+
+    fn fresh_allowed(&self) -> bool {
+        self.ready
+            && !self.pending
+            && self.task.is_none()
+            && self.remaining_dates.is_empty()
+            && self.failed_dates.is_empty()
+    }
+
+    fn retry_due(&self, now: chrono::NaiveDateTime) -> bool {
+        self.pending
+            && self.task.is_none()
+            && self.last_attempt.is_none_or(|previous| {
+                now < previous
+                    || now.signed_duration_since(previous) >= chrono::Duration::minutes(5)
+            })
+    }
+
+    fn discovered_dates(&mut self, dates: Vec<chrono::NaiveDate>) {
+        self.discovered = true;
+        self.remaining_dates = dates.into();
+        self.last_attempt = None;
+        self.pending = !self.remaining_dates.is_empty();
+        self.ready = !self.pending;
+    }
+
+    fn take_batch(&mut self) -> Vec<chrono::NaiveDate> {
+        let dates = (0..G5B_RECOVERY_BATCH_DATES)
+            .filter_map(|_| self.remaining_dates.pop_front())
+            .collect::<Vec<_>>();
+        self.in_flight_dates = dates.clone();
+        dates
+    }
+
+    fn finish_batch(
+        &mut self,
+        report: &stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery,
+        now: chrono::NaiveDateTime,
+    ) {
+        self.in_flight_dates.clear();
+        for (date, _) in &report.failures {
+            if !self.failed_dates.contains(date) {
+                self.failed_dates.push(*date);
+            }
+        }
+        if !self.remaining_dates.is_empty() {
+            self.ready = false;
+            self.pending = true;
+            self.last_attempt = None;
+        } else if self.failed_dates.is_empty() {
+            self.ready = true;
+            self.pending = false;
+        } else {
+            self.ready = false;
+            self.pending = true;
+            self.last_attempt = Some(now);
+            self.remaining_dates = self.failed_dates.drain(..).collect();
+        }
+    }
+
+    fn fail(&mut self, now: chrono::NaiveDateTime) {
+        for date in self.in_flight_dates.drain(..).rev() {
+            self.remaining_dates.push_front(date);
+        }
+        self.ready = false;
+        self.pending = true;
+        self.last_attempt = Some(now);
+    }
+
+    fn retry_date(&mut self, date: chrono::NaiveDate, now: chrono::NaiveDateTime) {
+        self.ready = false;
+        self.pending = true;
+        self.last_attempt = Some(now);
+        if !self.remaining_dates.contains(&date) {
+            self.remaining_dates.push_back(date);
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AttributionDailyPreflight {
     Prepare,
@@ -353,6 +467,68 @@ mod g5b_input_gate_tests {
             None,
             1
         ));
+    }
+}
+
+#[cfg(test)]
+mod g5b_archive_recovery_state_tests {
+    use super::{G5bArchiveRecoveryState, G5B_RECOVERY_BATCH_DATES};
+    use stock_analysis::monitor::attribution_deep::DeepAttributionArchiveRecovery;
+
+    #[test]
+    fn fresh_stays_closed_until_failed_dates_are_recovered() {
+        let older = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let newer = older.succ_opt().unwrap();
+        let failed = older + chrono::Duration::days(G5B_RECOVERY_BATCH_DATES as i64);
+        let now = newer.and_hms_opt(15, 5, 0).unwrap();
+        let mut state = G5bArchiveRecoveryState::new();
+        assert!(!state.fresh_allowed());
+        let dates = (0..G5B_RECOVERY_BATCH_DATES + 2)
+            .map(|offset| older + chrono::Duration::days(offset as i64))
+            .collect::<Vec<_>>();
+        state.discovered_dates(dates);
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.take_batch().len(), G5B_RECOVERY_BATCH_DATES);
+        state.finish_batch(&DeepAttributionArchiveRecovery::default(), now);
+        assert_eq!(state.remaining_dates.len(), 2);
+        assert!(!state.fresh_allowed());
+
+        assert_eq!(state.take_batch().len(), 2);
+        state.finish_batch(
+            &DeepAttributionArchiveRecovery {
+                appended: 1,
+                failures: vec![(failed, "damaged archive".to_string())],
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.remaining_dates.front(), Some(&failed));
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
+
+        assert_eq!(state.take_batch(), vec![failed]);
+        state.finish_batch(&DeepAttributionArchiveRecovery::default(), now);
+        assert!(state.fresh_allowed());
+        state.retry_date(newer, now);
+        assert!(!state.fresh_allowed());
+        assert_eq!(state.remaining_dates.front(), Some(&newer));
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn worker_failure_restores_its_batch_and_keeps_fresh_closed() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let now = day.and_hms_opt(15, 5, 0).unwrap();
+        let mut state = G5bArchiveRecoveryState::new();
+        state.discovered_dates(vec![day]);
+        assert_eq!(state.take_batch(), vec![day]);
+        state.fail(now);
+        assert_eq!(state.remaining_dates.front(), Some(&day));
+        assert!(!state.fresh_allowed());
+        assert!(!state.retry_due(now));
+        assert!(state.retry_due(now + chrono::Duration::minutes(5)));
     }
 }
 
@@ -10409,64 +10585,106 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
                 }
             }
-            // G5b 归档恢复不依赖模型、分析窗口或 LAST_RUN；只扫描已有冻结结果。
-            // 启动扫描一次；本进程归档失败再请求扫描，避免每 tick 重读全部历史归档。
-            struct G5bArchiveRecoveryState {
-                pending: bool,
-                last_attempt: Option<chrono::NaiveDateTime>,
-            }
+            // G5b 只在阻塞线程扫描已有 journal。扫描未完成或失败时，
+            // 当前 tick 继续运行其他 monitor 工作，但不建立新 LLM attempt。
             static G5B_ARCHIVE_RECOVERY: std::sync::Mutex<G5bArchiveRecoveryState> =
-                std::sync::Mutex::new(G5bArchiveRecoveryState {
-                    pending: true,
-                    last_attempt: None,
-                });
+                std::sync::Mutex::new(G5bArchiveRecoveryState::new());
             let recovery_now = now.naive_local();
-            let recovery_due = {
+            let finished_recovery = {
                 let mut state = G5B_ARCHIVE_RECOVERY
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.pending
-                    && state.last_attempt.is_none_or(|previous| {
-                        recovery_now < previous
-                            || recovery_now.signed_duration_since(previous)
-                                >= chrono::Duration::minutes(5)
-                    })
-                {
-                    state.last_attempt = Some(recovery_now);
-                    state.pending = false;
-                    true
+                if state.task.as_ref().is_some_and(|task| task.is_finished()) {
+                    state.task.take()
                 } else {
-                    false
+                    None
                 }
             };
-            if recovery_due {
-                let journal =
-                    stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production();
-                match journal.recover_existing_frozen_archives(recovery_now) {
-                    Ok(report) => {
-                        if report.appended > 0 || report.completion_unproven > 0 {
-                            log::info!(
-                                "[g5b] 已有结果归档恢复: 新增 {}, 已存在 {}, attempt-only {} (不自动 counted)",
-                                report.appended,
-                                report.already_present,
-                                report.completion_unproven
-                            );
-                        }
+            if let Some(task) = finished_recovery {
+                match task.await {
+                    Ok(Ok(G5bRecoveryTaskOutput::Discovered(dates))) => {
+                        let count = dates.len();
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .discovered_dates(dates);
+                        log::info!("[g5b] 已发现 {count} 个历史归档日期; 每批最多恢复 {G5B_RECOVERY_BATCH_DATES} 日");
                     }
-                    Err(error) => {
+                    Ok(Ok(G5bRecoveryTaskOutput::Recovered(report))) => {
                         let mut state = G5B_ARCHIVE_RECOVERY
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        state.pending = true;
-                        log::error!("[g5b] 已有结果归档恢复失败, 五分钟后只重试补归档, 不自动重算或 counted: {error}");
+                        state.finish_batch(&report, recovery_now);
+                        let remaining = state.remaining_dates.len();
+                        if report.failures.is_empty() {
+                            log::info!(
+                                "[g5b] 已有结果归档批次: 新增 {}, 已存在 {}, attempt-only {}, 待处理日期 {} (不自动 counted)",
+                                report.appended,
+                                report.already_present,
+                                report.completion_unproven,
+                                remaining
+                            );
+                        } else {
+                            let examples = report
+                                .failures
+                                .iter()
+                                .take(3)
+                                .map(|(date, error)| format!("{date}: {error}"))
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            log::error!(
+                                "[g5b] 已有结果归档部分失败: 新增 {}, 失败日期 {} (五分钟后仅重试失败日期; 不自动 counted): {}",
+                                report.appended,
+                                report.failures.len(),
+                                examples
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .fail(recovery_now);
+                        log::error!("[g5b] 已有结果归档扫描失败, 五分钟后重试; 不开始新 LLM attempt: {error}");
+                    }
+                    Err(error) => {
+                        G5B_ARCHIVE_RECOVERY
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .fail(recovery_now);
+                        log::error!("[g5b] 已有结果归档线程失败, 五分钟后重试; 不开始新 LLM attempt: {error}");
                     }
                 }
             }
+            let recovery_ready = {
+                let mut state = G5B_ARCHIVE_RECOVERY
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.retry_due(recovery_now) {
+                    state.last_attempt = Some(recovery_now);
+                    state.pending = false;
+                    state.task = Some(if state.discovered {
+                        let dates = state.take_batch();
+                        tokio::task::spawn_blocking(move || {
+                            stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production()
+                                .recover_frozen_archives_for_dates(dates)
+                                .map(G5bRecoveryTaskOutput::Recovered)
+                        })
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            stock_analysis::monitor::attribution_deep::DeepAttributionJournal::production()
+                                .existing_recovery_dates(recovery_now)
+                                .map(G5bRecoveryTaskOutput::Discovered)
+                        })
+                    });
+                }
+                state.fresh_allowed()
+            };
             // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
             // 窗口同 15:05-15:20; 空输入保留窗口内重查资格。选集与每次 LLM
             // attempt 先持久化, 重启后不会重选或重算已开始的非确定分析。
             // 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
-            if now.hour() == 15 && (5..=20).contains(&now.minute()) {
+            if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
@@ -10553,10 +10771,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                 record.code,
                                                 record.triggered_at
                                             );
-                                            let mut state = G5B_ARCHIVE_RECOVERY
+                                            G5B_ARCHIVE_RECOVERY
                                                 .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                            state.pending = true;
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .retry_date(today, recovery_now);
+                                            journal_failed = true;
+                                            break;
                                         }
                                     }
                                     continue;
@@ -10614,12 +10834,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         }
                                         Err(error) => {
                                             log::warn!("[g5b] 深链归因归档失败, attempt 已记录且禁止自动重算, 需人工核对: {error}");
-                                            let mut state = G5B_ARCHIVE_RECOVERY
+                                            G5B_ARCHIVE_RECOVERY
                                                 .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                            state.pending = true;
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .retry_date(today, recovery_now);
+                                            journal_failed = true;
                                             failed += 1;
-                                            continue;
+                                            break;
                                         }
                                     }
                                     log::info!(
@@ -14278,15 +14499,15 @@ mod tests_post_session_review_scheduler {
     fn g5b_archive_recovery_precedes_model_window_and_counted_handoff() {
         let source = include_str!("main.rs");
         let g5b = source
-            .split("// G5b 归档恢复不依赖模型、分析窗口或 LAST_RUN")
+            .split("// G5b 只在阻塞线程扫描已有 journal")
             .nth(1)
             .and_then(|tail| tail.split("// BR-226: 持仓快照").next())
             .expect("G5b monitor phase");
         let recovery = g5b
-            .find("journal.recover_existing_frozen_archives(recovery_now)")
-            .expect("read-only archive recovery");
+            .find(".existing_recovery_dates(recovery_now)")
+            .expect("read-only archive discovery");
         let window = g5b
-            .find("if now.hour() == 15 && (5..=20).contains(&now.minute())")
+            .find("if recovery_ready && now.hour() == 15 && (5..=20).contains(&now.minute())")
             .expect("fresh G5b analysis window");
         let last_run = g5b
             .find("if g5b_last_run != Some(today)")
@@ -14306,6 +14527,7 @@ mod tests_post_session_review_scheduler {
         assert!(!recovery_phase.contains("begin_assessment("));
         assert!(!recovery_phase.contains("LlmRegistry::from_env()"));
         assert!(!recovery_phase.contains("push_counted_with_binding("));
+        assert!(recovery_phase.contains("tokio::task::spawn_blocking"));
     }
 
     #[test]

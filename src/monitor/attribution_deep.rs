@@ -146,6 +146,8 @@ pub struct DeepAttributionArchiveRecovery {
     pub appended: usize,
     pub already_present: usize,
     pub completion_unproven: usize,
+    /// A damaged date does not prevent later dates from being inspected.
+    pub failures: Vec<(NaiveDate, String)>,
 }
 
 /// 与 G5b counted occurrence 的事件事实字段保持一致；业务日由归档路径约束。
@@ -597,12 +599,19 @@ impl DeepAttributionJournal {
         &self,
         as_of: NaiveDateTime,
     ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        self.recover_frozen_archives_for_dates(self.existing_recovery_dates(as_of)?)
+    }
+
+    /// Discover dates once in a blocking worker. Callers can process the
+    /// returned dates in bounded batches and retry only failed dates.
+    pub fn existing_recovery_dates(
+        &self,
+        as_of: NaiveDateTime,
+    ) -> Result<Vec<NaiveDate>, DeepAttributionError> {
         self.ensure_allowed()?;
         let dir_metadata = match fs::symlink_metadata(&self.dir) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(DeepAttributionArchiveRecovery::default())
-            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(DeepAttributionError::Io(format!(
                     "检查 {:?}: {error}",
@@ -649,44 +658,68 @@ impl DeepAttributionJournal {
             }
         }
 
+        Ok(dates.into_iter().collect())
+    }
+
+    /// Retry only dates that failed the initial scan. All filesystem work is
+    /// performed by the caller's blocking worker, never on the async tick.
+    pub fn recover_frozen_archives_for_dates(
+        &self,
+        dates: impl IntoIterator<Item = NaiveDate>,
+    ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        self.ensure_allowed()?;
         let mut recovery = DeepAttributionArchiveRecovery::default();
-        for date in dates {
-            // 空输入只加载已存在选集；孤儿 attempt/result/lock 会 fail closed。
-            let events = self.load_or_select(date, Vec::new())?;
-            for index in 0..events.len() {
-                let result_path = self.result_path(date, index);
-                match fs::symlink_metadata(&result_path) {
-                    Ok(metadata) if !metadata.file_type().is_file() => {
-                        return Err(DeepAttributionError::Io(format!(
-                            "G5b 冻结结果不是普通文件: {result_path:?}"
-                        )))
-                    }
-                    Ok(_) => match self.archive_frozen_result(date, index)? {
-                        DeepAttributionArchiveOutcome::Appended => recovery.appended += 1,
-                        DeepAttributionArchiveOutcome::AlreadyPresent => {
-                            recovery.already_present += 1
+        for date in dates.into_iter().collect::<std::collections::BTreeSet<_>>() {
+            match self.recover_frozen_archives_for_date(date) {
+                Ok(date_recovery) => {
+                    recovery.appended += date_recovery.appended;
+                    recovery.already_present += date_recovery.already_present;
+                    recovery.completion_unproven += date_recovery.completion_unproven;
+                }
+                Err(error) => recovery.failures.push((date, error.to_string())),
+            }
+        }
+        Ok(recovery)
+    }
+
+    fn recover_frozen_archives_for_date(
+        &self,
+        date: NaiveDate,
+    ) -> Result<DeepAttributionArchiveRecovery, DeepAttributionError> {
+        // 空输入只加载已存在选集；孤儿 attempt/result/lock 会 fail closed。
+        let events = self.load_or_select(date, Vec::new())?;
+        let mut recovery = DeepAttributionArchiveRecovery::default();
+        for index in 0..events.len() {
+            let result_path = self.result_path(date, index);
+            match fs::symlink_metadata(&result_path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(DeepAttributionError::Io(format!(
+                        "G5b 冻结结果不是普通文件: {result_path:?}"
+                    )))
+                }
+                Ok(_) => match self.archive_frozen_result(date, index)? {
+                    DeepAttributionArchiveOutcome::Appended => recovery.appended += 1,
+                    DeepAttributionArchiveOutcome::AlreadyPresent => recovery.already_present += 1,
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    let attempt = self.attempt_path(date, index);
+                    match fs::symlink_metadata(&attempt) {
+                        Ok(_) => {
+                            self.validate_attempt_marker(date, index)?;
+                            recovery.completion_unproven += 1;
                         }
-                    },
-                    Err(error) if error.kind() == ErrorKind::NotFound => {
-                        let attempt = self.attempt_path(date, index);
-                        match fs::symlink_metadata(&attempt) {
-                            Ok(_) => {
-                                self.validate_attempt_marker(date, index)?;
-                                recovery.completion_unproven += 1;
-                            }
-                            Err(error) if error.kind() == ErrorKind::NotFound => {}
-                            Err(error) => {
-                                return Err(DeepAttributionError::Io(format!(
-                                    "检查 {attempt:?}: {error}"
-                                )))
-                            }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(DeepAttributionError::Io(format!(
+                                "检查 {attempt:?}: {error}"
+                            )))
                         }
                     }
-                    Err(error) => {
-                        return Err(DeepAttributionError::Io(format!(
-                            "检查 {result_path:?}: {error}"
-                        )))
-                    }
+                }
+                Err(error) => {
+                    return Err(DeepAttributionError::Io(format!(
+                        "检查 {result_path:?}: {error}"
+                    )))
                 }
             }
         }
@@ -1524,6 +1557,45 @@ mod tests {
         assert_eq!(second.already_present, 1);
         assert_eq!(fs::read(&archive).unwrap(), expected.as_bytes());
         assert!(!journal.attempt_path(date, 1).exists());
+    }
+
+    #[test]
+    fn bad_older_archive_does_not_block_newer_date_and_retry_is_targeted() {
+        let root = tempfile::tempdir().unwrap();
+        let (journal, older, _) = prepared_archive_journal(root.path());
+        let newer = older.succ_opt().unwrap();
+        journal
+            .load_or_select(newer, vec![sample_record()])
+            .unwrap();
+        assert!(matches!(
+            journal.begin_assessment(newer, 0).unwrap(),
+            DeepAttributionClaim::Fresh
+        ));
+        let row = sample_row();
+        let newer_frozen = journal
+            .freeze_result(newer, 0, &row, &render_deep_attribution_summary(&row))
+            .unwrap();
+        let broken = b"{partial";
+        fs::write(journal.archive_path(older), broken).unwrap();
+
+        let report = journal
+            .recover_existing_frozen_archives(newer.and_hms_opt(15, 21, 0).unwrap())
+            .unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].0, older);
+        assert_eq!(report.appended, 1);
+        assert_eq!(fs::read(journal.archive_path(older)).unwrap(), broken);
+        let newer_bytes = format!("{}\n", newer_frozen.row_json).into_bytes();
+        assert_eq!(fs::read(journal.archive_path(newer)).unwrap(), newer_bytes);
+
+        fs::write(journal.archive_path(older), b"").unwrap();
+        let retried = journal
+            .recover_frozen_archives_for_dates(report.failures.iter().map(|(date, _)| *date))
+            .unwrap();
+        assert!(retried.failures.is_empty());
+        assert_eq!(retried.appended, 1);
+        assert_eq!(retried.already_present, 0);
+        assert_eq!(fs::read(journal.archive_path(newer)).unwrap(), newer_bytes);
     }
 
     #[test]
