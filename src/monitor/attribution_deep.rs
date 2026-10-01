@@ -16,10 +16,11 @@
 use crate::llm::{LlmError, LlmProvider, ModelCallReceipt, ReceiptBearingJson};
 use crate::monitor::alert_log::AlertRecord;
 use crate::risk::env_guard::{current_env, runtime_is_test_process, TradingEnv};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 深链归因模型调用超时 (与 news_ai 同档, 45s)。
@@ -79,6 +80,181 @@ pub struct DeepAttributionRow {
     pub upstream_request_id: Option<String>,
     pub upstream_response_id: Option<String>,
     pub elapsed_ms: u64,
+}
+
+/// 冻结当日选集并在每次非确定模型调用前记录尝试。标记存在只表示调用已开始，
+/// 不能当作结果、counted 决策或物理发送的完成证据。
+pub struct DeepAttributionJournal {
+    dir: PathBuf,
+    production: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeepAttributionSelection {
+    schema_version: u8,
+    business_date: NaiveDate,
+    events: Vec<AlertRecord>,
+}
+
+impl DeepAttributionJournal {
+    pub fn production() -> Self {
+        Self {
+            dir: PathBuf::from("data/g5b/attempts"),
+            production: true,
+        }
+    }
+
+    fn ensure_allowed(&self) -> Result<(), DeepAttributionError> {
+        if self.production && (runtime_is_test_process() || current_env() == TradingEnv::Test) {
+            return Err(DeepAttributionError::Io(
+                "test runtime cannot write the production G5b attempt journal".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn selection_path(&self, date: NaiveDate) -> PathBuf {
+        self.dir.join(format!("{date}.selection.json"))
+    }
+
+    fn attempt_path(&self, date: NaiveDate, index: usize) -> PathBuf {
+        self.dir.join(format!("{date}.{index}.attempt"))
+    }
+
+    /// 已保存的选集优先于当天不断增长的告警文件。首次无可选事件时不冻结选集。
+    pub fn load_or_select(
+        &self,
+        date: NaiveDate,
+        records: Vec<AlertRecord>,
+    ) -> Result<Vec<AlertRecord>, DeepAttributionError> {
+        self.ensure_allowed()?;
+        let path = self.selection_path(date);
+        let selection = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<DeepAttributionSelection>(&bytes)
+                .map_err(|e| DeepAttributionError::Io(format!("读取 {path:?}: {e}")))?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // 选集丢失但 attempt 留存时，ordinal 已无权威事件映射。
+                for index in 0..DEEP_ATTRIBUTION_MAX_EVENTS {
+                    let attempt = self.attempt_path(date, index);
+                    match fs::symlink_metadata(&attempt) {
+                        Ok(_) => {
+                            return Err(DeepAttributionError::Io(format!(
+                                "G5b 选集缺失但 attempt 留存, 需人工裁定: {attempt:?}"
+                            )))
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(DeepAttributionError::Io(format!(
+                                "检查 {attempt:?}: {error}"
+                            )))
+                        }
+                    }
+                }
+                // 升级前的结果归档没有 pre-call 标记，不能据此证明尚未开始分析。
+                let legacy_archive = self
+                    .dir
+                    .parent()
+                    .expect("journal dir has parent")
+                    .join(format!("{date}.jsonl"));
+                match fs::metadata(&legacy_archive) {
+                    Ok(_) => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "已有无 attempt 标记的 G5b 归档, 需人工裁定: {legacy_archive:?}"
+                        )))
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(DeepAttributionError::Io(format!(
+                            "检查 {legacy_archive:?}: {error}"
+                        )))
+                    }
+                }
+                let events = top_events_for_deep(records, DEEP_ATTRIBUTION_MAX_EVENTS);
+                if events.is_empty() {
+                    return Ok(events);
+                }
+                fs::create_dir_all(&self.dir)
+                    .map_err(|e| DeepAttributionError::Io(format!("创建 {:?}: {e}", self.dir)))?;
+                let selection = DeepAttributionSelection {
+                    schema_version: 1,
+                    business_date: date,
+                    events,
+                };
+                let bytes = serde_json::to_vec(&selection)
+                    .map_err(|e| DeepAttributionError::Io(e.to_string()))?;
+                match write_new_synced(&path, &bytes) {
+                    Ok(true) => selection,
+                    Ok(false) => {
+                        let bytes = fs::read(&path)
+                            .map_err(|e| DeepAttributionError::Io(format!("读取 {path:?}: {e}")))?;
+                        serde_json::from_slice(&bytes)
+                            .map_err(|e| DeepAttributionError::Io(format!("读取 {path:?}: {e}")))?
+                    }
+                    Err(error) => {
+                        return Err(DeepAttributionError::Io(format!("保存 {path:?}: {error}")))
+                    }
+                }
+            }
+            Err(error) => return Err(DeepAttributionError::Io(format!("读取 {path:?}: {error}"))),
+        };
+        if selection.schema_version != 1
+            || selection.business_date != date
+            || selection.events.is_empty()
+            || selection.events.len() > DEEP_ATTRIBUTION_MAX_EVENTS
+            || selection
+                .events
+                .iter()
+                .any(|event| !event.is_production_eligible())
+        {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b 选集完整性检查失败: {path:?}"
+            )));
+        }
+        fs::File::open(&path)
+            .and_then(|file| file.sync_all())
+            .and_then(|()| sync_parent(&path))
+            .map_err(|error| DeepAttributionError::Io(format!("同步 {path:?}: {error}")))?;
+        Ok(selection.events)
+    }
+
+    /// true 才允许进入 LLM；已有标记或任何 IO 不确定都阻止再次调用。
+    pub fn begin_assessment(
+        &self,
+        date: NaiveDate,
+        index: usize,
+    ) -> Result<bool, DeepAttributionError> {
+        self.ensure_allowed()?;
+        let events = self.load_or_select(date, Vec::new())?;
+        if index >= events.len() {
+            return Err(DeepAttributionError::Io(format!(
+                "G5b attempt 不在已保存选集内: {date} index={index}"
+            )));
+        }
+        let path = self.attempt_path(date, index);
+        match write_new_synced(&path, b"") {
+            Ok(created) => Ok(created),
+            Err(error) => Err(DeepAttributionError::Io(format!("记录 {path:?}: {error}"))),
+        }
+    }
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    file.write_all(bytes).and_then(|()| file.sync_all())?;
+    sync_parent(path)?;
+    Ok(true)
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path.parent().expect("journal path has parent")).and_then(|dir| dir.sync_all())
 }
 
 /// G5b 分析器 (side-effect-free, 仿 NewsAIAnalyzer)。
@@ -531,6 +707,89 @@ mod tests {
         record.origin = crate::monitor::alert_log::AlertRecordOrigin::Test;
         assert!(top_events_for_deep(vec![record], 3).is_empty());
         assert!(top_events_for_deep(vec![sample_record()], 0).is_empty());
+    }
+
+    #[test]
+    fn journal_replays_selected_events_without_restarting_an_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("isolated-g5b-attempts");
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let journal = DeepAttributionJournal {
+            dir: dir.clone(),
+            production: false,
+        };
+        let mut second = sample_record();
+        second.code = "600397".into();
+        second.level = "参考".into();
+        let selected = journal
+            .load_or_select(date, vec![sample_record(), second])
+            .expect("首次选集必须持久化");
+        assert_eq!(selected.len(), 2);
+        assert!(journal.begin_assessment(date, 0).unwrap());
+
+        // 模拟重启后告警文件新增了更高优先级的记录。已开始的分析不可重选/重算。
+        let restarted = DeepAttributionJournal {
+            dir,
+            production: false,
+        };
+        let mut newer = sample_record();
+        newer.code = "600001".into();
+        newer.level = "紧急".into();
+        let replay = restarted
+            .load_or_select(date, vec![newer])
+            .expect("重启后应使用原选集");
+        assert_eq!(replay[0].code, selected[0].code);
+        assert!(!restarted.begin_assessment(date, 0).unwrap());
+        assert!(restarted.begin_assessment(date, 1).unwrap());
+    }
+
+    #[test]
+    fn incomplete_selection_fails_closed_without_reselection() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        fs::create_dir_all(&journal.dir).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        fs::write(journal.selection_path(date), b"{\"schema_version\":1").unwrap();
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.attempt_path(date, 0).exists());
+    }
+
+    #[test]
+    fn legacy_result_without_attempt_journal_blocks_new_analysis() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        fs::write(root.path().join(format!("{date}.jsonl")), b"old result\n").unwrap();
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.selection_path(date).exists());
+    }
+
+    #[test]
+    fn orphan_attempt_without_selection_blocks_reselection() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = DeepAttributionJournal {
+            dir: root.path().join("isolated-g5b-attempts"),
+            production: false,
+        };
+        fs::create_dir_all(&journal.dir).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        fs::write(journal.attempt_path(date, 0), b"").unwrap();
+        assert!(journal.load_or_select(date, vec![sample_record()]).is_err());
+        assert!(!journal.selection_path(date).exists());
+    }
+
+    #[test]
+    fn production_journal_rejects_test_process_before_io() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        assert!(DeepAttributionJournal::production()
+            .load_or_select(date, vec![sample_record()])
+            .is_err());
     }
 
     #[test]

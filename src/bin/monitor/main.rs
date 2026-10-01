@@ -10410,28 +10410,54 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 }
             }
             // G5b 深链归因 (2026-08-22): 当日告警 LLM 深链 — 独立于结算成败。
-            // 窗口同 15:05-15:20; 空输入保留窗口内重查资格, 已尝试分析
-            // 的批次仍封日以免非确定 LLM 重跑或不明投递重复发送。
+            // 窗口同 15:05-15:20; 空输入保留窗口内重查资格。选集与每次 LLM
+            // attempt 先持久化, 重启后不会重选或重算已开始的非确定分析。
             // 无模型 → 出声跳过。上限 DEEP_ATTRIBUTION_MAX_EVENTS 条 (成本护栏)。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::llm::registry::LlmRegistry;
                 use stock_analysis::monitor::alert_log::read_today_records;
                 use stock_analysis::monitor::attribution_deep::{
                     append_deep_attribution_row, render_deep_attribution_summary,
-                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionRequest,
-                    DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
+                    top_events_for_deep, DeepAttributionAnalyzer, DeepAttributionJournal,
+                    DeepAttributionRequest, DeepAttributionRow, DEEP_ATTRIBUTION_MAX_EVENTS,
                 };
                 static G5B_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
                 let g5b_last_run = *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
                 if g5b_last_run != Some(today) {
-                    let events =
+                    let candidates =
                         top_events_for_deep(read_today_records(), DEEP_ATTRIBUTION_MAX_EVENTS);
-                    if !g5b_should_analyze(now.naive_local(), g5b_last_run, events.len()) {
-                        log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
+                    let provider = if candidates.is_empty() {
+                        None
                     } else {
-                        let Some(provider) = LlmRegistry::from_env().select("g5b") else {
+                        LlmRegistry::from_env().select("g5b")
+                    };
+                    if !candidates.is_empty() && provider.is_none() {
+                        // 尚未开始分析时不冻结选集，provider 恢复后仍可纳入新告警。
+                        g5b_no_provider_backoff().await;
+                        continue;
+                    }
+                    let journal = DeepAttributionJournal::production();
+                    let mut selection_failed = false;
+                    let events =
+                        journal
+                            .load_or_select(today, candidates)
+                            .unwrap_or_else(|error| {
+                                log::error!(
+                                    "[g5b] 深链归因选集不可用, 本 tick fail closed: {error}"
+                                );
+                                selection_failed = true;
+                                Vec::new()
+                            });
+                    if !selection_failed
+                        && !g5b_should_analyze(now.naive_local(), g5b_last_run, events.len())
+                    {
+                        log::debug!("[g5b] 深链归因: 当前无合格告警, 窗口内继续重查");
+                    } else if !selection_failed {
+                        let Some(provider) =
+                            provider.or_else(|| LlmRegistry::from_env().select("g5b"))
+                        else {
                             // v15.x 规则4: 每次跳过都出声 — 窗口内每 tick 提示, 不记 LAST_RUN
                             // 以便用户补配 provider 后窗口内自愈。退避消耗一个 tick:
                             // 裸 continue 会绕过循环尾部的 sleep, 造成无退避空转。
@@ -10441,7 +10467,29 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let analyzer = DeepAttributionAnalyzer::new(provider);
                         let mut done = 0usize;
                         let mut failed = 0usize;
-                        for record in events {
+                        let mut journal_failed = false;
+                        for (index, record) in events.into_iter().enumerate() {
+                            match journal.begin_assessment(today, index) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    log::info!(
+                                        "[g5b] 已有分析 attempt 标记, 不重算或重发: {} {}",
+                                        record.code,
+                                        record.triggered_at
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    log::error!(
+                                        "[g5b] 分析前 attempt 标记失败, 本事件 fail closed: {} {}: {error}",
+                                        record.code,
+                                        record.triggered_at
+                                    );
+                                    journal_failed = true;
+                                    failed += 1;
+                                    continue;
+                                }
+                            }
                             let request = DeepAttributionRequest {
                                 record,
                                 as_of: chrono::Utc::now(),
@@ -10465,7 +10513,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         elapsed_ms: outcome.elapsed_ms,
                                     };
                                     if let Err(e) = append_deep_attribution_row(&row) {
-                                        log::warn!("[g5b] 深链归因落库失败: {e}");
+                                        log::warn!("[g5b] 深链归因落库失败, attempt 已记录且禁止自动重算, 需人工核对: {e}");
                                         failed += 1;
                                         continue;
                                     }
@@ -10479,8 +10527,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     );
                                     let summary = render_deep_attribution_summary(&row);
                                     // 2026-09-20: G5b 升级 counted 持久投递 (MU-g5b-attribution)。
-                                    // binding 在分析后构造 (LLM 结果非确定, 重试分析=新事件);
-                                    // 推送失败决策落盘, 启动对账补发原文本。
+                                    // attempt 已持久化; counted handoff 只消费本次分析的摘要。
                                     let outcome = match push_templates::build_g5b_counted_binding(
                                         today,
                                         &row.record,
@@ -10508,12 +10555,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             crate::notify::PushOutcome::Denied(reason)
                                         }
                                     };
+                                    if matches!(
+                                        &outcome,
+                                        crate::notify::PushOutcome::Denied(_)
+                                            | crate::notify::PushOutcome::SinkError(_)
+                                    ) {
+                                        log::warn!("[g5b] counted 未确认, attempt 已记录且禁止自动重算, 需人工核对: {:?}", outcome);
+                                    }
                                     log::info!("[g5b] 深链归因推送完成: {:?}", outcome);
                                     done += 1;
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "[g5b] 深链归因分析失败 ({}): {e}",
+                                        "[g5b] 深链归因分析失败 ({}), attempt 已记录且禁止自动重算: {e}",
                                         request.record.code
                                     );
                                     failed += 1;
@@ -10524,8 +10578,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             "[g5b] 深链归因当日批次结束: 成功 {done}, 失败 {failed} (上限 {})",
                             DEEP_ATTRIBUTION_MAX_EVENTS
                         );
-                        // 全部事件已尝试 (成功/失败均已出声) → 记 LAST_RUN, 避免窗口内重计费
-                        *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                        // 标记 IO 故障可在下 tick 重试; 已标记事件不会重复调用 LLM。
+                        if !journal_failed {
+                            *G5B_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                        }
                     }
                 }
             }
