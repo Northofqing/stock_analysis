@@ -119,6 +119,7 @@ pub(crate) enum HistoricalQueryReply {
     OperationMismatch,
     RequestIdMismatch,
     StatusWithTrailer,
+    StatusMalformedTrailer(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,7 +493,11 @@ impl ExternalQueryWireService {
                     "TEST_CODE historical request contract",
                 ));
             }
-            if reply == HistoricalQueryReply::StatusWithTrailer {
+            if matches!(
+                reply,
+                HistoricalQueryReply::StatusWithTrailer
+                    | HistoricalQueryReply::StatusMalformedTrailer(_)
+            ) {
                 let details = ErrorDetail {
                     request_id,
                     operation: Operation::HistoricalBars as i32,
@@ -508,10 +513,19 @@ impl ExternalQueryWireService {
                     "TEST_CODE historical provider unavailable",
                     details.clone().into(),
                 );
-                status.metadata_mut().insert_bin(
-                    "magic-error-detail-bin",
-                    tonic::metadata::MetadataValue::from_bytes(&details),
-                );
+                if let HistoricalQueryReply::StatusMalformedTrailer(encoded) = reply {
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(
+                        "magic-error-detail-bin",
+                        http::HeaderValue::from_static(encoded),
+                    );
+                    *status.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+                } else {
+                    status.metadata_mut().insert_bin(
+                        "magic-error-detail-bin",
+                        tonic::metadata::MetadataValue::from_bytes(&details),
+                    );
+                }
                 return Err(status);
             }
             return Ok(Response::new(QueryResponse {

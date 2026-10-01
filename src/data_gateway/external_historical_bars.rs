@@ -45,18 +45,7 @@ impl HistoricalWindowRequest {
         }
         let calendar = resolve_verified_replay_range(from, to)
             .map_err(|error| request_error(error.code(), error.retryable()))?;
-        let shanghai = FixedOffset::east_opt(8 * 60 * 60).expect("fixed Shanghai offset is valid");
-        let local = invoked_at.with_timezone(&shanghai);
-        if to > local.date_naive()
-            || (calendar.required_trading_dates().last() == Some(&local.date_naive())
-                && local.time()
-                    < NaiveTime::from_hms_opt(15, 0, 0).expect("session close time is valid"))
-        {
-            return Err(request_error(
-                "external_historical_window_incomplete",
-                false,
-            ));
-        }
+        require_completed_window(&calendar, invoked_at)?;
         Ok(Self {
             instrument,
             calendar,
@@ -99,6 +88,26 @@ impl HistoricalWindowRequest {
     }
 }
 
+fn require_completed_window(
+    calendar: &VerifiedReplayCalendar,
+    at: DateTime<Utc>,
+) -> Result<(), GrpcError> {
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60).expect("fixed Shanghai offset is valid");
+    let local = at.with_timezone(&shanghai);
+    if calendar.target_to() > local.date_naive()
+        || (calendar.required_trading_dates().last() == Some(&local.date_naive())
+            && local.time()
+                < NaiveTime::from_hms_opt(15, 0, 0).expect("session close time is valid"))
+    {
+        Err(request_error(
+            "external_historical_window_incomplete",
+            false,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) struct ExternalHistoricalBarsGateway {
     reader: ExternalHistoricalReadClient,
 }
@@ -116,9 +125,25 @@ impl ExternalHistoricalBarsGateway {
         &mut self,
         request: HistoricalWindowRequest,
     ) -> Result<GatewayObservedHistoricalWindowCapture, GrpcError> {
+        self.observe_once_at(request, Utc::now()).await
+    }
+
+    async fn observe_once_at(
+        &mut self,
+        request: HistoricalWindowRequest,
+        checked_at: DateTime<Utc>,
+    ) -> Result<GatewayObservedHistoricalWindowCapture, GrpcError> {
+        // A request prepared with a supplied future invocation time cannot
+        // authorize an unfinished live read. Keep its original identity intact.
+        require_completed_window(&request.calendar, checked_at)?;
         let query = request.query()?;
+        let issued_request_bytes = query.wire_bytes();
         let observation = self.reader.query_once(query).await?;
-        GatewayObservedHistoricalWindowCapture::from_observed(request, observation)
+        GatewayObservedHistoricalWindowCapture::from_observed(
+            request,
+            issued_request_bytes,
+            observation,
+        )
     }
 }
 
@@ -127,7 +152,9 @@ impl ExternalHistoricalBarsGateway {
 #[derive(Debug)]
 pub(crate) struct GatewayObservedHistoricalWindowCapture {
     request: HistoricalWindowRequest,
+    issued_request_bytes: Vec<u8>,
     observation: ExternalHistoricalObservation,
+    request_binding_error: Option<GrpcError>,
     capture_hash: String,
 }
 
@@ -144,17 +171,42 @@ impl GatewayObservedHistoricalWindowCapture {
         &self.capture_hash
     }
 
+    /// A rejected binding still retains the original wire and typed result;
+    /// subsequent record admission or persistence must reject this capture.
+    pub(crate) fn request_binding_error(&self) -> Option<&GrpcError> {
+        self.request_binding_error.as_ref()
+    }
+
     fn from_observed(
         request: HistoricalWindowRequest,
+        issued_request_bytes: Vec<u8>,
         observation: ExternalHistoricalObservation,
     ) -> Result<Self, GrpcError> {
-        let capture_hash = observed_capture_hash(&request, &observation)?;
+        let request_binding_error = request_binding_error(&issued_request_bytes, &observation);
+        let capture_hash = observed_capture_hash(&request, &issued_request_bytes, &observation)?;
         Ok(Self {
             request,
+            issued_request_bytes,
             observation,
+            request_binding_error,
             capture_hash,
         })
     }
+}
+
+fn request_binding_error(
+    issued_request_bytes: &[u8],
+    observation: &ExternalHistoricalObservation,
+) -> Option<GrpcError> {
+    let valid = issued_request_bytes == observation.request_bytes.as_slice()
+        && crate::grpc_client::external_pb::magic::market::v1::QueryRequest::decode(
+            issued_request_bytes,
+        )
+        .ok()
+        .and_then(|request| request.context)
+        .and_then(|context| crate::grpc_client::errors::request_id_correlation(&context.request_id))
+        .is_some_and(|correlation| correlation == observation.request_id_correlation);
+    (!valid).then(|| request_error("external_historical_request_wire_conflict", false))
 }
 
 fn request_error(code: &str, retryable: bool) -> GrpcError {
@@ -178,6 +230,7 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 
 fn observed_capture_hash(
     request: &HistoricalWindowRequest,
+    issued_request_bytes: &[u8],
     observation: &ExternalHistoricalObservation,
 ) -> Result<String, GrpcError> {
     let serialize = |value: &serde_json::Value| {
@@ -204,7 +257,14 @@ fn observed_capture_hash(
             "code":status.code,
             "message":status.raw_status.message(),
             "details":status.details,
-            "error_detail_trailer":status.error_detail_trailer
+            "error_detail_trailer":status.error_detail_trailer,
+            "error_detail_trailer_encoded":match status.raw_status.metadata().get_bin("magic-error-detail-bin") {
+                None => serde_json::json!({"presence":"Absent"}),
+                Some(header) => serde_json::json!({
+                    "presence":"Present",
+                    "encoded_bytes":header.as_encoded_bytes()
+                })
+            }
         }))?,
     };
     let mut hasher = Sha256::new();
@@ -219,10 +279,17 @@ fn observed_capture_hash(
         &observation.capabilities_response.encode_to_vec(),
         &observation.capability.encode_to_vec(),
         observation.request_id_correlation.as_bytes(),
+        issued_request_bytes,
         &observation.request_bytes,
         &wire_material,
         &status_material,
         &serialize(&observed_result_material(&observation.result))?,
+        &serialize(
+            &match request_binding_error(issued_request_bytes, observation) {
+                None => serde_json::json!({"request_binding":"Matched"}),
+                Some(error) => observed_result_material(&Err(error)),
+            },
+        )?,
     ] {
         hash_bytes(&mut hasher, bytes);
     }

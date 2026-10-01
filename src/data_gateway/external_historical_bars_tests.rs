@@ -98,6 +98,20 @@ fn wg06_exact_window_rejects_future_unclosed_empty_invalid_and_unavailable_calen
         invoked_at("2026-09-15T15:00:00+08:00"),
     );
     assert!(at_close.is_ok());
+    // Construction using an explicit later timestamp does not authorize a read
+    // at an earlier actual time. The Gateway repeats this same check pre-RPC.
+    let prepared_later = test_window();
+    assert_eq!(
+        require_completed_window(
+            &prepared_later.calendar,
+            invoked_at("2026-09-15T14:59:59+08:00")
+        )
+        .unwrap_err()
+        .details()
+        .reason_code
+        .as_deref(),
+        Some("external_historical_window_incomplete")
+    );
     // An already completed Friday remains requestable on a Saturday morning.
     assert!(HistoricalWindowRequest::new(
         instrument(),
@@ -145,6 +159,7 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         .await
         .expect("TEST_CODE sealed observation");
     assert_eq!(capture.capture_hash().len(), 64);
+    assert!(capture.request_binding_error().is_none());
     assert_eq!(
         capture.request().required_trading_dates(),
         [date(11), date(14), date(15)]
@@ -168,11 +183,13 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
 
     let GatewayObservedHistoricalWindowCapture {
         request,
+        issued_request_bytes,
         mut observation,
         capture_hash,
+        ..
     } = capture;
     assert_eq!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     let different_window = HistoricalWindowRequest::new(
@@ -183,31 +200,31 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
     )
     .unwrap();
     assert_ne!(
-        observed_capture_hash(&different_window, &observation).unwrap(),
+        observed_capture_hash(&different_window, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     let mut different_instrument = request.clone();
     different_instrument.instrument =
         InstrumentId::new(Exchange::Shenzhen, "300005", AssetClass::Equity).unwrap();
     assert_ne!(
-        observed_capture_hash(&different_instrument, &observation).unwrap(),
+        observed_capture_hash(&different_instrument, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.request_bytes.push(0);
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.request_bytes.pop();
     observation.health_wire.push(0);
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.health_wire.pop();
     observation.capabilities_wire.push(0);
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.capabilities_wire.pop();
@@ -217,7 +234,7 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         .epoch
         .push_str("TEST_CODE_CHANGED");
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.connection_identity.epoch = original_epoch;
@@ -230,7 +247,7 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         panic!("TEST_CODE query raw body expected");
     }
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     if let ExternalWireMaterialV1::Payload {
@@ -240,7 +257,7 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         protobuf_payload.pop();
     }
     assert_eq!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation
@@ -250,7 +267,7 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         .selected_provider
         .push_str("TEST_CODE_CHANGED");
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     drop(gateway);
@@ -258,6 +275,39 @@ async fn wg06_exact_window_gateway_keeps_opaque_observation_and_sealed_capture_i
         .finish()
         .await
         .expect("TEST_CODE Gateway fixture cleanup");
+}
+
+#[tokio::test]
+async fn wg06_exact_window_gateway_rechecks_current_completion_before_control_or_data_rpc() {
+    let fixture = ExternalQueryWireFixture::bind_historical(
+        HistoricalQueryReply::Success,
+        HistoricalCapabilityBehavior::Ready,
+    )
+    .await
+    .expect("TEST_CODE current-clock completion fixture");
+    let mut gateway = ExternalHistoricalBarsGateway::connect_client_bundle(fixture.bundle_path())
+        .await
+        .expect("TEST_CODE completion connection");
+    let request = test_window();
+    let original_invoked_at = request.invoked_at;
+    let error = gateway
+        .observe_once_at(request, invoked_at("2026-09-15T14:59:59+08:00"))
+        .await
+        .expect_err("TEST_CODE actual unfinished clock rejected");
+    assert_eq!(
+        error.details().reason_code.as_deref(),
+        Some("external_historical_window_incomplete")
+    );
+    assert_eq!(original_invoked_at, invoked_at("2026-09-16T15:31:00+08:00"));
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.health_calls, 0);
+    assert_eq!(snapshot.capabilities_calls, 0);
+    assert_eq!(snapshot.calls, 0);
+    drop(gateway);
+    fixture
+        .finish()
+        .await
+        .expect("TEST_CODE completion cleanup");
 }
 
 #[tokio::test]
@@ -280,12 +330,14 @@ async fn wg06_exact_window_gateway_seals_failed_status_and_trailer_bytes() {
     assert!(capture.observation().result.is_err());
     let GatewayObservedHistoricalWindowCapture {
         request,
+        issued_request_bytes,
         mut observation,
         capture_hash,
+        ..
     } = capture;
     observation.status.as_mut().unwrap().details.push(0);
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     observation.status.as_mut().unwrap().details.pop();
@@ -297,7 +349,7 @@ async fn wg06_exact_window_gateway_seals_failed_status_and_trailer_bytes() {
         panic!("TEST_CODE retained error-detail trailer expected");
     }
     assert_ne!(
-        observed_capture_hash(&request, &observation).unwrap(),
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
         capture_hash
     );
     drop(gateway);
@@ -305,4 +357,151 @@ async fn wg06_exact_window_gateway_seals_failed_status_and_trailer_bytes() {
         .finish()
         .await
         .expect("TEST_CODE failed capture cleanup");
+}
+
+#[tokio::test]
+async fn wg06_exact_window_capture_binding_conflict_retains_original_typed_failure_and_raw_wire() {
+    let fixture = ExternalQueryWireFixture::bind_historical(
+        HistoricalQueryReply::StatusWithTrailer,
+        HistoricalCapabilityBehavior::Ready,
+    )
+    .await
+    .expect("TEST_CODE binding conflict fixture");
+    let mut reader = ExternalHistoricalReadClient::connect_client_bundle(fixture.bundle_path())
+        .await
+        .expect("TEST_CODE binding conflict connection");
+    let request = test_window();
+    let query = request.query().unwrap();
+    let mut issued_request_bytes = query.wire_bytes();
+    fixture.release_capabilities();
+    fixture.release();
+    let observation = reader
+        .query_once(query)
+        .await
+        .expect("TEST_CODE raw failed observation");
+    let actual_request_bytes = observation.request_bytes.clone();
+    let raw_status_details = observation.status.as_ref().unwrap().details.clone();
+    issued_request_bytes.push(0);
+    let capture = GatewayObservedHistoricalWindowCapture::from_observed(
+        request,
+        issued_request_bytes,
+        observation,
+    )
+    .expect("TEST_CODE mismatched binding remains observable");
+    assert_eq!(
+        capture
+            .request_binding_error()
+            .unwrap()
+            .details()
+            .reason_code
+            .as_deref(),
+        Some("external_historical_request_wire_conflict")
+    );
+    assert_eq!(capture.observation().request_bytes, actual_request_bytes);
+    assert_eq!(
+        capture.observation().status.as_ref().unwrap().details,
+        raw_status_details
+    );
+    assert!(matches!(
+        capture.observation().result,
+        Err(GrpcError::Unavailable { .. })
+    ));
+    assert_eq!(fixture.snapshot().calls, 1);
+    drop(reader);
+    fixture
+        .finish()
+        .await
+        .expect("TEST_CODE binding conflict cleanup");
+}
+
+#[tokio::test]
+async fn wg06_exact_window_capture_distinguishes_different_malformed_encoded_trailers() {
+    use crate::grpc_client::client::external_historical_read::ExternalHistoricalTrailerMaterial;
+    let first_encoded = "TEST_CODE_MALFORMED_TRAILER_ONE";
+    let second_encoded = "TEST_CODE_MALFORMED_TRAILER_TWO";
+    let fixture = ExternalQueryWireFixture::bind_historical(
+        HistoricalQueryReply::StatusMalformedTrailer(first_encoded),
+        HistoricalCapabilityBehavior::Ready,
+    )
+    .await
+    .expect("TEST_CODE malformed trailer fixture");
+    let mut gateway = ExternalHistoricalBarsGateway::connect_client_bundle(fixture.bundle_path())
+        .await
+        .expect("TEST_CODE malformed trailer connection");
+    fixture.release_capabilities();
+    fixture.release();
+    let capture = gateway
+        .observe_once(test_window())
+        .await
+        .expect("TEST_CODE malformed observation retained");
+    assert!(capture.observation().result.is_err());
+    assert_eq!(
+        capture
+            .observation()
+            .status
+            .as_ref()
+            .unwrap()
+            .error_detail_trailer,
+        ExternalHistoricalTrailerMaterial::Malformed
+    );
+    assert_eq!(
+        capture
+            .observation()
+            .status
+            .as_ref()
+            .unwrap()
+            .raw_status
+            .metadata()
+            .get_bin("magic-error-detail-bin")
+            .unwrap()
+            .as_encoded_bytes(),
+        first_encoded.as_bytes()
+    );
+    let GatewayObservedHistoricalWindowCapture {
+        request,
+        issued_request_bytes,
+        mut observation,
+        capture_hash,
+        ..
+    } = capture;
+    let original_typed_error = observation.result.as_ref().unwrap_err().clone();
+    let mut headers = tonic::codegen::http::HeaderMap::new();
+    headers.insert(
+        "magic-error-detail-bin",
+        tonic::codegen::http::HeaderValue::from_static(second_encoded),
+    );
+    *observation
+        .status
+        .as_mut()
+        .unwrap()
+        .raw_status
+        .metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+    assert!(observation
+        .status
+        .as_ref()
+        .unwrap()
+        .raw_status
+        .metadata()
+        .get_bin("magic-error-detail-bin")
+        .unwrap()
+        .to_bytes()
+        .is_err());
+    assert_eq!(
+        observation.status.as_ref().unwrap().error_detail_trailer,
+        ExternalHistoricalTrailerMaterial::Malformed
+    );
+    assert_eq!(
+        observation.result.as_ref().unwrap_err(),
+        &original_typed_error
+    );
+    assert_ne!(
+        observed_capture_hash(&request, &issued_request_bytes, &observation).unwrap(),
+        capture_hash
+    );
+    assert_eq!(fixture.snapshot().calls, 1);
+    drop(gateway);
+    fixture
+        .finish()
+        .await
+        .expect("TEST_CODE malformed trailer cleanup");
 }

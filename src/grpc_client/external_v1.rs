@@ -28,6 +28,10 @@ pub enum ExternalContractError {
 pub(crate) struct ExternalHistoricalBarsQuery(QueryRequest);
 
 impl ExternalHistoricalBarsQuery {
+    pub(crate) fn wire_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.0)
+    }
+
     pub(crate) fn into_request(self) -> QueryRequest {
         self.0
     }
