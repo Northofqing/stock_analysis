@@ -150,6 +150,7 @@ mod dryrun_report; // v26: dry-run 自动报告
 
 mod v13_diag; // v13.27: 端到端诊断
 
+mod attribution_daily_intent;
 mod attribution_epoch_runtime;
 mod blocking_market_data;
 #[cfg(test)]
@@ -222,9 +223,24 @@ fn classify_attribution_daily_preflight(
     }
 }
 
+fn attribution_daily_may_retry_frozen(
+    outcome: &crate::notify::PushOutcome,
+    postflight: &AttributionDailyPreflight,
+) -> bool {
+    matches!(postflight, AttributionDailyPreflight::Prepare)
+        && matches!(
+            outcome,
+            crate::notify::PushOutcome::Denied(_) | crate::notify::PushOutcome::SinkError(_)
+        )
+}
+
 #[cfg(test)]
 mod attribution_daily_preflight_tests {
-    use super::{classify_attribution_daily_preflight, AttributionDailyPreflight};
+    use super::{
+        attribution_daily_may_retry_frozen, classify_attribution_daily_preflight,
+        AttributionDailyPreflight,
+    };
+    use crate::notify::PushOutcome;
     use stock_analysis::durable_delivery::DecisionState;
 
     fn claim(
@@ -281,6 +297,42 @@ mod attribution_daily_preflight_tests {
             classify_attribution_daily_preflight(Err("TEST_CODE storage unavailable".to_owned())),
             AttributionDailyPreflight::Unavailable("TEST_CODE storage unavailable".to_owned())
         );
+    }
+
+    #[test]
+    fn retry_requires_failed_dispatch_and_proven_absence_of_a_claim() {
+        for outcome in [
+            PushOutcome::Denied("TEST_CODE_preclaim_gate".to_owned()),
+            PushOutcome::SinkError("TEST_CODE_prepare_error".to_owned()),
+        ] {
+            assert!(attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Prepare,
+            ));
+            for state in [
+                DecisionState::Reserved,
+                DecisionState::AttemptInFlight,
+                DecisionState::UncertainManualReview,
+                DecisionState::RejectedDurable,
+                DecisionState::Delivered,
+            ] {
+                let receipt = (state == DecisionState::Delivered)
+                    .then_some("TEST_CODE_authoritative_receipt_hash");
+                let postflight =
+                    classify_attribution_daily_preflight(Ok(Some(claim(state, receipt))));
+                assert!(!attribution_daily_may_retry_frozen(&outcome, &postflight));
+            }
+            assert!(!attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Unavailable("TEST_CODE_read_error".to_owned()),
+            ));
+        }
+        for outcome in [PushOutcome::Pushed, PushOutcome::Deduped] {
+            assert!(!attribution_daily_may_retry_frozen(
+                &outcome,
+                &AttributionDailyPreflight::Prepare,
+            ));
+        }
     }
 }
 
@@ -10050,8 +10102,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // 重试窗口 15:05-15:20: 失败后每个 tick 重试直到成功 (2026-08-22 实测
             // 15:05 失败后 minute==5 条件永不再真 → 当天归因永久缺失的 bug)。
             // 计算前只读检查当日 durable claim，避免重启后重算已投递或状态不明的报告。
-            // 首次无 claim 时，现有 LAST_RUN 仍在计算成功后封日；无 claim 的通知
-            // 准备失败需要先冻结精确摘要和报告 revision，才能安全开放自动重试。
+            // 首次无 claim 时，先冻结不可逆 DB 准备边界，再冻结精确摘要和报告 revision。
+            // 仅冻结成功且再次确认无 claim 时，才可重试通知准备失败。
             if now.hour() == 15 && (5..=20).contains(&now.minute()) {
                 use stock_analysis::performance::attribution::{
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
@@ -10102,7 +10154,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
                 };
                 if should_prepare {
-                    match (|| -> Result<String, AttributionEpochRuntimeError> {
+                    use crate::attribution_daily_intent::{
+                        AttributionDailyIntentStore, FreezeError, PreparedAttributionDaily,
+                    };
+                    let store = AttributionDailyIntentStore::new(std::path::Path::new(
+                        "data/attribution",
+                    ));
+                    type AttributionPreparation = Result<
+                        PreparedAttributionDaily,
+                        FreezeError<AttributionEpochRuntimeError>,
+                    >;
+                    match store.load_or_freeze(today, |store| -> AttributionPreparation {
                         let database = stock_analysis::database::DatabaseManager::get();
                         if std::env::var_os(
                             stock_analysis::trading::paper_ledger_runtime::BINDING_ENV,
@@ -10117,64 +10179,110 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 };
                             let binding =
                                 stock_analysis::trading::paper_ledger_runtime::active_binding()
-                                    .map_err(map_effective)?;
-                            let (prepared,_receipt)=stock_analysis::performance::attribution_replay::commit_effective_window(database,binding,today,30,chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap())).map_err(|error| {
+                                    .map_err(map_effective)
+                                    .map_err(FreezeError::Prepare)?;
+                            store
+                                .reserve_before_commit(today)
+                                .map_err(FreezeError::Storage)?;
+                            let invoked_at = chrono::Utc::now().with_timezone(
+                                &chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
+                            );
+                            let (prepared, _receipt) = stock_analysis::performance::attribution_replay::commit_effective_window(
+                                database,
+                                binding,
+                                today,
+                                30,
+                                invoked_at,
+                            )
+                            .map_err(|error| {
                                 use stock_analysis::performance::attribution_replay::ReplayErrorClass;
                                 match error.class() {
-                                    ReplayErrorClass::FailedIntegrity=>AttributionEpochRuntimeError::FailedIntegrity{reason_code:error.code(),detail:error.to_string()},
-                                    ReplayErrorClass::Unavailable|ReplayErrorClass::Storage=>AttributionEpochRuntimeError::Unavailable{reason_code:error.code(),retryable:error.retryable(),detail:error.to_string()},
+                                    ReplayErrorClass::FailedIntegrity => {
+                                        AttributionEpochRuntimeError::FailedIntegrity {
+                                            reason_code: error.code(),
+                                            detail: error.to_string(),
+                                        }
+                                    }
+                                    ReplayErrorClass::Unavailable | ReplayErrorClass::Storage => {
+                                        AttributionEpochRuntimeError::Unavailable {
+                                            reason_code: error.code(),
+                                            retryable: error.retryable(),
+                                            detail: error.to_string(),
+                                        }
+                                    }
                                 }
-                            })?;
-                            let md = prepared.report().render_markdown().map_err(map_effective)?;
+                            })
+                            .map_err(FreezeError::Prepare)?;
+                            let md = prepared
+                                .report()
+                                .render_markdown()
+                                .map_err(map_effective)
+                                .map_err(FreezeError::Prepare)?;
+                            let report_revision_path =
+                                stock_analysis::performance::report::persist_report_revision(
+                                    std::path::Path::new("data/attribution"),
+                                    today,
+                                    md.as_bytes(),
+                                )
+                            .map_err(map_effective)
+                            .map_err(FreezeError::Prepare)?;
+                            return Ok(PreparedAttributionDaily {
+                                summary: prepared.report().render_summary(),
+                                report_revision_path,
+                            });
+                        }
+                        // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
+                        // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
+                        // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
+                        // bar 缺失返回 Err → 在尚无不可逆写入时允许窗口内重试。
+                        let prices = market_data::fetch_attribution_close_prices(today)
+                            .map_err(|detail| AttributionEpochRuntimeError::Unavailable {
+                                reason_code: "attribution_market_prices_unavailable",
+                                retryable: true,
+                                detail,
+                            })
+                            .map_err(FreezeError::Prepare)?;
+                        let daily = compute_epoch_daily(database, today, &prices)
+                            .map_err(FreezeError::Prepare)?;
+                        let window = compute_epoch_window(database, today, 30, &prices)
+                            .map_err(FreezeError::Prepare)?;
+                        store
+                            .reserve_before_commit(today)
+                            .map_err(FreezeError::Storage)?;
+                        persist_epoch_daily(database, &daily).map_err(FreezeError::Prepare)?;
+                        let md = render_full_markdown(daily.daily(), window.window());
+                        let report_revision_path =
                             stock_analysis::performance::report::persist_report_revision(
                                 std::path::Path::new("data/attribution"),
                                 today,
                                 md.as_bytes(),
                             )
-                            .map_err(map_effective)?;
-                            return Ok(prepared.report().render_summary());
-                        }
-                        // 收盘后 RealtimeQuotes 五秒新鲜度门必挂 (BR-217/218,
-                        // 9/1+9/2 归因两次实锤) → 改用 HistoricalDailyBars 收盘价
-                        // (tdx-smart, 与 attribution_backfill 工具同源, 无新鲜度门);
-                        // bar 缺失返回 Err → Unavailable retryable, 15:05-15:20
-                        // 窗口内每 tick 重试 (成功才记 ATTRIBUTION_LAST_RUN)。
-                        let prices = market_data::fetch_attribution_close_prices(today).map_err(
-                            |detail| AttributionEpochRuntimeError::Unavailable {
-                                reason_code: "attribution_market_prices_unavailable",
-                                retryable: true,
-                                detail,
-                            },
-                        )?;
-                        let daily = compute_epoch_daily(database, today, &prices)?;
-                        let window = compute_epoch_window(database, today, 30, &prices)?;
-                        persist_epoch_daily(database, &daily)?;
-                        let md = render_full_markdown(daily.daily(), window.window());
-                        stock_analysis::performance::report::persist_report_revision(
-                            std::path::Path::new("data/attribution"),
-                            today,
-                            md.as_bytes(),
-                        )
                         .map_err(|error| {
                             AttributionEpochRuntimeError::Unavailable {
                                 reason_code: "attribution_report_storage_unavailable",
                                 retryable: true,
                                 detail: format!("write attribution md: {error}"),
                             }
-                        })?;
-                        Ok(render_summary(daily.daily(), window.window()))
-                    })() {
-                        Ok(text) => {
-                            // 2026-09-20: A-12 升级 counted 持久投递 (MU-attribution-daily 接线)。
-                            // 业务计算 (compute_epoch_daily/persist/md 落盘) 与 LAST_RUN 语义
-                            // 均不变; 仅投递层增加 durable 决策 owner — sink 失败落盘
-                            // RejectedDurable(retry)/Uncertain, 下次启动对账重发
-                            // Reserved/Rejected-retry (可跨日补发原 15:05 文本);
-                            // Uncertain 需人工裁定; binding/token 准备失败无 durable 行
-                            // 与原路径等价。原路径推送失败即永久丢, 新路径可补偿。
+                        })
+                        .map_err(FreezeError::Prepare)?;
+                        Ok(PreparedAttributionDaily {
+                            summary: render_summary(daily.daily(), window.window()),
+                            report_revision_path,
+                        })
+                    }) {
+                        Ok(frozen) => {
+                            let text = frozen.summary();
+                            log::info!(
+                                "[attribution] 使用冻结报告准备: revision={} summary_bytes={}",
+                                frozen.report_revision_file(),
+                                text.len(),
+                            );
+                            // 继续使用原 counted 物理投递 owner。sink 失败由 durable
+                            // claim 对账；Unknown 留待人工裁定。无 claim 的前置失败仅
+                            // 复用本次冻结的摘要，绝不重新计算行情或改写报告 revision。
                             let outcome =
                                 match push_templates::build_attribution_daily_counted_binding(
-                                    today, &text,
+                                    today, text,
                                 )
                                 .and_then(|binding| {
                                     crate::presentation_registry::acquire_token(
@@ -10187,7 +10295,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 }) {
                                     Ok((token, binding)) => {
                                         crate::notify::push_counted_with_binding(
-                                            token, &text, None, binding,
+                                            token, text, None, binding,
                                         )
                                         .await
                                     }
@@ -10197,26 +10305,79 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                 };
                             log::info!("[attribution] 15:05 归因推送完成: {:?}", outcome);
-                            *ATTRIBUTION_LAST_RUN
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(today);
+                            let occurrence_identity = format!("attribution-daily:{today}");
+                            let postflight = classify_attribution_daily_preflight(
+                                crate::durable_delivery_runtime::inspect_business_date_once_claim(
+                                    today,
+                                    stock_analysis::durable_delivery::PushKind::AttributionDaily,
+                                    stock_analysis::durable_delivery::DeliverySubKind::None,
+                                    "GLOBAL",
+                                    &occurrence_identity,
+                                )
+                                .await,
+                            );
+                            let may_retry =
+                                attribution_daily_may_retry_frozen(&outcome, &postflight);
+                            match postflight {
+                                AttributionDailyPreflight::Prepare if may_retry => {
+                                    // prepare() persists the exact claim before any sink call.
+                                    // No claim after this failure proves there was no physical
+                                    // attempt; the next tick may only reuse frozen summary bytes.
+                                    log::warn!(
+                                        "[attribution] 无 durable claim/物理尝试，保留冻结摘要供下个 tick 重试"
+                                    );
+                                }
+                                AttributionDailyPreflight::Prepare => {
+                                    log::error!(
+                                        "[attribution] 推送结果与缺失 durable claim 不一致，封日待核对"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                                AttributionDailyPreflight::ExistingClaim {
+                                    decision_identity,
+                                    state,
+                                } => {
+                                    log::info!(
+                                        "[attribution] durable claim 已接管后续处理: decision={decision_identity} state={state:?}"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                                AttributionDailyPreflight::Unavailable(error) => {
+                                    log::error!(
+                                        "[attribution] 推送后 claim 检查失败，封日待核对: {error}"
+                                    );
+                                    *ATTRIBUTION_LAST_RUN
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                                }
+                            }
                         }
-                        Err(AttributionEpochRuntimeError::Unavailable {
+                        Err(FreezeError::Prepare(AttributionEpochRuntimeError::Unavailable {
                             reason_code,
                             retryable,
                             detail,
-                        }) => {
+                        })) => {
                             log::warn!(
-                                "[attribution] 15:05 归因 unavailable code={reason_code} retryable={retryable} (允许 30s 后重试): {detail}"
+                                "[attribution] 15:05 归因 unavailable code={reason_code} retryable={retryable} (仅未进入持久准备边界可重试): {detail}"
                             );
                         }
-                        Err(AttributionEpochRuntimeError::FailedIntegrity {
+                        Err(FreezeError::Prepare(AttributionEpochRuntimeError::FailedIntegrity {
                             reason_code,
                             detail,
-                        }) => {
+                        })) => {
                             log::error!(
-                                "[attribution] 15:05 归因 failed_integrity code={reason_code} (允许 30s 后重试): {detail}"
+                                "[attribution] 15:05 归因 failed_integrity code={reason_code} (后续由持久准备标记决定是否可重试): {detail}"
                             );
+                        }
+                        Err(FreezeError::Storage(error)) => {
+                            log::error!("[attribution] 冻结报告准备失败，封日待核对: {error}");
+                            *ATTRIBUTION_LAST_RUN
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(today);
                         }
                     }
                 }
