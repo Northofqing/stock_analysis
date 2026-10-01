@@ -69,6 +69,13 @@ async fn model_commit_failures_remain_missing_sections_instead_of_fake_analysis(
         concepts,
         search_enabled: false,
         queries: vec![],
+        position_rows: vec![preparation::PositionInput::new(
+            "TEST_CODE_协议持仓".into(),
+            "TEST_CODE_持仓敏感正文".into(),
+            Some(1.5),
+        )],
+        position_reads: 0,
+        observe_positions: false,
     };
 
     let prepared = preparation::prepare_chain_analysis_with_io(

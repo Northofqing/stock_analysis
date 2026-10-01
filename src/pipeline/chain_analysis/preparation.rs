@@ -1,8 +1,9 @@
 //! Fixed in-memory preparation of the actual chain report. This is not a durable checkpoint.
 
 use anyhow::Result;
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -328,6 +329,24 @@ pub struct SourceObservation {
 }
 
 impl SourceObservation {
+    /// This is a content-addressed local projection, not a broker snapshot or
+    /// an upstream batch. `source_at` stays absent because the open-row query
+    /// supplies no single authoritative source timestamp.
+    pub(super) fn local_positions(positions: &[PositionInput], observed_at: DateTime<Utc>) -> Self {
+        Self {
+            status: if positions.is_empty() {
+                SourceStatus::VerifiedEmpty
+            } else {
+                SourceStatus::Available
+            },
+            batch_id: Some(format!("sha256:{}", position_projection_sha256(positions))),
+            provider: Some(crate::market_domain::ProviderId::LocalAnalysis),
+            source: Some(LOCAL_POSITIONS_SOURCE.into()),
+            observed_at: Some(observed_at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+            ..Self::unknown()
+        }
+    }
+
     pub(crate) fn from_batch_for_request(
         status: SourceStatus,
         evidence: BatchEvidence,
@@ -436,6 +455,35 @@ impl PositionInput {
     pub fn return_rate(&self) -> Option<f64> {
         self.return_rate
     }
+}
+
+const LOCAL_POSITIONS_SOURCE: &str =
+    "local:stock_position/open/buy_date_desc/chain_consumed_projection/sha256-v1";
+
+/// The domain tag and length-delimited fields bind the ordered rows actually
+/// used by this report. Float bits preserve distinct finite values, including
+/// `-0.0`; no raw position field is written to diagnostic logs.
+fn position_projection_sha256(positions: &[PositionInput]) -> String {
+    fn text_field(hash: &mut Sha256, value: &str) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+
+    let mut hash = Sha256::new();
+    hash.update(b"chain-consumed-stock-position-projection-v1\0");
+    hash.update((positions.len() as u64).to_be_bytes());
+    for position in positions {
+        text_field(&mut hash, &position.code);
+        text_field(&mut hash, &position.name);
+        match position.return_rate {
+            Some(rate) => {
+                hash.update([1]);
+                hash.update(rate.to_bits().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 /// Owns the caller inputs and original report bytes; getters only lend immutable views.
@@ -950,6 +998,11 @@ pub trait ChainPreparationIo {
     async fn positions(&mut self) -> Result<Vec<PositionInput>> {
         panic!("position database I/O not supplied")
     }
+    /// The default preserves existing controlled adapters without inventing
+    /// source authority. Production observes its existing single query below.
+    async fn positions_observed(&mut self) -> Result<(Vec<PositionInput>, SourceObservation)> {
+        Ok((self.positions().await?, SourceObservation::unknown()))
+    }
     async fn lhb(&mut self) -> Result<(HashMap<String, f64>, SourceObservation)> {
         panic!("dragon-tiger I/O not supplied")
     }
@@ -1073,6 +1126,11 @@ impl ChainPreparationIo for ProductionIo {
             .into_iter()
             .map(|p| PositionInput::new(p.code, p.name, p.return_rate))
             .collect())
+    }
+    async fn positions_observed(&mut self) -> Result<(Vec<PositionInput>, SourceObservation)> {
+        let positions = self.positions().await?;
+        let source = SourceObservation::local_positions(&positions, Utc::now());
+        Ok((positions, source))
     }
     async fn lhb(&mut self) -> Result<(HashMap<String, f64>, SourceObservation)> {
         super::fetchers::fetch_lhb_observed()
@@ -1252,13 +1310,13 @@ pub async fn prepare_chain_analysis_with_io(
     prepared.data.board_directory = candidates.board_directory;
     prepared.data.board_source = candidates.board_source;
     prepared.data.candidate_board_codes = candidates.selected_boards;
-    let positions = observe_stage(
-        io.positions().await,
+    let (positions, positions_source) = observe_stage(
+        io.positions_observed().await,
         PreparationStage::Positions,
         &mut prepared,
     )?;
     prepared.data.positions = positions.clone();
-    prepared.data.positions_source = SourceObservation::unknown();
+    prepared.data.positions_source = positions_source;
     let position_concepts = if positions.is_empty() {
         HashMap::new()
     } else {

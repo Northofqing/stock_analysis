@@ -13,6 +13,9 @@ pub(super) struct ProtocolIo {
     pub(super) concepts: HashMap<String, Vec<String>>,
     pub(super) search_enabled: bool,
     pub(super) queries: Vec<String>,
+    pub(super) position_rows: Vec<PositionInput>,
+    pub(super) position_reads: usize,
+    pub(super) observe_positions: bool,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -51,11 +54,23 @@ impl ChainPreparationIo for ProtocolIo {
         anyhow::bail!("TEST_CODE_协议目录缺失")
     }
     async fn positions(&mut self) -> anyhow::Result<Vec<PositionInput>> {
-        Ok(vec![PositionInput::new(
-            "TEST_CODE_协议持仓".into(),
-            "TEST_CODE_持仓敏感正文".into(),
-            Some(1.5),
-        )])
+        self.position_reads += 1;
+        Ok(self.position_rows.clone())
+    }
+    async fn positions_observed(
+        &mut self,
+    ) -> anyhow::Result<(Vec<PositionInput>, SourceObservation)> {
+        let positions = self.positions().await?;
+        let source = if self.observe_positions {
+            SourceObservation::local_positions(
+                &positions,
+                chrono::DateTime::parse_from_rfc3339("2026-07-22T00:30:00Z")?
+                    .with_timezone(&chrono::Utc),
+            )
+        } else {
+            SourceObservation::unknown()
+        };
+        Ok((positions, source))
     }
     async fn lhb(&mut self) -> anyhow::Result<(HashMap<String, f64>, SourceObservation)> {
         Ok((
@@ -121,6 +136,14 @@ impl ChainPreparationIo for ProtocolIo {
     }
 }
 
+fn protocol_position_rows() -> Vec<PositionInput> {
+    vec![PositionInput::new(
+        "TEST_CODE_协议持仓".into(),
+        "TEST_CODE_持仓敏感正文".into(),
+        Some(1.5),
+    )]
+}
+
 pub(super) fn protocol_inputs() -> (Vec<TopStock>, HashMap<String, Vec<String>>) {
     let mut stocks = Vec::new();
     let mut concepts = HashMap::new();
@@ -183,6 +206,9 @@ async fn model_preparation_records_real_prompts_search_and_original_responses() 
         concepts,
         search_enabled: true,
         queries: Vec::new(),
+        position_rows: protocol_position_rows(),
+        position_reads: 0,
+        observe_positions: false,
     };
     let prepared = prepare_chain_analysis_with_io(
         chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
@@ -270,6 +296,9 @@ async fn artifact_round_trip_preserves_owned_bytes_and_rejects_unsupported_or_lo
             concepts,
             search_enabled: true,
             queries: Vec::new(),
+            position_rows: protocol_position_rows(),
+            position_reads: 0,
+            observe_positions: false,
         }
     }
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
@@ -420,6 +449,146 @@ async fn artifact_round_trip_preserves_owned_bytes_and_rejects_unsupported_or_lo
 
 struct RejectExternalIo;
 
+#[test]
+fn local_position_source_revision_covers_ordered_consumed_projection() {
+    use crate::market_domain::ProviderId;
+
+    let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-22T00:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let first = vec![
+        PositionInput::new("TEST_CODE_A".into(), "TEST_CODE_名称甲".into(), Some(1.5)),
+        PositionInput::new("TEST_CODE_B".into(), "TEST_CODE_名称乙".into(), None),
+    ];
+    let source = SourceObservation::local_positions(&first, observed_at);
+    let same = SourceObservation::local_positions(&first, observed_at);
+    assert_eq!(source.status(), &SourceStatus::Available);
+    assert_eq!(source.provider(), Some(ProviderId::LocalAnalysis));
+    assert_eq!(
+        source.source(),
+        Some("local:stock_position/open/buy_date_desc/chain_consumed_projection/sha256-v1")
+    );
+    assert_eq!(source.observed_at(), Some("2026-07-22T00:30:00.000000Z"));
+    assert_eq!(source.source_at(), None);
+    let revision = source.batch_id().unwrap();
+    assert!(revision.starts_with("sha256:"));
+    assert_eq!(revision.len(), 71);
+    assert_eq!(same.batch_id(), Some(revision));
+
+    let variations = [
+        vec![
+            PositionInput::new("TEST_CODE_C".into(), "TEST_CODE_名称甲".into(), Some(1.5)),
+            first[1].clone(),
+        ],
+        vec![
+            PositionInput::new("TEST_CODE_A".into(), "TEST_CODE_名称改".into(), Some(1.5)),
+            first[1].clone(),
+        ],
+        vec![
+            PositionInput::new("TEST_CODE_A".into(), "TEST_CODE_名称甲".into(), Some(1.6)),
+            first[1].clone(),
+        ],
+        vec![
+            first[0].clone(),
+            PositionInput::new("TEST_CODE_B".into(), "TEST_CODE_名称乙".into(), Some(0.0)),
+        ],
+        vec![first[1].clone(), first[0].clone()],
+        first[..1].to_vec(),
+    ];
+    for changed in variations {
+        assert_ne!(
+            SourceObservation::local_positions(&changed, observed_at).batch_id(),
+            Some(revision)
+        );
+    }
+    let encoded = serde_json::to_string(&source).unwrap();
+    assert!(!encoded.contains("TEST_CODE_A"));
+    assert!(!encoded.contains("名称甲"));
+}
+
+#[tokio::test]
+async fn position_preparation_retains_one_local_query_observation_and_verified_empty() {
+    use super::preparation::PreparedChainAnalysis;
+
+    fn io(
+        concepts: HashMap<String, Vec<String>>,
+        rows: Vec<PositionInput>,
+        observed: bool,
+    ) -> ProtocolIo {
+        ProtocolIo {
+            analyzer: None,
+            scripted: None,
+            concepts,
+            search_enabled: false,
+            queries: Vec::new(),
+            position_rows: rows,
+            position_reads: 0,
+            observe_positions: observed,
+        }
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+    let (stocks, concepts) = protocol_inputs();
+    let rows = protocol_position_rows();
+    let mut observed_io = io(concepts.clone(), rows.clone(), true);
+    let prepared = prepare_chain_analysis_with_io(
+        date,
+        stocks.clone(),
+        Some("TEST_CODE_宏观".into()),
+        &mut observed_io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(observed_io.position_reads, 1);
+    assert_eq!(
+        prepared.positions_source().status(),
+        &SourceStatus::Available
+    );
+    assert_eq!(prepared.positions().len(), 1);
+    assert_eq!(prepared.positions()[0].code(), rows[0].code());
+    assert!(prepared.report().contains(rows[0].name()));
+    let restored =
+        PreparedChainAnalysis::from_artifact_bytes(&prepared.to_artifact_bytes().unwrap()).unwrap();
+    assert_eq!(
+        restored.positions_source().batch_id(),
+        prepared.positions_source().batch_id()
+    );
+
+    let mut legacy_io = io(concepts.clone(), rows, false);
+    let legacy = prepare_chain_analysis_with_io(
+        date,
+        stocks.clone(),
+        Some("TEST_CODE_宏观".into()),
+        &mut legacy_io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(legacy_io.position_reads, 1);
+    assert_eq!(legacy.positions_source().status(), &SourceStatus::Unknown);
+    assert_eq!(legacy.report().as_bytes(), prepared.report().as_bytes());
+
+    let mut empty_io = io(concepts, Vec::new(), true);
+    let empty =
+        prepare_chain_analysis_with_io(date, stocks, Some("TEST_CODE_宏观".into()), &mut empty_io)
+            .await
+            .unwrap();
+    assert_eq!(empty_io.position_reads, 1);
+    assert!(empty.positions().is_empty());
+    assert_eq!(
+        empty.positions_source().status(),
+        &SourceStatus::VerifiedEmpty
+    );
+    assert!(empty
+        .positions_source()
+        .batch_id()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_ne!(
+        empty.positions_source().batch_id(),
+        prepared.positions_source().batch_id()
+    );
+}
+
 // Only external effects vary here; clustering, selection, prompts and rendering stay real.
 struct CoverageIo {
     protocol: ProtocolIo,
@@ -524,6 +693,9 @@ fn coverage_io(
             concepts,
             search_enabled: false,
             queries: vec![],
+            position_rows: protocol_position_rows(),
+            position_reads: 0,
+            observe_positions: false,
         },
         macro_result: Ok(String::new()),
         macro_calls: 0,
