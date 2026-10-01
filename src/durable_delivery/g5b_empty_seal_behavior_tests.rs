@@ -144,6 +144,90 @@ fn g5b_empty_seal_real_prospective_closed_zero_and_exact_replay_have_no_decision
 }
 
 #[test]
+fn g5b_empty_seal_init_does_not_adopt_an_existing_zero_head_and_exact_owned_replay_is_noop() {
+    let fixture = Fixture::new("EMPTY_EXISTING_ZERO_INIT");
+    let log = fixture.g5b_input_log(DATE);
+    log.initialize_date_input_head(date()).unwrap();
+    record(&fixture, head(&fixture));
+    let before = b_rows(&fixture);
+    let bytes = std::fs::read(head(&fixture)).unwrap();
+    let identity = FilesystemIdentity::capture(&head(&fixture)).unwrap();
+    let leaves = std::fs::read_dir(namespace(&fixture))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<BTreeSet<_>>();
+    let session = fixture.coordinator.g5b_day_session(date()).unwrap();
+    assert!(session
+        .initialize_empty_prospective_for_test(clock("15:00:00"))
+        .is_err());
+    assert_eq!(b_rows(&fixture), before);
+    assert_eq!(std::fs::read(head(&fixture)).unwrap(), bytes);
+    assert_eq!(
+        FilesystemIdentity::capture(&head(&fixture)).unwrap(),
+        identity
+    );
+    assert_eq!(
+        std::fs::read_dir(namespace(&fixture))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        leaves
+    );
+    assert_eq!(fixture.query_i64("SELECT COUNT(*) FROM g5b_day_heads"), 0);
+    drop(session);
+
+    let unknown = Fixture::new("EMPTY_EXISTING_SQL_ZERO_INIT");
+    unknown.g5b_input_log(DATE);
+    let connection = Connection::open(&unknown.database_path).unwrap();
+    super::super::schema::register_sha256_function(&connection).unwrap();
+    connection
+        .execute(
+            "INSERT INTO g5b_day_heads(business_date,revision,artifact_state) VALUES(?1,0,'Clean')",
+            [DATE],
+        )
+        .unwrap();
+    drop(connection);
+    let before = b_rows(&unknown);
+    let leaves = std::fs::read_dir(namespace(&unknown))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<BTreeSet<_>>();
+    let session = unknown.coordinator.g5b_day_session(date()).unwrap();
+    assert!(!head(&unknown).exists());
+    assert!(session
+        .initialize_empty_prospective_for_test(clock("15:00:00"))
+        .is_err());
+    assert!(!head(&unknown).exists());
+    assert_eq!(b_rows(&unknown), before);
+    assert_eq!(
+        std::fs::read_dir(namespace(&unknown))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        leaves
+    );
+    drop(session);
+
+    let owned = Fixture::new("EMPTY_OWNED_ZERO_REPLAY");
+    owned.g5b_input_log(DATE);
+    let session = owned.coordinator.g5b_day_session(date()).unwrap();
+    session
+        .initialize_empty_prospective_for_test(clock("15:00:00"))
+        .unwrap();
+    record(&owned, head(&owned));
+    let before = b_rows(&owned);
+    let identity = FilesystemIdentity::capture(&head(&owned)).unwrap();
+    session
+        .initialize_empty_prospective_for_test(clock("15:04:00"))
+        .unwrap();
+    assert_eq!(b_rows(&owned), before);
+    assert_eq!(
+        FilesystemIdentity::capture(&head(&owned)).unwrap(),
+        identity
+    );
+}
+
+#[test]
 fn g5b_empty_seal_clock_boundaries_do_not_backfill_or_close_an_open_window() {
     for local in ["15:05:00", "15:21:00"] {
         let fixture = Fixture::new("EMPTY_LATE_INIT");

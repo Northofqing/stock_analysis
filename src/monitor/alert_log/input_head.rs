@@ -734,10 +734,14 @@ fn publish_head(
                 Err(error) => return Err(error),
             },
         }
-        fs::rename(&candidate, &path)?;
+        if previous.is_none() {
+            publish_new_head_no_replace(guard, &candidate, &path)?;
+        } else {
+            fs::rename(&candidate, &path)?;
+        }
         guard.dir_file.sync_all()?;
         let current = read_head(&path, date).map_err(io_unknown)?;
-        if current.bytes != bytes {
+        if current.bytes != bytes || !same_identity(&created, &current.metadata) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "published input head differs",
@@ -746,9 +750,84 @@ fn publish_head(
         guard.ensure_current()
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&candidate);
+        if fs::symlink_metadata(&candidate).is_ok_and(|metadata| same_identity(&created, &metadata))
+        {
+            let _ = fs::remove_file(&candidate);
+        }
     }
     result
+}
+
+/// First publication cannot overwrite a head that appeared after the absence
+/// check. The descriptor and both fixed leaves belong to the held date fence.
+fn publish_new_head_no_replace(guard: &DateFence, candidate: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let old = std::ffi::CString::new(
+            candidate
+                .file_name()
+                .ok_or_else(|| io::Error::other("missing head candidate leaf"))?
+                .as_bytes(),
+        )
+        .map_err(io::Error::other)?;
+        let new = std::ffi::CString::new(
+            path.file_name()
+                .ok_or_else(|| io::Error::other("missing head leaf"))?
+                .as_bytes(),
+        )
+        .map_err(io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        unsafe extern "C" {
+            fn renameat2(
+                oldfd: i32,
+                old: *const std::ffi::c_char,
+                newfd: i32,
+                new: *const std::ffi::c_char,
+                flags: u32,
+            ) -> i32;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe extern "C" {
+            fn renameatx_np(
+                oldfd: i32,
+                old: *const std::ffi::c_char,
+                newfd: i32,
+                new: *const std::ffi::c_char,
+                flags: u32,
+            ) -> i32;
+        }
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            renameat2(
+                guard.dir_file.as_raw_fd(),
+                old.as_ptr(),
+                guard.dir_file.as_raw_fd(),
+                new.as_ptr(),
+                1,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            renameatx_np(
+                guard.dir_file.as_raw_fd(),
+                old.as_ptr(),
+                guard.dir_file.as_raw_fd(),
+                new.as_ptr(),
+                4,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic initial head publication unavailable",
+    ))
 }
 
 fn reject_prehead_source(dir: &Path, date: NaiveDate) -> io::Result<()> {
@@ -912,6 +991,32 @@ impl AlertLog {
             }
             Err(error) => Err(io_unknown(error)),
         }
+    }
+
+    /// A prospective owner must author a genuinely new head, never adopt a
+    /// zero head written earlier without its own persisted observation.
+    pub(crate) fn initialize_new_date_input_head_locked(
+        &self,
+        date: NaiveDate,
+        guard: &DateFence,
+    ) -> io::Result<AlertInputHeadV1> {
+        self.validate_borrowed_fence(date, guard)
+            .map_err(io_unknown)?;
+        match fs::symlink_metadata(head_path(&guard.dir, date)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "existing input head has no prospective receipt",
+                ))
+            }
+        }
+        reject_prehead_source(&guard.dir, date)?;
+        let head = AlertInputHeadV1::empty(date);
+        publish_head(guard, date, &head, None)?;
+        inspect_locked(guard, date, self.origin).map_err(io_unknown)?;
+        Ok(head)
     }
 
     /// Require committed-prefix provenance. A pre-head archive cannot be adopted.
@@ -1162,6 +1267,30 @@ mod tests {
             archive.inspect_date_input_head(date()),
             Err(AlertInputHeadUnknown::UnexpectedSource)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_head_publication_never_clobbers_an_existing_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = AlertLog::production_at(temp.path());
+        archive.initialize_date_input_head(date()).unwrap();
+        let path = head_path(temp.path(), date());
+        let bytes = fs::read(&path).unwrap();
+        let identity = file_identity(&fs::metadata(&path).unwrap()).unwrap();
+        let guard = DateFence::acquire(temp.path(), date(), true).unwrap();
+        let candidate = temp.path().join("TEST_CODE_head_candidate");
+        fs::write(&candidate, b"TEST_CODE_FOREIGN_CANDIDATE").unwrap();
+        assert!(publish_new_head_no_replace(&guard, &candidate, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            file_identity(&fs::metadata(&path).unwrap()).unwrap(),
+            identity
+        );
+        assert_eq!(
+            fs::read(&candidate).unwrap(),
+            b"TEST_CODE_FOREIGN_CANDIDATE"
+        );
     }
 
     #[cfg(unix)]

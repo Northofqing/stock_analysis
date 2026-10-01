@@ -832,7 +832,7 @@ impl G5bDaySession<'_> {
             ));
         }
         self.reject_empty_unknown_files(None)?;
-        self.transaction(|tx| {
+        let prospective = self.transaction(|tx| {
             require_no_decisions(tx, self.date)?;
             let count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM g5b_cohorts WHERE business_date=?1",
@@ -844,16 +844,33 @@ impl G5bDaySession<'_> {
                     "prospective initialization cannot adopt an existing cohort",
                 ));
             }
-            Ok(())
+            let value: Option<Option<Vec<u8>>> = tx
+                .query_row(
+                    "SELECT prospective_canonical FROM g5b_day_heads WHERE business_date=?1",
+                    [self.date.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value)
         })?;
         let fresh = if test_clock { now } else { Utc::now() };
         if !prospective_time(self.date, fresh) {
             return Err(mismatch("prospective window expired before initialization"));
         }
-        self.coordinator
-            .g5b_input_log
-            .initialize_date_input_head_locked(self.date, &self.fence)
-            .map_err(io_error)?;
+        match prospective {
+            None => {
+                self.coordinator
+                    .g5b_input_log
+                    .initialize_new_date_input_head_locked(self.date, &self.fence)
+                    .map_err(io_error)?;
+            }
+            Some(Some(_)) => {}
+            Some(None) => {
+                return Err(mismatch(
+                    "existing SQL day head has no prospective receipt; cannot be adopted",
+                ))
+            }
+        }
         self.observe_prospective_zero_head_at(if test_clock { now } else { Utc::now() }, test_clock)
     }
 
