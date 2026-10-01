@@ -168,9 +168,10 @@ fn schema12_migration_populated_v11_preserves_every_legacy_typed_value_and_catal
     );
     prepare_reserved(&fixture, &uncertain, &append);
     let uncertain_sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let uncertain_sinks: [AuthoritativeSink; 1] = [uncertain_sink];
     fixture
         .coordinator
-        .resume_deliverable(&uncertain.decision_identity, &vec![uncertain_sink], now())
+        .resume_deliverable(&uncertain.decision_identity, &uncertain_sinks, now())
         .unwrap();
     reconcile_terminal(
         &fixture,
@@ -241,12 +242,9 @@ fn schema12_migration_populated_v11_preserves_every_legacy_typed_value_and_catal
         DecisionState::UncertainManualReview
     );
     let forbidden = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(recovered_at)));
+    let forbidden_sinks: [AuthoritativeSink; 1] = [forbidden.clone()];
     let observed = reopened
-        .resume_deliverable(
-            &delivered.decision_identity,
-            &vec![forbidden.clone()],
-            recovered_at,
-        )
+        .resume_deliverable(&delivered.decision_identity, &forbidden_sinks, recovered_at)
         .unwrap();
     assert_eq!(observed.sink_calls, 0);
     assert_eq!(forbidden.calls.load(Ordering::SeqCst), 0);

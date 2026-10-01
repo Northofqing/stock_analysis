@@ -23,8 +23,8 @@ fn mismatch(message: &str) -> DurableDeliveryError {
 fn io_error(error: std::io::Error) -> DurableDeliveryError {
     DurableDeliveryError::IsolationViolation(format!("g5b artifact namespace: {error}"))
 }
-fn codec_error(error: impl std::fmt::Display) -> DurableDeliveryError {
-    mismatch(&format!("encoded evidence rejected: {error}"))
+fn codec_error(error: impl std::fmt::Debug) -> DurableDeliveryError {
+    mismatch(&format!("encoded evidence rejected: {error:?}"))
 }
 fn checked_integer(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| mismatch("unsigned evidence exceeds SQLite integer range"))
