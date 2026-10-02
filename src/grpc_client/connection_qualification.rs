@@ -77,6 +77,26 @@ impl ConnectionGeneration {
         Ok(())
     }
 
+    /// Explicit probe Health starts by discarding any previous qualification.
+    /// A status or transport error therefore cannot retain the old Health.
+    pub(super) fn begin_health_observation(&self) -> Result<(), GrpcError> {
+        let mut health = self.0.health.lock().map_err(|_| unqualified())?;
+        *health = None;
+        if self.0.revoked.load(Ordering::SeqCst) {
+            return Err(unqualified());
+        }
+        Ok(())
+    }
+
+    /// A terminal candidate failure spends this physical generation even
+    /// before tonic attempts another dial. Later Health cannot revive it.
+    pub(super) fn revoke(&self) {
+        self.0.revoked.store(true, Ordering::SeqCst);
+        if let Ok(mut health) = self.0.health.lock() {
+            *health = None;
+        }
+    }
+
     pub(super) fn require_qualified(&self) -> Result<(), GrpcError> {
         if self.0.revoked.load(Ordering::SeqCst)
             || self.0.health.lock().map_err(|_| unqualified())?.is_none()

@@ -5,6 +5,14 @@
 use super::external_pb::magic::market::v1::{BuildIdentity, HealthResponse};
 use serde::{Deserialize, Serialize};
 
+#[path = "candidate_b7_profile.rs"]
+mod candidate_b7_profile;
+pub use candidate_b7_profile::CandidateCompiledInputs;
+
+pub fn compiled_candidate_b7_inputs() -> Result<CandidateCompiledInputs, BuildIdentityError> {
+    candidate_b7_profile::compiled_inputs()
+}
+
 const PUBLIC_BUNDLE_METADATA: &str =
     include_str!("../../contracts/external_v1_current/bundle-metadata.json");
 const PUBLIC_BUNDLE_PROTO: &[u8] =
@@ -108,6 +116,14 @@ impl BuildIdentityTrust {
             current_descriptor:
                 super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         })
+    }
+
+    /// An explicit diagnostic release. It never changes bundled/current replay.
+    pub(crate) fn candidate_b7_probe() -> Result<Self, BuildIdentityError> {
+        candidate_b7_profile::compiled_inputs()?;
+        let mut trust = Self::bundled()?;
+        trust.current = candidate_b7_profile::expected();
+        Ok(trust)
     }
 
     pub(crate) fn historical_identity(

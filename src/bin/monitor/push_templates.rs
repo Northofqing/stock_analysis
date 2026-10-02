@@ -12137,6 +12137,7 @@ pub async fn dispatch_post_session_review(
             Ok(report) => log::info!("[BR-232] 预测样本回填: {:?}", report),
             Err(error) => log::error!("[BR-232] 预测样本回填失败: {error}"),
         }
+        crate::durable_delivery_runtime::log_prediction_outcome_report().await;
 
         // BR-223: 盘后大宗交易推送 (自选+持仓代码集, 非 ReviewTask 侧推)
         let mut block_trade_codes: Vec<String> = stock_analysis::portfolio::get_positions()

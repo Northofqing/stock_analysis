@@ -406,6 +406,132 @@ impl DatabaseManager {
     }
 }
 
+/// One bounded operational read. These are recorded samples, not receipts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordedOutcomeRow {
+    pub(crate) id: i64,
+    pub(crate) pred_date: String,
+    pub(crate) target_date: String,
+    pub(crate) code: Option<String>,
+    pub(crate) direction: String,
+    pub(crate) score_bits: Option<u64>,
+    pub(crate) actual_change_bits: Option<u64>,
+    pub(crate) hit: Option<i64>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutcomePredictionSnapshot {
+    pub(crate) rows: Vec<RecordedOutcomeRow>,
+    pub(crate) freezes: Vec<FrozenCandidateBoardV2>,
+}
+pub(crate) const OUTCOME_REPORT_MAX_ROWS: i64 = 4096;
+pub(crate) const OUTCOME_REPORT_MAX_BYTES: i64 = 16 * 1024 * 1024;
+
+impl DatabaseManager {
+    /// Select by frozen maturity sessions. Counts/lengths are checked in this
+    /// same read transaction before copying selected rows or freeze blobs.
+    pub(crate) fn read_outcome_prediction_window(
+        &self,
+        dates: &[String],
+    ) -> FreezeResult<OutcomePredictionSnapshot> {
+        if dates.is_empty() || dates.len() > 5 || dates.windows(2).any(|v| v[0] >= v[1]) {
+            return Err(invalid("outcome target session vector invalid"));
+        }
+        for date in dates {
+            let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map_err(|_| invalid("outcome session date invalid"))?;
+            if day.to_string() != *date
+                || !crate::calendar::verified_a_share_trading_day(day)
+                    .map_err(CandidateBoardFreezeError::Calendar)?
+            {
+                return Err(invalid("outcome session is not verified trading"));
+            }
+        }
+        for pair in dates.windows(2) {
+            let next = crate::calendar::verified_next_a_share_trading_day(
+                NaiveDate::parse_from_str(&pair[0], "%Y-%m-%d").unwrap(),
+            )
+            .map_err(CandidateBoardFreezeError::Calendar)?;
+            if next.to_string() != pair[1] {
+                return Err(invalid("outcome session vector is not consecutive"));
+            }
+        }
+        let first = &dates[0];
+        let last = &dates[dates.len() - 1];
+        let mut conn = self
+            .get_conn()
+            .map_err(|_| invalid("outcome operational DB unavailable"))?;
+        conn.transaction::<_, CandidateBoardFreezeError, _>(|conn| {
+            #[derive(QueryableByName)]
+            struct Extent {
+                #[diesel(sql_type=BigInt)] count: i64,
+                #[diesel(sql_type=BigInt)] bytes: i64,
+            }
+            let extent = diesel::sql_query(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(192+length(CAST(pred_date AS BLOB))+length(CAST(target_date AS BLOB))+COALESCE(length(CAST(stock_code AS BLOB)),0)+length(CAST(pred_direction AS BLOB))),0) AS bytes FROM prediction_tracker WHERE target_date>=?1 AND target_date<=?2"
+            ).bind::<Text,_>(first).bind::<Text,_>(last).get_result::<Extent>(conn)?;
+            // Charge every original field copied by load_verified and both
+            // existing verification readers, including references whose target
+            // was corrupted outside this window. The constants conservatively
+            // charge fixed descriptors; this is not an allocator-peak claim.
+            let frozen_extent = diesel::sql_query(format!(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(256+length(CAST(occurrence_identity AS BLOB))+length(CAST(business_date AS BLOB))+length(CAST(target_date AS BLOB))+length(CAST(calendar_authority_hash AS BLOB))+length(CAST(rendered_bytes AS BLOB))+length(CAST(rendered_sha256 AS BLOB))+length(CAST(source_canonical AS BLOB))+length(CAST(source_sha256 AS BLOB))),0) AS bytes FROM {TABLE} WHERE target_date>=?1 AND target_date<=?2"
+            )).bind::<Text,_>(first).bind::<Text,_>(last).get_result::<Extent>(conn)?;
+            let member_extent = diesel::sql_query(format!(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(64+length(CAST(m.code AS BLOB))),0) AS bytes FROM {MEMBER_TABLE} m JOIN {TABLE} f ON f.occurrence_identity=m.occurrence_identity WHERE f.target_date>=?1 AND f.target_date<=?2"
+            )).bind::<Text,_>(first).bind::<Text,_>(last).get_result::<Extent>(conn)?;
+            let verified_row_extent = diesel::sql_query(format!(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(160+length(CAST(p.pred_date AS BLOB))+length(CAST(p.target_date AS BLOB))+COALESCE(length(CAST(p.stock_code AS BLOB)),0)+length(CAST(p.pred_direction AS BLOB))+COALESCE(length(CAST(p.pred_detail AS BLOB)),0)),0) AS bytes FROM prediction_tracker p JOIN {MEMBER_TABLE} m ON m.prediction_row_id=p.id JOIN {TABLE} f ON f.occurrence_identity=m.occurrence_identity WHERE f.target_date>=?1 AND f.target_date<=?2"
+            )).bind::<Text,_>(first).bind::<Text,_>(last).get_result::<Extent>(conn)?;
+            let mut copied_rows=0i64;
+            let mut copied_bytes=0i64;
+            for extent in [&extent,&frozen_extent,&member_extent,&verified_row_extent] {
+                if extent.count<0 || extent.bytes<0 {return Err(invalid("outcome operational snapshot extent invalid"));}
+                copied_rows=copied_rows.checked_add(extent.count).ok_or_else(||invalid("outcome operational snapshot row extent overflow"))?;
+                copied_bytes=copied_bytes.checked_add(extent.bytes).ok_or_else(||invalid("outcome operational snapshot byte extent overflow"))?;
+                if copied_rows>OUTCOME_REPORT_MAX_ROWS || copied_bytes>OUTCOME_REPORT_MAX_BYTES {
+                    return Err(invalid("outcome operational snapshot exceeds budget"));
+                }
+            }
+            #[derive(QueryableByName)]
+            struct Row {
+                #[diesel(sql_type=BigInt)] id:i64,
+                #[diesel(sql_type=Text)] pred_date:String,
+                #[diesel(sql_type=Text)] target_date:String,
+                #[diesel(sql_type=Nullable<Text>)] stock_code:Option<String>,
+                #[diesel(sql_type=Text)] pred_direction:String,
+                #[diesel(sql_type=Nullable<Double>)] pred_score:Option<f64>,
+                #[diesel(sql_type=Nullable<Double>)] actual_change:Option<f64>,
+                #[diesel(sql_type=Nullable<BigInt>)] hit:Option<i64>,
+            }
+            let rows = diesel::sql_query("SELECT id,pred_date,target_date,stock_code,pred_direction,pred_score,actual_change,hit FROM prediction_tracker WHERE target_date>=?1 AND target_date<=?2 ORDER BY id")
+                .bind::<Text,_>(first).bind::<Text,_>(last).load::<Row>(conn)?;
+            let mut recorded = Vec::with_capacity(rows.len());
+            for row in rows {
+                let pred = NaiveDate::parse_from_str(&row.pred_date,"%Y-%m-%d").map_err(|_| invalid("outcome pred date invalid"))?;
+                if row.id <= 0 || pred.to_string()!=row.pred_date || !dates.contains(&row.target_date)
+                    || row.pred_date > row.target_date
+                    || !crate::calendar::verified_a_share_trading_day(pred).map_err(CandidateBoardFreezeError::Calendar)?
+                    || row.pred_score.is_some_and(|v| !v.is_finite()) {
+                    return Err(invalid("outcome original row facts invalid"));
+                }
+                recorded.push(RecordedOutcomeRow {id:row.id,pred_date:row.pred_date,target_date:row.target_date,code:row.stock_code,direction:row.pred_direction,
+                    score_bits:row.pred_score.map(f64::to_bits),actual_change_bits:row.actual_change.map(f64::to_bits),hit:row.hit});
+            }
+            #[derive(QueryableByName)]
+            struct Key { #[diesel(sql_type=Text)] occurrence_identity:String }
+            let keys = diesel::sql_query(format!("SELECT occurrence_identity FROM {TABLE} WHERE target_date>=?1 AND target_date<=?2 ORDER BY occurrence_identity"))
+                .bind::<Text,_>(first).bind::<Text,_>(last).load::<Key>(conn)?;
+            let mut freezes=Vec::with_capacity(keys.len());
+            for key in keys {
+                let freeze=load_verified(conn,&key.occurrence_identity)?.ok_or_else(|| invalid("outcome actual freeze disappeared"))?;
+                if !dates.contains(&freeze.target_date) { return Err(invalid("outcome frozen target is outside verified sessions")); }
+                freezes.push(freeze);
+            }
+            Ok(OutcomePredictionSnapshot { rows:recorded, freezes })
+        })
+    }
+}
+
 #[derive(QueryableByName)]
 struct StoredFreeze {
     #[diesel(sql_type = Text)]

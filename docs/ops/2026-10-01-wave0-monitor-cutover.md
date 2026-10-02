@@ -35,3 +35,11 @@ PID 4371 在 20:34 CST 完成 core DB 初始化，migrations 用时 427764 ms。
 开发分支 `c91be0e1` 将配置了 client bundle 的全市场 `MarketAnnouncements` 路由到已发布的 ExternalV1，并在转换前核对 mTLS/LocalBridge 的 typed provenance；R-08 的来源绑定保留真实来源字节。相关库测试 9/9、monitor R-08 持久绑定测试 1/1 通过，独立复核无剩余高优先级阻断。`14be9462` 将 `NewsMonitor::new` 的同步元数据读取移到 blocking worker，启动期间 DataMode 同级计时器可继续推进；monitor 定向测试 1/1 通过。这两个提交**尚未进入生产**，须单独构建、生成并复核新 activation。
 
 21:33 CST 使用当前生产 bundle 做只读上游探针，ExternalV1 Health 为 live/ready 且构建身份匹配；`MarketAnnouncements` 对 2026-10-01 返回 Cninfo `ADMITTED/complete` 300 条，provider 报告总量 722。该结果证明有界 RPC 可用，不证明全天 722 条全部覆盖，也不证明新 monitor 消费路径或 R-08 强制 CFFEX 来源通过。完整覆盖合同与公告 consumer 的生产观察仍开放。
+
+## 2026-10-02：旧切换提醒结束
+
+旧 `wave-0-19-00` heartbeat 再次唤醒后，只读复核确认 Wave 0 已安装完成：当前 monitor `851a5fb9…`、activation `f574faf1…` 和其配置哈希与获批材料吻合，735 个可执行输入严格校验通过。launchd monitor PID4371 与桥 PID56417 保持，投递锁只由4371持有；三份原回退文件 SHA 均吻合。没有重复停机、安装、重启或替换候选。
+
+本次真实持久库只读聚合为 schema9、Delivered982、RejectedDurable3988、ManualResolvedRejected6、UncertainManualReview78；没有裁定或重发 Uncertain。新鲜健康快照仍 Frozen/Unsafe，缺 Quote/MoneyFlow/News/OrderBook。这些运行和数据缺项由平台持续开发任务继续验收。
+
+精确切换这一专用任务已达成，已通过 app 的 automation_update 将 `wave-0-19-00` 设为 PAUSED；`automation`（平台完整上线持续开发）仍 ACTIVE。证据位于当前 continuation 的 `validation/wave0-heartbeat-20261002-completed-readonly.json`。Wave 0 已安装不表示 M0–M7 全部完成，后继新候选仍须独立精确审阅。

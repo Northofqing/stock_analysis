@@ -15,6 +15,13 @@ pub use verifier::{
     verify_due_predictions, verify_one, PredictionVerificationReport, VerifyOutcome,
 };
 
+#[path = "prediction_outcome_tracker.rs"]
+mod outcome_tracker;
+pub use outcome_tracker::{
+    OutcomeDailyWeeklyObservation, OutcomePeriodObservation, OutcomeSampleCounts, OutcomeTracker,
+    PhysicalLinkedOutcomeCounts, PhysicalLinkedOutcomeObservation,
+};
+
 #[cfg(test)]
 use samples::collect_candidate_save_worker;
 #[cfg(test)]

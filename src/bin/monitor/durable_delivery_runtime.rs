@@ -6537,3 +6537,37 @@ mod tests {
         );
     }
 }
+
+/// Read the already bound owners only. A report cannot lazy-open or migrate a
+/// runtime, reconcile facts, or create an append/sink attempt.
+pub(super) async fn log_prediction_outcome_report() {
+    let namespace = match resolve_runtime_namespace() {
+        Ok(namespace) => namespace,
+        Err(_) => {
+            log::warn!("[OutcomeTracker] unavailable reason=runtime_namespace");
+            return;
+        }
+    };
+    let cached = match health::cached_state(&namespace) {
+        Ok(state) => state,
+        Err(_) => {
+            log::warn!("[OutcomeTracker] unavailable reason=runtime_cache");
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let db = stock_analysis::database::DatabaseManager::try_get()
+            .ok_or("outcome_prediction_db_absent")?;
+        stock_analysis::monitor::prediction::OutcomeTracker::new(
+            db,
+            cached.as_ref().map(|state| state.coordinator.as_ref()),
+        )
+        .read_daily_weekly()
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => log::info!("{}", report.render()),
+        Ok(Err(reason)) => log::warn!("[OutcomeTracker] unavailable reason={reason}"),
+        Err(_) => log::warn!("[OutcomeTracker] unavailable reason=report_worker"),
+    }
+}

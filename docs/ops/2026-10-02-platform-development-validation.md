@@ -385,3 +385,68 @@ main59 `20f5044823c031900dfc063a73ee3de032f3aabe73709af4326e886df28e25a8` 实际
 Paper working计划 `2a11bce98a5e8d5a400a89df26767c0c45cf9ea0550d16e0e3ed5ef0d964958c`经Root全文技术review：账户事实与explicit固定B分开、无默认用户本金、全Working单资金/费用/卖股aggregate reserve、partial逐fill费用/剩余冻结、cancel/重试精确释放及micro整数。给限定library14path源码GO，原V1/V5与真实soleowner/genesis保持，Global V6由原Global作者单独协调。来源与生产ApprovedIntent未交付时继续typed拒绝，实际资金/预算/seed/cutover/上线不由此技术GO批准。尚无Paper运行通过结论。
 
 gRPC Candidate3–5历史源码与static证据保留，必要scalar闭合在新Candidate6：Cninfo真实≤10页/300raw、有效page/unique计数和分配前len；Hithink真实false数量/unique日范围容量及empty源时间合同。新精确10与16lib/10bin仍未合入、未编译或RPC，不能称上游验收完成。
+
+## 19:16 CST：兼容回退制品与后继验证
+
+基础实现及此前验证记录已提交 `caafa228a296382d5539ceb93c412cc9a100708b`。其独立归档完整 1582 个 tracked 输入逐项核验；release `monitor`、`selection_activation_prepare`、`grpc_bundle_probe` 实际构建 **EXIT0 / 951.731s**，全部输入前后不变，log SHA `5f4152dcc569c64eb9830cd212f3c0e83930184e27eb5129d715150effecc237`。封存 monitor 为 47794960 bytes / `9443f2fd5d503aef22a7c2b08ae591dab36ae89b5cae953d84a4c9cb63d147bb`，位于 `/Users/zhangzhen/.local/share/stock-analysis-candidates/platform-caafa228-schema14-v1v2-fallback/bin/monitor`。
+
+该 release monitor 在新隔离 Test namespace 执行 `--test --push-dry-run`，实际 **EXIT0 / 2.306s**，stderr SHA `82407bf477b6e8b25052ccf94e79670ac783582b888d9469083718fa9c56d88b`。`proposal_missing`、`perf_recent=false` 和八项 counted binding 不具备的路径仍如实拒绝或跳过。这是命令执行证据；同生产库的兼容回退、匹配配置、未来 activation 人审及部署观察尚未完成。
+
+Root 已整合 Outcome13、日线失效化1、Global prospective4、独立 gRPC candidate10 和 backup v4 三文件增量，共 29 源码路径。首次实际定向编译 **EXIT101 / 175.871s**，未运行测试；log SHA `9b6a0c23e04f82f9583f961eb8efac4bd037952d5f17ea0a417e63ec0528e792`。随后仅修正私有 `StepSpec` 借用及两项测试 API 参数；三路径 delta SHA `f3625e298cf696531a2231910542b30a4cad3984efc8c95d5ca5c40af6492f84` 经独立静态复核无 P1/P2。当前 29 路径 patch `07ddd479a431cb20de63b86f47c79e009ad7071733c93a44959005362fbaf439` 的实际编译/测试仍 Pending；历史失败和封存作者原件均保留。
+
+Paper 最终预算合同已独立静态复核：`C0 = 初始策略现金 + 原 genesis 中完整分配 lot 的原标记价值 ≤ 固定授权 B`；单一现金投影分成策略与未分配现金，后者不能补亏或付费；新买入计入已有持仓、所有 Working 买单最大金额及所有 Working 费用冻结。合法估值上涨超过 B 仍记录真实事实，策略收益在固定 B 内回用，不自动增加 B。计划 SHA `e6543cc65404257822db9e51c46306837920eb91405f913775431a414d5b06dd`；library14 正在实现，无实际用户金额、生产预算、资金 seed 或 cutover 批准。
+
+Global CatalogV6 的五路径只读方案需要真实 branded Diesel checkout、原事务及独立提交后 reader。独立复核发现连接实例绑定缺口：TEMP token 和文件对象身份不足以证明同一借用连接；writer 与 reader witness 须分别绑定实际实例并测试复制 token 的第二连接。该计划尚未获源码 GO，Paper 正式 Test 正向验收仍依赖其闭合；Production 继续 `Catalog6RequalificationRequired`。
+
+19:15 最新生产只读核对：launchd monitor PID4371、gRPC server PID56417；installed monitor SHA `851a5fb9f384e5ffbb437ef04979bd21d26fa1991f11a264229d5eb93703d658` 与 Wave0 activation SHA `f574faf1868fc6e1a3963b83793e79fbcbb4a875116f864a29e4280e6a206b60` 保持。实际 `--health` **EXIT1**，账户 Frozen、数据 Unsafe、账户指标不完整，缺 Quote/MoneyFlow/News/OrderBook；未切换生产。VM 原任务 revision48 确认读取第十九批，等待 Mac 实际新客户端身份及请求队列；没有新同版 RPC、监听或停止执行证据。
+
+## 20:00 CST：后继实际回归与剩余工作
+
+后继 29 路径实际编译后，gRPC candidate 库 **15/16、EXIT101**，log `e55891516595995f610655c3add481986d4aceb3c1bd7c8f1b4a92b0381cdaaa`。原失败是首次真实断线后 qualification 没有立即永久撤销，可在下一次重拨前重新资格化；Root 三路径修正经独立静态复核通过，运行仍待验证。Outcome17 原运行首例因第二 coordinator 重入进程级 SQLite mutex 而阻塞；确认所属后中断，实际 **EXIT-2 / 519.177s**，不计通过。修为同一精确隔离测试的子进程通过原 coordinator 插入协议，目录前缀修正后的独立静态复核通过；实际重跑待完成。当前 29 路径 patch 为 `26b08d12d3e5b89661668dbfbb4c0cd80a7d2f79f01b56f96ef0cbb1b914973b`，HEAD 仍 `caafa228`，尚未提交此批源码。
+
+同份封存的原 `07ddd479` 实际库产物：日线失效化 **8/8**、prospective catalog **2/2**、bounded audit **4/4** 均 EXIT0。Global prospective **8/14、EXIT101**：首例因测试夹具普通 SQLite 连接留下 WAL 身份变化失败，其余五项为串行锁中毒；单例重跑 **0/1、EXIT101**，确认不是并行波动。backup **1/23、EXIT101**：首例独立失败为 `backup operation directory changed`，其余21项为锁中毒，CLI 一项通过。不得把两种原错误混为同一原因或称全部修复。
+
+Global WAL 新 V5 仅修测试夹具，要求原独占命名空间、实际 owned sidecar pin、真实 TRUNCATE 结果及零 WAL、明确成功 close、原 inode 清理/同步/无 sidecar；源已封存，独立复核中。备份生产 helper 的另一缺陷已定位：APFS 的目录 nlink 会随自身普通文件创建变化，旧整个 Node 相等检查因此拒绝原操作。Root 已给两路径窄修技术 GO：保留实际目录 device/inode/UID/mode、正 links、no-follow 与所有文件单链接检查；旧 journal codec/hash/bytes 保持，重开仅从完整验证的首 Intent 绑定原不可变 anchor。新修正及实际验证尚未交付。
+
+GlobalV6 连接实例绑定方案 V2 已独立静态通过并获限定五路径源码技术 GO；须先闭合以上实际失败，Production 仍 `Catalog6RequalificationRequired`。Paper 新 C3 依赖独立封存，新增估值 window 及实际事务时间校验；24 项只表示源码用例，library14 尚未整体稳定或实际运行，正式正向仍依赖真实 GlobalV6 借用资格。
+
+距全部上线尚需：完整资金预算/费用冻结/父单与部分成交取消闭环；全目录和全行值保留、实际目标库、原子切换与恢复；同版真实 VM RPC 与各数据来源资格；52 Unit 全面接管、真实回执和 Uncertain 人工裁定；Outcome/运行与 AI 基准及自然窗口；Gate P 远端 WORM/恢复和样本外、前瞻模拟；兼容回退、新精确 activation 人审、生产切换观察；M6 候选研究及 M8 按实测需求裁定。最新生产健康仍是19:15的 Frozen/Unsafe，未取得更新生产或全目标完成证据。
+
+V5 Test-WAL 修正随后经 Root 全文与独立静态复核通过，按精确 before/after 整合：唯一 Global owner after `6b1fe1e4b07e4b5313cfce5deaa6fc4a1a0ace378e727e11bb11db3ee034c562`，其余28路径不变。当前29路径 patch `76d55c77680425e965ae8209c50ef0f1f236fe118a65097b52b3d080c3482ff4`；运行验证仍 Pending，等待独立备份目录修正稳定并复核后一次编译。没有据静态通过覆盖原实际失败结论。
+
+备份目录修正随后封存为独立两路径 candidate，delta `146a4197e38cc8967435324bf290b698fa4045b761f742c98e424017cdb5474a`，经 Root 与独立静态复核无 P1/P2；按精确前后字节整合，其他27路径不变。当前29源 patch `c9b09e8b897b992012bc43e5c3be02ce128b3b2683f9f44f990e6a99b176e14a`，实际库定向编译/16项 gRPC candidate 回归已启动，结果 Pending；其后还需新封存库产物执行 Outcome17、Global prospective14 与 backup24。候选名称里的 v6 仅表示备份修正版本，未表示 Catalog6 或生产升级完成。
+
+## 20:56 CST：库回归实际结果
+
+同份 c9b09e8b 原源前后不变，gRPC candidate **16/16、EXIT0**，driver1101.824s，log SHA `38857be2570dfb28fcc4f6a64fe6b508041bec63e9302448b0f6fade5ec00435`。原断线后重新资格化缺陷已在该范围验证修复；Windows 实际同版 RPC 尚未执行。
+
+封存真实191554020-byte库测试产物 SHA `1f7fbf85bf4bb44fa0f1b50ca50ca41c579b13035e4832eac215e3c080c6a853`，分别执行相关范围：Global prospective **14/14、EXIT0**（log `a68c526f6417cfc0b70abd08c5ddb2dc04312ea511ed1f2fad7de7de6cec0fc2`）；backup **24/24、EXIT0**（log `e98a592e19c6006aa8f43b163e08cb9122b4453a4735bcba406fb319863dfda1`）。原 WAL 测试夹具和 APFS 目录 identity 故障在此范围闭合，未表示完整数据库升级、全行保留、原子交换或恢复已实现。
+
+Outcome **16/17、EXIT101**（log `f3b9eba504487b1f73290981a85b216c97ea612b70d348c7f2781a4e1598339c`）。原死锁场景已通过；唯一失败是预算测试写入超长 calendar hash，被原 SQLite 的64字符 CHECK拒绝，尚未到预检。独立诊断后正在做一个测试文件的窄修，用数据库允许的损坏日期证明字节预算先于解码拒绝；生产预算和约束保持。未将原16/17称成全部通过。
+
+20:52 新鲜生产健康快照仍 **Frozen/Unsafe、EXIT1**，账户指标不完整，缺 Quote/MoneyFlow/News/OrderBook。后继29源码尚未提交或部署，资金模拟盘、正式GlobalV6资格、真实RPC、逐Unit生产接管及外部GateP/观察仍待完成。
+
+
+## 21:42 CST：Outcome 精确修正闭合，继续当前批次门禁
+
+Outcome header 预算负例仅改一个测试文件，原3个hash及target保持，使用SQL可存入的损坏business_date验证预算先于解码。当前29源 patch `883d7e153750ae138a7c468558f7706c407a972f59c645af3621f19fde49e386`。精确用例实际 **1/1、EXIT0**，log `07c9514d87eda34ddd2dbcf3d5042f3feb8171f96f8ae8baffb48430e50e6cdf`，源前后不变；原其他16项已通过，复用其证据，保留原16/17失败运行。独立整合静态复核PASS/noP1P2，尚非生产验收。
+
+用户批准按既定依赖顺序继续。真正GlobalV6已选择固定C3更正full14输入并开始限定5路径实现，尚未运行；Production pool继续Catalog6RequalificationRequired。当前候选CLI10实际门禁进行中，随后monitor定向、普通debug两实际制品和隔离dry-run/offline36plan，再提交此批。VM最新revision49仍等待Mac候选身份与请求队列；无新真实RPC、生产激活或数据来源资格。
+
+
+### 正式构建可见性修正
+
+候选CLI10首轮 non-test 库编译实际EXIT101/119.373s，无测试执行，log681ecbef128c331641491880549e93a5c9c050350c5c3ebe9bfc5b71e3eef668。prospective::render_error调用GlobalSchemaV1Error::code，原impl仅cfg(test)。Root唯一删除该cfg，原2818-byte静态脱敏body完全相同（cd768a21），crate-only API不扩外部authority；before267366/4991658b→after267353/efe6d7a3。独立cfg-only静态PASS/noP1P2，旧source29/失败日志保留；当前source29 patchcdcf699f7c0f919e97df5dfb4d77a65ad9e0ccbc43528f5ab332665fac787349，actualCLI10重跑进行中。Global作者原baseline不覆盖，后继5路径候选需显式机械保留Root此1行fix。
+
+只读配方复核纠正交接摘要：b7 compiled expected_service_version实际为0.2.0，不能沿用旧摘要1.2.0；以实际源码、binary offline输出/固定plan为准。offlinePlan无RPC/凭据，不能作为实际同版RPC验收。
+
+
+## 22:03 CST：29 源码批次开发门禁完成
+
+当前29 source patch `cdcf699f7c0f919e97df5dfb4d77a65ad9e0ccbc43528f5ab332665fac787349`，HEAD仍caafa228；源在每项执行前后保持。候选CLI **10/10、EXIT0**，log `a2f15f8d50b5730bf415bc286fce29ddf0ded615f2a8f3e154b855cac91f6e04`；monitor durable-health **8/8、EXIT0**（147.802s，log `4f801a13a72be544456a603470ab6e507c54ce9851a5b6c96b1f60e7f35eeba4`）。普通默认debug实际两bin构建 **EXIT0/229.626s**，不带CLI profile覆写，build log `230a67b9c35430006cc141788938ee28844f91d1a6258fb56b75eb8847671eb7`；tracked inputs构建前后相同。actualseal：monitor130939256B/`edcd148c3e2e6175c00c189bc293a91795962e293f35a53c1be5d4af9b51332c`；candidateclient20043624B/`4b92894eceb5bc1c38abb52fe3bd52d9527769ba16c3a1d851645771378b9cee`，Desktop外独立原文件0700/nlink1/fsync。
+
+实际sealed普通debugmonitor --test --push-dry-run **EXIT0/6.902s**，stderr `c972bff6e92e5acd8bc1365fe04f4605a54775bc67566513b1524812b0dc2177`。Test root/webhook隔离、rendered59、explicitdryrunfamily59、failed0、external_process0、receipt_append0、live_opt_in=false；smoke0/0、缺countedbinding/账户perf_recent=false等降级原样保留。不是生产健康或所有能力正向运行。sealed实际client --offline-plan **EXIT0/1.061s**，固定新请求plan14470B/`a0f0f13abcf3b3c62b073129b3bee050eea1b148cefec4da0398a5be6edca6d9`，0600/nlink1；36步0–35、单连接串行/no retry/no fallback，全部原requestwire SHA对齐，compiled expected服务0.2.0/b7/f23binary/abfdescriptor/41dbclientdesc/002567policy一致，实际rpc_count0。未加载凭据或执行真实VM RPC；此plan不重生成替代精确输入。
+
+相关旧gRPC16/Outcome其余16+精确1/Global14/backup24/Kline8/catalog2/audit4证据复用，全部原失败日志保留；根+独立整合review与cfg-onlyreview覆盖当前cdcf差异。回执索引platform-followup29-cdcf-gate-index.json。原Windows公共CRLF保持原hash，源码whitespace采用cr-at-eol并保其他默认规则；普通文档diff-check通过，不声称default whole diff-check通过或全套tests。当前批次具备提交条件，未上线。
+
+GlobalV6 C1五路径source稳定（manifest466b9695/patch2563414d/16源码0运行），Root和独立审查已发现reader authority getter缺口以及reader/migration entry需先loan再任何Global SQL；下一C2窄修保原seal。Paper14完整资金/父单与formalDecision/Window生产issuer仍待接线/验证。主heartbeat ACTIVE。

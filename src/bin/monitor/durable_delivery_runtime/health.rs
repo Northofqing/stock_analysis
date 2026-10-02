@@ -31,7 +31,7 @@ fn typed_failure(
 }
 
 #[cfg(not(test))]
-fn cached_state(namespace: &RuntimeNamespace) -> Result<Option<Arc<RuntimeState>>, ()> {
+pub(super) fn cached_state(namespace: &RuntimeNamespace) -> Result<Option<Arc<RuntimeState>>, ()> {
     let Some(entry) = RUNTIME.get() else {
         return Ok(None);
     };
@@ -46,7 +46,7 @@ fn cached_state(namespace: &RuntimeNamespace) -> Result<Option<Arc<RuntimeState>
 }
 
 #[cfg(test)]
-fn cached_state(namespace: &RuntimeNamespace) -> Result<Option<Arc<RuntimeState>>, ()> {
+pub(super) fn cached_state(namespace: &RuntimeNamespace) -> Result<Option<Arc<RuntimeState>>, ()> {
     let RuntimeNamespace::Test { test_code } = namespace else {
         return Err(());
     };

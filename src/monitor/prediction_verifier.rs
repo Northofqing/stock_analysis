@@ -46,6 +46,18 @@ fn direction(value: &str) -> Result<Direction, String> {
     }
 }
 
+/// The existing directional threshold, shared by recorded-outcome reports.
+pub(super) fn recorded_direction_hit(value: &str, actual_change: f64) -> Result<bool, String> {
+    if !actual_change.is_finite() || actual_change < -100. {
+        return Err("recorded outcome return is invalid".into());
+    }
+    Ok(match direction(value)? {
+        Direction::Up => actual_change > DIRECTION_MOVE_THRESHOLD_PERCENT,
+        Direction::Down => actual_change < -DIRECTION_MOVE_THRESHOLD_PERCENT,
+        Direction::Neutral => actual_change.abs() <= DIRECTION_MOVE_THRESHOLD_PERCENT,
+    })
+}
+
 fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Option<f64>, String> {
     #[derive(diesel::QueryableByName)]
     struct Close {

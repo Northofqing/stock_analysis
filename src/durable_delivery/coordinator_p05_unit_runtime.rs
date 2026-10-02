@@ -854,15 +854,22 @@ fn validate_accepted_reference(
     }
     validate_audit_refs(c, &envelope.decision_identity, &original.audit_refs)
 }
-fn require_drained(c: &Connection, draft: &str) -> Result<()> {
+fn pending_unit_evidence(c: &Connection, draft: &str) -> Result<i64> {
     let pending:i64=c.query_row("SELECT (SELECT COUNT(*) FROM immutable_audit_outbox a JOIN p05_unit_children p ON p.decision_identity=a.decision_identity WHERE p.draft_identity=?1 AND a.append_state!='Appended')+(SELECT COUNT(*) FROM delivery_disposition_payloads d JOIN p05_unit_children p ON p.decision_identity=d.decision_identity WHERE p.draft_identity=?1 AND d.append_state!='Appended')+(SELECT COUNT(*) FROM task_transition_payloads t JOIN p05_unit_children p ON p.decision_identity=t.decision_identity WHERE p.draft_identity=?1 AND (t.append_state!='Appended' OR t.hydration_state!='Applied'))",[draft],|r|r.get(0))?;
-    if pending != 0 {
+    if pending < 0 {
+        return Err(invalid("negative Unit pending evidence count"));
+    }
+    Ok(pending)
+}
+fn require_drained(c: &Connection, draft: &str) -> Result<()> {
+    if pending_unit_evidence(c, draft)? != 0 {
         return Err(invalid(
             "Unit has pending audit/payload/hydration; no completion",
         ));
     }
     Ok(())
 }
+
 fn load_completion(c: &Connection, id: &str) -> Result<CompletionCanonical> {
     let (draft,rev,bytes,hash,image):(String,i64,Vec<u8>,String,Vec<u8>)=c.query_row("SELECT draft_identity,mutation_revision,completion_canonical,completion_sha256,completion_preimage FROM p05_s2_completion_receipts WHERE completion_identity=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     verify_blob(id, &bytes, &hash, &image, "p05-unit-completion-v1")?;
@@ -1961,4 +1968,262 @@ pub(in crate::durable_delivery::coordinator) fn actual_extra_mutation_for_test(
     // The extra change is otherwise valid: only the operation-local binding
     // should reject it after the original body has declared its one effect.
     validate_rows(tx)
+}
+
+fn outcome_binding_sha(binding: &SqlBinding) -> Result<String> {
+    Ok(sha256_hex(&encode(&(
+        &binding.date,
+        &binding.draft_identity,
+        &binding.head,
+        &binding.authority,
+        &binding.completion_head,
+        &binding.baseline,
+    ))?))
+}
+
+impl DurableDeliveryCoordinator {
+    /// Internal read-side contextual link. No consumer admission is issued.
+    pub(crate) fn read_p05_outcome_unit_on(
+        &self,
+        db: &DatabaseManager,
+        date: &str,
+    ) -> Result<crate::p05_auction_unit::P05OutcomeUnitRead> {
+        use crate::p05_auction_unit::{P05OutcomeBoardRead, P05OutcomeUnitRead};
+        date_day(date)?;
+        match &self.config.environment {
+            super::super::super::model::StoreEnvironment::Production => {
+                if !DatabaseManager::try_get().is_some_and(|actual| std::ptr::eq(actual, db)) {
+                    return Err(invalid(
+                        "outcome read requires actual operational singleton",
+                    ));
+                }
+            }
+            super::super::super::model::StoreEnvironment::Test { .. } => {
+                #[cfg(test)]
+                if !db.has_isolated_p05_consumer_origin() {
+                    return Err(invalid("outcome Test DB lacks isolated origin"));
+                }
+                #[cfg(not(test))]
+                return Err(invalid(
+                    "outcome Test reader unavailable in production library",
+                ));
+            }
+        }
+        let namespace = self.p05_namespace()?;
+        let (draft, intent, receipts, awaiting, binding) = self.with_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let draft = load_draft(&tx, date, namespace)?;
+            let intent = load_intent(&tx, date, namespace)?;
+            let receipts = if draft.is_some() {
+                let receipts = observe_receipts(&tx, date)?;
+                if let Some(intent) = &intent {
+                    for (child, raw) in &intent.children {
+                        let envelope = parse_envelope(raw)?;
+                        if let Some(P05ChildReceiptObservation::PhysicallyAccepted {
+                            child_identity,
+                            decision_identity,
+                            disposition_identity,
+                            attempt_identity,
+                            raw_sha256,
+                        }) = receipts.children.iter().find(|r| {
+                            matches!(r,
+                            P05ChildReceiptObservation::PhysicallyAccepted { child_identity, .. }
+                            if child_identity == child)
+                        }) {
+                            let original =
+                                accepted_reference(&tx, child, &envelope)?.ok_or_else(|| {
+                                    invalid("outcome original physical Accepted absent")
+                                })?;
+                            validate_audit_refs(
+                                &tx,
+                                &envelope.decision_identity,
+                                &original.audit_refs,
+                            )?;
+                            if &original.child_identity != child_identity
+                                || &original.decision_identity != decision_identity
+                                || &original.disposition_identity != disposition_identity
+                                || &original.attempt_identity != attempt_identity
+                                || &original.raw_sha256 != raw_sha256
+                            {
+                                return Err(invalid("outcome original Accepted receipt differs"));
+                            }
+                        }
+                    }
+                }
+                Some(receipts)
+            } else {
+                None
+            };
+            let awaiting = if let Some(draft) = &draft {
+                pending_unit_evidence(&tx, &draft.identity)? != 0
+            } else {
+                false
+            };
+            let binding = capture_sql_binding(&tx, date)?;
+            validate_rows(&tx)?;
+            tx.commit()?;
+            binding.validate(c)?;
+            Ok((draft, intent, receipts, awaiting, binding))
+        })?;
+        // Independent operational read happens after ALL hooks of the first core.
+        let prediction = match (&draft, &intent) {
+            (Some(draft), Some(intent)) => Some(read_actual_prediction(db, draft, intent)?),
+            (None, None) | (Some(_), None) => None,
+            _ => return Err(invalid("outcome Unit intent has no actual draft")),
+        };
+        self.with_mutation_routing_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            binding.validate(&tx)?;
+            validate_rows(&tx)?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        // No more durable SQL hooks follow this actual operational tail read.
+        if let (Some(draft), Some(intent), Some(expected)) = (&draft, &intent, &prediction) {
+            if read_actual_prediction(db, draft, intent)? != *expected {
+                return Err(invalid("outcome actual prediction changed at read tail"));
+            }
+        }
+        if self.p05_namespace()? != namespace {
+            return Err(invalid("outcome durable namespace changed"));
+        }
+        let board = if let (Some(intent), Some(prediction)) = (&intent, &prediction) {
+            let mut boards =
+                intent
+                    .children
+                    .iter()
+                    .filter_map(|(child, raw)| match parse_envelope(raw) {
+                        Ok(e) if e.push_kind == PushKind::CandidateBoard => {
+                            Some(Ok((child, e, raw)))
+                        }
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
+                    });
+            let (child, envelope, raw) = boards
+                .next()
+                .ok_or_else(|| invalid("outcome Unit board missing"))??;
+            if boards.next().is_some() {
+                return Err(invalid("outcome Unit has ambiguous board"));
+            }
+            let (target, source, rows) = match prediction {
+                PredictionObservation::Frozen {
+                    target_date,
+                    source_sha256,
+                    ordered_rows,
+                    ordered_prediction_score_bits,
+                    ..
+                } => (
+                    Some(target_date.clone()),
+                    source_sha256.clone(),
+                    ordered_rows
+                        .iter()
+                        .zip(ordered_prediction_score_bits)
+                        .map(|(r, b)| (r.prediction_row_id, r.code.clone(), *b))
+                        .collect(),
+                ),
+                PredictionObservation::UnlinkedNoStrong { .. } => {
+                    (None, envelope.source_binding_sha256.clone(), Vec::new())
+                }
+            };
+            Some(P05OutcomeBoardRead {
+                child_identity: child.clone(),
+                decision_identity: envelope.decision_identity,
+                envelope_sha256: sha256_hex(raw),
+                target_date: target,
+                source_sha256: source,
+                rows,
+                receipts: receipts
+                    .ok_or_else(|| invalid("outcome Unit receipt snapshot absent"))?
+                    .children,
+                awaiting_drain: awaiting,
+            })
+        } else {
+            None
+        };
+        Ok(P05OutcomeUnitRead {
+            date: date.into(),
+            sql_sha256: outcome_binding_sha(&binding)?,
+            draft_identity: draft.as_ref().map(|d| d.identity.clone()),
+            preparing: draft.is_some() && intent.is_none(),
+            board,
+        })
+    }
+}
+
+fn outcome_decision_pending(c: &Connection, decision: &str) -> Result<bool> {
+    let pending:i64=c.query_row("SELECT (SELECT COUNT(*) FROM immutable_audit_outbox WHERE decision_identity=?1 AND append_state!='Appended')+(SELECT COUNT(*) FROM delivery_disposition_payloads WHERE decision_identity=?1 AND append_state!='Appended')+(SELECT COUNT(*) FROM task_transition_payloads WHERE decision_identity=?1 AND (append_state!='Appended' OR hydration_state!='Applied'))",[decision],|r|r.get(0))?;
+    if pending < 0 {
+        return Err(invalid("negative outcome decision pending count"));
+    }
+    Ok(pending != 0)
+}
+impl DurableDeliveryCoordinator {
+    pub(crate) fn read_outcome_card_drains(
+        &self,
+        cards: &[&CandidateBoardCardObservationV2],
+    ) -> Result<BTreeMap<String, bool>> {
+        self.with_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let mut drains = BTreeMap::new();
+            for card in cards {
+                let id = card.card().decision_identity();
+                if drains
+                    .insert(id.into(), outcome_decision_pending(&tx, id)?)
+                    .is_some()
+                {
+                    return Err(invalid("outcome duplicate card decision"));
+                }
+            }
+            tx.commit()?;
+            Ok(drains)
+        })
+    }
+    /// Final no-hook SQL snapshot covers complete card membership plus actual
+    /// receipt identity/drain and every Unit date, including absent first insert.
+    pub(crate) fn validate_outcome_report_tail(
+        &self,
+        units: &[crate::p05_auction_unit::P05OutcomeUnitRead],
+        cards: &[&CandidateBoardCardObservationV2],
+        drains: &BTreeMap<String, bool>,
+    ) -> Result<()> {
+        self.with_mutation_routing_connection(|c| {
+            let tx=c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            for unit in units {
+                if outcome_binding_sha(&capture_sql_binding(&tx,&unit.date)?)? != unit.sql_sha256 {return Err(invalid("outcome exact Unit binding changed at tail"));}
+                let actual=tx.prepare("SELECT decision_identity FROM delivery_decisions WHERE business_date=?1 AND push_kind='CandidateBoard' ORDER BY decision_identity")?.query_map([&unit.date],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                let expected:BTreeSet<_>=cards.iter().filter(|card|card.card().business_date()==unit.date).map(|card|card.card().decision_identity().to_owned()).collect();
+                if actual!=expected {return Err(invalid("outcome complete card membership changed at tail"));}
+            }
+            for observation in cards {
+                let card=observation.card();let id=card.decision_identity();
+                let stored=load_decision(&tx,id)?.ok_or_else(||invalid("outcome original card absent at tail"))?;
+                let envelope=parse_envelope(&stored.envelope_canonical)?;
+                let source=super::super::candidate_board::validate_candidate_board_source(&envelope)?;
+                if stored.retry_authorized || stored.task_binding_present
+                    || stored.envelope_sha256!=card.envelope_sha256() || sha256_hex(&stored.envelope_canonical)!=card.envelope_sha256()
+                    || envelope.canonical_bytes()?!=stored.envelope_canonical || envelope.decision_identity!=id
+                    || stored.state!=card.decision_state() || envelope.business_date!=card.business_date()
+                    || envelope.schedule_occurrence_identity!=card.occurrence_identity()
+                    || envelope.source_binding_sha256!=card.source_binding_sha256()
+                    || envelope.rendered_content_sha256!=card.rendered_content_sha256()
+                    || &source!=observation.source_link() {return Err(invalid("outcome original card binding changed at tail"));}
+                if card.terminal()!=CandidateBoardCardTerminalV1::Pending {
+                    let terminal=build_validated_terminal_evidence(&tx,&stored,&envelope,None)?;
+                    let disposition=match terminal.disposition {
+                        FoundationTerminalDisposition::Accepted=>CandidateBoardCardTerminalV1::Accepted,
+                        FoundationTerminalDisposition::ManualAccepted=>CandidateBoardCardTerminalV1::ManualAccepted,
+                        FoundationTerminalDisposition::Rejected=>CandidateBoardCardTerminalV1::Rejected,
+                        FoundationTerminalDisposition::Uncertain=>CandidateBoardCardTerminalV1::Uncertain,
+                        FoundationTerminalDisposition::ManualNotDelivered=>CandidateBoardCardTerminalV1::ManualNotDelivered,
+                    };
+                    if disposition!=card.terminal() || terminal.attempt_id.as_deref()!=card.terminal_attempt_identity()
+                        || Some(terminal.ref_id.as_str())!=card.disposition_identity()
+                        || Some(terminal.evidence_sha256.as_str())!=card.terminal_evidence_sha256()
+                        || terminal.accepted_channel.as_deref()!=card.accepted_channel() {return Err(invalid("outcome physical original receipt changed at tail"));}
+                }
+                if drains.get(id)!=Some(&outcome_decision_pending(&tx,id)?) {return Err(invalid("outcome evidence drain changed at tail"));}
+            }
+            validate_rows(&tx)?;tx.commit()?;Ok(())
+        })
+    }
 }

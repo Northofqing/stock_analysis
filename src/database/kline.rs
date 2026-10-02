@@ -135,23 +135,25 @@ impl DatabaseManager {
         data_source: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
-        Self::upsert_daily_record(
-            &mut conn,
-            code,
-            date,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            amount,
-            pct_chg,
-            ma5,
-            ma10,
-            ma20,
-            volume_ratio,
-            data_source,
-        )
+        conn.transaction::<(), Box<dyn std::error::Error>, _>(|conn| {
+            Self::upsert_daily_record(
+                conn,
+                code,
+                date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                amount,
+                pct_chg,
+                ma5,
+                ma10,
+                ma20,
+                volume_ratio,
+                data_source,
+            )
+        })
     }
 
     /// 内部 UPSERT 方法，接受已有连接（避免批量操作时重复获取连接）
@@ -215,6 +217,17 @@ impl DatabaseManager {
                 stock_daily::updated_at.eq(Local::now().naive_local()),
             ))
             .execute(conn)?;
+
+        // Ordinary daily writes do not carry the authority that qualified the
+        // previous projection. Even identical prices cannot prove its original
+        // provenance binding survived. All callers hold the encompassing
+        // transaction, so an invalidation error also rolls back this UPSERT.
+        diesel::sql_query(
+            "DELETE FROM qualified_daily_trading_status WHERE code = ?1 AND date = ?2",
+        )
+        .bind::<diesel::sql_types::Text, _>(code)
+        .bind::<diesel::sql_types::Text, _>(date.to_string())
+        .execute(conn)?;
 
         Ok(())
     }
@@ -457,10 +470,16 @@ impl DatabaseManager {
     pub fn delete_stock_data(&self, code: &str) -> Result<usize, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
 
-        let deleted = diesel::delete(stock_daily::table.filter(stock_daily::code.eq(code)))
-            .execute(&mut conn)?;
-
-        Ok(deleted)
+        conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            let deleted = diesel::delete(stock_daily::table.filter(stock_daily::code.eq(code)))
+                .execute(conn)?;
+            // Also clear marker-only orphans. Preserve the daily-row count and
+            // propagate either deletion error without leaving a partial delete.
+            diesel::sql_query("DELETE FROM qualified_daily_trading_status WHERE code = ?1")
+                .bind::<diesel::sql_types::Text, _>(code)
+                .execute(conn)?;
+            Ok(deleted)
+        })
     }
 }
 
@@ -762,5 +781,406 @@ mod tests {
         assert_eq!(latest_results.len(), 1);
         assert_eq!(db.delete_stock_data(&code).unwrap(), 2);
         assert!(db.get_latest_data(&code, 1).unwrap().is_empty());
+    }
+
+    fn qualified_daily_private_db() -> (tempfile::TempDir, DatabaseManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            dir.path().join("TEST_CODE_qualified_daily_invalidation.db"),
+        )
+        .unwrap();
+        (dir, db)
+    }
+
+    fn qualified_daily_record(code: &str, day: NaiveDate, close: f64) -> StockDailyRecord {
+        assert!(code.starts_with("TEST_CODE_"));
+        StockDailyRecord {
+            code: code.to_owned(),
+            date: day,
+            open: Some(close),
+            high: Some(close),
+            low: Some(close),
+            close: Some(close),
+            volume: Some(1_000.0),
+            amount: Some(close * 1_000.0),
+            pct_chg: Some(0.0),
+            ma5: None,
+            ma10: None,
+            ma20: None,
+            volume_ratio: None,
+            data_source: Some("TEST_CODE_ordinary_daily".to_owned()),
+        }
+    }
+
+    fn qualified_daily_save_single(
+        db: &DatabaseManager,
+        record: &StockDailyRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        db.save_daily_record(
+            &record.code,
+            record.date,
+            record.open,
+            record.high,
+            record.low,
+            record.close,
+            record.volume,
+            record.amount,
+            record.pct_chg,
+            record.ma5,
+            record.ma10,
+            record.ma20,
+            record.volume_ratio,
+            record.data_source.as_deref(),
+        )
+    }
+
+    // Synthetic markers are confined to an actually isolated Test database.
+    // They never construct a Gateway authority or production status writer.
+    fn qualified_daily_test_marker(db: &DatabaseManager, code: &str, day: NaiveDate, status: &str) {
+        assert!(code.starts_with("TEST_CODE_"));
+        let mut conn = db.get_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO qualified_daily_trading_status \
+             (code,date,status,contract_version,source,source_at,observed_at,batch_id) \
+             VALUES (?1,?2,?3,'TEST_CODE_AUTHORITY_V1','TEST_CODE_AUTHORITY', \
+                     '2026-09-30T07:00:00Z','2026-09-30T07:00:01Z','TEST_CODE_BATCH')",
+        )
+        .bind::<diesel::sql_types::Text, _>(code)
+        .bind::<diesel::sql_types::Text, _>(day.to_string())
+        .bind::<diesel::sql_types::Text, _>(status)
+        .execute(&mut conn)
+        .unwrap();
+    }
+
+    fn qualified_daily_seed(
+        db: &DatabaseManager,
+        code: &str,
+        day: NaiveDate,
+        close: f64,
+        status: &str,
+    ) {
+        qualified_daily_save_single(db, &qualified_daily_record(code, day, close)).unwrap();
+        qualified_daily_test_marker(db, code, day, status);
+    }
+
+    #[derive(Debug, PartialEq, Eq, diesel::QueryableByName)]
+    struct QualifiedDailyMarkerRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        code: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        date: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+    }
+
+    fn qualified_daily_markers(db: &DatabaseManager) -> Vec<QualifiedDailyMarkerRow> {
+        let mut conn = db.get_conn().unwrap();
+        diesel::sql_query(
+            "SELECT code,date,status FROM qualified_daily_trading_status ORDER BY code,date",
+        )
+        .load(&mut conn)
+        .unwrap()
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct QualifiedDailySnapshotRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        serialized: String,
+    }
+
+    fn qualified_daily_snapshot(db: &DatabaseManager) -> Vec<String> {
+        let mut conn = db.get_conn().unwrap();
+        let daily = diesel::sql_query(
+            "SELECT 'daily:' || quote(id) || '|' || quote(code) || '|' || quote(date) || \
+             '|' || quote(open) || '|' || quote(high) || '|' || quote(low) || '|' || quote(close) || \
+             '|' || quote(volume) || '|' || quote(amount) || '|' || quote(pct_chg) || \
+             '|' || quote(ma5) || '|' || quote(ma10) || '|' || quote(ma20) || \
+             '|' || quote(volume_ratio) || '|' || quote(data_source) || \
+             '|' || quote(created_at) || '|' || quote(updated_at) || '|' || quote(is_limit_up) || \
+             '|' || quote(is_limit_down) || '|' || quote(is_suspended) AS serialized \
+             FROM stock_daily ORDER BY code,date",
+        )
+        .load::<QualifiedDailySnapshotRow>(&mut conn)
+        .unwrap();
+        let markers = diesel::sql_query(
+            "SELECT 'marker:' || quote(rowid) || '|' || quote(code) || '|' || quote(date) || \
+             '|' || quote(status) || '|' || quote(contract_version) || '|' || quote(source) || \
+             '|' || quote(source_at) || '|' || quote(observed_at) || '|' || quote(batch_id) \
+             AS serialized FROM qualified_daily_trading_status ORDER BY code,date",
+        )
+        .load::<QualifiedDailySnapshotRow>(&mut conn)
+        .unwrap();
+        daily
+            .into_iter()
+            .chain(markers)
+            .map(|row| row.serialized)
+            .collect()
+    }
+
+    fn qualified_daily_admitted(code: &str, bars: Vec<KlineData>) -> AdmittedDailyBars {
+        AdmittedDailyBars::from_test_fixture(
+            code,
+            bars,
+            BatchEvidence {
+                provider: ProviderId::Tdx,
+                source: "TEST_CODE_ordinary_daily".to_owned(),
+                source_at: Some("2026-09-29".to_owned()),
+                observed_at: "2026-09-29T15:01:00+08:00".to_owned(),
+                batch_id: "TEST_CODE_ordinary_batch".to_owned(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn qualified_daily_ordinary_savers_invalidate_only_exact_key() {
+        use crate::database::repository::StockRepository;
+
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        for saver in ["single", "batch", "raw_bars", "admitted", "repository"] {
+            let (_dir, db) = qualified_daily_private_db();
+            let code = "TEST_CODE_qualified_target";
+            let other = "TEST_CODE_qualified_other";
+            qualified_daily_seed(&db, code, day1, 10.0, "trading");
+            qualified_daily_seed(&db, code, day2, 11.0, "suspended");
+            qualified_daily_seed(&db, other, day1, 20.0, "trading");
+            let record = qualified_daily_record(code, day1, 10.5);
+            let bars = vec![kline(day1, 10.5, 0.0)];
+            match saver {
+                "single" => qualified_daily_save_single(&db, &record).unwrap(),
+                "batch" => assert_eq!(db.save_daily_batch(&[record]).unwrap(), 1),
+                "raw_bars" => {
+                    assert_eq!(
+                        db.save_kline_data(code, &bars, "TEST_CODE_daily").unwrap(),
+                        1
+                    )
+                }
+                "admitted" => assert_eq!(
+                    db.save_admitted_kline_data(&qualified_daily_admitted(code, bars))
+                        .unwrap(),
+                    1
+                ),
+                "repository" => {
+                    assert_eq!(
+                        StockRepository::save_kline(&db, code, &bars).await.unwrap(),
+                        1
+                    )
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                qualified_daily_markers(&db),
+                vec![
+                    QualifiedDailyMarkerRow {
+                        code: other.to_owned(),
+                        date: day1.to_string(),
+                        status: "trading".to_owned(),
+                    },
+                    QualifiedDailyMarkerRow {
+                        code: code.to_owned(),
+                        date: day2.to_string(),
+                        status: "suspended".to_owned(),
+                    },
+                ],
+                "{saver} must invalidate only the exact written key"
+            );
+            let rows = db.get_data_range(code, day1, day2).unwrap();
+            assert_eq!((rows[0].close, rows[1].close), (Some(10.5), Some(11.0)));
+            assert_eq!(db.get_latest_data(other, 1).unwrap()[0].close, Some(20.0));
+        }
+    }
+
+    #[test]
+    fn qualified_daily_identical_prices_and_both_statuses_lose_qualification() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        for status in ["trading", "suspended"] {
+            let (_dir, db) = qualified_daily_private_db();
+            let code = "TEST_CODE_qualified_identical";
+            qualified_daily_seed(&db, code, day, 10.0, status);
+            qualified_daily_save_single(&db, &qualified_daily_record(code, day, 10.0)).unwrap();
+            assert!(qualified_daily_markers(&db).is_empty());
+            assert_eq!(db.get_latest_data(code, 1).unwrap()[0].close, Some(10.0));
+        }
+    }
+
+    #[test]
+    fn qualified_daily_single_upsert_invalidation_failure_rolls_back_daily_and_marker() {
+        let (_dir, db) = qualified_daily_private_db();
+        let day = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let code = "TEST_CODE_qualified_single_rollback";
+        qualified_daily_seed(&db, code, day, 10.0, "trading");
+        diesel::sql_query(
+            "CREATE TRIGGER TEST_CODE_reject_marker_delete \
+             BEFORE DELETE ON qualified_daily_trading_status \
+             BEGIN SELECT RAISE(ABORT,'TEST_CODE_marker_delete_blocked'); END",
+        )
+        .execute(&mut db.get_conn().unwrap())
+        .unwrap();
+        let before = qualified_daily_snapshot(&db);
+        let error = qualified_daily_save_single(&db, &qualified_daily_record(code, day, 12.0))
+            .expect_err("invalidation failure must fail the whole ordinary write");
+        assert!(error
+            .to_string()
+            .contains("TEST_CODE_marker_delete_blocked"));
+        assert_eq!(qualified_daily_snapshot(&db), before);
+    }
+
+    #[test]
+    fn qualified_daily_batch_and_bar_later_invalidation_failure_rolls_back_all_rows() {
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        for saver in ["batch", "raw_bars", "admitted"] {
+            let (_dir, db) = qualified_daily_private_db();
+            let code = "TEST_CODE_qualified_later_rollback";
+            qualified_daily_seed(&db, code, day1, 10.0, "trading");
+            qualified_daily_seed(&db, code, day2, 11.0, "suspended");
+            diesel::sql_query(
+                "CREATE TRIGGER TEST_CODE_reject_later_marker_delete \
+                 BEFORE DELETE ON qualified_daily_trading_status WHEN OLD.date='2026-09-29' \
+                 BEGIN SELECT RAISE(ABORT,'TEST_CODE_later_marker_delete_blocked'); END",
+            )
+            .execute(&mut db.get_conn().unwrap())
+            .unwrap();
+            let before = qualified_daily_snapshot(&db);
+            let bars = vec![kline(day1, 10.5, 0.0), kline(day2, 11.55, 10.0)];
+            let error = match saver {
+                "batch" => db.save_daily_batch(&[
+                    qualified_daily_record(code, day1, 10.5),
+                    qualified_daily_record(code, day2, 11.55),
+                ]),
+                "raw_bars" => db.save_kline_data(code, &bars, "TEST_CODE_daily"),
+                "admitted" => db.save_admitted_kline_data(&qualified_daily_admitted(code, bars)),
+                _ => unreachable!(),
+            }
+            .expect_err("later invalidation failure must roll back every earlier row");
+            assert!(error
+                .to_string()
+                .contains("TEST_CODE_later_marker_delete_blocked"));
+            assert_eq!(qualified_daily_snapshot(&db), before, "{saver}");
+        }
+    }
+
+    #[test]
+    fn qualified_daily_empty_and_rejected_batches_preserve_rows_and_markers() {
+        let (_dir, db) = qualified_daily_private_db();
+        let day = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let code = "TEST_CODE_qualified_rejected";
+        qualified_daily_seed(&db, code, day, 10.0, "trading");
+        let before = qualified_daily_snapshot(&db);
+        assert_eq!(db.save_daily_batch(&[]).unwrap(), 0);
+        assert_eq!(db.save_kline_data(code, &[], "TEST_CODE_daily").unwrap(), 0);
+        let mut invalid = kline(day, 10.0, 0.0);
+        invalid.amount = 0.0;
+        assert!(db
+            .save_kline_data(code, &[invalid], "TEST_CODE_daily")
+            .is_err());
+        assert_eq!(qualified_daily_snapshot(&db), before);
+    }
+
+    #[test]
+    fn qualified_daily_delete_clears_only_requested_code_and_orphans_with_daily_count() {
+        let (_dir, db) = qualified_daily_private_db();
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let day3 = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let code = "TEST_CODE_qualified_delete";
+        let other = "TEST_CODE_qualified_other";
+        let orphan_only = "TEST_CODE_qualified_orphan_only";
+        qualified_daily_seed(&db, code, day1, 10.0, "trading");
+        qualified_daily_seed(&db, code, day2, 11.0, "suspended");
+        qualified_daily_test_marker(&db, code, day3, "trading");
+        qualified_daily_seed(&db, other, day1, 20.0, "trading");
+        qualified_daily_test_marker(&db, orphan_only, day1, "suspended");
+        assert_eq!(db.delete_stock_data(code).unwrap(), 2);
+        assert!(db.get_latest_data(code, 10).unwrap().is_empty());
+        assert_eq!(db.delete_stock_data(orphan_only).unwrap(), 0);
+        assert_eq!(
+            qualified_daily_markers(&db),
+            vec![QualifiedDailyMarkerRow {
+                code: other.to_owned(),
+                date: day1.to_string(),
+                status: "trading".to_owned(),
+            }]
+        );
+        assert_eq!(db.get_latest_data(other, 1).unwrap()[0].close, Some(20.0));
+    }
+
+    #[test]
+    fn qualified_daily_delete_invalidation_failure_rolls_back_rows_and_markers() {
+        let (_dir, db) = qualified_daily_private_db();
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let code = "TEST_CODE_qualified_delete_rollback";
+        qualified_daily_seed(&db, code, day1, 10.0, "trading");
+        qualified_daily_seed(&db, code, day2, 11.0, "suspended");
+        diesel::sql_query(
+            "CREATE TRIGGER TEST_CODE_reject_delete_invalidation \
+             BEFORE DELETE ON qualified_daily_trading_status \
+             BEGIN SELECT RAISE(ABORT,'TEST_CODE_delete_invalidation_blocked'); END",
+        )
+        .execute(&mut db.get_conn().unwrap())
+        .unwrap();
+        let before = qualified_daily_snapshot(&db);
+        let error = db.delete_stock_data(code).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("TEST_CODE_delete_invalidation_blocked"));
+        assert_eq!(qualified_daily_snapshot(&db), before);
+    }
+
+    #[tokio::test]
+    async fn qualified_daily_ordinary_overwrite_defers_actual_prediction_verifier_without_mutation()
+    {
+        let (_dir, db) = qualified_daily_private_db();
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let code = "TEST_CODE_qualified_prediction";
+        db.save_prediction_legacy(
+            &day1.to_string(),
+            &day2.to_string(),
+            None,
+            Some(code),
+            "up",
+            80.0,
+            None,
+        )
+        .unwrap();
+        qualified_daily_seed(&db, code, day1, 10.0, "trading");
+        qualified_daily_seed(&db, code, day2, 11.0, "trading");
+        let before = serde_json::to_value(
+            db.get_prediction_by_code_date(code, &day1.to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        let original = crate::monitor::prediction::verify_one(
+            &db,
+            code,
+            &day1.to_string(),
+            &day2.to_string(),
+            "up",
+        )
+        .await
+        .expect("synthetic qualified exact closes permit the original read-only observation");
+        assert!(original.hit);
+        assert!((original.actual_change - 10.0).abs() < 1e-9);
+
+        qualified_daily_save_single(&db, &qualified_daily_record(code, day2, 11.0)).unwrap();
+        assert!(crate::monitor::prediction::verify_one(
+            &db,
+            code,
+            &day1.to_string(),
+            &day2.to_string(),
+            "up",
+        )
+        .await
+        .is_none());
+        let after = db
+            .get_prediction_by_code_date(code, &day1.to_string())
+            .unwrap();
+        assert!(after.actual_change.is_none());
+        assert!(after.hit.is_none());
+        assert!(after.actual_result.is_none());
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
 }

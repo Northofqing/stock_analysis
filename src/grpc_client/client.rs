@@ -41,6 +41,8 @@ pub(crate) mod board_attempt;
 #[cfg(test)]
 #[path = "board_loopback_fixture.rs"]
 pub(crate) mod board_loopback_fixture;
+#[path = "candidate_probe.rs"]
+pub mod candidate_probe;
 #[cfg(test)]
 #[path = "dragon_tiger_attempt_tests.rs"]
 mod dragon_tiger_attempt_tests;
@@ -361,6 +363,36 @@ impl GrpcMarketClient {
     pub(crate) fn prepare_client_bundle(
         path: &Path,
     ) -> Result<PreparedExternalEndpoint, GrpcError> {
+        let config = Self::load_bundle_config(path)?;
+        let trust = super::build_identity::BuildIdentityTrust::bundled()
+            .map_err(|_| super::connection_qualification::unqualified())?;
+        Self::prepare_loaded_bundle(config, trust)
+    }
+
+    fn load_bundle_config(path: &Path) -> Result<ClientBundleConfig, GrpcError> {
+        crate::grpc_client::bundle::load(path).map_err(|_| GrpcError::InvalidArgument {
+            details: Box::default(),
+        })
+    }
+
+    fn prepare_candidate_b7_bundle(path: &Path) -> Result<PreparedExternalEndpoint, GrpcError> {
+        let config = Self::load_bundle_config(path)?;
+        if config.endpoint_uri != candidate_probe::CANDIDATE_ENDPOINT
+            || config.tls_server_name != candidate_probe::CANDIDATE_TLS_NAME
+        {
+            return Err(GrpcError::InvalidArgument {
+                details: Box::default(),
+            });
+        }
+        let trust = super::build_identity::BuildIdentityTrust::candidate_b7_probe()
+            .map_err(|_| super::connection_qualification::unqualified())?;
+        Self::prepare_loaded_bundle(config, trust)
+    }
+
+    fn prepare_loaded_bundle(
+        config: ClientBundleConfig,
+        qualification_trust: super::build_identity::BuildIdentityTrust,
+    ) -> Result<PreparedExternalEndpoint, GrpcError> {
         let ClientBundleConfig {
             endpoint_uri,
             tls_server_name,
@@ -368,9 +400,7 @@ impl GrpcMarketClient {
             certificate_pem,
             private_key_pem,
             bearer_token,
-        } = crate::grpc_client::bundle::load(path).map_err(|_| GrpcError::InvalidArgument {
-            details: Box::default(),
-        })?;
+        } = config;
 
         let acquisition_authority = format!("grpc-mtls:{tls_server_name}");
         let tls = ClientTlsConfig::new()
@@ -396,8 +426,7 @@ impl GrpcMarketClient {
             endpoint_uri,
             authorization: ClientAuthorization::InstanceBearer(bearer_token),
             acquisition_authority,
-            qualification_trust: super::build_identity::BuildIdentityTrust::bundled()
-                .map_err(|_| super::connection_qualification::unqualified())?,
+            qualification_trust,
         })
     }
 

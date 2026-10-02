@@ -340,3 +340,33 @@ impl P05PreparedChild {
         self.counted.resume_p05_child_inspection(&self.inner, sinks)
     }
 }
+
+/// Internal report observation. It cannot open business, send, or finalize.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct P05OutcomeUnitRead {
+    pub(crate) date: String,
+    pub(crate) sql_sha256: String,
+    pub(crate) draft_identity: Option<String>,
+    pub(crate) preparing: bool,
+    pub(crate) board: Option<P05OutcomeBoardRead>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct P05OutcomeBoardRead {
+    pub(crate) child_identity: String,
+    pub(crate) decision_identity: String,
+    pub(crate) envelope_sha256: String,
+    pub(crate) target_date: Option<String>,
+    pub(crate) source_sha256: String,
+    pub(crate) rows: Vec<(i64, String, u64)>,
+    pub(crate) receipts: Vec<crate::durable_delivery::P05ChildReceiptObservation>,
+    pub(crate) awaiting_drain: bool,
+}
+
+/// Calls only the existing local read owners; never restore/prepare/finalize.
+pub(crate) fn read_p05_outcome_unit(
+    counted: &DurableDeliveryCoordinator,
+    db: &crate::database::DatabaseManager,
+    date: &str,
+) -> Result<P05OutcomeUnitRead> {
+    counted.read_p05_outcome_unit_on(db, date)
+}

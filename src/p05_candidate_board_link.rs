@@ -9,9 +9,9 @@ use crate::database::p05_prediction_freeze::{
 };
 use crate::database::DatabaseManager;
 use crate::durable_delivery::{
-    CandidateBoardCardObservationV1, CandidateBoardCardTerminalV1, CandidateBoardSourceLinkV1,
-    CooldownScope, DeliveryEnvelope, DeliverySubKind, DurableDeliveryCoordinator,
-    DurableDeliveryError, PushKind,
+    CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
+    CandidateBoardSourceLinkV1, CooldownScope, DeliveryEnvelope, DeliverySubKind,
+    DurableDeliveryCoordinator, DurableDeliveryError, PushKind,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +96,37 @@ pub fn read_candidate_board_occurrence_link(
     }
 
     let freeze = prediction_db.read_candidate_board_v2_freeze(occurrence_identity)?;
+    link_candidate_board_snapshot(
+        observation.as_ref(),
+        freeze.as_ref(),
+        business_date,
+        occurrence_identity,
+    )
+}
+
+/// Internal batch reuse of the original exact comparison. The inputs are
+/// read observations, not an admission or a caller receipt factory.
+pub(crate) fn link_candidate_board_snapshot(
+    observation: Option<&CandidateBoardCardObservationV2>,
+    freeze: Option<&FrozenCandidateBoardV2>,
+    business_date: &str,
+    occurrence_identity: &str,
+) -> Result<CandidateBoardOccurrenceLinkV1, CandidateBoardLinkError> {
+    if !occurrence_identity.starts_with(&format!("candidate-board:{business_date}:")) {
+        return Err(CandidateBoardLinkError::Mismatch(
+            "occurrence does not match batch date",
+        ));
+    }
+    if let Some(observation) = observation {
+        if matches!(
+            observation.source_link(),
+            CandidateBoardSourceLinkV1::UnlinkedV1
+        ) {
+            return Ok(CandidateBoardOccurrenceLinkV1::UnlinkedV1 {
+                card: observation.card().clone(),
+            });
+        }
+    }
     match (observation, freeze) {
         (None, None) => Ok(CandidateBoardOccurrenceLinkV1::Absent),
         (None, Some(freeze)) => Ok(CandidateBoardOccurrenceLinkV1::FrozenOnly {

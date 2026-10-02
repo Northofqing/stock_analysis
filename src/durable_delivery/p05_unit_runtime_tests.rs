@@ -2529,3 +2529,435 @@ fn p05_shared_unit_consumer_crossday_view_retains_actual_t08_ordinal_scope_sourc
     assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"), 2);
     assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 2);
 }
+
+fn outcome_report(
+    db: &DatabaseManager,
+    f: &Fixture,
+    target: &str,
+) -> std::result::Result<crate::monitor::prediction::OutcomeDailyWeeklyObservation, &'static str> {
+    crate::monitor::prediction::OutcomeTracker::new(db, Some(&f.coordinator))
+        .read_at_for_test(format!("{target}T15:01:00+08:00").parse().unwrap())
+}
+fn outcome_target(db: &DatabaseManager, draft: &StoredP05Draft) -> String {
+    db.read_candidate_board_v2_freeze(&draft.board_occurrence().unwrap())
+        .unwrap()
+        .unwrap()
+        .target_date()
+        .into()
+}
+fn outcome_linked(
+    report: &crate::monitor::prediction::OutcomeDailyWeeklyObservation,
+) -> &crate::monitor::prediction::PhysicalLinkedOutcomeCounts {
+    match &report.daily.physical_linked {
+        crate::monitor::prediction::PhysicalLinkedOutcomeObservation::Observed(c) => c,
+        other => panic!("actual original Unit linkage unavailable: {other:?}"),
+    }
+}
+fn deliver_board_only(
+    f: &Fixture,
+    db: &DatabaseManager,
+    intent: &StoredP05Intent,
+    append: &Append,
+) -> Arc<Sink> {
+    let index = intent
+        .children
+        .iter()
+        .position(|(_, raw)| parse_envelope(raw).unwrap().push_kind == PushKind::CandidateBoard)
+        .unwrap();
+    let (port, sinks) = sink(accepted(at(23, 9, 22, 0)));
+    let delivered = f
+        .coordinator
+        .dispatch_p05_unit_child_local(db, DATE, index, &sinks, append, Some(at(23, 9, 22, 0)))
+        .unwrap();
+    assert_eq!(delivered.sink_calls, 1);
+    port
+}
+
+#[test]
+fn outcome_tracker_shared_unit_board_only_counts_original_rows_without_unit_completion() {
+    let f = Fixture::new("OUTCOME_UNIT_BOARD_ONLY");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_board_only(&f, &db, &intent, &append);
+    let target = outcome_target(&db, &draft);
+    let original = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    assert!(original.completion_identity().is_none());
+    assert_eq!(
+        original
+            .children()
+            .iter()
+            .filter(|c| matches!(c, P05ChildReceiptObservation::PhysicallyAccepted { .. }))
+            .count(),
+        1
+    );
+    assert!(original
+        .children()
+        .iter()
+        .any(|c| matches!(c, P05ChildReceiptObservation::NotPrepared { .. })));
+    let before = capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap();
+    let report = outcome_report(&db, &f, &target).unwrap();
+    let linked = outcome_linked(&report);
+    assert_eq!(
+        (
+            linked.physically_accepted_cards,
+            linked.covered_samples,
+            linked.pending_samples,
+            linked.awaiting_drain_samples
+        ),
+        (1, 2, 2, 0)
+    );
+    assert_eq!(linked.rate, None);
+    assert!(outcome_report(&db, &f, &target).unwrap() == report);
+    assert!(
+        capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap() == before
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.query_i64("SELECT COUNT(*) FROM p05_s2_completion_receipts"),
+        0
+    );
+}
+
+#[test]
+fn outcome_tracker_shared_unit_auction_acceptance_does_not_count_board_samples() {
+    let f = Fixture::new("OUTCOME_UNIT_AUCTION");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let index = intent
+        .children
+        .iter()
+        .position(|(_, raw)| parse_envelope(raw).unwrap().push_kind == PushKind::AuctionRepush)
+        .unwrap();
+    let (port, sinks) = sink(accepted(at(23, 9, 22, 0)));
+    f.coordinator
+        .dispatch_p05_unit_child_local(
+            &db,
+            DATE,
+            index,
+            &sinks,
+            &Append::default(),
+            Some(at(23, 9, 22, 0)),
+        )
+        .unwrap();
+    let report = outcome_report(&db, &f, &outcome_target(&db, &draft)).unwrap();
+    assert_eq!(report.daily.observed.due_samples, 2);
+    assert_eq!(
+        (
+            outcome_linked(&report).physically_accepted_cards,
+            outcome_linked(&report).covered_samples
+        ),
+        (0, 0)
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn outcome_tracker_shared_unit_completed_units_remain_in_report_and_score_drift_is_unavailable() {
+    let f = Fixture::new("OUTCOME_UNIT_COMPLETED");
+    let (dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_all(&f, &db, &intent, 23, &append);
+    assert!(finalize(&f, DATE).completion_identity().is_some());
+    assert!(f
+        .coordinator
+        .inspect_p05_unfinished_units()
+        .unwrap()
+        .is_empty());
+    let target = outcome_target(&db, &draft);
+    assert_eq!(
+        outcome_linked(&outcome_report(&db, &f, &target).unwrap()).covered_samples,
+        2
+    );
+    let original = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    let before = owned_revision(&f);
+    corrupt_actual_score(&dir);
+    let report = outcome_report(&db, &f, &target).unwrap();
+    assert!(matches!(
+        report.daily.physical_linked,
+        crate::monitor::prediction::PhysicalLinkedOutcomeObservation::Unavailable {
+            reason: "outcome_unit_context_unavailable"
+        }
+    ));
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(
+        f.coordinator.observe_p05_unit_receipts(DATE).unwrap(),
+        original
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    Connection::open(dir.path().join("TEST_CODE_P05_S2.db"))
+        .unwrap()
+        .execute(
+            "UPDATE prediction_tracker SET pred_score=80 WHERE stock_code='TEST_CODE_600001'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        outcome_linked(&outcome_report(&db, &f, &target).unwrap()).covered_samples,
+        2
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn outcome_tracker_shared_unit_late_pending_audit_retains_accepted_until_external_drain() {
+    let f = Fixture::new("OUTCOME_UNIT_LATE");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_all(&f, &db, &intent, 23, &append);
+    assert!(finalize(&f, DATE).completion_identity().is_some());
+    let target = outcome_target(&db, &draft);
+    let (attempt,fence):(String,i64)=Connection::open(&f.database_path).unwrap()
+        .query_row("SELECT a.attempt_identity,a.fence_token FROM delivery_attempts a JOIN delivery_decisions d ON d.decision_identity=a.decision_identity WHERE d.push_kind='CandidateBoard'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    f.coordinator
+        .record_sink_result(
+            &attempt,
+            fence,
+            accepted(at(23, 9, 22, 2)),
+            at(23, 9, 22, 2),
+        )
+        .unwrap();
+    let receipt = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    assert!(receipt.completion_identity().is_none());
+    assert!(receipt
+        .children()
+        .iter()
+        .all(|c| matches!(c, P05ChildReceiptObservation::PhysicallyAccepted { .. })));
+    let before = capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap();
+    let report = outcome_report(&db, &f, &target).unwrap();
+    let linked = outcome_linked(&report);
+    assert_eq!(
+        (
+            linked.physically_accepted_cards,
+            linked.covered_samples,
+            linked.awaiting_drain_samples
+        ),
+        (1, 2, 2)
+    );
+    assert_eq!(linked.rate, None);
+    assert!(
+        capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap() == before
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    f.coordinator
+        .reconcile_all_pending(&append, at(23, 9, 22, 3))
+        .unwrap();
+    assert_eq!(
+        outcome_linked(&outcome_report(&db, &f, &target).unwrap()).awaiting_drain_samples,
+        0
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 3);
+}
+
+#[test]
+fn outcome_tracker_shared_unit_unknown_started_does_not_run_preparation_or_fallback() {
+    let f = Fixture::new("OUTCOME_UNIT_STARTED");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, true);
+    drop(f.coordinator.claim_p05_prediction_prepare(&draft).unwrap());
+    let before = capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap();
+    let target = crate::calendar::verified_next_a_share_trading_day(
+        chrono::NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap(),
+    )
+    .unwrap();
+    let mut maturity = target;
+    for _ in 1..5 {
+        maturity = crate::calendar::verified_next_a_share_trading_day(maturity).unwrap();
+    }
+    let report = outcome_report(&db, &f, &maturity.to_string()).unwrap();
+    assert!(matches!(
+        report.daily.physical_linked,
+        crate::monitor::prediction::PhysicalLinkedOutcomeObservation::Unavailable {
+            reason: "outcome_unit_preparation_pending"
+        }
+    ));
+    assert!(
+        capture_sql_binding(&Connection::open(&f.database_path).unwrap(), DATE).unwrap() == before
+    );
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_decisions"), 0);
+    assert!(!db.p05_preparation_residue_for_date(DATE).unwrap());
+}
+
+#[test]
+fn outcome_tracker_shared_unit_no_strong_never_adopts_later_actual_freeze() {
+    let f = Fixture::new("OUTCOME_UNIT_NO_STRONG");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, false);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_all(&f, &db, &intent, 23, &append);
+    let request = crate::monitor::prediction::CandidateBoardPreparationRequest::new(
+        DATE,
+        "09:21",
+        draft.board_rendered_bytes().to_vec(),
+        vec![("TEST_CODE_600001".into(), 80.)],
+    )
+    .unwrap();
+    let freeze = crate::monitor::prediction::prepare_candidate_board_on(&db, &request).unwrap();
+    let crate::monitor::prediction::CandidateBoardPreparation::Frozen { record: freeze, .. } =
+        freeze
+    else {
+        panic!("actual strong fixture must freeze");
+    };
+    let target = freeze.target_date().to_owned();
+    let original = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    let report = outcome_report(&db, &f, &target).unwrap();
+    assert!(matches!(
+        report.daily.physical_linked,
+        crate::monitor::prediction::PhysicalLinkedOutcomeObservation::Unavailable {
+            reason: "outcome_unit_context_unavailable"
+        }
+    ));
+    assert_eq!(
+        f.coordinator.observe_p05_unit_receipts(DATE).unwrap(),
+        original
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
+
+fn install_outcome_last_hook(
+    coordinator: Arc<DurableDeliveryCoordinator>,
+    remaining: usize,
+    hits: Arc<AtomicUsize>,
+    action: Arc<Mutex<Option<Box<dyn FnOnce() -> Result<()> + Send>>>>,
+) {
+    let next = coordinator.clone();
+    coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                if remaining == 1 {
+                    action.lock().unwrap().take().unwrap()()?;
+                } else {
+                    install_outcome_last_hook(next, remaining - 1, hits, action);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn outcome_tracker_all_card_hooks_finish_before_actual_operational_tail_read() {
+    let f = Fixture::new("OUTCOME_LAST_CARD_SCORE");
+    let (dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_board_only(&f, &db, &intent, &append);
+    let target = outcome_target(&db, &draft);
+    let original = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    let path = dir.path().join("TEST_CODE_P05_S2.db");
+    let hits = Arc::new(AtomicUsize::new(0));
+    // Five dates each have one Unit core and one card core, followed by drain
+    // and five final card cores. Mutate in the last actual card post-SQL hook.
+    install_outcome_last_hook(
+        fixture_coordinator_arc(&f),
+        16,
+        hits.clone(),
+        Arc::new(Mutex::new(Some(Box::new(move || {
+            Connection::open(path)?.execute(
+                "UPDATE prediction_tracker SET pred_score=81 WHERE stock_code='TEST_CODE_600001'",
+                [],
+            )?;
+            Ok(())
+        })))),
+    );
+    assert_eq!(
+        outcome_report(&db, &f, &target).unwrap_err(),
+        "outcome_prediction_changed_at_tail"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 16);
+    assert_eq!(
+        f.coordinator.observe_p05_unit_receipts(DATE).unwrap(),
+        original
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn outcome_tracker_all_card_hooks_bind_absent_unit_against_real_first_insert() {
+    const CHILD_DATABASE: &str = "TEST_CODE_OUTCOME_LAST_CARD_INSERT_CHILD_DATABASE";
+    const CASE: &str = "durable_delivery::coordinator::p05_unit::runtime::tests::outcome_tracker_all_card_hooks_bind_absent_unit_against_real_first_insert";
+    if let Some(path) = std::env::var_os(CHILD_DATABASE) {
+        let path = std::path::PathBuf::from(path);
+        let test_code = path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert!(test_code.starts_with("TEST_CODE_BR192_OUTCOME_LAST_CARD_INSERT_"));
+        let other =
+            DurableDeliveryCoordinator::open(crate::durable_delivery::CoordinatorConfig::test(
+                &path,
+                test_code,
+                "owner-TEST_CODE_OUTCOME_INSERT_CHILD-0123456789abcdef",
+            ))
+            .unwrap();
+        other
+            .store_p05_observed_draft_rendered(
+                &input(23, &["TEST_CODE_600001", "TEST_CODE_000001"], true),
+                Some(at(23, 9, 24, 0)),
+                &mut renderer,
+            )
+            .unwrap();
+        return;
+    }
+    let f = Fixture::new("OUTCOME_LAST_CARD_INSERT");
+    let (_dir, db) = operational();
+    f.coordinator
+        .initialize_prospective_p05_family_at(&db, at(23, 9, 19, 0), f.database_path.parent())
+        .unwrap();
+    let mut target = chrono::NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();
+    for _ in 0..5 {
+        target = crate::calendar::verified_next_a_share_trading_day(target).unwrap();
+    }
+    assert_eq!(
+        outcome_linked(&outcome_report(&db, &f, &target.to_string()).unwrap()).covered_samples,
+        0
+    );
+    let database = f.database_path.clone();
+    let hits = Arc::new(AtomicUsize::new(0));
+    install_outcome_last_hook(
+        fixture_coordinator_arc(&f),
+        16,
+        hits.clone(),
+        Arc::new(Mutex::new(Some(Box::new(move || {
+            // The parent holds the process-wide attestation operation lease.
+            // A real independent process can append through the original
+            // coordinator protocol without reentering that local mutex.
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD_DATABASE, &database)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "actual insertion child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            Ok(())
+        })))),
+    );
+    let report = outcome_report(&db, &f, &target.to_string()).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 16);
+    assert!(matches!(
+        report.daily.physical_linked,
+        crate::monitor::prediction::PhysicalLinkedOutcomeObservation::Unavailable {
+            reason: "outcome_sql_binding_changed_at_tail"
+        }
+    ));
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_unit_drafts"), 1);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_decisions"), 0);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"), 0);
+    assert!(!db.p05_preparation_residue_for_date(DATE).unwrap());
+}

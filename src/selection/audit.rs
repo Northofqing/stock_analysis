@@ -202,6 +202,21 @@ impl ValidatedAuditChainSnapshot {
     }
 }
 
+/// Read restrictions for the prospective operator; they grant no append rights.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuditReadLimits {
+    pub(crate) max_scan_bytes: u64,
+    pub(crate) max_total_scan_bytes: u64,
+    pub(crate) max_records: usize,
+}
+
+struct AuditReadBudget {
+    limits: AuditReadLimits,
+    scanned: u64,
+    #[cfg(test)]
+    before_actual_read: Option<Box<dyn FnOnce()>>,
+}
+
 /// Result of an exact recovery lookup performed while the audit lock is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "recovery callers must handle missing and conflicting audit evidence"]
@@ -215,6 +230,8 @@ pub enum AuditExactLookup {
 
 #[derive(Debug, Error)]
 pub enum SelectionAuditError {
+    #[error("bounded selection audit read budget exceeded: {limit}")]
+    ReadBudgetExceeded { limit: &'static str },
     #[error("selection audit chain invalid: {0}")]
     ChainInvalid(String),
     #[error("selection audit record invalid: {0}")]
@@ -230,6 +247,7 @@ pub enum SelectionAuditError {
 impl SelectionAuditError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ReadBudgetExceeded { .. } => "audit_read_budget_exceeded",
             Self::ChainInvalid(_) => "audit_chain_invalid",
             Self::InvalidRecord(_) => "audit_record_invalid",
             Self::Lock(_) => "audit_lock_failed",
@@ -326,6 +344,7 @@ pub struct LockedSelectionAuditSession<'writer> {
     lock_identity: FileIdentity,
     audit_data: PinnedAuditData,
     validation: AuditValidationReceipt,
+    read_budget: Option<AuditReadBudget>,
     poisoned: bool,
     #[cfg(test)]
     inject_unlock_failure: bool,
@@ -452,6 +471,31 @@ impl SelectionAuditWriter {
     }
 
     pub fn locked_session(&self) -> Result<LockedSelectionAuditSession<'_>, SelectionAuditError> {
+        self.locked_session_with_read_budget(None)
+    }
+
+    pub(crate) fn locked_session_bounded(
+        &self,
+        limits: AuditReadLimits,
+    ) -> Result<LockedSelectionAuditSession<'_>, SelectionAuditError> {
+        if limits.max_scan_bytes == 0 || limits.max_total_scan_bytes == 0 || limits.max_records == 0
+        {
+            return Err(SelectionAuditError::ReadBudgetExceeded {
+                limit: "invalid limits",
+            });
+        }
+        self.locked_session_with_read_budget(Some(AuditReadBudget {
+            limits,
+            scanned: 0,
+            #[cfg(test)]
+            before_actual_read: None,
+        }))
+    }
+
+    fn locked_session_with_read_budget(
+        &self,
+        read_budget: Option<AuditReadBudget>,
+    ) -> Result<LockedSelectionAuditSession<'_>, SelectionAuditError> {
         // Note: an earlier draft attempted to recover from a poisoned
         // process_audit_lock (unwrap_or_else(|p| p.into_inner())) to
         // contain test-suite cascades. Empirical verification showed
@@ -602,6 +646,7 @@ impl SelectionAuditWriter {
                 record_count: 0,
                 tail_hash: None,
             },
+            read_budget,
             poisoned: false,
             #[cfg(test)]
             inject_unlock_failure: false,
@@ -1141,9 +1186,12 @@ impl LockedSelectionAuditSession<'_> {
                 record_count: 0,
                 tail_hash: None,
             }),
-            PinnedAuditData::Present { file, .. } => {
-                scan_validated_chain_file(file, &self.writer.path, inspect_record)
-            }
+            PinnedAuditData::Present { file, .. } => scan_validated_chain_file(
+                file,
+                &self.writer.path,
+                self.read_budget.as_mut(),
+                inspect_record,
+            ),
         }
     }
 
@@ -1566,6 +1614,7 @@ fn validate_record_fields(
 fn scan_validated_chain_file(
     file: &mut File,
     diagnostic_path: &Path,
+    mut read_budget: Option<&mut AuditReadBudget>,
     mut inspect_record: impl FnMut(&SelectionAuditRecord),
 ) -> Result<AuditValidationReceipt, SelectionAuditError> {
     file.seek(SeekFrom::Start(0)).map_err(|error| {
@@ -1575,12 +1624,78 @@ fn scan_validated_chain_file(
         ))
     })?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        SelectionAuditError::Io(format!(
-            "read pinned audit {}: {error}",
-            diagnostic_path.display()
-        ))
-    })?;
+    if let Some(budget) = read_budget.as_deref_mut() {
+        let remaining = budget
+            .limits
+            .max_total_scan_bytes
+            .checked_sub(budget.scanned)
+            .ok_or(SelectionAuditError::ReadBudgetExceeded {
+                limit: "total scan bytes",
+            })?;
+        let allowed = budget.limits.max_scan_bytes.min(remaining);
+        let declared = file
+            .metadata()
+            .map_err(|e| SelectionAuditError::Io(e.to_string()))?
+            .len();
+        if declared > allowed {
+            return Err(SelectionAuditError::ReadBudgetExceeded {
+                limit: "scan or total bytes",
+            });
+        }
+        #[cfg(test)]
+        if let Some(hook) = budget.before_actual_read.take() {
+            hook();
+        }
+        let mut chunk = [0_u8; 8192];
+        loop {
+            // One stack-only sentinel detects actual growth; fstat is not the read limit.
+            let room = allowed.saturating_sub(bytes.len() as u64);
+            let request = if room >= chunk.len() as u64 {
+                chunk.len()
+            } else {
+                room as usize + 1
+            };
+            let count = file
+                .read(&mut chunk[..request])
+                .map_err(|e| SelectionAuditError::Io(e.to_string()))?;
+            if count == 0 {
+                break;
+            }
+            let new_len = (bytes.len() as u64).checked_add(count as u64).ok_or(
+                SelectionAuditError::ReadBudgetExceeded {
+                    limit: "scan bytes overflow",
+                },
+            )?;
+            if new_len > allowed {
+                return Err(SelectionAuditError::ReadBudgetExceeded {
+                    limit: "actual scan bytes",
+                });
+            }
+            budget.scanned = budget.scanned.checked_add(count as u64).ok_or(
+                SelectionAuditError::ReadBudgetExceeded {
+                    limit: "total scan bytes overflow",
+                },
+            )?;
+            bytes.try_reserve_exact(count).map_err(|_| {
+                SelectionAuditError::ReadBudgetExceeded {
+                    limit: "allocation",
+                }
+            })?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        if bytes.len() as u64 != declared {
+            return Err(SelectionAuditError::ChainInvalid(
+                "bounded audit length changed during scan".into(),
+            ));
+        }
+    } else {
+        file.read_to_end(&mut bytes).map_err(|error| {
+            SelectionAuditError::Io(format!(
+                "read pinned audit {}: {error}",
+                diagnostic_path.display()
+            ))
+        })?;
+    }
     if bytes.is_empty() {
         return Ok(AuditValidationReceipt {
             record_count: 0,
@@ -1606,6 +1721,14 @@ fn scan_validated_chain_file(
                 diagnostic_path.display(),
                 index + 1
             )));
+        }
+        if read_budget
+            .as_ref()
+            .is_some_and(|budget| record_count >= budget.limits.max_records)
+        {
+            return Err(SelectionAuditError::ReadBudgetExceeded {
+                limit: "record count",
+            });
         }
         let record = serde_json::from_slice::<SelectionAuditRecord>(line).map_err(|error| {
             SelectionAuditError::ChainInvalid(format!(
@@ -1715,6 +1838,147 @@ mod tests {
     fn test_writer(root: &TempAuditRoot) -> SelectionAuditWriter {
         SelectionAuditWriter::for_test_code_root(&root.0)
             .expect("construct isolated TEST_CODE audit writer")
+    }
+
+    #[test]
+    fn bounded_setup_and_record_limit_fail_without_mutation() {
+        let root = TempAuditRoot::new("bounded-setup");
+        let writer = test_writer(&root);
+        writer
+            .append(record(SelectionAuditPhase::Prepared, "TEST_CODE_BOUNDED_1"))
+            .unwrap();
+        writer
+            .append(record(SelectionAuditPhase::Prepared, "TEST_CODE_BOUNDED_2"))
+            .unwrap();
+        let before = fs::read(writer.path()).unwrap();
+        let length = before.len() as u64;
+        for limits in [
+            AuditReadLimits {
+                max_scan_bytes: length - 1,
+                max_total_scan_bytes: length * 4,
+                max_records: 2,
+            },
+            AuditReadLimits {
+                max_scan_bytes: length,
+                max_total_scan_bytes: length * 4,
+                max_records: 1,
+            },
+        ] {
+            assert!(matches!(
+                writer.locked_session_bounded(limits),
+                Err(SelectionAuditError::ReadBudgetExceeded { .. })
+            ));
+            assert_eq!(fs::read(writer.path()).unwrap(), before);
+        }
+        assert_eq!(writer.validate().unwrap().record_count, 2);
+    }
+
+    #[test]
+    fn bounded_finish_is_charged_to_original_session_budget() {
+        let root = TempAuditRoot::new("bounded-finish");
+        let writer = test_writer(&root);
+        writer
+            .append(record(SelectionAuditPhase::Prepared, "TEST_CODE_BOUNDED"))
+            .unwrap();
+        let before = fs::read(writer.path()).unwrap();
+        let length = before.len() as u64;
+        let limits = AuditReadLimits {
+            max_scan_bytes: length,
+            max_total_scan_bytes: length * 2,
+            max_records: 1,
+        };
+        let mut session = writer.locked_session_bounded(limits).unwrap();
+        assert_eq!(
+            session
+                .validated_records()
+                .unwrap()
+                .validation()
+                .record_count,
+            1
+        );
+        assert!(matches!(
+            session.finish(),
+            Err(SelectionAuditError::ReadBudgetExceeded { .. })
+        ));
+        assert_eq!(fs::read(writer.path()).unwrap(), before);
+        let mut session = writer
+            .locked_session_bounded(AuditReadLimits {
+                max_total_scan_bytes: length * 3,
+                ..limits
+            })
+            .unwrap();
+        session.validated_records().unwrap();
+        assert_eq!(session.finish().unwrap().record_count, 1);
+    }
+
+    #[test]
+    fn bounded_actual_read_detects_growth_after_metadata_without_heap_copy() {
+        let root = TempAuditRoot::new("bounded-actual-growth");
+        let writer = test_writer(&root);
+        writer
+            .append(record(SelectionAuditPhase::Prepared, "TEST_CODE_BOUNDED"))
+            .unwrap();
+        let before = fs::read(writer.path()).unwrap();
+        let length = before.len() as u64;
+        let mut session = writer
+            .locked_session_bounded(AuditReadLimits {
+                max_scan_bytes: length,
+                max_total_scan_bytes: length * 4,
+                max_records: 1,
+            })
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_hit = hit.clone();
+        session.read_budget.as_mut().unwrap().before_actual_read = Some(Box::new(move || {
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            hook_hit.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(matches!(
+            session.finish(),
+            Err(SelectionAuditError::ReadBudgetExceeded {
+                limit: "actual scan bytes"
+            })
+        ));
+        assert!(hit.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(fs::metadata(writer.path()).unwrap().len(), length + 1);
+        fs::write(writer.path(), before).unwrap();
+        assert_eq!(writer.validate().unwrap().record_count, 1);
+    }
+
+    #[test]
+    fn bounded_growth_is_rejected_before_chain_decode_and_unlocks() {
+        let root = TempAuditRoot::new("bounded-growth");
+        let writer = test_writer(&root);
+        writer
+            .append(record(SelectionAuditPhase::Prepared, "TEST_CODE_BOUNDED"))
+            .unwrap();
+        let before = fs::read(writer.path()).unwrap();
+        let length = before.len() as u64;
+        let session = writer
+            .locked_session_bounded(AuditReadLimits {
+                max_scan_bytes: length,
+                max_total_scan_bytes: length * 4,
+                max_records: 1,
+            })
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(writer.path())
+            .unwrap()
+            .write_all(b"not a record beyond the bound")
+            .unwrap();
+        assert!(matches!(
+            session.finish(),
+            Err(SelectionAuditError::ReadBudgetExceeded { .. })
+        ));
+        fs::write(writer.path(), &before).unwrap();
+        assert_eq!(writer.validate().unwrap().record_count, 1);
     }
 
     #[test]

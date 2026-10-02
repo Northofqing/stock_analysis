@@ -1,0 +1,19 @@
+{
+  "bundle_version": "2026-10-02.3",
+  "source_commit": "b7d206668753dc762e776b0ff893c63d53166afe",
+  "market_data_rpc_count": 65,
+  "global_news_schema_version": 2,
+  "instrument_news_schema_version": 2,
+  "t0_evidence_schema_version": 2,
+  "financial_statements_schema_version": 2,
+  "market_announcements_supported_schema_versions": [1, 2],
+  "realtime_quotes_schema_version": 1,
+  "current_auction_observations_schema_version": 1,
+  "economic_release_observations_schema_version": 1,
+  "economic_release_schedule_schema_version": 1,
+  "futures_delivery_schema_version": 2,
+  "official_publications_schema_version": 1,
+  "official_publication_schema_version": 1,
+  "deployment_build_identity": null,
+  "generated_at_utc": "2026-10-02T06:22:48.1532025+00:00"
+}

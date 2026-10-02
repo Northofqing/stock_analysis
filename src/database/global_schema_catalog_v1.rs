@@ -1523,6 +1523,239 @@ pub(super) fn capture_catalog_snapshot(
     })
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProspectiveTargetKind {
+    InstallFinalSelectionSameCatalogFamily,
+    RequalifyExactExistingCatalog,
+    AlreadyQualified,
+}
+
+/// A prospective target, never an amended/schema-write capability.
+#[derive(Debug, serde::Serialize)]
+pub(super) struct ProspectiveCatalogReference {
+    pub(super) target_kind: ProspectiveTargetKind,
+    pub(super) application_id: i64,
+    pub(super) user_version: i64,
+    pub(super) catalog_mode: &'static str,
+    pub(super) sqlite_libversion_number: i32,
+    pub(super) sqlite_source_id: String,
+    pub(super) sqlite_compile_options_sha256: String,
+    pub(super) source_snapshot_sha256: String,
+    pub(super) target_whole_catalog_sha256: String,
+    pub(super) target_selection_catalog_sha256: String,
+    pub(super) target_template_sha256: String,
+}
+
+/// Restrict actual SQL copy extents before catalog capture. This is not a
+/// bound on SQLite's internal allocator or the old parser's entire peak.
+pub(super) fn prospective_catalog_extent(
+    connection: &Connection,
+    max_objects: u64,
+    max_bytes: u64,
+) -> Result<(), GlobalSchemaCatalogError> {
+    let mut objects = 0_u64;
+    let mut bytes = 0_u64;
+    for schema in ["main", "temp"] {
+        let (count, extent): (i64, i64) = connection.query_row(
+            &format!("SELECT COUNT(*),COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) FROM {schema}.sqlite_schema"),
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| sqlite_reference_build_error("prospective-catalog-extent", None, e))?;
+        objects = objects
+            .checked_add(u64::try_from(count).map_err(|_| {
+                GlobalSchemaCatalogError::CatalogMismatch {
+                    detail: "prospective catalog count is invalid".into(),
+                }
+            })?)
+            .ok_or_else(|| GlobalSchemaCatalogError::CatalogMismatch {
+                detail: "prospective catalog count overflow".into(),
+            })?;
+        bytes = bytes
+            .checked_add(u64::try_from(extent).map_err(|_| {
+                GlobalSchemaCatalogError::CatalogMismatch {
+                    detail: "prospective catalog extent is invalid".into(),
+                }
+            })?)
+            .ok_or_else(|| GlobalSchemaCatalogError::CatalogMismatch {
+                detail: "prospective catalog extent overflow".into(),
+            })?;
+    }
+    if objects > max_objects || bytes > max_bytes {
+        return Err(GlobalSchemaCatalogError::CatalogMismatch {
+            detail: "prospective catalog copy budget exceeded".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn prospective_target_reference(
+    actual: &CatalogSnapshot,
+    references: &SameRuntimeCatalogReferences,
+) -> Result<ProspectiveCatalogReference, GlobalSchemaCatalogError> {
+    let half = classify_database_half(actual, references)?;
+    let (source, target_kind) = match &half {
+        DatabaseHalfDiagnostic::PreAmendment(e) => (
+            e,
+            ProspectiveTargetKind::InstallFinalSelectionSameCatalogFamily,
+        ),
+        DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => (
+            e,
+            if e.identity.user_version == 1 {
+                ProspectiveTargetKind::AlreadyQualified
+            } else {
+                ProspectiveTargetKind::RequalifyExactExistingCatalog
+            },
+        ),
+        DatabaseHalfDiagnostic::AbsentDatabaseHalf(_) | DatabaseHalfDiagnostic::Transitional(_) => {
+            return Err(GlobalSchemaCatalogError::CatalogMismatch { detail: "prospective prepare requires an exact historical or final catalog; bootstrap/recovery is separate".into() });
+        }
+    };
+    let generation = match source.identity.user_version {
+        0 | 1 => STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
+        2..=5 => source.identity.user_version,
+        _ => {
+            return Err(GlobalSchemaCatalogError::CatalogMismatch {
+                detail: "unsupported prospective target generation".into(),
+            })
+        }
+    };
+    let reference = match generation {
+        1 => &references.amended,
+        2 => &references.paper_v2.amended,
+        3 => &references.review_v3.amended,
+        4 => &references.owner_v4.amended,
+        5 => &references.owner_v5.amended,
+        _ => unreachable!("closed generation above"),
+    };
+    // The target's SQL bytes were actually emitted by this linked SQLite in
+    // the original private reference producer. Zero counts describe a DDL
+    // template only; they never prove preservation of original rows.
+    let target = CatalogSnapshot {
+        mode: actual.mode,
+        identity: DatabaseSchemaIdentity {
+            application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+            user_version: generation,
+        },
+        runtime: actual.runtime.clone(),
+        objects: reference.objects.clone(),
+        managed_index_geometry: reference.managed_index_geometry.clone(),
+        foreign_keys: reference.foreign_keys.clone(),
+        sqlite_owned_objects: reference.sqlite_owned_objects.clone(),
+        attached_schema_names: vec!["main".into()],
+        legacy_row_counts: legacy_table_name_set()?
+            .into_iter()
+            .map(|name| (name, 0))
+            .collect(),
+        selection_row_counts: FINAL_SELECTION_TABLES
+            .iter()
+            .map(|name| ((*name).to_owned(), 0))
+            .collect(),
+        selection_payload_schemas: sorted_strings(
+            FINAL_SELECTION_PAYLOAD_SCHEMAS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        ),
+    };
+    let DatabaseHalfDiagnostic::AmendedDatabaseHalf(evidence) =
+        classify_database_half(&target, references)?
+    else {
+        return Err(GlobalSchemaCatalogError::CatalogMismatch {
+            detail: "prospective reference did not classify as exact final target".into(),
+        });
+    };
+    Ok(ProspectiveCatalogReference {
+        target_kind,
+        application_id: evidence.identity.application_id,
+        user_version: evidence.identity.user_version,
+        catalog_mode: actual.mode.label(),
+        sqlite_libversion_number: actual.runtime.libversion_number,
+        sqlite_source_id: actual.runtime.source_id.clone(),
+        sqlite_compile_options_sha256: actual.runtime.compile_options_sha256.clone(),
+        source_snapshot_sha256: prospective_snapshot_sha256(actual),
+        target_whole_catalog_sha256: evidence.whole_application_catalog_sha256.0,
+        target_selection_catalog_sha256: evidence
+            .selection_managed_catalog_sha256
+            .expect("final target has selection digest")
+            .0,
+        target_template_sha256: prospective_snapshot_sha256(&target),
+    })
+}
+
+fn prospective_snapshot_sha256(snapshot: &CatalogSnapshot) -> String {
+    let mut digest = Sha256::new();
+    hash_field(
+        &mut digest,
+        b"stock_analysis.global_schema.prospective_catalog_snapshot.v1",
+    );
+    hash_field(&mut digest, snapshot.mode.label().as_bytes());
+    digest.update(snapshot.identity.application_id.to_be_bytes());
+    digest.update(snapshot.identity.user_version.to_be_bytes());
+    hash_field(
+        &mut digest,
+        catalog_digest(
+            b"stock_analysis.global_schema.prospective_objects.v1",
+            snapshot.mode,
+            &snapshot.runtime,
+            &snapshot.objects,
+        )
+        .as_bytes(),
+    );
+    digest.update((snapshot.managed_index_geometry.len() as u64).to_be_bytes());
+    for index in &snapshot.managed_index_geometry {
+        hash_field(&mut digest, index.table_name.as_bytes());
+        hash_field(&mut digest, index.index_name.as_bytes());
+        digest.update([u8::from(index.unique), u8::from(index.partial)]);
+        hash_field(&mut digest, index.origin.as_bytes());
+        digest.update((index.terms.len() as u64).to_be_bytes());
+        for term in &index.terms {
+            digest.update(term.seqno.to_be_bytes());
+            digest.update(term.cid.to_be_bytes());
+            for value in [&term.name, &term.collation] {
+                digest.update([u8::from(value.is_some())]);
+                if let Some(value) = value {
+                    hash_field(&mut digest, value.as_bytes());
+                }
+            }
+            digest.update([u8::from(term.descending), u8::from(term.key)]);
+        }
+    }
+    digest.update((snapshot.foreign_keys.len() as u64).to_be_bytes());
+    for fk in &snapshot.foreign_keys {
+        hash_field(&mut digest, fk.source_table.as_bytes());
+        digest.update(fk.id.to_be_bytes());
+        digest.update(fk.sequence.to_be_bytes());
+        hash_field(&mut digest, fk.target_table.as_bytes());
+    }
+    digest.update((snapshot.sqlite_owned_objects.len() as u64).to_be_bytes());
+    for object in &snapshot.sqlite_owned_objects {
+        digest.update([object.kind.ordinal()]);
+        hash_field(&mut digest, object.name.as_bytes());
+        hash_field(&mut digest, object.table_name.as_bytes());
+        digest.update([u8::from(object.exact_sql.is_some())]);
+        if let Some(sql) = &object.exact_sql {
+            hash_field(&mut digest, sql.as_bytes());
+        }
+    }
+    for names in [
+        &snapshot.attached_schema_names,
+        &snapshot.selection_payload_schemas,
+    ] {
+        digest.update((names.len() as u64).to_be_bytes());
+        for name in names {
+            hash_field(&mut digest, name.as_bytes());
+        }
+    }
+    for counts in [&snapshot.legacy_row_counts, &snapshot.selection_row_counts] {
+        digest.update((counts.len() as u64).to_be_bytes());
+        for (name, count) in counts {
+            hash_field(&mut digest, name.as_bytes());
+            digest.update(count.to_be_bytes());
+        }
+    }
+    lower_hex(&digest.finalize())
+}
+
 fn capture_legacy_row_counts(
     connection: &Connection,
     objects: &[CatalogObjectRow],
@@ -1928,6 +2161,19 @@ fn paper_ledger_catalog_registry(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(super) fn install_legacy_catalog_for_prospective_test(
+    connection: &Connection,
+) -> Result<(), GlobalSchemaCatalogError> {
+    execute_legacy_catalog_ddl(
+        connection,
+        &legacy_catalog_registry_entries_v1()?,
+        &legacy_catalog_ddl_entries_v1()?,
+        "prospective-actual-test",
+        &mut BTreeSet::new(),
+    )
 }
 
 #[cfg(test)]
@@ -3286,6 +3532,46 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prospective_target_binds_exact_family_and_ancillary_facts() {
+        let refs = same_runtime_references(GlobalSchemaCatalogMode::Test);
+        let mut source = snapshot_for_state(&refs, DatabaseHalfState::PreAmendment);
+        let prepared = prospective_target_reference(&source, &refs).unwrap();
+        assert_eq!(prepared.user_version, 1);
+        assert!(matches!(
+            prepared.target_kind,
+            ProspectiveTargetKind::InstallFinalSelectionSameCatalogFamily
+        ));
+        let first = prospective_snapshot_sha256(&source);
+        source.legacy_row_counts.insert("ledger".into(), 1);
+        assert_ne!(prospective_snapshot_sha256(&source), first);
+        let second = prospective_snapshot_sha256(&source);
+        source.attached_schema_names.push("temp".into());
+        assert_ne!(prospective_snapshot_sha256(&source), second);
+        assert!(prospective_target_reference(
+            &snapshot_for_state(&refs, DatabaseHalfState::Transitional),
+            &refs
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prospective_catalog_extent_refuses_before_sql_copy() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sample(value TEXT)")
+            .unwrap();
+        prospective_catalog_extent(&connection, 1, 1024).unwrap();
+        assert!(prospective_catalog_extent(&connection, 0, 1024).is_err());
+        assert!(prospective_catalog_extent(&connection, 1, 1).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn frozen_legacy_registry_names_every_whole_application_object() {
