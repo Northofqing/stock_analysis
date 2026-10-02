@@ -5,11 +5,115 @@ use stock_analysis::monitor::g5b_analysis_v2::G5bAnalysisClaimV2;
 
 /// Returns true only to request the existing no-provider tick backoff.
 pub(crate) async fn run_tick(date: NaiveDate, fresh_window: bool) -> Result<bool, String> {
-    route_empty_before_models(
-        || runtime::inspect_g5b_empty_tick_v2(date),
+    // Current Empty inspection remains first. Its completed/pending route must
+    // not hide another real saved NonEmpty date requiring passive recovery.
+    let empty = runtime::inspect_g5b_empty_tick_v2(date).await;
+    let saved_dates = runtime::list_g5b_physical_cohort_dates_v2().await?;
+    let historical = recover_dates_with(saved_dates, date, |saved| async move {
+        run_physical_nonempty_tick(saved, false).await.map(|_| ())
+    })
+    .await;
+    let current = route_empty_before_models(
+        || std::future::ready(empty),
+        || run_physical_nonempty_tick(date, fresh_window),
+    )
+    .await;
+    match (historical, current) {
+        (Ok(()), result) => result,
+        (Err(history), Ok(_)) => Err(history),
+        (Err(history), Err(current)) => {
+            Err(format!("{history}; current G5b date={date}: {current}"))
+        }
+    }
+}
+
+async fn run_physical_nonempty_tick(date: NaiveDate, fresh_window: bool) -> Result<bool, String> {
+    if let runtime::G5bPhysicalTickObservation::Sealed {
+        seal_identity,
+        cohort_identity,
+        revision,
+        count,
+        reason,
+    } = runtime::inspect_g5b_physical_tick_v2(date).await?
+    {
+        log::info!("[g5b] actual physical prefix freshly verified date={date} cohort={cohort_identity} seal={seal_identity} revision={revision} selected={count} reason={reason}");
+        return Ok(false);
+    }
+    after_recovery_with(
         || run_nonempty_tick(date, fresh_window),
+        || async move {
+            let observed = runtime::finalize_g5b_physical_tick_v2(date).await?;
+            log_physical_finalizer(date, observed);
+            Ok(())
+        },
     )
     .await
+}
+
+fn log_physical_finalizer(date: NaiveDate, observed: runtime::G5bPhysicalTickObservation) {
+    match observed {
+        runtime::G5bPhysicalTickObservation::Incomplete => {
+            log::info!("[g5b] original physical completion remains unproven date={date}");
+        }
+        runtime::G5bPhysicalTickObservation::Sealed {
+            seal_identity,
+            cohort_identity,
+            revision,
+            count,
+            reason,
+        } => {
+            log::info!("[g5b] fresh physical finalizer verified date={date} cohort={cohort_identity} seal={seal_identity} revision={revision} selected={count} reason={reason}");
+        }
+    }
+}
+
+// Scheduling helpers carry no receipt/capability. Actual production callbacks
+// above consume only the original private-owner file/SQL readers.
+async fn recover_dates_with<Dates, Recover, Future>(
+    dates: Dates,
+    current: NaiveDate,
+    mut recover: Recover,
+) -> Result<(), String>
+where
+    Dates: IntoIterator<Item = NaiveDate>,
+    Recover: FnMut(NaiveDate) -> Future,
+    Future: std::future::Future<Output = Result<(), String>>,
+{
+    let mut errors = Vec::new();
+    for date in dates {
+        if date == current {
+            continue;
+        }
+        if let Err(e) = recover(date).await {
+            errors.push(format!("saved G5b date={date}: {e}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn after_recovery_with<Recover, RecoverFuture, Finalize, FinalizeFuture>(
+    recover: Recover,
+    finalize: Finalize,
+) -> Result<bool, String>
+where
+    Recover: FnOnce() -> RecoverFuture,
+    RecoverFuture: std::future::Future<Output = Result<bool, String>>,
+    Finalize: FnOnce() -> FinalizeFuture,
+    FinalizeFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let progress = recover().await;
+    let finalizer = finalize().await;
+    match (progress, finalizer) {
+        (Ok(backoff), Ok(())) => Ok(backoff),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(progress), Err(finalizer)) => {
+            Err(format!("{progress}; physical finalizer: {finalizer}"))
+        }
+    }
 }
 
 /// Empty initialization failure cannot disable ordinary scanners or NonEmpty
@@ -186,6 +290,115 @@ where
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn g5b_physical_v2_bin_saved_date_failure_does_not_hide_other_date_or_repeat_current() {
+        let current = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let older = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let later = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let error = recover_dates_with([older, current, later], current, |date| {
+            seen.borrow_mut().push(date);
+            std::future::ready(if date == older {
+                Err("TEST_CODE original committed file unavailable".into())
+            } else {
+                Ok(())
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(*seen.borrow(), vec![older, later]);
+        assert!(
+            error.contains("2026-09-28") && error.contains("original committed file unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn g5b_physical_v2_bin_post_recovery_finalizer_runs_without_fresh_model_work() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = after_recovery_with(
+            || {
+                calls
+                    .borrow_mut()
+                    .push("original stored recovery outside fresh window");
+                std::future::ready(Ok(false))
+            },
+            || {
+                calls
+                    .borrow_mut()
+                    .push("fresh physical reader and finalizer");
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result,
+            "only the original no-provider path requests backoff"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                "original stored recovery outside fresh window",
+                "fresh physical reader and finalizer"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn g5b_physical_v2_bin_progress_and_finalizer_errors_remain_visible() {
+        let calls = std::cell::Cell::new(0);
+        let error = after_recovery_with(
+            || std::future::ready(Err("TEST_CODE original source failed".into())),
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err("TEST_CODE known prefix verification failed".into()))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(
+            error.contains("original source failed")
+                && error.contains("known prefix verification failed")
+        );
+    }
+
+    #[test]
+    fn g5b_physical_v2_bin_real_callback_order_supplements_protocol_fixtures() {
+        let source = include_str!("g5b_v2.rs");
+        let tick = &source[source.find("pub(crate) async fn run_tick").unwrap()
+            ..source.find("async fn run_physical_nonempty_tick").unwrap()];
+        assert!(
+            tick.find("inspect_g5b_empty_tick_v2").unwrap()
+                < tick.find("list_g5b_physical_cohort_dates_v2").unwrap()
+        );
+        assert!(
+            tick.find("run_physical_nonempty_tick(saved, false)")
+                .unwrap()
+                < tick
+                    .find("run_physical_nonempty_tick(date, fresh_window)")
+                    .unwrap()
+        );
+        let physical = &source[source.find("async fn run_physical_nonempty_tick").unwrap()
+            ..source.find("async fn recover_dates_with").unwrap()];
+        assert!(
+            physical.find("inspect_g5b_physical_tick_v2").unwrap()
+                < physical
+                    .find("run_nonempty_tick(date, fresh_window)")
+                    .unwrap()
+        );
+        assert!(
+            physical
+                .find("run_nonempty_tick(date, fresh_window)")
+                .unwrap()
+                < physical.find("finalize_g5b_physical_tick_v2").unwrap()
+        );
+        let runtime = include_str!("durable_delivery_runtime/g5b_physical_v2.rs");
+        assert!(!runtime.contains(".prepare("));
+        assert!(!runtime.contains("resume_deliverable("));
+        assert!(!runtime.contains("known.by_date.remove("));
+    }
 
     #[tokio::test]
     async fn g5b_empty_runtime_saved_routing_precedes_models_and_provider_backoff() {

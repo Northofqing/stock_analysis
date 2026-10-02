@@ -174,7 +174,7 @@ pub(super) struct RuntimeHealthSnapshot {
     account: AccountObservation,
     data: DataObservation,
     raw_global_news: RawGlobalNewsObservation,
-    durable_delivery: NotObserved,
+    durable_delivery: super::durable_delivery::DeliveryHealthReport,
     data_quality: NotObserved,
     other_sources: NotObserved,
     quiet_halted_policy: NotObserved,
@@ -255,12 +255,12 @@ fn banner_observation_error(report: &HealthReport) -> Option<&'static str> {
 impl RuntimeHealthSnapshot {
     pub(super) fn text_summary(&self) -> String {
         format!(
-            "runtime_snapshot_version={} runtime_snapshot_coverage={} runtime_account_status={} runtime_data_status={} durable_delivery_status={} data_quality_status={} other_sources_status={} quiet_halted_policy_status={}",
+            "runtime_snapshot_version={} runtime_snapshot_coverage={} runtime_account_status={} runtime_data_status={} {} data_quality_status={} other_sources_status={} quiet_halted_policy_status={}",
             self.version,
             self.coverage,
             self.account.status,
             self.data.status,
-            self.durable_delivery.status,
+            self.durable_delivery.text_summary(),
             self.data_quality.status,
             self.other_sources.status,
             self.quiet_halted_policy.status,
@@ -309,9 +309,9 @@ impl RuntimeHealthSnapshot {
             }
         };
         Self {
-            version: 1,
+            version: 2,
             checked_at: now,
-            coverage: "readonly_process_banner_account_data_and_four_raw_global_news_sources_only",
+            coverage: "readonly_process_banner_account_data_four_raw_news_sources_and_durable_state_observations_only",
             process: ProcessObservation {
                 coverage: "monitor_lease_identity_and_process_heartbeat_only",
                 reason_domain: "process_health",
@@ -354,7 +354,7 @@ impl RuntimeHealthSnapshot {
                 reason_domain: "raw_global_news_source_recovery",
                 recovery: report.raw_news_source_recovery.clone(),
             },
-            durable_delivery: NotObserved::new("durable_decision_states_and_attempt_leases"),
+            durable_delivery: report.durable_delivery.clone(),
             data_quality: NotObserved::new("resident_scanner_data_quality_statistics"),
             other_sources: NotObserved::new(
                 "sources_outside_four_registered_raw_global_news_feeds",

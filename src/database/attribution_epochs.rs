@@ -4970,6 +4970,8 @@ mod tests {
             attribution_connection_source: Some(source_b),
             readonly_attribution_snapshot: None,
             allow_unattested_attribution_reads_for_test: false,
+            #[cfg(test)]
+            isolated_p05_consumer_origin: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -5212,6 +5214,8 @@ mod tests {
                     attribution_connection_source,
                     readonly_attribution_snapshot: None,
                     allow_unattested_attribution_reads_for_test: true,
+                    #[cfg(test)]
+                    isolated_p05_consumer_origin: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
@@ -5234,6 +5238,8 @@ mod tests {
                     attribution_connection_source: None,
                     readonly_attribution_snapshot: None,
                     allow_unattested_attribution_reads_for_test: true,
+                    #[cfg(test)]
+                    isolated_p05_consumer_origin: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },
@@ -5284,6 +5290,8 @@ mod tests {
                     attribution_connection_source: Some(source),
                     readonly_attribution_snapshot: None,
                     allow_unattested_attribution_reads_for_test: false,
+                    #[cfg(test)]
+                    isolated_p05_consumer_origin: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },

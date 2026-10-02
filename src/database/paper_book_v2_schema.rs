@@ -118,11 +118,11 @@ fn objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, StagedPape
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM main.sqlite_master
-         WHERE (name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*') AND sql IS NOT NULL
          UNION ALL
          SELECT 'temp' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM temp.sqlite_master
-         WHERE (name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*') AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .load(conn)?)
@@ -132,11 +132,11 @@ fn fee_objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, Staged
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM main.sqlite_master
-         WHERE (name GLOB 'paper_book_v2_fee_manifest*' OR tbl_name='paper_book_v2_fee_manifest') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_v2_fee_manifest*' OR lower(tbl_name)='paper_book_v2_fee_manifest') AND sql IS NOT NULL
          UNION ALL
          SELECT 'temp' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM temp.sqlite_master
-         WHERE (name GLOB 'paper_book_v2_fee_manifest*' OR tbl_name='paper_book_v2_fee_manifest') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_v2_fee_manifest*' OR lower(tbl_name)='paper_book_v2_fee_manifest') AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .load(conn)?)
@@ -448,5 +448,50 @@ mod tests {
             Err(StagedPaperBookV2Error::NotIsolated)
         ));
         assert!(objects(&mut conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paper_namespace_casefold_staged_fee_rejects_temp_aliases_and_v5_fee_shadow() {
+        for sql in [
+            "CREATE TEMP TABLE PAPER_BOOK_V2_FEE_MANIFEST AS SELECT * FROM main.paper_book_v2_fee_manifest",
+            "CREATE TEMP VIEW PaPeR_BoOk_V2_FeE_MaNiFeSt AS SELECT * FROM main.paper_book_v2_fee_manifest",
+            "CREATE TABLE PaPeR_BoOk_V2_unknown(value TEXT)",
+            "CREATE TEMP TABLE TEST_CODE_foreign(value TEXT); CREATE TEMP TRIGGER PAPER_BOOK_V2_extra BEFORE INSERT ON TEST_CODE_foreign BEGIN SELECT 1; END",
+        ] {
+            let mut conn = isolated_catalog_v2();
+            let policy = AShareFeePolicyV2::fixed_compatibility_assumption();
+            stage_for_isolated_test(&mut conn, &policy).unwrap();
+            let before = objects(&mut conn).unwrap();
+            conn.batch_execute(sql).unwrap();
+            assert!(matches!(verify_staged_policy(&mut conn, &policy), Err(StagedPaperBookV2Error::CatalogMismatch)), "{sql}");
+            assert_eq!(database_identity(&mut conn).unwrap().user_version, 2);
+            // The V5 fee-only gate must also reject upper-case aliases. Other
+            // V5 book tables legitimately do not belong to this fee manifest.
+            if sql.contains("AS SELECT * FROM main.paper_book_v2_fee_manifest") {
+                conn.batch_execute("PRAGMA user_version=5").unwrap();
+                assert!(matches!(verify_v5_manifest_on(&mut conn), Err(StagedPaperBookV2Error::CatalogMismatch)), "{sql}");
+            }
+            let main = objects(&mut conn).unwrap().into_iter().filter(|row| row.namespace == "main").collect::<Vec<_>>();
+            if sql.starts_with("CREATE TEMP") {
+                assert_eq!(before, main);
+            }
+        }
+    }
+
+    #[test]
+    fn paper_namespace_casefold_staging_does_not_adopt_preexisting_mixed_case() {
+        let mut conn = isolated_catalog_v2();
+        conn.batch_execute("CREATE TEMP VIEW PaPeR_BoOk_V2_unknown AS SELECT 1 AS value")
+            .unwrap();
+        let before = objects(&mut conn).unwrap();
+        assert!(matches!(
+            stage_for_isolated_test(
+                &mut conn,
+                &AShareFeePolicyV2::fixed_compatibility_assumption()
+            ),
+            Err(StagedPaperBookV2Error::AlreadyStaged)
+        ));
+        assert_eq!(objects(&mut conn).unwrap(), before);
+        assert_eq!(database_identity(&mut conn).unwrap().user_version, 2);
     }
 }

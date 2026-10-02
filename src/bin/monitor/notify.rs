@@ -3087,6 +3087,122 @@ pub(crate) async fn push_g5b_model_dispatch_v2(
     crate::durable_delivery_runtime::deliver_g5b_model_dispatch_v2(view).await
 }
 
+/// Only the original exact-view presentation/launch/v14 preflight constructs
+/// this local packet. It grants no source qualification or completion.
+pub(crate) struct GovernedP05UnitChild {
+    view: stock_analysis::p05_auction_unit::P05ChildDispatchView,
+}
+impl GovernedP05UnitChild {
+    pub(crate) fn into_view(self) -> stock_analysis::p05_auction_unit::P05ChildDispatchView {
+        self.view
+    }
+}
+
+/// Synchronous because both resident dispatch and startup call it on their
+/// existing blocking worker. Startup cannot recursively await its own barrier.
+pub(crate) fn preflight_p05_unit_child(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    view: stock_analysis::p05_auction_unit::P05ChildDispatchView,
+) -> Result<GovernedP05UnitChild, PushOutcome> {
+    use crate::v14_adapter::V14Gate;
+    use stock_analysis::durable_delivery::{DeliverySubKind, PushKind as DurableKind};
+    let kind = token.descriptor().push_kind;
+    let expected = match view.envelope().push_kind {
+        DurableKind::AuctionRepush => PushKind::AuctionRepush,
+        DurableKind::CandidateBoard => PushKind::CandidateBoard,
+        DurableKind::CandidateInvalidated => PushKind::CandidateInvalidated,
+        _ => return Err(PushOutcome::Denied("p05_unit_child_kind_invalid".into())),
+    };
+    if kind != expected || view.envelope().sub_kind != DeliverySubKind::None {
+        return Err(PushOutcome::Denied(
+            "p05_unit_presentation_kind_mismatch".into(),
+        ));
+    }
+    if !launch_gate_check(kind) {
+        return Err(PushOutcome::Denied("launch_gate_stage".into()));
+    }
+    match crate::v14_adapter::v14_gate_counted_binding(
+        kind,
+        view.governance_code(),
+        None,
+        &view.envelope().schedule_occurrence_identity,
+        view.business_date(),
+    ) {
+        V14Gate::Deduped => Err(PushOutcome::Denied(
+            "counted_gate_returned_legacy_dedup".into(),
+        )),
+        V14Gate::Denied(reason) => Err(PushOutcome::Denied(reason)),
+        V14Gate::Approved(_) => Ok(GovernedP05UnitChild { view }),
+    }
+}
+
+pub(crate) async fn push_p05_unit_child(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    view: stock_analysis::p05_auction_unit::P05ChildDispatchView,
+) -> PushOutcome {
+    let governed =
+        match tokio::task::spawn_blocking(move || preflight_p05_unit_child(token, view)).await {
+            Ok(Ok(governed)) => governed,
+            Ok(Err(outcome)) => return outcome,
+            Err(e) => return PushOutcome::Denied(format!("p05_unit_governance_join_failed: {e}")),
+        };
+    crate::durable_delivery_runtime::deliver_p05_unit_child(governed).await
+}
+
+/// Constructed only after governance of the exact original candidate.
+pub(crate) struct GovernedHoldingPlanCandidate {
+    candidate: crate::holding_plan::HoldingPlanCandidate,
+}
+impl GovernedHoldingPlanCandidate {
+    pub(crate) fn into_candidate(self) -> crate::holding_plan::HoldingPlanCandidate {
+        self.candidate
+    }
+}
+
+fn preflight_holding_plan_candidate(
+    token: crate::presentation_registry::ProductionPresentationToken,
+    candidate: crate::holding_plan::HoldingPlanCandidate,
+) -> Result<GovernedHoldingPlanCandidate, String> {
+    use crate::v14_adapter::V14Gate;
+    if token.descriptor().push_kind != PushKind::HoldingPlan {
+        return Err("holding_plan_presentation_kind_mismatch".into());
+    }
+    let date = candidate.business_date()?;
+    let code = candidate.instrument()?.code();
+    if !launch_gate_check(PushKind::HoldingPlan) {
+        return Err("launch_gate_stage".into());
+    }
+    match crate::v14_adapter::v14_gate_counted_binding(
+        PushKind::HoldingPlan,
+        Some(code),
+        None,
+        candidate.occurrence(),
+        date,
+    ) {
+        V14Gate::Approved(_) => Ok(GovernedHoldingPlanCandidate { candidate }),
+        V14Gate::Deduped => Err("counted_gate_returned_legacy_dedup".into()),
+        V14Gate::Denied(reason) => Err(reason),
+    }
+}
+
+pub(crate) async fn push_holding_plan_candidate(
+    candidate: crate::holding_plan::HoldingPlanCandidate,
+) -> Result<crate::durable_delivery_runtime::HoldingPlanDispatchResult, String> {
+    let governed = tokio::task::spawn_blocking(move || {
+        let token = crate::presentation_registry::acquire_token(
+            "T-03-holding-plan",
+            PushKind::HoldingPlan,
+            "holding_plan_dispatcher",
+            "render_holding_plan",
+        )
+        .map_err(|_| "holding_plan_presentation_token_rejected".to_owned())?;
+        preflight_holding_plan_candidate(token, candidate)
+    })
+    .await
+    .map_err(|_| "holding_plan_governance_worker_failed".to_owned())??;
+    crate::durable_delivery_runtime::deliver_holding_plan_candidate(governed).await
+}
+
 pub(crate) async fn push_p01_origin_with_binding(
     token: crate::presentation_registry::ProductionPresentationToken,
     text: &str,

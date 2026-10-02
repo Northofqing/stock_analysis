@@ -5640,6 +5640,18 @@ async fn main() {
     } else {
         None
     };
+    let mut durable_health_observer = if selection_cli.requires_service_enablement() {
+        let boot_id = _monitor_instance_lease
+            .as_ref()
+            .expect("resident monitor holds the singleton lease")
+            .boot_id
+            .clone();
+        Some(OperationalHeartbeatTask(Some(
+            health_cmd::durable_delivery::start_resident(test_mode, boot_id),
+        )))
+    } else {
+        None
+    };
 
     // BR-241: reject an invalid P-01 compensation command after acquiring the
     // production singleton lease, but before audit/sink initialization or the
@@ -6501,6 +6513,12 @@ async fn main() {
         // The existing startup barrier has completed. Observe a genuinely new
         // current zero head before any resident input writer starts.
         g5b_v2::initialize_before_input_writers().await;
+        // Recover saved P05 Units even on non-trading days before the resident
+        // market wait. This cannot acquire a new batch or seed a Test CLI.
+        if let Err(e) = push_templates::dispatch_auction_candidate_unit_tick(false).await {
+            log::warn!("[P05 Unit] resident saved recovery blocked: {e}");
+        }
+        push_templates::initialize_p05_family_before_window().await;
         let dryrun_reporter = dryrun_report::spawn_dryrun_reporter(1_800);
 
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
@@ -6699,6 +6717,13 @@ async fn main() {
                 operational_heartbeat
                     .as_mut()
                     .expect("resident heartbeat task was started")
+                    .take(),
+            ),
+            (
+                "durable_health_observer",
+                durable_health_observer
+                    .as_mut()
+                    .expect("resident durable health observer was started")
                     .take(),
             ),
             ("dryrun_reporter", dryrun_reporter),
@@ -9742,86 +9767,15 @@ fn t0_delivery_outcomes_confirmed(outcomes: &[notify::PushOutcome]) -> bool {
 //          <-3% 加仓, 否则持有观望。
 //   binding: source bytes 保留同轮快照与原始行情批次来源; occurrence =
 //          holding-plan:{date}:{code}, scope=Ticket, origin=InternalDurable。
-//          来源变化只改变新 decision 的身份, 不授予重发资格。holding_plan_daily
-//          仅是周期路径的辅助过滤, 不是手动/启动路径共享的 durable 完成权威。
-//          失败保留重试资格 (定时器不前进), 成功才封口。
+//          原 exact owner 优先恢复, 来源变化不授予重发资格。
+//          holding_plan_daily 只读为 LegacyUnknown; 检查时钟不表示完成。
+//          唯一完成观察是原 physical Accepted 且本地审计已排空。
 // ═══════════════════════════════════════════════════════════════
 
 struct PreparedHoldingPlan {
     code: String,
     text: String,
     binding: durable_delivery_runtime::CountedDeliveryBinding,
-}
-
-/// T-03 当日一票一推 (DB 级, 跨重启): 当日已投递的 code 集合。
-fn holding_plan_daily_pushed(plan_date: chrono::NaiveDate) -> std::collections::HashSet<String> {
-    use diesel::RunQueryDsl;
-    let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() else {
-        log::error!("[T-03] holding_plan_daily 查询: 数据库连接失败");
-        return std::collections::HashSet::new(); // 连接失败不拦截, 由写入路径暴露
-    };
-    if let Err(error) = diesel::sql_query(
-        "CREATE TABLE IF NOT EXISTS holding_plan_daily (\
-             plan_date TEXT NOT NULL, code TEXT NOT NULL, pushed_at TEXT NOT NULL, \
-             PRIMARY KEY (plan_date, code))",
-    )
-    .execute(&mut conn)
-    {
-        log::error!("[T-03] holding_plan_daily 建表失败: {error}");
-        return std::collections::HashSet::new();
-    }
-    let date_str = plan_date.format("%Y-%m-%d").to_string();
-    let rows: Vec<HoldingPlanDailyRow> = match diesel::sql_query(
-        "SELECT plan_date, code FROM holding_plan_daily WHERE plan_date = ?",
-    )
-    .bind::<diesel::sql_types::Text, _>(&date_str)
-    .load(&mut conn)
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            log::error!("[T-03] holding_plan_daily 查询失败: {error}");
-            return std::collections::HashSet::new();
-        }
-    };
-    rows.into_iter().map(|row| row.code).collect()
-}
-
-/// 记录当日已推 (INSERT OR REPLACE, 幂等)。
-fn holding_plan_daily_record(plan_date: chrono::NaiveDate, code: &str) {
-    use diesel::RunQueryDsl;
-    let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() else {
-        log::error!("[T-03] holding_plan_daily 记录: 数据库连接失败 code={code}");
-        return;
-    };
-    let date_str = plan_date.format("%Y-%m-%d").to_string();
-    let pushed_at = chrono::Local::now().to_rfc3339();
-    if let Err(error) = diesel::sql_query(
-        "INSERT OR REPLACE INTO holding_plan_daily (plan_date, code, pushed_at) VALUES (?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(&date_str)
-    .bind::<diesel::sql_types::Text, _>(code)
-    .bind::<diesel::sql_types::Text, _>(&pushed_at)
-    .execute(&mut conn)
-    {
-        log::error!("[T-03] holding_plan_daily 记录失败 code={code}: {error}");
-    }
-}
-
-#[derive(diesel::QueryableByName)]
-struct HoldingPlanDailyRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    code: String,
-}
-
-async fn prepare_holding_plan_messages(
-    banner: &push_templates::BannerCtx,
-) -> Result<Vec<PreparedHoldingPlan>, String> {
-    holding_plan::prepare_holding_plan_messages_with(
-        banner,
-        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot,
-        market_data::fetch_realtime_quote_batch,
-        || chrono::Local::now().fixed_offset(),
-    )
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -10021,6 +9975,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
         use stock_analysis::decision::intraday_monitor::{evening_review, IntradayMonitor};
         let monitor = IntradayMonitor;
         loop {
+            // Existing Unit recovery/finalization is independent of market,
+            // provider and Quiet/Halted source scheduling. Fresh acquisition
+            // is checked only after actual saved readers by the P05 owner.
+            if let Err(e) = push_templates::dispatch_auction_candidate_unit_tick(true).await {
+                log::warn!("[P05 Unit] saved/current tick blocked: {e}");
+            }
             let risk_context = current_banner_for("v16.3 paper decision").and_then(|banner| {
                 match push_templates::paper_risk_context_from_banner(&banner) {
                     Ok(context) => Some(context),
@@ -11068,6 +11028,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             // The market-active wait can span midnight. Resample inside the
             // local owner after that wait and before the first daily scanner.
             g5b_v2::initialize_before_input_writers().await;
+            push_templates::initialize_p05_family_before_window().await;
 
             log::info!("进入交易时段，开始监控");
 
@@ -11136,7 +11097,14 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
             let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
 
-            let mut last_holding_plan = std::time::Instant::now(); // v38: I-04 持仓操作建议 (30 min)
+            let mut holding_plan_schedule = holding_plan::HoldingPlanInspectionSchedule::new(
+                chrono::Utc::now()
+                    .with_timezone(
+                        &chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid Shanghai offset"),
+                    )
+                    .date_naive(),
+                std::time::Instant::now(),
+            );
 
             let mut last_sector_top = std::time::Instant::now(); // 2026-08-07: I-09 板块 TOP (60 min)
 
@@ -11188,8 +11156,6 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
             let mut virtual_observation: Vec<(String, String, f64)> = Vec::new(); // (code, name, open_price)
 
-            let mut post_close_candidates_notified = false;
-
             let mut virtual_snapshot_persisted = false;
 
             // P-03 and the 09:10 quote probe retain their legacy session-local
@@ -11202,8 +11168,6 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             let monitor_cfg = stock_analysis::config::get_monitor_config();
 
             let confirm_shares = monitor_cfg.air_refuel.confirm_lots.saturating_mul(100);
-
-            let pilot_shares = monitor_cfg.air_refuel.pilot_lots.saturating_mul(100);
 
             loop {
                 let session = current_session();
@@ -11376,7 +11340,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let limit_pool_date = chrono::Local::now().date_naive();
                         let auction_hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
                         let notified_at_tick_start = auction_vol_notified.clone();
-                        // 保留完整tick（含原始来源观察），供P-02与后续持仓检测借用。
+                        // 保留完整tick（含原始来源观察），供P-02借用。
                         // 不在这里拆走两个投影字段后丢弃同次采集的证据。
                         let auction_tick_data =
                             match tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -11426,276 +11390,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             .await;
                         }
 
-                        // BR-223: 9:20-9:25 竞价优选重推恢复 (A-02 AuctionRepush)。
-                        // 复用统一网关候选链路 load_real_candidate_batch (CandidateBoard 同源)。
-                        // 2026-08-06 实证: 9:20 时刻 DNS 全挂 + TDX 不可达 → A-02/P-05
-                        // 一次性尝试双双失败, 整个竞价窗口错过。改为成功才封口:
-                        // 窗口内每次扫描 tick (约 30s) 保留重试资格; 重复推送由进程内
-                        // cooldown 拦截 (AuctionRepush=600s, CandidateBoard=1800s)。
-                        if !post_close_candidates_notified {
-                            let captured_at = stock_analysis::monitor::prediction::shanghai_now();
-                            let board_date = captured_at.format("%Y-%m-%d").to_string();
-                            let observations = push_templates::dispatch_auction_candidate_unit(
-                                &board_date,
-                                captured_at,
-                            )
-                            .await;
-                            let repushed = observations.auction_repush.was_pushed();
-                            let board_pushed = observations.candidate_board.was_pushed();
-                            log::info!(
-                                "[竞价][BR-223] A-02={} P-05={} T-08 observed_children={}; legacy completion pair only",
-                                observations.auction_repush.label(),
-                                observations.candidate_board.label(),
-                                observations.invalidated.observed_count(),
-                            );
+                        // P05 shared Unit is recovered by the all-day loop.
+                        // The old pair flag and empty-text pilot extraction had
+                        // no candidate facts and grant no investment authority.
 
-                            if repushed && board_pushed {
-                                post_close_candidates_notified = true;
-                            } else {
-                                // 失败不封口: 竞价窗口内下一 tick 重试, 直至成功或窗口结束。
-                                // 空候选 (entries.is_empty) 也在重试之列 — 上游候选可能
-                                // 晚于 9:20:20 才生成 (2026-08-06 09:20 候选链路即为空)。
-                                log::warn!(
-                                    "[竞价][BR-223] A-02={repushed} P-05={board_pushed} \
-                                     未全成功; 竞价窗口内保留重试资格"
-                                );
-                            }
-
-                            let post_close = String::new();
-
-                            // 提取候选的code和name以便后续虚拟记录（简单方式：从推送文案中正则提取）
-
-                            // 格式: "N. 名称(代码)" → 收集前5个作为虚拟观察对象
-
-                            let mut seen_codes: std::collections::HashSet<String> =
-                                std::collections::HashSet::new();
-
-                            for line in post_close.lines() {
-                                if let Some(paren_start) = line.find('(') {
-                                    if let Some(paren_end) = line.find(')') {
-                                        if paren_start < paren_end {
-                                            let code_str = &line[paren_start + 1..paren_end];
-
-                                            if code_str.len() == 6
-                                                && code_str.chars().all(|c| c.is_numeric())
-                                            {
-                                                if !seen_codes.insert(code_str.to_string()) {
-                                                    continue;
-                                                }
-
-                                                // 从该行"  "后提取name
-
-                                                let name_part = line.trim_start();
-
-                                                if let Some(name_end) = name_part.find('(') {
-                                                    let name = name_part[..name_end].trim_end();
-
-                                                    // 移除序号 "N. "
-
-                                                    let name = if let Some(dot_pos) = name.find('.')
-                                                    {
-                                                        name[dot_pos + 1..].trim()
-                                                    } else {
-                                                        name
-                                                    };
-
-                                                    virtual_observation.push((
-                                                        code_str.to_string(),
-                                                        name.to_string(),
-                                                        0.0,
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // pilot 模式：竞价阶段先按当前价格虚拟潜伏记录（仅一次）
-
-                            if entry_mode == AirRefuelEntryMode::Pilot
-                                && !virtual_observation.is_empty()
-                            {
-                                let codes: Vec<String> = virtual_observation
-                                    .iter()
-                                    .map(|(c, _, _)| c.clone())
-                                    .collect();
-
-                                let quote_map = match tokio::task::spawn_blocking(move || {
-                                    market_data::fetch_realtime_quotes(&codes)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(quotes)) => quotes
-                                        .into_iter()
-                                        .map(|q| (q.code, q.price))
-                                        .collect::<std::collections::HashMap<_, _>>(),
-                                    Ok(Err(error)) => {
-                                        log::error!("[虚拟观察仓] pilot 行情批次拒绝: {}", error);
-                                        std::collections::HashMap::new()
-                                    }
-                                    Err(error) => {
-                                        log::error!(
-                                            "[虚拟观察仓] pilot 行情后台任务失败: {}",
-                                            error
-                                        );
-                                        std::collections::HashMap::new()
-                                    }
-                                };
-
-                                for v in &mut virtual_observation {
-                                    if let Some(px) = quote_map.get(&v.0) {
-                                        if *px > 0.0 {
-                                            v.2 = *px;
-                                        }
-                                    }
-                                }
-
-                                let mut lines = vec![
-                                    "🟠 虚拟观察仓位（尾盘/竞价潜伏模式）".to_string(),
-                                    String::new(),
-                                ];
-
-                                let mut records: Vec<VirtualObservationRecord> = Vec::new();
-
-                                let mut total_amount = 0.0_f64;
-
-                                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-                                for (code, name, price) in &virtual_observation {
-                                    if *price <= 0.0 {
-                                        continue;
-                                    }
-
-                                    let amount = *price * pilot_shares as f64;
-
-                                    total_amount += amount;
-
-                                    lines.push(format!(
-                                        "  {}({}) @ ¥{:.2} | {}股 预计 ¥{:.0}",
-                                        name, code, price, pilot_shares, amount
-                                    ));
-
-                                    records.push(VirtualObservationRecord {
-                                        entry_date: today.clone(),
-
-                                        code: code.clone(),
-
-                                        name: name.clone(),
-
-                                        entry_price: *price,
-
-                                        shares: pilot_shares,
-
-                                        entry_mode: "pilot".to_string(),
-                                    });
-                                }
-
-                                lines.push(format!(
-                                    "\n合计虚拟敞口: ¥{:.0} ({}股×{}只)",
-                                    total_amount,
-                                    pilot_shares,
-                                    records.len()
-                                ));
-
-                                lines.push("\n⚠️ 仅做观察、研究用途，未实际下单".to_string());
-
-                                if !records.is_empty() {
-                                    match persist_virtual_observation_snapshot(&records) {
-                                        Ok(()) => {
-                                            virtual_snapshot_persisted = true;
-
-                                            let outcome = push_governor_v3(
-                                                &lines.join("\n"),
-                                                PushKind::VirtualWatch,
-                                                None,
-                                            )
-                                            .await;
-                                            if !periodic_delivery_confirmed(&outcome) {
-                                                log::warn!(
-                                                    "[虚拟观察仓][BR-192] non-counted delivery not confirmed: {:?}",
-                                                    outcome
-                                                );
-                                            }
-                                        }
-                                        Err(error) => {
-                                            log::error!(
-                                                "[虚拟观察仓] pilot 快照批次拒绝: {}",
-                                                error
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 持仓信号（原有逻辑保留）
-
-                        for s in limit_stocks.iter().take(10) {
-                            if !our_codes.contains(&s.code) {
-                                continue;
-                            }
-
-                            let Some(volume_ratio) = s.volume_ratio else {
-                                log::warn!(
-                                    "[BR-097] detector row rejected code={} missing=volume_ratio",
-                                    s.code
-                                );
-                                continue;
-                            };
-                            let Some(main_net_yi) = s.main_net_yi else {
-                                log::warn!(
-                                    "[BR-097] detector row rejected code={} missing=main_net_yi",
-                                    s.code
-                                );
-                                continue;
-                            };
-
-                            let snap = StockSnapshot {
-                                code: s.code.clone(),
-
-                                name: s.name.clone(),
-
-                                price: s.price,
-
-                                change_pct: s.change_pct,
-
-                                volume_ratio,
-
-                                main_net_yi,
-
-                                limit_up_price: None,
-
-                                was_limit_up: false,
-
-                                t1_locked: false,
-                            };
-
-                            for mut e in detector.scan_stock(&snap) {
-                                signal_count += 1;
-
-                                // G5a (2026-08-20 spec §5): 同步归因, 2s 预算,
-                                // 失败出声不折叠; ai_decision 随审计落库
-                                // ({failure:?} 用 Debug 格式 — AttributionFailure 是否实现
-                                // Display 未承诺, Debug 恒可用)
-                                if let Err(failure) =
-                                    stock_analysis::monitor::attribution::apply_attribution(&mut e)
-                                {
-                                    log::warn!("[G5a] attribution failed: {failure:?}");
-                                }
-                                if let Err(error) =
-                                    stock_analysis::monitor::alert_log::append_jsonl(&e)
-                                {
-                                    log::warn!("[G5a] alert audit append failed: {error:?}");
-                                }
-
-                                if let Some(event) = state_machine.process(e) {
-                                    alert_count += 1;
-
-                                    reject_unbound_alert_delivery(&event);
-                                }
-                            }
-                        }
+                        // This branch has a date-level pool observation, not
+                        // a sealed realtime quote. P-02 does not grant price
+                        // consumption authority to Detector/G5a/the journal.
+                        log::info!(
+                            "[竞价][Scanner] consumer_unavailable=scanner_realtime_quote_not_acquired date_pool_rows={}; 持仓价格检测暂停",
+                            limit_stocks.len()
+                        );
 
                         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
@@ -11729,12 +11434,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             format!("初始化市场分析器失败: {error}")
                                         })?;
                                 analyzer
-                                    .get_limit_up_stocks(limit_pool_date)
+                                    .get_limit_up_observation(limit_pool_date)
                                     .map_err(|error| format!("涨停池获取失败: {error}"))
                             },
                             || {
                                 std::thread::sleep(std::time::Duration::from_millis(800));
-                                market_data::fetch_position_quotes()
+                                market_data::fetch_scanner_position_quotes()
                             },
                         )
                     })
@@ -11747,18 +11452,40 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         log::error!("[盘中监控] 涨停池批次拒绝: {error}");
                     }
                     if let Some(error) = resolved.position_error.as_deref() {
-                        log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
+                        log::error!(
+                            "[盘中监控][Scanner] consumer_unavailable=scanner_quote_acquisition_failed; 持仓价格检测暂停: {error}"
+                        );
                     }
                     if let Some(error) = resolved.task_error.as_deref() {
-                        log::error!("[盘中监控] 行情任务失败: {error}");
+                        log::error!(
+                            "[盘中监控][Scanner] consumer_unavailable=scanner_acquisition_task_failed; 持仓价格检测暂停: {error}"
+                        );
                     }
                     let consumer_plan = resolved.consumer_plan();
                     if !consumer_plan.use_limit_data && !consumer_plan.use_position_data {
                         log::error!("[盘中监控] 两路行情均不可用，仅跳过依赖这两路数据的计算");
                     }
                     debug_assert!(consumer_plan.run_independent_jobs);
-                    let limit_stocks = resolved.limit_stocks;
-                    let position_quotes = resolved.position_quotes;
+                    // Keep the original opaque pool and quote observations for
+                    // this tick. Vec projections below are display/date-level
+                    // inputs only; Detector uses the sealed quote itself.
+                    let limit_observation = resolved.limit_stocks;
+                    let scanner_position_quotes = resolved.position_quotes;
+                    let limit_stocks = limit_observation
+                        .as_ref()
+                        .map(|observation| observation.stocks().to_vec());
+                    let position_quotes = scanner_position_quotes
+                        .as_ref()
+                        .map(market_data::ScannerPositionQuotes::top_stocks);
+                    if let Some(observation) = limit_observation.as_ref() {
+                        let evidence = observation.limit_pool_batch().evidence();
+                        log::debug!(
+                            "[盘中监控] date_pool_only date={} batch_id={} source_at={:?}",
+                            observation.trading_date(),
+                            evidence.batch_id,
+                            evidence.source_at
+                        );
+                    }
 
                     {
                         // ▶ 新增：开盘后虚拟记录观察仓位（仅一次）
@@ -12034,26 +11761,23 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
 
-                        // 合并两路数据：涨停列表中的持仓 + 持仓单独查询
+                        // Only the original sealed position quote supplies
+                        // realtime price/change. The date-level pool remains
+                        // membership/rank data and cannot replace that price.
 
                         let mut stock_map: std::collections::HashMap<
                             String,
-                            &stock_analysis::market_data::TopStock,
+                            &stock_analysis::data_gateway::market_data::AdmittedRealtimeQuote,
                         > = std::collections::HashMap::new();
 
-                        if let Some(position_quotes) = position_quotes.as_ref() {
-                            if let Some(limit_stocks) = limit_stocks.as_ref() {
-                                for s in limit_stocks {
-                                    if our_codes.contains(&s.code) {
-                                        stock_map.insert(s.code.clone(), s);
-                                    }
-                                }
-                            }
-
-                            for q in position_quotes {
-                                if !stock_map.contains_key(&q.code) {
-                                    stock_map.insert(q.code.clone(), q);
-                                }
+                        if let Some(observation) = scanner_position_quotes.as_ref() {
+                            log::debug!(
+                                "[盘中监控][Scanner] requested_positions={} admitted_quotes={}",
+                                observation.requested().len(),
+                                observation.quotes().len()
+                            );
+                            for quote in observation.quotes() {
+                                stock_map.insert(quote.code().to_owned(), quote);
                             }
                         }
 
@@ -12089,7 +11813,44 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                         // 持仓遍历：信号融合（不再单独推送每条事件）
 
-                        for (code, s) in &stock_map {
+                        for (code, quote) in &stock_map {
+                            // Read-only work can also take time. The UTC check
+                            // occurs after this lookup and the flow await,
+                            // immediately before any transition or Detector use.
+                            let t1_locked = match stock_analysis::portfolio::is_t1_locked(code) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    log::warn!(
+                                        "[t+1] is_t1_locked({}) 失败: {} — 按锁定处理",
+                                        code,
+                                        e
+                                    );
+                                    true
+                                }
+                            };
+                            let rank = ranked
+                                .as_ref()
+                                .and_then(|rows| rows.iter().position(|r| r.code == *code))
+                                .map(|position| position + 1);
+                            let checked = match scanner.validate_admitted_quote(quote) {
+                                Ok(checked) => checked,
+                                Err(reason) => {
+                                    log::warn!(
+                                        "[盘中监控][Scanner] consumer_unavailable={} code={} provider={:?} batch_id={} source_at={} observed_at={}; 原状态保留",
+                                        reason.reason_code(), code, quote.evidence().provider,
+                                        quote.evidence().batch_id, quote.source_at(), quote.observed_at()
+                                    );
+                                    continue;
+                                }
+                            };
+                            let s = stock_analysis::market_data::TopStock {
+                                code: checked.code().to_owned(),
+                                name: checked.name().to_owned(),
+                                price: checked.price(),
+                                change_pct: checked.change_percent(),
+                                volume_ratio: None,
+                                main_net_yi: None,
+                            };
                             // 告警源修复 (2026-08-31): 上游 quote 合同暂不携带量比/主力净流
                             // (两数据源 limit_up.rs:186 / project_top_stock_batch 硬编码 None)。
                             // 缺失时不再 continue 整只股票 —— limit_up/limit_down/board_break
@@ -12100,7 +11861,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             // 量比缺失是静态事实 (数据源硬编码 None) 而非事件, 打 debug 避免
                             // 每 tick × 每股刷屏; 主力净流缺失才是事件性 (overlay 失败),
                             // 保留 warn。
-                            let main_net_yi = overlay_net_yi(&flow_overlay, s);
+                            let main_net_yi = overlay_net_yi(&flow_overlay, &s);
                             let volume_ratio = s.volume_ratio.unwrap_or(0.0);
                             if s.volume_ratio.is_none() {
                                 log::debug!(
@@ -12117,27 +11878,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 );
                             }
 
-                            // review #14: DB 错误按"已锁定"处理 (保守), log warn 提醒.
-
-                            let t1_locked = match stock_analysis::portfolio::is_t1_locked(code) {
-                                Ok(v) => v,
-
-                                Err(e) => {
-                                    log::warn!(
-                                        "[t+1] is_t1_locked({}) 失败: {} — 按锁定处理",
-                                        code,
-                                        e
-                                    );
-
-                                    true
-                                }
-                            };
-
-                            let rank = ranked
-                                .as_ref()
-                                .and_then(|rows| rows.iter().position(|r| r.code == *code))
-                                .map(|position| position + 1);
-
+                            // The existing 9.5%/1.1 diagnostics are not qualified
+                            // board/price-limit evidence. This quote gate checks
+                            // price consumption only; D17 remains Unknown.
                             let is_limit_up = s.change_pct >= 9.5;
 
                             let prev_was_limit = was_limit_up.contains(code);
@@ -12554,113 +12297,27 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                         // ═══════════════════════════════════════════════════════════════
 
-                        if last_holding_plan.elapsed().as_secs() >= 1800 {
-                            // BR-192 收尾: T-03 真实 counted 投递 (原恒 unavailable)。
-                            // 2026-08-07 实测修正: counted identity 是内容级
-                            // (文本/证据含价格时间戳, 内容变 → 新决策 → 再推),
-                            // 频率控制靠 cooldown(1800s) — 但 9:45/10:15 实测同票
-                            // 重复推送。"当日一票一推"由 holding_plan_daily 表
-                            // (DB 级) 保证: 同票当日只投递一次, 跨进程重启不丢
-                            // (10:27 重启实测内存 static 清空 → 10:57 重推)。
-                            if let Some(banner) = current_banner_for("I-04 holding plan") {
-                                match prepare_holding_plan_messages(&banner).await {
-                                    Ok(messages) => {
-                                        let today = chrono::Local::now().date_naive();
-                                        let already_pushed = holding_plan_daily_pushed(today);
-                                        let pending: Vec<PreparedHoldingPlan> = messages
-                                            .into_iter()
-                                            .filter(|m| !already_pushed.contains(&m.code))
-                                            .collect();
-                                        let mut confirmed = true;
-                                        // 2026-09-22: 进程级重试计数 (跨批次持久, 每码
-                                        // 每日最多 3 次失败尝试后记日推门放弃) — 修复
-                                        // 2026-09-21 尝试级记录的「一次拒绝=当日丢失」,
-                                        // 同时用上限防止每 tick 重试风暴复发.
-                                        static T03_RETRY_CAPS: std::sync::OnceLock<
-                                            std::sync::Mutex<std::collections::HashMap<String, u8>>,
-                                        > = std::sync::OnceLock::new();
-                                        for prepared in pending {
-                                            let token =
-                                                match crate::presentation_registry::acquire_token(
-                                                    "T-03-holding-plan",
-                                                    PushKind::HoldingPlan,
-                                                    "holding_plan_dispatcher",
-                                                    "render_holding_plan",
-                                                ) {
-                                                    Ok(token) => token,
-                                                    Err(reason) => {
-                                                        log::error!(
-                                                        "[T-03][BR-196] presentation token rejected code={} reason={}",
-                                                        prepared.code,
-                                                        reason
-                                                    );
-                                                        confirmed = false;
-                                                        continue;
-                                                    }
-                                                };
-                                            let outcome = notify::push_counted_with_binding(
-                                                token,
-                                                &prepared.text,
-                                                None,
-                                                prepared.binding,
-                                            )
-                                            .await;
-                                            if !matches!(
-                                                outcome,
-                                                notify::PushOutcome::Pushed
-                                                    | notify::PushOutcome::Deduped
-                                            ) {
-                                                log::error!(
-                                                    "[T-03][BR-116] 持仓建议投递未确认 code={} outcome={:?}",
-                                                    prepared.code,
-                                                    outcome
-                                                );
-                                                confirmed = false;
-                                                // 失败计数: <3 次 → 不记日推门, 下批重试;
-                                                // >=3 次 → 记录放弃 (防风暴).
-                                                let mut caps = T03_RETRY_CAPS
-                                                    .get_or_init(|| {
-                                                        std::sync::Mutex::new(
-                                                            std::collections::HashMap::new(),
-                                                        )
-                                                    })
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                let cap =
-                                                    caps.entry(prepared.code.clone()).or_insert(0);
-                                                *cap += 1;
-                                                if *cap >= 3 {
-                                                    log::warn!(
-                                                        "[T-03] code={} 连续 {} 次投递失败, 当日放弃重试",
-                                                        prepared.code,
-                                                        *cap
-                                                    );
-                                                    holding_plan_daily_record(
-                                                        today,
-                                                        &prepared.code,
-                                                    );
-                                                }
-                                            } else {
-                                                log::info!(
-                                                    "[T-03] delivered code={} outcome={:?}",
-                                                    prepared.code,
-                                                    outcome
-                                                );
-                                                holding_plan_daily_record(today, &prepared.code);
-                                            }
-                                        }
-                                        if confirmed {
-                                            last_holding_plan = std::time::Instant::now();
-                                        } else {
-                                            log::error!(
-                                            "[I-04][BR-091] dispatcher did not confirm delivery; timer not advanced"
-                                        );
-                                        }
-                                    }
-                                    Err(error) => log::error!(
-                                        "[I-04][T-03] 持仓建议批次拒绝, 保留重试资格: {error}"
-                                    ),
-                                }
+                        if holding_plan_schedule.begin_if_due(
+                            chrono::Utc::now()
+                                .with_timezone(
+                                    &chrono::FixedOffset::east_opt(8 * 60 * 60)
+                                        .expect("valid Shanghai offset"),
+                                )
+                                .date_naive(),
+                            std::time::Instant::now(),
+                        ) {
+                            let report = holding_plan::dispatch_tick(current_banner_for(
+                                "I-04 holding plan",
+                            ))
+                            .await;
+                            for failure in report.failures {
+                                log::error!("[I-04][T-03] {failure}");
+                            }
+                            if report.physically_accepted != 0 {
+                                log::info!(
+                                    "[T-03] physical Accepted and locally drained: {}",
+                                    report.physically_accepted
+                                );
                             }
                         }
 

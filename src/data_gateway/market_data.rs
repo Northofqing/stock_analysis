@@ -349,6 +349,14 @@ impl AdmittedRealtimeQuote {
         self.record.price
     }
 
+    pub fn previous_close(&self) -> f64 {
+        self.record.previous_close
+    }
+
+    pub fn change_percent(&self) -> f64 {
+        self.record.change_percent
+    }
+
     pub fn source_at(&self) -> DateTime<Utc> {
         self.record.source_at
     }

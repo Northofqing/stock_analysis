@@ -692,14 +692,14 @@ fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerEr
         .get_result::<IntegerRow>(conn)?
         .value;
     let owner_objects = diesel::sql_query(
-        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')
-              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')) AS value",
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*')) AS value",
     )
     .get_result::<IntegerRow>(conn)?
     .value;
     let fee_objects = diesel::sql_query(
-        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')
-              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')) AS value",
+        "SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*')) AS value",
     )
     .get_result::<IntegerRow>(conn)?
     .value;

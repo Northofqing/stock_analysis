@@ -26,6 +26,7 @@ pub mod global_market;
 pub mod global_news;
 pub mod grpc_source;
 pub mod historical_bars;
+mod historical_coverage_v2;
 mod historical_observed_diagnostic;
 mod historical_observed_store;
 pub(crate) mod historical_record_projection;
@@ -107,6 +108,10 @@ pub use global_news::{GlobalNewsGateway, GlobalNewsProvider, GlobalNewsRecord};
 pub use historical_bars::{
     daily_bar_provider_label, AdmittedDailyBars, HistoricalBarsGateway, ObservedDailyBarProjection,
     ObservedDailyBarsCapture,
+};
+pub use historical_coverage_v2::{
+    parse_recorded_historical_coverage_v2, RecordedHistoricalCoverageV2Error,
+    RecordedHistoricalCoverageV2Observation,
 };
 #[doc(hidden)]
 pub use historical_observed_diagnostic::observed_history_diagnostic;

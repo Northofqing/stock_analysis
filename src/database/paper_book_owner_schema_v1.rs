@@ -173,11 +173,11 @@ fn owner_objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, Pape
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM main.sqlite_master
-         WHERE (name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*') AND sql IS NOT NULL
          UNION ALL
          SELECT 'temp' AS namespace,type AS kind,name,tbl_name AS table_name,sql
          FROM temp.sqlite_master
-         WHERE (name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*') AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .load(conn)?)
@@ -428,9 +428,9 @@ fn v1_accounts(
 fn v1_objects(conn: &mut SqliteConnection) -> Result<Vec<CatalogObject>, PaperBookOwnerError> {
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
-         FROM main.sqlite_master WHERE (name GLOB 'paper_ledger_*' OR tbl_name GLOB 'paper_ledger_*') AND sql IS NOT NULL
+         FROM main.sqlite_master WHERE (lower(name) GLOB 'paper_ledger_*' OR lower(tbl_name) GLOB 'paper_ledger_*') AND sql IS NOT NULL
          UNION ALL SELECT 'temp',type,name,tbl_name,sql FROM temp.sqlite_master
-         WHERE (name GLOB 'paper_ledger_*' OR tbl_name GLOB 'paper_ledger_*') AND sql IS NOT NULL
+         WHERE (lower(name) GLOB 'paper_ledger_*' OR lower(tbl_name) GLOB 'paper_ledger_*') AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .load(conn)?)
@@ -443,8 +443,8 @@ fn has_v2_objects(conn: &mut SqliteConnection) -> Result<bool, PaperBookOwnerErr
         value: i64,
     }
     let count = diesel::sql_query(
-        "SELECT (SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*')
-              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_v2_*' OR tbl_name GLOB 'paper_book_v2_*') AS value",
+        "SELECT (SELECT COUNT(*) FROM main.sqlite_master WHERE lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*')
+              + (SELECT COUNT(*) FROM temp.sqlite_master WHERE lower(name) GLOB 'paper_book_v2_*' OR lower(tbl_name) GLOB 'paper_book_v2_*') AS value",
     )
     .get_result::<Count>(conn)?
     .value;
@@ -792,5 +792,68 @@ mod tests {
             ),
             Err(PaperBookOwnerError::CatalogMismatch)
         ));
+    }
+
+    #[test]
+    fn paper_namespace_casefold_v4_rejects_temp_aliases_and_reserved_attached_objects() {
+        for sql in [
+            "CREATE TEMP TABLE PAPER_BOOK_OWNER_V1 AS SELECT * FROM main.paper_book_owner_v1",
+            "CREATE TEMP VIEW PaPeR_LeDgEr_HeAd AS SELECT * FROM main.paper_ledger_head",
+            "CREATE TEMP VIEW PAPER_BOOK_V2_FEE_MANIFEST AS SELECT * FROM main.paper_book_v2_fee_manifest",
+            "CREATE TEMP TABLE TEST_CODE_foreign(value TEXT); CREATE TEMP TRIGGER PaPeR_BoOk_OwNeR_extra BEFORE INSERT ON TEST_CODE_foreign BEGIN SELECT 1; END",
+            "CREATE TABLE TEST_CODE_foreign(value TEXT); CREATE INDEX PAPER_BOOK_OWNER_extra ON TEST_CODE_foreign(value)",
+        ] {
+            let mut conn = installed();
+            let before = [
+                text_value(&mut conn, "SELECT manifest_bytes AS value FROM main.paper_ledger_account WHERE account_id='acct-a'"),
+                text_value(&mut conn, "SELECT payload AS value FROM main.paper_ledger_event WHERE account_id='acct-a' AND seq=1"),
+                text_value(&mut conn, "SELECT projection_bytes AS value FROM main.paper_ledger_head WHERE account_id='acct-a'"),
+            ];
+            conn.batch_execute(sql).unwrap();
+            let is_expected_namespace_error = |result| {
+                if sql.contains("PAPER_BOOK_V2_FEE_MANIFEST") {
+                    matches!(
+                        result,
+                        Err(PaperBookOwnerError::FeeManifest(
+                            super::super::paper_book_v2_schema::StagedPaperBookV2Error::CatalogMismatch
+                        ))
+                    )
+                } else {
+                    matches!(result, Err(PaperBookOwnerError::CatalogMismatch))
+                }
+            };
+            assert!(is_expected_namespace_error(verify_catalog_v4_on(&mut conn)), "{sql}");
+            assert!(is_expected_namespace_error(require_v1_owner_on(&mut conn, "acct-a", "epoch-a", &"a".repeat(64))), "{sql}");
+            assert_eq!(before, [
+                text_value(&mut conn, "SELECT manifest_bytes AS value FROM main.paper_ledger_account WHERE account_id='acct-a'"),
+                text_value(&mut conn, "SELECT payload AS value FROM main.paper_ledger_event WHERE account_id='acct-a' AND seq=1"),
+                text_value(&mut conn, "SELECT projection_bytes AS value FROM main.paper_ledger_head WHERE account_id='acct-a'"),
+            ]);
+        }
+    }
+
+    #[test]
+    fn paper_namespace_casefold_legacy_owner_fence_rejects_unknown_aliases() {
+        for generation in [1, 2, 3] {
+            for sql in [
+                "CREATE TEMP TABLE PAPER_BOOK_OWNER_unknown(value TEXT)",
+                "CREATE TEMP VIEW PaPeR_BoOk_V2_unknown AS SELECT 1 AS value",
+            ] {
+                let mut conn = v3_with_two_accounts();
+                conn.batch_execute(&format!("PRAGMA user_version={generation}"))
+                    .unwrap();
+                require_v1_owner_on(&mut conn, "acct-a", "epoch-a", &"a".repeat(64)).unwrap();
+                conn.batch_execute(sql).unwrap();
+                assert!(
+                    matches!(
+                        require_v1_owner_on(&mut conn, "acct-a", "epoch-a", &"a".repeat(64)),
+                        Err(PaperBookOwnerError::CatalogMismatch)
+                    ),
+                    "generation={generation} {sql}"
+                );
+                assert_eq!(identity(&mut conn).unwrap().user_version, generation);
+                assert_eq!(text_value(&mut conn, "SELECT manifest_bytes AS value FROM main.paper_ledger_account WHERE account_id='acct-a'"), "manifest-a");
+            }
+        }
     }
 }

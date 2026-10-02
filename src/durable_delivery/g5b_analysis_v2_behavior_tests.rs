@@ -537,3 +537,9 @@ mod model_archive_v2_tests;
 
 #[path = "g5b_v2_owner_behavior_tests.rs"]
 mod owner_v2_tests;
+
+#[path = "g5b_physical_seal_behavior_tests.rs"]
+mod physical_seal_behavior_tests;
+
+#[path = "g5b_physical_facade_behavior_tests.rs"]
+mod physical_facade_behavior_tests;

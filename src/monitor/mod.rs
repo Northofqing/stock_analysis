@@ -27,6 +27,7 @@ pub mod entity_linker;
 pub mod event_bus;
 pub mod g5b_analysis_v2;
 pub mod g5b_empty_v2;
+pub mod g5b_physical_v2;
 pub(crate) mod g5b_selection_v2;
 mod integration;
 pub mod news_ai;

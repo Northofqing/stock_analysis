@@ -1,6 +1,6 @@
 use super::*;
-use crate::durable_delivery::AuthoritativeSinkPort;
 use crate::durable_delivery::tests::{fixture_coordinator_arc, Fixture};
+use crate::durable_delivery::AuthoritativeSinkPort;
 use chrono::TimeZone;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -78,6 +78,17 @@ fn start(f: &Fixture, db: &DatabaseManager, strong: bool) -> StoredP05Draft {
             &mut renderer,
         )
         .unwrap()
+}
+fn begin_on(
+    f: &Fixture,
+    db: &DatabaseManager,
+    decision: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<AttemptLease>> {
+    let route = f.coordinator.decision_mutation_route(decision)?;
+    let check = f.coordinator.p05_consumer_check_on(db, &route);
+    f.coordinator
+        .begin_attempt_with_p05_check(decision, 1, now, Some(&check))
 }
 fn complete_intent(f: &Fixture, db: &DatabaseManager, draft: &StoredP05Draft) -> StoredP05Intent {
     let started = f.coordinator.claim_p05_prediction_prepare(draft).unwrap();
@@ -700,14 +711,23 @@ fn p05_shared_unit_runtime_intervening_partial_or_dirty_baseline_blocks_new_day_
             &mut renderer,
         )
         .unwrap();
-    assert!(f
+    assert_eq!(
+        crate::calendar::verified_next_a_share_trading_day(date_day("2026-09-24").unwrap())
+            .unwrap(),
+        date_day("2026-09-28").unwrap()
+    );
+    let error = f
         .coordinator
         .store_p05_observed_draft_rendered(
-            &input(25, &["TEST_CODE_600001"], false),
-            Some(at(25, 9, 24, 0)),
-            &mut renderer
+            &input(28, &["TEST_CODE_600001"], false),
+            Some(at(28, 9, 24, 0)),
+            &mut renderer,
         )
-        .is_err());
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("intervening incomplete Unit"),
+        "next trading day must be rejected for the unfinished prior Unit: {error}"
+    );
     assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_unit_drafts"), 2);
     assert_eq!(
         f.query_i64("SELECT baseline_revision FROM p05_baseline_heads"),
@@ -1040,8 +1060,13 @@ fn p05_shared_unit_runtime_manual_accepted_is_not_physical_completion() {
         AuthoritativeSinkResult::Accepted(r) => r,
         _ => unreachable!(),
     };
+    let route = f
+        .coordinator
+        .decision_mutation_route(&outcome.decision_identity)
+        .unwrap();
+    let check = f.coordinator.p05_consumer_check_on(&db, &route);
     f.coordinator
-        .resolve_uncertain(
+        .resolve_uncertain_with_p05_check(
             &crate::durable_delivery::ManualResolutionCommand {
                 decision_identity: outcome.decision_identity,
                 disposition: crate::durable_delivery::ManualDisposition::Accepted {
@@ -1053,6 +1078,7 @@ fn p05_shared_unit_runtime_manual_accepted_is_not_physical_completion() {
                 resolved_at: at(23, 9, 23, 0),
             },
             &append,
+            Some(&check),
         )
         .unwrap();
     f.coordinator
@@ -1391,10 +1417,9 @@ fn p05_shared_unit_runtime_prior_closure_hooks_fresh_draft_prepare_begin_rollbac
                     .coordinator
                     .prepare_p05_unit_child_local(&db, "2026-09-24", 0, 1, Some(at(24, 9, 22, 0)))
                     .map(|_| ()),
-                "begin" => f
-                    .coordinator
-                    .begin_attempt(decision.as_ref().unwrap(), 1, at(24, 9, 22, 1))
-                    .map(|_| ()),
+                "begin" => {
+                    begin_on(&f, &db, decision.as_ref().unwrap(), at(24, 9, 22, 1)).map(|_| ())
+                }
                 _ => unreachable!(),
             };
             let error = result.unwrap_err();
@@ -1551,10 +1576,7 @@ fn p05_shared_unit_runtime_prior_closure_true_postcommit_keeps_facts_and_returns
                 .coordinator
                 .prepare_p05_unit_child_local(&db, "2026-09-24", 0, 1, Some(at(24, 9, 22, 0)))
                 .map(|_| ()),
-            "begin" => f
-                .coordinator
-                .begin_attempt(decision.as_ref().unwrap(), 1, at(24, 9, 22, 1))
-                .map(|_| ()),
+            "begin" => begin_on(&f, &db, decision.as_ref().unwrap(), at(24, 9, 22, 1)).map(|_| ()),
             "finalize" => f
                 .coordinator
                 .finalize_p05_unit_observed("2026-09-24", observed.as_ref().unwrap())
@@ -1615,9 +1637,7 @@ fn p05_shared_unit_runtime_dirty_prior_keeps_existing_prepare_raw_audit_and_recl
     f.coordinator
         .reconcile_all_pending(&append, at(24, 9, 22, 0))
         .unwrap();
-    let attempt = f
-        .coordinator
-        .begin_attempt(&original.1.decision_identity, 1, at(24, 9, 22, 1))
+    let attempt = begin_on(&f, &db, &original.1.decision_identity, at(24, 9, 22, 1))
         .unwrap()
         .unwrap();
     let (prior_attempt,prior_fence):(String,i64)=Connection::open(&f.database_path).unwrap().query_row("SELECT a.attempt_identity,a.fence_token FROM delivery_attempts a JOIN delivery_decisions d ON d.decision_identity=a.decision_identity WHERE d.business_date='2026-09-23' ORDER BY a.rowid LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
@@ -1666,4 +1686,846 @@ fn p05_shared_unit_runtime_dirty_prior_keeps_existing_prepare_raw_audit_and_recl
         1
     );
     assert_eq!(prior_sink.calls.load(Ordering::SeqCst), 2);
+}
+
+fn corrupt_actual_score(dir: &tempfile::TempDir) {
+    Connection::open(dir.path().join("TEST_CODE_P05_S2.db"))
+        .unwrap()
+        .execute(
+            "UPDATE prediction_tracker SET pred_score=81 WHERE stock_code='TEST_CODE_600001'",
+            [],
+        )
+        .unwrap();
+}
+fn owned_route(f: &Fixture, decision: &str) -> DecisionMutationRoute {
+    f.coordinator.decision_mutation_route(decision).unwrap()
+}
+fn owned_revision(f: &Fixture) -> i64 {
+    f.query_i64("SELECT mutation_revision FROM p05_unit_heads ORDER BY rowid LIMIT 1")
+}
+fn prepare_first(f: &Fixture, db: &DatabaseManager) -> DeliveryEnvelope {
+    let draft = start(f, db, true);
+    complete_intent(f, db, &draft);
+    let (_, envelope) = f
+        .coordinator
+        .prepare_p05_unit_child_local(db, DATE, 0, 1, Some(at(23, 9, 22, 0)))
+        .unwrap();
+    f.coordinator
+        .reconcile_all_pending(&Append::default(), at(23, 9, 22, 0))
+        .unwrap();
+    envelope
+}
+
+#[test]
+fn p05_shared_unit_consumer_isolated_leaf_aliases_rejected_before_any_sqlite_write() {
+    use std::os::unix::fs::symlink;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        for hard in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("TEST_CODE_foreign_bytes");
+            let bytes = b"TEST_CODE unchanged foreign bytes, not SQLite";
+            std::fs::write(&target, bytes).unwrap();
+            let path = dir.path().join("TEST_CODE_alias.db");
+            let leaf = dir.path().join(format!("TEST_CODE_alias.db{suffix}"));
+            if hard {
+                std::fs::hard_link(&target, &leaf).unwrap();
+            } else {
+                symlink(&target, &leaf).unwrap();
+            }
+            let entries = || {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let before = entries();
+            assert!(
+                DatabaseManager::open_isolated_for_test(path).is_err(),
+                "{suffix}, hard={hard}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), bytes);
+            assert_eq!(
+                entries(),
+                before,
+                "rejection must not create main/sidecar files"
+            );
+        }
+    }
+}
+
+#[test]
+fn p05_shared_unit_consumer_isolated_parent_alias_outside_temp_rejected_without_write() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new("S3_OUTSIDE_TEMP");
+    let outside = tempfile::tempdir_in(f.database_path.parent().unwrap()).unwrap();
+    assert!(!outside
+        .path()
+        .canonicalize()
+        .unwrap()
+        .starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    let dir = tempfile::tempdir().unwrap();
+    let alias = dir.path().join("TEST_CODE_outside");
+    symlink(outside.path().canonicalize().unwrap(), &alias).unwrap();
+    assert!(DatabaseManager::open_isolated_for_test(alias.join("TEST_CODE_escaped.db")).is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn p05_shared_unit_consumer_constructor_origin_rechecks_replaced_main_before_business_gate() {
+    let f = Fixture::new("S3_REPLACED_MAIN");
+    let (dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let path = dir.path().join("TEST_CODE_P05_S2.db");
+    std::fs::rename(&path, dir.path().join("TEST_CODE_retained.db")).unwrap();
+    let foreign = b"TEST_CODE foreign replacement must never be read as original DB";
+    std::fs::write(&path, foreign).unwrap();
+    assert!(!db.has_isolated_p05_consumer_origin());
+    let check = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    let before = owned_revision(&f);
+    assert!(f
+        .coordinator
+        .begin_attempt_with_p05_check(
+            &envelope.decision_identity,
+            1,
+            at(23, 9, 22, 1),
+            Some(&check)
+        )
+        .is_err());
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 0);
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(std::fs::read(&path).unwrap(), foreign);
+}
+
+#[test]
+fn p05_shared_unit_consumer_generic_startup_and_direct_begin_block_but_actual_test_cap_sends_once()
+{
+    let f = Fixture::new("S3_GENERIC_OPEN");
+    let (_dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let before = owned_revision(&f);
+    let (port, sinks) = sink(accepted(at(23, 9, 22, 1)));
+    assert!(f
+        .coordinator
+        .begin_attempt(&envelope.decision_identity, 1, at(23, 9, 22, 1))
+        .is_err());
+    assert!(f
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, at(23, 9, 22, 1))
+        .is_err());
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 0);
+    let check = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    let opened = f
+        .coordinator
+        .resume_deliverable_with_p05_check(
+            &envelope.decision_identity,
+            &sinks,
+            at(23, 9, 22, 1),
+            Some(&check),
+        )
+        .unwrap();
+    assert_eq!(opened.sink_calls, 1);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 1);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 1);
+    assert_eq!(owned_revision(&f), before + 2); // original begin + original raw result
+    let after = owned_revision(&f);
+    let again = f
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, at(23, 9, 22, 2))
+        .unwrap();
+    assert_eq!(again.sink_calls, 0);
+    assert_eq!(owned_revision(&f), after);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn p05_shared_unit_consumer_actual_cap_cannot_cross_identical_namespace_or_member() {
+    let f = Fixture::new("S3_CAP_FIRST");
+    let other = Fixture::new("S3_CAP_OTHER");
+    let (_one, db) = operational();
+    let (_two, other_db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let foreign_envelope = prepare_first(&other, &other_db);
+    assert_eq!(envelope, foreign_envelope);
+    let check = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    assert!(matches!(check, ActualP05ConsumerCheck::Verified(_)));
+    let foreign_before = owned_revision(&other);
+    assert!(other
+        .coordinator
+        .begin_attempt_with_p05_check(
+            &foreign_envelope.decision_identity,
+            1,
+            at(23, 9, 22, 1),
+            Some(&check)
+        )
+        .is_err());
+    assert_eq!(owned_revision(&other), foreign_before);
+    assert_eq!(other.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 0);
+    let (_, board) = f
+        .coordinator
+        .prepare_p05_unit_child_local(&db, DATE, 1, 1, Some(at(23, 9, 22, 1)))
+        .unwrap();
+    f.coordinator
+        .reconcile_all_pending(&Append::default(), at(23, 9, 22, 1))
+        .unwrap();
+    let before = owned_revision(&f);
+    assert!(f
+        .coordinator
+        .begin_attempt_with_p05_check(&board.decision_identity, 1, at(23, 9, 22, 2), Some(&check))
+        .is_err());
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 0);
+    let view = f
+        .coordinator
+        .inspect_p05_unit_child_global(DATE, 0)
+        .unwrap();
+    assert!(other
+        .coordinator
+        .prepare_p05_child_inspection(&view, 1)
+        .is_err());
+}
+
+#[test]
+fn p05_shared_unit_consumer_heartbeat_reader_failure_preserves_noop_and_late_raw_audit() {
+    let f = Fixture::new("S3_HEARTBEAT");
+    let (dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let attempt = begin_on(&f, &db, &envelope.decision_identity, at(23, 9, 22, 1))
+        .unwrap()
+        .unwrap();
+    corrupt_actual_score(&dir);
+    let before = owned_revision(&f);
+    assert!(f
+        .coordinator
+        .heartbeat_attempt(
+            &envelope.decision_identity,
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            at(23, 9, 22, 1)
+        )
+        .unwrap());
+    assert!(!f
+        .coordinator
+        .heartbeat_attempt(
+            &envelope.decision_identity,
+            &attempt.attempt_identity,
+            attempt.fence_token + 1,
+            at(23, 9, 22, 2)
+        )
+        .unwrap());
+    let check = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    assert!(matches!(check, ActualP05ConsumerCheck::Failed(_)));
+    assert!(f
+        .coordinator
+        .heartbeat_attempt_with_p05_check(
+            &envelope.decision_identity,
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            at(23, 9, 22, 2),
+            Some(&check)
+        )
+        .is_err());
+    assert_eq!(owned_revision(&f), before);
+    let original = accepted(at(23, 9, 22, 3));
+    f.coordinator
+        .record_sink_result(
+            &attempt.attempt_identity,
+            attempt.fence_token,
+            original,
+            at(23, 9, 22, 3),
+        )
+        .unwrap();
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 1);
+    assert_eq!(owned_revision(&f), before + 1);
+    f.coordinator
+        .reconcile_all_pending(&Append::default(), at(23, 9, 22, 4))
+        .unwrap();
+    let read = f.coordinator.observe_p05_unit_receipts(DATE).unwrap();
+    assert!(matches!(
+        read.children()[0],
+        P05ChildReceiptObservation::PhysicallyAccepted { .. }
+    ));
+}
+
+#[test]
+fn p05_shared_unit_consumer_authorize_and_reacquire_consume_reader_only_at_real_opening() {
+    for automatic_retry in [false, true] {
+        let f = Fixture::new("S3_RETRY");
+        let (dir, db) = operational();
+        let envelope = prepare_first(&f, &db);
+        let check = f
+            .coordinator
+            .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+        let rejected = AuthoritativeSinkResult::Rejected(crate::durable_delivery::TypedRejection {
+            reason_code: "TEST_CODE_RETRY".into(),
+            evidence: b"TEST_CODE original rejection".to_vec(),
+            retry_authorized: automatic_retry,
+            observed_at: at(23, 9, 22, 1),
+        });
+        let (port, sinks) = sink(rejected);
+        f.coordinator
+            .resume_deliverable_with_p05_check(
+                &envelope.decision_identity,
+                &sinks,
+                at(23, 9, 22, 1),
+                Some(&check),
+            )
+            .unwrap();
+        let setup_append = Append::default();
+        f.coordinator
+            .reconcile_all_pending(&setup_append, at(23, 9, 22, 1))
+            .unwrap();
+        assert_eq!(
+            f.coordinator
+                .decision_state(&envelope.decision_identity)
+                .unwrap(),
+            DecisionState::RejectedDurable
+        );
+        corrupt_actual_score(&dir);
+        let failed = f
+            .coordinator
+            .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+        assert!(matches!(failed, ActualP05ConsumerCheck::Failed(_)));
+        let before = owned_revision(&f);
+        if automatic_retry {
+            // Already-authorized is a true NoChange, not a new grant.
+            f.coordinator
+                .authorize_rejected_retry(&envelope.decision_identity)
+                .unwrap();
+            assert!(f
+                .coordinator
+                .resume_deliverable_with_p05_check(
+                    &envelope.decision_identity,
+                    &sinks,
+                    at(23, 9, 22, 2),
+                    Some(&failed)
+                )
+                .is_err());
+        } else {
+            let outcome = f
+                .coordinator
+                .resume_deliverable(&envelope.decision_identity, &sinks, at(23, 9, 22, 2))
+                .unwrap();
+            assert_eq!(outcome.sink_calls, 0);
+            assert!(f
+                .coordinator
+                .authorize_rejected_retry_with_p05_check(&envelope.decision_identity, Some(&failed))
+                .is_err());
+        }
+        assert_eq!(owned_revision(&f), before);
+        assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 1);
+        assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 1);
+    }
+}
+
+#[test]
+fn p05_shared_unit_consumer_manual_resolution_reader_failure_keeps_external_authorization() {
+    let f = Fixture::new("S3_MANUAL_GATE");
+    let (dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let check = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    let (_, sinks) = sink(AuthoritativeSinkResult::Uncertain(
+        crate::durable_delivery::TypedUncertainty {
+            reason_code: "TEST_CODE_UNKNOWN".into(),
+            evidence: b"TEST_CODE original uncertain".to_vec(),
+            observed_at: at(23, 9, 22, 1),
+        },
+    ));
+    f.coordinator
+        .resume_deliverable_with_p05_check(
+            &envelope.decision_identity,
+            &sinks,
+            at(23, 9, 22, 1),
+            Some(&check),
+        )
+        .unwrap();
+    let setup_append = Append::default();
+    f.coordinator
+        .reconcile_all_pending(&setup_append, at(23, 9, 22, 1))
+        .unwrap();
+    assert_eq!(
+        f.coordinator
+            .decision_state(&envelope.decision_identity)
+            .unwrap(),
+        DecisionState::UncertainManualReview
+    );
+    corrupt_actual_score(&dir);
+    let failed = f
+        .coordinator
+        .p05_consumer_check_on(&db, &owned_route(&f, &envelope.decision_identity));
+    assert!(matches!(
+        failed,
+        ActualP05ConsumerCheck::Failed(
+            "P05 actual operational freeze/score unavailable or mismatched"
+        )
+    ));
+    let append = Append::default();
+    let before = owned_revision(&f);
+    let command = crate::durable_delivery::ManualResolutionCommand {
+        decision_identity: envelope.decision_identity.clone(),
+        disposition: crate::durable_delivery::ManualDisposition::Rejected,
+        operator_identity: "TEST_CODE_OPERATOR_S3_0123456789abcdef".into(),
+        reason: "TEST_CODE operator rejected".into(),
+        external_evidence: b"TEST_CODE independent authorization bytes".to_vec(),
+        resolved_at: at(23, 9, 23, 0),
+    };
+    let error = f
+        .coordinator
+        .resolve_uncertain_with_p05_check(&command, &append, Some(&failed))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableDeliveryError::PolicyMismatch(reason)
+            if reason == "P05 preparation: P05 actual operational freeze/score unavailable or mismatched"
+    ));
+    assert_eq!(append.calls.load(Ordering::SeqCst), 1);
+    let records = append.rows.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(records
+        .values()
+        .next()
+        .unwrap()
+        .1
+        .contains("ManualResolutionAuthorization"));
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM manual_resolutions"), 0);
+    assert_eq!(
+        f.coordinator
+            .decision_state(&envelope.decision_identity)
+            .unwrap(),
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 1);
+}
+
+#[tokio::test]
+async fn p05_shared_unit_consumer_public_passive_restore_existing_accepted_reclose_without_resampling(
+) {
+    use crate::p05_auction_unit::P05AuctionUnit;
+    let f = Fixture::new("S3_PASSIVE_RESTORE");
+    let (dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let append = Append::default();
+    let port = deliver_all(&f, &db, &intent, 23, &append);
+    let complete = finalize(&f, DATE);
+    corrupt_actual_score(&dir);
+    let counted = fixture_coordinator_arc(&f);
+    let unit = P05AuctionUnit::restore(counted.clone(), DATE)
+        .await
+        .unwrap()
+        .unwrap();
+    unit.require_counted_owner(&counted).unwrap();
+    let foreign = f.second_coordinator("S3_FOREIGN_ARC");
+    assert!(unit.require_counted_owner(&foreign).is_err());
+    let view = unit.inspect_child(0).unwrap();
+    assert_eq!(
+        view.envelope().canonical_bytes().unwrap(),
+        intent.children[0].1
+    );
+    view.require_counted_owner(&counted).unwrap();
+    assert!(view.require_counted_owner(&foreign).is_err());
+    let before = owned_revision(&f);
+    let prepared = view.prepare_child(1).unwrap();
+    assert_eq!(prepared.envelope(), view.envelope());
+    assert!(prepared.require_counted_owner(&foreign).is_err());
+    let (_, sinks) = sink(accepted(at(23, 9, 24, 0)));
+    let noop = prepared.resume(&sinks).unwrap();
+    assert_eq!(noop.sink_calls, 0);
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    let (attempt, fence): (String, i64) = Connection::open(&f.database_path)
+        .unwrap()
+        .query_row(
+            "SELECT attempt_identity,fence_token FROM delivery_attempts ORDER BY rowid LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let raw_before = f.query_i64("SELECT COUNT(*) FROM sink_results");
+    f.coordinator
+        .record_sink_result(
+            &attempt,
+            fence,
+            accepted(at(23, 9, 24, 1)),
+            at(23, 9, 24, 1),
+        )
+        .unwrap();
+    f.coordinator
+        .reconcile_all_pending(&append, at(23, 9, 24, 2))
+        .unwrap();
+    let observed = unit.observe().unwrap();
+    assert!(observed.completion_identity().is_none());
+    let reclosed = unit.finalize(&observed).unwrap();
+    assert!(reclosed.completion_identity().is_some());
+    assert_ne!(
+        reclosed.completion_identity(),
+        complete.completion_identity()
+    );
+    assert_eq!(
+        f.query_i64("SELECT baseline_revision FROM p05_baseline_heads"),
+        1
+    );
+    assert_eq!(
+        f.query_i64("SELECT COUNT(*) FROM sink_results"),
+        raw_before + 1
+    );
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(db.count_predictions().unwrap(), 2);
+    // Public fresh production work must never adopt Test/global fixture DB.
+    assert!(P05AuctionUnit::initialize_prospective_family(&f.coordinator).is_err());
+}
+
+#[test]
+fn p05_shared_unit_consumer_readonly_view_original_metadata_and_no_authority_before_prepare() {
+    let f = Fixture::new("S3_READONLY_VIEW");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, true);
+    let intent = complete_intent(&f, &db, &draft);
+    let before = owned_revision(&f);
+    for (ordinal, (child, raw)) in intent.children.iter().enumerate() {
+        let view = f
+            .coordinator
+            .inspect_p05_unit_child_global(DATE, ordinal)
+            .unwrap();
+        assert_eq!(view.ordinal(), ordinal);
+        assert_eq!(view.business_date(), DATE);
+        assert_eq!(view.child_identity(), child);
+        assert_eq!(view.unit_identity(), draft.identity());
+        assert_eq!(view.intent_identity(), intent.identity());
+        assert_eq!(view.envelope().canonical_bytes().unwrap(), *raw);
+        assert_eq!(view.governance_code(), None);
+        // Test's public/global path cannot grant a new owner or reservation.
+        assert!(f
+            .coordinator
+            .prepare_p05_child_inspection(&view, 1)
+            .is_err());
+    }
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_decisions"), 0);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"), 0);
+    assert_eq!(
+        f.query_i64("SELECT COUNT(*) FROM daily_budget_reservations"),
+        0
+    );
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
+}
+
+#[test]
+fn p05_shared_unit_consumer_readonly_list_phases_complete_exclusion_and_dirty_order() {
+    let f = Fixture::new("S3_LIST_PHASES");
+    let (_dir, db) = operational();
+    let draft = start(&f, &db, false);
+    let list = f.coordinator.inspect_p05_unfinished_units().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].phase(), P05StoredUnitPhase::Draft);
+    assert_eq!(list[0].mutation_revision(), 1);
+    assert_eq!(list[0].unit_identity(), draft.identity());
+    assert_eq!(list[0].intent_identity(), None);
+    let started = f.coordinator.claim_p05_prediction_prepare(&draft).unwrap();
+    let list = f.coordinator.inspect_p05_unfinished_units().unwrap();
+    assert_eq!(list[0].phase(), P05StoredUnitPhase::Started);
+    assert_eq!(list[0].mutation_revision(), 2);
+    let intent = f
+        .coordinator
+        .complete_p05_unit_intent_on(&draft, &started, &db)
+        .unwrap();
+    let list = f.coordinator.inspect_p05_unfinished_units().unwrap();
+    assert_eq!(list[0].phase(), P05StoredUnitPhase::IntentComplete);
+    assert_eq!(list[0].intent_identity(), Some(intent.identity()));
+    let append = Append::default();
+    let port = deliver_all(&f, &db, &intent, 23, &append);
+    let completed = finalize(&f, DATE);
+    assert!(f
+        .coordinator
+        .inspect_p05_unfinished_units()
+        .unwrap()
+        .is_empty());
+    next_draft(&f);
+    assert_eq!(
+        f.coordinator.inspect_p05_unfinished_units().unwrap()[0].business_date(),
+        "2026-09-24"
+    );
+    let (attempt, fence): (String, i64) = Connection::open(&f.database_path)
+        .unwrap()
+        .query_row(
+            "SELECT attempt_identity,fence_token FROM delivery_attempts ORDER BY rowid LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    f.coordinator
+        .record_sink_result(
+            &attempt,
+            fence,
+            accepted(at(24, 9, 22, 0)),
+            at(24, 9, 22, 0),
+        )
+        .unwrap();
+    let list = f.coordinator.inspect_p05_unfinished_units().unwrap();
+    assert_eq!(
+        list.iter().map(|s| s.business_date()).collect::<Vec<_>>(),
+        [DATE, "2026-09-24"]
+    );
+    assert_eq!(
+        list[0].first_completion_identity(),
+        completed.completion_identity()
+    );
+    assert!(list[0].mutation_revision() > completed.mutation_revision());
+    assert_eq!(list[1].phase(), P05StoredUnitPhase::Draft);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn p05_shared_unit_consumer_readonly_list_postread_mutation_cannot_return_stale_empty() {
+    let f = Fixture::new("S3_LIST_BOUNDARY");
+    let (_dir, db) = operational();
+    let append = Append::default();
+    let port = completed_prior(&f, &db, &append);
+    assert!(f
+        .coordinator
+        .inspect_p05_unfinished_units()
+        .unwrap()
+        .is_empty());
+    let path = f.database_path.clone();
+    let hit = Arc::new(AtomicUsize::new(0));
+    let callback_hit = hit.clone();
+    f.coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                callback_hit.fetch_add(1, Ordering::SeqCst);
+                let mut c = Connection::open(path)?;
+                crate::durable_delivery::schema::register_sha256_function(&c)?;
+                c.pragma_update(None, "foreign_keys", "ON")?;
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                actual_extra_mutation_for_test(&tx)?;
+                tx.commit()?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let error = f.coordinator.inspect_p05_unfinished_units().unwrap_err();
+    assert!(
+        error.to_string().contains("readonly Unit list membership"),
+        "{error}"
+    );
+    assert_eq!(hit.load(Ordering::SeqCst), 1);
+    let list = f.coordinator.inspect_p05_unfinished_units().unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(list[0].first_completion_identity().is_some());
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.query_i64("SELECT COUNT(*) FROM p05_s2_completion_receipts"),
+        1
+    );
+    assert_eq!(
+        f.query_i64("SELECT baseline_revision FROM p05_baseline_heads"),
+        1
+    );
+}
+
+#[test]
+fn p05_shared_unit_consumer_owned_classifier_validates_actual_owner_unowned_v1_keeps_original_route(
+) {
+    let f = Fixture::new("S3_CLASSIFIER");
+    let (_dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let inspected = f
+        .coordinator
+        .inspect_p05_owned_child_global(&envelope.decision_identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspected.envelope(), &envelope);
+    assert_eq!(inspected.ordinal(), 0);
+    let legacy = Fixture::new("S3_UNOWNED_V1");
+    let outcome = legacy
+        .coordinator
+        .prepare(&envelope, 1, at(23, 9, 22, 0))
+        .unwrap();
+    assert_eq!(outcome.state, DecisionState::Reserved);
+    assert!(legacy
+        .coordinator
+        .inspect_p05_owned_child_global(&envelope.decision_identity)
+        .unwrap()
+        .is_none());
+    legacy
+        .coordinator
+        .reconcile_all_pending(&Append::default(), at(23, 9, 22, 0))
+        .unwrap();
+    let (port, sinks) = sink(accepted(at(23, 9, 22, 1)));
+    let original = legacy
+        .coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, at(23, 9, 22, 1))
+        .unwrap();
+    assert_eq!(original.sink_calls, 1);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        legacy.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"),
+        0
+    );
+    // An invalid owned catalog must return an error, never classify as v1.
+    Connection::open(&f.database_path)
+        .unwrap()
+        .execute("DROP TABLE p05_s2_child_owners", [])
+        .unwrap();
+    assert!(f
+        .coordinator
+        .inspect_p05_owned_child_global(&envelope.decision_identity)
+        .is_err());
+}
+
+#[test]
+fn p05_shared_unit_consumer_global_or_production_tag_cannot_issue_test_capability() {
+    let f = Fixture::new("S3_ORIGIN_GATE");
+    let (_dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    DatabaseManager::init(None).unwrap();
+    let check = f.coordinator.p05_consumer_check_on(
+        DatabaseManager::get(),
+        &owned_route(&f, &envelope.decision_identity),
+    );
+    assert!(matches!(check, ActualP05ConsumerCheck::Failed(_)));
+    let before = owned_revision(&f);
+    assert!(f
+        .coordinator
+        .begin_attempt_with_p05_check(
+            &envelope.decision_identity,
+            1,
+            at(23, 9, 22, 1),
+            Some(&check)
+        )
+        .is_err());
+    assert_eq!(owned_revision(&f), before);
+    let mut config = f.coordinator.config.clone();
+    config.environment = super::super::super::super::model::StoreEnvironment::Production;
+    let bytes = std::fs::read(&f.database_path).unwrap();
+    assert!(DurableDeliveryCoordinator::open(config).is_err());
+    assert_eq!(std::fs::read(&f.database_path).unwrap(), bytes);
+}
+
+#[test]
+fn p05_shared_unit_consumer_readonly_view_postread_actual_mutation_rejected_without_losing_fact() {
+    let f = Fixture::new("S3_VIEW_BOUNDARY");
+    let (_dir, db) = operational();
+    let envelope = prepare_first(&f, &db);
+    let original = f
+        .coordinator
+        .inspect_p05_unit_child_global(DATE, 0)
+        .unwrap();
+    let path = f.database_path.clone();
+    let hit = Arc::new(AtomicUsize::new(0));
+    let callback_hit = hit.clone();
+    f.coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                callback_hit.fetch_add(1, Ordering::SeqCst);
+                let mut c = Connection::open(path)?;
+                crate::durable_delivery::schema::register_sha256_function(&c)?;
+                c.pragma_update(None, "foreign_keys", "ON")?;
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                actual_extra_mutation_for_test(&tx)?;
+                tx.commit()?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let error = match f.coordinator.inspect_p05_unit_child_global(DATE, 0) {
+        Ok(_) => panic!("stale readonly child snapshot returned"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("exact Unit SQL binding"),
+        "{error}"
+    );
+    assert_eq!(hit.load(Ordering::SeqCst), 1);
+    let current = f
+        .coordinator
+        .inspect_p05_unit_child_global(DATE, 0)
+        .unwrap();
+    assert_eq!(current.envelope(), &envelope);
+    assert_eq!(current.envelope(), original.envelope());
+    assert_eq!(
+        f.query_i64(
+            "SELECT COUNT(*) FROM immutable_audit_outbox WHERE audit_kind='LateReceiptObserved'"
+        ),
+        1
+    );
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"), 1);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_attempts"), 0);
+}
+
+#[test]
+fn p05_shared_unit_consumer_crossday_view_retains_actual_t08_ordinal_scope_source_and_occurrence() {
+    let f = Fixture::new("S3_T08_VIEW");
+    let (_dir, db) = operational();
+    let append = Append::default();
+    completed_prior(&f, &db, &append);
+    let next = f
+        .coordinator
+        .store_p05_observed_draft_rendered(
+            &input(24, &["TEST_CODE_300001"], false),
+            Some(at(24, 9, 24, 0)),
+            &mut renderer,
+        )
+        .unwrap();
+    let intent = complete_intent(&f, &db, &next);
+    let before = owned_revision(&f);
+    for (index, kind) in [
+        PushKind::AuctionRepush,
+        PushKind::CandidateInvalidated,
+        PushKind::CandidateInvalidated,
+        PushKind::CandidateBoard,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let view = f
+            .coordinator
+            .inspect_p05_unit_child_global("2026-09-24", index)
+            .unwrap();
+        assert_eq!(view.envelope().push_kind, kind);
+        assert_eq!(view.ordinal(), index);
+        assert_eq!(
+            view.envelope().canonical_bytes().unwrap(),
+            intent.children[index].1
+        );
+        if kind == PushKind::CandidateInvalidated {
+            let code = if index == 1 {
+                "TEST_CODE_000001"
+            } else {
+                "TEST_CODE_600001"
+            };
+            assert_eq!(view.governance_code(), Some(code));
+            assert_eq!(
+                view.envelope().schedule_occurrence_identity,
+                format!("candidate-invalidated:2026-09-24:{code}")
+            );
+            assert!(view.envelope().retry_authorized);
+            let source: serde_json::Value =
+                serde_json::from_slice(&view.envelope().source_binding_canonical).unwrap();
+            assert_eq!(source["code"], code);
+            assert_eq!(source["prev"], "候选");
+            assert_eq!(source["reason"], "从候选台消失");
+        } else {
+            assert_eq!(view.governance_code(), None);
+        }
+    }
+    assert_eq!(owned_revision(&f), before);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners"), 2);
+    assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 2);
 }

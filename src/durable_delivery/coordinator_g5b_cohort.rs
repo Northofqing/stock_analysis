@@ -15,6 +15,9 @@ use std::sync::Arc;
 mod artifact;
 #[path = "coordinator_g5b_empty.rs"]
 mod empty;
+#[path = "coordinator_g5b_physical_seal.rs"]
+mod physical;
+pub(crate) use physical::{G5bPhysicalSealAttempt, VerifiedG5bPhysicalSeal};
 #[path = "coordinator_g5b_model_bundle.rs"]
 mod model_bundle;
 pub(crate) use empty::{G5bEmptyDayInspection, G5bEmptyPending, VerifiedG5bEmptySeal};
@@ -1130,7 +1133,7 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
             }
         }
         if let Some(seal) = seal {
-            empty::validate_current_pointer(
+            physical::validate_current_pointer(
                 connection,
                 &date,
                 revision,
@@ -1151,7 +1154,7 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
             _ => return Err(mismatch("partial prospective reference")),
         }
     }
-    empty::validate_seals(connection)?;
+    physical::validate_seals(connection)?;
     Ok(())
 }
 

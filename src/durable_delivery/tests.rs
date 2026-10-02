@@ -40,6 +40,9 @@ mod p05_schema13_migration_tests;
 
 static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
 
+#[path = "delivery_status_tests.rs"]
+mod delivery_status_tests;
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FilesystemIdentity {
@@ -5075,7 +5078,7 @@ fn br192_compound_commit_and_rollback_failure_preserves_both_evidence() {
 }
 
 #[derive(Default)]
-struct MemoryAppendPort {
+pub(super) struct MemoryAppendPort {
     records: Mutex<BTreeMap<String, MemoryAppendRecord>>,
 }
 
@@ -5476,20 +5479,20 @@ impl ImmutableAppendPort for RacingAppendPort {
     }
 }
 
-struct StaticSink {
-    calls: AtomicUsize,
+pub(super) struct StaticSink {
+    pub(super) calls: AtomicUsize,
     result: AuthoritativeSinkResult,
 }
 
 struct BlockingSink {
-    calls: AtomicUsize,
+    pub(super) calls: AtomicUsize,
     entered: Mutex<Option<Sender<()>>>,
     release: Barrier,
     result: AuthoritativeSinkResult,
 }
 
 impl BlockingSink {
-    fn new(result: AuthoritativeSinkResult) -> (Arc<Self>, mpsc::Receiver<()>) {
+    pub(super) fn new(result: AuthoritativeSinkResult) -> (Arc<Self>, mpsc::Receiver<()>) {
         let (sender, receiver) = mpsc::channel();
         (
             Arc::new(Self {
@@ -5519,7 +5522,7 @@ impl AuthoritativeSinkPort for BlockingSink {
 }
 
 impl StaticSink {
-    fn new(result: AuthoritativeSinkResult) -> Arc<Self> {
+    pub(super) fn new(result: AuthoritativeSinkResult) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             result,
@@ -5538,13 +5541,13 @@ impl AuthoritativeSinkPort for StaticSink {
     }
 }
 
-fn now() -> DateTime<Utc> {
+pub(super) fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 30, 8, 0, 0)
         .single()
         .expect("valid timestamp")
 }
 
-fn receipt(at: DateTime<Utc>) -> TypedReceipt {
+pub(super) fn receipt(at: DateTime<Utc>) -> TypedReceipt {
     TypedReceipt {
         channel: "TEST_CODE_CHANNEL".to_owned(),
         provider: "TEST_CODE_PROVIDER".to_owned(),
@@ -5555,7 +5558,7 @@ fn receipt(at: DateTime<Utc>) -> TypedReceipt {
     }
 }
 
-fn rejection(at: DateTime<Utc>, retry_authorized: bool) -> TypedRejection {
+pub(super) fn rejection(at: DateTime<Utc>, retry_authorized: bool) -> TypedRejection {
     TypedRejection {
         reason_code: "TEST_CODE_DEFINITE_REJECTION".to_owned(),
         evidence: b"TEST_CODE_REJECTION_EVIDENCE".to_vec(),
@@ -5564,7 +5567,7 @@ fn rejection(at: DateTime<Utc>, retry_authorized: bool) -> TypedRejection {
     }
 }
 
-fn uncertainty(at: DateTime<Utc>) -> TypedUncertainty {
+pub(super) fn uncertainty(at: DateTime<Utc>) -> TypedUncertainty {
     TypedUncertainty {
         reason_code: "TEST_CODE_TRANSPORT_UNCERTAIN".to_owned(),
         evidence: b"TEST_CODE_UNCERTAINTY_EVIDENCE".to_vec(),
@@ -5572,7 +5575,7 @@ fn uncertainty(at: DateTime<Utc>) -> TypedUncertainty {
     }
 }
 
-fn envelope(
+pub(super) fn envelope(
     label: &str,
     push_kind: PushKind,
     sub_kind: DeliverySubKind,
@@ -5586,6 +5589,9 @@ fn envelope(
         .cooldown_scope;
     let scope_key = match scope {
         CooldownScope::Global => "GLOBAL".to_owned(),
+        CooldownScope::PerTicket if push_kind == PushKind::HoldingPlan => {
+            format!("SHANGHAI:EQUITY:TEST_CODE_{label}")
+        }
         CooldownScope::PerTicket => format!("SSE:EQUITY:TEST_CODE_{label}"),
     };
     let binding = task_bound.then(|| {
@@ -5601,18 +5607,35 @@ fn envelope(
             "render_mode": "Scheduled"
         }))
         .expect("serialize TEST_CODE P-01 binding")
+    } else if push_kind == PushKind::HoldingPlan {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "HOLDING_PLAN_SOURCE_BINDING_V1",
+            "code": format!("TEST_CODE_{label}"),
+            "observed_at": format!("{business_date}T16:00:00+08:00"),
+        }))
+        .expect("serialize actual T03 identity binding")
     } else {
         format!("TEST_CODE_SOURCE_BINDING_{label}").into_bytes()
+    };
+    let occurrence = if push_kind == PushKind::HoldingPlan {
+        format!("holding-plan:{business_date}:TEST_CODE_{label}")
+    } else {
+        format!("TEST_CODE_OCCURRENCE_{label}")
+    };
+    let subject = if push_kind == PushKind::HoldingPlan {
+        super::model::sha256_hex(&source_binding)
+    } else {
+        format!("TEST_CODE_SUBJECT_HASH_{label}")
     };
     DeliveryEnvelope::new(
         business_date,
         push_kind,
         sub_kind,
         scope_key,
-        format!("TEST_CODE_OCCURRENCE_{label}"),
+        occurrence,
         format!("TEST_CODE_EVIDENCE_{label}"),
         source_binding,
-        format!("TEST_CODE_SUBJECT_HASH_{label}"),
+        subject,
         format!("TEST_CODE_RENDERED_BODY_{label}").into_bytes(),
         true,
         binding,
@@ -5648,7 +5671,7 @@ fn review_envelope_with_task_identity(
     .expect("valid review envelope")
 }
 
-fn prepare_reserved(
+pub(super) fn prepare_reserved(
     fixture: &Fixture,
     envelope: &DeliveryEnvelope,
     append: &dyn ImmutableAppendPort,
@@ -9179,7 +9202,7 @@ fn br192_dual_reconciler_ack_has_one_cas_winner_and_one_exactly_once_loser() {
     );
 }
 
-fn reconcile_terminal(
+pub(super) fn reconcile_terminal(
     fixture: &Fixture,
     append: &dyn ImmutableAppendPort,
     expected: DecisionState,

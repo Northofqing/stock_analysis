@@ -15,15 +15,20 @@ mod schema_p05_unit_runtime;
 
 pub use coordinator::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
-    CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2, DurableDeliveryCoordinator,
-    G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+    CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2, DeliveryStateCount,
+    DeliveryStatusSnapshot, DurableDeliveryCoordinator, G5bCountedDayFactV1,
+    G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
+    HoldingPlanOccurrenceObservation, HoldingPlanOwnedOccurrence, HoldingPlanPrepareOutcome,
+    HoldingPlanReceiptKind,
     P05ChildReceiptObservation, P05InvalidationRenderFacts, P05NonAcceptedTerminal,
+    P05StoredUnitPhase, P05StoredUnitSnapshot, DELIVERY_STATUS_STATES,
 };
 pub(crate) use coordinator::{
-    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending, G5bSnapshotKind,
-    P05ObservedDraftInput, P05ObservedSourceBytes, P05PredictionStart, P05UnitReceiptObservation,
-    PreparedG5bArtifact, StoredP05Draft, StoredP05Intent, VerifiedG5bEmptySeal,
-    VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
+    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending,
+    G5bPhysicalSealAttempt, G5bSnapshotKind, P05ChildInspection, P05ObservedDraftInput,
+    P05ObservedSourceBytes, P05PredictionStart, P05UnitReceiptObservation, PreparedG5bArtifact,
+    StoredP05Draft, StoredP05Intent, VerifiedG5bEmptySeal, VerifiedG5bModelBundle,
+    VerifiedG5bPhysicalSeal, VerifiedStoredG5bCohort,
 };
 pub use correlation::P01OriginProducer;
 pub use model::{

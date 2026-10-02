@@ -40,6 +40,18 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+#[path = "coordinator_holding_plan.rs"]
+mod holding_plan;
+pub use holding_plan::{
+    HoldingPlanOccurrenceObservation, HoldingPlanOwnedOccurrence, HoldingPlanPrepareOutcome,
+    HoldingPlanReceiptKind,
+};
+
+#[path = "coordinator_status.rs"]
+mod status;
+use status::{classify_reconcile_state, ReconcileClassification};
+pub use status::{DeliveryStateCount, DeliveryStatusSnapshot, DELIVERY_STATUS_STATES};
+
 #[path = "coordinator_candidate_board.rs"]
 mod candidate_board;
 pub use candidate_board::{
@@ -48,8 +60,10 @@ pub use candidate_board::{
 };
 #[path = "coordinator_p05_unit.rs"]
 mod p05_unit;
-pub(crate) use p05_unit::runtime::P05UnitReceiptObservation;
-pub use p05_unit::runtime::{P05ChildReceiptObservation, P05NonAcceptedTerminal};
+pub(crate) use p05_unit::runtime::{P05ChildInspection, P05UnitReceiptObservation};
+pub use p05_unit::runtime::{
+    P05ChildReceiptObservation, P05NonAcceptedTerminal, P05StoredUnitPhase, P05StoredUnitSnapshot,
+};
 pub use p05_unit::P05InvalidationRenderFacts;
 pub(crate) use p05_unit::{
     P05ObservedDraftInput, P05ObservedSourceBytes, P05PredictionStart, StoredP05Draft,
@@ -65,8 +79,9 @@ pub use g5b::{
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
 };
 pub(crate) use g5b_cohort::{
-    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending, G5bSnapshotKind,
-    PreparedG5bArtifact, VerifiedG5bEmptySeal, VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
+    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending,
+    G5bPhysicalSealAttempt, G5bSnapshotKind, PreparedG5bArtifact, VerifiedG5bEmptySeal,
+    VerifiedG5bModelBundle, VerifiedG5bPhysicalSeal, VerifiedStoredG5bCohort,
 };
 
 const AUDIT_KINDS: [&str; 14] = [
@@ -443,6 +458,8 @@ pub(crate) enum OperationPostvalidationTestFault {
     P05UnitRevisionWithoutEvent,
     P05ActualExtraMutation,
     P05CompletionPointerDrift,
+    HoldingPlanExtraAudit,
+    HoldingPlanDuplicateOwner,
 }
 
 #[derive(Clone, Copy)]
@@ -486,6 +503,7 @@ struct DecisionMutationRoute {
     decision_identity: String,
     expected_envelope: Option<(Vec<u8>, String)>,
     g5b_date: Option<NaiveDate>,
+    holding_plan_context: Option<holding_plan::OccurrenceContext>,
 }
 
 impl DecisionMutationRoute {
@@ -522,6 +540,7 @@ impl DecisionMutationRoute {
                 stored.envelope_sha256.clone(),
             )),
             g5b_date,
+            holding_plan_context: holding_plan::OccurrenceContext::from_envelope(&envelope)?,
         })
     }
 
@@ -533,16 +552,22 @@ impl DecisionMutationRoute {
                 if &stored.envelope_canonical == bytes && &stored.envelope_sha256 == hash =>
             {
                 let current = Self::from_stored(connection, &stored)?;
-                if current.g5b_date == self.g5b_date {
+                if current.g5b_date == self.g5b_date
+                    && current.holding_plan_context == self.holding_plan_context
+                {
                     Ok(())
                 } else {
                     Err(Self::changed())
                 }
             }
-            // Preserve ordinary non-G5b prepare races. A newly discovered G5b
-            // owner always requires a fresh routed operation, even on this date.
+            // Preserve ordinary non-G5b races and same-context Holding races.
+            // A newly discovered guarded owner requires an explicitly fresh
+            // routed call; an absent unguarded route cannot write its audits.
             (None, Some(stored)) if self.g5b_date.is_none() => {
-                if Self::from_stored(connection, &stored)?.g5b_date.is_none() {
+                let current = Self::from_stored(connection, &stored)?;
+                if current.g5b_date.is_none()
+                    && current.holding_plan_context == self.holding_plan_context
+                {
                     Ok(())
                 } else {
                     Err(Self::changed())
@@ -3169,6 +3194,7 @@ impl DurableDeliveryCoordinator {
                 decision_identity: envelope.decision_identity.clone(),
                 expected_envelope: None,
                 g5b_date,
+                holding_plan_context: holding_plan::OccurrenceContext::from_envelope(envelope)?,
             })
         })
     }
@@ -3214,6 +3240,18 @@ impl DurableDeliveryCoordinator {
             &p05_unit::runtime::SqlDependencies,
         ) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
+        self.with_mutation_transaction_consumer(route, None, operation)
+    }
+
+    fn with_mutation_transaction_consumer<T>(
+        &self,
+        route: &DecisionMutationRoute,
+        consumer: Option<p05_unit::runtime::ActualP05ConsumerCheck>,
+        operation: impl FnOnce(
+            &Transaction<'_>,
+            &p05_unit::runtime::SqlDependencies,
+        ) -> Result<MutationEffect<T>>,
+    ) -> Result<T> {
         // Routing has released every attestation lease and connection mutex.
         // Never acquire a date lock from inside a SQLite operation.
         #[cfg(test)]
@@ -3238,20 +3276,37 @@ impl DurableDeliveryCoordinator {
         let p05_date =
             self.with_mutation_routing_connection(|c| p05_unit::runtime::mutation_date(c, route))?;
         let p05_binding = std::cell::RefCell::new(None::<p05_unit::runtime::SqlBinding>);
-        let p05_dependencies = p05_unit::runtime::SqlDependencies::default();
-        let p05_validate = |c: &Transaction<'_>| {
-            p05_binding
-                .borrow()
-                .as_ref()
-                .ok_or_else(|| {
-                    DurableDeliveryError::PolicyMismatch("P05 mutation SQL witness absent".into())
-                })?
-                .validate(c)?;
-            p05_dependencies.validate(c)
+        let holding_binding = std::cell::RefCell::new(None::<holding_plan::SqlBinding>);
+        let p05_dependencies = p05_unit::runtime::SqlDependencies::with_consumer(consumer);
+        let exact_sql_validate = |c: &Transaction<'_>| {
+            if p05_date.is_some() {
+                p05_binding
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        DurableDeliveryError::PolicyMismatch(
+                            "P05 mutation SQL witness absent".into(),
+                        )
+                    })?
+                    .validate(c)?;
+                p05_dependencies.validate(c)?;
+            }
+            if route.holding_plan_context.is_some() {
+                holding_binding
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        DurableDeliveryError::PolicyMismatch(
+                            "T03 mutation SQL witness absent".into(),
+                        )
+                    })?
+                    .validate(c)?;
+            }
+            Ok(())
         };
-        let sql_validator: Option<&dyn Fn(&Transaction<'_>) -> Result<()>> = p05_date
-            .as_ref()
-            .map(|_| &p05_validate as &dyn Fn(&Transaction<'_>) -> Result<()>);
+        let sql_validator: Option<&dyn Fn(&Transaction<'_>) -> Result<()>> = (p05_date.is_some()
+            || route.holding_plan_context.is_some())
+        .then_some(&exact_sql_validate as &dyn Fn(&Transaction<'_>) -> Result<()>);
         let outcome = self.with_immediate_transaction_validated_sql(
             SchemaVersionPolicy::Runtime,
             validator,
@@ -3264,6 +3319,12 @@ impl DurableDeliveryCoordinator {
                     p05_binding.replace(Some(p05_unit::runtime::capture_sql_binding(
                         transaction,
                         date,
+                    )?));
+                }
+                if let Some(context) = &route.holding_plan_context {
+                    holding_binding.replace(Some(holding_plan::capture_sql_binding(
+                        transaction,
+                        context,
                     )?));
                 }
                 Ok(value)
@@ -3419,6 +3480,29 @@ impl DurableDeliveryCoordinator {
         admission_at: DateTime<Utc>,
         origin_observation: Option<&CorrelationObservationV1>,
     ) -> Result<PrepareOutcome> {
+        let outcome = self.prepare_internal_owner_outcome(
+            envelope,
+            authoritative_sink_count,
+            admission_at,
+            origin_observation,
+        )?;
+        if outcome.decision_identity != envelope.decision_identity {
+            return Err(DurableDeliveryError::PolicyMismatch(
+                "holding_plan_exact_occurrence_already_owned".into(),
+            ));
+        }
+        Ok(outcome)
+    }
+
+    // Only the typed T03 facade may expose the original winner. Every other
+    // public prepare keeps its old outcome API and receives an explicit error.
+    fn prepare_internal_owner_outcome(
+        &self,
+        envelope: &DeliveryEnvelope,
+        authoritative_sink_count: usize,
+        admission_at: DateTime<Utc>,
+        origin_observation: Option<&CorrelationObservationV1>,
+    ) -> Result<PrepareOutcome> {
         let raw_canonical = serde_json::to_vec(envelope)?;
         let raw_sha256 = sha256_hex(&raw_canonical);
         let route = self.prepare_mutation_route(envelope)?;
@@ -3470,6 +3554,26 @@ impl DurableDeliveryCoordinator {
         g5b_admission: Option<&g5b_v2::Admission<'_>>,
         p05_admission: Option<&p05_unit::runtime::ChildAdmission<'_>>,
     ) -> Result<MutationEffect<PrepareTransactionOutcome>> {
+        if envelope.push_kind == PushKind::HoldingPlan {
+            let context = holding_plan::validate_fresh_envelope(envelope)?;
+            if let Some(owner) = holding_plan::load_strict_owner(transaction, &context)? {
+                if owner.envelope().decision_identity != envelope.decision_identity {
+                    let stored = load_decision(transaction, &owner.envelope().decision_identity)?
+                        .ok_or_else(|| {
+                        DurableDeliveryError::DecisionNotFound(
+                            owner.envelope().decision_identity.clone(),
+                        )
+                    })?;
+                    let hydration =
+                        load_schedule_hydration(transaction, &stored.decision_identity)?;
+                    return Ok(MutationEffect::NoChange(
+                        PrepareTransactionOutcome::Existing(Box::new(outcome_from_stored(
+                            &stored, &hydration,
+                        ))),
+                    ));
+                }
+            }
+        }
         if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
             if existing.envelope_canonical.as_slice() == raw_canonical
                 && existing.envelope_sha256 == raw_sha256
@@ -4621,8 +4725,15 @@ impl DurableDeliveryCoordinator {
     /// (错过窗口/进程未启时, 无 sink 拒因可依据, 由调度器决定重试)。授权后
     /// `resume_deliverable` 会对该决策走 `reacquire_rejected` 重开 attempt。
     pub fn authorize_rejected_retry(&self, decision_identity: &str) -> Result<()> {
+        self.authorize_rejected_retry_with_p05_check(decision_identity, None)
+    }
+    fn authorize_rejected_retry_with_p05_check(
+        &self,
+        decision_identity: &str,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<()> {
         let route = self.decision_mutation_route(decision_identity)?;
-        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
+        self.with_p05_business_mutation_transaction(&route, check, |transaction, dependencies| {
             let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;
@@ -4651,13 +4762,22 @@ impl DurableDeliveryCoordinator {
         authoritative_sinks: &[AuthoritativeSink],
         now: DateTime<Utc>,
     ) -> Result<ResumeOutcome> {
+        self.resume_deliverable_with_p05_check(decision_identity, authoritative_sinks, now, None)
+    }
+    fn resume_deliverable_with_p05_check(
+        &self,
+        decision_identity: &str,
+        authoritative_sinks: &[AuthoritativeSink],
+        now: DateTime<Utc>,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<ResumeOutcome> {
         let current = self.with_connection(|connection| {
             load_decision(connection, decision_identity)?
                 .ok_or_else(|| DurableDeliveryError::DecisionNotFound(decision_identity.to_owned()))
         })?;
 
         if current.state == DecisionState::RejectedDurable && current.retry_authorized {
-            if !self.reacquire_rejected(&current, now)? {
+            if !self.reacquire_rejected_with_p05_check(&current, now, check)? {
                 return Ok(ResumeOutcome {
                     decision_identity: decision_identity.to_owned(),
                     state: DecisionState::RejectedDurable,
@@ -4674,7 +4794,12 @@ impl DurableDeliveryCoordinator {
             });
         }
 
-        let attempt = match self.begin_attempt(decision_identity, authoritative_sinks.len(), now)? {
+        let attempt = match self.begin_attempt_with_p05_check(
+            decision_identity,
+            authoritative_sinks.len(),
+            now,
+            check,
+        )? {
             Some(attempt) => attempt,
             None => {
                 return Ok(ResumeOutcome {
@@ -4703,6 +4828,22 @@ impl DurableDeliveryCoordinator {
         fence_token: i64,
         heartbeat_at: DateTime<Utc>,
     ) -> Result<bool> {
+        self.heartbeat_attempt_with_p05_check(
+            decision_identity,
+            attempt_identity,
+            fence_token,
+            heartbeat_at,
+            None,
+        )
+    }
+    fn heartbeat_attempt_with_p05_check(
+        &self,
+        decision_identity: &str,
+        attempt_identity: &str,
+        fence_token: i64,
+        heartbeat_at: DateTime<Utc>,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<bool> {
         let lease_expires_at = heartbeat_at + Duration::seconds(self.config.attempt_lease_secs);
         let route = self.with_mutation_routing_connection(|connection| {
             load_decision(connection, decision_identity)?
@@ -4712,7 +4853,7 @@ impl DurableDeliveryCoordinator {
         let Some(route) = route else {
             return Ok(false);
         };
-        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
+        self.with_p05_business_mutation_transaction(&route, check, |transaction, dependencies| {
             let current: Option<(String, String)> = transaction
                 .query_row(
                     "SELECT a.lease_expires_at,a.lease_heartbeat_at FROM delivery_attempts a
@@ -4876,6 +5017,14 @@ impl DurableDeliveryCoordinator {
         command: &ManualResolutionCommand,
         append_port: &dyn ImmutableAppendPort,
     ) -> Result<DecisionState> {
+        self.resolve_uncertain_with_p05_check(command, append_port, None)
+    }
+    fn resolve_uncertain_with_p05_check(
+        &self,
+        command: &ManualResolutionCommand,
+        append_port: &dyn ImmutableAppendPort,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<DecisionState> {
         validate_manual_command(command)?;
         self.with_connection(|connection| {
             let stored =
@@ -4933,7 +5082,7 @@ impl DurableDeliveryCoordinator {
         )?;
 
         let route = self.decision_mutation_route(&command.decision_identity)?;
-        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
+        self.with_p05_business_mutation_transaction(&route, check, |transaction, dependencies| {
             let stored =
                 load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
@@ -5647,6 +5796,8 @@ impl DurableDeliveryCoordinator {
                     | OperationPostvalidationTestFault::P05UnitRevisionWithoutEvent
                     | OperationPostvalidationTestFault::P05ActualExtraMutation
                     | OperationPostvalidationTestFault::P05CompletionPointerDrift
+                    | OperationPostvalidationTestFault::HoldingPlanExtraAudit
+                    | OperationPostvalidationTestFault::HoldingPlanDuplicateOwner
             )
         ) {
             self.apply_operation_postvalidation_test_fault(transaction)?;
@@ -5673,6 +5824,19 @@ impl DurableDeliveryCoordinator {
         };
         let whitespace = " \t\n\r";
         let changed = match fault {
+            OperationPostvalidationTestFault::HoldingPlanExtraAudit
+            | OperationPostvalidationTestFault::HoldingPlanDuplicateOwner => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE T03 fault cannot access Production".into(),
+                    ));
+                }
+                holding_plan::inject_sql_fault_for_test(self, transaction, fault)?;
+                return Ok(());
+            }
             OperationPostvalidationTestFault::P05ActualExtraMutation => {
                 if !matches!(
                     self.config.environment,
@@ -6125,73 +6289,83 @@ impl DurableDeliveryCoordinator {
         Ok(())
     }
 
-    fn reacquire_rejected(&self, stored: &StoredDecision, now: DateTime<Utc>) -> Result<bool> {
+    fn reacquire_rejected_with_p05_check(
+        &self,
+        stored: &StoredDecision,
+        now: DateTime<Utc>,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<bool> {
         let envelope = parse_envelope(&stored.envelope_canonical)?;
         let route = self.with_mutation_routing_connection(|connection| {
             DecisionMutationRoute::from_stored(connection, stored)
         })?;
-        self.with_p05_business_pre_sink_transaction(&route, |transaction, dependencies| {
-            let current =
-                load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
-                    DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
-                })?;
-            if current.state != DecisionState::RejectedDurable || !current.retry_authorized {
-                return Ok(MutationEffect::NoChange(false));
-            }
-            // NewsAI uses a frozen rendered card, so a definitive pre-send
-            // transport rejection can be retried under the same identity.
-            // Keep the limit local to this kind: one first attempt plus two
-            // recovery attempts, even if every sink call rejects again.
-            if envelope.push_kind == PushKind::NewsAiAnalysis && current.reservation_generation >= 3
-            {
-                return Ok(MutationEffect::NoChange(false));
-            }
-            let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
-            if policy.window_mode == WindowMode::BusinessDateOnce {
-                let claim: Option<String> = transaction
-                    .query_row(
-                        "SELECT decision_identity FROM business_date_once_claims
-                     WHERE business_date=?1 AND push_kind=?2 AND sub_kind=?3 AND scope_key=?4",
-                        params![
-                            envelope.business_date,
-                            envelope.push_kind.as_str(),
-                            envelope.sub_kind.as_str(),
-                            envelope.scope_key
-                        ],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if claim.as_deref() != Some(&stored.decision_identity) {
+        self.with_p05_business_pre_sink_transaction_checked(
+            &route,
+            check,
+            |transaction, dependencies| {
+                let current =
+                    load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
+                        DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
+                    })?;
+                if current.state != DecisionState::RejectedDurable || !current.retry_authorized {
                     return Ok(MutationEffect::NoChange(false));
                 }
-            } else if policy.window_mode == WindowMode::Rolling
-                && rolling_head_conflicts(transaction, &envelope, now)?
-            {
-                return Ok(MutationEffect::NoChange(false));
-            }
-            // BR-237: 豁免类 (counts_against_daily_budget=false) 重试不占预算。
-            if policy.counts_against_daily_budget
-                && first_available_budget_slot(transaction, &envelope.business_date)?.is_none()
-            {
-                return Ok(MutationEffect::NoChange(false));
-            }
-            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
-            let generation = current.reservation_generation + 1;
-            self.reserve_generation(transaction, &envelope, &policy, generation, now)?;
-            transition_existing_state(
-                transaction,
-                &current,
-                DecisionState::Reserved,
-                "authorized-retry",
-                None,
-                canonical_json(&json!({
-                    "reservation_generation": generation,
-                    "envelope_sha256": stored.envelope_sha256,
-                }))?,
-                now,
-            )?;
-            Ok(MutationEffect::Changed(true))
-        })
+                // NewsAI uses a frozen rendered card, so a definitive pre-send
+                // transport rejection can be retried under the same identity.
+                // Keep the limit local to this kind: one first attempt plus two
+                // recovery attempts, even if every sink call rejects again.
+                if envelope.push_kind == PushKind::NewsAiAnalysis
+                    && current.reservation_generation >= 3
+                {
+                    return Ok(MutationEffect::NoChange(false));
+                }
+                let policy = load_policy(transaction, envelope.push_kind, envelope.sub_kind)?;
+                if policy.window_mode == WindowMode::BusinessDateOnce {
+                    let claim: Option<String> = transaction
+                        .query_row(
+                            "SELECT decision_identity FROM business_date_once_claims
+                     WHERE business_date=?1 AND push_kind=?2 AND sub_kind=?3 AND scope_key=?4",
+                            params![
+                                envelope.business_date,
+                                envelope.push_kind.as_str(),
+                                envelope.sub_kind.as_str(),
+                                envelope.scope_key
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if claim.as_deref() != Some(&stored.decision_identity) {
+                        return Ok(MutationEffect::NoChange(false));
+                    }
+                } else if policy.window_mode == WindowMode::Rolling
+                    && rolling_head_conflicts(transaction, &envelope, now)?
+                {
+                    return Ok(MutationEffect::NoChange(false));
+                }
+                // BR-237: 豁免类 (counts_against_daily_budget=false) 重试不占预算。
+                if policy.counts_against_daily_budget
+                    && first_available_budget_slot(transaction, &envelope.business_date)?.is_none()
+                {
+                    return Ok(MutationEffect::NoChange(false));
+                }
+                self.require_business_open_declared_tx(transaction, &route, dependencies)?;
+                let generation = current.reservation_generation + 1;
+                self.reserve_generation(transaction, &envelope, &policy, generation, now)?;
+                transition_existing_state(
+                    transaction,
+                    &current,
+                    DecisionState::Reserved,
+                    "authorized-retry",
+                    None,
+                    canonical_json(&json!({
+                        "reservation_generation": generation,
+                        "envelope_sha256": stored.envelope_sha256,
+                    }))?,
+                    now,
+                )?;
+                Ok(MutationEffect::Changed(true))
+            },
+        )
     }
 
     pub(crate) fn begin_attempt(
@@ -6200,153 +6374,166 @@ impl DurableDeliveryCoordinator {
         authoritative_sink_count: usize,
         now: DateTime<Utc>,
     ) -> Result<Option<AttemptLease>> {
+        self.begin_attempt_with_p05_check(decision_identity, authoritative_sink_count, now, None)
+    }
+    fn begin_attempt_with_p05_check(
+        &self,
+        decision_identity: &str,
+        authoritative_sink_count: usize,
+        now: DateTime<Utc>,
+        check: Option<&p05_unit::runtime::ActualP05ConsumerCheck>,
+    ) -> Result<Option<AttemptLease>> {
         let route = self.decision_mutation_route(decision_identity)?;
-        self.with_p05_business_pre_sink_transaction(&route, |transaction, dependencies| {
-            let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
-                DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
-            })?;
-            if stored.state != DecisionState::Reserved {
-                return Ok(MutationEffect::NoChange(None));
-            }
-            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
-            let envelope = parse_envelope(&stored.envelope_canonical)?;
-            if authoritative_sink_count != 1 {
-                let denial = PrepareDenial::InvalidSinkCardinality(authoritative_sink_count);
-                let evidence = canonical_json(&denial.evidence())?;
-                let evidence_hash = sha256_hex(&evidence);
-                let denial_identity = stable_identity(
-                    "delivery-pre-sink-denial-v1",
+        self.with_p05_business_pre_sink_transaction_checked(
+            &route,
+            check,
+            |transaction, dependencies| {
+                let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
+                    DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
+                })?;
+                if stored.state != DecisionState::Reserved {
+                    return Ok(MutationEffect::NoChange(None));
+                }
+                self.require_business_open_declared_tx(transaction, &route, dependencies)?;
+                let envelope = parse_envelope(&stored.envelope_canonical)?;
+                if authoritative_sink_count != 1 {
+                    let denial = PrepareDenial::InvalidSinkCardinality(authoritative_sink_count);
+                    let evidence = canonical_json(&denial.evidence())?;
+                    let evidence_hash = sha256_hex(&evidence);
+                    let denial_identity = stable_identity(
+                        "delivery-pre-sink-denial-v1",
+                        &[
+                            decision_identity,
+                            &stored.envelope_sha256,
+                            &envelope.policy_version.to_string(),
+                            denial.reason_code(),
+                            &evidence_hash,
+                        ],
+                    );
+                    freeze_disposition(
+                        transaction,
+                        &envelope,
+                        None,
+                        None,
+                        Some(&denial_identity),
+                        "Rejected",
+                        &evidence_hash,
+                        false,
+                        now,
+                    )?;
+                    mutate_reservations(transaction, &stored, "Released", now, None)?;
+                    transition_existing_state(
+                        transaction,
+                        &stored,
+                        DecisionState::RejectedAuditPending,
+                        "attempt-preflight",
+                        None,
+                        evidence,
+                        now,
+                    )?;
+                    return Ok(MutationEffect::Changed(None));
+                }
+                let attempt_no: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(attempt_no),0)+1 FROM delivery_attempts
+             WHERE decision_identity=?1",
+                    [decision_identity],
+                    |row| row.get(0),
+                )?;
+                let fence_token = stored.fence_generation + 1;
+                let attempt_identity = stable_identity(
+                    "delivery-attempt-v1",
                     &[
                         decision_identity,
-                        &stored.envelope_sha256,
-                        &envelope.policy_version.to_string(),
-                        denial.reason_code(),
-                        &evidence_hash,
+                        &attempt_no.to_string(),
+                        &fence_token.to_string(),
                     ],
                 );
-                freeze_disposition(
-                    transaction,
-                    &envelope,
-                    None,
-                    None,
-                    Some(&denial_identity),
-                    "Rejected",
-                    &evidence_hash,
-                    false,
-                    now,
-                )?;
-                mutate_reservations(transaction, &stored, "Released", now, None)?;
-                transition_existing_state(
-                    transaction,
-                    &stored,
-                    DecisionState::RejectedAuditPending,
-                    "attempt-preflight",
-                    None,
-                    evidence,
-                    now,
-                )?;
-                return Ok(MutationEffect::Changed(None));
-            }
-            let attempt_no: i64 = transaction.query_row(
-                "SELECT COALESCE(MAX(attempt_no),0)+1 FROM delivery_attempts
-             WHERE decision_identity=?1",
-                [decision_identity],
-                |row| row.get(0),
-            )?;
-            let fence_token = stored.fence_generation + 1;
-            let attempt_identity = stable_identity(
-                "delivery-attempt-v1",
-                &[
-                    decision_identity,
-                    &attempt_no.to_string(),
-                    &fence_token.to_string(),
-                ],
-            );
-            let lease_expires_at = now + Duration::seconds(self.config.attempt_lease_secs);
-            transaction.execute(
-                "INSERT INTO delivery_attempts(
+                let lease_expires_at = now + Duration::seconds(self.config.attempt_lease_secs);
+                transaction.execute(
+                    "INSERT INTO delivery_attempts(
                attempt_identity,decision_identity,attempt_no,owner_instance_identity,
                fence_token,lease_expires_at,lease_heartbeat_at,fence_revoked_at,state,started_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,'AttemptInFlight',?7)",
-                params![
-                    attempt_identity,
-                    decision_identity,
+                    params![
+                        attempt_identity,
+                        decision_identity,
+                        attempt_no,
+                        self.config.owner_instance_identity,
+                        fence_token,
+                        timestamp(lease_expires_at),
+                        timestamp(now),
+                    ],
+                )?;
+                attach_attempt_to_reservations(
+                    transaction,
+                    &stored,
+                    &attempt_identity,
                     attempt_no,
-                    self.config.owner_instance_identity,
-                    fence_token,
-                    timestamp(lease_expires_at),
-                    timestamp(now),
-                ],
-            )?;
-            attach_attempt_to_reservations(
-                transaction,
-                &stored,
-                &attempt_identity,
-                attempt_no,
-                now,
-            )?;
-            let changed = transaction.execute(
-                "UPDATE delivery_decisions SET state='AttemptInFlight',
+                    now,
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE delivery_decisions SET state='AttemptInFlight',
                current_attempt_identity=?1,fence_generation=?2,updated_at=?3
              WHERE decision_identity=?4 AND state='Reserved'",
-                params![
-                    attempt_identity,
+                    params![
+                        attempt_identity,
+                        fence_token,
+                        timestamp(now),
+                        decision_identity
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(DurableDeliveryError::IllegalTransition {
+                        from: stored.state.to_string(),
+                        to: DecisionState::AttemptInFlight.to_string(),
+                    });
+                }
+                record_state_transition(
+                    transaction,
+                    decision_identity,
+                    Some(DecisionState::Reserved),
+                    DecisionState::AttemptInFlight,
+                    "resume-deliverable",
+                    None,
+                    canonical_json(&json!({
+                        "attempt_identity": attempt_identity,
+                        "attempt_no": attempt_no,
+                        "fence_token": fence_token,
+                    }))?,
+                    now,
+                )?;
+                record_attempt_event(
+                    transaction,
+                    &attempt_identity,
+                    decision_identity,
+                    "LeaseGranted",
+                    canonical_json(&json!({
+                        "owner_instance_identity_hash": sha256_hex(
+                            self.config.owner_instance_identity.as_bytes()
+                        ),
+                        "fence_token": fence_token,
+                        "lease_expires_at": timestamp(lease_expires_at),
+                    }))?,
+                    now,
+                )?;
+                Ok(MutationEffect::Changed(Some(AttemptLease {
+                    attempt_identity: attempt_identity.clone(),
                     fence_token,
-                    timestamp(now),
-                    decision_identity
-                ],
-            )?;
-            if changed != 1 {
-                return Err(DurableDeliveryError::IllegalTransition {
-                    from: stored.state.to_string(),
-                    to: DecisionState::AttemptInFlight.to_string(),
-                });
-            }
-            record_state_transition(
-                transaction,
-                decision_identity,
-                Some(DecisionState::Reserved),
-                DecisionState::AttemptInFlight,
-                "resume-deliverable",
-                None,
-                canonical_json(&json!({
-                    "attempt_identity": attempt_identity,
-                    "attempt_no": attempt_no,
-                    "fence_token": fence_token,
-                }))?,
-                now,
-            )?;
-            record_attempt_event(
-                transaction,
-                &attempt_identity,
-                decision_identity,
-                "LeaseGranted",
-                canonical_json(&json!({
-                    "owner_instance_identity_hash": sha256_hex(
-                        self.config.owner_instance_identity.as_bytes()
-                    ),
-                    "fence_token": fence_token,
-                    "lease_expires_at": timestamp(lease_expires_at),
-                }))?,
-                now,
-            )?;
-            Ok(MutationEffect::Changed(Some(AttemptLease {
-                attempt_identity: attempt_identity.clone(),
-                fence_token,
-                request: AuthoritativeDeliveryRequest {
-                    decision_identity: decision_identity.to_owned(),
-                    attempt_identity,
-                    fence_token,
-                    push_kind: envelope.push_kind,
-                    stable_template_id: match envelope.foundation_binding() {
-                        Some(binding) => binding.template_id().to_owned(),
-                        None => envelope.push_kind.stable_template_id().to_owned(),
+                    request: AuthoritativeDeliveryRequest {
+                        decision_identity: decision_identity.to_owned(),
+                        attempt_identity,
+                        fence_token,
+                        push_kind: envelope.push_kind,
+                        stable_template_id: match envelope.foundation_binding() {
+                            Some(binding) => binding.template_id().to_owned(),
+                            None => envelope.push_kind.stable_template_id().to_owned(),
+                        },
+                        rendered_content: envelope.rendered_content,
+                        rendered_content_sha256: envelope.rendered_content_sha256,
                     },
-                    rendered_content: envelope.rendered_content,
-                    rendered_content_sha256: envelope.rendered_content_sha256,
-                },
-            })))
-        })
+                })))
+            },
+        )
     }
 
     pub(crate) fn record_sink_result(
@@ -7395,31 +7582,21 @@ impl DurableDeliveryCoordinator {
             for row in rows {
                 let (identity, raw_state, retry_authorized, owner, lease) = row?;
                 let state = DecisionState::parse(&raw_state)?;
-                match state {
-                    DecisionState::Reserved => deliverable_decisions.push(identity),
-                    DecisionState::RejectedDurable if retry_authorized => {
-                        deliverable_decisions.push(identity)
+                match classify_reconcile_state(
+                    state,
+                    retry_authorized,
+                    owner.as_deref(),
+                    lease.as_deref(),
+                    &self.config.owner_instance_identity,
+                    now,
+                )? {
+                    ReconcileClassification::Deliverable => deliverable_decisions.push(identity),
+                    ReconcileClassification::LocallyPending => {
+                        locally_pending_decisions.push(identity)
                     }
-                    DecisionState::AttemptInFlight => {
-                        let lease_live = lease
-                            .as_deref()
-                            .map(parse_timestamp)
-                            .transpose()?
-                            .is_some_and(|deadline| deadline > now);
-                        if lease_live
-                            && owner.as_deref()
-                                != Some(self.config.owner_instance_identity.as_str())
-                        {
-                            foreign_attempts.push(identity);
-                        } else {
-                            locally_pending_decisions.push(identity);
-                        }
-                    }
-                    DecisionState::Delivered
-                    | DecisionState::RejectedDurable
-                    | DecisionState::ManualResolvedRejected => {}
-                    DecisionState::UncertainManualReview => manual_reviews.push(identity),
-                    _ => locally_pending_decisions.push(identity),
+                    ReconcileClassification::ForeignLiveAttempt => foreign_attempts.push(identity),
+                    ReconcileClassification::ManualReview => manual_reviews.push(identity),
+                    ReconcileClassification::Terminal => {}
                 }
             }
             let mut hydrations = Vec::new();

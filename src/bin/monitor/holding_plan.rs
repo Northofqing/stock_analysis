@@ -1,28 +1,421 @@
 use sha2::{Digest, Sha256};
 use stock_analysis::database::user_position_snapshot::UserPositionSnapshot;
-use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
+use stock_analysis::durable_delivery::{
+    HoldingPlanOccurrenceObservation, HoldingPlanOwnedOccurrence,
+};
+use stock_analysis::market_domain::InstrumentId;
 
 use super::{durable_delivery_runtime, market_data, push_templates, PreparedHoldingPlan};
 
+/// A producer candidate, never sending or completion authority.
+pub(super) enum HoldingPlanCandidate {
+    Original {
+        instrument: InstrumentId,
+        owned: HoldingPlanOwnedOccurrence,
+    },
+    Fresh(PreparedHoldingPlan),
+}
+
+impl HoldingPlanCandidate {
+    pub(super) fn instrument(&self) -> Result<&InstrumentId, String> {
+        match self {
+            Self::Original { instrument, .. } => Ok(instrument),
+            Self::Fresh(prepared) => match prepared.binding.scope() {
+                durable_delivery_runtime::CountedDeliveryScope::Ticket { instrument } => {
+                    Ok(instrument)
+                }
+                _ => Err("holding_plan_ticket_scope_required".into()),
+            },
+        }
+    }
+    pub(super) fn business_date(&self) -> Result<chrono::NaiveDate, String> {
+        match self {
+            Self::Original { owned, .. } => {
+                chrono::NaiveDate::parse_from_str(&owned.envelope().business_date, "%Y-%m-%d")
+                    .map_err(|_| "holding_plan_original_date_invalid".into())
+            }
+            Self::Fresh(prepared) => Ok(prepared.binding.business_date()),
+        }
+    }
+    pub(super) fn occurrence(&self) -> &str {
+        match self {
+            Self::Original { owned, .. } => &owned.envelope().schedule_occurrence_identity,
+            Self::Fresh(prepared) => prepared.binding.schedule_occurrence_identity(),
+        }
+    }
+}
+
+pub(super) struct HoldingPlanPreparation {
+    pub(super) candidates: Vec<HoldingPlanCandidate>,
+    pub(super) failures: Vec<String>,
+}
+
+pub(super) struct HoldingPlanTickReport {
+    pub(super) physically_accepted: usize,
+    pub(super) failures: Vec<String>,
+}
+
+/// This is an inspection deadline, not a completed/delivered flag.
+pub(super) struct HoldingPlanInspectionSchedule {
+    date: chrono::NaiveDate,
+    next: std::time::Instant,
+}
+impl HoldingPlanInspectionSchedule {
+    pub(super) fn new(date: chrono::NaiveDate, now: std::time::Instant) -> Self {
+        Self {
+            date,
+            next: now + std::time::Duration::from_secs(1800),
+        }
+    }
+    pub(super) fn begin_if_due(
+        &mut self,
+        date: chrono::NaiveDate,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.date != date {
+            *self = Self::new(date, now);
+            return false;
+        }
+        if now < self.next {
+            return false;
+        }
+        self.next = now + std::time::Duration::from_secs(1800);
+        true
+    }
+}
+
+fn instrument_for_code(code: &str) -> Result<InstrumentId, String> {
+    let identity =
+        stock_analysis::data_gateway::instrument_identity::resolve_production_equity(code, None)
+            .map_err(|_| "holding_plan_instrument_invalid".to_owned())?;
+    identity
+        .require_a_share()
+        .map_err(|_| "holding_plan_instrument_invalid".to_owned())?;
+    Ok(identity.instrument().clone())
+}
+
+fn shanghai_capture(
+    observed_at: chrono::DateTime<chrono::FixedOffset>,
+) -> chrono::DateTime<chrono::FixedOffset> {
+    // Same actual instant; never replace the captured time with a second now.
+    observed_at
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid Shanghai offset"))
+        .fixed_offset()
+}
+
+pub(super) fn prepare_tick_with(
+    banner: Option<&push_templates::BannerCtx>,
+    load_snapshot: impl FnOnce() -> Result<Option<UserPositionSnapshot>, String>,
+    mut inspect_owner: impl FnMut(
+        chrono::NaiveDate,
+        &InstrumentId,
+    ) -> Result<HoldingPlanOccurrenceObservation, String>,
+    load_legacy: impl FnOnce(chrono::NaiveDate) -> Result<std::collections::HashSet<String>, String>,
+    fetch_quotes: impl FnOnce(&[String]) -> Result<market_data::TopStockBatch, String>,
+    observed_at: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<HoldingPlanPreparation, String> {
+    let observed_at = shanghai_capture(observed_at);
+    let snapshot = load_snapshot()
+        .map_err(|e| format!("持仓快照读取失败: {e}"))?
+        .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_owned())?;
+    let mut result = HoldingPlanPreparation {
+        candidates: Vec::new(),
+        failures: Vec::new(),
+    };
+    if snapshot.confirm_empty || snapshot.items.is_empty() {
+        return Ok(result);
+    }
+    let date = observed_at.date_naive();
+    let mut missing = Vec::new();
+    for item in &snapshot.items {
+        let instrument = match instrument_for_code(&item.code) {
+            Ok(instrument) => instrument,
+            Err(reason) => {
+                result.failures.push(format!("code={} {reason}", item.code));
+                continue;
+            }
+        };
+        match inspect_owner(date, &instrument) {
+            Ok(HoldingPlanOccurrenceObservation::Owned(owned)) => result
+                .candidates
+                .push(HoldingPlanCandidate::Original { instrument, owned }),
+            Ok(HoldingPlanOccurrenceObservation::Missing) => missing.push(item.code.clone()),
+            Err(e) => result
+                .failures
+                .push(format!("code={} 原 owner 读取拒绝: {e}", item.code)),
+        }
+    }
+    // All business DB handles are dropped by this detached legacy reader
+    // before the runtime counted/coordinator lock or any provider operation.
+    let legacy = if missing.is_empty() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        load_legacy(date)
+    };
+    let mut fresh = Vec::new();
+    for code in missing {
+        match &legacy {
+            Ok(markers) if markers.contains(&code) => result
+                .failures
+                .push(format!("code={code} holding_plan_legacy_unknown")),
+            Ok(_) => fresh.push(code),
+            Err(e) => result.failures.push(format!("code={code} 新候选阻断: {e}")),
+        }
+    }
+    if !fresh.is_empty() {
+        match banner {
+            None => result
+                .failures
+                .push("holding_plan_fresh_banner_unavailable".into()),
+            Some(banner) => {
+                match prepare_fresh_subset(banner, &snapshot, fresh, fetch_quotes, observed_at) {
+                    Ok(prepared) => result
+                        .candidates
+                        .extend(prepared.into_iter().map(HoldingPlanCandidate::Fresh)),
+                    Err(e) => result.failures.push(e),
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Legacy markers are evidence of an old workflow, never physical completion.
+/// This reader does not create/heal/update the legacy table.
+pub(super) fn read_legacy_markers(
+    date: chrono::NaiveDate,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut connection = stock_analysis::database::DatabaseManager::get()
+        .get_conn()
+        .map_err(|_| "holding_plan_legacy_read_unavailable".to_owned())?;
+    read_legacy_markers_with_connection(&mut connection, date)
+}
+
+struct LegacyReadFailure(String);
+impl From<diesel::result::Error> for LegacyReadFailure {
+    fn from(_: diesel::result::Error) -> Self {
+        Self("holding_plan_legacy_transaction_failed".into())
+    }
+}
+
+fn read_legacy_markers_with_connection(
+    connection: &mut diesel::SqliteConnection,
+    date: chrono::NaiveDate,
+) -> Result<std::collections::HashSet<String>, String> {
+    read_legacy_markers_transaction(connection, date, || {})
+}
+
+fn read_legacy_markers_transaction(
+    connection: &mut diesel::SqliteConnection,
+    date: chrono::NaiveDate,
+    metadata_observed: impl FnOnce(),
+) -> Result<std::collections::HashSet<String>, String> {
+    use diesel::Connection;
+    // SQLite's normal BEGIN is Deferred. No writer SQL is issued; all main
+    // metadata, columns and rows belong to this one actual read snapshot.
+    connection
+        .transaction::<_, LegacyReadFailure, _>(|connection| {
+            read_legacy_markers_snapshot(connection, date, metadata_observed)
+                .map_err(LegacyReadFailure)
+        })
+        .map_err(|error| error.0)
+}
+
+fn read_legacy_markers_snapshot(
+    connection: &mut diesel::SqliteConnection,
+    date: chrono::NaiveDate,
+    metadata_observed: impl FnOnce(),
+) -> Result<std::collections::HashSet<String>, String> {
+    use diesel::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Object {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        kind: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        definition: String,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Column {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        cid: i32,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        declared_type: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        required: i32,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pk: i32,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Marker {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        plan_date: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        code: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        pushed_at: String,
+    }
+    let objects: Vec<Object> = diesel::sql_query(
+        "SELECT type AS kind, sql AS definition FROM main.sqlite_master WHERE name = 'holding_plan_daily' COLLATE NOCASE UNION ALL SELECT type AS kind, sql AS definition FROM temp.sqlite_master WHERE name = 'holding_plan_daily' COLLATE NOCASE"
+    ).load(connection).map_err(|_| "holding_plan_legacy_schema_read_failed".to_owned())?;
+    metadata_observed();
+    if objects.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    if objects.len() != 1 || objects[0].kind != "table" {
+        return Err("holding_plan_legacy_schema_unknown".into());
+    }
+    let normalized = objects[0]
+        .definition
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if normalized != "createtableholding_plan_daily(plan_datetextnotnull,codetextnotnull,pushed_attextnotnull,primarykey(plan_date,code))" {
+        return Err("holding_plan_legacy_schema_unknown".into());
+    }
+    let columns: Vec<Column> = diesel::sql_query(
+        "SELECT cid, name, type AS declared_type, [notnull] AS required, pk FROM pragma_table_info('holding_plan_daily', 'main') ORDER BY cid"
+    ).load(connection).map_err(|_| "holding_plan_legacy_schema_read_failed".to_owned())?;
+    let expected = [("plan_date", 1), ("code", 2), ("pushed_at", 0)];
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .any(|(index, (column, (name, pk)))| {
+                column.cid != index as i32
+                    || column.name != name
+                    || !column.declared_type.eq_ignore_ascii_case("TEXT")
+                    || column.required != 1
+                    || column.pk != pk
+            })
+    {
+        return Err("holding_plan_legacy_schema_unknown".into());
+    }
+    let rows: Vec<Marker> = diesel::sql_query(
+        "SELECT plan_date, code, pushed_at FROM main.holding_plan_daily WHERE plan_date = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(date.format("%Y-%m-%d").to_string())
+    .load(connection)
+    .map_err(|_| "holding_plan_legacy_row_read_failed".to_owned())?;
+    let mut markers = std::collections::HashSet::new();
+    for row in rows {
+        if row.plan_date != date.format("%Y-%m-%d").to_string()
+            || row.code.len() != 6
+            || !row.code.bytes().all(|b| b.is_ascii_digit())
+            || chrono::DateTime::parse_from_rfc3339(&row.pushed_at).is_err()
+            || !markers.insert(row.code)
+        {
+            return Err("holding_plan_legacy_row_unknown".into());
+        }
+    }
+    Ok(markers)
+}
+
+pub(super) async fn dispatch_tick(
+    banner: Option<push_templates::BannerCtx>,
+) -> HoldingPlanTickReport {
+    let preparation = match durable_delivery_runtime::prepare_holding_plan_tick(banner).await {
+        Ok(value) => value,
+        Err(e) => {
+            return HoldingPlanTickReport {
+                physically_accepted: 0,
+                failures: vec![e],
+            }
+        }
+    };
+    let mut report = HoldingPlanTickReport {
+        physically_accepted: 0,
+        failures: preparation.failures,
+    };
+    for candidate in preparation.candidates {
+        match dispatch_candidate(candidate).await {
+            Ok(()) => report.physically_accepted += 1,
+            Err(e) => report.failures.push(e),
+        }
+    }
+    report
+}
+
+async fn dispatch_candidate(candidate: HoldingPlanCandidate) -> Result<(), String> {
+    let candidate =
+        match durable_delivery_runtime::reconcile_holding_plan_candidate(candidate).await? {
+            durable_delivery_runtime::HoldingPlanLocalProgress::PhysicalAccepted => return Ok(()),
+            durable_delivery_runtime::HoldingPlanLocalProgress::NotSendable(reason) => {
+                return Err(reason)
+            }
+            durable_delivery_runtime::HoldingPlanLocalProgress::Candidate(candidate) => candidate,
+        };
+    let outcome = super::notify::push_holding_plan_candidate(candidate).await?;
+    match outcome {
+        durable_delivery_runtime::HoldingPlanDispatchResult::PhysicalAccepted => Ok(()),
+        durable_delivery_runtime::HoldingPlanDispatchResult::NotCompleted(reason) => Err(reason),
+        durable_delivery_runtime::HoldingPlanDispatchResult::AlreadyOwned(candidate) => {
+            // The first critical section has ended. Governance is now applied
+            // to the actual original winner; there is no second quote/prepare.
+            let candidate = match durable_delivery_runtime::reconcile_holding_plan_candidate(
+                candidate,
+            )
+            .await?
+            {
+                durable_delivery_runtime::HoldingPlanLocalProgress::PhysicalAccepted => {
+                    return Ok(())
+                }
+                durable_delivery_runtime::HoldingPlanLocalProgress::NotSendable(reason) => {
+                    return Err(reason)
+                }
+                durable_delivery_runtime::HoldingPlanLocalProgress::Candidate(candidate) => {
+                    candidate
+                }
+            };
+            match super::notify::push_holding_plan_candidate(candidate).await? {
+                durable_delivery_runtime::HoldingPlanDispatchResult::PhysicalAccepted => Ok(()),
+                durable_delivery_runtime::HoldingPlanDispatchResult::NotCompleted(reason) => {
+                    Err(reason)
+                }
+                durable_delivery_runtime::HoldingPlanDispatchResult::AlreadyOwned(_) => {
+                    Err("holding_plan_owner_changed_again".into())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn prepare_holding_plan_messages_with(
     banner: &push_templates::BannerCtx,
     load_snapshot: impl FnOnce() -> Result<Option<UserPositionSnapshot>, String>,
     fetch_quote_batch: impl FnOnce(&[String]) -> Result<market_data::TopStockBatch, String>,
     capture_now: impl FnOnce() -> chrono::DateTime<chrono::FixedOffset>,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
-    let observed_at = capture_now();
+    let observed_at = shanghai_capture(capture_now());
     let snapshot = load_snapshot()
         .map_err(|error| format!("持仓快照读取失败: {error}"))?
         .ok_or_else(|| "无用户确认持仓快照 (BR-226)".to_string())?;
-    if snapshot.confirm_empty || snapshot.items.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let requested_codes = snapshot
+    let requested = snapshot
         .items
         .iter()
         .map(|item| item.code.clone())
         .collect::<Vec<_>>();
+    prepare_fresh_subset(banner, &snapshot, requested, fetch_quote_batch, observed_at)
+}
+
+fn prepare_fresh_subset(
+    banner: &push_templates::BannerCtx,
+    snapshot: &UserPositionSnapshot,
+    requested_codes: Vec<String>,
+    fetch_quote_batch: impl FnOnce(&[String]) -> Result<market_data::TopStockBatch, String>,
+    observed_at: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<Vec<PreparedHoldingPlan>, String> {
+    if snapshot.confirm_empty || requested_codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let instruments = requested_codes
+        .iter()
+        .map(|code| instrument_for_code(code).map(|instrument| (code.clone(), instrument)))
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
     let quote_batch = fetch_quote_batch(&requested_codes)
         .map_err(|error| format!("持仓行情批次拒绝: {error}"))?;
     if quote_batch.coverage != stock_analysis::data_gateway::QuoteCoverageDisposition::Complete
@@ -48,7 +441,11 @@ pub(super) fn prepare_holding_plan_messages_with(
     let business_date = observed_at.date_naive();
     let hhmm = observed_at.format("%H:%M").to_string();
     let mut out = Vec::new();
-    for item in &snapshot.items {
+    for item in snapshot
+        .items
+        .iter()
+        .filter(|item| requested_codes.contains(&item.code))
+    {
         let Some(quote) = quote_map.get(&item.code) else {
             log::warn!("[T-03] code={} 行情缺失, 跳过该票 (其余照常)", item.code);
             continue;
@@ -137,13 +534,10 @@ pub(super) fn prepare_holding_plan_messages_with(
         });
         let canonical_bytes = canonical.to_string().into_bytes();
         let subject_hash = hex::encode(Sha256::digest(&canonical_bytes));
-        let exchange = if item.code.starts_with('6') {
-            Exchange::Shanghai
-        } else {
-            Exchange::Shenzhen
-        };
-        let instrument = InstrumentId::new(exchange, item.code.clone(), AssetClass::Equity)
-            .map_err(|error| format!("instrument 构造失败 code={}: {error}", item.code))?;
+        let instrument = instruments
+            .get(&item.code)
+            .cloned()
+            .ok_or_else(|| "holding_plan_instrument_invalid".to_owned())?;
         let binding = durable_delivery_runtime::CountedDeliveryBinding::new(
             business_date,
             format!("holding-plan:{business_date}:{}", item.code),
@@ -680,5 +1074,226 @@ mod tests {
         assert_eq!(canonical["snapshot"]["snapshot_id"], "TEST_CODE_SNAPSHOT_A");
         assert_eq!(canonical["requested_codes"], serde_json::json!(["600000"]));
         assert_eq!(canonical["code"], "600000");
+    }
+    #[test]
+    fn t03_exact_owner_bin_legacy_read_is_select_only_and_unknown_schema_blocks_fresh() {
+        use diesel::connection::SimpleConnection;
+        use diesel::{Connection, RunQueryDsl};
+        let mut connection = diesel::SqliteConnection::establish(":memory:").unwrap();
+        let date = now().date_naive();
+        assert!(read_legacy_markers_with_connection(&mut connection, date)
+            .unwrap()
+            .is_empty());
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type=diesel::sql_types::BigInt)]
+            total: i64,
+        }
+        let tables = || {
+            diesel::sql_query(
+                "SELECT count(*) AS total FROM sqlite_master WHERE name='holding_plan_daily'",
+            )
+        };
+        assert_eq!(
+            tables().get_result::<Count>(&mut connection).unwrap().total,
+            0
+        );
+        connection.batch_execute("CREATE TABLE holding_plan_daily(plan_date TEXT NOT NULL,code TEXT NOT NULL,pushed_at TEXT NOT NULL,PRIMARY KEY(plan_date,code)); INSERT INTO holding_plan_daily VALUES('2026-09-10','600000','2026-09-10T09:30:02+08:00');").unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                read_legacy_markers_with_connection(&mut connection, date).unwrap(),
+                std::collections::HashSet::from(["600000".to_owned()])
+            );
+        }
+        assert_eq!(
+            diesel::sql_query("SELECT count(*) AS total FROM holding_plan_daily")
+                .get_result::<Count>(&mut connection)
+                .unwrap()
+                .total,
+            1
+        );
+        connection
+            .batch_execute("ALTER TABLE holding_plan_daily ADD COLUMN unknown TEXT;")
+            .unwrap();
+        assert_eq!(
+            read_legacy_markers_with_connection(&mut connection, date).unwrap_err(),
+            "holding_plan_legacy_schema_unknown"
+        );
+        assert_eq!(
+            diesel::sql_query("SELECT count(*) AS total FROM holding_plan_daily")
+                .get_result::<Count>(&mut connection)
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    #[test]
+    fn t03_exact_owner_bin_malformed_legacy_row_and_temp_shadow_are_not_absence() {
+        use diesel::connection::SimpleConnection;
+        use diesel::Connection;
+        let mut connection = diesel::SqliteConnection::establish(":memory:").unwrap();
+        connection.batch_execute("CREATE TABLE holding_plan_daily(plan_date TEXT NOT NULL,code TEXT NOT NULL,pushed_at TEXT NOT NULL,PRIMARY KEY(plan_date,code)); INSERT INTO holding_plan_daily VALUES('2026-09-10','600000','TEST_CODE_BAD_TIME');").unwrap();
+        assert_eq!(
+            read_legacy_markers_with_connection(&mut connection, now().date_naive()).unwrap_err(),
+            "holding_plan_legacy_row_unknown"
+        );
+        connection.batch_execute("CREATE TEMP TABLE holding_plan_daily(plan_date TEXT NOT NULL,code TEXT NOT NULL,pushed_at TEXT NOT NULL,PRIMARY KEY(plan_date,code));").unwrap();
+        assert_eq!(
+            read_legacy_markers_with_connection(&mut connection, now().date_naive()).unwrap_err(),
+            "holding_plan_legacy_schema_unknown"
+        );
+    }
+
+    #[test]
+    fn t03_exact_owner_bin_inspection_deadline_advances_on_failures_and_is_date_bound() {
+        let start = std::time::Instant::now();
+        let date = now().date_naive();
+        let mut schedule = HoldingPlanInspectionSchedule::new(date, start);
+        assert!(!schedule.begin_if_due(date, start + std::time::Duration::from_secs(1799)));
+        for failed_tick in 1..=3 {
+            let due = start + std::time::Duration::from_secs(failed_tick * 1800);
+            assert!(schedule.begin_if_due(date, due));
+            assert!(!schedule.begin_if_due(date, due + std::time::Duration::from_secs(1)));
+        }
+        let next_date = date.succ_opt().unwrap();
+        let next = start + std::time::Duration::from_secs(6000);
+        assert!(!schedule.begin_if_due(next_date, next));
+        assert!(!schedule.begin_if_due(next_date, next + std::time::Duration::from_secs(1799)));
+        assert!(schedule.begin_if_due(next_date, next + std::time::Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn t03_exact_owner_bin_real_callers_use_shared_owner_route_and_keep_governance_order() {
+        let main = include_str!("main.rs");
+        let manual = include_str!("manual_push.rs");
+        assert!(main.contains("holding_plan::dispatch_tick(current_banner_for("));
+        assert!(manual.contains("crate::holding_plan::dispatch_tick(Some(banner.clone()))"));
+        assert!(!main.contains("T03_RETRY_CAPS"));
+        assert!(!main.contains("fn holding_plan_daily_record"));
+        assert!(!main.contains("prepare_holding_plan_messages("));
+        assert!(!manual.contains("push_counted_with_binding("));
+        let notify = include_str!("notify.rs");
+        let route = &notify[notify.find("fn preflight_holding_plan_candidate(").unwrap()
+            ..notify
+                .find("pub(crate) async fn push_p01_origin_with_binding(")
+                .unwrap()];
+        assert!(
+            route.find("launch_gate_check(").unwrap()
+                < route.find("v14_gate_counted_binding(").unwrap()
+        );
+        assert!(
+            route.find("acquire_token(").unwrap()
+                < route
+                    .find("preflight_holding_plan_candidate(token,")
+                    .unwrap()
+        );
+        assert!(
+            route
+                .find("preflight_holding_plan_candidate(token,")
+                .unwrap()
+                < route
+                    .find("deliver_holding_plan_candidate(governed)")
+                    .unwrap()
+        );
+    }
+    #[test]
+    fn t03_exact_owner_bin_fresh_capture_keeps_same_instant_and_shanghai_date_text() {
+        let capture = chrono::DateTime::parse_from_rfc3339("2026-09-09T17:30:02-07:00").unwrap();
+        let mut capture_calls = 0;
+        let prepared = prepare_holding_plan_messages_with(
+            &push_templates::BannerCtx::test_default(),
+            || Ok(Some(snapshot())),
+            |_| Ok(quote_batch()),
+            || {
+                capture_calls += 1;
+                capture
+            },
+        )
+        .unwrap();
+        assert_eq!(capture_calls, 1);
+        assert_eq!(
+            prepared[0].binding.business_date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 10).unwrap()
+        );
+        assert!(prepared[0].text.contains("（08:30）"));
+        let source = canonical(&prepared[0]);
+        let saved =
+            chrono::DateTime::parse_from_rfc3339(source["observed_at"].as_str().unwrap()).unwrap();
+        assert_eq!(saved, capture);
+        assert_eq!(saved.offset().local_minus_utc(), 8 * 3600);
+    }
+
+    #[test]
+    fn t03_exact_owner_bin_legacy_multi_read_is_one_actual_wal_snapshot() {
+        use diesel::connection::SimpleConnection;
+        use diesel::{Connection, RunQueryDsl};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("TEST_CODE_T03_LEGACY.sqlite3");
+        let mut reader = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        reader.batch_execute("PRAGMA journal_mode=WAL; CREATE TABLE holding_plan_daily(plan_date TEXT NOT NULL,code TEXT NOT NULL,pushed_at TEXT NOT NULL,PRIMARY KEY(plan_date,code));").unwrap();
+        let mut writer = diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        let mut hook_calls = 0;
+        let markers=read_legacy_markers_transaction(&mut reader,now().date_naive(),|| {
+            hook_calls+=1;
+            writer.batch_execute("ALTER TABLE holding_plan_daily ADD COLUMN unknown TEXT; INSERT INTO holding_plan_daily(plan_date,code,pushed_at) VALUES('2026-09-10','600000','2026-09-10T09:30:02+08:00');").unwrap();
+        }).unwrap();
+        assert_eq!(hook_calls, 1);
+        assert!(
+            markers.is_empty(),
+            "old metadata/columns/rows must share original snapshot"
+        );
+        assert_eq!(
+            read_legacy_markers_with_connection(&mut reader, now().date_naive()).unwrap_err(),
+            "holding_plan_legacy_schema_unknown"
+        );
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type=diesel::sql_types::BigInt)]
+            total: i64,
+        }
+        let reader_changes = diesel::sql_query("SELECT total_changes() AS total")
+            .get_result::<Count>(&mut reader)
+            .unwrap()
+            .total;
+        assert_eq!(
+            reader_changes, 0,
+            "snapshot reader performs no business writes"
+        );
+        assert_eq!(
+            diesel::sql_query("SELECT count(*) AS total FROM main.holding_plan_daily")
+                .get_result::<Count>(&mut writer)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            diesel::sql_query(
+                "SELECT count(*) AS total FROM pragma_table_info('holding_plan_daily','main')"
+            )
+            .get_result::<Count>(&mut writer)
+            .unwrap()
+            .total,
+            4
+        );
+        // The failed snapshot releases its transaction; the other connection
+        // can still complete a subsequent independent write.
+        writer.batch_execute("INSERT INTO holding_plan_daily(plan_date,code,pushed_at) VALUES('2026-09-10','000001','2026-09-10T09:31:02+08:00');").unwrap();
+        assert_eq!(
+            diesel::sql_query("SELECT count(*) AS total FROM main.holding_plan_daily")
+                .get_result::<Count>(&mut writer)
+                .unwrap()
+                .total,
+            2
+        );
+        writer
+            .batch_execute("DROP TABLE holding_plan_daily;")
+            .unwrap();
+        assert!(
+            read_legacy_markers_with_connection(&mut reader, now().date_naive())
+                .unwrap()
+                .is_empty(),
+            "failed read must release its old snapshot before another inspection"
+        );
     }
 }

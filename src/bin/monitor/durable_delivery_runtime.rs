@@ -22,6 +22,17 @@ use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
 use crate::notify::{DailyReportSubKind, PushKind, PushOutcome};
 
+#[path = "durable_delivery_runtime/holding_plan.rs"]
+mod holding_plan;
+pub(crate) use holding_plan::{
+    deliver_holding_plan_candidate, prepare_holding_plan_tick, reconcile_holding_plan_candidate,
+    HoldingPlanDispatchResult, HoldingPlanLocalProgress,
+};
+
+#[path = "durable_delivery_runtime/health.rs"]
+mod health;
+pub(crate) use health::{read_cached_delivery_status, CachedDeliveryObservation};
+
 #[path = "durable_delivery_runtime/g5b_v2.rs"]
 mod g5b_v2;
 pub(crate) use g5b_v2::{
@@ -33,6 +44,21 @@ pub(crate) use g5b_v2::{
 mod g5b_empty_v2;
 pub(crate) use g5b_empty_v2::{
     initialize_g5b_empty_before_input_writers, inspect_g5b_empty_tick_v2, G5bEmptyTickObservation,
+};
+
+#[path = "durable_delivery_runtime/p05_unit.rs"]
+mod p05_unit;
+pub(crate) use p05_unit::{
+    deliver_p05_unit_child, finalize_p05_unit, initialize_p05_family_before_window,
+    inspect_p05_child, inspect_unfinished_p05_units, observe_p05_batch,
+    reconcile_p05_unit_observation, restore_p05_unit,
+};
+
+#[path = "durable_delivery_runtime/g5b_physical_v2.rs"]
+mod g5b_physical_v2;
+pub(crate) use g5b_physical_v2::{
+    finalize_g5b_physical_tick_v2, inspect_g5b_physical_tick_v2, list_g5b_physical_cohort_dates_v2,
+    G5bPhysicalTickObservation,
 };
 
 tokio::task_local! {
@@ -2228,6 +2254,10 @@ fn reconcile_startup_blocking(state: &RuntimeState) -> Result<StartupReconcileEv
                      producers stay frozen to avoid a retry loop"
                 ));
             }
+            if let Some(calls) = p05_unit::resume_owned_p05_at_startup(state, &identity)? {
+                resumed_sink_calls += calls;
+                continue;
+            }
             let outcome = state
                 .coordinator
                 .resume_deliverable(&identity, std::slice::from_ref(&state.sink), Utc::now())
@@ -2305,6 +2335,38 @@ fn advance_prepared_envelope(
     state: &RuntimeState,
     envelope: DeliveryEnvelope,
 ) -> Result<DurableDispatchEvidence, String> {
+    let resume_identity = envelope.decision_identity.clone();
+    let news_ai = envelope.push_kind == DurablePushKind::NewsAiAnalysis;
+    advance_prepared_envelope_with_resume(state, envelope, move |prepared_state| {
+        if prepared_state == DecisionState::Reserved
+            || (news_ai && prepared_state == DecisionState::RejectedDurable)
+        {
+            state
+                .coordinator
+                .resume_deliverable(
+                    &resume_identity,
+                    std::slice::from_ref(&state.sink),
+                    Utc::now(),
+                )
+                .map(Some)
+                .map_err(|error| format!("deliver counted decision {resume_identity}: {error}"))
+        } else {
+            Ok(None)
+        }
+    })
+    .map(|(evidence, _)| evidence)
+}
+
+/// Keep one physical consumer and its local audit/hydration/terminal behavior.
+/// A contextual owner can supply its private verified resume without a second
+/// generic prepare. The returned count is the actual original resume result.
+fn advance_prepared_envelope_with_resume(
+    state: &RuntimeState,
+    envelope: DeliveryEnvelope,
+    resume: impl FnOnce(
+        DecisionState,
+    ) -> Result<Option<stock_analysis::durable_delivery::ResumeOutcome>, String>,
+) -> Result<(DurableDispatchEvidence, usize), String> {
     let decision_identity = envelope.decision_identity.clone();
     let mut reconciled_hydrations = reconcile_current_decision(state, &decision_identity)?;
 
@@ -2312,20 +2374,12 @@ fn advance_prepared_envelope(
         .coordinator
         .decision_state(&decision_identity)
         .map_err(|error| format!("read prepared decision {decision_identity}: {error}"))?;
-    if prepared_state == DecisionState::Reserved
-        || (envelope.push_kind == DurablePushKind::NewsAiAnalysis
-            && prepared_state == DecisionState::RejectedDurable)
-    {
-        state
-            .coordinator
-            .resume_deliverable(
-                &decision_identity,
-                std::slice::from_ref(&state.sink),
-                Utc::now(),
-            )
-            .map_err(|error| format!("deliver counted decision {decision_identity}: {error}"))?;
+    let sink_calls = if let Some(outcome) = resume(prepared_state)? {
         reconciled_hydrations.extend(reconcile_current_decision(state, &decision_identity)?);
-    }
+        outcome.sink_calls
+    } else {
+        0
+    };
 
     let final_state = state
         .coordinator
@@ -2338,31 +2392,39 @@ fn advance_prepared_envelope(
         .cloned();
     queue_hydrations(state, &reconciled_hydrations)?;
     observe_terminal(&envelope, final_state);
-    Ok(DurableDispatchEvidence {
-        decision_identity,
-        state: final_state,
-        schedule_hydration,
-    })
+    Ok((
+        DurableDispatchEvidence {
+            decision_identity,
+            state: final_state,
+            schedule_hydration,
+        },
+        sink_calls,
+    ))
 }
 
 fn reconcile_current_decision(
     state: &RuntimeState,
     decision_identity: &str,
 ) -> Result<Vec<ScheduleHydration>, String> {
+    reconcile_pending_with_context(state, &format!("decision {decision_identity}"))
+}
+
+fn reconcile_pending_with_context(
+    state: &RuntimeState,
+    context: &str,
+) -> Result<Vec<ScheduleHydration>, String> {
     let mut hydrations = Vec::new();
     for _ in 0..20 {
         let summary = state
             .coordinator
             .reconcile_all_pending(state.append.as_ref(), Utc::now())
-            .map_err(|error| format!("reconcile decision {decision_identity}: {error}"))?;
+            .map_err(|error| format!("reconcile {context}: {error}"))?;
         hydrations.extend(summary.schedule_hydrations);
         if summary.progress_count == 0 {
             return Ok(hydrations);
         }
     }
-    Err(format!(
-        "decision {decision_identity} exceeded 20 local reconcile iterations"
-    ))
+    Err(format!("{context} exceeded 20 local reconcile iterations"))
 }
 
 fn envelope_from_binding(
@@ -2715,7 +2777,7 @@ mod tests {
             .expect("register TEST_CODE replay sha256 authority");
     }
 
-    struct TestNamespaceDir {
+    pub(super) struct TestNamespaceDir {
         root: std::path::PathBuf,
         retained: std::fs::File,
         device: u64,
@@ -2723,7 +2785,7 @@ mod tests {
     }
 
     impl TestNamespaceDir {
-        fn new(test_code: &str) -> Self {
+        pub(super) fn new(test_code: &str) -> Self {
             use std::os::unix::fs::MetadataExt;
             assert!(
                 test_code.starts_with("TEST_CODE")
@@ -2750,7 +2812,7 @@ mod tests {
             }
         }
 
-        fn path(&self) -> &std::path::Path {
+        pub(super) fn path(&self) -> &std::path::Path {
             &self.root
         }
     }
@@ -3007,6 +3069,148 @@ mod tests {
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
         });
         (namespace_dir, state)
+    }
+
+    #[test]
+    fn p05_unit_bin_sole_advance_preserves_real_receipt_audit_hydration_and_no_resend() {
+        let test_code = format!(
+            "TEST_CODE_P05_SOLE_ACCEPT_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let (_namespace, state) = replay_state(&test_code);
+        let date = Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive()
+            .to_string();
+        let envelope = hydration_envelope("P05_SOLE_ACCEPT", &date);
+        state.coordinator.prepare(&envelope, 1, Utc::now()).unwrap();
+        let observed_states = std::cell::RefCell::new(Vec::new());
+        let (evidence, calls) =
+            advance_prepared_envelope_with_resume(state.as_ref(), envelope.clone(), |status| {
+                observed_states.borrow_mut().push(status);
+                assert_eq!(status, DecisionState::Reserved);
+                state
+                    .coordinator
+                    .resume_deliverable(
+                        &envelope.decision_identity,
+                        std::slice::from_ref(&state.sink),
+                        Utc::now(),
+                    )
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(calls, 1, "count comes from the actual resume result");
+        assert_eq!(evidence.state, DecisionState::Delivered);
+        let hydration = evidence.schedule_hydration.unwrap();
+        assert_eq!(
+            pending_hydrations(state.as_ref()).unwrap(),
+            vec![hydration.clone()]
+        );
+        assert!(state
+            .coordinator
+            .reconcile_all_pending(state.append.as_ref(), Utc::now())
+            .unwrap()
+            .locally_pending_decisions
+            .is_empty());
+        let (replayed, replay_calls) =
+            advance_prepared_envelope_with_resume(state.as_ref(), envelope, |status| {
+                observed_states.borrow_mut().push(status);
+                assert_eq!(status, DecisionState::Delivered);
+                Ok(None)
+            })
+            .unwrap();
+        assert_eq!(replayed.state, DecisionState::Delivered);
+        assert_eq!(replay_calls, 0);
+        assert_eq!(
+            *observed_states.borrow(),
+            vec![DecisionState::Reserved, DecisionState::Delivered]
+        );
+        assert_eq!(pending_hydrations(state.as_ref()).unwrap(), vec![hydration]);
+    }
+
+    #[test]
+    fn p05_unit_bin_sole_advance_keeps_uncertain_raw_outcome_without_second_resume() {
+        let test_code = format!(
+            "TEST_CODE_P05_SOLE_UNCERTAIN_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let (namespace, mut state) = replay_state(&test_code);
+        let physical_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::get_mut(&mut state).unwrap().sink = Arc::new(UncertainCountingSink {
+            calls: Arc::clone(&physical_calls),
+        });
+        let date = Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive()
+            .to_string();
+        let envelope = hydration_envelope("P05_SOLE_UNCERTAIN", &date);
+        state.coordinator.prepare(&envelope, 1, Utc::now()).unwrap();
+        let (first, calls) =
+            advance_prepared_envelope_with_resume(state.as_ref(), envelope.clone(), |status| {
+                assert_eq!(status, DecisionState::Reserved);
+                state
+                    .coordinator
+                    .resume_deliverable(
+                        &envelope.decision_identity,
+                        std::slice::from_ref(&state.sink),
+                        Utc::now(),
+                    )
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(first.state, DecisionState::UncertainManualReview);
+        let hydration = first.schedule_hydration.unwrap();
+        assert_eq!(hydration.hydration_state, ScheduleHydrationState::Pending);
+        assert_eq!(hydration.decision_identity, envelope.decision_identity);
+        let transition: serde_json::Value =
+            serde_json::from_slice(&hydration.transition_canonical).unwrap();
+        assert_eq!(transition["task_disposition"], "Uncertain");
+        assert_eq!(
+            pending_hydrations(state.as_ref()).unwrap(),
+            vec![hydration.clone()]
+        );
+        let (replayed, replay_calls) =
+            advance_prepared_envelope_with_resume(state.as_ref(), envelope.clone(), |status| {
+                assert_eq!(status, DecisionState::UncertainManualReview);
+                Ok(None)
+            })
+            .unwrap();
+        assert_eq!(replayed.state, DecisionState::UncertainManualReview);
+        assert_eq!(replay_calls, 0);
+        assert_eq!(physical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replayed.schedule_hydration, Some(hydration.clone()));
+        assert_eq!(pending_hydrations(state.as_ref()).unwrap(), vec![hydration]);
+        let connection = rusqlite::Connection::open_with_flags(
+            namespace.path().join("durable_delivery.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_attempts WHERE decision_identity=?1",
+                [&envelope.decision_identity],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+        let raw: Vec<u8> = connection
+            .query_row(
+                "SELECT result_canonical FROM sink_results WHERE decision_identity=?1",
+                [&envelope.decision_identity],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(result["kind"], "Uncertain");
+        assert_eq!(
+            result["uncertainty"]["evidence"],
+            serde_json::json!(b"TEST_CODE_DATA_MODE_UNCERTAIN_EVIDENCE".to_vec())
+        );
     }
 
     #[test]

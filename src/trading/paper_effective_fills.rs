@@ -396,7 +396,7 @@ struct Application {
 /// Local exact namespace proof, on the SAME SQLite transaction. This is not a
 /// substitute for whole-application CatalogV2 activation authority.
 pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String), LedgerError> {
-    if diesel::sql_query("SELECT COUNT(*) AS value FROM sqlite_temp_master WHERE name GLOB 'paper_ledger_*' OR tbl_name GLOB 'paper_ledger_*'").get_result::<IntegerRow>(conn)?.value!=0 {
+    if diesel::sql_query("SELECT COUNT(*) AS value FROM sqlite_temp_master WHERE lower(name) GLOB 'paper_ledger_*' OR lower(tbl_name) GLOB 'paper_ledger_*'").get_result::<IntegerRow>(conn)?.value!=0 {
         return Err(LedgerError::IntegrityFailure("TEMP paper namespace is not permitted".into()));
     }
     let generation = diesel::sql_query("PRAGMA user_version")
@@ -406,13 +406,13 @@ pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String
         .get_result::<Application>(conn)?
         .application_id;
     if generation < 4
-        && diesel::sql_query("SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')
-            + (SELECT COUNT(*) FROM temp.sqlite_master WHERE name GLOB 'paper_book_owner_*' OR tbl_name GLOB 'paper_book_owner_*')) AS value")
+        && diesel::sql_query("SELECT ((SELECT COUNT(*) FROM main.sqlite_master WHERE lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*')
+            + (SELECT COUNT(*) FROM temp.sqlite_master WHERE lower(name) GLOB 'paper_book_owner_*' OR lower(tbl_name) GLOB 'paper_book_owner_*')) AS value")
             .get_result::<IntegerRow>(conn)?.value != 0
     {
         return Err(LedgerError::IntegrityFailure("unexpected owner namespace before CatalogV4".into()));
     }
-    let mut objects=diesel::sql_query("SELECT type AS kind,name,tbl_name AS owner,sql FROM sqlite_master WHERE (name GLOB 'paper_ledger_*' OR tbl_name GLOB 'paper_ledger_*') AND sql IS NOT NULL ORDER BY type,name,tbl_name,sql").load::<CatalogObject>(conn)?;
+    let mut objects=diesel::sql_query("SELECT type AS kind,name,tbl_name AS owner,sql FROM sqlite_master WHERE (lower(name) GLOB 'paper_ledger_*' OR lower(tbl_name) GLOB 'paper_ledger_*') AND sql IS NOT NULL ORDER BY type,name,tbl_name,sql").load::<CatalogObject>(conn)?;
     objects.sort();
     if objects.is_empty() {
         if !((generation == 0 && application == 0)

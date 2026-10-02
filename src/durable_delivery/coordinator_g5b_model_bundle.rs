@@ -2,6 +2,42 @@
 //! No model, provider, caller JSON factory, counted owner or completion seal.
 use super::*;
 
+/// One typed layer retains every original byte and file witness. Nested JSON
+/// is opaque bytes, never parsed or normalized by this binding codec.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SealModelArtifactBinding {
+    pub(super) event_identity: String,
+    pub(super) material: EventMaterial,
+    pub(super) desired_bytes: physical::EvidenceBytes,
+    pub(super) committed: artifact::FileWitness,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SealModelBinding {
+    pub(super) selection_bytes: physical::EvidenceBytes,
+    pub(super) admission: Admission,
+    pub(super) artifacts: Vec<SealModelArtifactBinding>,
+}
+
+#[derive(Serialize)]
+struct ArtifactBindingRef<'a> {
+    event_identity: &'a str,
+    material: &'a EventMaterial,
+    desired_bytes: physical::ByteRef<'a>,
+    committed: Option<&'a artifact::FileWitness>,
+}
+impl G5bModelArtifact {
+    fn binding_ref(&self) -> ArtifactBindingRef<'_> {
+        ArtifactBindingRef {
+            event_identity: &self.intent.event_identity,
+            material: &self.intent.material,
+            desired_bytes: physical::ByteRef(&self.intent.desired_bytes),
+            committed: self.committed.as_ref(),
+        }
+    }
+}
+
 pub(crate) struct G5bModelArtifact {
     intent: PreparedG5bArtifact,
     committed: Option<artifact::FileWitness>,
@@ -65,35 +101,137 @@ impl VerifiedG5bModelBundle {
         &self.archives
     }
 
-    fn binding(&self) -> Result<Vec<u8>> {
-        let encode = |value: &G5bModelArtifact| {
-            canonical_json(&(
-                &value.intent.event_identity,
-                &value.intent.material,
-                &value.intent.desired_bytes,
-                &value.committed,
-            ))
+    pub(super) fn seal_model_binding(
+        &self,
+        budget: &mut physical::WitnessBudget,
+    ) -> Result<SealModelBinding> {
+        budget.reserve(self.cohort.selection_bytes().len())?;
+        let mut items = Vec::new();
+        let mut add = |value: &G5bModelArtifact| -> Result<()> {
+            let committed = value
+                .committed
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal has uncommitted model artifact"))?;
+            budget.reserve(value.intent.desired_bytes.len())?;
+            items.push(SealModelArtifactBinding {
+                event_identity: value.intent.event_identity.clone(),
+                material: value.intent.material.clone(),
+                desired_bytes: physical::EvidenceBytes::Owned(value.intent.desired_bytes.clone()),
+                committed: committed.clone(),
+            });
+            Ok(())
         };
-        let mut artifacts = vec![encode(&self.selection)?];
+        add(&self.selection)?;
+        for member in &self.members {
+            add(member
+                .attempt
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal model Attempt missing"))?)?;
+            add(member
+                .frozen
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal model Frozen missing"))?)?;
+        }
+        for archive in &self.archives {
+            add(archive)?;
+        }
+        Ok(SealModelBinding {
+            selection_bytes: physical::EvidenceBytes::Owned(self.cohort.selection_bytes().to_vec()),
+            admission: self.cohort.admission.clone(),
+            artifacts: items,
+        })
+    }
+    /// Actual borrowed bodies are interned before any Physical-only copy.
+    /// Original model/file codecs and the v1 binding path above are unchanged.
+    pub(super) fn seal_model_binding_shared(
+        &self,
+        budget: &mut physical::WitnessBudget,
+    ) -> Result<SealModelBinding> {
+        let mut items = Vec::new();
+        let mut add = |value: &G5bModelArtifact| -> Result<()> {
+            let committed = value
+                .committed
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal has uncommitted model artifact"))?;
+            budget.reserve(4 * std::mem::size_of::<SealModelArtifactBinding>())?;
+            budget.reserve(value.intent.event_identity.len())?;
+            budget.reserve_clone(&value.intent.material)?;
+            budget.reserve_clone(committed)?;
+            let desired_bytes = budget.intern(&value.intent.desired_bytes)?;
+            items.push(SealModelArtifactBinding {
+                event_identity: value.intent.event_identity.clone(),
+                material: value.intent.material.clone(),
+                desired_bytes,
+                committed: committed.clone(),
+            });
+            Ok(())
+        };
+        add(&self.selection)?;
+        for member in &self.members {
+            add(member
+                .attempt
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal model Attempt missing"))?)?;
+            add(member
+                .frozen
+                .as_ref()
+                .ok_or_else(|| mismatch("Physical seal model Frozen missing"))?)?;
+        }
+        for archive in &self.archives {
+            add(archive)?;
+        }
+        budget.reserve_clone(&self.cohort.admission)?;
+        Ok(SealModelBinding {
+            selection_bytes: budget.intern(self.cohort.selection_bytes())?,
+            admission: self.cohort.admission.clone(),
+            artifacts: items,
+        })
+    }
+    pub(super) fn revision(&self) -> i64 {
+        self.revision
+    }
+    pub(super) fn head_state(&self) -> &str {
+        &self.head_state
+    }
+    pub(super) fn artifact_filenames(&self) -> Vec<String> {
+        let mut names = vec![artifact::filename(&self.selection.intent)];
+        for member in &self.members {
+            if let Some(value) = &member.attempt {
+                names.push(artifact::filename(&value.intent));
+            }
+            if let Some(value) = &member.frozen {
+                names.push(artifact::filename(&value.intent));
+            }
+        }
+        for value in &self.archives {
+            names.push(artifact::filename(&value.intent));
+        }
+        names
+    }
+    fn binding(&self) -> Result<Vec<u8>> {
+        let mut artifacts = vec![self.selection.binding_ref()];
         for member in &self.members {
             if let Some(attempt) = &member.attempt {
-                artifacts.push(encode(attempt)?);
+                artifacts.push(attempt.binding_ref());
             }
             if let Some(frozen) = &member.frozen {
-                artifacts.push(encode(frozen)?);
+                artifacts.push(frozen.binding_ref());
             }
         }
         for archive in &self.archives {
-            artifacts.push(encode(archive)?);
+            artifacts.push(archive.binding_ref());
         }
-        canonical_json(&(
-            self.cohort.selection_bytes(),
-            &self.cohort.admission,
-            self.revision,
-            &self.head_state,
-            &self.seal_pointer,
-            artifacts,
-        ))
+        physical::encode_bounded(
+            &(
+                physical::ByteRef(self.cohort.selection_bytes()),
+                &self.cohort.admission,
+                self.revision,
+                &self.head_state,
+                &self.seal_pointer,
+                artifacts,
+            ),
+            &mut physical::WitnessBudget::maximum(),
+        )
     }
     pub(crate) fn verify_files(&self, session: &G5bDaySession<'_>) -> Result<()> {
         session.validate_stored_admission(&self.cohort.admission)?;
@@ -158,7 +296,7 @@ impl VerifiedG5bModelBundle {
     }
 }
 
-fn load_artifact(tx: &Transaction<'_>, identity: &str) -> Result<G5bModelArtifact> {
+fn load_artifact(tx: &Connection, identity: &str) -> Result<G5bModelArtifact> {
     let intent =
         load_intent(tx, identity)?.ok_or_else(|| mismatch("bundle original intent absent"))?;
     let committed: Option<Vec<u8>> = tx.query_row(
@@ -174,7 +312,10 @@ fn load_artifact(tx: &Transaction<'_>, identity: &str) -> Result<G5bModelArtifac
 
 // SQL-only loader is not a trusted factory: read_model_bundle performs the
 // unified physical verification before its result can escape the owner.
-fn load_bundle(tx: &Transaction<'_>, date: NaiveDate) -> Result<Option<VerifiedG5bModelBundle>> {
+pub(super) fn load_bundle(
+    tx: &Connection,
+    date: NaiveDate,
+) -> Result<Option<VerifiedG5bModelBundle>> {
     let head: Option<(i64,String,Option<String>,Option<String>)> = tx
         .query_row(
             "SELECT revision,artifact_state,cohort_identity,current_seal_identity FROM g5b_day_heads WHERE business_date=?1",

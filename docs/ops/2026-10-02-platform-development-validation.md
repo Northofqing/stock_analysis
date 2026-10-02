@@ -157,3 +157,231 @@ Windows 第七批 exact `571489de1c4498ecab2b9f546dce52e6ec1dbb3a` 自包含归�
 同精确归档正常 public Provider 对 SZ300005 Day1 limit1/2 的两次请求在 Mac 也均于 HTTP status line前因 missing TLS close_notify失败，例子 **EXIT1**。原 fund_flow.rs CRLF input SHA `050a04d1a32d51013e7d05d61fd8e22977245c71b63e24a11ed17879bb1f833b`；实际 starts2、minimum gap1.007966505s、maximum concurrency1、active0。没有 body/normalized batch、RPC或候选Health准入。共享 Mac第五批10文件，manifest SHA `c8597006fed23e50c353d9eef1ba68094750c30e0229ee64aebd118aad52760a`；原生反馈消息发送成功。
 
 Windows第八批16文件原字节核验通过，manifest SHA `054999d7b736e5eef088db7926a1400088a194f763e582e1fd15aa909dbb7cd7`。三份实际RPC属于旧生产67源码，不属于未部署后继候选。依据用户继续全部开发的授权，已原生明确续办 HistoricalBars caller-limit 信息缺口及独立 observation-only覆盖版本：先校验整个响应再限额，实际本地删行不得称完整，未知缺日/源修订/发布时间/覆盖保持未知，不能以重新序列化JSON代transport bytes。D14/D17/D20权威用途及R08自动确认仍需真实来源证据。此前被执行策略拒绝的候选监听未绕过，生产配置、制品、投递库和activation未变。
+
+
+## 09:16 CST 持续实施与实际回归
+
+M3-A 主源码 `a0f0d6f5` 的 monitor `health_cmd::` **29/29 通过**，包含 8 项新增快照行为和 21 项原兼容检查；同份封存 bin harness 的 C4 `g5b_` **8/8 通过**。同源码封存 lib harness 的实际 transport error→health registry 用例 **1/1 通过**。这些是指定路径的代码证据；未接领域仍明确 `not_observed`，不代表全部 M3 或生产健康达标。
+
+原 `4f761d11` durable 运行保持 **314/317 通过、3 失败** 的原记录。旧 finalizer 的 readiness 超时同封存产物精确诊断通过；测试 fixture 的 immutable trigger 误用已窄修，实际 C2 owner 整组在 `a0f0d6f5` **16/16 通过**。真实 Prepared cohort、published pointer 为 NULL 时的新 v1 准入旁路已修复，原失败用例精确回归 **1/1 通过**，D1 revision 整组 **8/8 通过**。输入零头不得覆盖已有文件 **1/1 通过**。两次意外过滤词匹配零测试的记录明确不作为验证，另有上述非零实际回执。
+
+Empty 第一次行为运行 **20/24 通过、4 失败**，原日志保留。独立复核确认两项 raw fixture 使用被原 guard 拒绝的 TEST_CODE，另外两项 envelope 使用固定 08-18 而封日对象为 09-28。`905cbe7e` 只修隔离 Test 夹具与原 envelope helper，增加目标日期、Reserved 与实际同日 decision 数断言，生产 guard 不变。已合入 Empty monitor 的 resident/daily 初始化、先于模型的 tick 路由和 known opaque seal 刷新；新增 5 bin 用例尚未执行。修正后的 24 lib 用例复用 `6927e0c6` 封存真实产物，实际 **24/24 通过、EXIT0**；回执 `dev-6927-g5b-empty-fixed-actual-harness.json`，没有新编译或生产写入。
+
+P05 S2 精准源 `683baa9d` 已合入 `d43d90b0`：schema14 四个独立 runtime 表、三子归属、实际 Accepted 回执、修订与完成游标、跨日真实 Completed baseline；原 schema12/13 DDL 保留。实际编译发现并窄修测试 trait/type 与 same-Arc 参数错误，原两次失败回执保留。`6927e0c6` 的库已编译通过，32 项实际运行回归最终 **31/32 通过、1 失败、Cargo EXIT101**；原 runtime2404.55秒，精确回执 `dev-p05-s2-runtime-owner-arc-tests.json`。唯一失败在 test helper54行构造09-25输入时报 `not a verified trading day`，调用目标 store之前已 panic；仅Test修正为可信日历下一交易日09-28，并要求实际拒绝原因为 intervening incomplete Unit。原31通过与该修正场景的后继回归分开记录，不称原整组全通过。P05 主接线、恢复、原门禁与 sole physical consumer、非空 Physical 封日仍在独立实施，未声称平台或部署完成。
+
+Windows 第九批四个公共文件与 manifest SHA `052091e49248dbe301e28e6aee5ad6f5962622286a998f8cdaeea318cf6c1ceb` 已独立核验。这批是 Windows 对 exact571/Mac5 的复核，不是 Hithink successor 源码或新 gRPC 实例验收。远端报告正常 Provider 的 limit1 截断已为 complete=false，独立 observation coverage 版本与新源码归档仍待接收/验证。生产制品、配置、activation 和进程未替换；后继切换必须使用新的精确候选及动态门禁。
+
+## 09:29 CST：Windows 第十批精确归档与 Mac 后继复建
+
+第十批 exact `9e215d7a7a7eddb0040816903af6c2156e751765`（父571）的 public manifest SHA `e8765dde6a55ccbe9cc59141c2e21577f4eaf758c31cca90b8104bb3b8539280` 与归档原输入逐项校验通过。ZIP SHA `becaeb0f5187886dbd5ec2742d03a24f384431a4d770d6dd027e188d3b6e7d0a`，656 个原始源码输入在全新目录解压；actual Mac locked offline metadata EXIT0、41 个成员与本地 manifests 均在该目录。新的 lock SHA `a866a47b2f3a8f1ce0c01d6eb08011c3de6063879841600e023124e1e3c72dac` 未变。原 ZIP 检查误拒绝预期目录条目的失败保留，修正只影响归档检查器，没有改变源码或协议。
+
+Hithink 先校验整个历史响应再保留最近 limit 行，实际删行降为 best_effort/complete=false；显式 v2 观察覆盖 envelope 与 v1 区分，源穷尽/日历覆盖/缺日原因 Unknown，修订/历史发布时间 NotProvided，PIT=false。两次 Windows 正常 Provider 结果为源11行→limit1返回1行/false、limit15返回11行/true。交付包没有原上游 body，Mac 无法复算其 transport body SHA；不从 normalized JSON 重建或补发网络。无候选 listener/Health/v1-v2 RPC 验收，仍为 SourceOnlyNotDeployed。
+
+Mac Hithink/composition lib 首次 offline 因缓存缺 html-escape 0.2.15 退出101；失败原件保留，现使用相同精确解包源与 locked 公共依赖下载继续实际编译测试。实际 Mac 最终 **Hithink43 + composition lib71 =114/114 通过、EXIT0**；原 lock hash 未变，日志 SHA `211f96f2f45d676efdb66ec2d3d80df90914d341fb0b966dea94aaa4dc76b636`。这份 Mac 结果与 Windows 工作副本/解包测试分开记录，不计作候选 RPC。
+
+复用 `6927e0c6` 实际 sealed lib，原 P1 store/schema13 组 **25/25 通过、EXIT0**，含 schema12/13 向14兼容与旧原字节保留，不重新编译；回执 `dev-6927-p05-store-actual-harness.json`。Mac第六批10个public文件已写用户授权共享目录 `client-bundle/mac-evidence-20261002.6/`，manifest SHA `815f862645e774cab30739a620c4f8ee204b36c6bb880f898ef4a24e69f857ba`；native send成功。实际远端wait revision31 / active / inProgress，commentary确认已读取114项Mac日志，正在核metadata/path闭包，不能把只读核验称部署。
+
+## 09:48 CST：P05 S3 主树整合与下一批实际验证
+
+库10路径和bin7路径均经根与独立静态复核通过；主树实际16路径改变（同Fixture Arc helper已经存在），已整合source-only。两处3way冲突只作 Empty/P05 exports并集及同imports排序；没有丢旧Empty/模型归属边界。source patch SHA `1c7585b46ef75aa91a3a0ad07cb6f5deb5e5aadffdb9c586f5c19a4900b0b5c7` 与逐文件bytes/hash封存在 `p05-s3-main-integration-source.json`。16项库consumer测试现实际编译中，9项bin接线测试及新的真实dry-run尚未取得结果；静态review不能替代它们，未提交/部署该新接线。
+
+D2 Physical非空封日继续补真实historical seal与已观察head/namespace/DB/date-lock inode的known-aware reclose，late清pointer也不得丢旧文件锚；严格只读真实cohort/head日期list随后供D5历史恢复。D5 facade/runtime41行具体计划已复核并进入实现。M3后继只读审计发现可实施的durable健康查询，Scanner DQ目前没有真实validate调用，因此不能把零计数升级为observed ok。
+
+## 10:04 CST：实际测试与复审发现
+
+S3 首次编译误用了全新默认 target，根在测试执行前以 SIGINT 停止，Cargo 实际退出 -2 的回执保留；后继 session18213 显式复用既有 target。同一16路径源码已编译通过，16项consumer回归正在执行，目前出现两项失败，最终失败信息尚未输出。新bin回归与dry-run仍待验证。
+
+D2 独立最终静态复审发现两项 P2：当前attempt租约时间没有精确绑定最后原审计lease事件；历史seal读取在检查总字节预算前复制全部BLOB。作者已实际收到并确认修复，未宣称D2通过。D5的8路径/9回归已冻结并交独立复审，尚未导入修正后的D2依赖、未编译。M3真实durable健康接线已在独立工作树启动，尚处计划与实现阶段。
+
+S3该次16项最终14通过/2失败，原日志SHA `90ba7602321ea8141978e38034a868fdeded83759c69b7f5bb440df0aa93d0c2` 保留。两项Test夹具缺原reconcile，导致仍处于RejectedAuditPending/UncertainAuditPending，尚未进入目标业务门禁；作者已作Test-only修正并补精确状态/错误断言，实际复测待根整合。9项bin回归正在限定目标编译。
+
+上述实际库harness已封存，复用它执行修正后的S2跨日未完成Unit用例，**1/1通过、EXIT0**；日志SHA `590644d986eb40ecbbaa4feb0bc68cf8a00b0db24d55dd4d80fa6f4c9a1acbae`。它补上原31/32中因休市日夹具失败的场景；原整组失败证据保留，未伪称重新跑过32项。D5根与独立静态复审均通过，实际编译/9项回归仍待D2依赖修正与整合。
+
+
+## 10:48 CST：修正回归、合并后实际验证与 Windows 交接
+
+P05 S3 原库运行保留 **14/16、EXIT101**。两项夹具补原 reconcile 后，RejectedDurable retry 与 UncertainManualReview 未授权场景各自精确 **1/1、EXIT0**，日志 SHA 分别 `92c5bd23c5e47c5e41b4de1120980b37d070f4fc65e045cce750eb1bc1dce01c`、`1954837846d5d7437b9c82a7cda27d663cbc3d7ef8c019ddc6a0c658da4c0000`。原 bin **8/9、EXIT101** 的 Uncertain 用例误以为原 ReviewTask 不 hydration；Test-only 改为检查真实 Pending/Uncertain 队列与单次物理 sink 后精确 **1/1、EXIT0**，日志 SHA `d259b309937767ed89378d40d1dee51891c2a1d88aad07b4647a22939e1904f5`。没有把旧失败运行改写成全通过。同份原 bin 封存产物新增 Empty 与既有 C4 组 **13/13、EXIT0**，日志 SHA `3eb58a1a8e56237bf3ed69791663b5f0c9c9c9727a362a633009b0e7a451d669`。
+
+D2 Physical 封日两项 P2 已在独立静态复审闭合：当前租约列绑定实际 predecessor 审计链；SQLite 原行在复制前计入跨历史/编码共用字节预算。D5 opaque consumer 与 M3 只读 durable 健康亦静态复审通过。手工 backfill 改用上海已完成交易日，测试 companion 原放顶层会被 Cargo 发现为独立 bin 的 P2 已修为 `src/bin/backfill_predictions/tests.rs`。四组件与 S3 已整合主树 **40 source files**，尚未提交/部署。
+
+合并后 D2 第一次实际编译 **EXIT101**，无行为用例执行，日志 SHA `f4ca54c64a99c0268aff5d47b3b6c258dcfd4e55eb4c0a75518c9971c460a8f5`；两处接口适配错误分别为私有 `bundle.cohort` 和 Test `AttemptLease` 当 delivery request。根仅改为既有 `cohort()` 与 `lease.request`，保留原行为与失败证据。新40路径 source patch SHA `0c53809acfaaa3d80ae26850f3c1a93f8768a84ae041cc0879c6e1ececd3dc1e`，实际 D2 24项回归编译正在进行；D5、M3、manual backfill 及本批正常 monitor Test dry-run 仍待实际结果。
+
+Windows `.11` 四个与 `.12` 十五个公共文件已逐原字节/长度/安全路径独立校验，manifest SHA 分别 `158c3bf5a8e02b0bc65101f32e8453538c550d077b02f7eb08c176c4f83bd485`、`d0fc7d41c0c9f900ba7d152d4e24da08ca8e9137b3d51348ee5c93bb1eaab2df`。12包 exact9e215 Windows candidate release SHA `289a981507082a99868b1bca107afde97be4a7c33a816959242d72722966b0f1`、descriptor SHA `abf28a3e0028488a7579da4d961e1a7c1408482bdc0500122c1956d225e480cf` 已核原制品及23个非监听 server 测试日志；4 listener 用例未运行，候选未启动/未部署/未Health验收。Windows 工作 lock 与归档 lock 的差异独立验证为 CRLF→LF，不能混称原字节相同。原进程/67源码准入仍有效，新9e源码未晋升。
+
+原生 wait revision33 / active / inProgress 后，按用户既有授权继续向同 Windows 任务发送最小正常 HTTPS/TLS 只读诊断；不改验证、代理、凭据或重试策略，不绕过监听审批拒绝。Mac WG06 已进入 v2 coverage recorded-only codec 的只读缺口审计；Windows正常 Provider capture 不含 RPC request_id/payloadSHA，不伪标 RPC实录。纸账 reserved SQLite namespace 大小写发现问题已授权独立六路径修正与实际 V4/V5 回归，原 owner/schema/cutover 权限不变。
+
+
+## 11:29 CST：实际 D2 RED、M3 查询通过和新独立源码
+
+D2 corrected40-source `0c53809a` 已实际编译（5m52s）；24测试运行前两项失败后，根只对明确验证归属的 Cargo41747/test42945 发 SIGINT，保留 partial实际exit-2/753.87s、日志 SHA `b4f7d00362d946df94dcf43136c2f8d3ba6ea7e6133fe1ddf2f848941d75abfc` 与 `dev-physical-seal-d2-diagnostic-stop-ownership.json`。没有把中断称24通过。封存真实430789216-byte lib harness SHA `6044f00a150c555803cbe4521f3c9d65163c6d90b84fb4d2d2ad64185885e520`，精确原第一个正向用例 `--nocapture` 实际 **0/1、EXIT101**，122.90s；`dev-physical-seal-d2-exact-failure-diagnostic.json` /logSHA `b9e15f4170be858afc5d6598cea0898dec2ad3064e2f85e76234c921e89f3607`。错误为 Physical witness byte budget exceeded before copy/encoding。
+
+独立源码复核和根明确拥有的中断 Test fixture 只读长度投影确认多层 JSON 数字数组放大：单成员 SQL artifact desired原bytes1.4MB，旧 Physical seal约23.8MB，canonical+preimage同SQL行复制约47.6MB，超过32MiB。正在仅D2三路径实施 typed/无损Utf8-or-Hex leaf + bounded fixed-profile zstd wrapper；32MiB/4096/allhistory、实际SQL/FS/审计guard不降低，严格canonical/frame/inflate及全历史共有预算列为复审条件。新codec实际正向/late/budget回归仍未执行。
+
+同40-source实际 lib 的 M3 `delivery_status_` **4/4、EXIT0**，3.54s，日志SHA `2c183eba830109fbbe75591ef8f2d7d3bc31f1491b5ed85768a33bae20d28920`。Paper casefold6路径与 WG06 v2 phaseA3路径均根+独立静态PASS后干净合入；49源patch SHA `8e73ad450bd1f91b0a803cb9c96f95eca61be808bfa9a47d430f2d19b8caf1c7`。WG12 actual Cargo现启动；paper8待复用真实新harness。没有source commit/新normalmonitor dryrun/生产部署。
+
+Windows13 14publicfiles+manifest `4daafea44527d58da5c477749f04ba0d7df36d92b04b8d979e35824acbbdfeee` 独立原byte/hash/路径与源码trace复核通过。实际单次 normalProvider TLS stream→prelude→status EOF、EXIT2；SNI仍Unknown，4个隐私/字串测试不是根因回归。Mac仅只读本机Surge mapping显示该目标i=3323088417→198.18.78.33，route为utun4/接口198.18.0.1；不能推断历史流真实源站、policy或关闭归属。未发新remoteProvider请求或读profile/policy/headers/凭据。Mac7共享3publicfiles manifest `9bdf0d47f2dd1a560dc6d6edc8be879ed37bf61b31a08681803e0f055e5d94fc` 已发送原nativeWindows任务 SUCCESS；Windows上轮revision35 completed、其直接返Mac消息failed，但本轮Mac实际读交接与发送不受该失败影响。
+
+下一 T03/MU-holding-plan 审计追到真实main第三次任何失败写已推marker及source observed_at重渲染新decision；已授权独立原P05树先library exact同TX owner/strict physicalAccepted observation，再producer原卡恢复/legacyUnknown/退役falsecompletion。作者必须先封存解除冻结的3个原S3文件；不改DDL/policy、不自动授权重试、不改root源码、不Cargo。Scanner DQ留下一源时间保留完整切片，不能填now造已验证Tick。
+
+
+## 11:43 CST：WG12实际通过、Paper精确错误断言与Windows14
+
+49-source `8e73ad45` 实际 WG06 recorded-v2 库 **12/12、EXIT0**，编译/运行316.285s，log SHA `265adf597e1f08c0de7b2e7233528f21f8bd60cb0dc5254a153bf7d400a29609`；source前后原bytes unchanged。实际430745584-byte lib harness封存 SHA `17a6e2b797937c71cd6cb0411d98c103cef37cf15bfdd3e2bd55d04feea8cbc9`，receipt `dev-platform-8e73ad45-lib-harness-seal.json`。首次paper调用早于异步封存结束，driver读receipt即FileNotFound退出，未启动任何测试；完成封存后实际scope运行另有完整receipt。
+
+同真实harness paper casefold **7/8、EXIT101**，1.28s test，log SHA `e8745c811e1f004298bc22c73ec4165b4def079169dd85f20ee47ce442b9c20b`。根+原作者独立源码核对，唯一失败为Test只匹外层CatalogMismatch，而V4 fee namespace校验已精确返回FeeManifest(StagedPaperBookV2Error::CatalogMismatch)。仅修两条Test断言：fee shadow须精确nested variant，其它仍直接variant；保留原bytes/rowids不变检查与原失败，不放宽source gate。修复后真实回归待下次库编译。
+
+Windows native revision36实际ACK核读Mac7，revision37实际completed；其新Windows14三公共文件原bytes/长度/manifest `e84da67240e2dae955754810fa32248429d4605aaab7d46914cc8405751168a0` 根复算通过。它核验当前地址对应、记录相隔约24分钟，samehistoricalflow/关闭责任仍Unknown；无新Provider请求或source修复。root依原用户协调授权再次native发送继续审计既有架构与六项源码断点 **SUCCESS**，明确以已保存原生材料实现可做切片或输出唯一外部前置，不重复同映射，不绕listener自动审查拒绝。后续compact读取返回host unavailable，仅表示当前状态未知，不改写send成功。
+
+T03 library具体API/全部prepare同事务exact owner gate与17表字节witness组合获技术GO；实际原S3三文件已封存。bin只读审计发现periodic和manual_push两个真实调用，均须共享owner-first入口；原latest_user_position_snapshot本身只读SELECT。bin具体计划待reviewGO。D2三路径紧凑codec已首版静态写出，待Stable复审、实际正向/预算回归。仍无新source commit、normalmonitor dryrun或生产写入。
+
+
+## 12:12 CST：D2 codec 已编译与 T03 实际竞态复审
+
+D2 三个紧凑编码源逐原 bytes/hash 整合，增量 patch SHA `c1a1c9846fc1cacdb3084db6334e868a9a133485c185a2ea414335d34815efb9`；根与独立静态复审通过，预算仍为32MiB/4096、完整原证据与跨历史共有校验，固定zstd profile/封闭canonical codec。连同 Paper Test-only 精确错误类别修正，当前49源 patch SHA `499fffb486ecbee7ff1341988c0f4b30f29bb72686ad13c936a67f9378deceec`。实际 Cargo 编译通过（5m40s），one/two/three 原正向+restart/noop 用例正在运行；已输出 count1 inner2324163/compressed84943/stored170116/history_validation10773062 bytes，尚无最终通过结论。源仍冻结；旧失败证据不改写。
+
+T03 库首次 Stable 五路径 patch SHA `74de854133335871e89cff1633b6db93b7c8f1a251baab0e360204903c1853d4` 经逐源验证和独立复审发现一项 P2：预检 absent 后另一owner插入真实Holding，非Holding incoming沿旧mutation route写冲突audit时未装Holding最终SQL witness。已要求作者窄修新旧Holding context exact绑定、实际first-insert竞争/后续stored-route重试/last-hook rollback回归。原函数无自动重试；本次漂移须 failclosed，后续显式调用才重读原owner。首Missing测试另误写旧表为holding_plan_daily_record，修为真实holding_plan_daily。该库未整合主树、未Cargo；13原用例及新增回归仍待实际运行。
+
+T03 bin具体共享入口方案已获技术GO并实施：periodic/manual两真实caller共用owner-first、原卡恢复、strict physicalAccepted+local-drained完成判定、只读legacyUnknown，不将第三次失败写完成。作者已封存原M3/WG16源并精确同步根49源依赖；后继库竞态fix待独立复审。仍无新接线完整验证或生产切换。
+
+Windows native compact revision38实际active/inProgress，已开始CNInfo两源切片，从独立解包目录编译和运行测试；其commentary报告656构建输入、41成员/89本地path归档闭包。交付制品与实际测试结果尚未收到，不能计为源码或RPC验收。此前发送SUCCESS持续有效，未再重复派发；Windows14地址复核不计EOF根因解决。
+
+
+## 12:25 CST：Paper精准回归、T03库合并预案与bin复审
+
+当前499-source实际 lib harness已封存432194864bytes/SHA `a0ed3ac76741cf1dfb56199d033e3acc6848f73250a17393652c4247977dad89`；仅复用该真实产物执行 Paper 原唯一失败修正，实际 **1/1、EXIT0**、0.12s test，log SHA `e42cab4f554f00ffb1b68127a94d5ee13ab29ba4e17131538c31e6997b67452f`。原7/8运行及其失败日志保持不变。D2 one/two/three用例继续运行，count2实际inner6613792/compressed312558/stored625346/history_validation31173948bytes，仍在32MiB以内但不据此推定count3；最终结果尚未出。另复用同499 immutable harness启动D5 opaque physical四项库回归，结果仍待。
+
+T03库first-insert P2修复及第14实际竞争用例，经root与独立静态复审PASS。完整5源增量 patch SHA `ca539cbe28e9152003091539abaa25c6f9b8b7455cfc1712f1bfdb23ee7f8fc1` 已重封；根在ignored目录做原S3/root49/作者三方合并，两个注册/export冲突只取现M3与T03并集。五份合并预案与bin作者适配依赖逐byte一致；仍未改根当前49冻结源码或运行T03 Cargo。
+
+T03 bin7源/11新用例88ca Stable已送根+独立复审，确认两个实际P2：Local捕获/日期/新schedule在非+08主机可能漏Shanghai今日owner；6SH/elseSZ导致92xxxx真实BJ owner漏查，可能另开SZscope业务owner。后继须统一fixedShanghai并复用既有严格production equity resolver（含A-share约束；历史alias/未知不得伪转换）。当前bin候选不可整合；尚无真实测试/部署。Scanner独立只读审计同时确认date级limitpool价格覆盖实时quote、flow await后无消费时效复查，具体窄计划正在整理。
+
+
+## 12:51 CST：D5库实际通过、T03静态闭合和Windows新候选准备
+
+499-source immutable lib 的D5 `g5b_physical_v2_` 四项实际 **4/4、EXIT0**，1639.04s test，log SHA `d89c56006dfe35ecb4cb7d9a420acfccf2a388eec861f353d872f98d75fea6c9`。覆盖same Arc刷新/foreign Arc拒绝/重启、late raw清current后known重封、观察后suffix回退不得reset、Uncertain不等Empty/成功。复用已有封存产物，没有重复编译；D5 bin五项尚未运行，不作完整接线/部署结论。D2 one/two/three原正向依然运行；明确owned testPID53076的一次短sample EXIT0观察到原delivery audit归档内的C1/C3 canonical检查，只有瞬时样本，不能统计热点或据此判整项通过。
+
+T03 bin三P2四路径delta SHA `b87f62207742895f14bf5e715e9411a73c2900cd1dc0b0938b89a222cf5e9df5` / 完整七源 `3115a83d7801c3271f16fec17da81ed9d3a8b8fbae6cf848e419eb6dc6d2496c` 获根+独立静态PASS。上海日期/sameinstant、严格currentAshare/BJ resolver及原legacy一个Deferred read snapshot均闭合；实际新增5case使bin新case总16，尚未Cargo。根主树仍49 source-pinning，5库+7bin尚未整合。Scanner四个非main源有第一组实现，exactT03依赖同步后main限定hunks正在继续；不称Scanner完整验证。
+
+Windows15 public manifest `8184175248087d6d5e14a046b3d7790c0e3775a874cdf768cb6135a2359d3e72`、656源码成员与长度hash/safe路径已根独立验证，archive SHA `a86c7be00c32034e251b2105079d2d2db0529a4b707c152845cd088c60f020ca`。新source `b7d206668753dc762e776b0ff893c63d53166afe` / 父9e；654原输入逐byte相同，仅CNInfo两个源改变，旧release9e不含新修复。Mac在新解包源实际公开接口 **2/2、EXIT0**，15.908s compile/run、1.01s test；全656前后不变，lock a866原hash保持，log `d452fad80e76dd78cca2ee459ddd90da5d9bfd0b8650a46503072940bd098fac`。Windows报告51 provider/5 composition/独立51档案测试是其各自scope；Mac本轮不混称已跑这些或真实wire/RPC。
+
+Mac8共享四公共文件 manifest `dab1175ef84cfd00e268079ba6dee389180bd904b43f3e5201acce618516d349` 已写授权共享路径并native send **SUCCESS**。下一明确任务是b7独立offline release/descriptor/source/lock/binary精确候选及非监听门禁交接；保留旧9e，无listener/production/TLS/proxy/source capability/activation修改、不绕此前自动监听拒绝。六项外部来源/执行前置仍Unknown/NotProvided/PIT=false，待实际新反馈。
+
+
+## 13:10 CST：D2 三成员实际 RED 与 T03/Scanner 精确整合
+
+D2 current49 `499fffb4` 原 one/two/three 单用例已真实结束 **0/1、EXIT101**，test3739.33s/driver4089.301s；前后49源一致，log SHA `cc279caa1bcadc56ee73aeb67aad73be4b9af94967c0746625c961e114ab22a7`。count1/2 loop已完成原restart/refresh/noop，count3首次 `try_seal_physical_cohort` 在原行为测试line40报 `Physical witness byte budget exceeded before encoding`；不能把前两loop改写为2项通过。单独 canonical byte-leaf 回归 **1/1、EXIT0**，log SHA `ff1ce6944ded3c95f533b5fe8a7b31d1e493b8a9b1cdae677476f577e2939541`。
+
+根完整复核 private byte-arena plan `236bf5d9d52f8d1991eb801ee7dc1ecbf2e85a8fb701d373d8f6aa5104755ea9`，依实际第三成员RED授权仅D2三文件修复：完整原bytes共享而非hash替代，SQL类型/rowid/order/archive/allhistory保留，32MiB/4096不变，新增私有v2保留v1精确reader与noop，不改C1/C3持久codec/DDL/生产。共享和descriptor真实预算不得漏计；不保证三成员fit或宣称性能修复，待最终源复核和原生命周期实际回归。
+
+T03改正库5/bin7与Scanner5已经根+独立static PASS。Scanner精确patch `21c6d0c6f4488bd293ead6039239c74a117c258a6a79d6877cd68f2c09dc7c46`，9新增源用例未执行；每row flow await/T1后实际UTC、精确5秒、native原quote price/change与完整请求集合，拒绝在transition/Detector/G5a/journal前，Auction无realtime cap保持不可用。D17 qualified limit和MoneyFlow freshness未闭合。
+
+原live driver结束后根逐原bytes/hash验证root49与全部依赖，精确整合 **59 source paths**，patch SHA `1977d4b345a907a7ee78e64dd3b66f5ce3aa90d86e2003b48676d3e748dad70c`；receipt `platform-59-t03-scanner-fixed-source.json`/`t03-scanner-root-integration.json`。当前 sole stock Cargo 是 `--lib t03_exact_owner_ -- --nocapture --test-threads=1`，最终结果pending；主源码再次冻结。无新source commit、normal monitor dry-run、release/activation或生产写入。Windows最新compact revision40 active/inProgress，新b7服务release编译pending，旧生产/监听未改。
+
+
+### 13:15 CST：T03 首编译失败保留与窄适配修复
+
+59-source `1977d4b3` actual `--lib t03_exact_owner_` **编译 EXIT101，190.114s，未执行任何行为测试**；源前后一致，log SHA `75a35778b4d723947ac344d9ae5e1e6c503081042e4b1208f0286621b4774044`。五个 E0433 为 Holding 库/测试漏导入 `DeliverySubKind` 和新代码引用非直接依赖的 `chrono_tz`。根仅六路径补两导入，并将六处上海时区转换改为仓库既有 `chrono::FixedOffset::east_opt(8*60*60)`，同一瞬间/UTC+8/日期边界不变，无新依赖/lock/取时。独立 before/after 逐六源 hash/diff static PASS；原身份resolver、Deferred snapshot、Scanner接线未变。旧六源原bytes在 `validation/t03-compile-fix-before/`，receipt `t03-root-compile-fix.json`。
+
+新59 source patch `5a3658eb4df854a7834f4e678fe7012f65e8711709e68cf8c5a498f0e797d31c`；同唯一 Cargo filter实际重跑pending，未把静态通过当编译或行为通过。Windows13:15 compact读取 Timeout，当前服务构建状态未知；此前发送成功和revision40活跃构建不改写，尚无新公开制品/部署/RPC回执。
+
+
+## 13:34 CST：T03、Scanner、M3、D5 和 backfill 实际定向结果
+
+59 source `5a3658eb` 编译适配后实际库 T03 **14/14、EXIT0**（test14.53s/driver343.132s，log`70557687376b49720feb9e00933c322ccfef29fd9a2df76aab601e8b05a1efe9`）；真实432295488-byte库harness SHA `40ba01c23dd740ee6c185510e21b948151d51ec03f2bc321894da304862633a7` 另实际 Scanner **6/6** + 三个必要旧 Holding 库case各 **1/1**。bin实际 T03 **16/16、EXIT0**（test14.29s/driver234.084s，log`0f773191872043e0004b729f530ab7b6052be9f9d3e0cd2c533f9de7885f096d`）。封存实际97310676-byte monitor harness SHA `24c9cbd99a8c1eca28b992d6ee39d8318d9f2853a52497d40bb82d4cd478630a`，按受影响路径实际 Scanner **3/3**、旧 Holding renderers **13/13**、intraday failure matrix **4/4**、manual两个case各 **1/1**、M3 durable-health **8/8**（log`32d278bfce34b03bc67a8a613db94a8b1b57fa30f500318e3ace66f796ff1955`）、D5真实callback/runtime边界 **5/5**（log`acc4f785289a82ac1abf6d872d12356f67375bb6fc46170398dc45e5678ab78d`）均EXIT0。没有重复未改scope的全量检查。
+
+独立 `--bin backfill_predictions manual_backfill_completed_session_` **4/4、EXIT0**，原4 parent再执行实际isolated DB child，log`e52081585f61cef71a6c273eeafb01176c9cf1ed7f8ab4b95264eece9099a535`；源before/after一致。
+
+同份bin旧 quote-batch必要兼容运行 **8/9、EXIT101**，log`8c93bfdc43ee266b5d4527e6817b9fd73e1405593f69769c44717146cbdbd101`。唯一br210 malformed timestamp原用例已被coverage正确拒绝（invalid observed_at timestamp / reason_code=invalid_evidence），Test要求下游旧中文文案 `observed_at 非法`。根核HEAD原同断言，仅改两Test检查为真实field/reason_code；before原bytes保留，独立static PASS。新59patch `eabe9cac7021973f05396bda1a2b4829d26152fee2d6bf294b408ca58eabb449`，精确bin单例actual rerun当前pending；不改写旧8/9为9通过。全15scope逐log hash复核索引 `platform-5a3658eb-scoped-gate-index.json`。
+
+D2实际第三成员预算RED仍是上线阻断，private v2 arena作者实施中、未Stable/未Cargo；normal current monitor dry-run/commit/release/activation仍未完成。M3 Outcome只读plan确认已有交易日/方向/CAS，正在补核当前sharedUnit intent/score/实际child Accepted和原v2两路径的精确关联合同，尚未源码GO，不宣称完整live统计完成。
+
+
+## 13:55 CST：行情精准回归、Windows16 候选和 OutcomeTracker 源码 GO
+
+59-source `eabe9cac` 的旧 quote malformed-time Test-only 修正实际精确重跑 **1/1、EXIT0**，driver50.688s/log SHA `d73b5076f6bce096c2889f89c7f31ebef66779400f5ecb981b4bf89305a6b0e2`；59 源前后原bytes一致。不把旧8/9失败运行改写成9/9。
+
+Windows16 manifest `671f4279356265031687682519cba910294b7d5afcfb41a3386e35f77e94e49f`、20publicfiles、原656source/lock及b7新release全部根核验。exe18370560bytes/SHA `f23a7bf05f68b7f4fabc7feee27b405f1ae6a69ec281272203e5f3437114479a`，descriptor31818bytes/SHA `abf28a3e0028488a7579da4d961e1a7c1408482bdc0500122c1956d225e480cf`；实际Windows release EXIT0及nonlistener23PASS/4filtered。Mac只静态PE/embedded完整revision+descriptor与rawbytes核验，没有执行Windows exe或取得Health/wire证据；原构建env restore False未改写。
+
+Windows13:07:13CST只读CIM/TCP observation原PID10964与50051listener均Absent，原因Unknown、没有restart。05:07观察不是13:55fresh状态。根按用户既有授权native send原任务 **SUCCESS**：新只读process/listener/deployidentity/服务管理/原日志调查+精确恢复/RPC操作审阅方案；不绕之前自动listener拒绝去启动/重启/改production或TLS/proxy/credentials。Mac9公共复核包三文件+manifest已封存。
+
+M3 OutcomeTracker完整Unit计划 SHA `c4e1dc81ef53fe1c98bbdd1f9714c7fc86f362ca444a8775c17ae4f37a5f5f06` 经根+独立plan review GO，仅13功能源。作者18before archive、根59eabe mechanical overlay、11non59 HEAD6927 dependency精确SHA同步完；最终13基线逐原bytes==根当前（含原S3/P05三源）。新增统计只读，不扩completion authority，不把SQL失败当AwaitingDrain，不把Unit childAccepted当Unitdrained。作者实现中未Stable/未Cargo；主树没有整合此13源。D2arena三源仍在实施，原count3RED仍阻断。无新source commit、normalmonitor dryrun或生产切换。
+
+
+## 14:48 CST：Outcome v2 静态闭合与 Windows 恢复方案补充
+
+OutcomeTracker v1 的新只读窗口预算遗漏 freeze 全部 copied header、member 行与关联 prediction 的 pred_detail，独立复核判 P2。v2 在同一 Deferred 事务内、所有加载之前统一 checked-add 四组 SQL scalar extents；关联行即使 target 被改到窗口外仍按原 ID 纳入。4096/16MiB 保持，固定 descriptor 计费只描述新 SQL copy 预检，不宣称所有原 decoder/terminal/global allocator 的峰值有界。原 Frozen Test tuple 改为既有 struct variant。13 源 fullpatch `843ace0106273361aec6fa1b5f2592ffe45653c6fd423154b305b25f20f9aa24`，manifest `6daa212a7f9722ad74125764d262b77a73220d233c9f6b1d1e4e78735a7e223d`；根逐原 baseline/current hash、patch apply-check 和独立 static review PASS，receipt `outcome-tracker-v2-root-review.json`。17 actual cases 尚未执行，13 源尚未合入主树。
+
+D2 byte-arena Candidate2 的 copied seal/head metadata 计费已复核闭合。另一 dispatch owned material 分配在 unknown prefix 被转送 Empty decoder 后仍存在，正窄修为只允许 Physical v1/v2 与 Empty v1 的 canonical prefix，其余解析前拒绝；原32MiB/4096/全历史预算和合法接受集合不变。Candidate1/2 封存输入保留。尚未声称新 codec 编译、三成员正向或全35回归通过。
+
+Windows17 已读取，35 外层 /11 内层 public manifest 正独立复核。14:27 CST snapshot 报无 server/PID10964/50051 listener，原因仍 Unknown。RUN_REVIEW 的具体 runner/client/stop 均 NotProvided，previous denial 只标 retained、未给原 stated reason。按用户既有协调授权，根向原 Windows task 发送补全离线具体恢复/RPC审阅命令和原拒绝回执请求 SUCCESS；未启动监听、发新 RPC 或改生产。候选公共 metadata 的 deployment_build_identity=null 保留，静态b7身份不伪作已部署身份。
+
+
+## 14:58 CST：D2 Candidate3 合入并启动实际回归
+
+D2 Candidate3 fullpatch `5282275d69afc6afbfa38fd3aff1ce03e70dbb9ad996eba2b2f93587fb8597b5`、manifest `713ae601720c4ef0eca6302782ba8bb0ff7877e11cb37ca186d6c2cc1ce601d0` 经根及独立复核 PASS；两个 P2（copy metadata 与 unknown-prefix owned-parser 绕路）闭合。仅三授权源覆盖，其他56源 unchanged，原root3 before保留。main59 new patch `487b243d889b3139982c2368bdebbe90d9ff3d4743ba7e67ee454e689e2459cb`，receipt `d2-byte-arena-candidate3-root-integration.json`。根唯一实际 Cargo 当前 `--config profile.test.package.stock_analysis.opt-level=1 --locked --offline --lib g5b_physical_seal_byte_arena_ -- --nocapture --test-threads=1`，源冻结，结果 pending。CLI只优化自己的test crate；预算/fixture/debug assertions/overflow checks及Cargo文件未改。8新/27原用例尚不称通过。
+
+Windows17完整性复核 PASS：35 外层文件和 inner11 全SHA、实际目录成员完全一致、无symlink/越界。root manifest `8d73a96cc409dcafbb7fd6ef62f32bfbf11c800d87fd5d3e9ed5adc7abd620d7`；实际inner13含自身manifest及明确由外层覆盖的historical-v2补充。16候选/15 archive656原byte/长度关系保留，publicproto与candidate输入 exact；原独立receipt SHA `360300151afb8cddb8a5a9cd153d8daf472a8916101bd798c410a51a83e74482`。Mac10六publicfiles+manifest `8f6bce848ab09dcccbdd8bc895648f9248e4a473ee7150bed4862af7f222a4e5` 已封存共享并发送原Windows任务 SUCCESS，含完整实际Cargo生成并保留的31802-byte client descriptor /41db pin。此次复制及复算不是新b7探针编译或在线RPC验收。
+
+只读追踪发现 production qualified_daily_trading_status 无可授权writer：QualifiedTradingFactsGateway acquisition仍ContractNotDelivered，WG06 coverage仍Unknown。另有实际前置缺口：日线共同upsert能改close/source但未失效化原qualified标记，而prediction verifier只查EXISTS Trading。已安排穷举日线write/delete路径，准备同事务保守失效化窄片；尚未改源码，不创建Trading、不用is_suspended=false默认投影替代authority。
+
+
+## 15:16 CST：D2 新8项实际通过，原三成员回归进行中
+
+main59 `487b243d` 实际 Cargo新8 **8/8、EXIT0**；test351.93s/driver1320.066s，log SHA `1bcd70395ad570ec38fe463b6999e0a896d030df559689ef3bb36d2e3dd02075`，源前后原bytes一致。包括原v1 exact/noop、新v2 late-reclose、完整旧行类型/排序/全部bytes、metadata/intern preallocation、alias/dangling/unused/noncanonical/row-boundary与实际v1/v2混合SQL历史保留及重启读取。编译报告16m00s；CLI仅自身test package opt1，不把Cargo总体标签unoptimized或耗时推导成production性能证据。
+
+已封存实际349080544-byte lib harness SHA `39aeaa6ff0d9f6bc76611bdde6fd83755bf117ad10e547213615235acbad7749`，路径 `/Users/zhangzhen/.local/share/stock-analysis-candidates/platform-487b243d-d2-opt1-lib-harness/test_harness`；receipt `dev-platform-487b243d-d2-opt1-lib-harness-seal.json`。当前仅该实际产物执行原 `g5b_physical_seal_actual_one_two_three_original_members_restart_and_exact_noop`，结果Pending，不追加Cargo编译；主树59仍冻结。剩余26原failure/history/budget边界与必要D5 façade、normalmonitor dry-run/commit/release/精确activation未完成。
+
+Windows18 native revision46 completed 已知14publicfiles，正在独立复核。原自动拒绝动作已找到：2026-10-02 01:29:50 CST组合PowerShell试图hidden启动旧debug65bad1b候选127.0.0.1:50056、运行announcement probes并finally Stop-Process -Force；CreateProcess回执仅“rejected: blocked by policy”，未给具体内部规则。该拒绝及其旧tuple不得混称本次b7/原50051已执行或已授权。新具体恢复方案仍缺已证明的单PID正常stop；未执行启动/服务/RPC。
+
+
+## 16:06 CST：D5 四项通过；D2 故障 fixture RED 保留
+
+当前 main59 `487b243d` 仍固定。实际 immutable harness 的 D5 façade 四项 **4/4、EXIT0**，driver1614.018s、log `dae3f6c60e25dde533554b880fa6150ee4b47a11e6d2005f9d7f5452eb238cf6`。普通 default dev `monitor` build **EXIT0**，295.747s、log `d217200dc06c860d4f4fb83179c185f23459a1617c9ca8b477f5efe2c40491e5`；封存130240232-byte monitor `ec5acaf585bbb0849540a89e13472ee7fe0c5821e628a4ccf201ec9c9256d209`，尚不据此声称 dry-run 或生产通过。
+
+原26回归尚在运行，其中 `after_all_sql_hooks_input_mutation_rolls_back_seal_and_pointer` 实际 hit=0/expected1失败；原log保留。独立源码追踪定位预置 `20260928.TEST_CODE_REPLACEMENT` 在第三次CAS前被原生产目录闭合guard拒绝，故fault未触发。错误字符串尚未实际打印，这一因果当前为源码证据；已安排仅Test staging修复及诊断，不降低hook计数/改生产guard。原1/2/3成员仍进行中，已打印前两组预算观察，不是完整通过。
+
+owned PID79219的3秒采样36个active-worker样本均处于原sha2 software compress调用链；只描述这次采样，不量化全程热点。独立审查允许新test-only CLI自身opt1+sha2opt3，两个包explicit保留debug assertions/overflow checks；Cargo.toml/lock/dependencies/预算/fixture/production profile不变。唯一Cargo正在新8范围实际构建；它产生新harness和单独回执，旧partial/RED不会改写成通过。
+
+OutcomeTracker v2 13源与qualified日线保守失效化1源均SourceStable、static review PASS，尚未合入或Cargo验证。单路径fix令所有共同日线upsert/delete与qualified marker失效化同事务，绝不创建Trading authority。八项回归尚未执行。GlobalSchema/Paper审计 `37911e770fdd0deb654b1677f7d9426e0966cb72f39d1c5d9324da75bec1bd03` 明确：durable schema14独立于stockDB CatalogV1–V5；生产GlobalSchema apply仍拒绝、PaperV2尚无完整order/fill writer、startup尚未接amended cap。此审计不是完整M6退出证据（路线图M6是v20逐候选研究裁决）。
+
+Windows19全部15public成员/SHA独立核验、manifest `e04814de2cb2d27a08e5e1143c2287d37ed57305d01e5a157eb996ed221a5328`，root receipt `95a89f46b7f1ebc0447a151d0b4a015589fa8fa9d5b5bb7e9ed01d0794fa09f7`。新的原B owned-handle强停选项仅proposed，正常Hidden单PIDCtrlC仍NotProvided，13synthetic gate/syntax不是实际终止验证。停止不放RPC finally；所有unexpected RPC失败立刻停止队列、不追加HealthAfter。独立b7 candidate façade仍在独立树开发，尚无实际新client binary/Health/provider/停止；原67默认及生产配置保持。
+
+
+## 16:32 CST：普通 monitor dry-run通过；Candidate4实际35进行中
+
+标准dev monitor `ec5acaf585bbb0849540a89e13472ee7fe0c5821e628a4ccf201ec9c9256d209` 实际 `--test --push-dry-run` **EXIT0/8.178s**，stderr `ec35f52350cb1ab5b69f8138d648cdaf2477023bc40566b9f9365bbb75cbaf11`；CLI原独立Test数据库/审计namespace，无外发/生产迁移。
+
+Candidate3 shaopt新8实际8/8 EXIT0，编译17m44/test271.51s/driver1344.004s，log `ceb2752a300c394dfb612123530af3535fcd14215f1908bde655318f9217a5d0`。实际349171000-byte harness `a0d9b2cf21c40c7c5e3f44ff0c92d5987bfd8b44bc2bf1be12395975b2ccf3a5`已独立封存。单优化SHA2仍需较长fixture时间，未得生产性能结论。
+
+两旧owned harness按fresh PID/parent/image/完整args核验后仅发SIGINT。原1/2/3 actualdriver exit=-2/4061.808s/log `e8a37e141050e3e1ff43c0ef53f84022ba5bab18b6bda870c28e3f19d002eb69`；已有count3 inner4024957/compressed173128/stored346489/history27203627预算观察，但整case重启/noop未完成。旧26 exit=-2/3188.366s/log `80f27e7ad6cb6c959d5db0dd7e917f4909e1d4d5cbcd02fcf8e4fbd9c1f71744`，三个actualRED（两个file hook未触发，同一日期leaffixture原因；一个large-window实际未变frame）。不能把partial或打印预算汇成通过。
+
+Candidate4 reviewdelta `70dcc82ceebf39982c979c47f151e74625020c138dcec557ae48baaa46321264`经Root全读/逐byte/apply-check/frozen14复核，仅两Test-only路径：五处source replacement放同FS非日期staging，真实新inode/原aside/hook3、2、1不变；cfg(test) large-window helper实际改合法frame头log24，保留原内容长度/checksum/blocks且验证默认无损解压。其他57源不变，main59 new patch `20f5044823c031900dfc063a73ee3de032f3aabe73709af4326e886df28e25a8`。实际必要35唯一Cargo pending，CLI仅test依赖通配opt2/ownopt1/sha2opt3，所有debug/overflow checks显式true；没有修改Cargo输入或生产profile。
+
+GlobalSchema prospective四path计划 `b0ca9936a247290ba157d5f4561d13a42772708c06925f9e6114a8eec800e061`经Root全文技术GO，作者在B隔离树实现；Outcome13+kline1原Frozen。不授productionapply/newreceipt/backup权，旧blocker保留；完整backup/fsync/target/exchange/恢复仍需后继实际编码。
+
+## 17:12 CST：资金口径复核与 gRPC 限量返回缺口
+
+用户询问原设计是否考虑投资总金额。原四模块设计已要求组合成本/容量/约束证据，以及订单幂等、现金/冻结资金/持仓/费用的重放对账；这不等于资金接线完成。`monitor::risk::PositionSizer` 的 `TOTAL_CAPITAL` 默认100000、单股20%，与 PaperLedger 默认单股10%/现金底15%属于不同路径，均不是实际用户本金或新预算批准。现有 SeedManifest 的 `original_total` 与现金+标记持仓形成的 `seed_equity` 对账，显式 `excluded_residual` 不可变为可交易现金。PaperV2 后续计划需区分账户总资产与本策略允许投入预算，版本化固定资金/政策来源，涵盖未成交父单及费用冻结、全部未结订单的合计占用、部分成交和取消释放；不得以默认金额补全未知账户数据。
+
+gRPC Windows19 Candidate2 静态复核后，Root发现独立 P2：探针成功判定强制 outer `complete=true`，但原b7服务在合法 caller-limit 前缀时可返回 `complete=false`，Windows19策略要求保留该标志作为 bounded observation。已安排 Candidate3 仅 probe/tests 修复；正向仍须验证实际 typed payload、请求/响应关联、hash、provider/schema/limit边界，不能仅删除complete检查。Candidate2旧静态PASS不覆盖该缺口，Candidate3未完成实际编译/RPC，不能授PIT资格。
+
+Windows19原任务的读取ACK native call已实际返回成功，回执单独保留；该事实不证明接收方已开始新工作。当前没有新启动监听/RPC/强停授权或动作。主树59继续固定在Candidate4 `20f50448`，唯一Cargo35正在编译，尚无测试结果。
+
+## 17:29 CST：Global prospective源码封存及根独立审查
+
+prospective4 SourceStable：patch `973fca0b65439d548f55120d5a250b85bbf9dd5491e94a27ef875e015b983dad`、manifest `ad8585d78fdc7ea3b3a138c7bb2e97c28541d998533c30b8f29efdae91769d89`、handoff `c801f2b88b36b9107768a25166f44da631d208a4afad2e17720c60ff63f43864`。Root已全文独立审查生产delta、新module、20新sourcecase及handoff，三baseline/newAbsent、作者当前与archive4 exact SHA、实际apply-check均通过。root static receipt `12db7bdb6ad1b13fc94d150bec076c2a3e20d61336b7f5d3ccaa34f845c8c471`，没有未解决P1/P2。实际Cargo/tests仍Pending，未合入主树、未执行productionprepare。14 prepare/2catalog/4bounded audit只描述源用例数量。
+
+原生产apply仍在IO前拒绝；新prepare只给未批准private observation，不发backup/receipt/pool能力。原family1–5、真实SQL/审计高水位、zero-own-WAL下的main原bytes、cleanup与物理读后named身份检查均保留。作者后继仅准备ignored的真实backup/target/fsync/exchange/recovery计划，尚无该slice源码GO。PaperV6依赖不在这一冻结版本内自动启用。
+
+gRPC Candidate2已独立保存根P2 receipt `f6a1972542f58a242dc7591995e6f4c5ef33765c2cfc863e46f5f760ddacae3b`：旧archived10/baseline10/public7实际SHA和apply-check通过，但合法complete=false拒绝缺陷仍待Candidate3，不具备集成合格结论。Candidate3隔离树只镜像根WG06三源作为unchanged显式依赖，不能把旧HEAD冒称全部编译来源。
+
+## D2 Candidate4实际35项通过；资金与备份继续开发
+
+main59 `20f5044823c031900dfc063a73ee3de032f3aabe73709af4326e886df28e25a8` 实际必要D2 **35/35、EXIT0**，test1598.29s/driver5102.465s，compile58m18；log SHA `fef2e2fb22cb8cdf173f32e8db8acfaaef0f3c3268bacfc52402ecda14f50ac6`，receipt SHA `eae8964cfe7fac9e0cf7014d2efa8251fc85e1c8a9c95596bda1d4995c73754a`。所有59源前后SHA不变，实际1/2/3成员重启/noop、原fault hooks、合法large-window拒绝、v1/v2完整历史/类型/bytes/预算/lease/后提交失败均通过。此前SIGINT/三个RED保留；本轮通过不改写旧失败。没有生产性能或全项目测试结论。
+
+本轮实际188759436-byte lib harness独立封存，SHA `a9034dab295af71adf0158ec7596c3ca4d587f58c2912407f9ce30414f525727`，seal receipt `dev-platform-20f50448-d2-depopt-lib-harness-seal.json`。D5四项和普通debug monitor build/dry-run实际通过证据沿用；Candidate4只改两Test-only helper，生产body与该普通binary来源一致，不重复构建/测试同目标。
+
+真实backup producer新v2计划 `756f5eeef44572d4827aa7665fa95f3020ab750079ce988014857831012b19db` 经Root全文与独立设计review通过，3path技术GO receipt `7ab393bf83c10597257c08fd0aefc16227cda340c686ac5bb8aff4f5cdc0bb66`。要求空role inode与parent先同步、immutable journal自身inode/前序链、partial同inode/过长与gap拒绝、共享固定IO预算、真正O_RDWR读回和最终actualreader。仅作者隔离树源码，未执行生产backup；完整行值证明、实际交换/外部审计恢复/审批仍未交付。
+
+Paper working计划 `2a11bce98a5e8d5a400a89df26767c0c45cf9ea0550d16e0e3ed5ef0d964958c`经Root全文技术review：账户事实与explicit固定B分开、无默认用户本金、全Working单资金/费用/卖股aggregate reserve、partial逐fill费用/剩余冻结、cancel/重试精确释放及micro整数。给限定library14path源码GO，原V1/V5与真实soleowner/genesis保持，Global V6由原Global作者单独协调。来源与生产ApprovedIntent未交付时继续typed拒绝，实际资金/预算/seed/cutover/上线不由此技术GO批准。尚无Paper运行通过结论。
+
+gRPC Candidate3–5历史源码与static证据保留，必要scalar闭合在新Candidate6：Cninfo真实≤10页/300raw、有效page/unique计数和分配前len；Hithink真实false数量/unique日范围容量及empty源时间合同。新精确10与16lib/10bin仍未合入、未编译或RPC，不能称上游验收完成。

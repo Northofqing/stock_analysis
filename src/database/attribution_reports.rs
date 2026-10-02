@@ -454,6 +454,8 @@ impl AttributionDatabaseSession {
             readonly_attribution_snapshot,
             #[cfg(test)]
             allow_unattested_attribution_reads_for_test: false,
+            #[cfg(test)]
+            isolated_p05_consumer_origin: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         };
@@ -572,6 +574,7 @@ fn test_runner_database_manager_with_attribution_read_authority(
         attribution_connection_source: None,
         readonly_attribution_snapshot: None,
         allow_unattested_attribution_reads_for_test,
+        isolated_p05_consumer_origin: None,
         selection_connection_source: None,
         selection_schema_authority: None,
     }
@@ -3746,6 +3749,8 @@ mod tests {
                     attribution_connection_source: None,
                     readonly_attribution_snapshot: None,
                     allow_unattested_attribution_reads_for_test: true,
+                    #[cfg(test)]
+                    isolated_p05_consumer_origin: None,
                     selection_connection_source: None,
                     selection_schema_authority: None,
                 },

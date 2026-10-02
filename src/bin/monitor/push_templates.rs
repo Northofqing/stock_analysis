@@ -9733,9 +9733,9 @@ pub fn render_auction_repush(
 /// BR-223: A-02 竞价优选重推 (9:20-9:25, v13.10.1 曾停用, 现恢复)。
 /// 复用统一网关候选链路 load_real_candidate_batch, 按 Strong 档优先 + 热度排序取 Top5。
 pub async fn dispatch_auction_repush(hhmm: &str) -> bool {
-    p05_shared_unit::dispatch_auction_repush_compat(hhmm)
-        .await
-        .was_pushed()
+    let _ = hhmm;
+    log::warn!("[A-02] dispatch blocked reason=p05_shared_unit_required");
+    false
 }
 
 /// BR-223: A-11 IPO 阶段催化模板渲染 (静态供应链表)。
@@ -10227,9 +10227,9 @@ pub async fn dispatch_block_trade_review(
     pushed
 }
 
-/// BR-223: P-05 候选台推送 + 候选失效 diff。
-/// 每次推送前把候选 code 集快照落盘 (data/candidate_board_snapshot/<date>.jsonl,
-/// 每行一轮), 与上一轮 diff: 上轮有本轮无 → push_candidate_invalidated。
+// S1 renderer compatibility fixtures only. Production diff uses prior actual
+// Completed Unit facts and never reads or writes this legacy snapshot.
+#[cfg(test)]
 fn candidate_snapshot_path(date: &str) -> std::path::PathBuf {
     let is_test = stock_analysis::risk::env_guard::runtime_is_test_process()
         || stock_analysis::risk::env_guard::current_env()
@@ -10240,6 +10240,7 @@ fn candidate_snapshot_path(date: &str) -> std::path::PathBuf {
         .join(format!("{date}.jsonl"))
 }
 
+#[cfg(test)]
 fn candidate_snapshot_previous(date: &str) -> Option<std::collections::BTreeSet<String>> {
     let path = candidate_snapshot_path(date);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -10248,6 +10249,7 @@ fn candidate_snapshot_previous(date: &str) -> Option<std::collections::BTreeSet<
     Some(codes)
 }
 
+#[cfg(test)]
 fn candidate_snapshot_persist(date: &str, codes: &std::collections::BTreeSet<String>) {
     let path = candidate_snapshot_path(date);
     if let Some(parent) = path.parent() {
@@ -10302,17 +10304,37 @@ mod p05_counted_producer_tests;
 
 /// BR-223: P-05 候选筛选台 (v11-P0-5++) — 统一网关候选链路 + 失效 diff。
 pub async fn dispatch_candidate_board(date: &str) -> bool {
-    p05_shared_unit::dispatch_candidate_board_compat(date)
-        .await
-        .was_pushed()
+    let _ = date;
+    log::warn!("[P-05] dispatch blocked reason=p05_shared_unit_required");
+    false
 }
 
-/// One real candidate acquisition; child observations retain legacy policies.
-pub(super) async fn dispatch_auction_candidate_unit(
-    date: &str,
-    captured_at: chrono::DateTime<chrono::FixedOffset>,
-) -> p05_shared_unit::CandidateUnitDispatchObservation {
-    p05_shared_unit::dispatch(date, captured_at).await
+/// Recover actual saved Units before considering one fresh observed batch.
+pub(crate) async fn dispatch_auction_candidate_unit_tick(allow_fresh: bool) -> Result<(), String> {
+    p05_shared_unit::tick(allow_fresh).await
+}
+
+pub(crate) async fn initialize_p05_family_before_window() {
+    p05_shared_unit::initialize_before_window().await
+}
+
+pub(crate) fn p05_unit_presentation_token(
+    kind: stock_analysis::durable_delivery::PushKind,
+) -> Result<crate::presentation_registry::ProductionPresentationToken, String> {
+    p05_shared_unit::presentation_for_kind(kind)
+}
+
+pub(crate) fn render_p05_original_invalidation(
+    facts: &stock_analysis::p05_auction_unit::P05InvalidationRenderFacts,
+) -> stock_analysis::durable_delivery::Result<Vec<u8>> {
+    Ok(render_candidate_invalidated(
+        facts.hhmmss(),
+        facts.name(),
+        facts.code(),
+        facts.previous_state(),
+        facts.reason(),
+    )
+    .into_bytes())
 }
 
 /// BR-222: R-07 counted 投递材料 (BR-140/BR-192 counted ceremony)。
@@ -16981,9 +17003,9 @@ pub async fn push_candidate_invalidated(
     prev: &str,
     reason: &str,
 ) -> bool {
-    p05_shared_unit::dispatch_invalidated_compat(business_date, code, hhmm, name, prev, reason)
-        .await
-        .was_pushed()
+    let _ = (business_date, code, hhmm, name, prev, reason);
+    log::warn!("[T-08] dispatch blocked reason=p05_shared_unit_required");
+    false
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.

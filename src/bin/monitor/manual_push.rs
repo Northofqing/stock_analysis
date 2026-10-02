@@ -156,46 +156,9 @@ impl ManualPushEffects for RealManualPushEffects {
     }
 
     async fn dispatch_holding_plan(&mut self, banner: &Self::Banner) -> Vec<String> {
-        let messages = match crate::prepare_holding_plan_messages(banner).await {
-            Ok(messages) => messages,
-            Err(error) => return vec![format!("I-04 T-03 batch rejected: {error}")],
-        };
-
-        let mut failures = Vec::new();
-        for prepared in messages {
-            let token = match crate::presentation_registry::acquire_token(
-                "T-03-holding-plan",
-                crate::PushKind::HoldingPlan,
-                "holding_plan_dispatcher",
-                "render_holding_plan",
-            ) {
-                Ok(token) => token,
-                Err(reason) => {
-                    failures.push(format!(
-                        "I-04 T-03 token rejected code={}: {reason}",
-                        prepared.code
-                    ));
-                    continue;
-                }
-            };
-            let outcome = crate::notify::push_counted_with_binding(
-                token,
-                &prepared.text,
-                None,
-                prepared.binding,
-            )
-            .await;
-            if !matches!(
-                outcome,
-                crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
-            ) {
-                failures.push(format!(
-                    "I-04 T-03 delivery unconfirmed code={}: {:?}",
-                    prepared.code, outcome
-                ));
-            }
-        }
-        failures
+        crate::holding_plan::dispatch_tick(Some(banner.clone()))
+            .await
+            .failures
     }
 
     async fn dispatch_paper_review(&mut self, date: &str) -> bool {

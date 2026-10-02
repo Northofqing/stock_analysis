@@ -33,6 +33,8 @@ const HEALTH_O_NONBLOCK: i32 = 0x0000_0800;
     target_os = "netbsd"
 ))]
 const HEALTH_O_NONBLOCK: i32 = 0x0000_0004;
+#[path = "health_cmd_durable_delivery.rs"]
+pub(crate) mod durable_delivery;
 #[path = "health_cmd_runtime_snapshot.rs"]
 mod runtime_snapshot;
 #[path = "health_cmd_source_recovery.rs"]
@@ -127,6 +129,8 @@ struct HealthReport {
     missing_capabilities: Vec<String>,
     coverage: &'static str,
     raw_news_source_recovery: source_recovery::SourceRecoveryReport,
+    #[serde(skip)]
+    durable_delivery: durable_delivery::DeliveryHealthReport,
     runtime_snapshot: Option<runtime_snapshot::RuntimeHealthSnapshot>,
 }
 
@@ -531,6 +535,8 @@ fn report_at_with_boundary(
     );
     report.raw_news_source_recovery =
         source_recovery::report_at(root, test_mode, lease_identity.as_deref(), now);
+    report.durable_delivery =
+        durable_delivery::report_at(root, test_mode, lease_identity.as_deref(), now);
     after_component_reads();
     if !lease.unchanged_at(&lease_path) {
         // Discard the entire mixed observation, including otherwise-good modes
@@ -543,6 +549,9 @@ fn report_at_with_boundary(
         );
         report.raw_news_source_recovery = source_recovery::SourceRecoveryReport::with_reason(
             "raw_news_source_snapshot_process_mismatch",
+        );
+        report.durable_delivery = durable_delivery::DeliveryHealthReport::with_reason(
+            "durable_delivery_snapshot_process_mismatch",
         );
         report.runtime_snapshot = Some(runtime_snapshot::RuntimeHealthSnapshot::from_report(
             &report, now, None,
@@ -605,6 +614,9 @@ fn report_components_from(
         missing_capabilities: Vec::new(),
         coverage: "banner_account_data_and_process_liveness_only",
         raw_news_source_recovery: source_recovery::SourceRecoveryReport::unavailable(),
+        durable_delivery: durable_delivery::DeliveryHealthReport::with_reason(
+            "durable_delivery_snapshot_not_observed",
+        ),
         runtime_snapshot: None,
     };
     match heartbeat {

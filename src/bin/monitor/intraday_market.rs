@@ -1,13 +1,16 @@
 use stock_analysis::market_data::TopStock;
 
-pub struct IntradayMarketInputs {
-    pub limit_stocks: Result<Vec<TopStock>, String>,
-    pub position_quotes: Result<Vec<TopStock>, String>,
+/// Acquisitions retain their original observation types. The production
+/// scanner uses LimitUpObservation and ScannerPositionQuotes rather than
+/// reducing both to an interchangeable Vec<TopStock>.
+pub struct IntradayMarketInputs<Limit = Vec<TopStock>, Position = Vec<TopStock>> {
+    pub limit_stocks: Result<Limit, String>,
+    pub position_quotes: Result<Position, String>,
 }
 
-pub struct ResolvedIntradayMarketInputs {
-    pub limit_stocks: Option<Vec<TopStock>>,
-    pub position_quotes: Option<Vec<TopStock>>,
+pub struct ResolvedIntradayMarketInputs<Limit = Vec<TopStock>, Position = Vec<TopStock>> {
+    pub limit_stocks: Option<Limit>,
+    pub position_quotes: Option<Position>,
     pub limit_error: Option<String>,
     pub position_error: Option<String>,
     pub task_error: Option<String>,
@@ -20,7 +23,7 @@ pub struct IntradayConsumerPlan {
     pub run_independent_jobs: bool,
 }
 
-impl ResolvedIntradayMarketInputs {
+impl<Limit, Position> ResolvedIntradayMarketInputs<Limit, Position> {
     pub fn consumer_plan(&self) -> IntradayConsumerPlan {
         IntradayConsumerPlan {
             use_limit_data: self.limit_stocks.is_some(),
@@ -30,13 +33,13 @@ impl ResolvedIntradayMarketInputs {
     }
 }
 
-pub fn acquire_intraday_market_inputs<LimitFetch, PositionFetch>(
+pub fn acquire_intraday_market_inputs<Limit, Position, LimitFetch, PositionFetch>(
     limit_fetch: LimitFetch,
     position_fetch: PositionFetch,
-) -> IntradayMarketInputs
+) -> IntradayMarketInputs<Limit, Position>
 where
-    LimitFetch: FnOnce() -> Result<Vec<TopStock>, String>,
-    PositionFetch: FnOnce() -> Result<Vec<TopStock>, String>,
+    LimitFetch: FnOnce() -> Result<Limit, String>,
+    PositionFetch: FnOnce() -> Result<Position, String>,
 {
     let limit_stocks = limit_fetch();
     let position_quotes = position_fetch();
@@ -46,9 +49,9 @@ where
     }
 }
 
-pub fn resolve_intraday_market_inputs(
-    task_result: Result<IntradayMarketInputs, String>,
-) -> ResolvedIntradayMarketInputs {
+pub fn resolve_intraday_market_inputs<Limit, Position>(
+    task_result: Result<IntradayMarketInputs<Limit, Position>, String>,
+) -> ResolvedIntradayMarketInputs<Limit, Position> {
     match task_result {
         Ok(inputs) => {
             let (limit_stocks, limit_error) = match inputs.limit_stocks {
@@ -96,7 +99,7 @@ mod tests {
     #[test]
     fn limit_failure_does_not_prevent_position_quote_acquisition() {
         let position_called = Cell::new(false);
-        let inputs = acquire_intraday_market_inputs(
+        let inputs: IntradayMarketInputs = acquire_intraday_market_inputs(
             || Err("TEST_CODE limit source rejected".to_string()),
             || {
                 position_called.set(true);
@@ -114,7 +117,7 @@ mod tests {
 
     #[test]
     fn position_failure_does_not_discard_limit_up_data() {
-        let inputs = acquire_intraday_market_inputs(
+        let inputs: IntradayMarketInputs = acquire_intraday_market_inputs(
             || Ok(vec![test_stock("TEST_CODE_LIMIT")]),
             || Err("TEST_CODE position source rejected".to_string()),
         );
@@ -164,7 +167,8 @@ mod tests {
 
     #[test]
     fn task_failure_keeps_independent_jobs_eligible() {
-        let resolved = resolve_intraday_market_inputs(Err("TEST_CODE join failed".to_string()));
+        let resolved: ResolvedIntradayMarketInputs =
+            resolve_intraday_market_inputs(Err("TEST_CODE join failed".to_string()));
         let plan = resolved.consumer_plan();
 
         assert!(resolved.limit_stocks.is_none());
@@ -178,5 +182,51 @@ mod tests {
         assert!(!plan.use_limit_data);
         assert!(!plan.use_position_data);
         assert!(plan.run_independent_jobs);
+    }
+
+    #[test]
+    fn scanner_quote_original_observation_types_survive_source_matrix_without_projection() {
+        // Pure acquisition plumbing values, not Gateway admission factories.
+        // Different source types cannot be accidentally interchanged here.
+        struct DatePoolMarker(&'static str);
+        struct QuoteBatchMarker(&'static str, Vec<&'static str>);
+        for (limit_ok, position_ok) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let position_calls = Cell::new(0);
+            let inputs = acquire_intraday_market_inputs(
+                || {
+                    if limit_ok {
+                        Ok(DatePoolMarker("TEST_CODE_original_date_pool_receipt"))
+                    } else {
+                        Err("TEST_CODE date source unavailable".into())
+                    }
+                },
+                || {
+                    position_calls.set(position_calls.get() + 1);
+                    if position_ok {
+                        Ok(QuoteBatchMarker(
+                            "TEST_CODE_original_quote_batch",
+                            vec!["TEST_CODE_000001", "TEST_CODE_600000"],
+                        ))
+                    } else {
+                        Err("TEST_CODE native quote source unavailable".into())
+                    }
+                },
+            );
+            assert_eq!(position_calls.get(), 1);
+            let resolved = resolve_intraday_market_inputs(Ok(inputs));
+            assert_eq!(resolved.limit_stocks.is_some(), limit_ok);
+            assert_eq!(resolved.position_quotes.is_some(), position_ok);
+            if let Some(pool) = resolved.limit_stocks.as_ref() {
+                assert_eq!(pool.0, "TEST_CODE_original_date_pool_receipt");
+            }
+            if let Some(batch) = resolved.position_quotes.as_ref() {
+                assert_eq!(batch.0, "TEST_CODE_original_quote_batch");
+                assert_eq!(batch.1, ["TEST_CODE_000001", "TEST_CODE_600000"]);
+            }
+            assert_eq!(resolved.limit_error.is_some(), !limit_ok);
+            assert_eq!(resolved.position_error.is_some(), !position_ok);
+            assert!(resolved.consumer_plan().run_independent_jobs);
+        }
     }
 }

@@ -426,10 +426,91 @@ pub struct DatabaseManager {
     readonly_attribution_snapshot: Option<TemporaryAttributionSnapshot>,
     #[cfg(test)]
     allow_unattested_attribution_reads_for_test: bool,
+    #[cfg(test)]
+    isolated_p05_consumer_origin: Option<IsolatedP05ConsumerOrigin>,
     #[allow(dead_code)]
     selection_connection_source: Option<Arc<DescriptorSqliteSource>>,
     #[allow(dead_code)]
     selection_schema_authority: Option<Box<global_schema_v1::VerifiedAmendedSelectionSchema>>,
+}
+
+/// Issued only by the private isolated Test constructor. This is a retained
+/// pathname/inode isolation witness, not operational source qualification.
+#[cfg(test)]
+struct IsolatedP05ConsumerOrigin {
+    path: PathBuf,
+    parent: File,
+    main: File,
+}
+#[cfg(test)]
+fn isolated_test_regular_leaf(path: &Path) -> std::io::Result<Option<File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(std::io::Error::other(
+            "isolated Test SQLite leaf must be regular and singly linked",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.nlink() != 1
+        || (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino())
+    {
+        return Err(std::io::Error::other(
+            "isolated Test SQLite leaf changed while opening",
+        ));
+    }
+    Ok(Some(file))
+}
+#[cfg(test)]
+fn isolated_test_sqlite_leaves(path: &Path) -> std::io::Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        isolated_test_regular_leaf(&sqlite_sidecar_path(path, suffix))?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+impl IsolatedP05ConsumerOrigin {
+    fn validate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let parent_path = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("isolated Test parent absent"))?;
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+            .open(parent_path)?;
+        let actual = parent.metadata()?;
+        let original = self.parent.metadata()?;
+        if !actual.is_dir()
+            || !original.is_dir()
+            || actual.nlink() == 0
+            || original.nlink() == 0
+            || (actual.dev(), actual.ino()) != (original.dev(), original.ino())
+        {
+            return Err(std::io::Error::other("isolated Test parent was replaced"));
+        }
+        let actual = isolated_test_regular_leaf(&self.path)?
+            .ok_or_else(|| std::io::Error::other("isolated Test main absent"))?
+            .metadata()?;
+        let original = self.main.metadata()?;
+        if !original.is_file()
+            || original.nlink() != 1
+            || (actual.dev(), actual.ino()) != (original.dev(), original.ino())
+        {
+            return Err(std::io::Error::other("isolated Test main was replaced"));
+        }
+        isolated_test_sqlite_leaves(&self.path)
+    }
 }
 
 /// Recorded prediction outcomes in a checked-in trading-day window.
@@ -2757,7 +2838,46 @@ impl DatabaseManager {
         if !parent.starts_with(temp_root) || !test_named {
             return Err("isolated test database must be a TEST_CODE_*.db file under the OS temporary directory".into());
         }
-        Self::open_at_path(path)
+        use std::os::unix::fs::OpenOptionsExt;
+        // Resolve the parent before opening SQLite. Inspect every VFS leaf
+        // before even creating the main file, so alias rejection writes zero
+        // bytes to the target and creates no SQLite sidecar.
+        let path = parent.join(path.file_name().ok_or("isolated Test leaf absent")?);
+        let parent_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+            .open(&parent)?;
+        if !parent_file.metadata()?.is_dir() {
+            return Err("isolated Test parent is not a directory".into());
+        }
+        isolated_test_sqlite_leaves(&path)?;
+        let main = match isolated_test_regular_leaf(&path)? {
+            Some(main) => main,
+            None => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+                .open(&path)?,
+        };
+        let origin = IsolatedP05ConsumerOrigin {
+            path: path.clone(),
+            parent: parent_file,
+            main,
+        };
+        origin.validate()?;
+        let mut manager = Self::open_at_path(path)?;
+        origin.validate()?;
+        manager.isolated_p05_consumer_origin = Some(origin);
+        Ok(manager)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_isolated_p05_consumer_origin(&self) -> bool {
+        self.isolated_p05_consumer_origin
+            .as_ref()
+            .is_some_and(|origin| origin.validate().is_ok())
     }
 
     fn open_at_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
@@ -3002,6 +3122,8 @@ impl DatabaseManager {
             readonly_attribution_snapshot: None,
             #[cfg(test)]
             allow_unattested_attribution_reads_for_test: false,
+            #[cfg(test)]
+            isolated_p05_consumer_origin: None,
             selection_connection_source: None,
             selection_schema_authority: None,
         })
@@ -3038,6 +3160,8 @@ impl DatabaseManager {
             readonly_attribution_snapshot: None,
             #[cfg(test)]
             allow_unattested_attribution_reads_for_test: false,
+            #[cfg(test)]
+            isolated_p05_consumer_origin: None,
             selection_connection_source: Some(selection_connection_source),
             selection_schema_authority: Some(authority),
         })
@@ -5167,6 +5291,8 @@ mod tests {
                     attribution_connection_source: Some(Arc::clone(&source)),
                     readonly_attribution_snapshot: None,
                     allow_unattested_attribution_reads_for_test: false,
+                    #[cfg(test)]
+                    isolated_p05_consumer_origin: None,
                     selection_connection_source: Some(source),
                     selection_schema_authority: None,
                 },

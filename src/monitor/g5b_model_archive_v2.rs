@@ -172,6 +172,26 @@ fn saved_chain(
     }
     Ok(chain)
 }
+/// Pure closed codec qualification only. The actual day owner separately
+/// verifies every Committed original file and delivery/audit obligation.
+pub(super) fn full_archive_identity(bundle: &VerifiedG5bModelBundle) -> Result<Option<String>> {
+    let actual = actual_items(bundle)?;
+    let chain = saved_chain(bundle, &actual)?;
+    if actual.len() != bundle.cohort().selected_count()
+        || bundle.archives().iter().any(|value| !value.is_committed())
+    {
+        return Ok(None);
+    }
+    match (chain.last(), bundle.archives().last()) {
+        (Some(snapshot), Some(last))
+            if snapshot.coverage == G5bModelArchiveCoverageV2::Full && snapshot.items == actual =>
+        {
+            Ok(Some(last.identity().to_owned()))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn next_snapshot(bundle: &VerifiedG5bModelBundle, items: Vec<ArchiveItem>) -> ArchiveSnapshot {
     let evidence = G5bSelectionEvidence::decode(bundle.cohort().selection_bytes())
         .expect("already validated bundle codec");

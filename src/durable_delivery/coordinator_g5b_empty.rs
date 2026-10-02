@@ -44,7 +44,7 @@ struct EmptySelection {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptySeal {
+pub(super) struct EmptySeal {
     version: u8,
     material: String,
     business_date: NaiveDate,
@@ -526,7 +526,7 @@ fn require_absent_child(parent: &std::fs::File, name: &std::ffi::OsStr) -> Resul
 /// Enumerate only a retained directory descriptor. A missing legacy directory
 /// is proved by its first absent component beneath a retained existing parent;
 /// aliases, ancestor replacement and a newly appearing component fail closed.
-fn empty_directory_leaves(path: &std::path::Path) -> Result<Vec<std::ffi::OsString>> {
+pub(super) fn empty_directory_leaves(path: &std::path::Path) -> Result<Vec<std::ffi::OsString>> {
     let mut existing = path;
     loop {
         match std::fs::symlink_metadata(existing) {
@@ -603,7 +603,7 @@ pub(super) fn validate_cohort_row(
     require_empty_artifacts(connection, &stored)
 }
 
-fn validate_seal_row(
+pub(super) fn validate_seal_row(
     connection: &Connection,
     identity: &str,
     date: &str,

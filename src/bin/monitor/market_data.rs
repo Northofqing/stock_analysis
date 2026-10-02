@@ -223,36 +223,7 @@ fn fetch_close_via_outcome_adaptive(code: &str, today: chrono::NaiveDate) -> Opt
 
 /// BR-164 持仓实时行情：只消费统一 Magic provider Gateway。
 pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    // BR-227: 无券商时持仓代码来自 BR-226 用户确认快照 (24h 新鲜度),
-    // 行情经统一网关获取 (自带 source_at 证据); 持仓批次来源时间门
-    // 不再连坐行情获取 (BR-217 的券商批次要求由用户快照替代)。
-    let codes: Vec<String> =
-        match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
-            Ok(Some(snapshot))
-                if !snapshot.confirm_empty
-                    && chrono::Local::now()
-                        .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
-                        .num_hours()
-                        <= 24 =>
-            {
-                snapshot
-                    .items
-                    .iter()
-                    .map(|item| item.code.clone())
-                    .collect()
-            }
-            Ok(Some(_)) | Ok(None) => {
-                // 快照缺失/过期: 回退本地持仓代码 (仅行情展示用途, 行情自带来源时间)
-                stock_analysis::portfolio::get_positions()
-                    .map_err(|error| format!("持仓批次查询失败: {error}"))?
-                    .into_iter()
-                    .map(|position| position.code)
-                    .collect()
-            }
-            Err(error) => {
-                return Err(format!("用户持仓快照读取失败: {error}"));
-            }
-        };
+    let codes = current_position_quote_codes()?;
     if codes.is_empty() {
         return Ok(vec![]);
     }
@@ -261,11 +232,150 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
     if quotes.is_empty() {
         return Err("持仓行情源成功响应但无有效行".to_string());
     }
-    // This is the only quote-readiness owner: the exact current position set
-    // has passed strict coverage. Single-symbol execution and arbitrary
-    // scanner/probe requests must not refresh account-wide Quote health.
+    // This exact current-position acquisition owns Quote health. Arbitrary
+    // scanner/probe consumption checks must never refresh it.
     mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
     Ok(quotes)
+}
+
+fn current_position_quote_codes() -> Result<Vec<String>, String> {
+    // BR-227: 无券商时持仓代码来自 BR-226 用户确认快照 (24h 新鲜度),
+    // 行情经统一网关获取 (自带 source_at 证据); 持仓批次来源时间门
+    // 不再连坐行情获取 (BR-217 的券商批次要求由用户快照替代)。
+    match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
+        Ok(Some(snapshot))
+            if !snapshot.confirm_empty
+                && chrono::Local::now()
+                    .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
+                    .num_hours()
+                    <= 24 =>
+        {
+            Ok(snapshot
+                .items
+                .iter()
+                .map(|item| item.code.clone())
+                .collect())
+        }
+        Ok(Some(_)) | Ok(None) => {
+            // 快照缺失/过期: 回退本地持仓代码 (仅行情展示用途, 行情自带来源时间)
+            Ok(stock_analysis::portfolio::get_positions()
+                .map_err(|error| format!("持仓批次查询失败: {error}"))?
+                .into_iter()
+                .map(|position| position.code)
+                .collect())
+        }
+        Err(error) => Err(format!("用户持仓快照读取失败: {error}")),
+    }
+}
+
+/// A scanner route keeps the Gateway capability and original request together.
+/// NoPositions is absence of a request, not empty-source or Quote readiness.
+#[derive(Debug)]
+pub(super) enum ScannerPositionQuotes {
+    NoPositions,
+    Available(ScannerPositionQuoteBatch),
+}
+
+#[derive(Debug)]
+pub(super) struct ScannerPositionQuoteBatch {
+    requested: Vec<String>,
+    admitted: stock_analysis::data_gateway::market_data::AdmittedRealtimeQuotes,
+}
+
+impl ScannerPositionQuotes {
+    pub(super) fn quotes(
+        &self,
+    ) -> &[stock_analysis::data_gateway::market_data::AdmittedRealtimeQuote] {
+        match self {
+            Self::NoPositions => &[],
+            Self::Available(batch) => batch.admitted.quotes(),
+        }
+    }
+
+    /// Legacy display-only projection. Detector must consume quotes() through
+    /// TieredScanner's point-of-use check, rather than this projection.
+    pub(super) fn top_stocks(&self) -> Vec<stock_analysis::market_data::TopStock> {
+        self.quotes()
+            .iter()
+            .map(|quote| stock_analysis::market_data::TopStock {
+                code: quote.code().to_owned(),
+                name: quote.name().to_owned(),
+                price: quote.price(),
+                change_pct: quote.change_percent(),
+                volume_ratio: None,
+                main_net_yi: None,
+            })
+            .collect()
+    }
+
+    pub(super) fn requested(&self) -> &[String] {
+        match self {
+            Self::NoPositions => &[],
+            Self::Available(batch) => &batch.requested,
+        }
+    }
+}
+
+/// The single current-position acquisition used by an intraday scanner tick.
+/// Reuses the original position resolver; no per-row fetch or code guessing.
+pub(super) fn fetch_scanner_position_quotes() -> Result<ScannerPositionQuotes, String> {
+    let codes = current_position_quote_codes()?;
+    if codes.is_empty() {
+        return Ok(ScannerPositionQuotes::NoPositions);
+    }
+    let admitted = stock_analysis::data_gateway::MarketDataGateway::new()
+        .required_realtime_quotes(&codes)
+        .map_err(|error| format!("持仓行情严格原始批次不可用: {error}"))?;
+    validate_scanner_quote_membership(&codes, admitted.quotes())?;
+    // Same exact current-position readiness owner as the legacy Vec route.
+    // Point-of-use validation below never touches this capability.
+    mark_capability_success(stock_analysis::monitor::data_mode::Capability::Quote)?;
+    Ok(ScannerPositionQuotes::Available(
+        ScannerPositionQuoteBatch {
+            requested: codes,
+            admitted,
+        },
+    ))
+}
+
+fn validate_scanner_quote_membership(
+    requested: &[String],
+    quotes: &[stock_analysis::data_gateway::market_data::AdmittedRealtimeQuote],
+) -> Result<(), String> {
+    validate_scanner_requested_set(requested, quotes.iter().map(|quote| quote.code()))?;
+    let first = quotes
+        .first()
+        .ok_or_else(|| "持仓行情原始批次为空".to_string())?;
+    for quote in quotes {
+        if quote.evidence() != first.evidence()
+            || quote.source_at() != first.source_at()
+            || quote.observed_at() != first.observed_at()
+        {
+            return Err("持仓行情原始批次身份或时间不一致".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_scanner_requested_set<'code>(
+    requested: &[String],
+    returned: impl IntoIterator<Item = &'code str>,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    let expected: HashSet<&str> = requested.iter().map(String::as_str).collect();
+    if requested.is_empty() || expected.len() != requested.len() || expected.contains("") {
+        return Err("持仓行情请求代码必须为非空唯一集合".to_string());
+    }
+    let mut actual = HashSet::new();
+    for code in returned {
+        if !actual.insert(code) {
+            return Err("持仓行情原始批次含重复代码".to_string());
+        }
+    }
+    if actual != expected {
+        return Err("持仓行情原始批次与完整请求集合不一致".to_string());
+    }
+    Ok(())
 }
 
 /// BR-164 public quote projection over the evidence-preserving Gateway batch.
@@ -665,6 +775,40 @@ mod quote_batch_tests {
     }
 
     #[test]
+    fn scanner_quote_complete_request_membership_rejects_subset_duplicates_and_extras() {
+        let request = vec!["TEST_CODE_000001".into(), "TEST_CODE_600000".into()];
+        assert!(
+            validate_scanner_requested_set(&request, ["TEST_CODE_600000", "TEST_CODE_000001"])
+                .is_ok()
+        );
+        for returned in [
+            vec!["TEST_CODE_000001"],
+            vec!["TEST_CODE_000001", "TEST_CODE_000001"],
+            vec!["TEST_CODE_000001", "TEST_CODE_300001"],
+            vec!["TEST_CODE_000001", "TEST_CODE_600000", "TEST_CODE_300001"],
+            vec![],
+        ] {
+            assert!(validate_scanner_requested_set(&request, returned).is_err());
+        }
+        assert!(validate_scanner_requested_set(&[], ["TEST_CODE_000001"]).is_err());
+        assert!(validate_scanner_requested_set(
+            &["TEST_CODE_000001".into(), "TEST_CODE_000001".into()],
+            ["TEST_CODE_000001"]
+        )
+        .is_err());
+        assert!(validate_scanner_requested_set(&["".into()], [""]).is_err());
+    }
+
+    #[test]
+    fn scanner_quote_no_positions_is_not_an_available_empty_gateway_batch() {
+        let observation = ScannerPositionQuotes::NoPositions;
+        assert!(matches!(&observation, ScannerPositionQuotes::NoPositions));
+        assert!(observation.requested().is_empty());
+        assert!(observation.quotes().is_empty());
+        assert!(observation.top_stocks().is_empty());
+    }
+
+    #[test]
     fn br190_unavailable_disposition_is_not_empty_or_retryable() {
         assert_eq!(
             FULL_MARKET_RANKINGS_UNAVAILABLE_REASON,
@@ -876,8 +1020,8 @@ mod quote_batch_tests {
         )
         .expect_err("over-precision Magic observation evidence must fail closed");
 
-        assert!(error.contains("observed_at 非法"), "{error}");
-        assert!(error.contains("invalid_evidence"), "{error}");
+        assert!(error.contains("invalid observed_at timestamp"), "{error}");
+        assert!(error.contains("reason_code=invalid_evidence"), "{error}");
     }
 
     #[test]

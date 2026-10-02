@@ -940,3 +940,10 @@ pub(crate) fn model_archive_bytes_for_test(
 ) -> Result<Vec<u8>> {
     model_archive::bytes_for_test(coordinator, date)
 }
+
+/// Closed full archive codec projection, not a completion or send factory.
+pub(crate) fn full_model_archive_identity_v2(
+    bundle: &crate::durable_delivery::VerifiedG5bModelBundle,
+) -> Result<Option<String>> {
+    model_archive::full_archive_identity(bundle)
+}

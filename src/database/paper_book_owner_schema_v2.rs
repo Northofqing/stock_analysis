@@ -108,9 +108,9 @@ fn objects(
 ) -> Result<Vec<CatalogObject>, PaperBookOwnerError> {
     Ok(diesel::sql_query(
         "SELECT 'main' AS namespace,type AS kind,name,tbl_name AS table_name,sql
-         FROM main.sqlite_master WHERE (name GLOB ? OR tbl_name GLOB ?) AND sql IS NOT NULL
+         FROM main.sqlite_master WHERE (lower(name) GLOB ? OR lower(tbl_name) GLOB ?) AND sql IS NOT NULL
          UNION ALL SELECT 'temp',type,name,tbl_name,sql FROM temp.sqlite_master
-         WHERE (name GLOB ? OR tbl_name GLOB ?) AND sql IS NOT NULL
+         WHERE (lower(name) GLOB ? OR lower(tbl_name) GLOB ?) AND sql IS NOT NULL
          ORDER BY namespace,kind,name,table_name,sql",
     )
     .bind::<Text, _>(prefix)
@@ -557,5 +557,34 @@ mod tests {
             install_catalog_v5_for_isolated_test(&mut conn),
             Err(PaperBookOwnerError::NotIsolated)
         ));
+    }
+
+    #[test]
+    fn paper_namespace_casefold_v5_rejects_aliases_without_normalizing_manifest() {
+        for sql in [
+            "CREATE TEMP TABLE PAPER_BOOK_OWNER_V2 AS SELECT * FROM main.paper_book_owner_v2",
+            "CREATE TEMP VIEW PaPeR_BoOk_V2_FeE_MaNiFeSt AS SELECT * FROM main.paper_book_v2_fee_manifest",
+            "CREATE TEMP VIEW PAPER_LEDGER_HEAD AS SELECT * FROM main.paper_ledger_head",
+            "CREATE TABLE PaPeR_BoOk_V2_unknown(value TEXT)",
+            "CREATE TEMP TABLE TEST_CODE_foreign(value TEXT); CREATE TEMP TRIGGER PAPER_BOOK_V2_extra BEFORE INSERT ON TEST_CODE_foreign BEGIN SELECT 1; END",
+            "CREATE TABLE TEST_CODE_foreign(value TEXT); CREATE INDEX PaPeR_BoOk_OwNeR_extra ON TEST_CODE_foreign(value)",
+        ] {
+            let mut conn = v4();
+            install_catalog_v5_for_isolated_test(&mut conn).unwrap();
+            verify_catalog_v5_on(&mut conn).unwrap();
+            let before = [
+                value(&mut conn, "SELECT manifest_bytes AS value FROM main.paper_ledger_account WHERE account_id='acct-a'"),
+                value(&mut conn, "SELECT payload AS value FROM main.paper_ledger_event WHERE account_id='acct-a' AND seq=1"),
+                value(&mut conn, "SELECT projection_bytes AS value FROM main.paper_ledger_head WHERE account_id='acct-a'"),
+            ];
+            conn.batch_execute(sql).unwrap();
+            assert!(matches!(verify_catalog_v5_on(&mut conn), Err(PaperBookOwnerError::CatalogMismatch)), "{sql}");
+            assert!(matches!(require_v1_owner_on(&mut conn, "acct-a", "epoch-a", &"a".repeat(64)), Err(PaperBookOwnerError::CatalogMismatch)), "{sql}");
+            assert_eq!(before, [
+                value(&mut conn, "SELECT manifest_bytes AS value FROM main.paper_ledger_account WHERE account_id='acct-a'"),
+                value(&mut conn, "SELECT payload AS value FROM main.paper_ledger_event WHERE account_id='acct-a' AND seq=1"),
+                value(&mut conn, "SELECT projection_bytes AS value FROM main.paper_ledger_head WHERE account_id='acct-a'"),
+            ]);
+        }
     }
 }

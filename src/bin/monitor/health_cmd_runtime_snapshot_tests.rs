@@ -137,7 +137,7 @@ fn m3_runtime_health_snapshot_preserves_scopes_and_marks_unconnected_domains_not
         "banner_account_data_and_process_liveness_only"
     );
     let nested = &value["runtime_snapshot"];
-    assert_eq!(nested["version"], 1);
+    assert_eq!(nested["version"], 2);
     assert_eq!(nested["checked_at"], json!(fixture.now));
     assert_eq!(nested["process"]["status"], "ok");
     assert_eq!(nested["account"]["status"], "ok");
@@ -163,13 +163,21 @@ fn m3_runtime_health_snapshot_preserves_scopes_and_marks_unconnected_domains_not
     ] {
         assert_eq!(nested[domain]["status"], "not_observed");
         assert!(nested[domain].get("count").is_none());
-        assert!(nested[domain].get("reason_code").is_none());
+        if domain == "durable_delivery" {
+            assert_eq!(
+                nested[domain]["reason_code"],
+                "durable_delivery_snapshot_unavailable"
+            );
+            assert!(nested[domain]["counts"].is_null());
+        } else {
+            assert!(nested[domain].get("reason_code").is_none());
+        }
     }
     let output = serde_json::to_string(&report).unwrap();
     assert!(!output.contains(fixture.boot()));
     assert!(!output.contains("Ready"));
     let text = health::render_text(&report);
-    assert!(text.contains("runtime_snapshot_version=1"));
+    assert!(text.contains("runtime_snapshot_version=2"));
     assert!(text.contains("runtime_account_status=ok"));
     for domain in [
         "durable_delivery",

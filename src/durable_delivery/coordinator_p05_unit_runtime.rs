@@ -189,6 +189,221 @@ pub(in crate::durable_delivery::coordinator) struct ChildAdmission<'a> {
     child: &'a str,
     envelope: &'a DeliveryEnvelope,
 }
+
+/// A single released actual operational read, never a disk/JSON authority.
+/// It is namespace/member-bound and consumed only at a real business opening.
+#[derive(Clone)]
+pub(in crate::durable_delivery::coordinator) enum ActualP05ConsumerCheck {
+    Unowned,
+    Failed(&'static str),
+    Verified(ActualP05ConsumerCapability),
+}
+#[derive(Clone)]
+pub(in crate::durable_delivery::coordinator) struct ActualP05ConsumerCapability {
+    namespace: FileObjectIdentity,
+    date: String,
+    draft: String,
+    intent: String,
+    child: String,
+    decision: String,
+    envelope: Vec<u8>,
+    prediction: PredictionObservation,
+}
+impl ActualP05ConsumerCheck {
+    fn require(&self, c: &Connection, route: &DecisionMutationRoute) -> Result<()> {
+        let date = mutation_date(c, route)?;
+        match (date, self) {
+            (None, Self::Unowned) => Ok(()),
+            (None, _) => Err(invalid("consumer check no longer matches owned route")),
+            (Some(_), Self::Unowned) => {
+                Err(invalid("owned P05 business opening needs actual reader"))
+            }
+            (Some(_), Self::Failed(reason)) => Err(invalid(reason)),
+            (Some(date), Self::Verified(cap))
+                if date == cap.date && route.decision_identity == cap.decision =>
+            {
+                cap.validate(c)
+            }
+            _ => Err(invalid("actual consumer belongs to another Unit/member")),
+        }
+    }
+}
+impl ActualP05ConsumerCapability {
+    fn validate(&self, c: &Connection) -> Result<()> {
+        let draft = load_draft_inner(c, &self.date, self.namespace, false)?
+            .ok_or_else(|| invalid("actual consumer draft absent"))?;
+        let intent = load_intent_inner(c, &self.date, self.namespace, false)?
+            .ok_or_else(|| invalid("actual consumer full intent absent"))?;
+        let data: IntentCanonical = decode(&intent.canonical)?;
+        if draft.identity != self.draft
+            || intent.identity != self.intent
+            || data.prediction != self.prediction
+            || !intent
+                .children
+                .iter()
+                .any(|(child, raw)| child == &self.child && raw == &self.envelope)
+            || parse_envelope(&self.envelope)?.decision_identity != self.decision
+        {
+            return Err(invalid("actual consumer original intent/member changed"));
+        }
+        Ok(())
+    }
+}
+
+impl DurableDeliveryCoordinator {
+    fn p05_consumer_recipe(
+        &self,
+        route: &DecisionMutationRoute,
+    ) -> Result<Option<(StoredP05Draft, StoredP05Intent, String, Vec<u8>)>> {
+        let namespace = self.p05_namespace()?;
+        self.with_mutation_routing_connection(|c| {
+            let Some(date) = mutation_date(c, route)? else {
+                return Ok(None);
+            };
+            let draft = load_draft(c, &date, namespace)?
+                .ok_or_else(|| invalid("actual consumer draft absent"))?;
+            let intent = load_intent(c, &date, namespace)?
+                .ok_or_else(|| invalid("actual consumer full intent absent"))?;
+            let (child, raw) = intent
+                .children
+                .iter()
+                .find(|(_, raw)| {
+                    parse_envelope(raw)
+                        .is_ok_and(|e| e.decision_identity == route.decision_identity)
+                })
+                .ok_or_else(|| invalid("actual consumer original member absent"))?;
+            let child = child.clone();
+            let raw = raw.clone();
+            Ok(Some((draft, intent, child, raw)))
+        })
+    }
+    fn p05_consumer_check_from_recipe(
+        &self,
+        db: &DatabaseManager,
+        recipe: Option<(StoredP05Draft, StoredP05Intent, String, Vec<u8>)>,
+    ) -> ActualP05ConsumerCheck {
+        let Some((draft, intent, child, raw)) = recipe else {
+            return ActualP05ConsumerCheck::Unowned;
+        };
+        let decision = match parse_envelope(&raw) {
+            Ok(envelope) => envelope.decision_identity,
+            Err(_) => return ActualP05ConsumerCheck::Failed("P05 actual original member invalid"),
+        };
+        let observation = read_actual_prediction(db, &draft, &intent);
+        match observation {
+            Ok(prediction) => ActualP05ConsumerCheck::Verified(ActualP05ConsumerCapability {
+                namespace: draft.namespace,
+                date: draft.data.business_date,
+                draft: draft.identity,
+                intent: intent.identity,
+                child,
+                decision,
+                envelope: raw,
+                prediction,
+            }),
+            Err(_) => ActualP05ConsumerCheck::Failed(
+                "P05 actual operational freeze/score unavailable or mismatched",
+            ),
+        }
+    }
+    pub(in crate::durable_delivery::coordinator) fn p05_consumer_check_global(
+        &self,
+        route: &DecisionMutationRoute,
+    ) -> ActualP05ConsumerCheck {
+        let recipe = match self.p05_consumer_recipe(route) {
+            Ok(None) => return ActualP05ConsumerCheck::Unowned,
+            Ok(recipe) => recipe,
+            Err(_) => {
+                return ActualP05ConsumerCheck::Failed(
+                    "P05 actual owned consumer recipe unavailable",
+                )
+            }
+        };
+        if !matches!(
+            &self.config.environment,
+            super::super::super::model::StoreEnvironment::Production
+        ) {
+            return ActualP05ConsumerCheck::Failed(
+                "Test P05 opening requires actual isolated consumer capability",
+            );
+        }
+        let Some(db) = DatabaseManager::try_get() else {
+            return ActualP05ConsumerCheck::Failed("P05 actual operational singleton unavailable");
+        };
+        self.p05_consumer_check_from_recipe(db, recipe)
+    }
+    fn p05_consumer_check_on(
+        &self,
+        db: &DatabaseManager,
+        route: &DecisionMutationRoute,
+    ) -> ActualP05ConsumerCheck {
+        match &self.config.environment {
+            super::super::super::model::StoreEnvironment::Production => {
+                if !DatabaseManager::try_get().is_some_and(|actual| std::ptr::eq(actual, db)) {
+                    return ActualP05ConsumerCheck::Failed(
+                        "Production P05 consumer requires actual singleton",
+                    );
+                }
+            }
+            super::super::super::model::StoreEnvironment::Test { .. } => {
+                #[cfg(test)]
+                if !db.has_isolated_p05_consumer_origin() {
+                    return ActualP05ConsumerCheck::Failed(
+                        "Test P05 consumer DB lacks isolated constructor origin",
+                    );
+                }
+                #[cfg(not(test))]
+                return ActualP05ConsumerCheck::Failed(
+                    "Test P05 consumer capability unavailable in production library",
+                );
+            }
+        }
+        let recipe = match self.p05_consumer_recipe(route) {
+            Ok(recipe) => recipe,
+            Err(_) => {
+                return ActualP05ConsumerCheck::Failed(
+                    "P05 actual owned consumer recipe unavailable",
+                )
+            }
+        };
+        let check = self.p05_consumer_check_from_recipe(db, recipe);
+        #[cfg(test)]
+        if matches!(
+            &self.config.environment,
+            super::super::super::model::StoreEnvironment::Test { .. }
+        ) && !db.has_isolated_p05_consumer_origin()
+        {
+            return ActualP05ConsumerCheck::Failed(
+                "Test P05 consumer isolation changed during actual read",
+            );
+        }
+        check
+    }
+    pub(in crate::durable_delivery::coordinator) fn bind_p05_consumer_check(
+        &self,
+        check: &ActualP05ConsumerCheck,
+    ) -> ActualP05ConsumerCheck {
+        if let ActualP05ConsumerCheck::Verified(cap) = check {
+            if self.p05_namespace().ok() != Some(cap.namespace) {
+                return ActualP05ConsumerCheck::Failed(
+                    "actual P05 consumer belongs to another durable namespace",
+                );
+            }
+        }
+        check.clone()
+    }
+    pub(in crate::durable_delivery::coordinator) fn with_p05_business_mutation_transaction<T>(
+        &self,
+        route: &DecisionMutationRoute,
+        supplied: Option<&ActualP05ConsumerCheck>,
+        operation: impl FnOnce(&Transaction<'_>, &SqlDependencies) -> Result<MutationEffect<T>>,
+    ) -> Result<T> {
+        let check = supplied
+            .map(|check| self.bind_p05_consumer_check(check))
+            .unwrap_or_else(|| self.p05_consumer_check_global(route));
+        self.with_mutation_transaction_consumer(route, Some(check), operation)
+    }
+}
 pub(in crate::durable_delivery::coordinator) fn validate_new_prepare(
     c: &Connection,
     envelope: &DeliveryEnvelope,
@@ -341,30 +556,52 @@ impl DurableDeliveryCoordinator {
         if test_now.is_some() {
             self.require_p05_test_clock()?;
         }
-        let draft = self
-            .read_p05_unit_draft(date)?
-            .ok_or_else(|| invalid("Unit draft absent"))?;
         let intent = self
             .read_p05_unit_intent(date)?
             .ok_or_else(|| invalid("all required children must be committed before admission"))?;
-        verify_actual_prediction(prediction_db, &draft, &intent)?;
+        let (_, raw) = intent
+            .children
+            .get(index)
+            .ok_or_else(|| invalid("child ordinal absent"))?;
+        let envelope = parse_envelope(raw)?;
+        let route = self.prepare_mutation_route(&envelope)?;
+        let actual = self.p05_consumer_check_on(prediction_db, &route);
+        self.prepare_p05_unit_child_checked(
+            date,
+            index,
+            sink_count,
+            test_now.unwrap_or_else(Utc::now),
+            &actual,
+        )
+    }
+    fn prepare_p05_unit_child_checked(
+        &self,
+        date: &str,
+        index: usize,
+        sink_count: usize,
+        now: DateTime<Utc>,
+        actual: &ActualP05ConsumerCheck,
+    ) -> Result<(PrepareOutcome, DeliveryEnvelope)> {
+        let intent = self
+            .read_p05_unit_intent(date)?
+            .ok_or_else(|| invalid("all required children must be committed before admission"))?;
         let (child, raw) = intent
             .children
             .get(index)
             .ok_or_else(|| invalid("child ordinal absent"))?;
         let envelope = parse_envelope(raw)?;
         let sha = sha256_hex(raw);
-        let now = test_now.unwrap_or_else(Utc::now);
         let admission = ChildAdmission {
             intent: &intent,
             child,
             envelope: &envelope,
         };
         let route = self.prepare_mutation_route(&envelope)?;
-        let effect=self.with_mutation_transaction_declared(&route,|tx,dependencies| {
+        let effect=self.with_p05_business_mutation_transaction(&route,Some(actual),|tx,dependencies| {
             validate_new_prepare(tx,&envelope,Some(&admission))?;
             if load_decision(tx,&envelope.decision_identity)?.is_some() {validate_owner(tx,&envelope)?;}
             else {
+                dependencies.require_business_open(tx,&route)?;
                 let data=OwnerCanonical {schema:"p05-unit-child-owner-v1".into(),draft_identity:intent.draft_identity.clone(),intent_identity:intent.identity.clone(),child_identity:child.clone(),decision_identity:envelope.decision_identity.clone(),envelope_sha256:sha.clone()};
                 let canonical=encode(&data)?;let image=preimage("p05-unit-child-owner-v1",&canonical);let id=sha256_hex(&image);
                 tx.execute("INSERT INTO p05_s2_child_owners(owner_identity,child_identity,draft_identity,intent_identity,decision_identity,envelope_canonical,envelope_sha256,owner_canonical,owner_sha256,owner_preimage) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,child,intent.draft_identity,intent.identity,envelope.decision_identity,raw,sha,canonical,sha256_hex(&canonical),image])?;
@@ -401,6 +638,13 @@ fn verify_actual_prediction(
     draft: &StoredP05Draft,
     intent: &StoredP05Intent,
 ) -> Result<()> {
+    read_actual_prediction(db, draft, intent).map(|_| ())
+}
+fn read_actual_prediction(
+    db: &DatabaseManager,
+    draft: &StoredP05Draft,
+    intent: &StoredP05Intent,
+) -> Result<PredictionObservation> {
     let data: IntentCanonical = decode(&intent.canonical)?;
     let actual = db
         .read_p05_unit_freeze_with_scores(&board_occurrence(&draft.data)?)
@@ -413,12 +657,12 @@ fn verify_actual_prediction(
                     "actual prediction observation differs from immutable intent",
                 ));
             }
-            Ok(())
+            Ok(data.prediction.clone())
         }
         (PredictionObservation::UnlinkedNoStrong { .. }, None)
             if draft.data.strong_recipe.is_empty() =>
         {
-            Ok(())
+            Ok(data.prediction.clone())
         }
         _ => Err(invalid(
             "original prediction freeze/absence differs; no fallback or resave",
@@ -1159,19 +1403,14 @@ impl DurableDeliveryCoordinator {
             append,
             test_now.unwrap_or_else(Utc::now),
         )?;
-        // Read-only independent prediction snapshot finishes before the original
-        // durable begin/retry path. No two DB guards or locks cross the sink.
-        let draft = self
-            .read_p05_unit_draft(date)?
-            .ok_or_else(|| invalid("dispatch draft absent"))?;
-        let intent = self
-            .read_p05_unit_intent(date)?
-            .ok_or_else(|| invalid("dispatch intent absent"))?;
-        verify_actual_prediction(prediction_db, &draft, &intent)?;
-        let outcome = self.resume_deliverable(
+        // The independent read is released before either begin/retry transaction.
+        let route = self.decision_mutation_route(&envelope.decision_identity)?;
+        let actual = self.p05_consumer_check_on(prediction_db, &route);
+        let outcome = self.resume_deliverable_with_p05_check(
             &envelope.decision_identity,
             sinks,
             test_now.unwrap_or_else(Utc::now),
+            Some(&actual),
         )?;
         self.reconcile_pending(
             ReconcileScope::Decision(&envelope.decision_identity),
@@ -1182,12 +1421,318 @@ impl DurableDeliveryCoordinator {
     }
 }
 
+/// Opaque readonly original child plus a released operational observation.
+/// This does not prepare, reserve budget, qualify source or call a sink.
+#[derive(Clone)]
+pub(crate) struct P05ChildInspection {
+    namespace: FileObjectIdentity,
+    date: String,
+    draft: String,
+    intent: String,
+    child: String,
+    index: usize,
+    envelope: DeliveryEnvelope,
+    actual: ActualP05ConsumerCheck,
+}
+impl P05ChildInspection {
+    pub(crate) fn business_date(&self) -> &str {
+        &self.date
+    }
+    pub(crate) fn unit_identity(&self) -> &str {
+        &self.draft
+    }
+    pub(crate) fn intent_identity(&self) -> &str {
+        &self.intent
+    }
+    pub(crate) fn child_identity(&self) -> &str {
+        &self.child
+    }
+    pub(crate) fn ordinal(&self) -> usize {
+        self.index
+    }
+    pub(crate) fn envelope(&self) -> &DeliveryEnvelope {
+        &self.envelope
+    }
+    pub(crate) fn governance_code(&self) -> Option<&str> {
+        (self.envelope.push_kind == PushKind::CandidateInvalidated)
+            .then(|| self.envelope.scope_key.rsplit(':').next())
+            .flatten()
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum P05StoredUnitPhase {
+    Draft,
+    Started,
+    IntentComplete,
+}
+/// An immutable read snapshot, not a lease, completion or permission to sample.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct P05StoredUnitSnapshot {
+    namespace: FileObjectIdentity,
+    date: String,
+    draft: String,
+    revision: i64,
+    phase: P05StoredUnitPhase,
+    intent: Option<String>,
+    first_completion: Option<String>,
+}
+impl P05StoredUnitSnapshot {
+    pub fn business_date(&self) -> &str {
+        &self.date
+    }
+    pub fn unit_identity(&self) -> &str {
+        &self.draft
+    }
+    pub fn mutation_revision(&self) -> i64 {
+        self.revision
+    }
+    pub fn phase(&self) -> P05StoredUnitPhase {
+        self.phase
+    }
+    pub fn intent_identity(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+    pub fn first_completion_identity(&self) -> Option<&str> {
+        self.first_completion.as_deref()
+    }
+}
+#[derive(Eq, PartialEq)]
+struct UnitListBinding {
+    // Include clean Units too: a lawful late mutation may make one dirty.
+    units: Vec<SqlBinding>,
+    baseline: Option<(i64, String)>,
+}
+fn capture_unit_list(
+    c: &Connection,
+    namespace: FileObjectIdentity,
+) -> Result<(Vec<P05StoredUnitSnapshot>, UnitListBinding)> {
+    validate_rows(c)?;
+    let dates = c
+        .prepare("SELECT business_date FROM p05_unit_drafts ORDER BY business_date")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut units = Vec::new();
+    let mut unfinished = Vec::new();
+    for date in dates {
+        date_day(&date)?;
+        let binding = capture_sql_binding(c, &date)?;
+        let (revision, phase, intent) = binding
+            .head
+            .as_ref()
+            .ok_or_else(|| invalid("listed Unit head absent"))?;
+        let phase = match phase.as_str() {
+            "Draft" => P05StoredUnitPhase::Draft,
+            "Started" => P05StoredUnitPhase::Started,
+            "IntentComplete" => P05StoredUnitPhase::IntentComplete,
+            _ => return Err(invalid("listed Unit phase unknown")),
+        };
+        if binding
+            .completion_head
+            .as_ref()
+            .is_none_or(|(_, current)| current.is_none())
+        {
+            unfinished.push(P05StoredUnitSnapshot {
+                namespace,
+                date: date.clone(),
+                draft: binding
+                    .draft_identity
+                    .clone()
+                    .ok_or_else(|| invalid("listed Unit absent"))?,
+                revision: *revision,
+                phase,
+                intent: intent.clone(),
+                first_completion: binding
+                    .completion_head
+                    .as_ref()
+                    .map(|(first, _)| first.clone()),
+            });
+        }
+        units.push(binding);
+    }
+    let baseline = c
+        .query_row(
+            "SELECT baseline_revision,origin_identity FROM p05_baseline_heads WHERE family=?1",
+            [FAMILY],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok((unfinished, UnitListBinding { units, baseline }))
+}
+impl UnitListBinding {
+    fn validate(&self, c: &Connection, namespace: FileObjectIdentity) -> Result<()> {
+        if capture_unit_list(c, namespace)?.1 != *self {
+            return Err(invalid(
+                "readonly Unit list membership/actual SQL snapshot changed",
+            ));
+        }
+        Ok(())
+    }
+}
+impl DurableDeliveryCoordinator {
+    pub(crate) fn require_p05_production_singleton(&self) -> Result<&'static DatabaseManager> {
+        if !matches!(
+            &self.config.environment,
+            super::super::super::model::StoreEnvironment::Production
+        ) {
+            return Err(invalid(
+                "P05 public worker requires Production singleton namespace",
+            ));
+        }
+        DatabaseManager::try_get()
+            .ok_or_else(|| invalid("actual operational singleton unavailable"))
+    }
+    fn validate_p05_child_inspection(&self, view: &P05ChildInspection) -> Result<()> {
+        if self.p05_namespace()? != view.namespace {
+            return Err(invalid("child view belongs to another durable namespace"));
+        }
+        self.with_mutation_routing_connection(|c| {
+            if let ActualP05ConsumerCheck::Verified(cap) = &view.actual {
+                cap.validate(c)?;
+            }
+            let intent = load_intent(c, &view.date, view.namespace)?
+                .ok_or_else(|| invalid("child view intent absent"))?;
+            if intent.identity != view.intent
+                || intent.draft_identity != view.draft
+                || intent.children.get(view.index)
+                    != Some(&(view.child.clone(), view.envelope.canonical_bytes()?))
+            {
+                return Err(invalid("child view differs from exact original member"));
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn inspect_p05_unit_child_global(
+        &self,
+        date: &str,
+        index: usize,
+    ) -> Result<P05ChildInspection> {
+        date_day(date)?;
+        let namespace = self.p05_namespace()?;
+        let view = self.with_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let intent = load_intent(&tx, date, namespace)?
+                .ok_or_else(|| invalid("readonly child full intent absent"))?;
+            let (child, raw) = intent
+                .children
+                .get(index)
+                .ok_or_else(|| invalid("readonly child ordinal absent"))?;
+            let envelope = parse_envelope(raw)?;
+            if load_decision(&tx, &envelope.decision_identity)?.is_some() {
+                validate_owner(&tx, &envelope)?;
+            }
+            let binding = capture_sql_binding(&tx, date)?;
+            validate_rows(&tx)?;
+            let view = P05ChildInspection {
+                namespace,
+                date: date.into(),
+                draft: intent.draft_identity.clone(),
+                intent: intent.identity.clone(),
+                child: child.clone(),
+                index,
+                envelope,
+                actual: ActualP05ConsumerCheck::Unowned,
+            };
+            tx.commit()?;
+            binding.validate(c)?;
+            Ok((view, binding))
+        })?;
+        self.with_mutation_routing_connection(|c| view.1.validate(c))?;
+        let mut view = view.0;
+        let route = self.prepare_mutation_route(&view.envelope)?;
+        view.actual = self.p05_consumer_check_global(&route);
+        Ok(view)
+    }
+    pub(crate) fn inspect_p05_owned_child_global(
+        &self,
+        decision: &str,
+    ) -> Result<Option<P05ChildInspection>> {
+        let route = self.decision_mutation_route(decision)?;
+        let member=self.with_mutation_routing_connection(|c| {
+            let row=c.query_row("SELECT d.business_date,p.ordinal FROM p05_s2_child_owners o JOIN p05_unit_children p ON p.child_identity=o.child_identity JOIN p05_unit_drafts d ON d.draft_identity=o.draft_identity WHERE o.decision_identity=?1",[decision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).optional()?;
+            if row.is_none() && mutation_date(c,&route)?.is_some() {return Err(invalid("owned P05 decision lacks its original contextual owner"));}
+            Ok(row)
+        })?;
+        match member {
+            None => Ok(None),
+            Some((date, index)) => Ok(Some(self.inspect_p05_unit_child_global(
+                &date,
+                usize::try_from(index).map_err(|_| invalid("owned child ordinal invalid"))?,
+            )?)),
+        }
+    }
+    pub(crate) fn prepare_p05_child_inspection(
+        &self,
+        view: &P05ChildInspection,
+        sink_count: usize,
+    ) -> Result<PrepareOutcome> {
+        self.validate_p05_child_inspection(view)?;
+        let route = self.prepare_mutation_route(&view.envelope)?;
+        // Refresh a real released reader immediately before a fresh opening;
+        // failed reads remain deferred so exact Existing can still recover.
+        let check = self.p05_consumer_check_global(&route);
+        self.prepare_p05_unit_child_checked(&view.date, view.index, sink_count, Utc::now(), &check)
+            .map(|(outcome, _)| outcome)
+    }
+    pub(crate) fn resume_p05_child_inspection(
+        &self,
+        view: &P05ChildInspection,
+        sinks: &[AuthoritativeSink],
+    ) -> Result<ResumeOutcome> {
+        self.validate_p05_child_inspection(view)?;
+        let route = self.decision_mutation_route(&view.envelope.decision_identity)?;
+        self.with_mutation_routing_connection(|c| validate_owner(c, &view.envelope))?;
+        let check = self.p05_consumer_check_global(&route);
+        self.resume_deliverable_with_p05_check(
+            &view.envelope.decision_identity,
+            sinks,
+            Utc::now(),
+            Some(&check),
+        )
+    }
+    pub(crate) fn p05_has_first_completion(&self, date: &str) -> Result<bool> {
+        self.with_connection(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM p05_s2_completion_heads h JOIN p05_unit_drafts d ON d.draft_identity=h.draft_identity WHERE d.business_date=?1)",[date],|r|r.get(0))?))
+    }
+    pub(crate) fn dispatch_p05_child_inspection(
+        &self,
+        view: &P05ChildInspection,
+        sinks: &[AuthoritativeSink],
+        append: &dyn ImmutableAppendPort,
+    ) -> Result<ResumeOutcome> {
+        self.prepare_p05_child_inspection(view, sinks.len())?;
+        self.reconcile_pending(
+            ReconcileScope::Decision(&view.envelope.decision_identity),
+            append,
+            Utc::now(),
+        )?;
+        let outcome = self.resume_p05_child_inspection(view, sinks)?;
+        self.reconcile_pending(
+            ReconcileScope::Decision(&view.envelope.decision_identity),
+            append,
+            Utc::now(),
+        )?;
+        Ok(outcome)
+    }
+    pub(crate) fn inspect_p05_unfinished_units(&self) -> Result<Vec<P05StoredUnitSnapshot>> {
+        let namespace = self.p05_namespace()?;
+        let (snapshots, binding) = self.with_connection(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let (snapshots, binding) = capture_unit_list(&tx, namespace)?;
+            tx.commit()?;
+            binding.validate(c, namespace)?;
+            Ok((snapshots, binding))
+        })?;
+        self.with_mutation_routing_connection(|c| binding.validate(c, namespace))?;
+        Ok(snapshots)
+    }
+}
+
 #[cfg(test)]
 #[path = "p05_unit_runtime_tests.rs"]
 mod tests;
 
 /// An operation-local exact SQL witness, never serialized or caller-created.
 /// This is checked after every SQL hook and at the actual commit boundary.
+#[derive(Eq, PartialEq)]
 pub(in crate::durable_delivery::coordinator) struct SqlBinding {
     date: String,
     draft_identity: Option<String>,
@@ -1205,8 +1750,18 @@ struct PriorClosureBinding {
 #[derive(Default)]
 pub(in crate::durable_delivery::coordinator) struct SqlDependencies {
     prior: std::cell::RefCell<Vec<PriorClosureBinding>>,
+    consumer: Option<ActualP05ConsumerCheck>,
+    consumer_used: std::cell::Cell<bool>,
 }
 impl SqlDependencies {
+    pub(in crate::durable_delivery::coordinator) fn with_consumer(
+        consumer: Option<ActualP05ConsumerCheck>,
+    ) -> Self {
+        Self {
+            consumer,
+            ..Self::default()
+        }
+    }
     pub(super) fn require_current_baseline(&self, c: &Connection, id: &str) -> Result<()> {
         require_current_baseline(c, id)?;
         let origin = load_completed_origin(c, id)?;
@@ -1225,6 +1780,11 @@ impl SqlDependencies {
         let Some(date) = mutation_date(c, route)? else {
             return Ok(());
         };
+        self.consumer
+            .as_ref()
+            .ok_or_else(|| invalid("owned P05 business opening needs actual reader"))?
+            .require(c, route)?;
+        self.consumer_used.set(true);
         let draft = load_draft(c, &date, zero_namespace())?
             .ok_or_else(|| invalid("business-opening Unit absent"))?;
         if draft.data.baseline_kind == "CompletedUnitV2Baseline" {
@@ -1233,6 +1793,12 @@ impl SqlDependencies {
         Ok(())
     }
     pub(in crate::durable_delivery::coordinator) fn validate(&self, c: &Connection) -> Result<()> {
+        if self.consumer_used.get() {
+            match self.consumer.as_ref() {
+                Some(ActualP05ConsumerCheck::Verified(cap)) => cap.validate(c)?,
+                _ => return Err(invalid("consumed actual P05 reader witness absent")),
+            }
+        }
         for prior in self.prior.borrow().iter() {
             let actual = capture_sql_binding(c, &prior.snapshot.date)?;
             if actual.draft_identity != prior.snapshot.draft_identity
@@ -1348,11 +1914,21 @@ impl DurableDeliveryCoordinator {
         route: &DecisionMutationRoute,
         operation: impl FnOnce(&Transaction<'_>, &SqlDependencies) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
+        self.with_p05_business_pre_sink_transaction_checked(route, None, operation)
+    }
+    pub(in crate::durable_delivery::coordinator) fn with_p05_business_pre_sink_transaction_checked<
+        T,
+    >(
+        &self,
+        route: &DecisionMutationRoute,
+        check: Option<&ActualP05ConsumerCheck>,
+        operation: impl FnOnce(&Transaction<'_>, &SqlDependencies) -> Result<MutationEffect<T>>,
+    ) -> Result<T> {
         let p05 = self
             .with_mutation_routing_connection(|c| mutation_date(c, route))?
             .is_some();
         if p05 {
-            self.with_mutation_transaction_declared(route, operation)
+            self.with_p05_business_mutation_transaction(route, check, operation)
         } else {
             let dependencies = SqlDependencies::default();
             self.with_pre_sink_mutation_transaction(route, |tx| operation(tx, &dependencies))

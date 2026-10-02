@@ -3645,3 +3645,278 @@ fn paper_ledger_history_partial_lot_absorbs_fee_remainder_and_overflow_rolls_bac
     assert_eq!(view.realized_pnl, Money::from_cny(-23.0).unwrap());
     assert_eq!(view.fees, Money::from_cny(23.0).unwrap());
 }
+
+// Snapshot actual persistent bytes/rowids, using main-qualified reads even
+// while a TEMP shadow is present. Rejected runtime calls must change no row.
+fn paper_namespace_persistent_rows(conn: &mut SqliteConnection) -> Vec<(String, Vec<String>)> {
+    #[derive(diesel::QueryableByName)]
+    struct ColumnName {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let tables = diesel::sql_query(
+        "SELECT name AS value FROM main.sqlite_master WHERE type='table' AND
+         (lower(name) GLOB 'paper_ledger_*' OR lower(name) GLOB 'paper_book_owner_*'
+          OR lower(name) GLOB 'paper_book_v2_*'
+          OR name IN ('paper_trades','order_audit','order_audit_chain')) ORDER BY name",
+    )
+    .load::<GoldenTextValue>(conn)
+    .unwrap();
+    let mut snapshot = Vec::new();
+    for table in tables {
+        let quoted_table = format!("\"{}\"", table.value.replace('"', "\"\""));
+        let columns = diesel::sql_query(format!("PRAGMA main.table_info({quoted_table})"))
+            .load::<ColumnName>(conn)
+            .unwrap();
+        let values = std::iter::once("quote(rowid)".to_owned())
+            .chain(
+                columns
+                    .iter()
+                    .map(|column| format!("quote(\"{}\")", column.name.replace('"', "\"\""))),
+            )
+            .collect::<Vec<_>>()
+            .join("||'|'||");
+        let rows = diesel::sql_query(format!(
+            "SELECT {values} AS value FROM main.{quoted_table} ORDER BY rowid"
+        ))
+        .load::<GoldenTextValue>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.value)
+        .collect();
+        snapshot.push((table.value, rows));
+    }
+    snapshot
+}
+
+#[test]
+fn paper_namespace_casefold_runtime_v4_v5_shadows_reject_reads_owner_and_writer_without_mutation() {
+    for generation in [4, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            dir.path().join("TEST_CODE_namespace_runtime.db"),
+        )
+        .unwrap();
+        declare_test_catalog_v2(&db);
+        let ledger = PaperLedger::open(&db, &instant);
+        let seed = manifest();
+        let binding = seed.binding().unwrap();
+        ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        ledger
+            .apply(PaperCommand::Execute(order(
+                &ledger,
+                &binding,
+                "before-shadow",
+                Direction::Buy,
+                10.0,
+                instant(),
+            )))
+            .unwrap();
+        {
+            let mut conn = db.get_conn().unwrap();
+            crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+            conn.batch_execute("PRAGMA user_version=3").unwrap();
+            crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+                &mut conn,
+                &crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(
+                ),
+            )
+            .unwrap();
+            if generation == 5 {
+                crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(
+                    &mut conn,
+                )
+                .unwrap();
+            }
+        }
+        let before_view = ledger.read(&binding).unwrap();
+        let request = EffectiveFillRequest {
+            scope: EffectiveFillScope::Epoch(binding.clone()),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: day(instant()),
+        };
+        let before_fills = ledger.verified_effective_fills(&request).unwrap();
+        let intent = order(
+            &ledger,
+            &binding,
+            "blocked-by-shadow",
+            Direction::Buy,
+            10.0,
+            instant(),
+        );
+        let owner = format!("paper_book_owner_v{}", generation - 3);
+        let shadows = [
+            (
+                format!("CREATE TEMP TABLE {} AS SELECT * FROM main.{owner}", owner.to_ascii_uppercase()),
+                format!("DROP TABLE temp.{owner}"),
+            ),
+            (
+                "CREATE TEMP VIEW PaPeR_LeDgEr_HeAd AS SELECT * FROM main.paper_ledger_head".to_owned(),
+                "DROP VIEW temp.PaPeR_LeDgEr_HeAd".to_owned(),
+            ),
+            (
+                "CREATE TEMP VIEW PAPER_BOOK_V2_FEE_MANIFEST AS SELECT * FROM main.paper_book_v2_fee_manifest".to_owned(),
+                "DROP VIEW temp.PAPER_BOOK_V2_FEE_MANIFEST".to_owned(),
+            ),
+            (
+                "CREATE TEMP TABLE TEST_CODE_foreign(value TEXT); CREATE TEMP TRIGGER PaPeR_BoOk_OwNeR_extra BEFORE INSERT ON TEST_CODE_foreign BEGIN SELECT 1; END".to_owned(),
+                "DROP TRIGGER temp.PaPeR_BoOk_OwNeR_extra; DROP TABLE temp.TEST_CODE_foreign".to_owned(),
+            ),
+        ];
+        // The ordinary fixture pool has ten slots. Retain nine so all public
+        // calls below use the one actual checkout carrying the TEMP objects.
+        let _other_checkouts = (0..9).map(|_| db.get_conn().unwrap()).collect::<Vec<_>>();
+        for (create, remove) in shadows {
+            let before = {
+                let mut conn = db.get_conn().unwrap();
+                conn.batch_execute(&create).unwrap();
+                paper_namespace_persistent_rows(&mut conn)
+            };
+            assert!(
+                matches!(ledger.read(&binding), Err(LedgerError::IntegrityFailure(_))),
+                "generation={generation} {create}"
+            );
+            assert!(
+                matches!(
+                    ledger.read_at_version(&binding, 1),
+                    Err(LedgerError::IntegrityFailure(_))
+                ),
+                "generation={generation} {create}"
+            );
+            assert!(
+                matches!(
+                    ledger.verified_effective_fills(&request),
+                    Err(LedgerError::IntegrityFailure(_))
+                ),
+                "generation={generation} {create}"
+            );
+            assert!(
+                matches!(
+                    ledger.require_active_v1_owner(&binding),
+                    Err(LedgerError::IntegrityFailure(_))
+                ),
+                "generation={generation} {create}"
+            );
+            assert!(
+                matches!(
+                    ledger.apply(PaperCommand::Execute(intent.clone())),
+                    Err(LedgerError::IntegrityFailure(_))
+                ),
+                "generation={generation} {create}"
+            );
+            {
+                let mut conn = db.get_conn().unwrap();
+                assert_eq!(
+                    paper_namespace_persistent_rows(&mut conn),
+                    before,
+                    "generation={generation} {create}"
+                );
+                conn.batch_execute(&remove).unwrap();
+            }
+            assert_eq!(ledger.read(&binding).unwrap(), before_view);
+            let after_fills = ledger.verified_effective_fills(&request).unwrap();
+            assert_eq!(after_fills.rows().unwrap(), before_fills.rows().unwrap());
+            assert_eq!(after_fills.lineage(), before_fills.lineage());
+            assert_eq!(after_fills.receipt(), before_fills.receipt());
+        }
+    }
+}
+
+#[test]
+fn paper_namespace_casefold_v5_actual_genesis_reader_rejects_temp_aliases_without_healing() {
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
+    let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
+    cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
+    let before_view = read_v2_on(&db, &binding.account_id).unwrap();
+    let _other_checkouts = (0..9).map(|_| db.get_conn().unwrap()).collect::<Vec<_>>();
+    for (create, remove) in [
+        (
+            "CREATE TEMP TABLE PAPER_BOOK_V2_ACCOUNT AS SELECT * FROM main.paper_book_v2_account",
+            "DROP TABLE temp.PAPER_BOOK_V2_ACCOUNT",
+        ),
+        (
+            "CREATE TEMP VIEW PaPeR_BoOk_V2_EvEnT AS SELECT * FROM main.paper_book_v2_event",
+            "DROP VIEW temp.PaPeR_BoOk_V2_EvEnT",
+        ),
+        (
+            "CREATE TEMP TABLE PAPER_BOOK_V2_HEAD AS SELECT * FROM main.paper_book_v2_head",
+            "DROP TABLE temp.PAPER_BOOK_V2_HEAD",
+        ),
+    ] {
+        let before = {
+            let mut conn = db.get_conn().unwrap();
+            conn.batch_execute(create).unwrap();
+            paper_namespace_persistent_rows(&mut conn)
+        };
+        assert!(
+            matches!(
+                read_v2_on(&db, &binding.account_id),
+                Err(LedgerError::IntegrityFailure(_))
+            ),
+            "{create}"
+        );
+        {
+            let mut conn = db.get_conn().unwrap();
+            assert_eq!(
+                paper_namespace_persistent_rows(&mut conn),
+                before,
+                "{create}"
+            );
+            conn.batch_execute(remove).unwrap();
+        }
+        assert_eq!(read_v2_on(&db, &binding.account_id).unwrap(), before_view);
+    }
+}
+
+#[test]
+fn paper_namespace_casefold_effective_v2_rejects_temp_head_without_raw_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(
+        dir.path().join("TEST_CODE_namespace_effective.db"),
+    )
+    .unwrap();
+    declare_test_catalog_v2(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "before-shadow",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
+    let request = EffectiveFillRequest {
+        scope: EffectiveFillScope::Epoch(binding),
+        history: EffectiveHistory::RestatedLatest,
+        as_of: day(instant()),
+    };
+    let before_fills = ledger.verified_effective_fills(&request).unwrap();
+    let _other_checkouts = (0..9).map(|_| db.get_conn().unwrap()).collect::<Vec<_>>();
+    let before = {
+        let mut conn = db.get_conn().unwrap();
+        conn.batch_execute(
+            "CREATE TEMP TABLE PAPER_LEDGER_HEAD AS SELECT * FROM main.paper_ledger_head",
+        )
+        .unwrap();
+        paper_namespace_persistent_rows(&mut conn)
+    };
+    assert!(matches!(
+        ledger.verified_effective_fills(&request),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    {
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(paper_namespace_persistent_rows(&mut conn), before);
+        conn.batch_execute("DROP TABLE temp.PAPER_LEDGER_HEAD")
+            .unwrap();
+    }
+    let after = ledger.verified_effective_fills(&request).unwrap();
+    assert_eq!(after.rows().unwrap(), before_fills.rows().unwrap());
+    assert_eq!(after.lineage(), before_fills.lineage());
+    assert_eq!(after.receipt(), before_fills.receipt());
+}
