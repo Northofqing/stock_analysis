@@ -5691,7 +5691,7 @@ fn accepted_pending_fixture(
     candidate
 }
 
-fn fixture_coordinator_arc(fixture: &Fixture) -> Arc<DurableDeliveryCoordinator> {
+pub(super) fn fixture_coordinator_arc(fixture: &Fixture) -> Arc<DurableDeliveryCoordinator> {
     fixture
         .coordinator
         .0

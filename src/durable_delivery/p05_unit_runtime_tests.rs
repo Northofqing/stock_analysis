@@ -1,6 +1,6 @@
 use super::*;
 use crate::durable_delivery::AuthoritativeSinkPort;
-use crate::durable_delivery::tests::Fixture;
+use crate::durable_delivery::tests::{fixture_coordinator_arc, Fixture};
 use chrono::TimeZone;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -1377,7 +1377,7 @@ fn p05_shared_unit_runtime_prior_closure_hooks_fresh_draft_prepare_begin_rollbac
             };
             let day2_owners=f.query_i64("SELECT COUNT(*) FROM p05_s2_child_owners o JOIN p05_unit_drafts d ON d.draft_identity=o.draft_identity WHERE d.business_date='2026-09-24'");
             let audits = f.query_i64("SELECT COUNT(*) FROM immutable_audit_outbox");
-            let hit = arm_extra_at_phase(&f.coordinator, second_phase);
+            let hit = arm_extra_at_phase(&fixture_coordinator_arc(&f), second_phase);
             let result = match opening {
                 "draft" => f
                     .coordinator
@@ -1453,7 +1453,7 @@ fn p05_shared_unit_runtime_prior_closure_after_sql_first_finalizer_rolls_back_on
             .observe_p05_unit_receipts("2026-09-24")
             .unwrap();
         let raw=f.query_blob("SELECT result_canonical FROM sink_results s JOIN delivery_decisions d ON d.decision_identity=s.decision_identity WHERE d.business_date='2026-09-24' ORDER BY s.rowid LIMIT 1");
-        let hit = arm_extra_at_phase(&f.coordinator, second_phase);
+        let hit = arm_extra_at_phase(&fixture_coordinator_arc(&f), second_phase);
         let error = f
             .coordinator
             .finalize_p05_unit_observed("2026-09-24", &day2)
