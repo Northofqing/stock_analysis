@@ -6498,6 +6498,9 @@ async fn main() {
         );
         exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
     } else {
+        // The existing startup barrier has completed. Observe a genuinely new
+        // current zero head before any resident input writer starts.
+        g5b_v2::initialize_before_input_writers().await;
         let dryrun_reporter = dryrun_report::spawn_dryrun_reporter(1_800);
 
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
@@ -11062,6 +11065,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 continue;
             }
 
+            // The market-active wait can span midnight. Resample inside the
+            // local owner after that wait and before the first daily scanner.
+            g5b_v2::initialize_before_input_writers().await;
+
             log::info!("进入交易时段，开始监控");
 
             let (_positions, targets) = match TieredScanner::load_portfolio_targets() {
@@ -14340,6 +14347,62 @@ mod tests_post_session_review_scheduler {
         assert!(
             !scheduler[error_branch..review_window_gate].contains("continue;"),
             "selection failure must not suppress independent core review work"
+        );
+    }
+
+    #[test]
+    fn g5b_empty_runtime_initialization_precedes_resident_and_rollover_input_writers() {
+        // Supplement the real runtime/routing cases with the two required
+        // integration ordering contracts. No test clock or receipt is minted.
+        let source = include_str!("main.rs");
+        let production = source
+            .split("mod tests_post_session_review_scheduler")
+            .next()
+            .unwrap();
+        let barrier = production
+            .find("durable_delivery_runtime::ensure_startup_reconciled().await")
+            .unwrap();
+        let service = production
+            .find("} else if !selection_cli.requires_service_enablement() {")
+            .unwrap();
+        let resident = production[service..]
+            .split("let main_loops = async")
+            .next()
+            .unwrap();
+        let init = resident
+            .find("g5b_v2::initialize_before_input_writers().await;")
+            .unwrap();
+        assert!(barrier < service);
+        assert!(
+            resident.find("} else {").unwrap() < init,
+            "terminal CLI must not seed a head"
+        );
+        assert!(init < resident.find("let dryrun_reporter").unwrap());
+        let market = production
+            .split("let market_loop = async {")
+            .nth(1)
+            .unwrap()
+            .split("let scanner = TieredScanner::new")
+            .next()
+            .unwrap();
+        let init = market
+            .find("g5b_v2::initialize_before_input_writers().await;")
+            .unwrap();
+        let waiting = market.find("while !is_market_active()").unwrap();
+        let second_trading_check = market[..init]
+            .rfind("if !calendar::today_is_trading_day() {")
+            .unwrap();
+        assert!(waiting < second_trading_check && second_trading_check < init);
+        assert!(
+            init < market
+                .find("TieredScanner::load_portfolio_targets()")
+                .unwrap()
+        );
+        assert_eq!(
+            production
+                .matches("g5b_v2::initialize_before_input_writers().await;")
+                .count(),
+            2
         );
     }
 

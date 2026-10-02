@@ -29,6 +29,12 @@ pub(crate) use g5b_v2::{
     inspect_g5b_cohort_v2, inspect_g5b_dispatch_v2,
 };
 
+#[path = "durable_delivery_runtime/g5b_empty_v2.rs"]
+mod g5b_empty_v2;
+pub(crate) use g5b_empty_v2::{
+    initialize_g5b_empty_before_input_writers, inspect_g5b_empty_tick_v2, G5bEmptyTickObservation,
+};
+
 tokio::task_local! {
     static P01_COMPENSATION_BUSINESS_DATE: NaiveDate;
 }

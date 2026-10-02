@@ -5,6 +5,54 @@ use stock_analysis::monitor::g5b_analysis_v2::G5bAnalysisClaimV2;
 
 /// Returns true only to request the existing no-provider tick backoff.
 pub(crate) async fn run_tick(date: NaiveDate, fresh_window: bool) -> Result<bool, String> {
+    route_empty_before_models(
+        || runtime::inspect_g5b_empty_tick_v2(date),
+        || run_nonempty_tick(date, fresh_window),
+    )
+    .await
+}
+
+/// Empty initialization failure cannot disable ordinary scanners or NonEmpty
+/// recovery. A legacy head without its original receipt stays Unknown.
+pub(crate) async fn initialize_before_input_writers() {
+    match runtime::initialize_g5b_empty_before_input_writers().await {
+        Ok(Some(date)) => log::info!("[g5b] prospective zero input observed for {date}"),
+        Ok(None) => {}
+        Err(e) => log::warn!("[g5b] Empty prospective observation unavailable: {e}"),
+    }
+}
+
+async fn route_empty_before_models<Inspect, InspectFuture, Models, ModelsFuture>(
+    inspect: Inspect,
+    models: Models,
+) -> Result<bool, String>
+where
+    Inspect: FnOnce() -> InspectFuture,
+    InspectFuture: std::future::Future<Output = Result<runtime::G5bEmptyTickObservation, String>>,
+    Models: FnOnce() -> ModelsFuture,
+    ModelsFuture: std::future::Future<Output = Result<bool, String>>,
+{
+    match inspect().await? {
+        runtime::G5bEmptyTickObservation::ContinueNonEmpty => models().await,
+        runtime::G5bEmptyTickObservation::Pending {
+            cohort_identity,
+            revision,
+        } => {
+            log::info!("[g5b] original Empty Selection remains pending cohort={cohort_identity} revision={revision}");
+            Ok(false)
+        }
+        runtime::G5bEmptyTickObservation::Sealed {
+            seal_identity,
+            revision,
+            reason,
+        } => {
+            log::info!("[g5b] closed zero prefix freshly verified seal={seal_identity} revision={revision} reason={reason}");
+            Ok(false)
+        }
+    }
+}
+
+async fn run_nonempty_tick(date: NaiveDate, fresh_window: bool) -> Result<bool, String> {
     let saved_count = runtime::inspect_g5b_cohort_v2(date).await?;
     let mut first_claim = None;
     let count = match saved_count {
@@ -138,6 +186,82 @@ where
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn g5b_empty_runtime_saved_routing_precedes_models_and_provider_backoff() {
+        // Only low authority scheduling observations are supplied here. Actual
+        // Pending recovery/Sealed refresh and source-inode authority are covered
+        // by the library's real g5b_empty_facade_behavior_tests Fixture cases.
+        for observation in [
+            runtime::G5bEmptyTickObservation::Pending {
+                cohort_identity: "routing-only".to_owned(),
+                revision: 1,
+            },
+            runtime::G5bEmptyTickObservation::Sealed {
+                seal_identity: "routing-only".to_owned(),
+                revision: 1,
+                reason: "routing-only",
+            },
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let read = Arc::clone(&calls);
+            let models = Arc::clone(&calls);
+            let result = route_empty_before_models(
+                move || async move {
+                    read.lock().unwrap().push("inspect");
+                    Ok(observation)
+                },
+                move || async move {
+                    models.lock().unwrap().push("model");
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                !result,
+                "Empty routing must not request no-provider backoff"
+            );
+            assert_eq!(*calls.lock().unwrap(), vec!["inspect"]);
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let read = Arc::clone(&calls);
+        let models = Arc::clone(&calls);
+        let result = route_empty_before_models(
+            move || async move {
+                read.lock().unwrap().push("inspect");
+                Ok(runtime::G5bEmptyTickObservation::ContinueNonEmpty)
+            },
+            move || async move {
+                models.lock().unwrap().push("model");
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            result,
+            "only ordinary model preflight may request provider backoff"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["inspect", "model"]);
+    }
+
+    #[tokio::test]
+    async fn g5b_empty_runtime_failed_actual_observation_cannot_fall_through_to_models() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&calls);
+        let error = route_empty_before_models(
+            || async { Err("known positive source replaced".to_owned()) },
+            move || async move {
+                output.lock().unwrap().push("model");
+                Ok(false)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "known positive source replaced");
+        assert!(calls.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn g5b_v2_runtime_saved_later_member_is_recovered_after_earlier_gaps() {
