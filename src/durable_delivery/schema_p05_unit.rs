@@ -173,7 +173,9 @@ pub(super) fn verify_catalog(connection: &Connection) -> Result<()> {
         rows.sort();
         rows
     });
-    let mut statement = connection.prepare("SELECT type,name,COALESCE(sql,'') FROM main.sqlite_master WHERE sql IS NOT NULL AND (lower(name) GLOB 'p05_*' OR lower(tbl_name) GLOB 'p05_*') ORDER BY type,name")?;
+    // Schema14 attests its separate p05_s2 catalog. The original seven table
+    // declarations and their original triggers retain this exact manifest.
+    let mut statement = connection.prepare("SELECT type,name,COALESCE(sql,'') FROM main.sqlite_master WHERE sql IS NOT NULL AND (lower(name) GLOB 'p05_*' OR lower(tbl_name) GLOB 'p05_*') AND lower(name) NOT GLOB 'p05_s2_*' AND lower(tbl_name) NOT GLOB 'p05_s2_*' ORDER BY type,name")?;
     let actual = statement
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<Vec<(String, String, String)>>>()?;
@@ -197,6 +199,7 @@ fn invalid(reason: &str) -> DurableDeliveryError {
 
 #[cfg(test)]
 pub(super) fn remove_empty_extension_for_legacy_test(connection: &Connection) {
+    super::schema_p05_unit_runtime::remove_empty_extension_for_legacy_test(connection);
     for table in TABLES {
         let rows: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))

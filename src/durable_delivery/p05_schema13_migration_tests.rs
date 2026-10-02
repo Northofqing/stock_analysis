@@ -81,7 +81,10 @@ fn version(path: &Path) -> i64 {
 fn p05_unit_store_schema13_fresh_has_seven_empty_tables_and_unmodified_schema12_manifest() {
     let fixture = Fixture::new("P05_SCHEMA13_FRESH");
     let connection = Connection::open(&fixture.database_path).unwrap();
-    assert_eq!(version(&fixture.database_path), 13);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     super::super::schema_p05_unit::verify_catalog(&connection).unwrap();
     super::super::schema_g5b_cohort::verify_catalog(&connection).unwrap();
     for table in super::super::schema_p05_unit::TABLES {
@@ -143,7 +146,10 @@ fn p05_unit_store_schema13_v12_additive_preserves_all_old_rows_raw_policies_sequ
     let before = old_snapshot(&connection);
     drop(connection);
     let reopened = DurableDeliveryCoordinator::open(config).unwrap();
-    assert_eq!(version(&fixture.database_path), 13);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     let connection = Connection::open(&fixture.database_path).unwrap();
     assert_eq!(old_snapshot(&connection), before);
     super::super::schema_g5b_cohort::verify_catalog(&connection).unwrap();
@@ -174,7 +180,10 @@ fn p05_unit_store_schema13_v11_chain_adds_schema12_then13_without_changing_legac
     let before = old_snapshot(&connection);
     drop(connection);
     let reopened = DurableDeliveryCoordinator::open(config).unwrap();
-    assert_eq!(version(&fixture.database_path), 13);
+    assert_eq!(
+        version(&fixture.database_path),
+        super::super::schema::SCHEMA_VERSION
+    );
     let connection = Connection::open(&fixture.database_path).unwrap();
     // Only the exact schema12 objects may appear in the old-object snapshot.
     let after = old_snapshot(&connection);
@@ -251,7 +260,10 @@ fn p05_unit_store_schema13_current_missing_table_or_trigger_is_not_healed() {
         .is_err());
         let connection = Connection::open(&fixture.database_path).unwrap();
         assert_eq!(old_snapshot(&connection), before);
-        assert_eq!(version(&fixture.database_path), 13);
+        assert_eq!(
+            version(&fixture.database_path),
+            super::super::schema::SCHEMA_VERSION
+        );
         let name = object.split_whitespace().nth(1).unwrap();
         assert_eq!(
             connection

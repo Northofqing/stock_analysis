@@ -721,6 +721,11 @@ fn p05_unit_store_future_completed_baseline_shape_cas_is_reserved_and_current_re
     let (_dir, db) = operational();
     let draft = draft(&fixture, &db, false);
     let connection = Connection::open(&fixture.database_path).unwrap();
+    // Shape the real schema13 extension without discarding its nonempty draft.
+    super::super::super::schema_p05_unit_runtime::remove_empty_extension_for_legacy_test(
+        &connection,
+    );
+    connection.pragma_update(None, "user_version", 13).unwrap();
     super::super::super::schema::register_sha256_function(&connection).unwrap();
     connection
         .pragma_update(None, "foreign_keys", "ON")

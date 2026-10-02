@@ -313,7 +313,7 @@ impl DurableDeliveryCoordinator {
         let result=session.with_held_transaction_sql(&verify,Some(&validate_sql),|tx| {
             bundle.verify_sql(&session,tx)?;
             self.mutation_transaction_body(tx,&route,|tx| {
-                let effect=self.prepare_transaction_body(tx,&route,envelope,&raw,&sha,sink_count,now,None,Some(&admission))?;
+                let effect=self.prepare_transaction_body(tx,&route,envelope,&raw,&sha,sink_count,now,None,Some(&admission),None)?;
                 match &effect {
                     MutationEffect::Changed(PrepareTransactionOutcome::Inserted)=> {
                         tx.execute("INSERT INTO g5b_occurrence_owners(occurrence_identity,business_date,cohort_identity,decision_identity,frozen_canonical,frozen_sha256,source_canonical,source_sha256,rendered_bytes,rendered_sha256,envelope_canonical,envelope_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![admission.bytes.occurrence,date.to_string(),admission.bytes.cohort,envelope.decision_identity,admission.bytes.frozen,sha256_hex(&admission.bytes.frozen),admission.bytes.source,sha256_hex(&admission.bytes.source),admission.bytes.rendered,sha256_hex(&admission.bytes.rendered),raw,sha])?;

@@ -48,6 +48,9 @@ pub use candidate_board::{
 };
 #[path = "coordinator_p05_unit.rs"]
 mod p05_unit;
+pub(crate) use p05_unit::runtime::P05UnitReceiptObservation;
+pub use p05_unit::runtime::{P05ChildReceiptObservation, P05NonAcceptedTerminal};
+pub use p05_unit::P05InvalidationRenderFacts;
 pub(crate) use p05_unit::{
     P05ObservedDraftInput, P05ObservedSourceBytes, P05PredictionStart, StoredP05Draft,
     StoredP05Intent,
@@ -437,6 +440,9 @@ pub(crate) enum OperationPostvalidationTestFault {
     SchemaVersion(i64),
     G5bHeadRevisionAdvance,
     G5bHeadArtifactStateDrift,
+    P05UnitRevisionWithoutEvent,
+    P05ActualExtraMutation,
+    P05CompletionPointerDrift,
 }
 
 #[derive(Clone, Copy)]
@@ -3197,6 +3203,17 @@ impl DurableDeliveryCoordinator {
         route: &DecisionMutationRoute,
         operation: impl FnOnce(&Transaction<'_>) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
+        self.with_mutation_transaction_declared(route, |tx, _| operation(tx))
+    }
+
+    fn with_mutation_transaction_declared<T>(
+        &self,
+        route: &DecisionMutationRoute,
+        operation: impl FnOnce(
+            &Transaction<'_>,
+            &p05_unit::runtime::SqlDependencies,
+        ) -> Result<MutationEffect<T>>,
+    ) -> Result<T> {
         // Routing has released every attestation lease and connection mutex.
         // Never acquire a date lock from inside a SQLite operation.
         #[cfg(test)]
@@ -3218,10 +3235,39 @@ impl DurableDeliveryCoordinator {
         };
         let validator: Option<&dyn Fn() -> Result<()>> =
             fence.as_ref().map(|_| &validate as &dyn Fn() -> Result<()>);
-        let outcome = self.with_immediate_transaction_validated(
+        let p05_date =
+            self.with_mutation_routing_connection(|c| p05_unit::runtime::mutation_date(c, route))?;
+        let p05_binding = std::cell::RefCell::new(None::<p05_unit::runtime::SqlBinding>);
+        let p05_dependencies = p05_unit::runtime::SqlDependencies::default();
+        let p05_validate = |c: &Transaction<'_>| {
+            p05_binding
+                .borrow()
+                .as_ref()
+                .ok_or_else(|| {
+                    DurableDeliveryError::PolicyMismatch("P05 mutation SQL witness absent".into())
+                })?
+                .validate(c)?;
+            p05_dependencies.validate(c)
+        };
+        let sql_validator: Option<&dyn Fn(&Transaction<'_>) -> Result<()>> = p05_date
+            .as_ref()
+            .map(|_| &p05_validate as &dyn Fn(&Transaction<'_>) -> Result<()>);
+        let outcome = self.with_immediate_transaction_validated_sql(
             SchemaVersionPolicy::Runtime,
             validator,
-            |transaction| self.mutation_transaction_body(transaction, route, operation),
+            sql_validator,
+            |transaction| {
+                let value = self.mutation_transaction_body(transaction, route, |tx| {
+                    operation(tx, &p05_dependencies)
+                })?;
+                if let Some(date) = &p05_date {
+                    p05_binding.replace(Some(p05_unit::runtime::capture_sql_binding(
+                        transaction,
+                        date,
+                    )?));
+                }
+                Ok(value)
+            },
         );
         // Covers the connection core's post-SQL hooks as well as the commit
         // boundary, and preserves committed/compound error evidence.
@@ -3246,10 +3292,15 @@ impl DurableDeliveryCoordinator {
         operation: impl FnOnce(&Transaction<'_>) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
         route.validate(transaction)?;
+        let p05_before = p05_unit::runtime::before_mutation(transaction, route)?;
         match operation(transaction)? {
-            MutationEffect::NoChange(value) => Ok(value),
+            MutationEffect::NoChange(value) => {
+                p05_unit::runtime::verify_no_change(transaction, p05_before)?;
+                Ok(value)
+            }
             MutationEffect::Changed(value) => {
                 self.advance_g5b_mutation_revision_tx(transaction, route)?;
+                p05_unit::runtime::after_mutation(transaction, p05_before, route)?;
                 Ok(value)
             }
         }
@@ -3293,6 +3344,7 @@ impl DurableDeliveryCoordinator {
         transaction: &Transaction<'_>,
         route: &DecisionMutationRoute,
     ) -> Result<()> {
+        p05_unit::runtime::require_business_open(transaction, route)?;
         if let Some(date) = route.g5b_date {
             let sealed: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM g5b_day_seals WHERE business_date=?1)",
@@ -3306,6 +3358,16 @@ impl DurableDeliveryCoordinator {
             }
         }
         Ok(())
+    }
+
+    fn require_business_open_declared_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        route: &DecisionMutationRoute,
+        dependencies: &p05_unit::runtime::SqlDependencies,
+    ) -> Result<()> {
+        self.require_g5b_business_open_tx(transaction, route)?;
+        dependencies.require_business_open(transaction, route)
     }
 
     /// The monitor verifies producer catalog membership and the full P01 input
@@ -3371,6 +3433,7 @@ impl DurableDeliveryCoordinator {
                 admission_at,
                 origin_observation,
                 None,
+                None,
             )
         })?;
         match transaction_outcome {
@@ -3405,6 +3468,7 @@ impl DurableDeliveryCoordinator {
         admission_at: DateTime<Utc>,
         origin_observation: Option<&CorrelationObservationV1>,
         g5b_admission: Option<&g5b_v2::Admission<'_>>,
+        p05_admission: Option<&p05_unit::runtime::ChildAdmission<'_>>,
     ) -> Result<MutationEffect<PrepareTransactionOutcome>> {
         if let Some(existing) = load_decision(transaction, &envelope.decision_identity)? {
             if existing.envelope_canonical.as_slice() == raw_canonical
@@ -3459,6 +3523,7 @@ impl DurableDeliveryCoordinator {
         }
 
         g5b_v2::validate_new_prepare_tx(transaction, envelope, g5b_admission)?;
+        p05_unit::runtime::validate_new_prepare(transaction, envelope, p05_admission)?;
         self.require_g5b_business_open_tx(transaction, route)?;
         envelope.validate()?;
         if envelope.push_kind == PushKind::CandidateBoard {
@@ -4557,7 +4622,7 @@ impl DurableDeliveryCoordinator {
     /// `resume_deliverable` 会对该决策走 `reacquire_rejected` 重开 attempt。
     pub fn authorize_rejected_retry(&self, decision_identity: &str) -> Result<()> {
         let route = self.decision_mutation_route(decision_identity)?;
-        self.with_mutation_transaction(&route, |transaction| {
+        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
             let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;
@@ -4570,7 +4635,7 @@ impl DurableDeliveryCoordinator {
             if stored.retry_authorized {
                 return Ok(MutationEffect::NoChange(()));
             }
-            self.require_g5b_business_open_tx(transaction, &route)?;
+            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
             transaction.execute(
                 "UPDATE delivery_decisions SET retry_authorized=1,updated_at=datetime('now')
                  WHERE decision_identity=?1 AND state='RejectedDurable'",
@@ -4647,7 +4712,7 @@ impl DurableDeliveryCoordinator {
         let Some(route) = route else {
             return Ok(false);
         };
-        self.with_mutation_transaction(&route, |transaction| {
+        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
             let current: Option<(String, String)> = transaction
                 .query_row(
                     "SELECT a.lease_expires_at,a.lease_heartbeat_at FROM delivery_attempts a
@@ -4672,7 +4737,7 @@ impl DurableDeliveryCoordinator {
             {
                 return Ok(MutationEffect::NoChange(true));
             }
-            self.require_g5b_business_open_tx(transaction, &route)?;
+            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
             let changed = transaction.execute(
                 "UPDATE delivery_attempts
                  SET lease_expires_at=?1,lease_heartbeat_at=?2
@@ -4868,7 +4933,7 @@ impl DurableDeliveryCoordinator {
         )?;
 
         let route = self.decision_mutation_route(&command.decision_identity)?;
-        self.with_mutation_transaction(&route, |transaction| {
+        self.with_mutation_transaction_declared(&route, |transaction, dependencies| {
             let stored =
                 load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
@@ -4879,7 +4944,7 @@ impl DurableDeliveryCoordinator {
                     stored.state
                 )));
             }
-            self.require_g5b_business_open_tx(transaction, &route)?;
+            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
             let attempt_identity = stored.current_attempt_identity.clone().ok_or_else(|| {
                 DurableDeliveryError::InvalidManualResolution(
                     "uncertain decision has no original attempt".to_owned(),
@@ -5564,8 +5629,8 @@ impl DurableDeliveryCoordinator {
 
     #[cfg(test)]
     fn apply_g5b_head_revision_test_fault(&self, transaction: &Transaction<'_>) -> Result<()> {
-        // Only this new fault is consumed at the second after-SQL boundary.
-        // All older faults retain their original one-pass timing.
+        // Owned revision/binding faults may be armed by the second after-SQL
+        // hook. Other faults retain their original one-pass timing.
         let pending = *self
             .operation_postvalidation_test_fault
             .lock()
@@ -5579,6 +5644,9 @@ impl DurableDeliveryCoordinator {
             Some(
                 OperationPostvalidationTestFault::G5bHeadRevisionAdvance
                     | OperationPostvalidationTestFault::G5bHeadArtifactStateDrift
+                    | OperationPostvalidationTestFault::P05UnitRevisionWithoutEvent
+                    | OperationPostvalidationTestFault::P05ActualExtraMutation
+                    | OperationPostvalidationTestFault::P05CompletionPointerDrift
             )
         ) {
             self.apply_operation_postvalidation_test_fault(transaction)?;
@@ -5605,6 +5673,43 @@ impl DurableDeliveryCoordinator {
         };
         let whitespace = " \t\n\r";
         let changed = match fault {
+            OperationPostvalidationTestFault::P05ActualExtraMutation => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE P05 fault cannot access Production".into(),
+                    ));
+                }
+                p05_unit::runtime::actual_extra_mutation_for_test(transaction)?;
+                return Ok(());
+            }
+            OperationPostvalidationTestFault::P05CompletionPointerDrift => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE P05 fault cannot access Production".into(),
+                    ));
+                }
+                let changed=transaction.execute("UPDATE p05_s2_completion_heads SET current_completion_identity=NULL WHERE current_completion_identity IS NOT NULL",[])?;
+                p05_unit::validate_rows(transaction)?;
+                changed
+            }
+            OperationPostvalidationTestFault::P05UnitRevisionWithoutEvent => {
+                if !matches!(
+                    self.config.environment,
+                    super::model::StoreEnvironment::Test { .. }
+                ) {
+                    return Err(DurableDeliveryError::InvalidConfiguration(
+                        "TEST_CODE P05 fault cannot access Production".into(),
+                    ));
+                }
+                transaction.execute("UPDATE p05_unit_heads SET mutation_revision=mutation_revision+1 WHERE phase='IntentComplete'",[])?
+            }
+
             OperationPostvalidationTestFault::G5bHeadArtifactStateDrift => {
                 if !matches!(
                     self.config.environment,
@@ -6025,7 +6130,7 @@ impl DurableDeliveryCoordinator {
         let route = self.with_mutation_routing_connection(|connection| {
             DecisionMutationRoute::from_stored(connection, stored)
         })?;
-        self.with_pre_sink_mutation_transaction(&route, |transaction| {
+        self.with_p05_business_pre_sink_transaction(&route, |transaction, dependencies| {
             let current =
                 load_decision(transaction, &stored.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(stored.decision_identity.clone())
@@ -6070,7 +6175,7 @@ impl DurableDeliveryCoordinator {
             {
                 return Ok(MutationEffect::NoChange(false));
             }
-            self.require_g5b_business_open_tx(transaction, &route)?;
+            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
             let generation = current.reservation_generation + 1;
             self.reserve_generation(transaction, &envelope, &policy, generation, now)?;
             transition_existing_state(
@@ -6096,14 +6201,14 @@ impl DurableDeliveryCoordinator {
         now: DateTime<Utc>,
     ) -> Result<Option<AttemptLease>> {
         let route = self.decision_mutation_route(decision_identity)?;
-        self.with_pre_sink_mutation_transaction(&route, |transaction| {
+        self.with_p05_business_pre_sink_transaction(&route, |transaction, dependencies| {
             let stored = load_decision(transaction, decision_identity)?.ok_or_else(|| {
                 DurableDeliveryError::DecisionNotFound(decision_identity.to_owned())
             })?;
             if stored.state != DecisionState::Reserved {
                 return Ok(MutationEffect::NoChange(None));
             }
-            self.require_g5b_business_open_tx(transaction, &route)?;
+            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
             let envelope = parse_envelope(&stored.envelope_canonical)?;
             if authoritative_sink_count != 1 {
                 let denial = PrepareDenial::InvalidSinkCardinality(authoritative_sink_count);

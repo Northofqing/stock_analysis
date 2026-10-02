@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+pub(crate) const SCHEMA_VERSION: i64 = 14;
 
 #[cfg(test)]
 thread_local! {
@@ -104,11 +104,16 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
     } else {
         super::schema_g5b_cohort::reject_preexisting_extension(transaction)?;
     }
-    if current_version == 13 {
+    if current_version >= 13 {
         super::schema_p05_unit::verify_catalog(transaction)?;
         super::coordinator::validate_p05_unit_rows(transaction)?;
     } else {
         super::schema_p05_unit::reject_preexisting_extension(transaction)?;
+    }
+    if current_version == 14 {
+        super::schema_p05_unit_runtime::verify_catalog(transaction)?;
+    } else {
+        super::schema_p05_unit_runtime::reject_preexisting_extension(transaction)?;
     }
     match current_version {
         1 => {
@@ -865,11 +870,15 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
     if current_version < 13 {
         super::schema_p05_unit::initialize(transaction)?;
     }
+    if current_version < 14 {
+        super::schema_p05_unit_runtime::initialize(transaction)?;
+    }
     super::schema_g5b_cohort::verify_catalog(transaction)?;
     super::schema_g5b_cohort::verify_foreign_keys(transaction)?;
     super::coordinator::validate_g5b_cohort_rows(transaction)?;
-    super::coordinator::validate_p05_unit_rows(transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    super::schema_p05_unit_runtime::verify_catalog(transaction)?;
+    super::coordinator::validate_p05_unit_rows(transaction)?;
     Ok(())
 }
 

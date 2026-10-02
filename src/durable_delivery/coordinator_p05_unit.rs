@@ -11,6 +11,9 @@ const POLICY: &str = "P05_AUCTION_UNIT_FIRST_OBSERVED_V1";
 const MAX_BYTES: usize = 4_194_304;
 const MAX_ROWS: usize = 512;
 
+#[path = "coordinator_p05_unit_runtime.rs"]
+pub(super) mod runtime;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum ObservedTier {
@@ -243,7 +246,7 @@ fn ensure_no_legacy_family(connection: &Connection, date: &str) -> Result<()> {
     }
     Ok(())
 }
-fn load_origin(connection: &Connection, id: &str) -> Result<ProspectiveOrigin> {
+fn load_prospective_origin(connection: &Connection, id: &str) -> Result<ProspectiveOrigin> {
     let reserved: i64 = connection.query_row("SELECT COUNT(*) FROM p05_baseline_origins WHERE origin_identity=?1 AND (completed_unit_identity IS NOT NULL OR completed_receipt_identity IS NOT NULL OR accepted_physical_refs IS NOT NULL)",[id],|r|r.get(0))?;
     if reserved != 0 {
         return Err(invalid("P1 cannot adopt reserved Completed origin fields"));
@@ -279,10 +282,46 @@ fn load_origin(connection: &Connection, id: &str) -> Result<ProspectiveOrigin> {
     }
     Ok(data)
 }
+struct OriginObservation {
+    business_date: String,
+    kind: String,
+    codes: Vec<String>,
+    completed_unit: Option<String>,
+    completed_receipt: Option<String>,
+}
+fn load_origin(c: &Connection, id: &str) -> Result<OriginObservation> {
+    let kind: String = c.query_row(
+        "SELECT origin_kind FROM p05_baseline_origins WHERE origin_identity=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    match kind.as_str() {
+        "ProspectiveNoPreviousV2Baseline" => {
+            let origin = load_prospective_origin(c, id)?;
+            Ok(OriginObservation {
+                business_date: origin.business_date,
+                kind,
+                codes: Vec::new(),
+                completed_unit: None,
+                completed_receipt: None,
+            })
+        }
+        "CompletedUnitV2Baseline" => runtime::load_completed_origin(c, id),
+        _ => Err(invalid("unknown baseline origin kind")),
+    }
+}
 fn load_draft(
     connection: &Connection,
     date: &str,
     namespace: FileObjectIdentity,
+) -> Result<Option<StoredP05Draft>> {
+    load_draft_inner(connection, date, namespace, true)
+}
+fn load_draft_inner(
+    connection: &Connection,
+    date: &str,
+    namespace: FileObjectIdentity,
+    validate_origin: bool,
 ) -> Result<Option<StoredP05Draft>> {
     type Row = (
         String,
@@ -300,12 +339,21 @@ fn load_draft(
     else {
         return Ok(None);
     };
-    verify_blob(&id, &bytes, &hash, &image, "p05-unit-draft-v1")?;
     let data: DraftCanonical = decode(&bytes)?;
+    if !matches!(
+        data.schema.as_str(),
+        "p05-unit-draft-v1" | "p05-unit-draft-v2"
+    ) {
+        return Err(invalid("unknown draft codec"));
+    }
+    verify_blob(&id, &bytes, &hash, &image, &data.schema)?;
     validate_input(&data.input)?;
-    let origin = load_origin(connection, &origin_id)?;
-    if data.schema != "p05-unit-draft-v1"
-        || family != FAMILY
+    let origin = if validate_origin {
+        Some(load_origin(connection, &origin_id)?)
+    } else {
+        None
+    };
+    if family != FAMILY
         || data.family != family
         || policy != POLICY
         || data.policy != policy
@@ -316,15 +364,19 @@ fn load_draft(
             != date
         || data.unit_occurrence != occurrence
         || occurrence != unit_occurrence(date)
-        || revision != 0
+        || revision < 0
         || data.baseline_revision != revision
         || data.baseline_origin_identity != origin_id
-        || origin.business_date != date
-        || data.baseline_kind != origin.kind
         || data.current_codes != current_codes(&data.input)
         || data.strong_recipe != strong_recipe(&data.input)?
     {
         return Err(invalid("stored draft contract differs"));
+    }
+    if let Some(origin) = origin {
+        if data.baseline_kind != origin.kind {
+            return Err(invalid("draft baseline kind differs"));
+        }
+        validate_baseline_draft(&data, &origin)?;
     }
     Ok(Some(StoredP05Draft {
         namespace,
@@ -567,7 +619,15 @@ fn load_intent(
     date: &str,
     namespace: FileObjectIdentity,
 ) -> Result<Option<StoredP05Intent>> {
-    let Some(draft) = load_draft(connection, date, namespace)? else {
+    load_intent_inner(connection, date, namespace, true)
+}
+fn load_intent_inner(
+    connection: &Connection,
+    date: &str,
+    namespace: FileObjectIdentity,
+    validate_origin: bool,
+) -> Result<Option<StoredP05Intent>> {
+    let Some(draft) = load_draft_inner(connection, date, namespace, validate_origin)? else {
         return Ok(None);
     };
     type Row = (String, String, i64, Vec<u8>, String, Vec<u8>);
@@ -575,24 +635,25 @@ fn load_intent(
     let Some((id, start_id, count, bytes, hash, image)) = row else {
         return Ok(None);
     };
-    verify_blob(&id, &bytes, &hash, &image, "p05-unit-intent-v1")?;
     let data: IntentCanonical = decode(&bytes)?;
+    let schema = if draft.data.schema == "p05-unit-draft-v1" {
+        "p05-unit-intent-v1"
+    } else {
+        "p05-unit-intent-v2"
+    };
+    verify_blob(&id, &bytes, &hash, &image, schema)?;
     let start = load_started(connection, &draft.identity, namespace)?
         .ok_or_else(|| invalid("intent Started missing"))?;
-    if data.schema != "p05-unit-intent-v1"
+    if data.schema != schema
         || data.draft_identity != draft.identity
         || data.started_event_identity != start_id
         || start_id != start.identity
-        || count != 2
-        || data.ordered_child_identities.len() != 2
+        || count != data.ordered_child_identities.len() as i64
         || data.invalidated != draft.data.invalidated
     {
         return Err(invalid("complete intent set differs"));
     }
-    let expected = [
-        original_v1_envelope(&draft.data, PushKind::AuctionRepush)?,
-        board_from_stored_observation(&draft.data, &data.prediction)?,
-    ];
+    let expected = expected_children(&draft.data, &data.prediction)?;
     let mut statement=connection.prepare("SELECT child_identity,draft_identity,ordinal,child_kind,decision_identity,child_canonical,child_sha256,child_preimage FROM p05_unit_children WHERE intent_identity=?1 ORDER BY ordinal")?;
     type ChildRow = (
         String,
@@ -618,7 +679,7 @@ fn load_intent(
             ))
         })?
         .collect::<rusqlite::Result<Vec<ChildRow>>>()?;
-    if rows.len() != 2 {
+    if rows.len() != expected.len() || rows.len() != count as usize {
         return Err(invalid("intent does not contain every required child"));
     }
     let mut children = Vec::new();
@@ -638,11 +699,7 @@ fn load_intent(
             "p05-unit-child-v1",
         )?;
         let child: ChildCanonical = decode(&canonical)?;
-        let expected_kind = if index == 0 {
-            "AuctionRepush"
-        } else {
-            "CandidateBoard"
-        };
+        let expected_kind = envelope.push_kind.as_str();
         if child.schema != "p05-unit-child-v1"
             || draft_id != draft.identity
             || child.draft_identity != draft.identity
@@ -679,23 +736,27 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
     if invalid_fk != 0 {
         return Err(invalid("P05 foreign key violation"));
     }
-    let mut origins = connection
-        .prepare("SELECT origin_identity FROM p05_baseline_origins ORDER BY origin_identity")?;
-    let ids = origins
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in &ids {
-        load_origin(connection, id)?;
-    }
-    let heads:Vec<(String,i64,String)>=connection.prepare("SELECT family,baseline_revision,origin_identity FROM p05_baseline_heads ORDER BY family")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-    if heads.len() != ids.len()
-        || heads
-            .iter()
-            .any(|(family, revision, id)| family != FAMILY || *revision != 0 || !ids.contains(id))
-    {
-        return Err(invalid(
-            "baseline head differs from immutable prospective origin",
-        ));
+    let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version >= 14 {
+        runtime::validate_baseline_rows(connection)?;
+    } else {
+        let ids = connection
+            .prepare("SELECT origin_identity FROM p05_baseline_origins ORDER BY origin_identity")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in &ids {
+            load_prospective_origin(connection, id)?;
+        }
+        let heads:Vec<(String,i64,String)>=connection.prepare("SELECT family,baseline_revision,origin_identity FROM p05_baseline_heads ORDER BY family")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        if heads.len() != ids.len()
+            || heads
+                .iter()
+                .any(|(family, rev, id)| family != FAMILY || *rev != 0 || !ids.contains(id))
+        {
+            return Err(invalid(
+                "pre14 baseline must remain original prospective P1",
+            ));
+        }
     }
     // Identity is irrelevant to validation; no capability leaves this function.
     let namespace = FileObjectIdentity {
@@ -722,7 +783,9 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
         let valid = match (revision, phase.as_str(), started, intent, current) {
             (1, "Draft", None, None, None) => true,
             (2, "Started", Some(_), None, None) => true,
-            (3, "IntentComplete", Some(_), Some(intent), Some(current)) => {
+            (rev, "IntentComplete", Some(_), Some(intent), Some(current))
+                if rev == 3 || (version >= 14 && rev > 3) =>
+            {
                 intent.identity == current
             }
             _ => false,
@@ -732,6 +795,9 @@ pub(super) fn validate_rows(connection: &Connection) -> Result<()> {
                 "Unit mutation head differs from complete stored preparation",
             ));
         }
+    }
+    if version >= 14 {
+        runtime::validate_runtime_rows(connection)?;
     }
     Ok(())
 }
@@ -858,8 +924,135 @@ struct StrongRecipe {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum InvalidatedPreparation {
-    // This is prospective policy initialization, not EmptyObservedDifference or Accepted.
+    // Prospective policy initialization is not an empty market difference or Accepted.
     ProspectiveNoPreviousV2Baseline,
+    CompletedBaseline {
+        origin_date: String,
+        unit_identity: String,
+        receipt_identity: String,
+        removals: Vec<InvalidatedObservation>,
+    },
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvalidatedObservation {
+    code: String,
+    name: String,
+    prev: String,
+    reason: String,
+    scope_key: String,
+    rendered: Vec<u8>,
+}
+/// Ordinary renderer input computed exclusively from the actual immutable baseline.
+/// These fields carry no source, owner, completion or sink authority.
+#[derive(Debug)]
+pub struct P05InvalidationRenderFacts {
+    business_date: String,
+    hhmmss: String,
+    code: String,
+    name: String,
+    prev: String,
+    reason: String,
+}
+impl P05InvalidationRenderFacts {
+    pub fn business_date(&self) -> &str {
+        &self.business_date
+    }
+    pub fn hhmmss(&self) -> &str {
+        &self.hhmmss
+    }
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn previous_state(&self) -> &str {
+        &self.prev
+    }
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+fn invalidated_envelopes(draft: &DraftCanonical) -> Result<Vec<DeliveryEnvelope>> {
+    let removals = match &draft.invalidated {
+        InvalidatedPreparation::ProspectiveNoPreviousV2Baseline => return Ok(Vec::new()),
+        InvalidatedPreparation::CompletedBaseline { removals, .. } => removals,
+    };
+    removals.iter().map(|row| {
+        let source=serde_json::to_vec(&json!({"schema":"candidate-invalidated-v1","business_date":draft.business_date,"code":row.code,"prev":row.prev,"reason":row.reason,"rendered_sha256":sha256_hex(&row.rendered)}))?;
+        let hash=sha256_hex(&source);
+        DeliveryEnvelope::new(&draft.business_date,PushKind::CandidateInvalidated,super::super::model::DeliverySubKind::None,&row.scope_key,format!("candidate-invalidated:{}:{}",draft.business_date,row.code),&hash,source,&hash,row.rendered.clone(),true,None)
+    }).collect()
+}
+fn expected_children(
+    draft: &DraftCanonical,
+    prediction: &PredictionObservation,
+) -> Result<Vec<DeliveryEnvelope>> {
+    let mut children = vec![original_v1_envelope(draft, PushKind::AuctionRepush)?];
+    children.extend(invalidated_envelopes(draft)?);
+    children.push(board_from_stored_observation(draft, prediction)?);
+    Ok(children)
+}
+fn validate_baseline_draft(draft: &DraftCanonical, origin: &OriginObservation) -> Result<()> {
+    match (
+        &draft.invalidated,
+        &origin.completed_unit,
+        &origin.completed_receipt,
+    ) {
+        (InvalidatedPreparation::ProspectiveNoPreviousV2Baseline, None, None)
+            if draft.schema == "p05-unit-draft-v1"
+                && draft.baseline_revision == 0
+                && origin.business_date == draft.business_date
+                && origin.kind == "ProspectiveNoPreviousV2Baseline" =>
+        {
+            Ok(())
+        }
+        (
+            InvalidatedPreparation::CompletedBaseline {
+                origin_date,
+                unit_identity,
+                receipt_identity,
+                removals,
+            },
+            Some(unit),
+            Some(receipt),
+        ) if draft.schema == "p05-unit-draft-v2"
+            && draft.baseline_revision > 0
+            && origin.business_date < draft.business_date
+            && origin_date == &origin.business_date
+            && unit_identity == unit
+            && receipt_identity == receipt =>
+        {
+            let expected = origin
+                .codes
+                .iter()
+                .filter(|code| !draft.current_codes.contains(code))
+                .collect::<Vec<_>>();
+            if expected.len() != removals.len() {
+                return Err(invalid(
+                    "required T08 set differs from actual Completed baseline",
+                ));
+            }
+            for (code, row) in expected.into_iter().zip(removals) {
+                // The original dispatcher looks names up in the current batch;
+                // removed members are absent there, so its fallback is the code.
+                if code != &row.code
+                    || row.name != row.code
+                    || row.prev != "候选"
+                    || row.reason != "从候选台消失"
+                    || row.rendered.is_empty()
+                    || row.rendered.len() > 262144
+                    || std::str::from_utf8(&row.rendered).is_err()
+                    || row.scope_key != runtime::scope_key_for_stored_code(&row.code)?
+                {
+                    return Err(invalid("fixed removal observation differs"));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(invalid("baseline provenance/date/version differs")),
+    }
 }
 
 /// Verified local draft in one attested DB. It cannot be deserialized or sent.
@@ -1067,7 +1260,7 @@ impl DurableDeliveryCoordinator {
         let canonical = encode(&origin)?;
         let preimage = preimage("p05-prospective-origin-v1", &canonical);
         let id = sha256_hex(&preimage);
-        self.with_immediate_transaction(|tx| {
+        self.with_p05_immediate_transaction(&date,|tx| {
             let existing: Option<String>=tx.query_row("SELECT origin_identity FROM p05_baseline_heads WHERE family=?1",[FAMILY],|r|r.get(0)).optional()?;
             if let Some(existing)=existing { return Ok(existing); }
             if matches!(&self.config.environment,super::super::model::StoreEnvironment::Production) {
@@ -1207,6 +1400,25 @@ impl DurableDeliveryCoordinator {
         input: &P05ObservedDraftInput,
         test_now: Option<DateTime<Utc>>,
     ) -> Result<StoredP05Draft> {
+        self.store_p05_observed_draft_rendered(input, test_now, &mut |_| {
+            Err(invalid(
+                "T08 renderer unavailable for actual Completed baseline",
+            ))
+        })
+    }
+    pub(crate) fn store_p05_observed_draft_with_renderer(
+        &self,
+        input: &P05ObservedDraftInput,
+        renderer: &mut impl FnMut(&P05InvalidationRenderFacts) -> Result<Vec<u8>>,
+    ) -> Result<StoredP05Draft> {
+        self.store_p05_observed_draft_rendered(input, None, renderer)
+    }
+    fn store_p05_observed_draft_rendered(
+        &self,
+        input: &P05ObservedDraftInput,
+        test_now: Option<DateTime<Utc>>,
+        renderer: &mut impl FnMut(&P05InvalidationRenderFacts) -> Result<Vec<u8>>,
+    ) -> Result<StoredP05Draft> {
         if test_now.is_some() {
             self.require_p05_test_clock()?;
         }
@@ -1214,7 +1426,7 @@ impl DurableDeliveryCoordinator {
         let captured = parse_shanghai(&input.captured_shanghai)?;
         let date = captured.date_naive().to_string();
         let namespace = self.p05_namespace()?;
-        self.with_immediate_transaction(|tx| {
+        self.with_p05_immediate_transaction_declared(&date,|tx,dependencies| {
             // Existing winner is restored outside the fresh window, never overwritten.
             if let Some(existing)=load_draft(tx,&date,namespace)? { return Ok(existing); }
             #[cfg(not(test))] if test_now.is_some() { return Err(invalid("test clock unavailable")); }
@@ -1222,12 +1434,30 @@ impl DurableDeliveryCoordinator {
             ensure_no_legacy_family(tx,&date)?;
             let (origin_id,revision):(String,i64)=tx.query_row("SELECT origin_identity,baseline_revision FROM p05_baseline_heads WHERE family=?1",[FAMILY],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or_else(||invalid("NoPreviousBaseline: no real prospective origin"))?;
             let origin=load_origin(tx,&origin_id)?;
-            if origin.business_date!=date || revision!=0 { return Err(invalid("prospective origin belongs to another day; no Completed baseline exists")); }
-            let pending:i64=tx.query_row("SELECT COUNT(*) FROM p05_unit_drafts",[],|r|r.get(0))?;
-            if pending!=0 { return Err(invalid("previous Unit remains incomplete")); }
-            let data=DraftCanonical {schema:"p05-unit-draft-v1".into(),family:FAMILY.into(),policy:POLICY.into(),business_date:date.clone(),unit_occurrence:unit_occurrence(&date),baseline_origin_identity:origin_id,baseline_revision:revision,baseline_kind:origin.kind,input:input.clone(),current_codes:current_codes(input),strong_recipe:strong_recipe(input)?,invalidated:InvalidatedPreparation::ProspectiveNoPreviousV2Baseline};
+            let (schema,invalidated)=if origin.completed_unit.is_none() {
+                if origin.business_date!=date || revision!=0 {return Err(invalid("NoPreviousBaseline: prospective date differs"));}
+                let units:i64=tx.query_row("SELECT COUNT(*) FROM p05_unit_drafts",[],|r|r.get(0))?;
+                if units!=0 {return Err(invalid("prospective Unit residue"));}
+                ("p05-unit-draft-v1",InvalidatedPreparation::ProspectiveNoPreviousV2Baseline)
+            } else {
+                if origin.business_date>=date || revision<=0 {return Err(invalid("same day cannot create another episode or use future baseline"));}
+                dependencies.require_current_baseline(tx,&origin_id)?;
+                let pending:i64=tx.query_row("SELECT COUNT(*) FROM p05_unit_drafts d LEFT JOIN p05_s2_completion_heads h ON h.draft_identity=d.draft_identity WHERE d.business_date>?1 AND d.business_date<?2 AND h.first_completion_identity IS NULL",params![origin.business_date,date],|r|r.get(0))?;
+                if pending!=0 {return Err(invalid("intervening incomplete Unit blocks baseline skip"));}
+                let codes=current_codes(input);let mut removals=Vec::new();
+                for code in origin.codes.iter().filter(|code|!codes.contains(code)) {
+                    let scope=runtime::scope_key_for_new_code(code,matches!(self.config.environment,super::super::model::StoreEnvironment::Test {..}))?;
+                    let facts=P05InvalidationRenderFacts {business_date:date.clone(),hhmmss:captured.format("%H:%M:%S").to_string(),code:code.clone(),name:code.clone(),prev:"候选".into(),reason:"从候选台消失".into()};
+                    let rendered=renderer(&facts)?;
+                    if rendered.is_empty() || rendered.len()>262144 || std::str::from_utf8(&rendered).is_err() {return Err(invalid("original T08 renderer returned invalid UTF8 bytes"));}
+                    removals.push(InvalidatedObservation {code:code.clone(),name:facts.name,prev:facts.prev,reason:facts.reason,scope_key:scope,rendered});
+                }
+                ("p05-unit-draft-v2",InvalidatedPreparation::CompletedBaseline {origin_date:origin.business_date.clone(),unit_identity:origin.completed_unit.clone().unwrap(),receipt_identity:origin.completed_receipt.clone().unwrap(),removals})
+            };
+            let data=DraftCanonical {schema:schema.into(),family:FAMILY.into(),policy:POLICY.into(),business_date:date.clone(),unit_occurrence:unit_occurrence(&date),baseline_origin_identity:origin_id,baseline_revision:revision,baseline_kind:origin.kind,input:input.clone(),current_codes:current_codes(input),strong_recipe:strong_recipe(input)?,invalidated};
+            fresh_window(captured,test_now.unwrap_or_else(Utc::now))?;
             let canonical=encode(&data)?;
-            let preimage=preimage("p05-unit-draft-v1",&canonical);
+            let preimage=preimage(&data.schema,&canonical);
             let identity=sha256_hex(&preimage);
             tx.execute("INSERT INTO p05_unit_drafts(draft_identity,unit_occurrence,business_date,family,policy,baseline_revision,baseline_origin_identity,draft_canonical,draft_sha256,draft_preimage) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![identity,data.unit_occurrence,date,FAMILY,POLICY,revision,data.baseline_origin_identity,canonical,sha256_hex(&canonical),preimage])?;
             tx.execute("INSERT INTO p05_unit_heads(draft_identity,mutation_revision,phase) VALUES(?1,1,'Draft')",[&identity])?;
@@ -1243,9 +1473,12 @@ impl DurableDeliveryCoordinator {
         if namespace != draft.namespace {
             return Err(invalid("draft belongs to another namespace"));
         }
-        self.with_immediate_transaction(|tx| {
+        self.with_p05_immediate_transaction(&draft.data.business_date,|tx| {
             require_draft(tx,draft,namespace)?;
             if let Some(mut existing)=load_started(tx,&draft.identity,namespace)? { existing.claimed_here=false; return Ok(existing); }
+            if matches!(self.config.environment,super::super::model::StoreEnvironment::Production) {
+                fresh_window(parse_shanghai(&draft.data.input.captured_shanghai)?,Utc::now())?;
+            }
             let data=StartedCanonical {schema:"p05-prediction-start-v1".into(),draft_identity:draft.identity.clone(),phase:"Started".into(),started_utc:utc_text(Utc::now())};
             let canonical=encode(&data)?;
             let preimage=preimage("p05-prediction-start-v1",&canonical);
@@ -1323,7 +1556,10 @@ impl DurableDeliveryCoordinator {
             }
         };
         let auction = original_v1_envelope(&draft.data, PushKind::AuctionRepush)?;
-        let children = [auction, board]
+        let mut envelopes = vec![auction];
+        envelopes.extend(invalidated_envelopes(&draft.data)?);
+        envelopes.push(board);
+        let children = envelopes
             .into_iter()
             .enumerate()
             .map(|(ordinal, envelope)| {
@@ -1334,6 +1570,7 @@ impl DurableDeliveryCoordinator {
                     kind: match envelope.push_kind {
                         PushKind::AuctionRepush => "AuctionRepush",
                         PushKind::CandidateBoard => "CandidateBoard",
+                        PushKind::CandidateInvalidated => "CandidateInvalidated",
                         _ => unreachable!(),
                     }
                     .into(),
@@ -1351,7 +1588,12 @@ impl DurableDeliveryCoordinator {
             })
             .collect::<Result<Vec<_>>>()?;
         let data = IntentCanonical {
-            schema: "p05-unit-intent-v1".into(),
+            schema: if draft.data.schema == "p05-unit-draft-v1" {
+                "p05-unit-intent-v1"
+            } else {
+                "p05-unit-intent-v2"
+            }
+            .into(),
             draft_identity: draft.identity.clone(),
             started_event_identity: start.identity.clone(),
             prediction,
@@ -1359,9 +1601,9 @@ impl DurableDeliveryCoordinator {
             invalidated: draft.data.invalidated.clone(),
         };
         let canonical = encode(&data)?;
-        let preimage = preimage("p05-unit-intent-v1", &canonical);
+        let preimage = preimage(&data.schema, &canonical);
         let identity = sha256_hex(&preimage);
-        self.with_immediate_transaction(|tx| {
+        self.with_p05_immediate_transaction(&draft.data.business_date,|tx| {
             require_draft(tx,draft,namespace)?;
             let actual_start=load_started(tx,&draft.identity,namespace)?.ok_or_else(||invalid("Started claim missing"))?;
             if actual_start.identity!=start.identity || actual_start.canonical!=start.canonical {return Err(invalid("Started identity drift"));}
