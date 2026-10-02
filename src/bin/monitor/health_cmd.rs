@@ -33,6 +33,8 @@ const HEALTH_O_NONBLOCK: i32 = 0x0000_0800;
     target_os = "netbsd"
 ))]
 const HEALTH_O_NONBLOCK: i32 = 0x0000_0004;
+#[path = "health_cmd_runtime_snapshot.rs"]
+mod runtime_snapshot;
 #[path = "health_cmd_source_recovery.rs"]
 mod source_recovery;
 pub use source_recovery::write_raw_news_source_snapshot;
@@ -125,6 +127,7 @@ struct HealthReport {
     missing_capabilities: Vec<String>,
     coverage: &'static str,
     raw_news_source_recovery: source_recovery::SourceRecoveryReport,
+    runtime_snapshot: Option<runtime_snapshot::RuntimeHealthSnapshot>,
 }
 
 fn snapshot_path(root: &Path, test_mode: bool) -> PathBuf {
@@ -500,27 +503,26 @@ fn read_snapshot_at(path: &Path) -> Result<HealthSnapshot, &'static str> {
     Ok(snapshot)
 }
 
+#[cfg(test)]
 fn monitor_lease_identity(path: &Path) -> Option<String> {
-    let Ok(file) = open_regular_health_file(path) else {
-        return None;
-    };
-    match fs2::FileExt::try_lock_shared(&file) {
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            let mut bytes = Vec::new();
-            file.take(97).read_to_end(&mut bytes).ok()?;
-            let identity = std::str::from_utf8(&bytes).ok()?.trim_end_matches('\n');
-            valid_boot_id(identity).then(|| identity.to_owned())
-        }
-        Ok(()) => {
-            let _ = fs2::FileExt::unlock(&file);
-            None
-        }
-        Err(_) => None,
-    }
+    runtime_snapshot::MonitorLeaseObservation::read(path)
+        .boot_identity()
+        .map(str::to_owned)
 }
 
 fn report_at(root: &Path, test_mode: bool, now: DateTime<Utc>) -> HealthReport {
-    let lease_identity = monitor_lease_identity(&lease_path(root, test_mode));
+    report_at_with_boundary(root, test_mode, now, || {})
+}
+
+fn report_at_with_boundary(
+    root: &Path,
+    test_mode: bool,
+    now: DateTime<Utc>,
+    after_component_reads: impl FnOnce(),
+) -> HealthReport {
+    let lease_path = lease_path(root, test_mode);
+    let mut lease = runtime_snapshot::MonitorLeaseObservation::read(&lease_path);
+    let lease_identity = lease.boot_identity().map(str::to_owned);
     let mut report = report_from(
         read_snapshot_at(&snapshot_path(root, test_mode)),
         read_heartbeat_at(&heartbeat_path(root, test_mode), now),
@@ -529,6 +531,29 @@ fn report_at(root: &Path, test_mode: bool, now: DateTime<Utc>) -> HealthReport {
     );
     report.raw_news_source_recovery =
         source_recovery::report_at(root, test_mode, lease_identity.as_deref(), now);
+    after_component_reads();
+    if !lease.unchanged_at(&lease_path) {
+        // Discard the entire mixed observation, including otherwise-good modes
+        // and source rows. A changed lease must not leave old successful facts.
+        report = report_from(
+            Err("health_snapshot_process_mismatch"),
+            Err("process_heartbeat_process_mismatch"),
+            None,
+            now,
+        );
+        report.raw_news_source_recovery = source_recovery::SourceRecoveryReport::with_reason(
+            "raw_news_source_snapshot_process_mismatch",
+        );
+        report.runtime_snapshot = Some(runtime_snapshot::RuntimeHealthSnapshot::from_report(
+            &report, now, None,
+        ));
+        return report;
+    }
+    report.runtime_snapshot = Some(runtime_snapshot::RuntimeHealthSnapshot::from_report(
+        &report,
+        now,
+        lease_identity.as_deref(),
+    ));
     report
 }
 
@@ -538,6 +563,21 @@ fn fresh_at(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 }
 
 fn report_from(
+    snapshot: Result<HealthSnapshot, &'static str>,
+    heartbeat: Result<ProcessHeartbeat, &'static str>,
+    lease_identity: Option<String>,
+    now: DateTime<Utc>,
+) -> HealthReport {
+    let mut report = report_components_from(snapshot, heartbeat, lease_identity.clone(), now);
+    report.runtime_snapshot = Some(runtime_snapshot::RuntimeHealthSnapshot::from_report(
+        &report,
+        now,
+        lease_identity.as_deref(),
+    ));
+    report
+}
+
+fn report_components_from(
     snapshot: Result<HealthSnapshot, &'static str>,
     heartbeat: Result<ProcessHeartbeat, &'static str>,
     lease_identity: Option<String>,
@@ -565,6 +605,7 @@ fn report_from(
         missing_capabilities: Vec::new(),
         coverage: "banner_account_data_and_process_liveness_only",
         raw_news_source_recovery: source_recovery::SourceRecoveryReport::unavailable(),
+        runtime_snapshot: None,
     };
     match heartbeat {
         Err(reason) => report.heartbeat_reason_code = Some(reason),
@@ -663,7 +704,7 @@ pub fn run(command: HealthCommand) -> i32 {
 }
 
 fn render_text(report: &HealthReport) -> String {
-    format!(
+    let legacy = format!(
             "status={} reason={} monitor_running={} snapshot_fresh={} heartbeat_fresh={} heartbeat_status={} heartbeat_reason_code={} heartbeat_observed_at={} heartbeat_age_seconds={} observed_at={} observed_age_seconds={} account_evaluated_at={} account_age_seconds={} data_evaluated_at={} data_age_seconds={} account_mode={} data_mode={} account_metrics_complete={} missing_capabilities={} coverage={} raw_news_source_recovery_status={} raw_news_source_recovery_reason={} raw_news_source_recovery_sources={}",
             report.status,
             report.reason_code.unwrap_or("none"),
@@ -688,7 +729,11 @@ fn render_text(report: &HealthReport) -> String {
             report.raw_news_source_recovery.status,
             report.raw_news_source_recovery.reason_code.unwrap_or("none"),
             report.raw_news_source_recovery.source_summary(),
-        )
+        );
+    match &report.runtime_snapshot {
+        Some(snapshot) => format!("{legacy} {}", snapshot.text_summary()),
+        None => legacy,
+    }
 }
 
 #[cfg(test)]

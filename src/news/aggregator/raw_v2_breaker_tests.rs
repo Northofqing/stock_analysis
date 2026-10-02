@@ -78,6 +78,7 @@ fn record(provider: GlobalNewsProvider, evidence: &BatchEvidence) -> GlobalNewsR
 #[derive(Clone, Copy)]
 enum Scripted {
     Retryable,
+    ExternalTransport,
     Nonretryable,
     Available,
     VerifiedEmpty,
@@ -118,6 +119,13 @@ impl RawGlobalNewsPort for ScriptedPort {
             .pop_front()
             .unwrap_or(Scripted::VerifiedEmpty);
         match scripted {
+            Scripted::ExternalTransport => Err(
+                crate::data_gateway::grpc_source::map_external_connection_error(
+                    crate::grpc_client::errors::GrpcError::Unavailable {
+                        details: Box::default(),
+                    },
+                ),
+            ),
             Scripted::Retryable => Err(GatewayError::unavailable(
                 provider.capability(),
                 Some(provider.provider_id()),
@@ -143,6 +151,40 @@ impl RawGlobalNewsPort for ScriptedPort {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn m3_runtime_health_actual_external_transport_reason_retains_registry_outage() {
+    let clock = TestClock::new();
+    let registry = GlobalNewsSourceRegistry::new_at(clock.now());
+    let port = ScriptedPort::new();
+    for _ in 0..10 {
+        port.push(GlobalNewsProvider::Eastmoney, Scripted::ExternalTransport);
+        tick(&port, &registry, &clock).await;
+    }
+    let source = east(&registry);
+    assert_eq!(source.state, SourceBreakerState::Open);
+    assert_eq!(source.consecutive_retryable_failures, 10);
+    assert_eq!(
+        source.last_reason_code,
+        Some("external_transport_unavailable")
+    );
+    assert_eq!(source.last_retryable, Some(true));
+    assert_eq!(source.outage_started_at, Some(clock.now()));
+    assert_eq!(
+        source.next_probe_at,
+        Some(clock.now() + chrono::Duration::seconds(60))
+    );
+    assert!(
+        crate::data_gateway::grpc_source::is_known_global_news_recovery_reason(
+            source.last_reason_code.unwrap()
+        )
+    );
+    assert!(
+        !crate::data_gateway::grpc_source::is_known_global_news_recovery_reason(
+            "secret_token_test_code"
+        )
+    );
 }
 
 async fn tick(

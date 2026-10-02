@@ -1187,6 +1187,34 @@ fn reason_code_static(s: &str) -> &'static str {
         .unwrap_or("internal")
 }
 
+/// Read-only recognition for the raw GlobalNews recovery file. Reuses the
+/// existing wire directory and the local reasons emitted by ordinary routed
+/// query, External connection/query, capability and build-identity failures.
+/// This does not classify an error, admit a source, or change retry policy.
+pub fn is_known_global_news_recovery_reason(value: &str) -> bool {
+    reason_code_static(value) == value
+        || matches!(
+            value,
+            "unsupported_contract"
+                | "operation_retired"
+                | "external_bundle_unconfigured"
+                | "external_bundle_invalid"
+                | "external_authentication_failed"
+                | "external_permission_denied"
+                | "external_contract_unavailable"
+                | "external_transport_unavailable"
+                | "external_connection_failed"
+                | "external_query_unavailable"
+                | "external_contract_rejected"
+                | "external_capability_missing"
+                | "external_capability_unadmitted"
+                | "external_capability_runtime_unavailable"
+                | "external_health_not_ready"
+                | "external_expected_identity_missing"
+                | "external_build_identity_unverified"
+        )
+}
+
 /// 已挂桥的 op 清单 (与各网关文件内 `super::grpc_source::bridge_for("X")` 调用
 /// 一一对应)。变更时必须同步 — hooked_ops_match_bridge_for_call_sites 单测
 /// 直接扫 src/data_gateway 源码断言集合相等, 防 rot (Spec Evidence Rule)。

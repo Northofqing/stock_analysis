@@ -100,6 +100,7 @@ fn validate(file: &SourceRecoveryFile) -> Result<(), &'static str> {
                     || !reason.bytes().all(|byte| {
                         byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
                     })
+                    || !stock_analysis::data_gateway::grpc_source::is_known_global_news_recovery_reason(reason)
             })
             || source.last_failure_at.is_some() != source.last_reason_code.is_some()
             || source.last_failure_at.is_some() != source.last_retryable.is_some()
@@ -190,7 +191,7 @@ fn read_at(path: &Path) -> Result<SourceRecoveryFile, &'static str> {
     Ok(decoded)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct SourceRecoveryReport {
     pub(super) status: &'static str,
     pub(super) reason_code: Option<&'static str>,
@@ -205,7 +206,7 @@ impl SourceRecoveryReport {
         Self::with_reason("raw_news_source_snapshot_unavailable")
     }
 
-    fn with_reason(reason_code: &'static str) -> Self {
+    pub(super) fn with_reason(reason_code: &'static str) -> Self {
         Self {
             status: "unavailable",
             reason_code: Some(reason_code),
