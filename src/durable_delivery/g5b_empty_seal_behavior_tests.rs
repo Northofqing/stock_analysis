@@ -366,11 +366,17 @@ fn g5b_empty_seal_legacy_unknown_artifacts_and_real_legacy_decisions_prevent_fir
     }
     let fixture = Fixture::new("EMPTY_LEGACY_DECISION");
     setup(&fixture);
-    let candidate = g5b_frozen_envelope("EMPTY_LEGACY_DECISION", false);
-    fixture
+    let candidate = g5b_frozen_envelope_for_date("EMPTY_LEGACY_DECISION", false, DATE);
+    assert_eq!(candidate.business_date, DATE);
+    let prepared = fixture
         .coordinator
         .prepare(&candidate, 1, clock("15:10:00"))
         .unwrap();
+    assert_eq!(prepared.state, DeliveryState::Reserved);
+    assert_eq!(
+        fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions WHERE business_date='2026-09-28' AND push_kind='G5bAttribution'"),
+        1
+    );
     let before = b_rows(&fixture);
     let session = fixture.coordinator.g5b_day_session(date()).unwrap();
     assert!(session
@@ -540,7 +546,7 @@ fn g5b_empty_seal_real_eversealed_date_blocks_business_and_new_artifacts_but_exa
         assert!(session.attempt_empty_artifact_reopen_for_test().is_err());
         assert_eq!(session.recover_prepared_artifacts().unwrap(), 0);
     }
-    let candidate = g5b_frozen_envelope("EMPTY_EVERSEALED_FRESH", false);
+    let candidate = g5b_frozen_envelope_for_date("EMPTY_EVERSEALED_FRESH", false, DATE);
     assert!(fixture
         .coordinator
         .prepare(&candidate, 1, clock("16:00:00"))

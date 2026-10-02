@@ -98,7 +98,7 @@ fn no_delivery(fixture: &Fixture) {
 fn append(fixture: &Fixture, log: &AlertLog, local: &str) {
     let value: AlertRecord = serde_json::from_value(serde_json::json!({
         "origin":"production","triggered_at":format!("{DATE}T{local}+08:00"),
-        "code":"TEST_CODE_FACADE_SUFFIX","name":"TEST_CODE_FACADE_SUFFIX",
+        "code":"600001","name":"TEST_CODE_FACADE_SUFFIX",
         "level":"重要","category":"TEST_CODE_FACADE_SUFFIX",
         "message":"actual late input","t1_locked":false
     }))

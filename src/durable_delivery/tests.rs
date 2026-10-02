@@ -6159,9 +6159,16 @@ fn g5b_policy_is_global_no_cooldown_and_budget_exempt() {
 }
 
 fn g5b_frozen_envelope(label: &str, extra_source_field: bool) -> DeliveryEnvelope {
-    let business_date = "2026-08-18";
+    g5b_frozen_envelope_for_date(label, extra_source_field, "2026-08-18")
+}
+
+fn g5b_frozen_envelope_for_date(
+    label: &str,
+    extra_source_field: bool,
+    business_date: &str,
+) -> DeliveryEnvelope {
     let code = "TEST_CODE_G5B";
-    let triggered_at = "2026-08-18T15:06:00+08:00";
+    let triggered_at = format!("{business_date}T15:06:00+08:00");
     let category = "TEST_CODE_CATEGORY";
     let message = format!("TEST_CODE_EVENT_{label}");
     let rendered = format!("TEST_CODE_FROZEN_SUMMARY_{label}").into_bytes();
