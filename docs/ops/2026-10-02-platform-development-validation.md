@@ -144,3 +144,16 @@ Mac `.4` 已公开 3 文件、manifest SHA `db81314929092ba4958e6cf03592f1f2d142
 C2 正在独立树实现 actual bundle→closed handoff→原 prepare body→immutable occurrence owner 的同事务登记及 begin/startup 物理发送前实际验证；通用 fresh v2 与同日新增 v1 旁路必须拒绝，旧 existing/conflict/late/audit 保真。D3 正在独立树实现真实 prospective 零头与窗口关闭 Empty seal，含合法晚到 input suffix 和当前 reader 的完整重查；Physical seal 仍等待 C2。P05 P1 在独立树实现 schema13 的真实 Draft/Started/IntentComplete/storage 与跨库预测 freeze 验证，明确为后继 owner/results/finalizer 和 Completed baseline 留窄 revision/CAS 结构，当前未授它们能力。它们未完成运行验证时不列为 Code Ready。
 
 完整 M0–M7 仍需 bin 纵向接线、真实 Delivered/seal/finalizer、统一健康/评价、paper/schema cutover、WORM/Gate P 及外部资格和真实观察。Wave2 精确激活批准和动态生产门禁未闭合；前次 Wave0/Wave1 批准不会被套用于后继二进制。
+
+
+## 08:24 CST：实际失败修复、精确 Mac 复建与继续接线
+
+原主树 `4f761d11` 的限定 durable 运行最终 **314/317**。原失败证据保留：C2 测试直接修改 immutable envelope 被原 guard 拒绝，`be36fed7` 修正隔离 Test corruption fixture并恢复精确原 trigger；旧 finalizer 最初握手 Timeout，同原封存 harness 精确复测通过，等待上限未改；另一个是真实 Prepared cohort 的 published 指针尚为空时旧 v1 准入旁路，同 harness 精确 RED 已复现，`750fc74e` 改为读取不可变 cohort 记录并修复两处检查。后者尚待新编译回归，不能将原整组称为通过。
+
+D3 真正 Empty seal、prospective 初始化不收养既有零头及 D4 opaque facade已整合；C4 独立 counted runtime接线也已整合。第一次限定24个 Empty 用例在编译阶段因两处测试路径类型不符退出101，无实际行为通过；`9adb6bf3` 仅修真实 owned path 转换，原失败保留。Empty 启动/跨日接线与 NonEmpty Physical seal仍待完成。M3-A `4921b208` 增加原读结果构造的 scoped健康快照，lease inode/rawbytes/锁状态变化清空整组旧事实，原本地错误分类保留；未接领域明确 `not_observed`。静态双复核通过，8 bin和1 lib新用例尚未运行，不宣称统一健康或上线完成。
+
+Windows 第七批 exact `571489de1c4498ecab2b9f546dce52e6ec1dbb3a` 自包含归档在 Mac 654 原始输入核验后实际复建。metadata 的41个 workspace/path dependency均位于该归档；第一次 offline 因缺 html-escape 退出101，正常 locked 获取精确依赖后 **magic-eastmoney-rs lib 220/220 通过**。原 Cargo.lock SHA `349933ddbc3c6f5b76e285083aa0d0635b06037e1b74fb380c0ba0c672cbc192` 未变。
+
+同精确归档正常 public Provider 对 SZ300005 Day1 limit1/2 的两次请求在 Mac 也均于 HTTP status line前因 missing TLS close_notify失败，例子 **EXIT1**。原 fund_flow.rs CRLF input SHA `050a04d1a32d51013e7d05d61fd8e22977245c71b63e24a11ed17879bb1f833b`；实际 starts2、minimum gap1.007966505s、maximum concurrency1、active0。没有 body/normalized batch、RPC或候选Health准入。共享 Mac第五批10文件，manifest SHA `c8597006fed23e50c353d9eef1ba68094750c30e0229ee64aebd118aad52760a`；原生反馈消息发送成功。
+
+Windows第八批16文件原字节核验通过，manifest SHA `054999d7b736e5eef088db7926a1400088a194f763e582e1fd15aa909dbb7cd7`。三份实际RPC属于旧生产67源码，不属于未部署后继候选。依据用户继续全部开发的授权，已原生明确续办 HistoricalBars caller-limit 信息缺口及独立 observation-only覆盖版本：先校验整个响应再限额，实际本地删行不得称完整，未知缺日/源修订/发布时间/覆盖保持未知，不能以重新序列化JSON代transport bytes。D14/D17/D20权威用途及R08自动确认仍需真实来源证据。此前被执行策略拒绝的候选监听未绕过，生产配置、制品、投递库和activation未变。
