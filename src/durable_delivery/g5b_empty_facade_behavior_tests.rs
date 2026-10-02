@@ -34,7 +34,7 @@ fn source(fixture: &Fixture) -> PathBuf {
 fn record(fixture: &Fixture, path: impl AsRef<Path>) {
     fixture
         .cleanup
-        .record_if_present(path, OwnedPathKind::FileOrSymlink);
+        .record_if_present(path.as_ref().to_path_buf(), OwnedPathKind::FileOrSymlink);
 }
 fn rows(fixture: &Fixture) -> Vec<Vec<String>> {
     let connection = Connection::open(&fixture.database_path).unwrap();
