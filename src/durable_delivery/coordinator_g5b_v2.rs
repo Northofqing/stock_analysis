@@ -60,12 +60,11 @@ pub(super) fn validate_new_prepare_tx(
     }
     let cohort: Option<String> = tx
         .query_row(
-            "SELECT cohort_identity FROM g5b_day_heads WHERE business_date=?1",
+            "SELECT cohort_identity FROM g5b_cohorts WHERE business_date=?1",
             [&envelope.business_date],
             |r| r.get(0),
         )
-        .optional()?
-        .flatten();
+        .optional()?;
     match admission {
         Some(admission)
             if source_is_v2(&envelope.source_binding_canonical)
@@ -183,7 +182,11 @@ pub(super) fn validate_global_rows(connection: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, date, raw) in rows {
-        let cohort_present:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM g5b_day_heads WHERE business_date=?1 AND cohort_identity IS NOT NULL)",[&date],|r|r.get(0))?;
+        let cohort_present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM g5b_cohorts WHERE business_date=?1)",
+            [&date],
+            |r| r.get(0),
+        )?;
         let v2 = match serde_json::from_slice::<SourceProjection>(&raw) {
             Ok(source) => {
                 classify_stored_source_v2(&source.source_binding_canonical).map_err(codec_error)?
