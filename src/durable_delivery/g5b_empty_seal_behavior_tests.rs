@@ -372,7 +372,7 @@ fn g5b_empty_seal_legacy_unknown_artifacts_and_real_legacy_decisions_prevent_fir
         .coordinator
         .prepare(&candidate, 1, clock("15:10:00"))
         .unwrap();
-    assert_eq!(prepared.state, DeliveryState::Reserved);
+    assert_eq!(prepared.state, DecisionState::Reserved);
     assert_eq!(
         fixture.query_i64("SELECT COUNT(*) FROM delivery_decisions WHERE business_date='2026-09-28' AND push_kind='G5bAttribution'"),
         1

@@ -1,4 +1,5 @@
 use super::*;
+use crate::durable_delivery::AuthoritativeSinkPort;
 use crate::durable_delivery::tests::Fixture;
 use chrono::TimeZone;
 use std::sync::atomic::{AtomicUsize, Ordering};
