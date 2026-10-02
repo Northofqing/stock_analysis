@@ -62,8 +62,8 @@ pub use g5b::{
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
 };
 pub(crate) use g5b_cohort::{
-    G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, PreparedG5bArtifact,
-    VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
+    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending, G5bSnapshotKind,
+    PreparedG5bArtifact, VerifiedG5bEmptySeal, VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
 };
 
 const AUDIT_KINDS: [&str; 14] = [

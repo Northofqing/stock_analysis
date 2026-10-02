@@ -253,6 +253,24 @@ pub(super) fn inspect(
     Ok(witness)
 }
 
+/// Read only the exact saved leaf when it exists. A dangling alias or any
+/// non-NotFound failure is an error, never evidence of an absent publication.
+pub(super) fn inspect_if_present(
+    session: &G5bDaySession<'_>,
+    intent: &PreparedG5bArtifact,
+) -> Result<Option<FileWitness>> {
+    session.validate()?;
+    let parent = session.fence.namespace_file().map_err(io_error)?;
+    let target = filename(intent);
+    let witness = match open(parent, &target, 0) {
+        Ok(_) => Some(read(parent, &target, &intent.desired_bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    session.validate()?;
+    Ok(witness)
+}
+
 pub(super) fn publish(
     session: &G5bDaySession<'_>,
     intent: &PreparedG5bArtifact,

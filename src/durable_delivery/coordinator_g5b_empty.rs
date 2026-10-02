@@ -91,6 +91,41 @@ impl VerifiedG5bEmptySeal {
     }
 }
 
+/// Routing observations have no model, delivery or completion authority.
+pub(crate) enum G5bEmptyDayInspection {
+    Absent,
+    NonEmpty,
+    Pending(G5bEmptyPending),
+    Sealed(VerifiedG5bEmptySeal),
+}
+pub(crate) struct G5bEmptyPending {
+    date: NaiveDate,
+    cohort_identity: String,
+    revision: i64,
+}
+impl G5bEmptyPending {
+    pub(crate) fn business_date(&self) -> NaiveDate {
+        self.date
+    }
+    pub(crate) fn cohort_identity(&self) -> &str {
+        &self.cohort_identity
+    }
+    pub(crate) fn revision(&self) -> i64 {
+        self.revision
+    }
+}
+
+fn routing_snapshot(connection: &Connection, date: NaiveDate) -> Result<Option<(String, String)>> {
+    connection
+        .query_row(
+            "SELECT selection_kind,cohort_identity FROM g5b_cohorts WHERE business_date=?1",
+            [date.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn closing_time(date: NaiveDate, now: DateTime<Utc>) -> bool {
     let local = now.with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
     local.date_naive() == date && local.time() >= NaiveTime::from_hms_opt(15, 21, 0).unwrap()
@@ -1104,6 +1139,101 @@ fn load_current(connection: &Connection, date: NaiveDate) -> Result<Option<Empty
 }
 
 impl G5bDaySession<'_> {
+    /// Classify before the NonEmpty model reader. Absent means no v2 cohort,
+    /// not an empty input day or permission to start new work.
+    pub(crate) fn inspect_empty_day(&self) -> Result<G5bEmptyDayInspection> {
+        let routing = self.transaction(|tx| routing_snapshot(tx, self.date))?;
+        match &routing {
+            None | Some((_, _)) if routing.as_ref().is_none_or(|v| v.0 == "NonEmpty") => {
+                let validate_sql = |tx: &Transaction<'_>| {
+                    if routing_snapshot(tx, self.date)? != routing {
+                        return Err(mismatch("Empty routing snapshot changed"));
+                    }
+                    Ok(())
+                };
+                let validate = || self.validate();
+                self.coordinator.with_immediate_transaction_validated_sql(
+                    SchemaVersionPolicy::Runtime,
+                    Some(&validate),
+                    Some(&validate_sql),
+                    |tx| validate_sql(tx),
+                )?;
+                return Ok(if routing.is_none() {
+                    G5bEmptyDayInspection::Absent
+                } else {
+                    G5bEmptyDayInspection::NonEmpty
+                });
+            }
+            Some((kind, _)) if kind == "Empty" => {}
+            _ => return Err(mismatch("unsupported cohort routing kind")),
+        }
+        let (stored, binding, historical) = self.transaction(|tx| {
+            let stored = load_empty(tx, self.date)?
+                .ok_or_else(|| mismatch("Empty routing lost its original cohort"))?;
+            let binding = empty_sql_snapshot(tx, self.date)?;
+            let historical: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM g5b_day_seals WHERE business_date=?1",
+                [self.date.to_string()],
+                |row| row.get(0),
+            )?;
+            Ok((stored, binding, historical != 0))
+        })?;
+        if stored.pointer.is_some() {
+            return self
+                .read_empty_seal()?
+                .map(G5bEmptyDayInspection::Sealed)
+                .ok_or_else(|| mismatch("Empty current seal disappeared during inspection"));
+        }
+        // Prepared-but-unpublished is valid pending evidence. If the exact
+        // target exists, verify it; do not silently ignore a corrupt alias.
+        let publication = artifact::inspect_if_present(self, &stored.intent)?;
+        let validate = || {
+            let before = self.empty_fs_validate(&stored, historical, None)?;
+            if artifact::inspect_if_present(self, &stored.intent)? != publication {
+                return Err(mismatch("pending Empty publication changed"));
+            }
+            #[cfg(test)]
+            run_file_read_fault(self)?;
+            let after = self.empty_actual_input(&stored.closing, historical, Some(&before))?;
+            if after != before {
+                return Err(mismatch("pending Empty input changed during observation"));
+            }
+            self.validate()
+        };
+        let validate_sql =
+            |tx: &Transaction<'_>| require_empty_sql_snapshot(tx, self.date, &binding);
+        validate()?;
+        self.coordinator.with_immediate_transaction_validated_sql(
+            SchemaVersionPolicy::Runtime,
+            Some(&validate),
+            Some(&validate_sql),
+            |tx| validate_sql(tx),
+        )?;
+        validate()?;
+        Ok(G5bEmptyDayInspection::Pending(G5bEmptyPending {
+            date: self.date,
+            cohort_identity: stored.identity,
+            revision: stored.revision,
+        }))
+    }
+
+    /// Only recover an already saved Empty Selection. This never creates a
+    /// closing receipt, cohort or seal, and never recreates a Committed leaf.
+    pub(crate) fn recover_existing_empty_day(&self) -> Result<G5bEmptyDayInspection> {
+        let state = self.inspect_empty_day()?;
+        if !matches!(&state, G5bEmptyDayInspection::Pending(_)) {
+            return Ok(state);
+        }
+        let stored = self
+            .transaction(|tx| load_empty(tx, self.date))?
+            .ok_or_else(|| mismatch("pending Empty original intent disappeared"))?;
+        if stored.committed.is_none() {
+            self.publish_prepared_artifact(&stored.intent)?;
+        }
+        self.commit_prepared_artifact(&stored.intent)?;
+        self.inspect_empty_day()
+    }
+
     /// Only this fresh SQL + guarded actual filesystem reader mints completion.
     pub(crate) fn read_empty_seal(&self) -> Result<Option<VerifiedG5bEmptySeal>> {
         self.read_empty_seal_inner(None)

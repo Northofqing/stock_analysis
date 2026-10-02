@@ -18,9 +18,10 @@ pub use coordinator::{
     G5bCountedDayFactV1, G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
 };
 pub(crate) use coordinator::{
-    G5bConfiguredAnalysis, G5bDaySession, G5bSnapshotKind, P05ObservedDraftInput,
-    P05ObservedSourceBytes, P05PredictionStart, PreparedG5bArtifact, StoredP05Draft,
-    StoredP05Intent, VerifiedG5bModelBundle, VerifiedStoredG5bCohort,
+    G5bConfiguredAnalysis, G5bDaySession, G5bEmptyDayInspection, G5bEmptyPending, G5bSnapshotKind,
+    P05ObservedDraftInput, P05ObservedSourceBytes, P05PredictionStart, PreparedG5bArtifact,
+    StoredP05Draft, StoredP05Intent, VerifiedG5bEmptySeal, VerifiedG5bModelBundle,
+    VerifiedStoredG5bCohort,
 };
 pub use correlation::P01OriginProducer;
 pub use model::{

@@ -17,7 +17,7 @@ mod artifact;
 mod empty;
 #[path = "coordinator_g5b_model_bundle.rs"]
 mod model_bundle;
-pub(crate) use empty::VerifiedG5bEmptySeal;
+pub(crate) use empty::{G5bEmptyDayInspection, G5bEmptyPending, VerifiedG5bEmptySeal};
 pub(crate) use model_bundle::VerifiedG5bModelBundle;
 
 const ADMISSION_MATERIAL: &str = "g5b-configured-analysis-owner-v1";
