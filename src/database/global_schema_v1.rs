@@ -4319,6 +4319,69 @@ mod tests {
         }
     }
     #[test]
+    fn rows_backup_utf16_refusal_precedes_intent_and_copy() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let fixture = TestFixture::new("rows-utf16-precopy", 0, 0);
+            let connection = Connection::open(fixture.database()).unwrap();
+            connection
+                .pragma_update(None, "encoding", encoding)
+                .unwrap();
+            super::super::global_schema_catalog_v1::install_legacy_catalog_for_prospective_test(
+                &connection,
+            )
+            .unwrap();
+            let text = "汉".repeat(32);
+            connection
+                .execute(
+                    "INSERT INTO ledger(date,total_value,cash,market_value,daily_pnl,created_at) VALUES('2026-10-03',0,0,0,0,?1)",
+                    [&text],
+                )
+                .unwrap();
+            let actual_encoding: String = connection
+                .query_row("PRAGMA main.encoding", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual_encoding, encoding);
+            let (stored_bytes, utf8_bytes): (usize, usize) = connection
+                .query_row(
+                    "SELECT length(CAST(created_at AS BLOB)),created_at FROM ledger",
+                    [],
+                    |r| {
+                        let utf8 = match r.get_ref(1)? {
+                            rusqlite::types::ValueRef::Text(bytes) => bytes.len(),
+                            _ => panic!("fixture must retain actual TEXT storage class"),
+                        };
+                        Ok((r.get(0)?, utf8))
+                    },
+                )
+                .unwrap();
+            assert_eq!((stored_bytes, utf8_bytes), (64, 96));
+            drop(connection);
+            fixture.enable_wal_without_selection_catalog();
+            prospective_assert_fixture_offline(&fixture);
+            let writer = fixture.pinned_audit_writer();
+            let before = fs::read(fixture.database()).unwrap();
+            let mut options = rows::Options::production();
+            // The old SQL preflight accepts 64 bytes, while ValueRef bills 96.
+            options.limits.cell_bytes = 80;
+            let error = match rows_test_prepare(&fixture, &writer, options) {
+                Err(error) => error,
+                Ok(_) => panic!("UTF-16 cannot qualify the UTF-8 Rows budget contract"),
+            };
+            assert!(
+                backup_test_known_bytes(&fixture).is_empty(),
+                "{encoding} refusal must precede intent/role/copy creation: {error:?}"
+            );
+            assert!(error
+                .to_string()
+                .contains("rows source encoding must be UTF-8"));
+            assert_eq!(fs::read(fixture.database()).unwrap(), before);
+            assert!(!writer.path().exists());
+            prospective_assert_fixture_offline(&fixture);
+            drop(fixture.acquire_exclusive().unwrap());
+        }
+    }
+    #[test]
     fn rows_backup_six_pass_reservation_and_finite_review_are_enforced() {
         let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
         let (fixture, writer) = prospective_test_fixture("rows-six-budget", 0, false);

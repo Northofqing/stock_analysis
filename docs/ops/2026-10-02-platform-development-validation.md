@@ -565,3 +565,13 @@ Rows 正式提交 `5075d9ba4a93b47e2f661cb857643dbf4f3d2209` 已推送至上述�
 独立静态复核 `/root/temp_sql_root_cause` 已审阅5075相对f8的四个功能路径及必要调用链：无P1，发现1项P2。Rows预检以`length(CAST(TEXT AS BLOB))`计费，而rusqlite `ValueRef::Text`取得UTF-8字节；当main采用UTF-16时，中文可能按每字2字节通过预检、实际按3字节计费，复制角色创建后才拒绝。实际计费仍会拒绝，不会错误签发Rows cap，但违反复制前预算检查的合同。该结论为静态源码证据，尚未实际SQL复现。
 
 下一窄修先做隔离UTF-16精确目录回归，证明拒绝发生在intent/复制角色创建前；在Rows capture预检前限定main为UTF-8，保留原typed比较与全部固定预算。Rows审阅暂未收口。既有持久顺序继续为Rows问题闭合→正式F2评估/真实来源与明确资金激活→Global目标库及apply恢复→逐Unit生产验收和Gate P/自然观察。
+
+### Rows UTF-16 预算边界关闭
+
+用户要求先提交再继续开发：独立复核记录先以 `a1c5e802` 提交，push/ls-remote OID一致，再开始修复。Rows capture 从原事务读取 main.encoding，仅接受 UTF-8，先于 spec、预算及任何 intent/复制角色创建。固定生产预算、原 byte backup 与 source sidecar guard 均保持原合同。
+
+新增完整 legacy UTF-16le/be 回归实际证明 CAST(BLOB)=64 字节、ValueRef TEXT=96 字节，80 字节界限；拒绝时8个 journal/role/backup文件均 NotFound，原main字节不变、audit缺席、sidecar缺席且lease可重新获取。首轮测试已实测64/96，但先失败于测试bootstrap WAL关闭残留，不能称预算路径RED；复用既有隔离WAL bootstrap helper后最终 `cargo test --locked --offline --lib rows_backup_` **EXIT0 / 20 passed / 0 failed**（编译5m44s，测试131.13s）。最终日志 SHA-256 `cd9770833e5bc3c7ce2fed6a83e1b1aa6b3bd18736067971bf3c5b288b10726e`。原审阅者只读复核最终15/63行新增：原P2静态闭合，无新P1/P2；静态与实际验证分开记录。
+
+此片关闭 Rows 复核缺陷，仍不颁发 target/apply/restore 或生产资格。下一片为 actual Global loan 内的 bounded pushed-row Top50 来源捕获，独立 CandidateScopeCaptureId 和完整拒绝原因；formal F2 typed identity、Catalog7 immutable持久owner、真实source及B/seed/cutover继续待完成。
+
+Windows D14 docs-only新交接 `62502520` 已实读，manifest `d5766f82ac9127ab1dab05c69518ff009dbe5c8efd4a5b7d8188617b64bd5d40` 和25成员长度/SHA独立no-follow核验通过，已发送Mac读取ACK。WG07正式请求/结果规范及caller seam、区间语义、逐代码终态、publication/revision/PIT证据仍有缺口；未部署服务或执行真实业务RPC。

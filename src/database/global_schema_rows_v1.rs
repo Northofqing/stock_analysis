@@ -588,6 +588,21 @@ impl Pending {
         source: &prospective::Pending,
         options: &Options,
     ) -> Result<Self, GlobalSchemaV1Error> {
+        // CAST(TEXT AS BLOB) measures the database encoding, while ValueRef::Text
+        // returns UTF-8. Require their byte units to agree before preflight and
+        // before creating any durable intent or copy role.
+        let utf8 = snapshot
+            .transaction
+            .query_row("PRAGMA main.encoding", [], |row| {
+                Ok(matches!(row.get_ref(0)?, ValueRef::Text(bytes) if bytes == b"UTF-8"))
+            })
+            .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+                operation: "check Rows source encoding",
+                source,
+            })?;
+        if !utf8 {
+            return Err(fail("rows source encoding must be UTF-8"));
+        }
         let mut work = RowsWork::new(options.limits.clone());
         let spec = capture_whole_rows_read_spec(
             &snapshot.authority,
