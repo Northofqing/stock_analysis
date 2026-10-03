@@ -24,6 +24,9 @@ path = "src/bin/rsi_optimize.rs"
 name = "winrate_simulator"
 path = "src/bin/winrate_simulator.rs"
 
+[features]
+replay-sqlite-bundled-v1 = ["rusqlite/bundled"]
+
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 anyhow = "1.0.100"
