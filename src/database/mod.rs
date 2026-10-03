@@ -2773,6 +2773,7 @@ pub(crate) mod agent_logs;
 pub mod attribution_epochs;
 pub mod attribution_reports;
 pub mod benchmark_segments;
+pub(crate) mod candidate_scope_observation_schema_v1;
 pub mod chain_intelligence;
 pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod daily_change_confirmation;

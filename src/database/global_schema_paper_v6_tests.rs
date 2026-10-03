@@ -439,6 +439,47 @@ fn f2_candidate_scope_retains_original_namespace_even_for_equal_content() {
 }
 
 #[test]
+fn candidate_scope_schema_local_ddl_cannot_qualify_global6() {
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let operation_completed = std::cell::Cell::new(false);
+    let result = session.with_immediate_catalog6(
+        |conn, _, _| {
+            crate::database::candidate_scope_observation_schema_v1::create_schema(conn)?;
+            diesel::sql_query("PRAGMA user_version=7").execute(conn)?;
+            operation_completed.set(true);
+            Ok::<_, diesel::result::Error>(())
+        },
+        |_, _, _, _| Ok(()),
+    );
+    assert!(operation_completed.get());
+    assert!(
+        matches!(
+            result,
+            Err(PaperCatalog6TransactionError::BeforeCommit(
+                PaperCatalog6Error::Catalog6RequalificationRequired
+                    | PaperCatalog6Error::Catalog(_)
+            ))
+        ),
+        "{result:?}"
+    );
+    drop(session);
+    // The rollback retained the actual Catalog6 borrower and financial family.
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    session
+        .with_readonly_catalog6(
+            |conn, _| {
+                assert_eq!(capture::int(conn, "SELECT user_version AS value FROM pragma_user_version")?, 6);
+                assert_eq!(capture::int(conn, "SELECT COUNT(*) AS value FROM main.sqlite_master WHERE name GLOB 'candidate_scope_observations_v1*'")?, 0);
+                Ok::<_, PaperCatalog6Error>(())
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+}
+
+#[test]
 fn f2_candidate_scope_actual_limits_types_and_empty_calendar_refusal() {
     use crate::decision::pushed_candidate_scope_v1::{
         capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,

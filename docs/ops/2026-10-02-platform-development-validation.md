@@ -587,3 +587,13 @@ Rows 修复 `eb52eca565616057ea930a7b5897dad1b21c7a1d` 已 push，真实 ls-remo
 原第一次编译在确认不安全 Text 解码后中断（EXIT130、无测试结果）；修复后第一完整轮为2PASS/4FAIL，首失败是多次独立评估复用累计预算 session，后三是串行锁 poison。仅测试改为每次独立评估 fresh actual session，未重置/增加生产 CopyWork 预算；原失败/诊断日志保留。最终 source `398e2c3c` 与注册 `632e95f9` 未改，测试 `4f3a42ad`。独立审阅者实际读取完整 source 及最终 fresh-session 窄测试 delta，无剩余 P1/P2；静态复核不代称测试。`git diff --check`通过；new module/测试文件 scoped rustfmt 通过，mod.rs 的既存 approved/action 声明排序差异保留，新增声明本身已核对。全库、非 macOS 原生路径、正式 typed instrument、持久 occurrence/cold reopen 与生产未由本片验证。
 
 后继按依赖交付 Catalog7 固定 schema/borrower 与不可变来源观察 occurrence、exact retry/conflict/cold reopen，然后真实来源身份和完整 F2/风险/资金资格；Global target/apply、逐Unit生产接管、Uncertain裁定、Gate P及自然观察仍待完成。
+
+### Catalog7 bounded observation 固定存储合同前置
+
+F2 来源组件已正式提交并推送 `4199a11d2c4f87edcb605d16c5875fb5ef50ba93`，真实远端OID一致、clean。后继新增 `candidate_scope_observation_schema_v1` 固定表与3个不可变触发器；逻辑 occurrence 为固定 Top50 policy、owner UTC 30秒slot和显式revision，完整 cutoff秒/纳秒限于该slot。正数具名物理rowid只作存储surrogate，逻辑键独立UNIQUE；原scope canonical为1..8MiB BLOB，SHA-256为32B BLOB。存储约束不证明digest正确、canonical资格、source identity或投资批准。
+
+独立首审发现P1：普通隐藏rowid可被不同occurrence的 `INSERT OR REPLACE` 碰撞，默认非递归删除触发器可让旧记录被删除；原4项PASS没有覆盖该路径，不能当收口证据。修订为正数具名 `INTEGER PRIMARY KEY` 加同时保护物理/逻辑键的 BEFORE INSERT guard，保留Rows普通表合同；新增 `recursive_triggers=OFF` 下rowid/_rowid_/oid/具名键四种攻击，均拒绝且原id/slot/BLOB不变。C6回归记录operation已实际完成DDL与version7，随后必须由原Global尾部拒绝、回滚到schema6，并由新actual readonly borrower重验原catalog/financial family。
+
+最终唯一命令 `cargo test --locked --offline --lib candidate_scope_schema_` **EXIT0 / 5 passed / 0 failed**（编译4m30s、运行2.24s），日志SHA-256 `40a97ee27782c6fbf561d82f6e2ea36597ec00c11a93cc39e6cd79ba351c7e41`。含类型/NULL/slot/revision/cutoff/nanos/digest/canonical边界、普通更新删除/重复/replace/ignore/upsert攻击、隐藏物理键攻击、同内容独立occurrence以及actual C6完整回滚。新module与测试scopedrustfmt及diffcheck通过；source `3c57d77c`、registration `88d45cf2`、test `be32cfee` 与实际最终输入相同。独立审阅者实际读取这些精确文件和合同：原P1静态关闭，无剩余P1/P2；未代跑Cargo。
+
+本片只完成固定存储合同，不增加Global supported generation、不建Catalog7 borrower、不安装生产表、不接普通startup。Catalog7完整reference/borrower、同TX append/tail、独立postcommit reader、original-cutoff retry/conflict/race/cold reopen/Unknown仍是下一垂直片；正式InvestmentDecisionId、真实source/risk/B/approval及生产资格未由DDL签发。仅验证所列lib目标，未跑全库或部署。
