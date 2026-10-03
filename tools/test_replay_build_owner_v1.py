@@ -105,7 +105,25 @@ args=sys.argv[1:]
 hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
 if args==['-vV']:
     (hits/'probe').write_text('entered');print('TEST_CODE_version_probe');sys.exit(0)
-def value(key): return args[args.index(key)+1]
+def value(key):
+    values=[arg.split('=',1)[1] for arg in args if arg.startswith(key+'=')]
+    return values[0] if values else args[args.index(key)+1]
+if args==['--version']:
+    (hits/'nested-version').write_text('entered');print('TEST_CODE_nested_version')
+    sys.exit(int(os.environ.get('FIXTURE_VERSION_EXIT','0')))
+if '--cfg=procmacro2_build_probe' in args:
+    source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+    (hits/('nested-'+source.stem)).write_text('entered')
+    out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+    code=int(os.environ.get('FIXTURE_PROBE_EXIT','1' if source.stem=='proc_macro_span' else '0'))
+    source_path=pathlib.Path('/TEST_CODE_escape.rs') if os.environ.get('FIXTURE_DEP_ESCAPE') else source.resolve()
+    (out/'proc_macro2.d').write_text('out: '+str(source_path)+chr(10))
+    if code==0: (out/'libproc_macro2.rmeta').write_bytes(b'TEST_CODE_METADATA:'+source.read_bytes())
+    if os.environ.get('FIXTURE_OUTPUT_SYMLINK'):
+        (out/'proc_macro2.d').unlink();(out/'proc_macro2.d').symlink_to(source.resolve())
+    print(json.dumps({'fixture_argv':args}),file=sys.stderr)
+    if os.environ.get('FIXTURE_PROBE_SIGNAL'): os.kill(os.getpid(),9)
+    sys.exit(code)
 (hits/('compile-'+value('--crate-name'))).write_text('entered')
 if 'FIXTURE_JOBSERVER_CHECK' in os.environ:
     read,write=map(int,os.environ['FIXTURE_JOBSERVER_CHECK'].split(','))
@@ -120,16 +138,27 @@ if 'FIXTURE_JOBSERVER_CHECK' in os.environ:
     (hits.parent/('jobserver-observed-'+value('--crate-name')+'.json')).write_text(json.dumps(
         {'pair':[read,write],'canary':canary,'canary_closed':True,'token_hex':token.hex()}))
 name=value('--crate-name'); out=pathlib.Path(value('--out-dir')); out.mkdir(parents=True,exist_ok=True)
-source=pathlib.Path(args[-1]); body=source.read_bytes()
+source=next(pathlib.Path(a) for a in reversed(args) if a.endswith('.rs')); body=source.read_bytes()
 if name=='build_script_build':
     executable=out/name
-    executable.write_text("#!"+sys.executable+chr(10)+'import os,pathlib'+chr(10)+'p=pathlib.Path(os.environ["OUT_DIR"]);p.mkdir(parents=True,exist_ok=True);(p/"generated.rs").write_text("pub const FIXTURE: u8 = 1;")'+chr(10))
+    executable.write_text("#!"+sys.executable+chr(10)+"""import json,os,pathlib,shutil,subprocess,sys
+p=pathlib.Path(os.environ['OUT_DIR']);p.mkdir(parents=True,exist_ok=True)
+(p/'generated.rs').write_text('pub const FIXTURE: u8 = 1;')
+(p/'private.rs').write_text('pub const TEST_CODE_PRIVATE: u8 = 1;')
+for command in json.loads(os.environ.get('FIXTURE_NESTED_COMMANDS','[]')):
+    (p/'probe').mkdir(exist_ok=True)
+    result=subprocess.run(command,cwd=os.environ.get('FIXTURE_NESTED_CWD',os.environ['CARGO_MANIFEST_DIR']),stdout=subprocess.PIPE)
+    with open(os.environ['FIXTURE_STATUS_LOG'],'a') as log: log.write(str(result.returncode)+'\\n')
+    shutil.rmtree(p/'probe',ignore_errors=True)
+    if command[-1]=='--version' and result.returncode: sys.exit(result.returncode)
+    if command[-1]!='--version' and result.returncode not in (0,1): sys.exit(result.returncode)
+""")
     executable.chmod(0o700)
 else:
     for suffix in ['.rmeta','.rlib']:
         (out/('lib'+name+suffix)).write_bytes(name.encode()+b':'+body)
 inputs=[str(source)]
-if name=='stock_analysis': inputs.append(str(pathlib.Path(os.environ['OUT_DIR'])/'generated.rs'))
+if name=='stock_analysis': inputs.append(str(pathlib.Path(os.environ['OUT_DIR'])/os.environ.get('FIXTURE_GENERATED_NAME','generated.rs')))
 def escape(x): return x.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
 (out/(name+'.d')).write_text(escape(str(out/(name+'.rlib')))+': '+' '.join(map(escape,inputs))+chr(10))
 print(json.dumps({'fixture_argv':args}),file=sys.stderr)
@@ -212,8 +241,19 @@ def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
     if kind=='bin':
         alias=out/'build-script-build';shutil.copy2(out/name,alias);files=[str(alias)];executable=str(alias)
     else: files=[str(out/('lib'+name+'.rlib')),str(out/('lib'+name+'.rmeta'))];executable=None
-    emit({'reason':'compiler-artifact','package_id':package,'target':{'src_path':str(root),'kind':['custom-build'] if kind=='bin' else ['lib'],'name':name},'filenames':files,'executable':executable,'fresh':False})
-    return executable
+    if MODE.startswith('nested:') and kind=='bin':
+        event_executable=None
+        if MODE=='nested:nonnull_mismatch': event_executable=str(out/'TEST_CODE_wrong')
+        if MODE=='nested:alias_bytes': alias.write_bytes(b'TEST_CODE_CHANGED')
+        if MODE=='nested:multiple_filenames': files.append(str(out/name))
+        if MODE=='nested:metadata_alias':
+            files=[str(out/(name+'.d'))];event_executable=None
+    else: event_executable=executable
+    event={'reason':'compiler-artifact','package_id':package,'target':{'src_path':str(root),'kind':['custom-build'] if kind=='bin' else ['lib'],'name':name,'crate_types':[kind]},'filenames':files,'executable':event_executable,'fresh':False}
+    if MODE=='nested:wrong_package' and kind=='bin': event['package_id']='TEST_CODE_WRONG'
+    emit(event)
+    if MODE=='nested:duplicate_producer' and kind=='bin': emit(event)
+    return str(out/name) if MODE=="nested:alias_bytes" and kind=="bin" else executable
 compile('dep',session/'vendor/dep/src/lib.rs',session/'vendor/dep','rlib','TEST_CODE_dep',target/'deps',env_extra={'FIXTURE_FAIL':'1'} if MODE=='compiler_fails' else {})
 script=compile('build_script_build',app/'build.rs',app,'bin','TEST_CODE_app',target/'build-bin')
 out=target/'build-output';subprocess.run([script],env=dict(os.environ,OUT_DIR=str(out)),check=True)
@@ -223,6 +263,82 @@ if MODE=='output_drift': (target/'deps/libdep.rmeta').write_bytes(b'TEST_CODE_CH
 if MODE=='source_drift': (app/'src/lib.rs').chmod(0o644);(app/'src/lib.rs').write_text('changed')
 if MODE=='unknown_event': emit({'reason':'TEST_CODE_unknown','producer':'do not guess'})
 emit({'reason':'build-finished','success':True})
+'''
+
+
+NESTED_CARGO_FLOW = r'''
+if MODE.startswith('nested:'):
+    case=MODE.split(':',1)[1]
+    hostlib=str(pathlib.Path(sysroot_lib)/'rustlib/x86_64-apple-darwin/lib')
+    loader=':'.join([str(target/'debug'),str(target/'debug/deps'),hostlib,sysroot_lib])
+    origin_records=[]
+    for package_name,version in [('libc','0.2.184'),('proc-macro2','1.0.106')]:
+        package='registry+https://github.com/rust-lang/crates.io-index#'+package_name+'@'+version
+        root=session/'vendor'/package_name
+        builder=compile('build_script_build',root/'build.rs',root,'bin',package,
+                        target/'debug/build'/('TEST_CODE_builder_'+package_name))
+        # Replace just-emitted ordinary fake event behavior through compile's branch below.
+        forms=['debug','x86_64-apple-darwin/debug'] if package_name=='libc' else ['debug']
+        for form in forms:
+            out=target/form/'build'/('TEST_CODE_output_'+package_name)/'out';out.mkdir(parents=True,exist_ok=True)
+            env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_PKG_NAME=package_name,
+                     HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',OUT_DIR=str(out),
+                     DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),
+                     FIXTURE_STATUS_LOG=str(session/'nested-status.raw'),FIXTURE_NESTED_CWD=str(root))
+            if package_name=='libc': commands=[[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--version']]
+            else:
+                commands=[[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--cfg=procmacro2_build_probe',
+                           '--edition=2021','--crate-name=proc_macro2','--crate-type=lib','--cap-lints=allow',
+                           '--emit=dep-info,metadata','--out-dir',str(out/'probe'),'src/probe/'+name+'.rs',
+                           '--target','x86_64-apple-darwin'] for name in
+                          ['proc_macro_span_location','proc_macro_span_file','proc_macro_span']]
+            # Injection cases target the first nested call. The already-built generator is not a compiler hit for that call.
+            if package_name=='libc' and form=='debug':
+                mutations={'extra':loader+':/usr/local/lib','permuted':':'.join(reversed(loader.split(':'))),
+                           'foreign':loader.replace(str(target/'debug'),'/TEST_CODE_FOREIGN',1),
+                           'empty':'','empty_component':loader+':'}
+                if case in mutations: env['DYLD_FALLBACK_LIBRARY_PATH']=mutations[case]
+                if case in ('host','target','package','manifest','wrapper'):
+                    key={'host':'HOST','target':'TARGET','package':'CARGO_PKG_NAME','manifest':'CARGO_MANIFEST_DIR','wrapper':'RUSTC_WRAPPER'}[case]
+                    env[key]='/TEST_CODE_WRONG'
+                if case=='outdir': env['OUT_DIR']=str(target/'TEST_CODE_arbitrary_out');pathlib.Path(env['OUT_DIR']).mkdir()
+                if case=='cwd': env['FIXTURE_NESTED_CWD']=str(app)
+                if case=='version_failure': env['FIXTURE_VERSION_EXIT']='1'
+                if case in ('encoded','bootstrap'):
+                    env['CARGO_ENCODED_RUSTFLAGS' if case=='encoded' else 'RUSTC_BOOTSTRAP']='TEST_CODE'
+                if case=='direct_disguise': commands=[[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'-vV']]
+            if package_name=='proc-macro2':
+                if case=='unknown_probe': commands[0][-3]='src/probe/unknown.rs'
+                if case=='source_substitution': commands[0][-3]='src/lib.rs'
+                if case=='unknown_flag': commands[0].append('-ZTEST_CODE')
+                if case=='exit2': env['FIXTURE_PROBE_EXIT']='2'
+                if case=='signal': env['FIXTURE_PROBE_SIGNAL']='1'
+                if case=='symlink': env['FIXTURE_OUTPUT_SYMLINK']='1'
+                if case=='escaped_dep': env['FIXTURE_DEP_ESCAPE']='1'
+            env['FIXTURE_NESTED_COMMANDS']=json.dumps(commands)
+            result=subprocess.run([builder],env=env)
+            if result.returncode: emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+            event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'cfgs':[],
+                   'env':[],'linked_libs':[],'linked_paths':[]}
+            if case not in ('missing_origin','wrong_origin'): emit(event)
+            if case=='duplicate_event': emit(event)
+            if case=='wrong_origin':
+                event=dict(event,out_dir=str(target/'TEST_CODE_wrong_origin'));pathlib.Path(event['out_dir']).mkdir(exist_ok=True);emit(event)
+            origin_records.append((package,str(out)))
+    if case in ('transient_extern','transient_consumed'):
+        probe=target/'debug/build/TEST_CODE_output_proc-macro2/out/probe';probe.mkdir()
+        (probe/'libproc_macro2.rmeta').write_bytes(b'TEST_CODE_RECREATED')
+    # A normal library consumes actual generated private.rs from the Target execution of a Host builder.
+    out=target/'x86_64-apple-darwin/debug/build/TEST_CODE_output_libc/out'
+    generated_name='private.rs'
+    if case=='transient_consumed': out=probe.parent;generated_name='probe/libproc_macro2.rmeta'
+    compile('stock_analysis',app/'src/lib.rs',app,'rlib','TEST_CODE_app',target/'deps',
+            extra=['--target','x86_64-apple-darwin']+(['--extern','probe='+str(probe/'libproc_macro2.rmeta')] if case=='transient_extern' else []),env_extra={'OUT_DIR':str(out),'FIXTURE_GENERATED_NAME':generated_name})
+    if case in ('snapshot_tamper','snapshot_missing'):
+        snapshot=next((session/'invocations').glob('*/probe-output-*.raw'))
+        if case=='snapshot_tamper': snapshot.write_bytes(b'TEST_CODE_CHANGED')
+        else: snapshot.unlink()
+    emit({'reason':'build-finished','success':True});sys.exit(0)
 '''
 
 
@@ -271,8 +387,17 @@ class RecordingProtocolTests(unittest.TestCase):
         write(vendor / "dep/.cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
         sysroot = self.root / "sysroot"
         write(sysroot / "lib/test.bin", "TEST_CODE_SYSROOT")
+        if mode.startswith("nested:"):
+            write(sysroot / "lib/rustlib/x86_64-apple-darwin/lib/test.bin", "TEST_CODE_HOST_SYSROOT")
+            for name, version in (("libc", "0.2.184"), ("proc-macro2", "1.0.106")):
+                write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+                write(vendor / name / "build.rs", "// TEST_CODE generator simulation for " + name + "\n")
+                for probe in ("proc_macro_span", "proc_macro_span_file", "proc_macro_span_location"):
+                    write(vendor / name / ("src/probe/" + probe + ".rs"), "// TEST_CODE " + probe + "\n")
+
         rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC)
-        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + FAKE_CARGO.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)))
+        cargo_source = FAKE_CARGO.replace("compile('dep',session/", NESTED_CARGO_FLOW + "\ncompile('dep',session/", 1)
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_source.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)))
         rustc.chmod(0o700); cargo.chmod(0o700)
         def pin(path): return {"path": str(path), "sha256": sha(path)}
         inventory = {"owner_sha256": sha(self.tool), "cargo": pin(cargo), "rustc": pin(rustc),
@@ -284,6 +409,11 @@ class RecordingProtocolTests(unittest.TestCase):
                      "generators": {"PROTOC": pin(rustc)},
                      "environment": {"PATH": str(Path(PYTHON).parent), "PROTOC": str(rustc)},
                      "ancestor_configs": []}
+        if mode.startswith("nested:"):
+            inventory["vendor"] = snapshot(vendor, ["dep", "libc", "proc-macro2"])
+            inventory["packages"].extend({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                                          for name, version in (("libc", "0.2.184"), ("proc-macro2", "1.0.106")))
         self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
         return inventory
 
@@ -591,6 +721,128 @@ class RecordingProtocolTests(unittest.TestCase):
                    for k, v in invocation["environment_hex"].items()}
             self.assertNotIn("CARGO_MAKEFLAGS", env)
             self.assertEqual(invocation["exit_code"], 0)
+
+    def nested_result(self, case="normal", expected=0):
+        self.prepare("nested:" + case)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, expected, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def test_nested_libc_version_host_and_target_outdir(self):
+        session, record, receipts = self.nested_result()
+        versions = [r for _, r in receipts if r["context"]["kind"] == "LibcBuildVersion"]
+        self.assertEqual(len(versions), 2)
+        self.assertEqual({r["context"]["out_dir"] for r in versions}, {
+            str(session / "target/debug/build/TEST_CODE_output_libc/out"),
+            str(session / "target/x86_64-apple-darwin/debug/build/TEST_CODE_output_libc/out")})
+        for r in versions:
+            self.assertEqual([bytes.fromhex(x).decode() for x in r["argv_hex"]][1:], ["--version"])
+            self.assertEqual(r["exit_code"], 0)
+        self.assertEqual(record["blockers"], [])
+        _, failure, bad = self.nested_result("version_failure", 2)
+        self.assertIn("CompilerFailed", failure["blockers"])
+        self.assertTrue(any(r["context"]["kind"] == "LibcBuildVersion" and r["exit_code"] == 1 for _, r in bad))
+
+    def test_nested_context_and_loader_injection_zero_compiler_hits(self):
+        first = ("extra", "permuted", "foreign", "empty", "empty_component", "host", "target",
+                 "package", "manifest", "wrapper", "outdir", "cwd", "encoded", "bootstrap", "direct_disguise")
+        for case in first + ("unknown_probe", "source_substitution", "unknown_flag"):
+            with self.subTest(case=case):
+                session, record, _ = self.nested_result(case, 2)
+                self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+                hits = {p.name for p in (session / "compiler-entry").iterdir()}
+                if case in first:
+                    self.assertFalse(any(h.startswith("nested-") for h in hits), hits)
+                else:
+                    self.assertFalse(any(h.startswith("nested-proc_") for h in hits), hits)
+                rejected = [p for p in (session / "invocations").iterdir() if not (p / "receipt.json").exists()]
+                self.assertEqual(len(rejected), 1)
+                self.assertTrue((rejected[0] / "request.json").is_file())
+                self.assertFalse((rejected[0] / "invocation.json").exists())
+                self.assertEqual(record["selected_library"], [])
+
+    def test_proc_macro_feature_probe_transient_success_and_unsupported(self):
+        session, record, receipts = self.nested_result()
+        probes = [(p, r) for p, r in receipts if r["kind"] == "TransientProbe"]
+        self.assertEqual(len(probes), 3)
+        self.assertEqual(sorted(r["exit_code"] for _, r in probes), [0, 0, 1])
+        self.assertEqual((session / "nested-status.raw").read_text().splitlines(), ["0", "0", "0", "0", "1"])
+        self.assertEqual(len(record["nested_origins"]), 5)
+        self.assertEqual(record["blockers"], [])
+        seen = set()
+        for path, receipt in probes:
+            self.assertEqual(receipt["probe_outcome"], "Supported" if receipt["exit_code"] == 0 else "Unsupported")
+            self.assertEqual(len(receipt["outputs"]), 2 if receipt["exit_code"] == 0 else 1)
+            raw = json.loads((path.parent / "stderr.raw").read_text())
+            self.assertEqual(raw["fixture_argv"], [bytes.fromhex(v).decode() for v in receipt["argv_hex"]][1:])
+            for output in receipt["outputs"]:
+                self.assertFalse(Path(output["path"]).exists())
+                snapshot_file = path.parent / output["snapshot"]
+                self.assertEqual(sha(snapshot_file), output["sha256"])
+                self.assertNotIn(snapshot_file, seen); seen.add(snapshot_file)
+            self.assertFalse(any(a["producer_invocation"] == path.parent.name for a in record["build_script_associations"]))
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(record["extern_edges"], [])
+
+    def test_transient_probe_evidence_failure_is_blocker(self):
+        for case, blocker in (("snapshot_tamper", "ChangedTransientEvidence:"),
+                              ("snapshot_missing", "ChangedTransientEvidence:"),
+                              ("exit2", "CompilerFailed"), ("signal", "CompilerFailed"),
+                              ("symlink", "TransientEvidence:"),
+                              ("escaped_dep", "UnresolvedConsumedSource:"),
+                              ("transient_extern", "TransientExtern:"),
+                              ("transient_consumed", "TransientConsumedSource:")):
+            with self.subTest(case=case):
+                _, record, _ = self.nested_result(case, 2)
+                self.assertTrue(any(b.startswith(blocker) for b in record["blockers"]), record["blockers"])
+        # Existing ordinary compiler-failure fixture remains strict, even though feature exit 1 is supported.
+        self.prepare("compiler_fails")
+        self.assertIn("CompilerFailed", self.record_result(self.invoke("record"))["blockers"])
+
+    def test_custom_build_null_executable_alias_host_target_outdir(self):
+        session, record, receipts = self.nested_result()
+        events = [json.loads(line) for line in (session / "cargo.stdout.raw").read_text().splitlines()]
+        builders = [e for e in events if e["reason"] == "compiler-artifact" and e["target"]["kind"] == ["custom-build"]]
+        self.assertEqual(len(builders), 2)
+        self.assertTrue(all(e["executable"] is None for e in builders))
+        libc = [a for a in record["build_script_associations"] if a["package_id"].endswith("#libc@0.2.184")]
+        self.assertEqual(len(libc), 2)
+        self.assertEqual(len({a["producer_invocation"] for a in libc}), 1)
+        producer = next(r for p, r in receipts if p.parent.name == libc[0]["producer_invocation"])
+        self.assertEqual(producer["role"], "Host")
+        target_out = session / "target/x86_64-apple-darwin/debug/build/TEST_CODE_output_libc/out"
+        generated = [c for c in record["consumed_sources"] if c["path"] == str(target_out / "private.rs")]
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(generated[0]["owner"]["generated_by"], libc[0]["producer_invocation"])
+        self.assertEqual(generated[0]["owner"]["out_dir"], str(target_out))
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["selected_library"]), 1)
+
+    def test_custom_build_alias_and_nested_origin_ambiguity_refuse(self):
+        for case, blocker in (("nonnull_mismatch", "CustomBuildExecutable"),
+                              ("alias_bytes", "UnresolvedCargoArtifact:"),
+                              ("multiple_filenames", "CustomBuildFilenames"),
+                              ("metadata_alias", "CustomBuildLinkAlias"),
+                              ("duplicate_event", "DuplicateBuildScriptOutDir:"),
+                              ("duplicate_producer", "UnresolvedBuildScriptProducer"),
+                              ("wrong_package", "UnresolvedCargoArtifact:"),
+                              ("missing_origin", "UnresolvedNestedOrigin:"),
+                              ("wrong_origin", "UnresolvedNestedOrigin:")):
+            with self.subTest(case=case):
+                _, record, _ = self.nested_result(case, 2)
+                self.assertTrue(any(b.startswith(blocker) for b in record["blockers"]), record["blockers"])
+        # The closed alias helper does not accept a transient or failed receipt even with equal bytes.
+        event = {"target": {"kind": ["custom-build"], "crate_types": ["bin"]}, "executable": None,
+                 "filenames": ["/TEST_CODE/alias"]}
+        base = {"kind": "Compile", "exit_code": 0, "blockers": [],
+                "outputs": [{"kind": "link", "sha256": "TEST_CODE_SHA", "path": "/TEST_CODE/link"}]}
+        for change in ({"kind": "TransientProbe"}, {"exit_code": 1}, {"blockers": ["CompilerFailed"]}):
+            with self.assertRaises(owner.Refusal):
+                owner.custom_build_producer(event, dict(base, **change), {"/TEST_CODE/alias": "TEST_CODE_SHA"})
+
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:

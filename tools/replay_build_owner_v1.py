@@ -386,16 +386,106 @@ def sysroot_loader_path(sysroot):
     return str(path)
 
 
-def compiler_environment(env, session, sysroot, *, probe):
+def invocation_context(args, parsed, env, cwd, session, inv):
+    """Reached generator templates only; final Cargo events must bind their origin."""
+    nested_loader = str(session / "target/debug") + ":"
+    feature = any(value.startswith("src/probe/") for value in parsed["inputs"])
+    nested = feature or (parsed["probe"] and "OUT_DIR" in env) or env.get(
+        "DYLD_FALLBACK_LIBRARY_PATH", "").startswith(nested_loader)
+    if not nested:
+        return {"kind": "DirectCargoProbe" if parsed["probe"] else "DirectCargoCompile"}
+    require(env.get("RUSTC") == inv["rustc"]["path"]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not env.get("RUSTC_WORKSPACE_WRAPPER")
+            and env.get("HOST") == TARGET and env.get("TARGET") == TARGET,
+            "NestedCompilerContext")
+    name = "libc" if args[1:] == ["--version"] else "proc-macro2"
+    version = {"libc": "0.2.184", "proc-macro2": "1.0.106"}[name]
+    expected = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    require(inv["packages"].count(expected) == 1, "NestedPackageInventory")
+    package_root = session / "vendor" / name
+    require(cwd == package_root and env.get("CARGO_MANIFEST_DIR") == str(package_root)
+            and env.get("CARGO_PKG_NAME") == name, "NestedSourcePackage")
+    for relative in (name + "/Cargo.toml", name + "/build.rs"):
+        path = session / "vendor" / relative
+        regular(path)
+        require(path.resolve() == path and inv["vendor"]["files"].get(relative) == file_hash(path),
+                "NestedSourceMismatch")
+    raw_out = env.get("OUT_DIR", "")
+    out = Path(raw_out)
+    require(out.is_absolute() and str(out) == raw_out and out.resolve() == out
+            and out.is_dir() and not out.is_symlink(), "NestedOutDir")
+    target = session / "target"
+    prefixes = [target / "debug/build"]
+    if name == "libc":
+        prefixes.append(target / TARGET / "debug/build")
+    require(out.name == "out" and out.parent.parent in prefixes
+            and re.fullmatch(r"[A-Za-z0-9_-]+", out.parent.name), "NestedOutDir")
+    if name == "libc":
+        kind, probe = "LibcBuildVersion", None
+    else:
+        require(len(parsed["inputs"]) == 1, "NestedProbeTemplate")
+        source = parsed["inputs"][0]
+        allowed = {"src/probe/" + part + ".rs" for part in (
+            "proc_macro_span", "proc_macro_span_file", "proc_macro_span_location")}
+        require(source in allowed, "NestedProbeTemplate")
+        exact = ["--cfg=procmacro2_build_probe", "--edition=2021", "--crate-name=proc_macro2",
+                 "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata",
+                 "--out-dir", str(out / "probe"), source, "--target", TARGET]
+        require(args[1:] == exact, "NestedProbeTemplate")
+        path = package_root / source
+        regular(path)
+        require(path.resolve() == path and inv["vendor"]["files"].get(name + "/" + source)
+                == file_hash(path), "NestedSourceMismatch")
+        kind, probe = "ProcMacro2FeatureProbe", source
+    return {"kind": kind, "package_id": expected["id"], "manifest": str(package_root),
+            "out_dir": str(out), "probe": probe}
+
+
+def compiler_environment(env, session, sysroot, *, probe, context=None):
     require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     expected = sysroot_loader_path(sysroot)
-    if not probe:
+    kind = (context or {}).get("kind")
+    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe"}:
+        relative = "lib/rustlib/" + TARGET + "/lib"
+        host_lib = Path(sysroot["root"]) / relative
+        require(host_lib.is_dir() and host_lib.resolve() == host_lib
+                and any(name.startswith(relative + "/") for name in sysroot["files"]),
+                "IncompleteHostLoaderInventory")
+        components = (str(session / "target/debug"), str(session / "target/debug/deps"), str(host_lib), expected)
+        require(all(":" not in part for part in components), "SessionLoaderPath")
+        expected = ":".join(components)
+    elif not probe:
         prefix = str(session / "target/debug/deps")
         require(":" not in prefix, "SessionLoaderPath")
         expected = prefix + ":" + expected
-    # Compare original bytes represented by Python's environment strings. Do not
-    # normalize, reorder, remove empty components, or trust ambient defaults.
+    # Original strings only: do not normalize, reorder, or accept empty components.
     require(env.get("DYLD_FALLBACK_LIBRARY_PATH") == expected, "CompilerEnvironmentInjection")
+
+
+def capture_transient_outputs(call, outputs, code):
+    captured, blockers = [], []
+    for index, item in enumerate(outputs):
+        path = Path(item["path"])
+        if not path.exists() and not path.is_symlink():
+            if code == 0:
+                blockers.append("MissingDeclaredOutput:" + str(path))
+            continue
+        require(path.resolve() == path, "TransientOutputAlias")
+        regular(path)
+        snapshot = call / ("probe-output-" + str(index) + ".raw")
+        with open(path, "rb") as source, open(snapshot, "xb") as dest:
+            shutil.copyfileobj(source, dest)
+        output = dict(item, sha256=file_hash(snapshot), snapshot=snapshot.name)
+        require(file_hash(path) == output["sha256"], "TransientOutputChanged")
+        if item["kind"] == "dep-info":
+            try:
+                output["dep_info"] = dep_info(snapshot.read_bytes())
+            except Refusal as error:
+                blockers.append(str(error))
+        captured.append(output)
+    return captured, blockers
 
 
 def inherited_jobserver_fds(env):
@@ -441,15 +531,16 @@ def wrapper(session_id, args):
                 "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()}})
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
     parsed = parse_rustc(args[1:])
-    compiler_environment(os.environ, session, inv["sysroot"], probe=parsed["probe"])
+    cwd = Path.cwd().resolve()
+    require(inside(cwd, session), "CompilerCwd")
+    context = invocation_context(args, parsed, os.environ, cwd, session, inv)
+    compiler_environment(os.environ, session, inv["sysroot"], probe=parsed["probe"], context=context)
     jobserver_fds = inherited_jobserver_fds(os.environ)
     options, codegen = parsed["options"], parsed["codegen"]
     if "--target" in options:
         require(options["--target"] == [TARGET], "WrongTarget")
     if "--sysroot" in options:
         require(options["--sysroot"] == [inv["sysroot"]["root"]], "WrongSysroot")
-    cwd = Path.cwd().resolve()
-    require(inside(cwd, session), "CompilerCwd")
     target = session / "target"
     externs, package, source, outputs = [], None, None, []
     if not parsed["probe"]:
@@ -482,7 +573,9 @@ def wrapper(session_id, args):
         for value in codegen.get("linker", []):
             require(value in {v["path"] for v in inv["generators"].values()}, "UnpinnedLinker")
         outputs = selected_outputs(parsed, cwd, target)
-    record = {"state": "RecordingOnly", "kind": "Probe" if parsed["probe"] else "Compile",
+    transient = context["kind"] == "ProcMacro2FeatureProbe"
+    record = {"state": "RecordingOnly", "kind": "TransientProbe" if transient else (
+                  "Probe" if parsed["probe"] else "Compile"), "context": context,
               "argv_hex": [os.fsencode(value).hex() for value in args], "parsed": parsed,
               "cwd": str(cwd), "source": str(source) if source else None, "package": package,
               "role": "Probe" if parsed["probe"] else ("Target" if "--target" in options else "Host"),
@@ -495,7 +588,16 @@ def wrapper(session_id, args):
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
     record["outputs"], record["blockers"] = [], []
-    if code == 0:
+    if transient:
+        try:
+            record["outputs"], record["blockers"] = capture_transient_outputs(call, outputs, code)
+        except (Refusal, OSError) as error:
+            # Preserve the actual compiler status even when evidence retention fails.
+            record["blockers"].append("TransientEvidence:" + str(error))
+        record["probe_outcome"] = {0: "Supported", 1: "Unsupported"}.get(code, "CompilerFailure")
+        if code not in (0, 1):
+            record["blockers"].append("CompilerFailed")
+    elif code == 0:
         for item in outputs:
             path = Path(item["path"])
             if not path.is_file() or path.is_symlink():
@@ -539,6 +641,21 @@ def cargo_events(raw_path):
     return events, blockers
 
 
+def custom_build_producer(event, receipt, hashes):
+    """Use structured filename plus actual link bytes; null executable is Cargo data."""
+    target = event.get("target", {})
+    require(target.get("kind") == ["custom-build"] and target.get("crate_types") == ["bin"],
+            "CustomBuildTarget")
+    require(receipt["kind"] == "Compile" and receipt["exit_code"] == 0 and not receipt["blockers"],
+            "CustomBuildReceipt")
+    require(len(hashes) == 1 and len(event.get("filenames", [])) == 1, "CustomBuildFilenames")
+    alias, sha = next(iter(hashes.items()))
+    require("executable" in event and event["executable"] in (None, alias), "CustomBuildExecutable")
+    links = [o for o in receipt["outputs"] if o["kind"] == "link" and o["sha256"] == sha]
+    require(len(links) == 1, "CustomBuildLinkAlias")
+    return {"path": alias, "sha256": sha, "link_path": links[0]["path"]}
+
+
 def seal_record(session, policy, cargo_exit):
     """Resolve observed graph after Cargo; this is a diagnostic seal, never issuance."""
     events, blockers = cargo_events(session / "cargo.stdout.raw")
@@ -556,13 +673,24 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("ChangedInvocationBytes:" + directory.name)
         receipts.append(receipt)
         blockers.extend(receipt["blockers"])
-    output_owners = {}
+    output_owners, transient_paths = {}, set()
     for receipt in receipts:
         for output in receipt["outputs"]:
             path = Path(output["path"])
+            if receipt["kind"] == "TransientProbe":
+                transient_paths.add(str(path))
+                snapshot = session / "invocations" / receipt["invocation_id"] / output["snapshot"]
+                if (snapshot.parent != session / "invocations" / receipt["invocation_id"]
+                        or snapshot.resolve() != snapshot or not snapshot.is_file()
+                        or snapshot.is_symlink() or file_hash(snapshot) != output["sha256"]):
+                    blockers.append("ChangedTransientEvidence:" + receipt["invocation_id"])
+                continue
             if not path.is_file() or path.is_symlink() or file_hash(path) != output["sha256"]:
                 blockers.append("ChangedOutput:" + str(path))
             output_owners.setdefault(str(path), []).append(receipt["invocation_id"])
+    for receipt in receipts:
+        if receipt["kind"] == "TransientProbe":
+            transient_paths.update(o["path"] for o in receipt["declared_outputs"])
     artifacts, associations, selected = [], [], []
     for event in events:
         if event["reason"] != "compiler-artifact":
@@ -590,6 +718,11 @@ def seal_record(session, policy, cargo_exit):
         record = {"package_id": event["package_id"], "target": target,
                   "invocation_id": candidates[0]["invocation_id"], "files": filename_list, "file_sha256": hashes,
                   "executable": event.get("executable")}
+        if target.get("kind") == ["custom-build"]:
+            try:
+                record["builder_alias"] = custom_build_producer(event, candidates[0], hashes)
+            except Refusal as error:
+                blockers.append(str(error)); continue
         artifacts.append(record)
         for filename in filename_list:
             owners = output_owners.setdefault(filename, [])
@@ -602,22 +735,41 @@ def seal_record(session, policy, cargo_exit):
             continue
         out_dir = event.get("out_dir")
         producers = [a for a in artifacts if a["package_id"] == event.get("package_id")
-                     and a["target"].get("kind") == ["custom-build"] and a["executable"] in a["files"]]
-        if not isinstance(out_dir, str) or not inside(Path(out_dir), session / "target") or len(producers) != 1:
+                     and "builder_alias" in a]
+        if (not isinstance(out_dir, str) or not inside(Path(out_dir), session / "target")
+                or str(Path(out_dir)) != out_dir or Path(out_dir).resolve() != Path(out_dir)
+                or not Path(out_dir).is_dir() or len(producers) != 1):
             blockers.append("UnresolvedBuildScriptProducer"); continue
+        if any(a["out_dir"] == out_dir for a in associations):
+            blockers.append("DuplicateBuildScriptOutDir:" + out_dir); continue
         generated = {}
         for path in Path(out_dir).rglob("*"):
             if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                 blockers.append("GeneratedNonregular:" + str(path)); continue
-            if path.is_file():
+            if path.is_file() and str(path) not in transient_paths:
                 generated[path.relative_to(out_dir).as_posix()] = file_hash(path)
         associations.append({"out_dir": str(Path(out_dir).resolve()), "package_id": event["package_id"],
                              "producer_invocation": producers[0]["invocation_id"],
                              "generated_files": generated, "cargo_event": event})
+    nested_origins = []
+    for receipt in receipts:
+        context = receipt.get("context", {})
+        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe"}:
+            matches = [a for a in associations if a["package_id"] == context["package_id"]
+                       and a["out_dir"] == context["out_dir"]]
+            if len(matches) != 1:
+                blockers.append("UnresolvedNestedOrigin:" + receipt["invocation_id"])
+            else:
+                nested_origins.append({"invocation_id": receipt["invocation_id"],
+                                       "producer_invocation": matches[0]["producer_invocation"],
+                                       "out_dir": context["out_dir"], "package_id": context["package_id"]})
     edges = []
     for receipt in receipts:
         for edge in receipt["externs"]:
             producers = output_owners.get(edge["path"], [])
+            if edge["path"] in transient_paths:
+                blockers.append("TransientExtern:" + edge["path"])
+                producers = []
             if len(producers) != 1:
                 blockers.append("UnresolvedExternProducer:" + edge["path"])
             edges.append(dict(edge, consumer=receipt["invocation_id"], producers=producers))
@@ -626,6 +778,8 @@ def seal_record(session, policy, cargo_exit):
         for output in receipt["outputs"]:
             for value in output.get("dep_info", {}).get("paths", []):
                 path = (Path(receipt["cwd"]) / value).resolve()
+                if str(path) in transient_paths:
+                    blockers.append("TransientConsumedSource:" + str(path)); continue
                 owner = None
                 for tree in ("application", "vendor"):
                     if inside(path, session / tree):
@@ -634,8 +788,12 @@ def seal_record(session, policy, cargo_exit):
                             owner = {"tree": tree, "relative_path": name}
                 if owner is None:
                     matches = [a for a in associations if inside(path, Path(a["out_dir"]))]
-                    if len(matches) == 1:
-                        owner = {"generated_by": matches[0]["producer_invocation"], "out_dir": matches[0]["out_dir"]}
+                    if len(matches) == 1 and receipt["kind"] != "TransientProbe":
+                        association = matches[0]
+                        name = path.relative_to(association["out_dir"]).as_posix()
+                        expected = association["generated_files"].get(name)
+                        if path.is_file() and expected == file_hash(path):
+                            owner = {"generated_by": association["producer_invocation"], "out_dir": association["out_dir"]}
                 if owner is None or not path.is_file() or path.is_symlink():
                     blockers.append("UnresolvedConsumedSource:" + str(path)); continue
                 consumed.append({"path": str(path), "sha256": file_hash(path), "owner": owner})
@@ -660,6 +818,7 @@ def seal_record(session, policy, cargo_exit):
     seal = {"schema": SCHEMA, "state": "RecordingOnly", "review_gate": "IndependentPolicyReviewRequired",
             "cargo_exit_code": cargo_exit, "blockers": sorted(set(blockers)), "selected_library": selected,
             "extern_edges": edges, "build_script_associations": associations, "consumed_sources": consumed,
+            "nested_origins": nested_origins,
             # This binds the owner receipt; its nested owner_sha256 binds tool source.
             "owner_sha256": file_hash(session / "owner.json"),
             "policy_sha256": digest(POLICY.read_bytes()),
