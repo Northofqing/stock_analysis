@@ -643,3 +643,6 @@ Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需
 独立全任务审查发现 original source/backup journal metadata 误扣 TargetWork；现由保留的原 RowsSpecWork 在每次 origin loan 的任何原验证/回调之前支付原 reservation，移除该项错误目标扣费。两池数值上限不变、不重置或退款。新增真实 Catalog6 cap 回归验证两次借用累计，第三次差1字节时在原校验、回调和目标扣费之前拒绝。
 
 修正后实际4项定向 PASS：新增累计原 metadata 回归、真实财务副本/冷重开/四流、未知partial与缺槽冷拒绝、原rows work不能重置。仅一次 `cargo test --locked --offline --lib` 编译，之后复用同SHA封存harness，不重复43项原范围或全库。实际新回归日志SHA `b63353667aaa2f28415f492e5614662a21ea0b194e902d6f2f7622d10df71450`；harness SHA `f92dc1ca43774a5ed403799699b50b7539294366004842f484e1112822bd8d27`；本地 `dev-20261003-target-reviewfix1-acceptance.json` 保留四项命令、原日志与源码归属。I1范围复核待完成，未部署或取得批准迁移/切换资格。
+
+
+Task2 I1 范围独立复核已通过：原 reservation 在原校验/回调之前累计扣保留的原 meter，fresh/cold 路径及四项日志/源码/hash核验一致；无新 Critical/Important、无其余观察。源码检查点 f6bebc2f。完整 Task2 审查与唯一 I1 修复闭合，当前开发片完成，仍无批准迁移、切换、上线或 Paper 资格。继续 Task3 WG07 完整窗口与既有复核账本/后续精确消费。
