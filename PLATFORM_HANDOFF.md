@@ -1,0 +1,170 @@
+# stock_analysis 开发与上线交接
+
+更新日期：2026-10-03（Asia/Shanghai）。此文档交接当前开发状态；生产事实另附明确观察时间。
+
+## 1. 接手目标与授权
+
+完成无券商研究 / paper 平台 M0–M7 的必要开发、验证、分批生产上线与观察；M8 根据实际需求或容量证据裁定实施 / 不实施。用户已授权按依赖继续开发、提交并推送当前功能分支，也已授权协调现有 Windows Codex 解决 gRPC / 数据合同并反馈。
+
+最近要求依次是：先提交再继续开发；询问剩余工期；整理交接。本次交接不创建新聊天，不更换生产 owner，不把长期目标标成完成。
+
+- 常规源码、定向验证和当前 feature commit/push 可以继续执行。
+- 生产 activation、资金 B / allocation / seed / cutover、VM 监听 / Provider capture / 固定36真实RPC仍有各自精确门禁。开发授权不替代对应人审；已批准的 Wave0/Wave1 元组只适用于原精确候选，不适用于新制品。
+- 既有生产保持无真实券商接入。T-14/T-15 等依赖真实券商的入口保持原裁定。
+- 不修改或合并 master，不创建 PR，不重启生产，不自动重发或裁定 Uncertain。需要新发布时，先准备具体可审候选，再按对应门禁执行。
+
+## 2. 工作目录与 Git
+
+| 项目 | 精确身份 |
+| --- | --- |
+| 当前工作树 | `/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis` |
+| 分支 | `codex/platform-roadmap-implementation-20261002` |
+| remote / upstream | `stock_analysis` / `stock_analysis/codex/platform-roadmap-implementation-20261002` |
+| remote 地址 | `github.com:Northofqing/stock_analysis.git` |
+| 最后源码提交 | `b005457e94138147f11af4def4240a2aa9d3996d` |
+
+交接编写前实际 `git status` clean、upstream +0/-0；实际 `git ls-remote` 与上述完整 OID 一致。此文档随后单独提交，接手时以实际 Git HEAD 为准；文档提交不改变已验证源码。没有 `origin` remote。历史提交数不能当完成任务数。
+
+先读取 [AGENTS.md](AGENTS.md)、[CLAUDE.md](CLAUDE.md)、[整体路线图](docs/superpowers/plans/2026-09-28-platform-complete-roadmap.md) 和本交接，再检查实际工作树。
+
+## 3. 最近已完成并推送的切片
+
+| 提交 | 已实现 / 已验证 | 能力边界 |
+| --- | --- | --- |
+| `f8e583b44b9d30cc7373b4b8b15c614ff964ca28` | actual Catalog6 loan、固定资金预算 Paper 执行及相关 Global/Paper 开发门禁；普通 debug monitor 和隔离 dry-run 已通过 | Catalog6 生产资格、真实 source、资金批准和生产 cutover仍未交付 |
+| `5075d9ba4a93b47e2f661cb857643dbf4f3d2209` | original 同事务与真实 Copied RO 备份逐表逐行类型/值/rowid/sequence相等；Rows19及旧backup24/prospective14定向通过 | 只有 source↔backup 证明，没有 target/apply/restore/exchange/recovery资格 |
+| `a1c5e80214dd773303cc17441c0d756e2bc514ee` | 先提交 Rows 独立复核记录 | 文档提交 |
+| `eb52eca565616057ea930a7b5897dad1b21c7a1d` | Rows 在 spec/preflight/intent/复制角色前限定 main UTF-8；完整UTF-16LE/BE回归；20项通过，原P2关闭 | 固定预算和原 guard不变 |
+| `4199a11d2c4f87edcb605d16c5875fb5ef50ba93` | F2 Top50原始候选范围捕获；6项通过，独立复核无剩余P1/P2 | 来源准备组件，不是正式投资决策或持久 occurrence |
+| `b005457e94138147f11af4def4240a2aa9d3996d` | future Catalog7固定不可变存储合同及防覆盖；5项通过，独立复核无剩余P1/P2 | 没有Catalog7 reference/borrower、durable owner或生产接线 |
+
+前批完整开发验证及局部历史在 [验证记录](docs/ops/2026-10-02-platform-development-validation.md)。不要用最后3组测试代称全库验证或 M0–M7 达标。
+
+### F2 来源合同（必须保留）
+
+源码：[pushed_candidate_scope_v1.rs](src/decision/pushed_candidate_scope_v1.rs)。
+
+- actual callback-local Catalog6 loan 内，同 SQLite snapshot 读取原 `pushed_stocks` **11列**；不使用普通启动 DDL额外的 `created_at`。
+- 未消费，严格前一小时文本界限；owner一次UTC clock、显式 +08毫秒上下界；总排序 `push_time COLLATE BINARY DESC,id DESC`，Top50是新版本策略定义。
+- 范围只代表符合谓词的Top50，不代表完整小时池、全市场或账户 universe。i64 row id、重复 raw code、REAL price bits及原消费字段均保留。
+- 固定界限：一般文本16KiB、metric64KiB、单行128KiB、选集1MiB、canonical8MiB；main仅UTF-8，预检实际存储类型/长度。9个文本字段经Binary运输后checked UTF-8解码。
+- `CandidateScopeCaptureId` 是内容身份，非 `InvestmentDecisionId`、Recorded occurrence或审批能力。保留原opaque `DatabaseConnectionAuthority`；同内容异库也不能换源。
+- identity实际未资格；lifecycle/price_regime/suspension因identity不可用而未请求。risk inventory/evaluation、cost/liquidity、B/allocation/manual approval缺口完整保存。日历只记录实际immutable API的covered hash/open/closed或coverage unavailable。
+- 原cutoff用于mandatory tail与独立committed reader重捕获；当前不写持久记录。生产Catalog6仍在checkout前拒绝。
+
+### 固定 Catalog7 存储合同（不能重开已修漏洞）
+
+源码：[candidate_scope_observation_schema_v1.rs](src/database/candidate_scope_observation_schema_v1.rs)。
+
+- 一张 `candidate_scope_observations_v1` 表及no-update/no-delete/no-reinsert触发器。
+- logical occurrence唯一键：固定policy + owner UTC30秒slot Unix毫秒 + 显式revision。cutoff完整秒/纳秒须在该slot；revision为1..u32::MAX。
+- scope canonical为1..8MiB BLOB，SHA-256为32B BLOB。DDL不认证digest/content/source/资格。
+- 具名正数 `observation_row_id INTEGER PRIMARY KEY` 是物理surrogate；logical composite另设UNIQUE。BEFORE INSERT同时保护物理/逻辑键，阻断默认 `recursive_triggers=OFF` 下不同逻辑键但相同隐藏rowid的REPLACE删除历史。
+- 保留普通rowid表，当前Rows不能直接支持WITHOUT ROWID。后继closed writer应在原事务内显式分配正数物理键并检查i64溢出；它不能成为决定身份。
+- actual C6回归已证明：operation实际执行新DDL及version7，然后由现有尾部拒绝、整笔回滚到exact6；新readonly borrower重验成功。
+- Global支持最大代际、Catalog6 literals、普通startup与生产路径均未改。不能仅提高supported max或直接在普通连接安装新表。
+
+## 4. 实际验证证据与复用规则
+
+下面是已结束的真实执行，均EXIT0。接手无需例行重跑未改范围；修改后按影响运行最小充分验证。
+
+| 命令 | 实际结果 | 最终日志 SHA-256 |
+| --- | --- | --- |
+| `cargo test --locked --offline --lib rows_backup_` | 20 passed，0 failed；compile5m44s，runtime131.13s | `cd9770833e5bc3c7ce2fed6a83e1b1aa6b3bd18736067971bf3c5b288b10726e` |
+| `cargo test --locked --offline --lib f2_candidate_scope` | 6 passed，0 failed；compile4m43s，runtime10.20s | `1ac82a7d744aaaa94fed84a724e204e123f2e580fec6e64a0f36b556c5411c24` |
+| `cargo test --locked --offline --lib candidate_scope_schema_` | 5 passed，0 failed；compile4m30s，runtime2.24s | `40a97ee27782c6fbf561d82f6e2ea36597ec00c11a93cc39e6cd79ba351c7e41` |
+
+以上原始日志和JSON回执位于当前工作树本地 `.planning/2026-10-02-platform-continued-implementation/` 与其 `validation/`；该目录被忽略，**没有推送原始日志**。新 clone只能获得本交接与tracked验证摘要，不应声称读到了本地原件。
+
+关键回执文件：
+
+- `validation/rows-utf16-final-20261003.json`
+- `validation/f2-candidate-scope-final-20261003.json`
+- `validation/catalog7-candidate-scope-schema-final-20261003.json`
+- `validation/authorized-f2-source-and-catalog7-schema-push-20261003.json`
+
+独立reviewer `/root/temp_sql_root_cause` 实际只读精确差异；没有代跑Cargo。root负责实际验证。
+
+已知失败 / 工具经验：
+
+1. Rows首UTF-16回归先证明64/96字节差异，再失败于fixture bootstrap WAL残留；不是预算路径RED。已复用既有isolated helper修fixture。
+2. SQLite UTF-8 TEXT仍可含损坏字节；缓存Diesel2.3.7 Text解码使用unchecked UTF-8。不要把TEXT类型检查当Rust String安全证明；当前来源组件已改bounded Binary + checked decode。
+3. F2首完整轮2PASS/4FAIL：多次独立评估复用累计CopyWork session导致真实预算耗尽，随后mutex poison。修复仅在每次独立测试评估创建fresh actual session；没有重置或增加生产32MiB预算。
+4. C7首4PASS未覆盖隐藏rowid REPLACE；最后5项含四别名攻击才是收口证据。
+5. 过滤器匹配0tests不算通过。Rows私有typed模块真实路径在 `database::global_schema_v1::rows::tests`。
+6. 仅一位Cargo executor使用共享target；不要并行多次Cargo。lib编译常需4–8分钟，限定`--lib`或具体`--bin`，不因已有PASS追加同目标check/build/clippy。
+7. scoped rustfmt用 `--config skip_children=true`；递归格式化曾发现无关既存差异。decision/mod.rs原approved/action声明排序差异保留，未为此扩大源码修改。
+8. 文档任务仅内容核查和diff-check。`.planning`不可force-add；tracked但所在目录被忽略的ops文档使用 `git add -u -- <path>`。不要broad-add。
+
+## 5. 下一项最小可验收切片
+
+**从 b005源码基线继续 Catalog7 closed reference/borrower + immutable bounded observation owner。** 先冻结受影响路径、资源预算和发生身份；新旧代际分别严格验证，保持原financial codec和单owner。
+
+建议顺序及完成标准：
+
+1. 增加显式closed generation7完整reference/classification及受限actual borrower；原Catalog6 API继续只接受exact6，不允许未知objects/影子TEMP/foreign namespace。可复用机制，但不能拿VerifiedCatalog6冒充7。
+2. 将原来源捕获接入同一个actual IMMEDIATE事务：closed UTC slot/revision → 原cutoff capture → 完整canonical/digest/新occurrence身份 → no-clobber append。source ID和发生身份分开；storage reader不给ApprovedPaperIntent。
+3. strict stored reader先预算后加载BLOB，重验canonical/digest、logical/physical membership及原namespace。same key + exact bytes返原记录；same key + changed bytes冲突；不overwrite，不靠ignore/replace完成retry。
+4. 所有可修改SQL hooks后精确tail，独立post-COMMIT reader使用原cutoff/原authority；Unknown保留真实已提交记录、不自动重放或重建实时资格。
+5. meaningful actual tests：insert/cold reopen/exact retry/conflict、双coordinator race、catalog shadow/unknown拒绝、last-hook drift回滚、真实external child在新reader first-main-SQL前commit后的Unknown保存原记录。
+6. 定向验证 + 必要独立复核 + 更新持久计划 + commit/push feature并核实际远端OID。不要为source日常编辑部署生产。
+
+相关入口：
+
+- [global_schema_paper_v6.rs](src/database/global_schema_paper_v6.rs)：当前HRTB loan、maintenance lease、mandatory tail及独立reader机制。
+- [global_schema_catalog_v1.rs](src/database/global_schema_catalog_v1.rs)、[Diesel catalog capture](src/database/global_schema_catalog_diesel_v1.rs)：closed代际reference/classifier/CopyWork。
+- [Global owner](src/database/global_schema_v1.rs)、[Rows](src/database/global_schema_rows_v1.rs)：整体模式/namespace/备份行保全。
+- [实际C6测试](src/database/global_schema_paper_v6_tests.rs)：完整非空V1/V2 seed/genesis/financial fixture和当前来源/DDL测试。
+
+本地计划（不在Git中）：
+
+- `.planning/2026-10-02-platform-continued-implementation/task_plan.md`：主线最新追加状态；旧段按时间解读。
+- 同目录 `catalog7-candidate-observation-contract-20261003.md`：已完成fixed schema合同。
+- 同目录 `f2-candidate-source-slice-20261003.md`：已完成来源组件合同。
+- 同目录 `formal-paper-issuers-next-slice-plan.md` 与 `formal-f2-evaluation-readonly-readiness-20261003.md`：formal身份、真实facts/risk/funds/positive factory后继要求；旧NO_CODE_GO是当时状态，当前fixed/source片已实施，但没有由此批准生产或全部formal owner。
+- 同目录 `global-target-next-slice-readonly-readiness-20261003.md`：target/apply仅准备，没有目标源码。
+- 原生产计划位于 `/Users/zhangzhen/Desktop/Quant/stock_analysis/.planning/2026-09-29-platform-production/task_plan.md`，不在当前worktree；该文件旧段不可覆盖10/3新事实。
+
+## 6. 整体剩余顺序
+
+1. C7不可变观察持久owner及正式F2 identity：当前source/fixed DDL只是前置。
+2. source-backed instrument、真实lifecycle/band/tick/suspension、整数执行价格/数量/有效窗、完整逐规则risk/cost/liquidity结果。
+3. 显式B/allocation/seed/cutover批准、唯一positive intent factory和actual Paper consumer；固定B不得由默认本金、健康、f64投影或caller token制造。
+4. Global target/apply/恢复及production requalification，保留原V1–V6历史。
+5. 逐Unit同事实shadow、单physical owner接管、实际权威receipt/恢复/cleanup；Uncertain依人工证据裁定。
+6. F4研究/决策/账本/归因关联、外部WORM/Gate P及自然运行、持有窗口和前瞻观察。
+7. M6按数据与证据决定必要实现；M7策略保留/限制/淘汰；M8有触发证据才实施，否则有证据关闭。
+
+估算只供排期：已识别可控核心主线约15–30有效开发日（每日8小时口径，含复核返工），完整上线暂按2–3个月以上量级预留。不是固定交付日期；真实数据合同、Unit数量/每交易日最多一个physical-owner晋级、自然窗口及未冻结研究范围需重新估算。
+
+## 7. Windows Codex / gRPC 交接
+
+现有聊天标题：**R08 FuturesDelivery 上游合同与部署**。
+
+- threadId：`01a0e0cf-2276-7512-96ee-3a94bdfa8ca5`
+- hostId：`remote-control:env_e_6ab6a791c27c832a98417a42584a1a39`
+- 最后compact cursor：`a8c7a172-615a-48fe-b562-46ed52452e6d:3`；可用现有wait工具做一次有界状态核查，避免重复派发。旧cursor失效不代表任务或消息失败。
+- 最新实读交付包：`/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/windows-d14-contract-research-20261003.1`；REPORT、manifest及25公共成员已实际no-follow bytes/SHA核验。manifest SHA：`d5766f82ac9127ab1dab05c69518ff009dbe5c8efd4a5b7d8188617b64bd5d40`。
+- SDK基线9da925a8，交付文档提交 `62502520c75feee34bf9ed67aaa846f60b9d3948`：只有两份研究文档，不是新SDK能力、服务部署或真实RPC。最后实际compact状态completed/idle；Mac读取ACK工具发送成功，但未取得之后的新对方ACK，勿伪称已收到。
+
+**当前Mac前置欠项：** 导出WG07正式request/result规范、实际qualification caller seam及消费fixture；明确定义新接口的精确窗口、as_of、instrument/adjustment、来源绑定预期交易日和逐代码终态。旧`days=90`不静默重解释。现有 `pending_daily_change_confirmations_async` 固定unavailable，`QualifiedDailyChangeDiscovery`只有test factory；review identities只接受`outcome-provider-sequence-v1`。
+
+TDX native bar缺返回issuer/venue；Hithink v2是observation-only，source exhaustion/calendar Unknown、publication/revision NotProvided、PIT=false；六份旧SZSE短窗口不证明90日发现。需先完整source合同，再做typed qualification与兼容回归。不要新增无caller的观察脚本或永远unavailable的伪生产能力。
+
+同版fixed36真实RPC、D14/D17/D20/R08 confirmed仍开放。Health/离线plan/合成fixture/不同版本业务结果不替代该验收。本次未新发Windows任务、监听、capture、stop、部署或运行RPC。
+
+## 8. 生产事实与接手边界
+
+最近生产观察是 **2026-10-03 09:28 CST的历史只读snapshot**，本交接未刷新生产：
+
+- monitor PID4371、bridge PID56417当时同boot；正式根 `/Users/zhangzhen/.local/share/stock-analysis-runtime`，launchd管理。
+- 当时Frozen/Unsafe、metrics incomplete，缺Quote/MoneyFlow/News/OrderBook；不能把该历史PID/状态当接手时fresh检查。
+- 最后记录安装的是原Wave0制品（monitor SHA前缀851a5fb9、activation前缀f574faf1），本轮开发源码没有部署。完整候选哈希及原审批元组见原activation review/preflight，不从此处短前缀执行切换。
+- 78条Uncertain是更早历史数，未重新计数；不得当新查询结果或自动裁定。
+- source/config上线仍按未来effective_from的精确activation人审、hash、single-instance、数据库/lease、水位、source与Uncertain门禁执行，使用正式launchd流程。
+
+主heartbeat最后持久记录ACTIVE，本交接未修改自动化。若另一个会话实际接手，先核当前任务/自动化执行状态并确定唯一源码与Cargo owner，避免双方同时开发、发布或验证。不要仅因交接就把M0–M7目标标Complete或停掉尚有用途的自动化。
+
+## 9. 可直接给接手会话的指令
+
+> 请先阅读仓库根目录 PLATFORM_HANDOFF.md、AGENTS.md 和 CLAUDE.md，核对实际HEAD、未提交改动和当前执行owner。沿用 codex/platform-roadmap-implementation-20261002；从最后已验证源码 b005457e 开始下一片 Catalog7 closed reference/borrower 与不可变观察持久owner，验证原cutoff exact retry/conflict、tail、独立reader、race/cold reopen和Unknown保留，再提交推送该feature。继续M0–M7全部上线及M8有证据裁定目标。不要把Top50来源捕获或固定DDL当正式F2/生产资格；不要复跑未改范围或绕过精确生产/VM运行/资金门禁。协调Windows时先读既有D14包，完成Mac WG07合同/caller前置，避免重复派发。
