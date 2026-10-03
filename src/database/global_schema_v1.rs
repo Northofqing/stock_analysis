@@ -5553,6 +5553,14 @@ mod tests {
         }
     }
     #[test]
+    fn target_origin_loans_charge_original_metadata_cumulatively_before_validation() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        target::test_original_origin_metadata_accounting(original);
+        assert!(!fixture.root.join("global-schema-targets").exists());
+    }
+    #[test]
     fn target_pair_cannot_reset_original_rows_work_to_gain_allowance() {
         let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
         let (fixture, writer) = actual_offline_catalog6_fixture();

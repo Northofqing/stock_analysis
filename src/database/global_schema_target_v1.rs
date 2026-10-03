@@ -999,6 +999,17 @@ pub(super) struct VerifiedUnapprovedRequalificationTarget {
     work: TargetWork,
     options: Options,
 }
+#[cfg(test)]
+pub(super) fn test_original_origin_metadata_accounting(
+    original: rows::VerifiedUnapprovedOriginalRowsBackup,
+) {
+    let mut source = original.into_target_source().unwrap();
+    assert!(source.is_test());
+    let options = Options::production();
+    options.validate(source.is_test()).unwrap();
+    let mut work = TargetWork::new(options.limits, &source);
+    source.test_original_origin_metadata_accounting(&mut work);
+}
 pub(super) fn prepare(
     original: rows::VerifiedUnapprovedOriginalRowsBackup,
     options: Options,

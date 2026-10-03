@@ -971,7 +971,75 @@ impl OriginalRowsTargetSource {
             &mut target::TargetWork,
         ) -> Result<T, GlobalSchemaV1Error>,
     ) -> Result<T, GlobalSchemaV1Error> {
-        self.original.backup.with_target_origin(work, operation)
+        self.original.backup.with_target_origin(
+            &mut self.original.pending.work.metadata,
+            work,
+            operation,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn test_original_origin_metadata_accounting(
+        &mut self,
+        work: &mut target::TargetWork,
+    ) {
+        assert!(self.is_test());
+        let reservation = self.original.backup.target_metadata_reservation().unwrap();
+        let remaining = reservation.checked_mul(3).unwrap() - 1;
+        let original = &mut self.original.pending.work;
+        let spend = original
+            .limits
+            .metadata_bytes
+            .checked_sub(original.metadata.used())
+            .unwrap()
+            .checked_sub(remaining)
+            .unwrap();
+        original.metadata.charge(spend).unwrap();
+        let initial = original.metadata.used();
+        for completed in 1..=2 {
+            let journal_before = self.original.backup.target_test_original_journal_work();
+            self.with_copy_origin(work, |loan, work| loan.binding(work))
+                .unwrap();
+            assert_eq!(
+                self.original.pending.work.metadata.used(),
+                initial + completed * reservation
+            );
+            assert!(self.original.backup.target_test_original_journal_work() > journal_before);
+        }
+        let journal_before = self.original.backup.target_test_original_journal_work();
+        let target_before = work.metadata_used();
+        assert!(
+            target_before.checked_add(reservation + 512).unwrap() < 16 * MIB,
+            "target pool could pay the loan but must not fund original validation"
+        );
+        let mut entered = false;
+        let error = self
+            .with_copy_origin(work, |_, _| {
+                entered = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(error, GlobalSchemaV1Error::SelectionCatalog {
+            source: GlobalSchemaCatalogError::CatalogMismatch { detail }
+        } if detail == "whole rows: metadata work exceeded"));
+        assert!(
+            !entered,
+            "exhausted original metadata must refuse before the loan"
+        );
+        assert_eq!(
+            self.original.backup.target_test_original_journal_work(),
+            journal_before,
+            "exhausted original metadata must refuse before original validation allocation/read"
+        );
+        assert_eq!(work.metadata_used(), target_before);
+        assert_eq!(
+            self.original.pending.work.metadata.used(),
+            initial + 3 * reservation
+        );
+        assert_eq!(
+            self.original.pending.work.metadata.used(),
+            self.original.pending.work.limits.metadata_bytes + 1
+        );
+        assert_eq!(self.original.pending.work.streams, 6);
     }
     pub(super) fn pair_evidence(&self) -> impl Serialize + '_ {
         &self.target_comparisons

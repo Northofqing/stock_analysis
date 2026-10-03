@@ -207,3 +207,10 @@ Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需
 本地 `validation/dev-20261003-target-final-acceptance.json` 记录不同编译产物的复用来源：fix2 业务源码与最终相同，fix3/fix4 仅修改两个 Test 消费者及最后一个 Test 攻击/断言，未重复未改范围。最终 fullcatalog 日志 SHA `af00af39328819051c4f2fb6c2c56515cf6265e4f48034a559dd240bd51e8527`，最终封存 lib harness SHA `3e07c6450562d05f55395ee28cf1d893bdc36095c13bb6d78b35258e3277a5b2`；未运行全库、release 或部署。
 
 独立全任务 spec/quality 审查待进行。本片输出明确 `approval=not_granted`、`maintenance_receipt=not_created`、`exchange=not_implemented`、`apply_supported=false`；不代表历史到最终代际迁移、production requalification、Paper 或全平台完成。后续继续 WG07 完整窗口与复核消费、逐规则风控和完整不可变 F2，再处理真实源、明确资金、批准迁移/切换及 WORM/自然观察。
+
+
+### Task2 审查 I1 修正实际验收（待范围复核）
+
+独立全任务审查发现 original source/backup journal metadata 误扣 TargetWork；现由保留的原 RowsSpecWork 在每次 origin loan 的任何原验证/回调之前支付原 reservation，移除该项错误目标扣费。两池数值上限不变、不重置或退款。新增真实 Catalog6 cap 回归验证两次借用累计，第三次差1字节时在原校验、回调和目标扣费之前拒绝。
+
+修正后实际4项定向 PASS：新增累计原 metadata 回归、真实财务副本/冷重开/四流、未知partial与缺槽冷拒绝、原rows work不能重置。仅一次 `cargo test --locked --offline --lib` 编译，之后复用同SHA封存harness，不重复43项原范围或全库。实际新回归日志SHA `b63353667aaa2f28415f492e5614662a21ea0b194e902d6f2f7622d10df71450`；harness SHA `f92dc1ca43774a5ed403799699b50b7539294366004842f484e1112822bd8d27`；本地 `dev-20261003-target-reviewfix1-acceptance.json` 保留四项命令、原日志与源码归属。I1范围复核待完成，未部署或取得批准迁移/切换资格。

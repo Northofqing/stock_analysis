@@ -1,4 +1,5 @@
 //! Fixed, unapproved byte backup. This local journal is not apply/WORM authority.
+use super::super::global_schema_catalog_v1::RowsSpecWork;
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1457,15 +1458,24 @@ impl VerifiedUnapprovedByteBackup {
             .and_then(|n| n.checked_add(65536))
             .ok_or_else(|| refuse("target original journal metadata overflow"))
     }
+    #[cfg(test)]
+    pub(super) fn target_test_original_journal_work(&self) -> u64 {
+        self.workspace.work.journal
+    }
     pub(super) fn with_target_origin<T>(
         &mut self,
+        original_metadata: &mut RowsSpecWork,
         work: &mut target::TargetWork,
         operation: impl for<'loan> FnOnce(
             &mut CopiedTargetOriginLoan<'loan>,
             &mut target::TargetWork,
         ) -> Result<T, GlobalSchemaV1Error>,
     ) -> Result<T, GlobalSchemaV1Error> {
-        work.metadata(self.target_metadata_reservation()?)?;
+        // This covers both original validation passes, before either allocates.
+        // Target bindings/routes below keep their separate target-owned charges.
+        original_metadata
+            .charge(self.target_metadata_reservation()?)
+            .map_err(|source| GlobalSchemaV1Error::SelectionCatalog { source })?;
         let (source, options, _, _) = self.source.backup_parts();
         self.workspace
             .validate_outputs_without_hooks(source, options, &self.settings)?;
