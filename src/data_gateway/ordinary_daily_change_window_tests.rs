@@ -1268,6 +1268,30 @@ pub(crate) fn oversized_stored_proofs(
         proof.capabilities_hex = hex::encode(caps.encode_to_vec());
         cases.push((proof, [1, 0, 0, 0]));
     }
+    for name in [
+        "native_hex",
+        "request_hex",
+        "response_hex",
+        "health_hex",
+        "capabilities_hex",
+    ] {
+        let mut request =
+            QueryRequest::decode(hex::decode(&original.request_hex).unwrap().as_slice()).unwrap();
+        let payload = request.payload.as_mut().unwrap();
+        // Preserve every genuine request field; only the unexpected name is
+        // added. It must fail the scalar budget before owned protobuf decode,
+        // rather than rely on later RequestV1 unknown-field rejection.
+        let mut data: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
+        data.as_object_mut()
+            .unwrap()
+            .insert(name.into(), serde_json::Value::String(oversized.clone()));
+        payload.data = serde_json::to_vec(&data).unwrap();
+        let raw = request.encode_to_vec();
+        assert!(raw.len() < c::MIB);
+        let mut proof = original.clone();
+        proof.request_hex = hex::encode(raw);
+        cases.push((proof, [1, 1, 0, 0]));
+    }
     cases
 }
 
@@ -1278,7 +1302,7 @@ async fn wg07_review_fix2_stored_controls_and_request_reject_before_each_owned_d
     assert!(inspect_proof(q.proof()).is_ok());
     assert_eq!(stored_decode_hits(), [1, 1, 1, 1]);
     let cases = oversized_stored_proofs(q.proof());
-    assert_eq!(cases.len(), 16);
+    assert_eq!(cases.len(), 21);
     for (index, (proof, expected_hits)) in cases.into_iter().enumerate() {
         // These are canonical, within aggregate proof/request bounds; the
         // offending short field must be refused before its first owned call.

@@ -875,7 +875,7 @@ fn preflight_stored_fields(shape: StoredShape, mut bytes: &[u8]) -> Result<(), G
             StoredField::Message(child) => preflight_stored_fields(child, value)?,
             StoredField::Json => {
                 use crate::data_gateway::ordinary_daily_change_window_contract as contract;
-                contract::preflight(value, contract::MIB)
+                contract::preflight_request(value)
                     .map_err(|_| wire_error("ordinary_window_stored_request_json"))?;
             }
             _ if value.len() > 16 * 1024 => {

@@ -69,6 +69,19 @@ pub(crate) fn encode(value: &impl Serialize, limit: usize) -> Result<Vec<u8>> {
 /// Allocation-free JSON lexical preflight. serde still validates the grammar and
 /// rejects duplicate struct fields. String lengths are conservative encoded limits.
 pub(crate) fn preflight(bytes: &[u8], limit: usize) -> Result<()> {
+    preflight_with_policy(bytes, limit, JsonPolicy::Evidence)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonPolicy {
+    Evidence,
+    Request,
+}
+/// Request JSON has no native/proof hex storage exemptions. The aggregate
+/// request bound is distinct from the existing per-string encoded-byte bound.
+pub(crate) fn preflight_request(bytes: &[u8]) -> Result<()> {
+    preflight_with_policy(bytes, MIB, JsonPolicy::Request)
+}
+fn preflight_with_policy(bytes: &[u8], limit: usize, policy: JsonPolicy) -> Result<()> {
     ensure(
         bytes.len() <= limit,
         FailureKind::EnvelopeRejected,
@@ -165,9 +178,13 @@ pub(crate) fn preflight(bytes: &[u8], limit: usize) -> Result<()> {
                     FailureKind::EnvelopeRejected,
                     "canonical unescaped field names required",
                 )?;
-                let cap = if !is_key && matches!(last_key, "native_hex") {
+                let cap = if policy == JsonPolicy::Evidence
+                    && !is_key
+                    && matches!(last_key, "native_hex")
+                {
                     2 * MIB
-                } else if !is_key
+                } else if policy == JsonPolicy::Evidence
+                    && !is_key
                     && matches!(
                         last_key,
                         "request_hex" | "response_hex" | "health_hex" | "capabilities_hex"
@@ -1369,5 +1386,52 @@ mod bound_tests {
         let raw = br#"{"sess\u0069ons":[]}"#;
         assert!(preflight(raw, PROOF_LIMIT).is_err());
         assert!(preflight(&vec![b'1'; 16385], PROOF_LIMIT).is_err());
+    }
+    #[test]
+    fn wg07_review_fix3_request_json_budget_excludes_evidence_hex_exemptions() {
+        for name in [
+            "native_hex",
+            "request_hex",
+            "response_hex",
+            "health_hex",
+            "capabilities_hex",
+        ] {
+            for length in [16384, 16385] {
+                let bytes =
+                    serde_json::to_vec(&serde_json::json!({(name): "a".repeat(length)})).unwrap();
+                assert_eq!(
+                    preflight_request(&bytes).is_ok(),
+                    length == 16384,
+                    "{name}/{length}"
+                );
+            }
+            // Even-length valid hex remains legal in the old Evidence policy,
+            // including when both policies use the same aggregate MIB bound.
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({(name): "ab".repeat(8193)})).unwrap();
+            assert!(preflight(&bytes, MIB).is_ok(), "{name}");
+            assert!(preflight(&bytes, PROOF_LIMIT).is_ok(), "{name}");
+            assert!(preflight_request(&bytes).is_err(), "{name}");
+        }
+        for length in [16384, 16385] {
+            let value =
+                serde_json::to_vec(&serde_json::json!({"ordinary": "x".repeat(length)})).unwrap();
+            let key =
+                serde_json::to_vec(&serde_json::json!({("x".repeat(length)): "ordinary"})).unwrap();
+            assert_eq!(preflight_request(&value).is_ok(), length == 16384);
+            assert_eq!(preflight_request(&key).is_ok(), length == 16384);
+        }
+        let large_container = serde_json::to_vec(
+            &serde_json::json!({"first": "x".repeat(16384), "second": "y".repeat(16384)}),
+        )
+        .unwrap();
+        assert!(large_container.len() > 16384);
+        assert!(preflight_request(&large_container).is_ok());
+        assert!(preflight_request(&vec![b' '; MIB + 1]).is_err());
+        let sessions =
+            serde_json::to_vec(&serde_json::json!({"expected_sessions": vec![0; 261]})).unwrap();
+        assert!(preflight_request(&sessions).is_err());
+        let deep = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+        assert!(preflight_request(deep.as_bytes()).is_err());
     }
 }
