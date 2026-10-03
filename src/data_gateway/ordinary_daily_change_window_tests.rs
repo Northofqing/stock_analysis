@@ -1032,3 +1032,174 @@ fn wg07_wider_window_preserves_same_material_pairs() {
     .unwrap();
     assert_eq!(old.pairs, new.pairs);
 }
+
+#[tokio::test]
+async fn wg07_review_fix_i2_stored_response_preflight_precedes_owned_decode() {
+    let q = acquire_fixture(reply).await;
+    let original = q.proof().clone();
+    REPLAY_RESPONSE_DECODE_HITS.with(|hits| hits.set(0));
+    assert!(inspect_proof(&original).is_ok());
+    REPLAY_RESPONSE_DECODE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+    let decoded =
+        QueryResponse::decode(hex::decode(&original.response_hex).unwrap().as_slice()).unwrap();
+    for mutation in 0..3 {
+        let mut response = decoded.clone();
+        match mutation {
+            0 => response.records.push(response.records[0].clone()),
+            1 => response.batch_id = "x".repeat(16385),
+            _ => {
+                response.records[0].data =
+                    format!("{{\"sessions\":[{}]}}", vec!["null"; 261].join(",")).into_bytes()
+            }
+        }
+        let mut proof = original.clone();
+        proof.response_hex = hex::encode(response.encode_to_vec());
+        REPLAY_RESPONSE_DECODE_HITS.with(|hits| hits.set(0));
+        assert!(inspect_proof(&proof).is_err());
+        REPLAY_RESPONSE_DECODE_HITS.with(|hits| assert_eq!(hits.get(), 0));
+    }
+}
+
+#[tokio::test]
+async fn wg07_review_fix_i3_connected_lifecycle_interval_before_no_changes() {
+    for mode in 0..3 {
+        let (_dir, path) = database();
+        let fixture = ExternalQueryWireFixture::bind_window(move |q| {
+            let mut e = evidence(q);
+            let listing = if mode == 2 {
+                "1990-01-01"
+            } else {
+                "2030-01-01"
+            }
+            .parse()
+            .unwrap();
+            e.lifecycle.listing_date = listing;
+            e.lifecycle.delisting_date = if mode == 1 {
+                None
+            } else {
+                Some("2000-01-01".parse().unwrap())
+            };
+            for s in &mut e.sessions {
+                s.terminal = if mode == 2 {
+                    Terminal::Delisted {
+                        delisting_date: e.lifecycle.delisting_date.unwrap(),
+                    }
+                } else {
+                    Terminal::NotYetListed {
+                        listing_date: listing,
+                    }
+                };
+            }
+            seal_native(&mut e);
+            Ok(response(&e))
+        })
+        .await
+        .unwrap();
+        fixture.release_capabilities();
+        fixture.release();
+        let result = prepare_at(input(), fixture.bundle_path(), &path, now()).await;
+        let mut conn = open_existing(&path, true).unwrap();
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type=diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        use diesel::RunQueryDsl;
+        let count: Count = diesel::sql_query("SELECT count(*) AS n FROM daily_change_review_event")
+            .get_result(&mut conn)
+            .unwrap();
+        if mode == 0 {
+            let failure = result.err().unwrap();
+            assert!(failure
+                .failures()
+                .iter()
+                .any(|f| f.kind == FailureKind::LifecycleCoverageMissing));
+            assert_eq!(count.n, 0);
+        } else {
+            let receipt = result.unwrap();
+            assert_eq!(receipt.window_status, WindowStatus::NoChanges);
+            assert!(receipt.candidates.is_empty());
+            assert_eq!(count.n, 1);
+            review::require_window_store(&mut conn).unwrap();
+        }
+        assert_eq!(fixture.snapshot().calls, 1);
+        fixture.finish().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn wg07_review_fix_m1_public_preacquisition_failures_keep_context_and_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let empty = dir.path().join("empty.sqlite");
+    drop(SqliteConnection::establish(empty.to_str().unwrap()).unwrap());
+    for consume in [false, true] {
+        for (stage, database) in [("profile", &missing), ("open", &missing), ("store", &empty)] {
+            let mut request = input();
+            if stage == "profile" {
+                request.source_profile = "TEST_CODE_UNKNOWN@1".into();
+            }
+            let error = if consume {
+                consume_window(request.clone(), &missing, database)
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                prepare_window(request.clone(), &missing, database)
+                    .await
+                    .err()
+                    .unwrap()
+            };
+            assert_eq!(error.stage(), stage);
+            assert!(error.request_identity().is_none());
+            assert!(error.retained_evidence.is_none());
+            assert!(error.retained_window_proof.is_none());
+            assert!(error
+                .failures()
+                .iter()
+                .all(|f| f.instrument.as_ref() == Some(&request.instrument)
+                    && f.range == Some((request.from, request.to))));
+        }
+    }
+}
+
+#[tokio::test]
+async fn wg07_review_fix_m1_fresh_unconfirmed_consumer_reports_admission_stage() {
+    let (_dir, path) = database();
+    let fixture = ExternalQueryWireFixture::bind_window(reply).await.unwrap();
+    fixture.release_capabilities();
+    fixture.release();
+    let error = consume_at(input(), fixture.bundle_path(), &path, now())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.stage(), "admission");
+    assert!(error.request_identity().is_some());
+    assert!(error.retained_window_proof.is_some());
+    assert!(error
+        .failures()
+        .iter()
+        .all(|f| f.instrument.as_ref() == Some(&input().instrument)
+            && f.range == Some((input().from, input().to))));
+    fixture.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn wg07_review_fix_m1_transport_setup_failure_reports_known_context_only() {
+    let (dir, path) = database();
+    let missing_bundle = dir.path().join("absent-client-bundle");
+    let error = prepare_at(input(), &missing_bundle, &path, now())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.stage(), "transport");
+    assert!(error.request_identity().is_some());
+    assert!(error.retained_window_proof.is_none());
+    let retained = error.retained_evidence.as_ref().unwrap();
+    assert!(retained.wire.is_none());
+    assert!(error
+        .failures()
+        .iter()
+        .all(|f| f.instrument.as_ref() == Some(&input().instrument)
+            && f.range == Some((input().from, input().to))));
+}

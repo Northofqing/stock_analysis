@@ -764,12 +764,19 @@ impl tonic::codec::Decoder for WindowDecoder {
         if remaining > 8 * 1024 * 1024 || buf.chunk().len() != remaining {
             return Err(tonic::Status::resource_exhausted("WG07 decode buffer"));
         }
-        preflight_window_protobuf(buf.chunk(), false)
+        preflight_window_response(buf.chunk())
             .map_err(|_| tonic::Status::resource_exhausted("WG07 response resource limit"))?;
         QueryResponse::decode(buf)
             .map(Some)
             .map_err(|_| tonic::Status::data_loss("WG07 protobuf"))
     }
+}
+/// The closed WG07 response budget, shared by live transport and recorded proof replay.
+pub(crate) fn preflight_window_response(bytes: &[u8]) -> Result<(), GrpcError> {
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(wire_error("ordinary_window_response_limit"));
+    }
+    preflight_window_protobuf(bytes, false)
 }
 fn preflight_window_protobuf(mut bytes: &[u8], record: bool) -> Result<(), GrpcError> {
     let mut records = 0;

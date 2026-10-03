@@ -233,3 +233,11 @@ WG07 当前运行门禁已通过：31新lib、87去重旧lib及5个命令行case
 新增逐规则执行报告，冻结真实配置、阈值、输入与执行状态；包含关闭的规则，并分别执行两个技术条件开关。分析流程返回实际报告；输入缺失、无效或规则 panic 如实记为不完整，保持原 live/dry-run 决策政策，不授予正式风控通过。真实聚合、报告构造或编码失败在 enabled exact-live Buy 路径阻断并保留诊断。AnalysisResult 与推送格式没有改变。
 
 实际44项定向 PASS（17新、27旧）：15项新规则/边界测试、2项真实分析流程、24项旧规则/链、3项原流程回归。仅一次 scoped library Cargo 编译，后续复用同源 SHA 封存 harness；首段日志 SHA `ccdaa371216637aecfd9dd196da246bef5831a71e3576f0bbe967b94e58cf7c4`，其余29项日志 SHA `b0564ad9f542ebe0dcfefa07a734eefc4dce51f0136ce451061eb68bc54ceae7`。原建议清单的一项不存在的测试名已纠正，不计入通过数。凭据 `dev-20261003-risk-matrix-acceptance.json` 保留八文件与制品绑定。未运行全库、release 或部署；独立完整任务审查待进行。
+
+Task4 逐项风控已完成独立全任务 spec/quality 审查：均 Approved，无需源码修复；实际八文件、44项运行证据、报告在超时/保存失败后的保留和最终分析结果接线已复核。源码检查点 b74593e1，未部署。
+
+### Task3 全任务审查后的来源、资源与生命周期修正
+
+原独立审查发现三个 Important：后续 Observation 未逐项核对真实 native batch/refs；事件预算选择可被 JSON 字段位置或转义绕过，保存的 response 重放也缺解码前预检；同源退市早于上市未拒绝。原作者以共享事实重构核对完整来源、固定栈结构判断与同一 response 预检、生命周期区间约束修正，并补齐早期失败的实际上下文与阶段。限定六文件，无公共 ABI、DDL 或生产 profile 改动。
+
+修正后实际27项定向 PASS（7新、20相关旧）。仅一次 scoped lib Cargo 编译，旧例复用同 SHA 封存 harness；新日志 SHA `471c2957650c958137197c5feefa79cc6b28fabce58ab3687a489573c01a4c79`，旧例日志 SHA `3b065fc36e3d530a847fa15036a5b4080aa5746371b279a959e25d731c6b016b`，harness SHA `8a525e0a32de6fdbe99b566746a757a205b4585e249a0b6e99e4c7d95e816bdd`。初版123项证据作为 baseline 保留，未宣称本次重跑。原审查者范围复核待进行；另请其检查保存的 request 在 owned decode 前的 scalar 限制是否也需闭合。未据测试通过宣布整个 WG07 或平台完成，真实上游与上线门禁保持。

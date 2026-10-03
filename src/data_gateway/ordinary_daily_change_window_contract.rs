@@ -1061,7 +1061,8 @@ pub(crate) fn interpret(
             && lc.to == frozen.request.to
             && matches!(lc.action_coverage.as_str(), "Complete" | "None")
             && (lc.action_coverage != "None" || lc.actions.is_empty())
-            && lc.actions.len() <= 1024,
+            && lc.actions.len() <= 1024
+            && lc.delisting_date.is_none_or(|date| date >= lc.listing_date),
         FailureKind::LifecycleCoverageMissing,
         "same-source lifecycle coverage",
     )?;

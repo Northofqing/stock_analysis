@@ -197,3 +197,100 @@ fn wg07_literal_scope_golden_preserves_legacy_scope_domain() {
         "be0aa363001b9dbfe2506cd8952cfa550b3f4b211995f0f5a2a841a6806740d9"
     );
 }
+
+#[tokio::test]
+async fn wg07_review_fix_i1_rehashed_observation_requires_exact_native_provenance() {
+    let q = acquire_fixture(reply).await;
+    for change_batch in [true, false] {
+        let (_dir, path) = database();
+        let mut conn = window::open_existing(&path, false).unwrap();
+        prepare_window_on_conn(&mut conn, &q, now()).unwrap();
+        let state = load(&mut conn).unwrap();
+        let c = state.candidates.values().next().unwrap();
+        let (pair, mut provenance, _) = window::snapshot_fact(&c.review.snapshot).unwrap();
+        if change_batch {
+            provenance.daily_batch_id = "TEST_CODE_forged_batch".into();
+        } else {
+            provenance.pair_evidence[0].fact_id = "TEST_CODE_forged_native_ref".into();
+        }
+        let snapshot = window::snapshot_for(&pair, &provenance).unwrap();
+        // Stable identity, pair/query consistency, acquisition hash and command
+        // are all valid. Only linkage to the original actual proof is false.
+        assert_eq!(
+            identities(&snapshot).unwrap(),
+            identities(&c.review.snapshot).unwrap()
+        );
+        let key = acquisition(&snapshot).unwrap();
+        append(
+            &mut conn,
+            &state,
+            &c.review,
+            &c.scope,
+            "Observation",
+            &format!("observation:{}:{key}", c.review.candidate_id),
+            &Event::Observation {
+                candidate_id: c.review.candidate_id.clone(),
+                snapshot,
+                observed_at: now(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rows(&mut conn), 4);
+        drop(conn);
+        let mut reopened = window::open_existing(&path, true).unwrap();
+        let error = load(&mut reopened).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("window snapshot native provenance"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn wg07_review_fix_i2_event_discriminator_precedes_owned_decode() {
+    let scalar = "x".repeat(16385);
+    let sessions = vec!["null"; 261].join(",");
+    let payloads = [
+        format!(r#" {{"proof":{{"bad":"{scalar}"}},"kind":"WindowObservation"}}"#),
+        format!(
+            r#"{{"snapshot":{{"schema\u005fversion" : 2,"bad":"{scalar}"}},"kind":"Observation"}}"#
+        ),
+        format!(
+            r#"{{"review":{{"snapshot":{{"schema_version" : 2,"sessions":[{sessions}]}}}},"kind":"Candidate"}}"#
+        ),
+        format!(
+            r#"{{"snapshot":{{"schema_version":1,"schema_version":2,"bad":"{scalar}"}},"kind":"Observation"}}"#
+        ),
+        format!(
+            r#"{{"snapshot":{{"schema_version":2,"schema_version":1,"bad":"{scalar}"}},"kind":"Observation"}}"#
+        ),
+        format!(r#"{{"snapshot":{{"schema_version":1.0,"bad":"{scalar}"}},"kind":"Observation"}}"#),
+        format!(r#"{{"snapshot":{{"schema_version":9,"bad":"{scalar}"}},"kind":"Observation"}}"#),
+        format!(r#"{{"proof":{{"sessions":[{sessions}]}},"k\u0069nd":"WindowObservation"}}"#),
+    ];
+    for payload in payloads {
+        EVENT_OWNED_DECODE_HITS.with(|hits| hits.set(0));
+        assert!(decode_review_event(&payload).is_err());
+        EVENT_OWNED_DECODE_HITS.with(|hits| assert_eq!(hits.get(), 0));
+    }
+    // Unknown nested versions and large strings in schema1 opaque evidence do
+    // not opt the old contract into WG07 limits or change its canonical bytes.
+    let q = crate::data_gateway::historical_bars::qualified_review_fixture();
+    let mut snapshot = q.snapshot().clone();
+    snapshot.raw_evidence = serde_json::json!({"schema_version":2,"kind":"WindowObservation","big":scalar,"sessions":vec![0;261],"schema\"version":2});
+    let event = Event::Observation {
+        candidate_id: "TEST_CODE_legacy".into(),
+        snapshot,
+        observed_at: now(),
+    };
+    let payload = json(&event).unwrap();
+    assert!(!window_event_budget(payload.as_bytes()).unwrap());
+    EVENT_OWNED_DECODE_HITS.with(|hits| hits.set(0));
+    assert_eq!(
+        json(&decode_review_event(&payload).unwrap()).unwrap(),
+        payload
+    );
+    EVENT_OWNED_DECODE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+}

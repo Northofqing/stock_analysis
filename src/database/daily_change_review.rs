@@ -359,6 +359,251 @@ fn acquisition(snapshot: &ReviewSnapshot) -> ReviewResult<String> {
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    static EVENT_OWNED_DECODE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn decode_review_event(payload: &str) -> ReviewResult<Event> {
+    if window_event_budget(payload.as_bytes())? {
+        window_contract::preflight(payload.as_bytes(), window_contract::PROOF_LIMIT)
+            .map_err(|e| audit(e.to_string()))?;
+    }
+    #[cfg(test)]
+    EVENT_OWNED_DECODE_HITS.with(|hits| hits.set(hits.get() + 1));
+    serde_json::from_str(payload).map_err(|e| audit(e.to_string()))
+}
+
+/// Structural discriminator only: fixed stack and fixed token scratch, no owned
+/// JSON strings/tree. Opaque schema1 subtrees are scanned without WG07 limits.
+/// serde subsequently validates grammar, duplicate fields and canonical bytes.
+fn window_event_budget(bytes: &[u8]) -> ReviewResult<bool> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Name {
+        Other,
+        Kind,
+        Review,
+        Snapshot,
+        Version,
+        Candidate,
+        Observation,
+        Decision,
+        Window,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Place {
+        Other,
+        Root,
+        Review,
+        Snapshot,
+    }
+    #[derive(Clone, Copy)]
+    struct Frame {
+        object: bool,
+        // 0: next key/array element or end; 1: colon; 2: member value;
+        // 3: comma or end. Full JSON grammar remains serde's responsibility.
+        state: u8,
+        place: Place,
+        key: Name,
+    }
+    fn string(bytes: &[u8], pos: &mut usize) -> ReviewResult<Name> {
+        *pos += 1;
+        let mut token = [0u8; 32];
+        let mut count = 0usize;
+        while *pos < bytes.len() {
+            let mut ch = u32::from(bytes[*pos]);
+            *pos += 1;
+            if ch == u32::from(b'"') {
+                return Ok(match token.get(..count) {
+                    Some(b"kind") => Name::Kind,
+                    Some(b"review") => Name::Review,
+                    Some(b"snapshot") => Name::Snapshot,
+                    Some(b"schema_version") => Name::Version,
+                    Some(b"Candidate") => Name::Candidate,
+                    Some(b"Observation") => Name::Observation,
+                    Some(b"Decision") => Name::Decision,
+                    Some(b"WindowObservation") => Name::Window,
+                    _ => Name::Other,
+                });
+            }
+            if ch == u32::from(b'\\') {
+                let escape = *bytes
+                    .get(*pos)
+                    .ok_or_else(|| audit("event string escape"))?;
+                *pos += 1;
+                ch = match escape {
+                    b'u' => {
+                        let digits = bytes
+                            .get(*pos..*pos + 4)
+                            .ok_or_else(|| audit("event unicode escape"))?;
+                        let mut code = 0u32;
+                        for digit in digits {
+                            code = code * 16
+                                + char::from(*digit)
+                                    .to_digit(16)
+                                    .ok_or_else(|| audit("event unicode digit"))?;
+                        }
+                        *pos += 4;
+                        code
+                    }
+                    b'"' | b'\\' | b'/' => u32::from(escape),
+                    b'b' => 8,
+                    b'f' => 12,
+                    b'n' => 10,
+                    b'r' => 13,
+                    b't' => 9,
+                    _ => return Err(audit("event string escape")),
+                };
+            }
+            if count < token.len() {
+                token[count] = u8::try_from(ch).unwrap_or(0xff);
+            }
+            // Saturate beyond the fixed scratch; oversized opaque strings stay unallocated.
+            count = (count + 1).min(token.len() + 1);
+        }
+        Err(audit("event unterminated string"))
+    }
+    let empty = Frame {
+        object: false,
+        state: 0,
+        place: Place::Other,
+        key: Name::Other,
+    };
+    let mut stack = [empty; 256];
+    let mut depth = 0usize;
+    let mut pos = 0usize;
+    let mut root_seen = false;
+    let mut kind = Name::Other;
+    let mut kinds = 0usize;
+    let mut versions = 0usize;
+    let mut needs = false;
+    while pos < bytes.len() {
+        if bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+            continue;
+        }
+        if depth == 0 && root_seen {
+            return Err(audit("event trailing JSON"));
+        }
+        if depth > 0 {
+            let frame = &mut stack[depth - 1];
+            if frame.state == 3 {
+                if bytes[pos] == b',' {
+                    frame.state = 0;
+                    pos += 1;
+                    continue;
+                }
+                if bytes[pos] != if frame.object { b'}' } else { b']' } {
+                    return Err(audit("event JSON separator"));
+                }
+            }
+            if bytes[pos] == if frame.object { b'}' } else { b']' } {
+                if !matches!(frame.state, 0 | 3) {
+                    return Err(audit("event incomplete member"));
+                }
+                depth -= 1;
+                pos += 1;
+                continue;
+            }
+            if frame.object && frame.state == 0 {
+                if bytes[pos] != b'"' {
+                    return Err(audit("event member key"));
+                }
+                frame.key = string(bytes, &mut pos)?;
+                frame.state = 1;
+                continue;
+            }
+            if frame.object && frame.state == 1 {
+                if bytes[pos] != b':' {
+                    return Err(audit("event member colon"));
+                }
+                frame.state = 2;
+                pos += 1;
+                continue;
+            }
+        }
+        let (place, key) = if depth == 0 {
+            (Place::Other, Name::Other)
+        } else {
+            let f = &mut stack[depth - 1];
+            f.state = 3;
+            (f.place, f.key)
+        };
+        let is_kind = place == Place::Root && key == Name::Kind;
+        let is_version = place == Place::Snapshot && key == Name::Version;
+        if is_kind {
+            kinds += 1;
+        }
+        if is_version {
+            versions += 1;
+        }
+        match bytes[pos] {
+            b'{' | b'[' => {
+                if is_kind || is_version {
+                    needs = true;
+                }
+                if depth == stack.len() {
+                    return Err(audit("event JSON nesting"));
+                }
+                let object = bytes[pos] == b'{';
+                let child = if !root_seen {
+                    Place::Root
+                } else if object && place == Place::Root && key == Name::Review {
+                    Place::Review
+                } else if object
+                    && matches!(place, Place::Root | Place::Review)
+                    && key == Name::Snapshot
+                {
+                    Place::Snapshot
+                } else {
+                    Place::Other
+                };
+                if !root_seen && !object {
+                    return Err(audit("event root object"));
+                }
+                root_seen = true;
+                stack[depth] = Frame {
+                    object,
+                    state: 0,
+                    place: child,
+                    key: Name::Other,
+                };
+                depth += 1;
+                pos += 1;
+            }
+            b'"' => {
+                let value = string(bytes, &mut pos)?;
+                if is_kind {
+                    kind = value;
+                }
+                if is_version {
+                    needs = true;
+                }
+            }
+            _ => {
+                let start = pos;
+                while pos < bytes.len()
+                    && !bytes[pos].is_ascii_whitespace()
+                    && !matches!(bytes[pos], b',' | b'}' | b']')
+                {
+                    pos += 1;
+                }
+                if start == pos {
+                    return Err(audit("event scalar token"));
+                }
+                if is_kind || (is_version && &bytes[start..pos] != b"1") {
+                    needs = true;
+                }
+            }
+        }
+    }
+    require(root_seen && depth == 0, "event incomplete JSON")?;
+    Ok(needs
+        || kinds != 1
+        || kind == Name::Window
+        || !matches!(kind, Name::Candidate | Name::Observation | Name::Decision)
+        || (matches!(kind, Name::Candidate | Name::Observation) && versions != 1))
+}
+
 fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
     if !super::daily_change_review_schema_v1::is_present(conn)? {
         return Err(ReviewError::Unavailable);
@@ -384,13 +629,7 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
             row.payload.len() <= window_contract::PROOF_LIMIT,
             "review event byte limit",
         )?;
-        if row.payload.starts_with("{\"kind\":\"WindowObservation\"")
-            || row.payload.contains("\"schema_version\":2")
-        {
-            window_contract::preflight(row.payload.as_bytes(), window_contract::PROOF_LIMIT)
-                .map_err(|e| audit(e.to_string()))?;
-        }
-        let event: Event = serde_json::from_str(&row.payload).map_err(|e| audit(e.to_string()))?;
+        let event = decode_review_event(&row.payload)?;
         require(json(&event)? == row.payload, "noncanonical review event")?;
         match event {
             Event::Candidate {
@@ -1158,16 +1397,30 @@ fn validate_window_receipt(
     Ok(())
 }
 fn validate_window_closure(state: &State) -> ReviewResult<()> {
+    // Cache plain reconstructed facts once per window; replay never seals authority.
+    let mut recorded = BTreeMap::new();
     for c in state.candidates.values() {
         for s in std::iter::once(&c.review.snapshot).chain(c.observations.iter()) {
             if s.schema_version != 2 {
                 continue;
             }
             let (_, a, _) = window::snapshot_fact(s).map_err(|e| audit(e.to_string()))?;
-            let (_, receipt) = state
+            let (proof, receipt) = state
                 .windows
                 .get(&a.window_acquisition_identity)
                 .ok_or_else(|| audit("orphan window candidate"))?;
+            if !recorded.contains_key(&a.window_acquisition_identity) {
+                let facts = window::inspect_proof(proof).map_err(|e| audit(e.to_string()))?;
+                recorded.insert(a.window_acquisition_identity.clone(), facts);
+            }
+            let expected = window::recorded_pair_snapshot(
+                &recorded[&a.window_acquisition_identity],
+                &receipt.proof_identity,
+                &receipt.acquisition_identity,
+                a.pair_index,
+            )
+            .map_err(|e| audit(e.to_string()))?;
+            require(*s == expected, "window snapshot native provenance")?;
             require(
                 receipt.proof_identity == a.proof_identity
                     && receipt.candidates.get(a.pair_index).is_some_and(|v| {

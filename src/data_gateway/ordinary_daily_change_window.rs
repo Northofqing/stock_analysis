@@ -97,6 +97,10 @@ impl DiscoveryFailure {
             retained_window_proof: None,
         }
     }
+    fn at_stage(mut self, stage: &str) -> Self {
+        self.stage = stage.into();
+        self
+    }
     fn context_input(mut self, request: &OrdinaryDailyChangeWindowRequest) -> Self {
         for item in &mut self.failures {
             if item.instrument.is_none() {
@@ -269,6 +273,10 @@ pub(crate) fn proof_identities(proof: &CompleteWindowProof) -> c::Result<(String
     let acquisition = c::digest(b"BR171_ORDINARY_WINDOW_ACQUISITION_V1\0", &bytes);
     Ok((request, proof_id, acquisition))
 }
+#[cfg(test)]
+thread_local! {
+    static REPLAY_RESPONSE_DECODE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Reconstruct recorded facts without minting live transport authority. Used by
 /// strict ledger replay; it does not call public acquisition or perform I/O.
 pub(crate) fn inspect_proof(proof: &CompleteWindowProof) -> c::Result<c::Interpreted> {
@@ -360,6 +368,10 @@ pub(crate) fn inspect_proof(proof: &CompleteWindowProof) -> c::Result<c::Interpr
     let raw = unhex(&proof.response_hex, c::PROOF_LIMIT)?;
     crate::grpc_client::external_query_transport::admit_external_payload(&raw)
         .map_err(|_| c::failure(FailureKind::EnvelopeRejected, "response wire"))?;
+    crate::grpc_client::external_query_transport::preflight_window_response(&raw)
+        .map_err(|_| c::failure(FailureKind::EnvelopeRejected, "response resource preflight"))?;
+    #[cfg(test)]
+    REPLAY_RESPONSE_DECODE_HITS.with(|hits| hits.set(hits.get() + 1));
     let response = decoder
         .query(&raw)
         .map_err(|_| c::failure(FailureKind::EnvelopeRejected, "response protobuf"))?;
@@ -483,27 +495,45 @@ pub(crate) fn snapshot_fact(
     );
     Ok((pair, acquisition, stable))
 }
+/// Rebuild recorded content only; this function cannot mint a live capability.
+pub(crate) fn recorded_pair_snapshot(
+    interpreted: &c::Interpreted,
+    proof_identity: &str,
+    acquisition_identity: &str,
+    pair_index: usize,
+) -> c::Result<ReviewSnapshot> {
+    let pair = interpreted
+        .pairs
+        .get(pair_index)
+        .ok_or_else(|| c::failure(FailureKind::AuditFailure, "recorded pair index"))?;
+    let refs = interpreted
+        .evidence
+        .sessions
+        .iter()
+        .filter(|s| s.date >= pair.previous.date && s.date <= pair.current.date)
+        .flat_map(|s| s.evidence_refs.clone())
+        .collect();
+    let a = PairAcquisition {
+        window_acquisition_identity: acquisition_identity.to_owned(),
+        proof_identity: proof_identity.to_owned(),
+        pair_index,
+        daily_batch_id: interpreted.evidence.source.batch_id.clone(),
+        pair_evidence: refs,
+    };
+    snapshot_for(pair, &a)
+}
 fn qualify(proof: CompleteWindowProof) -> c::Result<QualifiedDailyChangeWindow> {
     let interpreted = inspect_proof(&proof)?;
     let (request_identity, proof_identity, acquisition_identity) = proof_identities(&proof)?;
     let mut candidates = Vec::new();
     let mut budget = c::encode(&proof, c::PROOF_LIMIT)?.len();
-    for (pair_index, pair) in interpreted.pairs.iter().enumerate() {
-        let refs = interpreted
-            .evidence
-            .sessions
-            .iter()
-            .filter(|s| s.date >= pair.previous.date && s.date <= pair.current.date)
-            .flat_map(|s| s.evidence_refs.clone())
-            .collect();
-        let a = PairAcquisition {
-            window_acquisition_identity: acquisition_identity.clone(),
-            proof_identity: proof_identity.clone(),
+    for pair_index in 0..interpreted.pairs.len() {
+        let snapshot = recorded_pair_snapshot(
+            &interpreted,
+            &proof_identity,
+            &acquisition_identity,
             pair_index,
-            daily_batch_id: interpreted.evidence.source.batch_id.clone(),
-            pair_evidence: refs,
-        };
-        let snapshot = snapshot_for(pair, &a)?;
+        )?;
         budget = budget
             .checked_add(c::encode(&snapshot, c::PROOF_LIMIT)?.len())
             .filter(|n| *n <= c::PREPARE_LIMIT)
@@ -550,7 +580,7 @@ async fn acquire_inner(
     bundle: &Path,
     now: DateTime<Utc>,
 ) -> c::Result<QualifiedDailyChangeWindow> {
-    let p = c::profile(&input.source_profile)?;
+    let p = c::profile(&input.source_profile).map_err(|e| e.at_stage("profile"))?;
     let frozen = c::freeze(input, now, &p)?;
     let query = build_ordinary_window_query(&frozen, &p)?;
     let request_bytes = query.wire_bytes()?;
@@ -561,6 +591,7 @@ async fn acquire_inner(
         .map_err(|e| {
             c::failure(FailureKind::ConnectionQualification, &e.to_string())
                 .with_retryable(e.details().retryable)
+                .at_stage("transport")
                 .retained(&request_identity, &retained)
         })?;
     let observation = reader
@@ -574,6 +605,7 @@ async fn acquire_inner(
             };
             c::failure(kind, &e.to_string())
                 .with_retryable(e.details().retryable)
+                .at_stage("transport")
                 .retained(&request_identity, &retained)
         })?;
     if let Err(e) = &observation.result {
@@ -586,6 +618,7 @@ async fn acquire_inner(
             &e.to_string(),
         )
         .with_retryable(e.details().retryable)
+        .at_stage("transport")
         .retained(&request_identity, &retained));
     }
     if observation.request_bytes != request_bytes {
@@ -636,12 +669,18 @@ async fn prepare_at(
 ) -> c::Result<PreparedWindowReceipt> {
     // Validate the profile before filesystem/network access, then acquire only
     // after an existing review namespace has been proved locally.
-    c::profile(&request.source_profile)?;
-    let mut conn = open_existing(database, false)?;
-    review::require_window_store(&mut conn).map_err(review_failure)?;
+    c::profile(&request.source_profile)
+        .map_err(|e| e.at_stage("profile").context_input(&request))?;
+    let mut conn =
+        open_existing(database, false).map_err(|e| e.at_stage("open").context_input(&request))?;
+    review::require_window_store(&mut conn)
+        .map_err(|e| review_failure(e).at_stage("store").context_input(&request))?;
     let qualified = acquire(request, client_bundle, now).await?;
-    review::prepare_window_on_conn(&mut conn, &qualified, now)
-        .map_err(|e| review_failure(e).with_window(&qualified))
+    review::prepare_window_on_conn(&mut conn, &qualified, now).map_err(|e| {
+        review_failure(e)
+            .at_stage("persistence")
+            .with_window(&qualified)
+    })
 }
 pub async fn consume_window(
     request: OrdinaryDailyChangeWindowRequest,
@@ -656,12 +695,15 @@ async fn consume_at(
     database: &Path,
     now: DateTime<Utc>,
 ) -> c::Result<AdmittedOrdinaryDailyChangeWindow> {
-    c::profile(&request.source_profile)?;
-    let mut conn = open_existing(database, true)?;
-    review::require_window_store(&mut conn).map_err(review_failure)?;
+    c::profile(&request.source_profile)
+        .map_err(|e| e.at_stage("profile").context_input(&request))?;
+    let mut conn =
+        open_existing(database, true).map_err(|e| e.at_stage("open").context_input(&request))?;
+    review::require_window_store(&mut conn)
+        .map_err(|e| review_failure(e).at_stage("store").context_input(&request))?;
     let q = acquire(request, client_bundle, now).await?;
     let ids = review::admit_window_on_conn(&mut conn, &q)
-        .map_err(|e| review_failure(e).with_window(&q))?;
+        .map_err(|e| review_failure(e).at_stage("admission").with_window(&q))?;
     Ok(AdmittedOrdinaryDailyChangeWindow {
         request: q.proof.frozen,
         request_identity: q.request_identity,
