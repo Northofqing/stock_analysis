@@ -28,6 +28,7 @@ pub use effective::{
     EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, EffectiveProjectionReceipt,
     FillAuthority, FillLineage, VerifiedEffectiveFillSet,
 };
+pub(crate) use effective::{observe_actual_parent_fills, RecordedPaperV2EffectiveFillSet};
 #[path = "paper_ledger_snapshot.rs"]
 mod snapshot;
 pub use snapshot::SnapshotRevision;
@@ -55,6 +56,12 @@ pub const FEE_MODEL: &str = "lot-rates-v1";
 pub struct Money(i64);
 impl Money {
     pub const ZERO: Self = Self(0);
+    pub(crate) const fn micros(self) -> i64 {
+        self.0
+    }
+    pub(crate) const fn from_micros(value: i64) -> Self {
+        Self(value)
+    }
     pub fn from_cny(value: f64) -> Result<Self, LedgerError> {
         let scaled = value * 1_000_000.0;
         if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
@@ -1070,6 +1077,18 @@ pub(crate) fn verified_v1_snapshot_with_audit_guard_on(
         projection_hash: stored.projection_hash,
         equity,
     })
+}
+
+/// Full original V1 observation after the caller has verified the complete
+/// CatalogV6 and every original owner/genesis row on this same snapshot.
+/// This body never grants V1 write or approval authority.
+pub(crate) fn read_verified_original_v1_body_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<PaperView, LedgerError> {
+    let view = load_inner(conn, binding, true)?;
+    view.require_available()?;
+    Ok(view)
 }
 
 pub(crate) struct VerifiedV1Snapshot {

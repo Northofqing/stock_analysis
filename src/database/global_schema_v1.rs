@@ -37,6 +37,8 @@ use crate::selection::audit::{
 
 #[path = "global_schema_backup_v1.rs"]
 mod backup;
+#[path = "global_schema_paper_v6.rs"]
+pub(crate) mod paper_v6;
 #[path = "global_schema_prospective_v1.rs"]
 mod prospective;
 
@@ -48,6 +50,8 @@ const PAPER_BOOK_OWNER_CATALOG_GENERATION: i64 =
     super::paper_book_owner_schema_v1::CATALOG_GENERATION;
 const PAPER_BOOK_PREPARED_CATALOG_GENERATION: i64 =
     super::paper_book_owner_schema_v2::CATALOG_GENERATION;
+
+const PAPER_BOOK_EXECUTION_CATALOG_GENERATION: i64 = 6;
 
 const PRODUCTION_DATABASE_RELATIVE_PATH: &str = "data/stock_analysis.db";
 const PRODUCTION_LOCK_DIRECTORY_RELATIVE_PATH: &str = "data/locks";
@@ -480,6 +484,9 @@ fn render_selection_v2_migration_diagnostic(
         }
         SelectionSchemaAuthorityDiagnostic::CatalogV4RequalificationRequired => {
             "catalog_v4_requalification_required"
+        }
+        SelectionSchemaAuthorityDiagnostic::CatalogV6RequalificationRequired => {
+            "catalog_v6_requalification_required"
         }
         SelectionSchemaAuthorityDiagnostic::CatalogV5RequalificationRequired => {
             "catalog_v5_requalification_required"
@@ -1283,6 +1290,7 @@ pub(crate) enum SelectionSchemaAuthorityDiagnostic {
     CatalogV3RequalificationRequired,
     CatalogV4RequalificationRequired,
     CatalogV5RequalificationRequired,
+    CatalogV6RequalificationRequired,
 }
 
 #[allow(dead_code)]
@@ -1873,6 +1881,9 @@ fn classify_selection_authority_state(
         | DatabaseHalfDiagnostic::Transitional(e)
         | DatabaseHalfDiagnostic::AmendedDatabaseHalf(e) => e,
     };
+    if evidence.identity.user_version == PAPER_BOOK_EXECUTION_CATALOG_GENERATION {
+        return Ok(SelectionSchemaAuthorityDiagnostic::CatalogV6RequalificationRequired);
+    }
     if evidence.identity.user_version == PAPER_BOOK_PREPARED_CATALOG_GENERATION {
         return Ok(SelectionSchemaAuthorityDiagnostic::CatalogV5RequalificationRequired);
     }
@@ -2494,6 +2505,7 @@ fn classify_identity(
                 | REVIEW_CATALOG_GENERATION
                 | PAPER_BOOK_OWNER_CATALOG_GENERATION
                 | PAPER_BOOK_PREPARED_CATALOG_GENERATION
+                | PAPER_BOOK_EXECUTION_CATALOG_GENERATION
         )
     {
         return Ok(GlobalSchemaIdentity {
@@ -2502,11 +2514,11 @@ fn classify_identity(
         });
     }
     if application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && user_version > PAPER_BOOK_PREPARED_CATALOG_GENERATION
+        && user_version > PAPER_BOOK_EXECUTION_CATALOG_GENERATION
     {
         return Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
             actual: user_version,
-            supported: PAPER_BOOK_PREPARED_CATALOG_GENERATION,
+            supported: PAPER_BOOK_EXECUTION_CATALOG_GENERATION,
         });
     }
     if application_id == 0 && user_version == 0 {
@@ -3928,7 +3940,7 @@ mod tests {
         .expect("TEST_CODE insert activation audit chain");
     }
 
-    static PROSPECTIVE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static PROSPECTIVE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn prospective_test_fixture(
         label: &str,
@@ -5659,10 +5671,10 @@ mod tests {
             );
         }
         assert!(matches!(
-            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 6),
+            classify_identity(STOCK_ANALYSIS_SQLITE_APPLICATION_ID, 7),
             Err(GlobalSchemaV1Error::UnsupportedFutureGeneration {
-                actual: 6,
-                supported: 5
+                actual: 7,
+                supported: 6
             })
         ));
         assert!(classify_identity(

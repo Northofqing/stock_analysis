@@ -7,6 +7,9 @@
 
 pub mod order_safety;
 pub(crate) mod paper_book_v2;
+pub(crate) mod paper_book_v2_budget_v1;
+pub(crate) mod paper_book_v2_fill_model;
+pub(crate) mod paper_book_v2_execution;
 pub mod paper_engine; // v16.3 Commit 4a: 4 铁律接入 paper_trade 卖出
 pub mod paper_ledger;
 pub mod paper_ledger_runtime;

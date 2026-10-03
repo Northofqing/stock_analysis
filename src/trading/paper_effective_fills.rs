@@ -809,3 +809,37 @@ fn legacy_verified_on(
         seed_lots: Vec::new(),
     })
 }
+
+/// Parent-fill facts use a new identity and integer money domain. This view
+/// does not implement, convert to, or supply rows for the historical raw-i64
+/// VerifiedEffectiveFillSet; its reader cannot reconstruct approval/window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordedPaperV2EffectiveFillSet {
+    account_id: String,
+    epoch_id: String,
+    execution_manifest_hash: String,
+    current_revision: i64,
+    current_event_hash: String,
+    fills: Vec<crate::trading::paper_book_v2_execution::FillRecord>,
+}
+impl RecordedPaperV2EffectiveFillSet {
+    pub(crate) fn identity_domain(&self) -> &'static str { "paper-parent-fill-id/v1" }
+    pub(crate) fn account_id(&self) -> &str { &self.account_id }
+    pub(crate) fn epoch_id(&self) -> &str { &self.epoch_id }
+    pub(crate) fn manifest_hash(&self) -> &str { &self.execution_manifest_hash }
+    pub(crate) fn revision(&self) -> (i64, &str) { (self.current_revision, &self.current_event_hash) }
+    pub(crate) fn fills(&self) -> &[crate::trading::paper_book_v2_execution::FillRecord] { &self.fills }
+}
+pub(crate) fn observe_actual_parent_fills(
+    account_id: &str,
+) -> Result<RecordedPaperV2EffectiveFillSet, LedgerError> {
+    let original = crate::trading::paper_book_v2_execution::read_actual(account_id)?;
+    Ok(RecordedPaperV2EffectiveFillSet {
+        account_id: original.manifest.account_id,
+        epoch_id: original.manifest.epoch_id,
+        execution_manifest_hash: original.manifest_hash,
+        current_revision: original.head.version,
+        current_event_hash: original.head.event_hash,
+        fills: original.projection.fills,
+    })
+}

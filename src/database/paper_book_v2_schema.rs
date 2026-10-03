@@ -183,6 +183,26 @@ pub(crate) fn verify_v5_manifest_on(
     verify_manifest_row_on(conn, 5)
 }
 
+/// CatalogV6 preserves the exact original fee namespace and descriptor.
+/// This is not whole-catalog qualification or execution authority.
+pub(crate) fn verify_v6_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    #[derive(QueryableByName)]
+    struct InvalidRow {
+        #[diesel(sql_type = BigInt)]
+        value: i64,
+    }
+    let invalid = diesel::sql_query(
+        "SELECT COUNT(*) AS value FROM paper_book_v2_fee_manifest WHERE
+         typeof(singleton)!='integer' OR singleton!=1 OR typeof(schema_id)!='text'
+         OR typeof(policy_instance_id)!='text' OR typeof(descriptor_sha256)!='text'
+         OR typeof(descriptor_bytes)!='blob'",
+    ).get_result::<InvalidRow>(conn)?.value;
+    if invalid != 0 { return Err(StagedPaperBookV2Error::ManifestMismatch); }
+    verify_manifest_row_on(conn, 6)
+}
+
 /// A complete inactive gen2 staging row may coexist with legacy V1 writes.
 /// This is only a structural check; it never activates a V2 owner or fill.
 pub(crate) fn verify_inactive_staged_manifest_on(
@@ -201,7 +221,7 @@ fn verify_manifest_row_on(
     }
     let mut reference = SqliteConnection::establish(":memory:")?;
     create_schema(&mut reference)?;
-    let matches_reference = if expected_user_version == 5 {
+    let matches_reference = if matches!(expected_user_version, 5 | 6) {
         fee_objects(conn)? == fee_objects(&mut reference)?
     } else {
         objects(conn)? == objects(&mut reference)?

@@ -477,6 +477,62 @@ fn isolated_test_sqlite_leaves(path: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+/// Retain the original private Test pathname/inode witness for both constructors.
+/// The fresh flag records only this helper's successful create_new operation.
+#[cfg(test)]
+fn pin_isolated_test_origin(
+    path: PathBuf,
+) -> Result<(IsolatedP05ConsumerOrigin, bool), Box<dyn std::error::Error>> {
+    let parent = path
+        .parent()
+        .ok_or("isolated test database requires a parent directory")?
+        .canonicalize()?;
+    let temp_root = std::env::temp_dir().canonicalize()?;
+    let test_named = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("TEST_CODE_") && name.ends_with(".db"));
+    if !parent.starts_with(temp_root) || !test_named {
+        return Err(
+            "isolated test database must be a TEST_CODE_*.db file under the OS temporary directory"
+                .into(),
+        );
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    // Resolve the parent before opening SQLite. Inspect every VFS leaf
+    // before even creating the main file, so alias rejection writes zero
+    // bytes to the target and creates no SQLite sidecar.
+    let path = parent.join(path.file_name().ok_or("isolated Test leaf absent")?);
+    let parent_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+        .open(&parent)?;
+    if !parent_file.metadata()?.is_dir() {
+        return Err("isolated Test parent is not a directory".into());
+    }
+    isolated_test_sqlite_leaves(&path)?;
+    let (main, fresh) = match isolated_test_regular_leaf(&path)? {
+        Some(main) => (main, false),
+        None => (
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
+                .open(&path)?,
+            true,
+        ),
+    };
+    let origin = IsolatedP05ConsumerOrigin {
+        path: path.clone(),
+        parent: parent_file,
+        main,
+    };
+    origin.validate()?;
+    Ok((origin, fresh))
+}
+
 #[cfg(test)]
 impl IsolatedP05ConsumerOrigin {
     fn validate(&self) -> std::io::Result<()> {
@@ -2731,6 +2787,7 @@ pub mod order_audit;
 pub mod p05_prediction_freeze;
 pub(crate) mod paper_book_owner_schema_v1;
 pub(crate) mod paper_book_owner_schema_v2;
+pub(crate) mod paper_book_v2_execution_schema_v1;
 pub(crate) mod paper_book_v2_ledger_schema_v1;
 pub(crate) mod paper_book_v2_schema;
 pub(crate) mod paper_inventory_failure_audit;
@@ -2826,51 +2883,94 @@ impl DatabaseManager {
     pub(crate) fn open_isolated_for_test(
         path: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let parent = path
-            .parent()
-            .ok_or("isolated test database requires a parent directory")?
-            .canonicalize()?;
-        let temp_root = std::env::temp_dir().canonicalize()?;
-        let test_named = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("TEST_CODE_") && name.ends_with(".db"));
-        if !parent.starts_with(temp_root) || !test_named {
-            return Err("isolated test database must be a TEST_CODE_*.db file under the OS temporary directory".into());
-        }
-        use std::os::unix::fs::OpenOptionsExt;
-        // Resolve the parent before opening SQLite. Inspect every VFS leaf
-        // before even creating the main file, so alias rejection writes zero
-        // bytes to the target and creates no SQLite sidecar.
-        let path = parent.join(path.file_name().ok_or("isolated Test leaf absent")?);
-        let parent_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
-            .open(&parent)?;
-        if !parent_file.metadata()?.is_dir() {
-            return Err("isolated Test parent is not a directory".into());
-        }
-        isolated_test_sqlite_leaves(&path)?;
-        let main = match isolated_test_regular_leaf(&path)? {
-            Some(main) => main,
-            None => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(O_NOFOLLOW_FLAG | O_NONBLOCK_FLAG | O_CLOEXEC_FLAG)
-                .open(&path)?,
-        };
-        let origin = IsolatedP05ConsumerOrigin {
-            path: path.clone(),
-            parent: parent_file,
-            main,
-        };
-        origin.validate()?;
-        let mut manager = Self::open_at_path(path)?;
+        let (origin, _) = pin_isolated_test_origin(path)?;
+        let mut manager = Self::open_at_path(origin.path.clone())?;
         origin.validate()?;
         manager.isolated_p05_consumer_origin = Some(origin);
         Ok(manager)
+    }
+
+    /// A fixed private fixture for the deliberately frozen GlobalSchema catalog.
+    /// Fresh owned files receive only the original same-runtime frozen legacy
+    /// DDL. Existing nonempty files reopen without migration or repair.
+    #[cfg(test)]
+    pub(crate) fn open_frozen_catalog_for_isolated_test(
+        path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (origin, fresh) = pin_isolated_test_origin(path)?;
+        origin.validate()?;
+        if fresh {
+            if origin.main.metadata()?.len() != 0 {
+                return Err("fresh isolated frozen main is not empty".into());
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                if isolated_test_regular_leaf(&sqlite_sidecar_path(&origin.path, suffix))?.is_some()
+                {
+                    return Err("fresh isolated frozen main has a SQLite sidecar".into());
+                }
+            }
+            let connection = rusqlite::Connection::open_with_flags(
+                &origin.path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+            global_schema_catalog_v1::install_legacy_catalog_for_prospective_test(&connection)?;
+            connection.close().map_err(|(_, error)| error)?;
+            origin.validate()?;
+        } else if origin.main.metadata()?.len() == 0 {
+            return Err("existing isolated frozen main is empty; no repair is allowed".into());
+        }
+
+        // Close the bootstrap before creating either real descriptor pool.
+        let mut bootstrap = SqliteConnection::establish(&origin.path.to_string_lossy())?;
+        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap)?;
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap)?
+            .journal_mode;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(
+                format!("SQLite journal_mode mismatch: expected WAL, got {journal_mode}").into(),
+            );
+        }
+        configure_sqlite_connection(&mut bootstrap)?;
+        drop(bootstrap);
+        origin.validate()?;
+
+        let leaf = origin.path.file_name().ok_or("isolated Test leaf absent")?;
+        let pinned = PinnedSqliteDatabase::from_test_descriptors(
+            origin.parent.try_clone()?,
+            origin.parent.try_clone()?,
+            leaf.to_os_string(),
+            PathBuf::from(leaf),
+            origin.main.try_clone()?,
+        )?;
+        let manager = SqliteConnectionManager::descriptor(pinned)?;
+        let source = manager.descriptor_source().ok_or_else(|| {
+            DatabaseAuthorityError::DescriptorAttestationUnavailable {
+                detail: "frozen Test manager has no actual descriptor source".into(),
+            }
+        })?;
+        let attribution_pool = build_attribution_sqlite_pool_from_manager(manager.clone(), 2)?;
+        let pool = build_sqlite_pool_from_manager(manager, SQLITE_POOL_SIZE)?;
+        origin.validate()?;
+        let result = Self {
+            pool,
+            attribution_pool: Some(attribution_pool),
+            attribution_connection_source: Some(source),
+            readonly_attribution_snapshot: None,
+            allow_unattested_attribution_reads_for_test: false,
+            isolated_p05_consumer_origin: Some(origin),
+            selection_connection_source: None,
+            selection_schema_authority: None,
+        };
+        // The actual branded checkout must exist; no optional-attestation fallback.
+        drop(result.attribution_checkout()?);
+        result
+            .isolated_p05_consumer_origin
+            .as_ref()
+            .ok_or("frozen Test origin absent")?
+            .validate()?;
+        Ok(result)
     }
 
     #[cfg(test)]

@@ -447,6 +447,8 @@ pub(crate) struct VerifiedV2GenesisView {
     pub(crate) event_hash: String,
     pub(crate) projection_bytes: Vec<u8>,
     pub(crate) projection_hash: String,
+    pub(crate) cutover_id: String,
+    pub(crate) fee_policy_instance_id: String,
 }
 
 /// Verify the entire CatalogV5 and every owner inside the same read transaction
@@ -461,31 +463,7 @@ pub(crate) fn read_v2_on(
     conn.transaction(|conn| {
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(conn)
             .map_err(|error| invalid(&error.to_string()))?;
-        let owner = diesel::sql_query(
-            "SELECT account_id,active_generation,active_epoch_id,active_manifest_hash,owner_revision,cutover_id
-             FROM paper_book_owner_v2 WHERE account_id=?",
-        )
-        .bind::<Text, _>(account_id)
-        .get_result::<OwnerRow>(conn)
-        .optional()?
-        .ok_or(LedgerError::InactiveEpoch)?;
-        if owner.active_generation != 2 {
-            return Err(LedgerError::InactiveEpoch);
-        }
-        let account = v2_account(conn, account_id)?;
-        let head = v2_head(conn, account_id)?;
-        Ok(VerifiedV2GenesisView {
-            account_id: account.account_id,
-            epoch_id: account.epoch_id,
-            manifest_hash: account.manifest_hash,
-            v1_epoch_id: account.v1_epoch_id,
-            v1_head_version: account.v1_head_version,
-            v1_head_hash: account.v1_head_hash,
-            version: head.version,
-            event_hash: head.event_hash,
-            projection_bytes: head.projection_bytes,
-            projection_hash: head.projection_hash,
-        })
+        read_verified_genesis_body_on(conn, account_id)
     })
 }
 
@@ -738,4 +716,39 @@ pub(crate) fn cutover_for_isolated_test(
         }
         result => result,
     }
+}
+
+/// Read-only body after full catalog and all original owner/genesis rows have
+/// been verified on this same transaction. It grants no execution authority.
+pub(crate) fn read_verified_genesis_body_on(
+    conn: &mut SqliteConnection,
+    account_id: &str,
+) -> Result<VerifiedV2GenesisView, LedgerError> {
+    let owner = diesel::sql_query(
+        "SELECT account_id,active_generation,active_epoch_id,active_manifest_hash,owner_revision,cutover_id
+         FROM paper_book_owner_v2 WHERE account_id=?",
+    )
+    .bind::<Text, _>(account_id)
+    .get_result::<OwnerRow>(conn)
+    .optional()?
+    .ok_or(LedgerError::InactiveEpoch)?;
+    if owner.active_generation != 2 {
+        return Err(LedgerError::InactiveEpoch);
+    }
+    let account = v2_account(conn, account_id)?;
+    let head = v2_head(conn, account_id)?;
+    Ok(VerifiedV2GenesisView {
+        account_id: account.account_id,
+        epoch_id: account.epoch_id,
+        manifest_hash: account.manifest_hash,
+        v1_epoch_id: account.v1_epoch_id,
+        v1_head_version: account.v1_head_version,
+        v1_head_hash: account.v1_head_hash,
+        version: head.version,
+        event_hash: head.event_hash,
+        projection_bytes: head.projection_bytes,
+        projection_hash: head.projection_hash,
+        cutover_id: account.cutover_id,
+        fee_policy_instance_id: account.fee_policy_instance_id,
+    })
 }
