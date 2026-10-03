@@ -178,6 +178,413 @@ fn insert(conn: &mut SqliteConnection, date: &str) -> Result<(), PaperCatalog6Er
     diesel::sql_query("INSERT INTO stock_daily(code,date,open,high,low,close,volume) VALUES ('TEST_CODE_G6_SENTINEL',?,10,10,10,10,100)").bind::<diesel::sql_types::Text,_>(date).execute(conn)?;
     Ok(())
 }
+
+fn insert_candidate_scope_row(
+    conn: &mut SqliteConnection,
+    id: i64,
+    time: &str,
+    metric: &str,
+    consumed: Option<&str>,
+) {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    diesel::sql_query("INSERT INTO main.pushed_stocks(id,push_time,push_kind,code,name,push_price,metric_json,source,consumed_at,consumed_by,outcome) VALUES(?,?,'raw_kind','SAME_RAW_CODE','原始候选',10.25,?,'TEST_CODE_raw_source',?,'raw_owner','raw_outcome')")
+        .bind::<BigInt,_>(id)
+        .bind::<Text,_>(time)
+        .bind::<Text,_>(metric)
+        .bind::<Nullable<Text>,_>(consumed)
+        .execute(conn).unwrap();
+}
+
+#[test]
+fn f2_candidate_scope_actual_top50_ties_bounds_and_raw_identity() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    let base = i64::from(i32::MAX) + 1;
+    {
+        let mut conn = f.db.get_conn().unwrap();
+        for i in 0..51 {
+            insert_candidate_scope_row(&mut conn, base + i, "2026-09-28 09:15:00.000", "{}", None);
+        }
+        for (id, time, consumed) in [
+            (100, "2026-09-28 08:30:00.000", None),
+            (101, "2026-09-28 09:30:00.000", None),
+            (102, "2026-09-28 08:29:59.999", None),
+            (103, "2026-09-28 09:30:00.001", None),
+            (
+                104,
+                "2026-09-28 09:20:00.000",
+                Some("2026-09-28 09:21:00.000"),
+            ),
+        ] {
+            insert_candidate_scope_row(&mut conn, id, time, "{}", consumed);
+        }
+    }
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let captured = session
+        .with_immediate_catalog6(
+            |conn, _, proof| {
+                let first = capture_scope(conn, proof, instant())?;
+                let same = capture_scope(conn, proof, instant())?;
+                assert_eq!(first.id(), same.id());
+                assert_eq!(first.canonical_bytes(), same.canonical_bytes());
+                Ok::<_, CandidateScopeError>(first)
+            },
+            |conn, _, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    assert!(captured
+        .id()
+        .as_str()
+        .starts_with("candidate-scope-capture-v1:"));
+    let content: serde_json::Value = serde_json::from_slice(captured.canonical_bytes()).unwrap();
+    assert_eq!(
+        content["lower_exclusive_shanghai"],
+        "2026-09-28 08:30:00.000"
+    );
+    assert_eq!(
+        content["upper_exclusive_shanghai"],
+        "2026-09-28 09:30:00.000"
+    );
+    assert_eq!(content["calendar"]["state"], "covered");
+    let candidates = content["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 50);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let row = &candidate["row"];
+        assert_eq!(row["id"], base + 50 - index as i64);
+        assert_eq!(row["code"], "SAME_RAW_CODE");
+        assert_eq!(row.as_object().unwrap().len(), 11);
+        assert_eq!(row["push_price_real_bits"], 10.25f64.to_bits());
+        assert_eq!(row["source"], "TEST_CODE_raw_source");
+        assert!(row["consumed_at"].is_null());
+        assert_eq!(row["consumed_by"], "raw_owner");
+        assert_eq!(row["outcome"], "raw_outcome");
+        assert_eq!(candidate["disposition"], "identity_unqualified");
+        let facts = candidate["facts"].as_array().unwrap();
+        assert_eq!(facts.len(), 3);
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact["requirement"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["lifecycle", "price_regime", "suspension"]
+        );
+        for fact in facts {
+            assert_eq!(fact["state"], "unqualified");
+            assert_eq!(fact["reason"], "not_requested_identity_unavailable");
+        }
+        for field in [
+            "risk_inventory",
+            "cost_model",
+            "liquidity_model",
+            "budget_allocation",
+            "manual_approval",
+        ] {
+            assert!(candidate[field]
+                .as_str()
+                .unwrap()
+                .starts_with("unavailable_"));
+        }
+        assert_eq!(
+            candidate["risk_evaluation"],
+            "not_evaluated_identity_unqualified"
+        );
+    }
+    // Exact raw source and all candidate state, including unqualified fields,
+    // are part of identity rather than being dropped by a code-based grouping.
+    f.db.get_conn().unwrap().batch_execute("UPDATE main.pushed_stocks SET source='changed_raw_source',outcome=NULL WHERE id=(SELECT MAX(id) FROM main.pushed_stocks)").unwrap();
+    drop(session);
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let changed = session
+        .with_readonly_catalog6(
+            |conn, proof| capture_scope(conn, proof, instant()),
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    assert_ne!(captured.id(), changed.id());
+    // Without the tie pool, lower-bound rows cannot hide below LIMIT 50.
+    diesel::sql_query("DELETE FROM main.pushed_stocks WHERE id>=?")
+        .bind::<diesel::sql_types::BigInt, _>(base)
+        .execute(&mut f.db.get_conn().unwrap())
+        .unwrap();
+    {
+        let mut conn = f.db.get_conn().unwrap();
+        insert_candidate_scope_row(&mut conn, 105, "2026-09-28 08:30:00.001", "{}", None);
+        insert_candidate_scope_row(&mut conn, 106, "2026-09-28 09:29:59.999", "{}", None);
+    }
+    // Separate evaluations use fresh bounded owner sessions. A live session's
+    // cumulative copy-work counter is never reset or increased.
+    drop(session);
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let boundaries = session
+        .with_readonly_catalog6(
+            |conn, proof| capture_scope(conn, proof, instant()),
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    let content: serde_json::Value = serde_json::from_slice(boundaries.canonical_bytes()).unwrap();
+    let ids = content["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["row"]["id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [106, 105]);
+}
+
+#[test]
+fn f2_candidate_scope_malformed_text_is_rejected_before_string_construction() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    insert_candidate_scope_row(
+        &mut f.db.get_conn().unwrap(),
+        1,
+        "2026-09-28 09:15:00.000",
+        "{}",
+        None,
+    );
+    for (field, original) in [
+        ("push_time", "2026-09-28 09:15:00.000"),
+        ("push_kind", "raw_kind"),
+        ("code", "SAME_RAW_CODE"),
+        ("name", "原始候选"),
+        ("metric_json", "{}"),
+        ("source", "TEST_CODE_raw_source"),
+        ("consumed_by", "raw_owner"),
+        ("outcome", "raw_outcome"),
+    ] {
+        let bytes = if field == "push_time" {
+            [b"2026-09-28 09:15:".as_slice(), &[0xff, 0, b'A']].concat()
+        } else {
+            vec![0xff, 0, b'A']
+        };
+        // Only test-owned fixed field names enter SQL. No Diesel TEXT read of
+        // the damaged value occurs, including in the assertion or diagnostics.
+        f.db.get_conn()
+            .unwrap()
+            .batch_execute(&format!(
+                "UPDATE main.pushed_stocks SET {field}=CAST(X'{}' AS TEXT)",
+                hex::encode(&bytes)
+            ))
+            .unwrap();
+        let mut session = paper_catalog6_session(&f.db).unwrap();
+        let result = session.with_readonly_catalog6(
+            |conn, proof| capture_scope(conn, proof, instant()),
+            |_, _, _| Ok::<_, CandidateScopeError>(()),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("{field} malformed TEXT cannot yield a capture"),
+        };
+        assert!(
+            matches!(
+                error,
+                PaperCatalog6ReadbackError::Consumer(CandidateScopeError::InvalidText)
+            ),
+            "{field}: {error:?}"
+        );
+        diesel::sql_query(format!("UPDATE main.pushed_stocks SET {field}=?"))
+            .bind::<diesel::sql_types::Text, _>(original)
+            .execute(&mut f.db.get_conn().unwrap())
+            .unwrap();
+    }
+}
+
+#[test]
+fn f2_candidate_scope_retains_original_namespace_even_for_equal_content() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let original = Fixture::v6();
+    let foreign = Fixture::v6();
+    let original_capture = paper_catalog6_session(&original.db)
+        .unwrap()
+        .with_readonly_catalog6(
+            |conn, proof| capture_scope(conn, proof, instant()),
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    let mut session = paper_catalog6_session(&foreign.db).unwrap();
+    let foreign_capture = session
+        .with_readonly_catalog6(
+            |conn, proof| capture_scope(conn, proof, instant()),
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    // These are content IDs, while retained authority is nonserializable and
+    // still identifies the original source objects independently of contents.
+    assert_eq!(original_capture.id(), foreign_capture.id());
+    let result = session.with_readonly_catalog6(
+        |conn, proof| {
+            let count = count_actual_sql(conn);
+            confirm_counter_and_reset(conn, &count);
+            let result = original_capture.verify_unchanged(conn, proof);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            result
+        },
+        |_, _, _| Ok::<_, CandidateScopeError>(()),
+    );
+    assert!(matches!(
+        result,
+        Err(PaperCatalog6ReadbackError::Consumer(
+            CandidateScopeError::SourceAuthority
+        ))
+    ));
+}
+
+#[test]
+fn f2_candidate_scope_actual_limits_types_and_empty_calendar_refusal() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let empty = session
+        .with_readonly_catalog6(
+            |conn, proof| {
+                capture_scope(
+                    conn,
+                    proof,
+                    Utc.with_ymd_and_hms(2027, 1, 4, 1, 30, 0).unwrap(),
+                )
+            },
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    let content: serde_json::Value = serde_json::from_slice(empty.canonical_bytes()).unwrap();
+    assert_eq!(content["scope_state"], "empty_bounded_scope");
+    assert_eq!(content["calendar"]["state"], "unavailable");
+    assert!(content["candidates"].as_array().unwrap().is_empty());
+    let closed = session
+        .with_readonly_catalog6(
+            |conn, proof| {
+                capture_scope(
+                    conn,
+                    proof,
+                    Utc.with_ymd_and_hms(2026, 10, 3, 1, 30, 0).unwrap(),
+                )
+            },
+            |conn, proof, value| value.verify_unchanged(conn, proof),
+        )
+        .unwrap();
+    let content: serde_json::Value = serde_json::from_slice(closed.canonical_bytes()).unwrap();
+    assert_eq!(content["calendar"]["state"], "covered");
+    assert_eq!(content["calendar"]["open"], false);
+    {
+        let mut conn = f.db.get_conn().unwrap();
+        insert_candidate_scope_row(
+            &mut conn,
+            1,
+            "2026-09-28 09:15:00.000",
+            &"x".repeat(64 * 1024 + 1),
+            None,
+        );
+    }
+    let too_large = session.with_readonly_catalog6(
+        |conn, proof| capture_scope(conn, proof, instant()),
+        |_, _, _| Ok::<_, CandidateScopeError>(()),
+    );
+    assert!(matches!(
+        too_large,
+        Err(PaperCatalog6ReadbackError::Consumer(
+            CandidateScopeError::Bounds
+        ))
+    ));
+    f.db.get_conn()
+        .unwrap()
+        .batch_execute("UPDATE main.pushed_stocks SET metric_json=X'7B7D'")
+        .unwrap();
+    let wrong_type = session.with_readonly_catalog6(
+        |conn, proof| capture_scope(conn, proof, instant()),
+        |_, _, _| Ok::<_, CandidateScopeError>(()),
+    );
+    assert!(matches!(
+        wrong_type,
+        Err(PaperCatalog6ReadbackError::Consumer(
+            CandidateScopeError::Bounds
+        ))
+    ));
+    assert_eq!(
+        capture::int(
+            &mut f.db.get_conn().unwrap(),
+            "SELECT COUNT(*) AS value FROM main.pushed_stocks"
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn f2_candidate_scope_actual_last_sql_mutation_rolls_back() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    insert_candidate_scope_row(
+        &mut f.db.get_conn().unwrap(),
+        1,
+        "2026-09-28 09:15:00.000",
+        "{}",
+        None,
+    );
+    let _hook = set_hook(|phase, conn| {
+        if phase == TestPhase::BeforeTail {
+            conn.batch_execute("UPDATE main.pushed_stocks SET metric_json='late_change'")?;
+        }
+        Ok(())
+    });
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let outcome = session.with_immediate_catalog6(
+        |conn, _, proof| capture_scope(conn, proof, instant()),
+        |conn, _, proof, value| value.verify_unchanged(conn, proof),
+    );
+    assert!(matches!(
+        outcome,
+        Err(PaperCatalog6TransactionError::Consumer(
+            CandidateScopeError::Changed
+        ))
+    ));
+    assert_eq!(
+        capture::int(
+            &mut f.db.get_conn().unwrap(),
+            "SELECT COUNT(*) AS value FROM main.pushed_stocks WHERE metric_json='{}'"
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn f2_candidate_scope_foreign_loan_rejects_with_zero_sql() {
+    use crate::decision::pushed_candidate_scope_v1::{
+        capture_pushed_candidate_scope_at_for_test as capture_scope, CandidateScopeError,
+    };
+    let _serial = super::super::tests::PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+    let f = Fixture::v6();
+    let mut foreign = SqliteConnection::establish(":memory:").unwrap();
+    let count = count_actual_sql(&mut foreign);
+    confirm_counter_and_reset(&mut foreign, &count);
+    let mut session = paper_catalog6_session(&f.db).unwrap();
+    let outcome = session.with_immediate_catalog6(
+        |_, _, proof| capture_scope(&mut foreign, proof, instant()),
+        |_, _, _, _| Ok::<_, CandidateScopeError>(()),
+    );
+    assert!(matches!(
+        outcome,
+        Err(PaperCatalog6TransactionError::Consumer(
+            CandidateScopeError::Catalog(PaperCatalog6Error::ConnectionInstanceMismatch)
+        ))
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
 struct HookGuard;
 impl Drop for HookGuard {
     fn drop(&mut self) {

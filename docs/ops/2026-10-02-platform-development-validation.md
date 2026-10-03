@@ -575,3 +575,15 @@ Rows 正式提交 `5075d9ba4a93b47e2f661cb857643dbf4f3d2209` 已推送至上述�
 此片关闭 Rows 复核缺陷，仍不颁发 target/apply/restore 或生产资格。下一片为 actual Global loan 内的 bounded pushed-row Top50 来源捕获，独立 CandidateScopeCaptureId 和完整拒绝原因；formal F2 typed identity、Catalog7 immutable持久owner、真实source及B/seed/cutover继续待完成。
 
 Windows D14 docs-only新交接 `62502520` 已实读，manifest `d5766f82ac9127ab1dab05c69518ff009dbe5c8efd4a5b7d8188617b64bd5d40` 和25成员长度/SHA独立no-follow核验通过，已发送Mac读取ACK。WG07正式请求/结果规范及caller seam、区间语义、逐代码终态、publication/revision/PIT证据仍有缺口；未部署服务或执行真实业务RPC。
+
+### F2 bounded candidate 来源组件验收
+
+Rows 修复 `eb52eca565616057ea930a7b5897dad1b21c7a1d` 已 push，真实 ls-remote OID一致、clean 后开始本片。新 private `pushed_candidate_scope_v1` 在 actual Catalog6 loan 内冻结原 `pushed_stocks` 11列：未消费、严格前一小时文本界限、`push_time COLLATE BINARY DESC,id DESC` 的版本化 Top50；保留 i64 行身份、重复 raw code、REAL bits 和完整原字段。固定资源界、主库 UTF-8、类型/长度预检、9文本列 Binary 运输与 checked UTF-8 解码；不借 SQLite TEXT 构造未检查的 Rust String。原 namespace authority 和原 cutoff 保留，用于同事务 tail 与独立 committed reader 精确重捕获。
+
+每行明确 identity 未资格，lifecycle/price-regime/suspension 因 identity 不可用而未请求；risk inventory/evaluation、cost/liquidity、B/allocation/manual approval 缺口均保存。日历记录实际 immutable API 的 covered hash/open/closed 或 coverage unavailable。独立 `CandidateScopeCaptureId` 是来源内容身份，不是 InvestmentDecisionId、Recorded occurrence、审批或执行资格；本片没有持久写入或生产接线，Catalog6 生产仍在 checkout 前拒绝。
+
+唯一最终命令 `cargo test --locked --offline --lib f2_candidate_scope` **EXIT0 / 6 passed / 0 failed**，编译4m43s、运行10.20s；日志 SHA-256 `1ac82a7d744aaaa94fed84a724e204e123f2e580fec6e64a0f36b556c5411c24`。实际 complete C6 fixture 保留既有非空 V1/V2 seed/genesis/financial history，验证51条 tie 的精确Top50、严格上下界、全11字段、空范围/日历、错类型/超限、8个可入选的损坏TEXT、最后hook改行回滚、错loan及同内容换namespace零scope SQL拒绝。
+
+原第一次编译在确认不安全 Text 解码后中断（EXIT130、无测试结果）；修复后第一完整轮为2PASS/4FAIL，首失败是多次独立评估复用累计预算 session，后三是串行锁 poison。仅测试改为每次独立评估 fresh actual session，未重置/增加生产 CopyWork 预算；原失败/诊断日志保留。最终 source `398e2c3c` 与注册 `632e95f9` 未改，测试 `4f3a42ad`。独立审阅者实际读取完整 source 及最终 fresh-session 窄测试 delta，无剩余 P1/P2；静态复核不代称测试。`git diff --check`通过；new module/测试文件 scoped rustfmt 通过，mod.rs 的既存 approved/action 声明排序差异保留，新增声明本身已核对。全库、非 macOS 原生路径、正式 typed instrument、持久 occurrence/cold reopen 与生产未由本片验证。
+
+后继按依赖交付 Catalog7 固定 schema/borrower 与不可变来源观察 occurrence、exact retry/conflict/cold reopen，然后真实来源身份和完整 F2/风险/资金资格；Global target/apply、逐Unit生产接管、Uncertain裁定、Gate P及自然观察仍待完成。
