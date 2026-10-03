@@ -851,10 +851,85 @@ def inherited_jobserver_fds(env):
     return (read, write)
 
 
-# Two reached host requests only; these names do not authorize other sources.
+# Finite prospective origins from frozen metadata SHA-256
+# 1b87b599363d23bfa26ddf176f12a449193e4154da894c731607a96b898c795a.
+# Eligibility is not a reached/selected-artifact claim. All paths are explicit;
+# duplicate crate names are distinguished by full package ID, never normalized.
 BARE_PROC_MACRO_ORIGINS = {
-    "serde_derive": ("serde_derive", "1.0.228"),
-    "tokio_macros": ("tokio-macros", "2.7.0"),
+    ('registry+https://github.com/rust-lang/crates.io-index#async-stream-impl@0.3.6', 'async_stream_impl'):
+        ('async-stream-impl', '0.3.6', 'async-stream-impl/Cargo.toml', 'async-stream-impl/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#async-trait@0.1.89', 'async_trait'):
+        ('async-trait', '0.1.89', 'async-trait/Cargo.toml', 'async-trait/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#bincode_derive@2.0.1', 'bincode_derive'):
+        ('bincode_derive', '2.0.1', 'bincode_derive/Cargo.toml', 'bincode_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#bytemuck_derive@1.10.2', 'bytemuck_derive'):
+        ('bytemuck_derive', '1.10.2', 'bytemuck_derive/Cargo.toml', 'bytemuck_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#clap_derive@4.6.0', 'clap_derive'):
+        ('clap_derive', '4.6.0', 'clap_derive/Cargo.toml', 'clap_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#darling_macro@0.14.4', 'darling_macro'):
+        ('darling_macro', '0.14.4', 'darling_macro-0.14.4/Cargo.toml', 'darling_macro-0.14.4/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#darling_macro@0.21.3', 'darling_macro'):
+        ('darling_macro', '0.21.3', 'darling_macro/Cargo.toml', 'darling_macro/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#derive_builder_macro@0.12.0', 'derive_builder_macro'):
+        ('derive_builder_macro', '0.12.0', 'derive_builder_macro/Cargo.toml', 'derive_builder_macro/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#diesel_derives@2.3.7', 'diesel_derives'):
+        ('diesel_derives', '2.3.7', 'diesel_derives/Cargo.toml', 'diesel_derives/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.5', 'displaydoc'):
+        ('displaydoc', '0.2.5', 'displaydoc/Cargo.toml', 'displaydoc/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#document-features@0.2.12', 'document_features'):
+        ('document-features', '0.2.12', 'document-features/Cargo.toml', 'document-features/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#foreign-types-macros@0.2.3', 'foreign_types_macros'):
+        ('foreign-types-macros', '0.2.3', 'foreign-types-macros/Cargo.toml', 'foreign-types-macros/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#futures-macro@0.3.32', 'futures_macro'):
+        ('futures-macro', '0.3.32', 'futures-macro/Cargo.toml', 'futures-macro/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.23', 'jiff_static'):
+        ('jiff-static', '0.2.23', 'jiff-static/Cargo.toml', 'jiff-static/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#num-derive@0.4.2', 'num_derive'):
+        ('num-derive', '0.4.2', 'num-derive/Cargo.toml', 'num-derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#openssl-macros@0.1.1', 'openssl_macros'):
+        ('openssl-macros', '0.1.1', 'openssl-macros/Cargo.toml', 'openssl-macros/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#pin-project-internal@1.1.13', 'pin_project_internal'):
+        ('pin-project-internal', '1.1.13', 'pin-project-internal/Cargo.toml', 'pin-project-internal/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.4', 'prost_derive'):
+        ('prost-derive', '0.14.4', 'prost-derive/Cargo.toml', 'prost-derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#recursive-proc-macro-impl@0.1.1', 'recursive_proc_macro_impl'):
+        ('recursive-proc-macro-impl', '0.1.1', 'recursive-proc-macro-impl/Cargo.toml', 'recursive-proc-macro-impl/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#rustversion@1.0.22', 'rustversion'):
+        ('rustversion', '1.0.22', 'rustversion/Cargo.toml', 'rustversion/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.228', 'serde_derive'):
+        ('serde_derive', '1.0.228', 'serde_derive/Cargo.toml', 'serde_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#serial_test_derive@0.10.0', 'serial_test_derive'):
+        ('serial_test_derive', '0.10.0', 'serial_test_derive/Cargo.toml', 'serial_test_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#sqlparser_derive@0.4.0', 'sqlparser_derive'):
+        ('sqlparser_derive', '0.4.0', 'sqlparser_derive/Cargo.toml', 'sqlparser_derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#strum_macros@0.27.2', 'strum_macros'):
+        ('strum_macros', '0.27.2', 'strum_macros/Cargo.toml', 'strum_macros/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@1.0.69', 'thiserror_impl'):
+        ('thiserror-impl', '1.0.69', 'thiserror-impl-1.0.69/Cargo.toml', 'thiserror-impl-1.0.69/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.18', 'thiserror_impl'):
+        ('thiserror-impl', '2.0.18', 'thiserror-impl/Cargo.toml', 'thiserror-impl/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#time-macros@0.2.32', 'time_macros'):
+        ('time-macros', '0.2.32', 'time-macros/Cargo.toml', 'time-macros/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#tokio-macros@2.7.0', 'tokio_macros'):
+        ('tokio-macros', '2.7.0', 'tokio-macros/Cargo.toml', 'tokio-macros/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#tracing-attributes@0.1.31', 'tracing_attributes'):
+        ('tracing-attributes', '0.1.31', 'tracing-attributes/Cargo.toml', 'tracing-attributes/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro@0.2.117', 'wasm_bindgen_macro'):
+        ('wasm-bindgen-macro', '0.2.117', 'wasm-bindgen-macro/Cargo.toml', 'wasm-bindgen-macro/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#windows-implement@0.60.2', 'windows_implement'):
+        ('windows-implement', '0.60.2', 'windows-implement/Cargo.toml', 'windows-implement/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#windows-interface@0.59.3', 'windows_interface'):
+        ('windows-interface', '0.59.3', 'windows-interface/Cargo.toml', 'windows-interface/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#wit-bindgen-rust-macro@0.51.0', 'wit_bindgen_rust_macro'):
+        ('wit-bindgen-rust-macro', '0.51.0', 'wit-bindgen-rust-macro/Cargo.toml', 'wit-bindgen-rust-macro/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.2', 'yoke_derive'):
+        ('yoke-derive', '0.8.2', 'yoke-derive/Cargo.toml', 'yoke-derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.48', 'zerocopy_derive'):
+        ('zerocopy-derive', '0.8.48', 'zerocopy-derive/Cargo.toml', 'zerocopy-derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.7', 'zerofrom_derive'):
+        ('zerofrom-derive', '0.1.7', 'zerofrom-derive/Cargo.toml', 'zerofrom-derive/src/lib.rs'),
+    ('registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.3', 'zerovec_derive'):
+        ('zerovec-derive', '0.11.3', 'zerovec-derive/Cargo.toml', 'zerovec-derive/src/lib.rs'),
 }
 BARE_PROC_MACRO_CANDIDATES = tuple(
     "lib/rustlib/x86_64-apple-darwin/lib/libproc_macro-b94f7a67a9654a0b." + suffix
@@ -897,12 +972,12 @@ def bare_proc_macro_declarations(args, parsed, context, cwd, session, inv, packa
             and options.get("--out-dir") == [host] and options.get("-L") == ["dependency=" + host],
             "BareProcMacroRole")
     crate = options.get("--crate-name", [None])[0]
-    require(crate in BARE_PROC_MACRO_ORIGINS, "BareProcMacroOrigin")
-    name, version = BARE_PROC_MACRO_ORIGINS[crate]
-    expected = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
-                "tree": "vendor", "manifest": name + "/Cargo.toml"}
-    manifest = session / "vendor" / expected["manifest"]
-    expected_source = manifest.parent / "src/lib.rs"
+    key = (package["id"], crate)
+    require(key in BARE_PROC_MACRO_ORIGINS, "BareProcMacroOrigin")
+    name, version, manifest_relative, source_relative = BARE_PROC_MACRO_ORIGINS[key]
+    expected = {"id": key[0], "tree": "vendor", "manifest": manifest_relative}
+    manifest = session / "vendor" / manifest_relative
+    expected_source = session / "vendor" / source_relative
     require(package == expected and inv["packages"].count(expected) == 1
             and cwd == manifest.parent and source == expected_source
             and env.get("CARGO_MANIFEST_DIR") == str(manifest.parent)
