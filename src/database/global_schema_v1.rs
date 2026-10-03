@@ -47,6 +47,8 @@ pub(crate) mod paper_v6;
 mod prospective;
 #[path = "global_schema_rows_v1.rs"]
 mod rows;
+#[path = "global_schema_replay_work_v1.rs"]
+mod replay_work;
 #[path = "global_schema_target_v1.rs"]
 mod target;
 

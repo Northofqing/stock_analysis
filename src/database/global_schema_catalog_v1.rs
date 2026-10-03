@@ -1233,6 +1233,12 @@ struct WholeRowsColumn {
     primary_key: i64,
     hidden: i64,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowsSpecDebitFailure {
+    Overflow,
+    Exceeded,
+}
+
 pub(super) struct RowsSpecWork {
     used: u64,
     limit: u64,
@@ -1249,12 +1255,17 @@ impl RowsSpecWork {
         }
     }
     pub(super) fn charge(&mut self, amount: u64) -> Result<(), GlobalSchemaCatalogError> {
-        self.used = self
-            .used
-            .checked_add(amount)
-            .ok_or_else(|| rows_catalog_error("metadata work overflow"))?;
+        self.try_charge(amount).map_err(|failure| match failure {
+            RowsSpecDebitFailure::Overflow => rows_catalog_error("metadata work overflow"),
+            RowsSpecDebitFailure::Exceeded => rows_catalog_error("metadata work exceeded"),
+        })
+    }
+    // Preserve the historical assignment order: addition overflow leaves used
+    // unchanged; a limit failure retains the successfully added attempted total.
+    pub(super) fn try_charge(&mut self, amount: u64) -> Result<(), RowsSpecDebitFailure> {
+        self.used = self.used.checked_add(amount).ok_or(RowsSpecDebitFailure::Overflow)?;
         if self.used > self.limit {
-            return Err(rows_catalog_error("metadata work exceeded"));
+            return Err(RowsSpecDebitFailure::Exceeded);
         }
         Ok(())
     }
