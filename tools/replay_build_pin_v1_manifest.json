@@ -973,7 +973,7 @@
         "sha256": "91d60b39e4207cb8d7c16c340f20979b5cf34f7220443aa6271244dd3a399366"
       }
     },
-    "owner_sha256": "7e3aa560343c9083cb11ee97706aad5a7ff20a4f9b76135c3c7b57c94c1f4cbb",
+    "owner_sha256": "34dab66120a86ca9994d4a6ad21735b5e7699e53731c46821e194cb1d4807c02",
     "packages": [
       {
         "id": "registry+https://github.com/rust-lang/crates.io-index#adler2@2.0.1",
