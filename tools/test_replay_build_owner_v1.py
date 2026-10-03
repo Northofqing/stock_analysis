@@ -770,6 +770,141 @@ compile(['--crate-name','stock_analysis','--crate-type','lib','--emit=dep-info,m
 emit({'reason':'build-finished','success':True})
 """
 
+# Record7 argv literals are retained observations; substituted paths, package
+# source bytes, sysroot candidates, compiler products and events below are fake.
+PROC_MACRO7_ARGS = {'serde_derive': ['--crate-name', 'serde_derive', '--edition=2021', '{session}/vendor/serde_derive/src/lib.rs', '--error-format=json', '--json=diagnostic-rendered-ansi,artifacts,future-incompat', '--crate-type', 'proc-macro', '--emit=dep-info,link', '-C', 'prefer-dynamic', '-C', 'embed-bitcode=no', '-C', 'debuginfo=1', '-C', 'split-debuginfo=unpacked', '--cfg', 'feature="default"', '--check-cfg', 'cfg(docsrs,test)', '--check-cfg', 'cfg(feature, values("default", "deserialize_in_place"))', '-C', 'metadata=736489fbc97c464d', '-C', 'extra-filename=-32debcfbaa2a46e3', '--out-dir', '{session}/target/debug/deps', '-L', 'dependency={session}/target/debug/deps', '--extern', 'proc_macro2={session}/target/debug/deps/libproc_macro2-2e38878fe48e194f.rlib', '--extern', 'quote={session}/target/debug/deps/libquote-75266c67e160dbe3.rlib', '--extern', 'syn={session}/target/debug/deps/libsyn-ad068d60231c3384.rlib', '--extern', 'proc_macro', '--cap-lints', 'allow'], 'tokio_macros': ['--crate-name', 'tokio_macros', '--edition=2021', '{session}/vendor/tokio-macros/src/lib.rs', '--error-format=json', '--json=diagnostic-rendered-ansi,artifacts,future-incompat', '--crate-type', 'proc-macro', '--emit=dep-info,link', '-C', 'prefer-dynamic', '-C', 'embed-bitcode=no', '-C', 'debuginfo=1', '-C', 'split-debuginfo=unpacked', '--warn=unexpected_cfgs', '--check-cfg', 'cfg(fuzzing)', '--check-cfg', 'cfg(loom)', '--check-cfg', 'cfg(mio_unsupported_force_poll_poll)', '--check-cfg', 'cfg(tokio_allow_from_blocking_fd)', '--check-cfg', 'cfg(tokio_internal_mt_counters)', '--check-cfg', 'cfg(tokio_no_parking_lot)', '--check-cfg', 'cfg(tokio_no_tuning_tests)', '--check-cfg', 'cfg(tokio_unstable)', '--check-cfg', 'cfg(target_os, values("cygwin"))', '--check-cfg', 'cfg(docsrs,test)', '--check-cfg', 'cfg(feature, values())', '-C', 'metadata=390ed39a8149c6db', '-C', 'extra-filename=-f1e8bd05b14268be', '--out-dir', '{session}/target/debug/deps', '-L', 'dependency={session}/target/debug/deps', '--extern', 'proc_macro2={session}/target/debug/deps/libproc_macro2-2e38878fe48e194f.rlib', '--extern', 'quote={session}/target/debug/deps/libquote-75266c67e160dbe3.rlib', '--extern', 'syn={session}/target/debug/deps/libsyn-ad068d60231c3384.rlib', '--extern', 'proc_macro', '--cap-lints', 'allow']}
+PROC_MACRO7_CANDIDATES = (
+    "lib/rustlib/x86_64-apple-darwin/lib/libproc_macro-b94f7a67a9654a0b.rlib",
+    "lib/rustlib/x86_64-apple-darwin/lib/libproc_macro-b94f7a67a9654a0b.rmeta")
+PROC_MACRO7_RUSTC = "\nimport json,os,pathlib,sys\nargs=sys.argv[1:]\ndef value(key):\n    inline=[a.split('=',1)[1] for a in args if a.startswith(key+'=')]\n    return inline[0] if inline else args[args.index(key)+1]\nname=value('--crate-name');source=next(pathlib.Path(a).resolve() for a in args if a.endswith('.rs'))\ncodegen=[args[i+1] for i,a in enumerate(args) if a=='-C']\nsuffix=next((v.split('=',1)[1] for v in codegen if v.startswith('extra-filename=')),'')\nbase=name+suffix;out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)\nhits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)\n(hits/('compile-'+name)).write_text(json.dumps(args))\nfor ext in (('.dylib',) if value('--crate-type')=='proc-macro' else ('.rmeta','.rlib')):(out/('lib'+base+ext)).write_bytes(name.encode()+b':'+source.read_bytes())\ndef escape(text):return text.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')\n(out/(base+'.d')).write_text(escape(str(out/('lib'+base+'.rlib')))+': '+escape(str(source))+chr(10))\nprint(json.dumps({'fixture_argv':args}),file=sys.stderr)\n"
+PROC_MACRO7_REJECTIONS = {
+    "unknown": "UnsupportedBareExtern", "core": "UnsupportedBareExtern", "std": "UnsupportedBareExtern",
+    "namespace": "UnsupportedBareExtern", "modifier": "UnsupportedBareExtern",
+    "space": "UnsupportedBareExtern", "control": "UnsupportedBareExtern",
+    "joined": "UnsupportedBareExtern", "duplicate": "BareProcMacroAmbiguous",
+    "mixed": "BareProcMacroAmbiguous", "crate_type": "BareProcMacroRole",
+    "target": "BareProcMacroRole", "probe": "BareProcMacroRole",
+    "out_dir": "BareProcMacroRole", "search": "BareProcMacroRole",
+    "emit": "BareProcMacroRole", "nested": "NestedCompilerContext",
+    "package": "UnresolvedSourcePackage", "source": "SourceMismatch",
+    "manifest": "BareProcMacroOrigin", "version": "BareProcMacroOrigin",
+    "manifest_path": "BareProcMacroOrigin", "origin": "BareProcMacroOrigin",
+    "candidate_missing": "BareProcMacroSysroot", "candidate_drift": "BareProcMacroSysroot",
+    "candidate_alias": "BareProcMacroSysroot", "candidate_extra": "BareProcMacroSysroot",
+    "candidate_foreign": "BareProcMacroSysroot"}
+
+PROC_MACRO7_CARGO = r'''
+import json,os,pathlib,subprocess,sys
+CASE=__CASE__;TEMPLATES=__TEMPLATES__;CANDIDATES=__CANDIDATES__
+args=sys.argv[1:];assert args[:6]==['build','--locked','--offline','--lib','--target','x86_64-apple-darwin']
+app=pathlib.Path(args[args.index('--manifest-path')+1]).parent;session=app.parent
+host=session/'target/debug/deps';dest=session/'target/x86_64-apple-darwin/debug/deps'
+sysroot=pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']).parent
+events=[]
+def event(value): events.append(value)
+def finish(success):
+    for value in events:print(json.dumps(value),flush=True)
+    print(json.dumps({'reason':'build-finished','success':success}),flush=True)
+def compile(argv,root,package,macro=False):
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),
+             FIXTURE_HIT_ROOT=str(session/'compiler-entry'),
+             DYLD_FALLBACK_LIBRARY_PATH=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+    name=argv[argv.index('--crate-name')+1];restores=[]
+    if macro:
+        env.update(CARGO_PKG_NAME=root.name,CARGO_PKG_VERSION='1.0.228' if root.name=='serde_derive' else '2.7.0')
+        if CASE=='package':env['CARGO_MANIFEST_DIR']=str(app)
+        if CASE=='version':env['CARGO_PKG_VERSION']='0.0.0'
+        if CASE=='manifest_path':env['CARGO_MANIFEST_PATH']=str(app/'Cargo.toml')
+        if CASE=='nested':env['DYLD_FALLBACK_LIBRARY_PATH']=str(session/'target/debug')+':'+env['DYLD_FALLBACK_LIBRARY_PATH']
+        changed=None
+        if CASE in ('source','manifest'):changed=root/('src/lib.rs' if CASE=='source' else 'Cargo.toml')
+        if CASE in ('candidate_drift','candidate_alias'):changed=sysroot/CANDIDATES[0]
+        if changed:
+            restores.append((changed,changed.read_bytes(),changed.stat().st_mode & 0o777));changed.chmod(0o644)
+            if CASE=='candidate_alias':changed.unlink();changed.symlink_to(sysroot/CANDIDATES[1])
+            else:changed.write_bytes(b'// TEST_CODE drift\n')
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],*argv]
+    if macro:(session/('fix7-attempt-'+name+'.json')).write_text(json.dumps({'argv_hex':[os.fsencode(v).hex() for v in command[1:]]}))
+    try:result=subprocess.run(command,cwd=root,env=env)
+    finally:
+        for path,body,mode in restores:
+            if path.is_symlink():path.unlink()
+            path.write_bytes(body);path.chmod(mode)
+    if result.returncode:finish(False);sys.exit(result.returncode)
+    out=pathlib.Path(argv[argv.index('--out-dir')+1]);source=next((root/a).resolve() for a in argv if a.endswith('.rs'))
+    suffix=next((v.split('=',1)[1] for v in argv if v.startswith('extra-filename=')),'')
+    kind='proc-macro' if macro else 'lib';exts=['.dylib'] if macro else ['.rlib','.rmeta']
+    event({'reason':'compiler-artifact','package_id':package,'target':{'src_path':str(source),'kind':[kind],
+          'crate_types':[kind],'name':name},'filenames':[str(out/('lib'+name+suffix+ext)) for ext in exts],
+          'executable':None,'fresh':False})
+positive=CASE in ('normal','qualified','unresolved') or CASE.startswith('seal_')
+if positive:
+    for name,suffix in [('proc_macro2','-2e38878fe48e194f'),('quote','-75266c67e160dbe3'),('syn','-ad068d60231c3384')]:
+        root=session/'vendor'/name
+        compile(['--crate-name',name,'--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(host),
+                 '-C','extra-filename='+suffix,str(root/'src/lib.rs')],root,'TEST_CODE_'+name)
+for crate,name,version in [('serde_derive','serde_derive','1.0.228'),('tokio_macros','tokio-macros','2.7.0')]:
+    root=session/'vendor'/name
+    argv=[v.replace('{session}',str(session)).replace('{sysroot}',str(sysroot)) for v in TEMPLATES[crate]]
+    at=argv.index('proc_macro');flag=at-1
+    replacements={'unknown':'proc_macro2','core':'core','std':'std','namespace':'other::proc_macro','modifier':'priv:proc_macro',
+                  'space':'proc_macro ','control':'proc_macro\t'}
+    if CASE in replacements:argv[at]=replacements[CASE]
+    if CASE=='joined':argv[flag:at+1]=['--extern=proc_macro']
+    if CASE=='duplicate':argv[flag:flag]=['--extern','proc_macro']
+    if CASE=='mixed':argv[flag:flag]=['--extern','proc_macro='+str(host/'libproc_macro.rlib')]
+    if CASE=='qualified':argv[at]='proc_macro='+str(host/'libproc_macro2-2e38878fe48e194f.rlib')
+    if CASE=='crate_type':argv[argv.index('--crate-type')+1]='lib'
+    if CASE=='target':argv.extend(['--target','x86_64-apple-darwin'])
+    if CASE=='probe':argv=['--version','--extern','proc_macro']
+    if CASE=='out_dir':argv[argv.index('--out-dir')+1]=str(dest)
+    if CASE=='search':argv[argv.index('-L')+1]='dependency='+str(dest)
+    if CASE=='emit':argv[argv.index('--emit=dep-info,link')]='--emit=dep-info,metadata,link'
+    if CASE=='unresolved':argv[argv.index('proc_macro2='+str(host/'libproc_macro2-2e38878fe48e194f.rlib'))]='proc_macro2='+str(host/'unproduced.rlib')
+    if CASE=='probe':
+        # compile's only --crate-name read is bookkeeping, so this raw probe is
+        # sent separately and must still stop before the fake compiler entry.
+        env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),DYLD_FALLBACK_LIBRARY_PATH=os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+        command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],*argv]
+        (session/('fix7-attempt-'+crate+'.json')).write_text(json.dumps({'argv_hex':[os.fsencode(v).hex() for v in command[1:]]}))
+        result=subprocess.run(command,cwd=root,env=env);finish(False);sys.exit(result.returncode)
+    compile(argv,root,'registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version,True)
+    if not positive:raise AssertionError('negative case reached compiler')
+compile(['--crate-name','stock_analysis','--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),
+         '--target','x86_64-apple-darwin',str(app/'src/lib.rs')],app,'TEST_CODE_app')
+if CASE.startswith('seal_'):
+    call=next(p.parent for p in (session/'invocations').glob('*/receipt.json')
+              if json.loads(p.read_text())['parsed']['options'].get('--crate-name')==['serde_derive'])
+    (session/'fix7-seal-call').write_text(call.name)
+    event_index=next(i for i,e in enumerate(events) if e['target']['name']=='serde_derive')
+    if CASE=='seal_missing_event':events.pop(event_index)
+    elif CASE=='seal_duplicate_event':events.append(events[event_index])
+    elif CASE in ('seal_wrong_kind','seal_wrong_crate_type','seal_wrong_name','seal_wrong_source','seal_wrong_package'):
+        e=events[event_index]
+        if CASE=='seal_wrong_kind':e['target']['kind']=['lib']
+        if CASE=='seal_wrong_crate_type':e['target']['crate_types']=['lib']
+        if CASE=='seal_wrong_name':e['target']['name']='other'
+        if CASE=='seal_wrong_source':e['target']['src_path']=str(app/'src/lib.rs')
+        if CASE=='seal_wrong_package':e['package_id']='TEST_CODE_other'
+    else:
+        filename='request.json' if CASE in ('seal_raw','seal_environment') else ('invocation.json' if CASE=='seal_initial' else 'receipt.json')
+        path=call/filename;data=json.loads(path.read_text())
+        if CASE in ('seal_missing','seal_initial','seal_all_missing'):
+            data.pop('sysroot_extern_declarations')
+            if CASE=='seal_all_missing':
+                initial=call/'invocation.json';item=json.loads(initial.read_text());item.pop('sysroot_extern_declarations');initial.write_text(json.dumps(item))
+        elif CASE=='seal_nonzero':data['exit_code']=7
+        elif CASE=='seal_role':data['role']='Target'
+        elif CASE=='seal_source':data['source']=str(app/'src/lib.rs')
+        elif CASE=='seal_package':data['package']['id']='TEST_CODE_other'
+        elif CASE=='seal_raw':data['argv_hex'][-1]=b'warn'.hex()
+        elif CASE=='seal_environment':data['environment_hex'][b'CARGO_PKG_VERSION'.hex()]=b'0'.hex()
+        elif CASE=='seal_candidate':data['sysroot_extern_declarations'][0]['candidates'][0]['sha256']='0'*64
+        elif CASE=='seal_selected':data['sysroot_extern_declarations'][0]['artifact_selection']='opened'
+        path.write_text(json.dumps(data))
+finish(True)
+'''
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -1684,6 +1819,164 @@ class RecordingProtocolTests(unittest.TestCase):
                 argv = [os.fsdecode(bytes.fromhex(v)) for v in request["argv_hex"]]
                 self.assertEqual(argv[1:1 + len(tokens)], tokens)
                 self.assertEqual(record["invocations"], [])
+
+    def prepare_proc_macro7(self, case="normal"):
+        inventory = self.prepare()
+        vendor = self.root / "vendor-origin"
+        roots = ["dep"]
+        for crate, name, version in (("serde_derive", "serde_derive", "1.0.228"),
+                                     ("tokio_macros", "tokio-macros", "2.7.0")):
+            roots.append(name)
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version
+                  + '"\n[lib]\nname="' + crate + '"\npath="src/lib.rs"\nproc-macro=true\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE synthetic macro " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                          "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        for name in ("proc_macro2", "quote", "syn"):
+            roots.append(name)
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="0.0.0"\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE prerequisite " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id": "TEST_CODE_" + name, "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        inventory["vendor"] = snapshot(vendor, roots)
+        if case == "origin":
+            next(p for p in inventory["packages"] if p["manifest"] == "serde_derive/Cargo.toml")["id"] = "TEST_CODE_foreign"
+        sysroot = self.root / "sysroot"
+        # Each subcase owns only this new fixture tree; earlier ambiguity cases
+        # must not contaminate the next positive control. No budget/policy reset API.
+        shutil.rmtree(sysroot / "lib/rustlib", ignore_errors=True)
+        for relative in PROC_MACRO7_CANDIDATES:
+            write(sysroot / relative, "TEST_CODE sysroot candidate " + relative + "\n")
+        if case in ("candidate_missing", "candidate_foreign"):
+            (sysroot / PROC_MACRO7_CANDIDATES[0]).unlink()
+        if case == "candidate_foreign":
+            write(sysroot / PROC_MACRO7_CANDIDATES[0].replace("x86_64-apple-darwin", "aarch64-apple-darwin"), "TEST_CODE foreign")
+        if case == "candidate_extra":
+            write(sysroot / PROC_MACRO7_CANDIDATES[0].replace("b94f7a67a9654a0b", "other"), "TEST_CODE ambiguous")
+        inventory["sysroot"] = snapshot(sysroot, ["lib"])
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + PROC_MACRO7_RUSTC)
+        text = PROC_MACRO7_CARGO.replace("__CASE__", repr(case)).replace("__TEMPLATES__", repr(PROC_MACRO7_ARGS)).replace("__CANDIDATES__", repr(PROC_MACRO7_CANDIDATES))
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + text)
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inventory["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}
+        inventory["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
+        return inventory
+
+    def proc_macro7_result(self, case="normal"):
+        inventory = self.prepare_proc_macro7(case)
+        result = self.invoke("record")
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        return inventory, result, record, session
+
+    def proc_macro7_rejection(self, case):
+        inventory, result, record, session = self.proc_macro7_result(case)
+        self.assertEqual(result.returncode, 2, result.stderr.decode(errors="replace"))
+        calls = list((session / "invocations").iterdir())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual({p.name for p in calls[0].iterdir()}, {"request.json"})
+        self.assertEqual(record["invocations"], [])
+        self.assertEqual(record["blockers"], sorted(["CargoDidNotFinishSuccessfully", "IncompleteInvocation:" + calls[0].name, "UnresolvedSelectedLibrary"]))
+        self.assertFalse((session / "compiler-entry").exists())
+        self.assertFalse(list((session / "target").rglob("*.dylib")))
+        diagnostic = [json.loads(line) for line in (session / "cargo.stderr.raw").read_text().splitlines()]
+        self.assertEqual(diagnostic, [{"schema": owner.SCHEMA, "detail": PROC_MACRO7_REJECTIONS[case], "reason": "Refused", "state": "RecordingOnly"}])
+        request = json.loads((calls[0] / "request.json").read_text())
+        self.assertEqual(request["argv_hex"], json.loads((session / "fix7-attempt-serde_derive.json").read_text())["argv_hex"])
+        return inventory, request, record, session
+
+    def test_record7_bare_proc_macro_declaration_preserves_argv(self):
+        inventory, result, record, session = self.proc_macro7_result()
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(record["review_gate"], "IndependentPolicyReviewRequired")
+        self.assertEqual(len(record["selected_library"]), 1)
+        self.assertEqual(len(record["sysroot_extern_declarations"]), 2)
+        self.assertEqual(len(record["extern_edges"]), 6)
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()},
+                         {"compile-" + n for n in ("proc_macro2", "quote", "syn", "serde_derive", "tokio_macros", "stock_analysis")})
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        self.assertEqual(len(receipts), 6)
+        for crate, package in (("serde_derive", "serde_derive"), ("tokio_macros", "tokio-macros")):
+            with self.subTest(crate=crate):
+                call, receipt = next((p, r) for p, r in receipts if r["parsed"]["options"]["--crate-name"] == [crate])
+                argv = [inventory["rustc"]["path"], *[v.replace("{session}", str(session)).replace("{sysroot}", inventory["sysroot"]["root"]) for v in PROC_MACRO7_ARGS[crate]]]
+                encoded = [os.fsencode(v).hex() for v in argv]
+                for name in ("request.json", "invocation.json", "receipt.json"):
+                    self.assertEqual(json.loads((call / name).read_text())["argv_hex"], encoded)
+                self.assertEqual(json.loads((call / "stderr.raw").read_text())["fixture_argv"], argv[1:])
+                self.assertEqual(json.loads((session / ("compiler-entry/compile-" + crate)).read_text()), argv[1:])
+                declaration, = receipt["sysroot_extern_declarations"]
+                self.assertEqual(declaration, {"kind": "BareProcMacroSearchV1", "name": "proc_macro", "host": owner.TARGET,
+                    "compiler_sha256": inventory["rustc"]["sha256"], "sysroot_root": inventory["sysroot"]["root"],
+                    "argument_index": argv.index("proc_macro"), "artifact_selection": "not_observed",
+                    "candidates": [{"relative_path": p, "sha256": inventory["sysroot"]["files"][p]} for p in PROC_MACRO7_CANDIDATES]})
+                self.assertIn(dict(declaration, consumer=call.name), record["sysroot_extern_declarations"])
+                self.assertEqual(receipt["source"], str(session / "vendor" / package / "src/lib.rs"))
+                self.assertEqual(receipt["role"], "Host"); self.assertEqual(receipt["context"], {"kind": "DirectCargoCompile"})
+                self.assertEqual(receipt["exit_code"], 0)
+                edges = [e for e in record["extern_edges"] if e["consumer"] == call.name]
+                self.assertEqual({e["name"] for e in edges}, {"proc_macro2", "quote", "syn"})
+                self.assertTrue(all(len(e["producers"]) == 1 for e in edges))
+                self.assertTrue(all(e["path"].startswith(str(session / "target")) for e in edges))
+        self.assertFalse(any(e["name"] == "proc_macro" for e in record["extern_edges"]))
+        self.assertTrue(all("sysroot_extern_declarations" not in r for _, r in receipts if r["role"] == "Target"))
+
+    def test_record7_bare_proc_macro_rejects_unreached_forms_before_compiler(self):
+        for case in ("unknown", "core", "std", "namespace", "modifier", "space", "control", "joined", "duplicate", "mixed",
+                     "crate_type", "target", "probe", "out_dir", "search", "emit", "nested"):
+            with self.subTest(case=case):
+                self.proc_macro7_rejection(case)
+
+    def test_record7_bare_proc_macro_preserves_source_and_sysroot_gates(self):
+        for case in ("package", "source", "manifest", "version", "manifest_path", "origin", "candidate_missing",
+                     "candidate_drift", "candidate_alias", "candidate_extra", "candidate_foreign"):
+            with self.subTest(case=case):
+                _, request, _, _ = self.proc_macro7_rejection(case)
+                self.assertIn(b"proc_macro".hex(), request["argv_hex"])
+        _, result, record, _ = self.proc_macro7_result()
+        self.assertEqual(result.returncode, 0); self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["sysroot_extern_declarations"]), 2)
+
+    def test_record7_declaration_seal_requires_raw_and_macro_artifact_binding(self):
+        for case in ("missing", "initial", "all_missing", "nonzero", "role", "source", "package", "raw", "environment", "candidate", "selected",
+                     "missing_event", "duplicate_event", "wrong_kind", "wrong_crate_type", "wrong_name", "wrong_source", "wrong_package"):
+            with self.subTest(case=case):
+                _, result, record, session = self.proc_macro7_result("seal_" + case)
+                self.assertEqual(result.returncode, 2, result.stderr.decode(errors="replace"))
+                call = (session / "fix7-seal-call").read_text()
+                marker = "UnresolvedSysrootExternConsumer:" if case in ("nonzero", "missing_event", "duplicate_event", "wrong_kind", "wrong_crate_type", "wrong_name", "wrong_source", "wrong_package") else "ChangedSysrootExternDeclaration:"
+                self.assertIn(marker + call, record["blockers"])
+                self.assertFalse(any(d["consumer"] == call for d in record.get("sysroot_extern_declarations", [])))
+                self.assertEqual(len(record["sysroot_extern_declarations"]), 1)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(len(list((session / "compiler-entry").iterdir())), 6)
+                self.assertEqual(len(record["selected_library"]), 1)
+        _, result, record, _ = self.proc_macro7_result()
+        self.assertEqual(result.returncode, 0); self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["sysroot_extern_declarations"]), 2)
+
+    def test_record7_path_qualified_externs_keep_original_graph(self):
+        for flag in ("--cfg", "--check-cfg", "-C", "--remap-path-prefix"):
+            self.assertEqual(owner.raw_bare_externs(["TEST_CODE_compiler", flag, "--extern=proc_macro"]), [])
+        _, result, record, session = self.proc_macro7_result("qualified")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(record["blockers"], [])
+        self.assertNotIn("sysroot_extern_declarations", record)
+        receipts = [json.loads(p.read_text()) for p in (session / "invocations").glob("*/receipt.json")]
+        self.assertTrue(all("sysroot_extern_declarations" not in r for r in receipts))
+        self.assertEqual(len(record["extern_edges"]), 8)
+        self.assertEqual(len([e for e in record["extern_edges"] if e["name"] == "proc_macro"]), 2)
+        self.assertTrue(all(len(e["producers"]) == 1 for e in record["extern_edges"]))
+        _, result, record, session = self.proc_macro7_result("unresolved")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("UnresolvedExternProducer:" + str(session / "target/debug/deps/unproduced.rlib"), record["blockers"])
+        self.assertEqual(len(record["sysroot_extern_declarations"]), 2)
+        self.assertEqual(len(record["selected_library"]), 1)
+        self.assertFalse(any("SysrootExtern" in b for b in record["blockers"]))
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:

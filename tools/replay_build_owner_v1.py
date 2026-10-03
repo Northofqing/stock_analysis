@@ -250,11 +250,14 @@ def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False, *, pass_f
     return code
 
 
+RUSTC_VALUE_FLAGS = {"--crate-name", "--edition", "--crate-type", "--emit", "--out-dir", "--target",
+                     "--extern", "--cfg", "--check-cfg", "--cap-lints", "--error-format", "--json",
+                     "--color", "--sysroot", "--print", "--remap-path-prefix", "--diagnostic-width"}
+
+
 def parse_rustc(args):
     """Finite Cargo call forms, exact original argv retained separately. Not rustc grammar."""
-    values = {"--crate-name", "--edition", "--crate-type", "--emit", "--out-dir", "--target",
-              "--extern", "--cfg", "--check-cfg", "--cap-lints", "--error-format", "--json",
-              "--color", "--sysroot", "--print", "--remap-path-prefix", "--diagnostic-width"}
+    values = RUSTC_VALUE_FLAGS
     booleans = {"--test", "-g", "-O", "-vV", "-V", "--version"}
     options, inputs = {}, []
     i = 0
@@ -848,6 +851,141 @@ def inherited_jobserver_fds(env):
     return (read, write)
 
 
+# Two reached host requests only; these names do not authorize other sources.
+BARE_PROC_MACRO_ORIGINS = {
+    "serde_derive": ("serde_derive", "1.0.228"),
+    "tokio_macros": ("tokio-macros", "2.7.0"),
+}
+BARE_PROC_MACRO_CANDIDATES = tuple(
+    "lib/rustlib/x86_64-apple-darwin/lib/libproc_macro-b94f7a67a9654a0b." + suffix
+    for suffix in ("rlib", "rmeta"))
+
+
+def raw_bare_externs(args):
+    """Keep token positions; deliberately do not normalize the extern spelling."""
+    result, i = [], 1  # argv[0] is the compiler, also retained in argument_index.
+    while i < len(args):
+        value = args[i]
+        if value == "--extern" and i + 1 < len(args):
+            if "=" not in args[i + 1]:
+                result.append((i + 1, args[i + 1], True))
+            i += 2
+        elif value.startswith("--extern="):
+            if "=" not in value[len("--extern="):]:
+                result.append((i, value[len("--extern="):], False))
+            i += 1
+        else:
+            # A cfg/check-cfg/codegen value is not another command-line option.
+            i += 2 if value in RUSTC_VALUE_FLAGS or value in {"-C", "-L", "-A", "-W", "-D", "-F"} else 1
+    return result
+
+
+def bare_proc_macro_declarations(args, parsed, context, cwd, session, inv, package, source, env):
+    bare = raw_bare_externs(args)
+    if not bare:
+        return []
+    require(all(value == "proc_macro" and separated for _, value, separated in bare),
+            "UnsupportedBareExtern")
+    options = parsed["options"]
+    require(len(bare) == 1 and options.get("--extern", []).count("proc_macro") == 1
+            and not any(value.startswith("proc_macro=") for value in options.get("--extern", [])),
+            "BareProcMacroAmbiguous")
+    host = str(session / "target/debug/deps")
+    require(not parsed["probe"] and context == {"kind": "DirectCargoCompile"}
+            and "--target" not in options and options.get("--crate-type") == ["proc-macro"]
+            and options.get("--emit") == ["dep-info,link"]
+            and options.get("--out-dir") == [host] and options.get("-L") == ["dependency=" + host],
+            "BareProcMacroRole")
+    crate = options.get("--crate-name", [None])[0]
+    require(crate in BARE_PROC_MACRO_ORIGINS, "BareProcMacroOrigin")
+    name, version = BARE_PROC_MACRO_ORIGINS[crate]
+    expected = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    manifest = session / "vendor" / expected["manifest"]
+    expected_source = manifest.parent / "src/lib.rs"
+    require(package == expected and inv["packages"].count(expected) == 1
+            and cwd == manifest.parent and source == expected_source
+            and env.get("CARGO_MANIFEST_DIR") == str(manifest.parent)
+            and env.get("CARGO_MANIFEST_PATH") == str(manifest)
+            and env.get("CARGO_PKG_NAME") == name and env.get("CARGO_PKG_VERSION") == version,
+            "BareProcMacroOrigin")
+    try:
+        for path in (manifest, expected_source):
+            regular(path)
+            require(path.resolve() == path and inv["vendor"]["files"].get(
+                path.relative_to(session / "vendor").as_posix()) == file_hash(path), "BareProcMacroOrigin")
+    except (OSError, Refusal):
+        raise Refusal("BareProcMacroOrigin") from None
+    candidates = []
+    try:
+        spec = inv["sysroot"]
+        root = Path(spec["root"])
+        require(root.is_absolute() and root.resolve() == root, "BareProcMacroSysroot")
+        prefix = "lib/rustlib/x86_64-apple-darwin/lib/libproc_macro-"
+        require({key for key in spec["files"] if key.startswith(prefix)} == set(BARE_PROC_MACRO_CANDIDATES),
+                "BareProcMacroSysroot")
+        for relative in BARE_PROC_MACRO_CANDIDATES:
+            path = root / relative
+            regular(path)
+            require(path.resolve() == path and spec["files"][relative] == file_hash(path), "BareProcMacroSysroot")
+            candidates.append({"relative_path": relative, "sha256": spec["files"][relative]})
+    except (KeyError, OSError, Refusal):
+        raise Refusal("BareProcMacroSysroot") from None
+    # Availability is not resolver selection: rustc can also search the -L path.
+    return [{"kind": "BareProcMacroSearchV1", "name": "proc_macro", "host": TARGET,
+             "compiler_sha256": inv["rustc"]["sha256"], "sysroot_root": inv["sysroot"]["root"],
+             "argument_index": bare[0][0], "candidates": candidates, "artifact_selection": "not_observed"}]
+
+
+def verify_sysroot_extern_declaration(directory, receipt, session, inv):
+    request = strict_json((directory / "request.json").read_bytes())
+    initial = strict_json((directory / "invocation.json").read_bytes())
+    raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    if not (raw_bare_externs(raw) or "sysroot_extern_declarations" in initial
+            or "sysroot_extern_declarations" in receipt
+            or raw_bare_externs([os.fsdecode(bytes.fromhex(a)) for a in receipt["argv_hex"]])
+            or raw_bare_externs([os.fsdecode(bytes.fromhex(a)) for a in initial["argv_hex"]])):
+        return []
+    require(request.get("state") == initial.get("state") == receipt.get("state") == "RecordingOnly"
+            and all(initial[k] == receipt[k] for k in ("argv_hex", "environment_hex", "parsed", "context",
+                "cwd", "source", "package", "role", "kind", "compiler_sha256", "externs", "declared_outputs"))
+            and request["argv_hex"] == receipt["argv_hex"]
+            and request["environment_hex"] == receipt["environment_hex"]
+            and os.fsdecode(bytes.fromhex(request["cwd_hex"])) == receipt["cwd"],
+            "ChangedSysrootExternDeclaration")
+    parsed = parse_rustc(raw[1:])
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v))
+           for k, v in request["environment_hex"].items()}
+    cwd = Path(receipt["cwd"])
+    require(raw[0] == inv["rustc"]["path"] and parsed == receipt["parsed"]
+            and receipt["role"] == "Host" and receipt["kind"] == "Compile"
+            and receipt["compiler_sha256"] == inv["rustc"]["sha256"]
+            and invocation_context(raw, parsed, env, cwd, session, inv) == receipt["context"],
+            "ChangedSysrootExternDeclaration")
+    compiler_environment(env, session, inv["sysroot"], probe=False, context=receipt["context"])
+    require("--sysroot" not in parsed["options"] or parsed["options"]["--sysroot"] == [inv["sysroot"]["root"]],
+            "ChangedSysrootExternDeclaration")
+    source = (cwd / parsed["inputs"][0]).resolve()
+    require(str(source) == receipt["source"], "ChangedSysrootExternDeclaration")
+    expected = bare_proc_macro_declarations(raw, parsed, receipt["context"], cwd, session, inv,
+                                            receipt["package"], source, env)
+    require(expected and initial.get("sysroot_extern_declarations") == expected
+            and receipt.get("sysroot_extern_declarations") == expected, "ChangedSysrootExternDeclaration")
+    externs = []
+    for value in parsed["options"].get("--extern", []):
+        if value == "proc_macro":
+            continue
+        name, separator, path = value.partition("=")
+        require(separator and re.fullmatch(r"[A-Za-z0-9_]+", name), "ChangedSysrootExternDeclaration")
+        path = (cwd / path).resolve()
+        require(inside(path, session / "target"), "ChangedSysrootExternDeclaration")
+        externs.append({"name": name, "path": str(path)})
+    require(receipt["externs"] == externs
+            and receipt["declared_outputs"] == selected_outputs(parsed, cwd, session / "target"),
+            "ChangedSysrootExternDeclaration")
+    return expected
+
+
 def wrapper(session_id, args):
     require(ID.fullmatch(session_id), "SessionId")
     session = SESSIONS / ("pending-" + session_id)
@@ -890,6 +1028,9 @@ def wrapper(session_id, args):
         require(options["--sysroot"] == [inv["sysroot"]["root"]], "WrongSysroot")
     target = session / "target"
     externs, package, source, outputs = [], None, None, []
+    sysroot_declarations = []
+    if parsed["probe"] and raw_bare_externs(args):
+        bare_proc_macro_declarations(args, parsed, context, cwd, session, inv, None, None, os.environ)
     stdin_bytes, stdin_evidence = None, None
     autocfg_stdin = context["kind"] == "NumTraitsAutocfgStdinProbe"
     rustix_stdin = context["kind"] == RUSTIX_KIND
@@ -917,7 +1058,11 @@ def wrapper(session_id, args):
         tree = session / package["tree"]
         name = source.relative_to(tree).as_posix()
         require(inv[package["tree"]]["files"].get(name) == file_hash(source), "SourceMismatch")
+        sysroot_declarations = bare_proc_macro_declarations(
+            args, parsed, context, cwd, session, inv, package, source, os.environ)
         for value in options.get("--extern", []):
+            if value == "proc_macro" and sysroot_declarations:
+                continue
             name, separator, path = value.partition("=")
             require(separator and re.fullmatch(r"[A-Za-z0-9_]+", name), "UnresolvedExtern")
             path = (cwd / path).resolve()
@@ -940,6 +1085,8 @@ def wrapper(session_id, args):
               "role": "Probe" if parsed["probe"] else ("Target" if "--target" in options else "Host"),
               "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()},
               "externs": externs, "declared_outputs": outputs, "compiler_sha256": file_hash(Path(args[0]))}
+    if sysroot_declarations:
+        record["sysroot_extern_declarations"] = sysroot_declarations
     if stdin_evidence is not None:
         record["stdin"] = stdin_evidence
     if rustix_stdin:
@@ -1078,6 +1225,7 @@ def seal_record(session, policy, cargo_exit):
     """Resolve observed graph after Cargo; this is a diagnostic seal, never issuance."""
     events, blockers = cargo_events(session / "cargo.stdout.raw")
     receipts = []
+    sysroot_declarations = {}
     for directory in sorted((session / "invocations").iterdir()):
         if not (directory / "receipt.json").is_file():
             blockers.append("IncompleteInvocation:" + directory.name); continue
@@ -1091,6 +1239,12 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("ChangedInvocationBytes:" + directory.name)
         receipts.append(receipt)
         blockers.extend(receipt["blockers"])
+        try:
+            declared = verify_sysroot_extern_declaration(directory, receipt, session, policy["inventory"])
+            if declared:
+                sysroot_declarations[directory.name] = declared
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError):
+            blockers.append("ChangedSysrootExternDeclaration:" + directory.name)
         initial = strict_json((directory / "invocation.json").read_bytes())
         if "framework_declaration" in initial.get("context", {}) or "framework_declaration" in receipt.get("context", {}):
             try:
@@ -1193,6 +1347,19 @@ def seal_record(session, policy, cargo_exit):
                 owners.append(record["invocation_id"])
         if root == str(session / "application/src/lib.rs") and "lib" in target.get("kind", []):
             selected.append(record)
+    bound_sysroot_declarations = []
+    for receipt in receipts:
+        call_id = receipt["invocation_id"]
+        if call_id not in sysroot_declarations:
+            continue
+        requesting = [a for a in artifacts if a["invocation_id"] == call_id]
+        if (receipt["exit_code"] != 0 or receipt["blockers"] or len(requesting) != 1
+                or requesting[0]["target"].get("kind") != ["proc-macro"]
+                or requesting[0]["target"].get("crate_types") != ["proc-macro"]
+                or requesting[0]["target"].get("name") != receipt["parsed"]["options"]["--crate-name"][0]):
+            blockers.append("UnresolvedSysrootExternConsumer:" + call_id)
+            continue
+        bound_sysroot_declarations.extend(dict(d, consumer=call_id) for d in sysroot_declarations[call_id])
     for event in events:
         if event["reason"] != "build-script-executed":
             continue
@@ -1293,6 +1460,8 @@ def seal_record(session, policy, cargo_exit):
             "invocations": [{key: r[key] for key in ("invocation_id", "receipt_sha256", "request_sha256", "invocation_sha256", "stdout_sha256", "stderr_sha256")} for r in receipts],
             "cargo_stdout_sha256": file_hash(session / "cargo.stdout.raw"),
             "cargo_stderr_sha256": file_hash(session / "cargo.stderr.raw")}
+    if bound_sysroot_declarations:
+        seal["sysroot_extern_declarations"] = bound_sysroot_declarations
     atomic_json(session / "record.json", seal)
     return seal
 
