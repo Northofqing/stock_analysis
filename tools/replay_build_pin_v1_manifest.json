@@ -162,7 +162,7 @@
         "src/breakout/signal.rs": "9db5ad6a801382e0b24a8ada0b0a7d681587aeb92161df08841461d0cb7590e5",
         "src/broker.rs": "1c0f339c7ca5d6137dc61b7a9bde37c45179708c8793ba3c6732f5422ef31b9c",
         "src/bus/mod.rs": "27ba67f843aea185a841dc441baac55e4bf167d5f145ecbd798647621c1b80b3",
-        "src/calendar.rs": "94f08fde8ea49147ac4dda2aa8182a9e474735d7adab28eb9514ab31a77e9ccd",
+        "src/calendar.rs": "7949e63c1ae3a5ba9fa60b1f51458b7d6039007d3d88e467a9d39d2b75861ef4",
         "src/capital_flow.rs": "90279198d3892d1fe679239c3a60a4fe8d294a7c60e23f01d57090910f276bf2",
         "src/chart_generator.rs": "e3747a412b250ddb34277aa67519e612d01f1316d7eff285ef8cfce5572b0d63",
         "src/cli.rs": "b86f6ea8abd70b666850c8576966c32c8f0653f4d34775d4fab75bb4d4072947",
@@ -273,8 +273,10 @@
         "src/database/global_schema_paper_v6.rs": "56de0ac746fce1b52c5110115c4468d2cf8d38f0e3529ad58acd5743c85d0aca",
         "src/database/global_schema_paper_v6_tests.rs": "f2e292c02fcfa7c8bc868a2e4b775b7ebcc8c81bad77237280324916a9be85b2",
         "src/database/global_schema_prospective_v1.rs": "df90777bc480a1827001dc043174b335b068053b6f93cff7c1735ecab98ecdf3",
+        "src/database/global_schema_replay_calendar_v1.rs": "cd9710b220852ed880d022dc07eaf34208a8d43113adbb06682a5ce03ee946b0",
+        "src/database/global_schema_replay_calendar_v1_tests.rs": "1d98783be996b26ce697d54150f6cd7c262f30ee1be7326f201200bf55c79b23",
         "src/database/global_schema_replay_sql_v1.rs": "c68934e855ce316711c917582c287b23a9b3bb371e5c60c915388e5ad1ae1dc0",
-        "src/database/global_schema_replay_work_v1.rs": "afd4b155904cb18d0d3b2311c3038bd9ce86a5d63d3ab3f0883a42e5a398e1b9",
+        "src/database/global_schema_replay_work_v1.rs": "ef199d53699081a640eaa3a63369a0860437d6cc09f6bf9a39cb95b4459573a4",
         "src/database/global_schema_replay_work_v1_tests.rs": "eabe66035a365ce8f9542f989bcaa6d8f8d2814e3f3e04a1513e7dcee8ec9648",
         "src/database/global_schema_rows_v1.rs": "32236851b331d630e5a57597e2ed72f04a5a8cfc3c88fed178d539fb232771a2",
         "src/database/global_schema_target_v1.rs": "4c1acbdefa157a56d107253ede5a15f5f41af8a08f9422f4a7984c7daf24b167",
@@ -976,7 +978,7 @@
         "sha256": "91d60b39e4207cb8d7c16c340f20979b5cf34f7220443aa6271244dd3a399366"
       }
     },
-    "owner_sha256": "a68839c9e7ae3c2bd361ad797fac793c1358be3f7b7961926cc4cc387c8f35d5",
+    "owner_sha256": "8439d8e9726ca169c1a79e65a214a66ab0d059b8cef9a1cc3dff84a4f427c69f",
     "packages": [
       {
         "id": "registry+https://github.com/rust-lang/crates.io-index#adler2@2.0.1",
