@@ -1443,6 +1443,61 @@ pub(super) struct VerifiedUnapprovedByteBackup {
     settings: Settings,
 }
 impl VerifiedUnapprovedByteBackup {
+    pub(super) fn target_metadata_reservation(&self) -> Result<u64, GlobalSchemaV1Error> {
+        // Both before/after passes parse and canonically encode the retained
+        // fixed journal and source binding. Reserve their actual extents.
+        let bytes = self.workspace.records.iter().try_fold(0u64, |n, saved| {
+            checked_io(saved.file.metadata())?
+                .len()
+                .checked_add(n)
+                .ok_or_else(|| refuse("target original journal metadata overflow"))
+        })?;
+        bytes
+            .checked_mul(20)
+            .and_then(|n| n.checked_add(65536))
+            .ok_or_else(|| refuse("target original journal metadata overflow"))
+    }
+    pub(super) fn with_target_origin<T>(
+        &mut self,
+        work: &mut target::TargetWork,
+        operation: impl for<'loan> FnOnce(
+            &mut CopiedTargetOriginLoan<'loan>,
+            &mut target::TargetWork,
+        ) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        work.metadata(self.target_metadata_reservation()?)?;
+        let (source, options, _, _) = self.source.backup_parts();
+        self.workspace
+            .validate_outputs_without_hooks(source, options, &self.settings)?;
+        self.workspace.copied_sidecars_absent()?;
+        let expected = self
+            .workspace
+            .copied(Role::Database)
+            .ok_or_else(|| refuse("target has no original Copied witness"))?;
+        work.metadata(512)?;
+        let expected = expected.clone();
+        let file = existing(&self.workspace.directory.file, Role::Database.leaf(), false)?
+            .ok_or_else(|| refuse("target original Copied missing"))?;
+        self.workspace
+            .same_named(Role::Database.leaf(), &file, &expected.node)?;
+        let result = operation(
+            &mut CopiedTargetOriginLoan {
+                file: &file,
+                expected: &expected,
+                workspace: &mut self.workspace,
+                source,
+                options,
+                settings: &self.settings,
+            },
+            work,
+        );
+        self.workspace
+            .same_named(Role::Database.leaf(), &file, &expected.node)?;
+        self.workspace.copied_sidecars_absent()?;
+        self.workspace
+            .validate_outputs_without_hooks(source, options, &self.settings)?;
+        result
+    }
     pub(super) fn with_copied_rows<T>(
         &mut self,
         work: &mut rows::RowsWork,
@@ -1565,5 +1620,82 @@ pub(super) struct OwnedBackupRowsView<'loan> {
 impl OwnedBackupRowsView<'_> {
     pub(super) fn connection(&self) -> &Connection {
         self.connection
+    }
+}
+
+/// Private callback-local access to the exact recorded Copied FD. Neither an
+/// FD nor a route is exposed; only the sealed target sink can receive bytes.
+pub(super) struct CopiedTargetOriginLoan<'loan> {
+    file: &'loan File,
+    expected: &'loan FileWitness,
+    workspace: &'loan mut Workspace,
+    source: &'loan mut prospective::Pending,
+    options: &'loan prospective::Options,
+    settings: &'loan Settings,
+}
+impl CopiedTargetOriginLoan<'_> {
+    pub(super) fn binding(
+        &self,
+        work: &mut target::TargetWork,
+    ) -> Result<target::OriginalBackupBinding, GlobalSchemaV1Error> {
+        #[derive(Serialize)]
+        struct Binding<'a> {
+            source: &'a str,
+            intent: &'a str,
+            terminal: &'a str,
+            copied: &'a FileWitness,
+        }
+        let first = self
+            .workspace
+            .record(0)
+            .ok_or_else(|| refuse("target original intent missing"))?;
+        let terminal = self
+            .workspace
+            .record(5)
+            .ok_or_else(|| refuse("target original terminal missing"))?;
+        let Transition::Intent {
+            source_canonical, ..
+        } = &first.record.transition
+        else {
+            return Err(refuse("target original intent shape"));
+        };
+        let bytes = work.encode_metadata(
+            &Binding {
+                source: source_canonical,
+                intent: &first.hash,
+                terminal: &terminal.hash,
+                copied: self.expected,
+            },
+            1024 * 1024,
+        )?;
+        work.metadata(64)?;
+        Ok(target::OriginalBackupBinding {
+            canonical: String::from_utf8(bytes)
+                .map_err(|_| refuse("target original binding encoding"))?,
+            length: self.expected.length,
+            sha256: self.expected.sha256.clone(),
+        })
+    }
+    pub(super) fn copy_to(
+        &mut self,
+        target: &mut target::CreatedTarget<'_>,
+        work: &mut target::TargetWork,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        // Charge the very same original physical/common owner before any read.
+        let length = self
+            .expected
+            .length
+            .checked_add(1)
+            .ok_or_else(|| refuse("target original read overflow"))?;
+        self.source.reserve_backup_reads(length, self.options)?;
+        self.workspace
+            .work
+            .common(self.source, self.options, &self.settings.limits)?;
+        self.workspace
+            .same_named(Role::Database.leaf(), self.file, &self.expected.node)?;
+        target.copy_from_original(self.file, self.expected.length, &self.expected.sha256, work)?;
+        self.workspace
+            .same_named(Role::Database.leaf(), self.file, &self.expected.node)?;
+        self.workspace.copied_sidecars_absent()
     }
 }

@@ -624,3 +624,15 @@ Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需
 ### 2026-10-03 M1/Catalog7 实际整合验证
 
 在源码d12be0ed完成一次 `cargo build --locked --offline --bin monitor`，exit0（6m52s）；保存private复制并SHA核验的实际monitor制品，SHA256 `8b2308dc690884dda5f32874a42aa6aaecbb6b9dbf2ad993516aceda81ae745f`。执行 `monitor --test --push-dry-run`，独立TEST_CODE审计路径：59模板、4batches、failed0、external_process_attempted0、receipt_audit_appended0、live_opt_in=false。首次进程exit0但继承warn日志过滤导致验收计数不可见，保留该不足证据；同sealed制品显式info补取后计数完整，exit0（3.557s），实际日志SHA256 `15bbdb0f5a1249baea22159004f04a6d4929ae3d9b8ac5cc4e8d26d6150d0975`。未启用真实外发、未更换生产制品。现有counted-binding缺口仍原样拒绝，模板检查不代表正式业务source或生产验收通过。
+
+## 10/3：实际未批准的 Catalog6 目标副本开发验收
+
+本片从 a05b09f6 实施，固定配方 `requalification-exact-amended-catalog6-v1` 只接受实际 amended Catalog6，复制到同一精确代际的受控目标文件。其他 family/generation 在创建目标前拒绝。原 Global 独占租约、真实 Copied FD、源/备份/审计绑定继续保留；独立四槽日志记录 intent、created、copied、verified，冷启动只重开记录中的原 inode，不收养、截断或覆盖未知副本。
+
+目标完整 catalog/header/geometry/payload/integrity 与逐表逐行 storage class、REAL bits、原始 TEXT/BLOB、rowid、双 EOF 和 sqlite_sequence 实际验证。原六流与目标四流分别固定；最终 reader 关闭、所有可变 hook 完成后重验全部原文件、目录、锁、sidecar 与记录，之后只有限编码。原/目标元数据各 16 MiB 持续累计，目标 catalog 与路径、记录、编码共用目标的唯一计量池；其他原校验和两侧 typed/comparator/transcript 继续原池，不提高或重置上限。
+
+实际 **43 项定向 PASS**：14 个新目标 owner 用例、3 个共池/溢出用例、20 个原 Rows 用例、6 个受影响原备份用例。真实非空 V6 seed/genesis/财务 fixture 的复制与冷重开通过；count-preserving typed mutations 确实进入比较器，五种结构攻击均须匹配实际 catalog 拒绝。前期元数据归属、测试 sidecar 生命周期、writable_schema 攻击被提前阻止的失败均保留，未把 poisoned-lock 连锁失败当独立缺陷或通过。
+
+本地 `validation/dev-20261003-target-final-acceptance.json` 记录不同编译产物的复用来源：fix2 业务源码与最终相同，fix3/fix4 仅修改两个 Test 消费者及最后一个 Test 攻击/断言，未重复未改范围。最终 fullcatalog 日志 SHA `af00af39328819051c4f2fb6c2c56515cf6265e4f48034a559dd240bd51e8527`，最终封存 lib harness SHA `3e07c6450562d05f55395ee28cf1d893bdc36095c13bb6d78b35258e3277a5b2`；未运行全库、release 或部署。
+
+独立全任务 spec/quality 审查待进行。本片输出明确 `approval=not_granted`、`maintenance_receipt=not_created`、`exchange=not_implemented`、`apply_supported=false`；不代表历史到最终代际迁移、production requalification、Paper 或全平台完成。后续继续 WG07 完整窗口与复核消费、逐规则风控和完整不可变 F2，再处理真实源、明确资金、批准迁移/切换及 WORM/自然观察。

@@ -45,6 +45,8 @@ pub(crate) mod paper_v6;
 mod prospective;
 #[path = "global_schema_rows_v1.rs"]
 mod rows;
+#[path = "global_schema_target_v1.rs"]
+mod target;
 
 pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
@@ -1087,6 +1089,15 @@ impl GlobalSchemaVersionOwner {
             SelectionOwnerObservation::Backup(result) => Ok(result),
             _ => Err(prospective::refusal("unexpected backup owner branch")),
         }
+    }
+
+    fn prepare_fixed_unapproved_requalification_target(
+        &self,
+    ) -> Result<target::VerifiedUnapprovedRequalificationTarget, GlobalSchemaV1Error> {
+        target::prepare(
+            self.prepare_fixed_selection_rows_backup()?,
+            target::Options::production(),
+        )
     }
 
     fn prepare_fixed_selection_rows_backup(
@@ -4656,10 +4667,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rows_backup_actual_v6_seed_genesis_financial_family_closes_original_pools() {
+    fn actual_offline_catalog6_fixture() -> (TestFixture, SelectionAuditWriter) {
         use crate::trading::paper_book_v2::{
-            cutover_for_isolated_test, TestCutoverFault, TestCutoverRequest,
+            TestCutoverFault, TestCutoverRequest, cutover_for_isolated_test,
         };
         use crate::trading::paper_ledger::{
             Money, PaperCommand, PaperLedger, RiskPolicyV1, SeedManifest,
@@ -4670,7 +4680,6 @@ mod tests {
         fn instant() -> chrono::DateTime<Utc> {
             Utc.with_ymd_and_hms(2026, 9, 28, 1, 30, 0).unwrap()
         }
-        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
         let (fixture, writer) = prospective_test_fixture("rows-real-v6", 2, false);
         // The real descriptor-pool fixture requires its own TEST_CODE leaf.
         // Relocate only this already closed Pre2 inode; preserve the fixed
@@ -5005,6 +5014,13 @@ mod tests {
             ));
         }
         prospective_assert_fixture_offline(&fixture);
+        (fixture, writer)
+    }
+
+    #[test]
+    fn rows_backup_actual_v6_seed_genesis_financial_family_closes_original_pools() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
         let before = fs::read(fixture.database()).unwrap();
         let rendered = rows_test_prepare(&fixture, &writer, rows::Options::production())
             .unwrap()
@@ -5028,6 +5044,567 @@ mod tests {
                 .count()
                 > 4
         );
+    }
+
+    fn target_test_directory(fixture: &TestFixture) -> PathBuf {
+        fixture
+            .root
+            .join("global-schema-targets/requalification-exact-amended-catalog6-v1")
+    }
+    fn target_test_prepare(
+        fixture: &TestFixture,
+        writer: &SelectionAuditWriter,
+        options: target::Options,
+    ) -> Result<target::VerifiedUnapprovedRequalificationTarget, GlobalSchemaV1Error> {
+        target::prepare(
+            rows_test_prepare(fixture, writer, rows::Options::production())?,
+            options,
+        )
+    }
+    const TARGET_TEST_PAYLOAD_MUTATION: &str = "PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=replace(sql,'outcome-stage-v3','TEST_CODE_wrong_payload') WHERE name='selection_v2_recovery_envelopes'; PRAGMA writable_schema=OFF; PRAGMA schema_version=999";
+    fn target_test_modify(root: &Path, path: &Path, mutation: &str) {
+        // Keep the copied WAL header unchanged and own only the sidecars this
+        // isolated mutation creates; native close alone need not remove them.
+        let mut paths = ModeBoundPaths::isolated_test(root).unwrap();
+        paths.database = path.to_path_buf();
+        paths.wal = sidecar_path(path, "-wal");
+        paths.shm = sidecar_path(path, "-shm");
+        paths.validate_mode_binding().unwrap();
+        let namespace = PinnedNamespace::open(&paths).unwrap();
+        require_no_live_sidecars_for_bound_namespace(&namespace, path).unwrap();
+        let (main, identity) = open_pinned_regular_read_write(
+            &namespace.database_parent,
+            &namespace.database_leaf,
+            path,
+        )
+        .unwrap();
+        let connection = open_pinned_sqlite_read_write(
+            &namespace.database_parent,
+            &namespace.database_leaf,
+            &main,
+            identity,
+            path,
+        )
+        .unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        let sidecars =
+            OwnerCreatedSqliteSidecars::materialize_and_pin(&connection, &namespace, path).unwrap();
+        prospective::require_zero_owned_wal(&sidecars).unwrap();
+        if mutation == TARGET_TEST_PAYLOAD_MUTATION {
+            use rusqlite::config::DbConfig::{
+                SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_WRITABLE_SCHEMA,
+            };
+            // This exact Test attack emulates external schema tampering. Save
+            // and restore connection-local policy before target validation.
+            let defensive = connection.db_config(SQLITE_DBCONFIG_DEFENSIVE).unwrap();
+            let writable = connection
+                .db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA)
+                .unwrap();
+            assert!(
+                !connection
+                    .set_db_config(SQLITE_DBCONFIG_DEFENSIVE, false)
+                    .unwrap()
+            );
+            assert!(
+                connection
+                    .set_db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA, true)
+                    .unwrap()
+            );
+            let attacked = connection.execute_batch(mutation);
+            assert_eq!(
+                connection
+                    .set_db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA, writable)
+                    .unwrap(),
+                writable
+            );
+            assert_eq!(
+                connection
+                    .set_db_config(SQLITE_DBCONFIG_DEFENSIVE, defensive)
+                    .unwrap(),
+                defensive
+            );
+            attacked.unwrap();
+            let changed: bool = connection.query_row(
+                "SELECT instr(sql,'TEST_CODE_wrong_payload')>0 AND instr(sql,'outcome-stage-v3')=0 FROM sqlite_schema WHERE name='selection_v2_recovery_envelopes'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert!(
+                changed,
+                "payload attack must actually replace the schema marker"
+            );
+        } else {
+            connection.execute_batch(mutation).unwrap();
+        }
+        let checkpoint: (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(checkpoint.0, 0, "target fixture checkpoint is not busy");
+        assert!(checkpoint.1 >= 0 && checkpoint.2 >= 0);
+        assert_eq!(checkpoint.1, checkpoint.2);
+        prospective::require_zero_owned_wal(&sidecars).unwrap();
+        sidecars.validate_present_exact(&namespace, path).unwrap();
+        connection.close().unwrap();
+        sidecars
+            .cleanup_after_connection_close(&namespace, path)
+            .unwrap();
+        require_no_live_sidecars_for_bound_namespace(&namespace, path).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                matches!(fs::symlink_metadata(sidecar_path(path, suffix)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound),
+                "target fixture retained {suffix} after recorded sidecar cleanup"
+            );
+        }
+    }
+    #[test]
+    fn target_actual_catalog6_financial_copy_cold_reopen_and_fixed_four_streams() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        rows_test_seed(&fixture);
+        let main = fs::read(fixture.database()).unwrap();
+        let audit = fs::read(writer.path()).ok();
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut options = target::Options::production();
+        options.trace = Some(trace.clone());
+        let cap = target_test_prepare(&fixture, &writer, options).unwrap();
+        let original_backup = backup_test_known_bytes(&fixture);
+        let report = rows_test_report(&cap.render_unapproved().unwrap());
+        assert_eq!(report["original_streams"], 6);
+        assert_eq!(report["target_streams"], 4);
+        assert_eq!(report["approval"], "not_granted");
+        assert_eq!(report["maintenance_receipt"], "not_created");
+        assert_eq!(report["exchange"], "not_implemented");
+        assert_eq!(report["apply_supported"], false);
+        assert!(report["row_observations"].as_u64().unwrap() > 0);
+        assert_eq!(fs::read(fixture.database()).unwrap(), main);
+        assert_eq!(fs::read(writer.path()).ok(), audit);
+        assert_eq!(backup_test_known_bytes(&fixture), original_backup);
+        let directory = target_test_directory(&fixture);
+        let target_path = directory.join("stock_analysis.db.target");
+        assert_eq!(fs::read(&target_path).unwrap(), main);
+        let inode = fs::metadata(&target_path).unwrap().ino();
+        let records = [
+            "000-intent.json",
+            "001-created-target.json",
+            "002-copied-target.json",
+            "003-target-verified.json",
+        ]
+        .map(|name| fs::read(directory.join(name)).unwrap());
+        let second = rows_test_report(
+            &target_test_prepare(&fixture, &writer, target::Options::production())
+                .unwrap()
+                .render_unapproved()
+                .unwrap(),
+        );
+        assert_eq!(second["target_streams"], 4);
+        assert_eq!(fs::read(writer.path()).ok(), audit);
+        assert_eq!(fs::metadata(&target_path).unwrap().ino(), inode);
+        for (name, bytes) in [
+            "000-intent.json",
+            "001-created-target.json",
+            "002-copied-target.json",
+            "003-target-verified.json",
+        ]
+        .into_iter()
+        .zip(records)
+        {
+            assert_eq!(fs::read(directory.join(name)).unwrap(), bytes);
+        }
+        let events = trace.lock().unwrap();
+        let close = events
+            .iter()
+            .rposition(|e| *e == "target_readers_closed")
+            .unwrap();
+        assert_eq!(
+            &events[close..],
+            &[
+                "target_readers_closed",
+                "target_mutable_hooks_finished",
+                "target_immutable_tail_complete"
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| **e == "target_readers_closed")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn target_rejects_other_actual_families_before_target_directory() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for generation in [0, 1, 2, 3, 4, 5] {
+            let (fixture, writer) =
+                prospective_test_fixture("target-wrong-family", generation, false);
+            assert!(target_test_prepare(&fixture, &writer, target::Options::production()).is_err());
+            assert!(!fixture.root.join("global-schema-targets").exists());
+        }
+    }
+    #[test]
+    fn target_actual_catalog7_is_ineligible_before_any_target_creation() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        prospective_with_offline_fixture_connection(&fixture, |c| {
+            for (_, _, _, ddl) in super::super::candidate_scope_observation_schema_v1::STATEMENTS {
+                c.execute_batch(ddl).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version=7").unwrap();
+        });
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        assert!(target::prepare(original, target::Options::production()).is_err());
+        assert!(!fixture.root.join("global-schema-targets").exists());
+    }
+    #[test]
+    fn target_actual_comparator_count_preserving_cells_types_bits_raw_bytes_rowids_sequence() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for mutation in [
+            "UPDATE ledger SET total_value=123.25000000000003 WHERE id=1",
+            "UPDATE ledger SET created_at=X'544553545F434F44455F524F57535F505249564154455F54455854' WHERE id=1",
+            "UPDATE ledger SET created_at=CAST(X'FF0042' AS TEXT) WHERE id=1",
+            "UPDATE ledger SET id=2 WHERE id=1",
+            "UPDATE sqlite_sequence SET seq=CAST(seq AS TEXT) WHERE name='TEST_CODE_UNKNOWN_COUNTER'",
+            "UPDATE sqlite_sequence SET seq=92 WHERE name='ledger' AND seq=91",
+            "UPDATE sqlite_sequence SET name='TEST_CODE_DIFFERENT_COUNTER' WHERE name='TEST_CODE_UNKNOWN_COUNTER'",
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            rows_test_seed(&fixture);
+            let path = target_test_directory(&fixture).join("stock_analysis.db.target");
+            let root = fixture.root.clone();
+            let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let recorded = hits.clone();
+            let mut options = target::Options::production();
+            options.comparator_test = true;
+            options.trace = Some(trace.clone());
+            options.hook = Some(Box::new(move |phase| {
+                if phase == target::Phase::BeforeReader {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                    target_test_modify(&root, &path, mutation);
+                }
+                Ok(())
+            }));
+            let error = target_test_prepare(&fixture, &writer, options)
+                .err()
+                .unwrap();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert!(
+                trace.lock().unwrap().contains(&"target_comparator_entered"),
+                "comparator was not reached: {error}"
+            );
+            assert!(
+                matches!(error, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == "rows actual storage class or cell differs" || detail == "rows actual rowid differs")
+            );
+        }
+    }
+    #[test]
+    fn target_actual_full_catalog_header_geometry_and_unknown_schema_refuse() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for mutation in [
+            "CREATE TABLE TEST_CODE_unknown_target(x)",
+            "PRAGMA user_version=7",
+            "DROP INDEX idx_pushed_stocks_code; CREATE INDEX idx_pushed_stocks_code ON pushed_stocks(push_time,code)",
+            "CREATE TABLE TEST_CODE_foreign_key(x REFERENCES ledger(id))",
+            TARGET_TEST_PAYLOAD_MUTATION,
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let path = target_test_directory(&fixture).join("stock_analysis.db.target");
+            let root = fixture.root.clone();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let recorded = hits.clone();
+            let mut options = target::Options::production();
+            options.comparator_test = true;
+            options.hook = Some(Box::new(move |phase| {
+                if phase == target::Phase::BeforeReader {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                    target_test_modify(&root, &path, mutation);
+                }
+                Ok(())
+            }));
+            let error = target_test_prepare(&fixture, &writer, options)
+                .err()
+                .unwrap();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(&error, GlobalSchemaV1Error::SelectionCatalog {
+                    source: GlobalSchemaCatalogError::CatalogMismatch { detail }
+                } if detail == "whole rows: copy catalog/runtime/header differs"),
+                "attack must fail actual full catalog equality, not the comparator-only no-cap fallback: {error}"
+            );
+        }
+    }
+    #[test]
+    fn target_actual_reader_temp_and_attached_schemas_refuse() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        fn temp(c: &Connection) -> Result<(), GlobalSchemaV1Error> {
+            c.execute_batch(
+                "PRAGMA query_only=OFF; CREATE TEMP TABLE TEST_CODE_temp(x); PRAGMA query_only=ON",
+            )
+            .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+                operation: "target test TEMP",
+                source,
+            })
+        }
+        fn attached(c: &Connection) -> Result<(), GlobalSchemaV1Error> {
+            c.execute_batch("ATTACH ':memory:' AS TEST_CODE_attached")
+                .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+                    operation: "target test attached",
+                    source,
+                })
+        }
+        for fault in [
+            temp as fn(&Connection) -> Result<(), GlobalSchemaV1Error>,
+            attached,
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let mut options = target::Options::production();
+            options.reader_fault = Some(fault);
+            let error = target_test_prepare(&fixture, &writer, options)
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error,
+                GlobalSchemaV1Error::SelectionCatalog { .. }
+            ));
+        }
+    }
+    #[test]
+    fn target_final_hooks_reject_target_source_backup_audit_lock_and_ancestor_drift() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for role in [
+            "target", "source", "backup", "audit", "lock", "ancestor", "sidecar", "record",
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let dir = target_test_directory(&fixture);
+            let path = match role {
+                "target" => dir.join("stock_analysis.db.target"),
+                "source" => fixture.database(),
+                "backup" => backup_test_directory(&fixture).join("stock_analysis.db.backup"),
+                "audit" => writer.path().to_path_buf(),
+                "lock" => fixture.lock_file(),
+                "ancestor" => dir.clone(),
+                "sidecar" => dir.join("stock_analysis.db.target-wal"),
+                _ => dir.join("003-target-verified.json"),
+            };
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let recorded = hits.clone();
+            let mut options = target::Options::production();
+            options.hook = Some(Box::new(move |phase| {
+                if phase == target::Phase::BeforeImmutableTail {
+                    if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Ok(());
+                    }
+                    if role == "ancestor" {
+                        fs::rename(&path, path.with_extension("moved")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    } else if role == "sidecar" {
+                        fs::write(&path, b"unknown").unwrap();
+                    } else if role == "audit" && !path.exists() {
+                        fs::write(&path, b"unknown audit").unwrap();
+                    } else {
+                        let bytes = fs::read(&path).unwrap();
+                        fs::rename(&path, path.with_extension("retained-original")).unwrap();
+                        fs::write(&path, bytes).unwrap();
+                    }
+                }
+                Ok(())
+            }));
+            let cap = target_test_prepare(&fixture, &writer, options).unwrap();
+            assert!(
+                cap.render_unapproved().is_err(),
+                "{role} drift rendered a capability"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{role} final hook missed");
+        }
+    }
+    #[test]
+    fn target_durable_created_empty_inode_can_resume_actual_cold() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        let mut options = target::Options::production();
+        options.hook = Some(Box::new(|phase| {
+            if phase == target::Phase::AfterCreated {
+                Err(prospective::refusal("TEST_CODE_target_stop_after_created"))
+            } else {
+                Ok(())
+            }
+        }));
+        assert!(target_test_prepare(&fixture, &writer, options).is_err());
+        let path = target_test_directory(&fixture).join("stock_analysis.db.target");
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), 0);
+        target_test_prepare(&fixture, &writer, target::Options::production())
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), metadata.ino());
+    }
+    #[test]
+    fn target_unknown_partial_and_unrecorded_gaps_preserve_and_refuse_actual_cold() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for phase in [
+            target::Phase::AfterEmptyParentSync,
+            target::Phase::AfterCopyChunk,
+            target::Phase::AfterCopy,
+            target::Phase::BeforeRecordSync(0),
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let hits = std::sync::Arc::new(AtomicUsize::new(0));
+            let recorded = hits.clone();
+            let mut options = target::Options::production();
+            options.hook = Some(Box::new(move |p| {
+                if p == phase {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                    Err(prospective::refusal("TEST_CODE_target_gap"))
+                } else {
+                    Ok(())
+                }
+            }));
+            assert!(target_test_prepare(&fixture, &writer, options).is_err());
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let dir = target_test_directory(&fixture);
+            let paths = [
+                "stock_analysis.db.target",
+                "000-intent.json",
+                "001-created-target.json",
+                "002-copied-target.json",
+                "003-target-verified.json",
+            ];
+            let facts = paths.map(|name| fs::read(dir.join(name)).ok());
+            // A fully readable intent written before its reported sync failure
+            // is a possible durable fact; all unknown role gaps still refuse.
+            if phase != target::Phase::BeforeRecordSync(0) {
+                assert!(
+                    target_test_prepare(&fixture, &writer, target::Options::production()).is_err()
+                );
+                for (name, bytes) in paths.into_iter().zip(facts) {
+                    assert_eq!(fs::read(dir.join(name)).ok(), bytes);
+                }
+            }
+        }
+    }
+    #[test]
+    fn target_same_bytes_foreign_inode_cannot_be_adopted_on_cold_retry() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        target_test_prepare(&fixture, &writer, target::Options::production())
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        let path = target_test_directory(&fixture).join("stock_analysis.db.target");
+        let bytes = fs::read(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        fs::rename(&path, path.with_extension("original-inode")).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(target_test_prepare(&fixture, &writer, target::Options::production()).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    #[test]
+    fn target_bounds_changes_and_original_lease_conflict_refuse() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        let cap = target_test_prepare(&fixture, &writer, target::Options::production()).unwrap();
+        assert!(rows_test_prepare(&fixture, &writer, rows::Options::production()).is_err());
+        cap.render_unapproved().unwrap();
+        let mut options = target::Options::production();
+        options.limits.physical -= 1;
+        assert!(target_test_prepare(&fixture, &writer, options).is_err());
+    }
+
+    #[test]
+    fn target_physical_metadata_and_journal_limits_refuse_before_copy_or_allocation() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for bound in [
+            "physical", "metadata", "journal", "extent", "intent", "event", "records", "review",
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let mut options = target::Options::production();
+            match bound {
+                "physical" => options.limits.physical = 0,
+                "metadata" => options.limits.metadata = 0,
+                "journal" => options.limits.journal = 0,
+                "extent" => options.limits.extent = 0,
+                "intent" => options.limits.intent = 0,
+                "event" => options.limits.event = 0,
+                "records" => options.limits.records = 0,
+                _ => options.limits.review = 0,
+            }
+            let result = target_test_prepare(&fixture, &writer, options)
+                .and_then(|cap| cap.render_unapproved());
+            assert!(result.is_err(), "{bound} exhausted budget passed");
+            if bound != "review" {
+                let target = target_test_directory(&fixture).join("stock_analysis.db.target");
+                if target.exists() {
+                    assert_eq!(
+                        fs::metadata(target).unwrap().len(),
+                        0,
+                        "{bound} copied bytes before refusal"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn target_pair_cannot_reset_original_rows_work_to_gain_allowance() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        let report = rows_test_report(
+            &rows_test_prepare(&fixture, &writer, rows::Options::production())
+                .unwrap()
+                .render_unapproved()
+                .unwrap(),
+        );
+        let mut rows_options = rows::Options::production();
+        rows_options.limits.row_observations = report["row_observations"].as_u64().unwrap();
+        let original = rows_test_prepare(&fixture, &writer, rows_options).unwrap();
+        let error = target::prepare(original, target::Options::production())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error,GlobalSchemaV1Error::SelectionSnapshotChanged{detail} if detail=="target pair exceeds remaining original Rows allowance")
+        );
+    }
+    #[test]
+    fn target_reader_and_terminal_failure_retain_copied_facts_for_cold_recheck() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for phase in [
+            target::Phase::AfterCopySync,
+            target::Phase::AfterCopied,
+            target::Phase::AfterReadersClosed,
+            target::Phase::AfterRecordReadback(3),
+        ] {
+            let (fixture, writer) = actual_offline_catalog6_fixture();
+            let mut options = target::Options::production();
+            options.hook = Some(Box::new(move |p| {
+                if p == phase {
+                    Err(prospective::refusal("TEST_CODE_target_retained_failure"))
+                } else {
+                    Ok(())
+                }
+            }));
+            assert!(target_test_prepare(&fixture, &writer, options).is_err());
+            let path = target_test_directory(&fixture).join("stock_analysis.db.target");
+            let bytes = fs::read(&path).unwrap();
+            let inode = fs::metadata(&path).unwrap().ino();
+            assert!(!bytes.is_empty());
+            let retry = target_test_prepare(&fixture, &writer, target::Options::production())
+                .and_then(|cap| cap.render_unapproved());
+            if phase == target::Phase::AfterCopySync {
+                assert!(retry.is_err());
+            } else {
+                retry.unwrap();
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
     }
 
     fn backup_test_prepare(

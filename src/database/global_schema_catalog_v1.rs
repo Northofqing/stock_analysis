@@ -1192,6 +1192,21 @@ pub(super) struct WholeRowsReadSpec {
     tables: Vec<WholeRowsTable>,
     mode: GlobalSchemaCatalogMode,
     expected: CatalogSnapshot,
+    // Set only by the actual original classifier/capture below. The immutable
+    // expected snapshot and its mode travel with this non-forgeable result.
+    exact_amended_catalog6: bool,
+}
+/// Chosen solely from the original whole-family spec; no caller factory.
+pub(super) struct ClosedRequalificationRecipe {
+    mode: GlobalSchemaCatalogMode,
+}
+impl ClosedRequalificationRecipe {
+    pub(super) fn id(&self) -> &'static str {
+        "requalification-exact-amended-catalog6-v1"
+    }
+    pub(super) fn is_test(&self) -> bool {
+        self.mode == GlobalSchemaCatalogMode::Test
+    }
 }
 pub(super) struct WholeRowsTable {
     name: String,
@@ -1508,6 +1523,21 @@ impl WholeRowsTable {
     }
 }
 impl WholeRowsReadSpec {
+    pub(super) fn select_exact_amended_catalog6(
+        &self,
+    ) -> Result<ClosedRequalificationRecipe, GlobalSchemaCatalogError> {
+        if !self.exact_amended_catalog6
+            || self.expected.mode != self.mode
+            || self.expected.identity.application_id != STOCK_ANALYSIS_SQLITE_APPLICATION_ID
+            || self.expected.identity.user_version != PAPER_BOOK_EXECUTION_CATALOG_GENERATION
+        {
+            return Err(rows_catalog_error("target requires exact amended Catalog6"));
+        }
+        // capture_whole_rows_read_spec already charged and executed the full
+        // actual classifier and rebound expected to that same transaction.
+        // Do not allocate/normalize the identical three references a second time.
+        Ok(ClosedRequalificationRecipe { mode: self.mode })
+    }
     pub(super) fn tables(&self) -> &[WholeRowsTable] {
         &self.tables
     }
@@ -1546,6 +1576,10 @@ pub(super) fn capture_whole_rows_read_spec(
     work.before_catalog_capture(transaction)?;
     work.before_rows_classifier(actual, references)?;
     let half = classify_database_half(actual, references)?;
+    let exact_amended_catalog6 = matches!(&half, DatabaseHalfDiagnostic::AmendedDatabaseHalf(_))
+        && actual.identity.application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
+        && actual.identity.user_version == PAPER_BOOK_EXECUTION_CATALOG_GENERATION;
+
     match half {
         DatabaseHalfDiagnostic::PreAmendment(_)
         | DatabaseHalfDiagnostic::AmendedDatabaseHalf(_) => {}
@@ -1646,6 +1680,7 @@ pub(super) fn capture_whole_rows_read_spec(
         tables,
         mode: actual.mode,
         expected,
+        exact_amended_catalog6,
     })
 }
 

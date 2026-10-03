@@ -12,7 +12,7 @@ const DOMAIN: &[u8] = b"stock_analysis.global_schema.original_source_to_exact_by
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Limits {
     pub(super) tables: u64,
     pub(super) columns: u64,
@@ -107,6 +107,14 @@ pub(super) struct RowsWork {
     streams: u64,
 }
 impl RowsWork {
+    #[cfg(test)]
+    fn target_metadata_diagnostic(&self, stage: &str, needed: u64) {
+        eprintln!(
+            "TEST_CODE target metadata stage={stage} used={} limit={} needed={needed}",
+            self.metadata.used(),
+            self.limits.metadata_bytes
+        );
+    }
     fn new(limits: Limits) -> Self {
         Self {
             metadata: RowsSpecWork::new(limits.metadata_bytes, limits.tables, limits.columns),
@@ -803,6 +811,39 @@ pub(super) struct VerifiedUnapprovedOriginalRowsBackup {
     pending: Pending,
 }
 impl VerifiedUnapprovedOriginalRowsBackup {
+    pub(super) fn into_target_source(
+        mut self,
+    ) -> Result<OriginalRowsTargetSource, GlobalSchemaV1Error> {
+        #[cfg(test)]
+        self.pending
+            .work
+            .target_metadata_diagnostic("consume_before_recipe", 0);
+        let recipe = self
+            .pending
+            .spec
+            .select_exact_amended_catalog6()
+            .map_err(catalog_error)?;
+        self.backup.before_rows_render()?;
+        self.pending.read_last_copy(&mut self.backup)?;
+        #[cfg(test)]
+        self.pending
+            .work
+            .target_metadata_diagnostic("consume_after_original_six", 0);
+        if self.pending.work.streams != 6 {
+            return Err(fail("target requires exactly six original streams"));
+        }
+        self.pending
+            .work
+            .metadata
+            .charge(2 * std::mem::size_of::<Transcript>() as u64)
+            .map_err(catalog_error)?;
+        Ok(OriginalRowsTargetSource {
+            original: self,
+            recipe,
+            target_streams: 0,
+            target_comparisons: Vec::with_capacity(2),
+        })
+    }
     pub(super) fn render_unapproved(mut self) -> Result<String, GlobalSchemaV1Error> {
         self.backup.before_rows_render()?;
         self.pending.read_last_copy(&mut self.backup)?;
@@ -851,6 +892,208 @@ impl VerifiedUnapprovedOriginalRowsBackup {
         };
         let bytes = prospective::bounded_json(&review, self.pending.work.limits.review_bytes)?;
         String::from_utf8(bytes).map_err(|_| fail("rows bounded review encoding failed"))
+    }
+}
+
+/// One-way move out of the original Rows renderer. The original counters,
+/// transcript, actual backup and exclusive lease remain the same objects.
+pub(super) struct OriginalRowsTargetSource {
+    original: VerifiedUnapprovedOriginalRowsBackup,
+    recipe: super::super::global_schema_catalog_v1::ClosedRequalificationRecipe,
+    target_streams: u64,
+    target_comparisons: Vec<Transcript>,
+}
+#[derive(Serialize)]
+pub(super) struct TargetRowsObservation {
+    pub(super) original_streams: u64,
+    pub(super) target_streams: u64,
+    pub(super) row_observations: u64,
+    pub(super) typed_observation_bytes: u64,
+    pub(super) metadata_work: u64,
+}
+impl OriginalRowsTargetSource {
+    pub(super) fn recipe(&self) -> &str {
+        self.recipe.id()
+    }
+    pub(super) fn is_test(&self) -> bool {
+        self.recipe.is_test()
+    }
+    // Constructs only the target's resource meter from sealed source bounds.
+    // The caller has already validated the target limit; no authority is issued.
+    pub(super) fn new_target_metadata_meter(&self, limit: u64) -> RowsSpecWork {
+        let limits = &self.original.pending.work.limits;
+        RowsSpecWork::new(limit, limits.tables, limits.columns)
+    }
+    pub(super) fn with_namespace<T>(
+        &self,
+        operation: impl for<'loan> FnOnce(&'loan PinnedNamespace) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        self.original.pending.tail.namespace.validate_unchanged()?;
+        operation(&self.original.pending.tail.namespace)
+    }
+    pub(super) fn original_binding(
+        &mut self,
+        work: &mut target::TargetWork,
+    ) -> Result<String, GlobalSchemaV1Error> {
+        #[derive(Serialize)]
+        struct Binding<'a> {
+            domain: &'static str,
+            limits: &'a Limits,
+            tables: &'a Transcript,
+        }
+        let pending = &mut self.original.pending;
+        let evidence = Binding {
+            domain: "stock_analysis.global_schema.original_source_to_exact_byte_backup_rows.v1",
+            limits: &pending.work.limits,
+            tables: pending
+                .initial
+                .as_ref()
+                .ok_or_else(|| fail("target missing original transcript"))?,
+        };
+        let length = target::encoded_len(&evidence, 1024 * 1024)?;
+        #[cfg(test)]
+        pending
+            .work
+            .target_metadata_diagnostic("original_proof_binding", length);
+        pending
+            .work
+            .metadata
+            .charge(length)
+            .map_err(catalog_error)?;
+        let bytes = work.encode_metadata(&evidence, 1024 * 1024)?;
+        String::from_utf8(bytes).map_err(|_| fail("target original proof encoding"))
+    }
+    pub(super) fn with_copy_origin<T>(
+        &mut self,
+        work: &mut target::TargetWork,
+        operation: impl for<'loan> FnOnce(
+            &mut backup::CopiedTargetOriginLoan<'loan>,
+            &mut target::TargetWork,
+        ) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        self.original.backup.with_target_origin(work, operation)
+    }
+    pub(super) fn pair_evidence(&self) -> impl Serialize + '_ {
+        &self.target_comparisons
+    }
+    pub(super) fn observation(&self) -> TargetRowsObservation {
+        let w = &self.original.pending.work;
+        TargetRowsObservation {
+            original_streams: w.streams,
+            target_streams: self.target_streams,
+            row_observations: w.rows,
+            typed_observation_bytes: w.bytes,
+            metadata_work: w.metadata.used(),
+        }
+    }
+    pub(super) fn compare_owned_target(
+        &mut self,
+        target: &target::RetainedTargetReader<'_>,
+        target_work: &mut target::TargetWork,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        if self.original.pending.work.streams != 6 || !matches!(self.target_streams, 0 | 2) {
+            return Err(fail("target fixed pair lifecycle exceeded"));
+        }
+        let journal_metadata = self.original.backup.target_metadata_reservation()?;
+        #[cfg(test)]
+        self.original
+            .pending
+            .work
+            .target_metadata_diagnostic("pair_before_original_journal", journal_metadata);
+        self.original
+            .pending
+            .work
+            .metadata
+            .charge(journal_metadata)
+            .map_err(catalog_error)?;
+        let p = &mut self.original.pending;
+        let references = p
+            .references
+            .as_ref()
+            .ok_or_else(|| fail("target original references missing"))?;
+        let spec = &p.spec;
+        let authority = &p.authority;
+        let expected = p
+            .initial
+            .as_ref()
+            .ok_or_else(|| fail("target original transcript missing"))?;
+        let work = &mut p.work;
+        // Both typed sides consume the original cumulative allowance.
+        // The old finished()/six-stream proof lifecycle is never expanded.
+        let actual = self.original.backup.with_copied_rows(work, |copy, work| {
+            #[cfg(test)]
+            target_work.metadata_diagnostic("pair_before_actual_target_catalog");
+            spec.validate_connection(
+                authority,
+                target.connection(),
+                references,
+                target_work.catalog_metadata(),
+            )
+            .map_err(|error| {
+                #[cfg(test)]
+                target_work.metadata_diagnostic("pair_target_catalog_rejected");
+                catalog_error(error)
+            })?;
+            #[cfg(test)]
+            target_work.metadata_diagnostic("pair_after_actual_target_catalog");
+            let rows = expected.tables.iter().try_fold(0, |n, t| add(n, t.rows))?;
+            let bytes = expected
+                .tables
+                .iter()
+                .try_fold(0, |n, t| add(n, t.typed_bytes))?;
+            if add(work.rows, multiply(rows, 2)?)? > work.limits.row_observations
+                || add(work.bytes, multiply(bytes, 2)?)? > work.limits.observation_bytes
+            {
+                return Err(fail(
+                    "target pair exceeds remaining original Rows allowance",
+                ));
+            }
+            // The original Copied bytes are checked by the loan on both sides;
+            // its six original streams already closed the catalog/cell bounds.
+            // The target pre-reader fingerprint binds those same individual
+            // bounds. No redundant catalog/preflight allocation grants budget.
+            work.reserve_transcript(spec.tables().len())?;
+            let mut tables = Vec::with_capacity(spec.tables().len());
+            for table in spec.tables() {
+                target.comparator_entered();
+                tables.push(read_table_pair(
+                    copy.connection(),
+                    target.connection(),
+                    table.sql(),
+                    table.name(),
+                    table.column_count(),
+                    work,
+                )?);
+            }
+            Ok(Transcript { tables })
+        })?;
+        if &actual != expected {
+            return Err(fail("target pair differs from original proof transcript"));
+        }
+        self.target_comparisons.push(actual);
+        self.target_streams = add(self.target_streams, 2)?;
+        Ok(())
+    }
+    pub(super) fn validate_without_hooks(&mut self) -> Result<(), GlobalSchemaV1Error> {
+        let journal_metadata = self.original.backup.target_metadata_reservation()?;
+        #[cfg(test)]
+        self.original
+            .pending
+            .work
+            .target_metadata_diagnostic("tail_before_original_journal", journal_metadata);
+        self.original
+            .pending
+            .work
+            .metadata
+            .charge(journal_metadata)
+            .map_err(catalog_error)?;
+        self.original
+            .pending
+            .tail
+            .reserve_validation(&mut self.original.pending.work)?;
+        self.original
+            .backup
+            .validate_rows_tail_without_hooks(&self.original.pending.tail)
     }
 }
 
