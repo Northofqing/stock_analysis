@@ -210,8 +210,8 @@ fn source_formulas_do_not_grant_a_runtime_pin() {
             >= size_of::<Box<str>>() as u64 + 2 * size_of::<usize>() as u64
     );
     assert_eq!(
-        require_reviewed_layout_pin(),
-        Err(LayoutPinRefusal::BuildVerificationNotInstalled)
+        require_reviewed_layout_pin().err(),
+        Some(LayoutPinRefusal::BuildVerificationNotInstalled)
     );
 }
 
@@ -372,4 +372,209 @@ fn dropping_and_forgetting_short_loans_cannot_clear_persistent_failure() {
     }
     assert_eq!(terminal.finish(), Err(first));
     assert_eq!(metadata.used(), 0);
+}
+
+#[path = "../../build_support/replay_layout_pin_v1.rs"]
+mod refusal_writer;
+
+const EXPECTED_REFUSAL: &str = "pub(super) const fn acquire() -> Result<ReviewedLayoutPin, LayoutPinRefusal> {\n    Err(LayoutPinRefusal::BuildVerificationNotInstalled)\n}\n";
+
+#[test]
+fn ordinary_generated_pin_refuses_without_an_authority_value() {
+    assert_eq!(
+        include_str!(env!("STOCK_REPLAY_PIN_INCLUDE")),
+        EXPECTED_REFUSAL
+    );
+    assert_eq!(
+        require_reviewed_layout_pin().err(),
+        Some(LayoutPinRefusal::BuildVerificationNotInstalled)
+    );
+}
+
+#[test]
+fn memory_pin_refusal_survives_swallow_drop_and_reborrow() {
+    let mut metadata = RowsSpecWork::new(20, 1, 1);
+    metadata.charge(3).unwrap();
+    let mut terminal = super::super::target::test_replay_terminal();
+    let expected = ReplayTerminalFailure::CodecQualification(ReplayCodecQualificationFailure {
+        kind: ReplayCodecFailureKind::PinUnavailable,
+        offset: None,
+    });
+    {
+        let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        assert_eq!(work.codec_memory().err(), Some(expected));
+        assert_eq!(work.used(), 3);
+        assert_eq!((work.row_buffer_requests, work.text_copy_requests), (0, 0));
+        // Discarding the failed result and dropping the borrower cannot undo it.
+    }
+    {
+        let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        assert_eq!(work.codec_memory().err(), Some(expected));
+        assert_eq!(work.reserve(ReplaySite::Collection, 0).err(), Some(expected));
+        assert_eq!(work.reserve(ReplaySite::StateCopy, 1).err(), Some(expected));
+        assert_eq!(work.finish(), Err(expected));
+        assert_eq!(work.used(), 3);
+    }
+    assert_eq!(terminal.finish(), Err(expected));
+}
+
+#[test]
+fn codec_refusal_preserves_first_terminal_and_original_used() {
+    use ReplayCodecFailureKind::*;
+    let kinds = [
+        PinUnavailable,
+        UnsupportedSerdeProfile,
+        MalformedJson,
+        UnexpectedType,
+        MissingField,
+        DuplicateField,
+        UnknownField,
+        UnknownVariant,
+        SequenceArity,
+        IntegerRange,
+        FloatRange,
+        InvalidDate,
+        InvalidDateTime,
+        InvalidMapKey,
+        TypedRecursionLimit,
+        Noncanonical,
+        RecordExtent,
+        PlanMismatch,
+    ];
+    for kind in kinds {
+        let mut metadata = RowsSpecWork::new(20, 1, 1);
+        metadata.charge(2).unwrap();
+        let mut terminal = super::super::target::test_replay_terminal();
+        let first = ReplayTerminalFailure::CodecQualification(ReplayCodecQualificationFailure {
+            kind,
+            offset: Some(11),
+        });
+        {
+            let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+            assert_eq!(work.qualify_codec(kind, Some(11)), first);
+            assert_eq!(work.qualify_codec(PlanMismatch, None), first);
+            assert_eq!(work.qualify(ReplaySqlQualificationFailure::Shape), first);
+            assert_eq!(work.reserve(ReplaySite::Collection, 0).err(), Some(first));
+            assert_eq!(work.reserve(ReplaySite::Collection, 5).err(), Some(first));
+        }
+        let work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        assert_eq!(work.finish(), Err(first));
+        assert_eq!(work.used(), 2);
+    }
+    for resource_first in [true, false] {
+        let mut metadata = RowsSpecWork::new(1, 1, 1);
+        let mut terminal = super::super::target::test_replay_terminal();
+        let first;
+        let expected_used;
+        {
+            let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+            first = if resource_first {
+                expected_used = 2;
+                work.reserve(ReplaySite::StateCopy, 2).err().unwrap()
+            } else {
+                expected_used = 0;
+                work.qualify(ReplaySqlQualificationFailure::Extent)
+            };
+            assert_eq!(work.qualify_codec(MalformedJson, Some(7)), first);
+            assert_eq!(work.codec_memory().err(), Some(first));
+        }
+        assert_eq!(terminal.finish(), Err(first));
+        assert_eq!(metadata.used(), expected_used);
+    }
+}
+
+#[test]
+fn sql_provider_refusal_is_independent_and_persistent() {
+    let mut metadata = RowsSpecWork::new(20, 1, 1);
+    metadata.charge(4).unwrap();
+    let mut terminal = super::super::target::test_replay_terminal();
+    let expected = ReplayTerminalFailure::Qualification(
+        ReplaySqlQualificationFailure::SqlProviderUnavailable,
+    );
+    {
+        let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        // Exercise the real independent gate, without a synthetic layout token.
+        assert_eq!(work.require_sql_provider(), Err(expected));
+        assert_eq!((work.row_buffer_requests, work.text_copy_requests), (0, 0));
+        assert_eq!(work.used(), 4);
+    }
+    {
+        let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        assert_eq!(work.require_sql_provider(), Err(expected));
+        assert_eq!(work.codec_memory().err(), Some(expected));
+        assert_eq!(work.reserve(ReplaySite::SqlRows, 1).err(), Some(expected));
+        assert_eq!(work.finish(), Err(expected));
+    }
+    assert_eq!(terminal.finish(), Err(expected));
+    assert_eq!(metadata.used(), 4);
+}
+
+#[test]
+fn refusal_writer_replaces_stale_final_with_constant_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("replay_layout_pin_v1_refusal.rs");
+    std::fs::write(&destination, "stale untrusted generated contents").unwrap();
+    refusal_writer::write_refusal(dir.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        EXPECTED_REFUSAL
+    );
+    assert!(!dir
+        .path()
+        .join("replay_layout_pin_v1_refusal.rs.pending")
+        .exists());
+    refusal_writer::write_refusal(dir.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        EXPECTED_REFUSAL
+    );
+}
+
+#[test]
+fn refusal_writer_failure_cannot_leave_a_successful_directive_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_directory = dir.path().join("file");
+    std::fs::write(&not_directory, b"file").unwrap();
+    assert!(refusal_writer::write_refusal(&not_directory).is_err());
+    let final_path = dir.path().join("replay_layout_pin_v1_refusal.rs");
+    let pending_path = dir.path().join("replay_layout_pin_v1_refusal.rs.pending");
+    std::fs::write(&pending_path, b"interrupted write").unwrap();
+    assert_eq!(
+        refusal_writer::write_refusal(dir.path()).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert!(!final_path.exists());
+    assert_eq!(std::fs::read(&pending_path).unwrap(), b"interrupted write");
+
+    // Renaming over a directory fails after writing pending bytes; no success.
+    let blocked = tempfile::tempdir().unwrap();
+    let blocked_final = blocked.path().join("replay_layout_pin_v1_refusal.rs");
+    std::fs::create_dir(&blocked_final).unwrap();
+    assert!(refusal_writer::write_refusal(blocked.path()).is_err());
+    assert!(blocked_final.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(blocked.path().join("replay_layout_pin_v1_refusal.rs.pending"))
+            .unwrap(),
+        EXPECTED_REFUSAL
+    );
+
+    for bad in ["line\nfeed", "carriage\rreturn"] {
+        assert_eq!(
+            refusal_writer::write_refusal(&dir.path().join(bad))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            refusal_writer::write_refusal(&dir.path().join(bad))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 }

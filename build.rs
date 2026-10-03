@@ -4,6 +4,9 @@
 //! generated modules and descriptors.
 use std::path::{Path, PathBuf};
 
+#[path = "build_support/replay_layout_pin_v1.rs"]
+mod replay_layout_pin_v1;
+
 #[allow(dead_code)]
 #[path = "src/production_root.rs"]
 mod production_root;
@@ -20,6 +23,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("invalid STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT: {error}"));
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    replay_layout_pin_v1::write_refusal(&out_dir).expect("write replay layout refusal");
     let local_source = "contracts/local_bridge_v1/market.proto";
     let local_dir = out_dir.join("local_bridge_v1");
     std::fs::create_dir_all(&local_dir).expect("create LocalBridgeV1 output directory");

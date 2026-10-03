@@ -60,11 +60,39 @@ pub(crate) enum ReplaySqlQualificationFailure {
     Utf8,
     Extent,
     PinUnavailable,
+    SqlProviderUnavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayCodecFailureKind {
+    PinUnavailable,
+    UnsupportedSerdeProfile,
+    MalformedJson,
+    UnexpectedType,
+    MissingField,
+    DuplicateField,
+    UnknownField,
+    UnknownVariant,
+    SequenceArity,
+    IntegerRange,
+    FloatRange,
+    InvalidDate,
+    InvalidDateTime,
+    InvalidMapKey,
+    TypedRecursionLimit,
+    Noncanonical,
+    RecordExtent,
+    PlanMismatch,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayCodecQualificationFailure {
+    kind: ReplayCodecFailureKind,
+    offset: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayTerminalFailure {
     Resource(ReplayResourceFailure),
     Qualification(ReplaySqlQualificationFailure),
+    CodecQualification(ReplayCodecQualificationFailure),
 }
 
 // Constructed once by the actual target owner, never by a phase borrower.
@@ -127,6 +155,29 @@ impl<'a> BorrowedReplayWork<'a> {
     fn qualify(&mut self, cause: ReplaySqlQualificationFailure) -> ReplayTerminalFailure {
         self.terminal
             .latch(ReplayTerminalFailure::Qualification(cause))
+    }
+    fn qualify_codec(
+        &mut self,
+        kind: ReplayCodecFailureKind,
+        offset: Option<u64>,
+    ) -> ReplayTerminalFailure {
+        self.terminal.latch(ReplayTerminalFailure::CodecQualification(
+            ReplayCodecQualificationFailure { kind, offset },
+        ))
+    }
+    fn require_sql_provider(&mut self) -> Result<(), ReplayTerminalFailure> {
+        self.finish()?;
+        Err(self.qualify(ReplaySqlQualificationFailure::SqlProviderUnavailable))
+    }
+    pub(crate) fn codec_memory<'loan>(
+        &'loan mut self,
+    ) -> Result<ReplayMemory<'loan, 'a>, ReplayTerminalFailure> {
+        self.finish()?;
+        let pin = require_reviewed_layout_pin()
+            .map_err(|_| self.qualify_codec(ReplayCodecFailureKind::PinUnavailable, None))?;
+        pin.codec_rules()
+            .map_err(|kind| self.qualify_codec(kind, None))?;
+        Ok(ReplayMemory { work: self, pin })
     }
     fn sql<T>(
         &mut self,
@@ -201,10 +252,12 @@ impl<'a> V1RowsLoan<'a> {
     }
     fn require_pin(&mut self) -> Result<(), ReplayTerminalFailure> {
         self.work.finish()?;
-        require_reviewed_layout_pin().map_err(|_| {
+        let _pin = require_reviewed_layout_pin().map_err(|_| {
             self.work
                 .qualify(ReplaySqlQualificationFailure::PinUnavailable)
-        })
+        })?;
+        // A layout proof does not identify the linked SQLite provider.
+        self.work.require_sql_provider()
     }
     pub(super) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
         self.work.finish()
@@ -232,13 +285,60 @@ impl Reservation {
     }
 }
 
-// No accepted pin variant, factory, caller-provided bool, or certificate exists.
+// Ordinary generated code refuses. Future accepted issuance alone may create
+// this child-private token; no test factory or caller-supplied proof exists.
+mod layout_qualification {
+    use super::{LayoutPinRefusal, ReplayCodecFailureKind};
+
+    pub(crate) struct ReviewedLayoutPin {
+        consumer_seed_sha256: [u8; 32],
+        proof_rules_sha256: [u8; 32],
+        rules: Option<ReviewedRulesV1>,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ReviewedRulesV1 {
+        // Future issuance must bind actual serde_json default/std source/cfg.
+        FiniteDtoV1,
+    }
+    impl ReviewedLayoutPin {
+        pub(super) fn codec_rules(&self) -> Result<&ReviewedRulesV1, ReplayCodecFailureKind> {
+            self.rules
+                .as_ref()
+                .ok_or(ReplayCodecFailureKind::UnsupportedSerdeProfile)
+        }
+    }
+    include!(env!("STOCK_REPLAY_PIN_INCLUDE"));
+}
+pub(crate) use layout_qualification::ReviewedLayoutPin;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LayoutPinRefusal {
+pub(crate) enum LayoutPinRefusal {
     BuildVerificationNotInstalled,
 }
-pub(super) fn require_reviewed_layout_pin() -> Result<(), LayoutPinRefusal> {
-    Err(LayoutPinRefusal::BuildVerificationNotInstalled)
+pub(crate) fn require_reviewed_layout_pin() -> Result<ReviewedLayoutPin, LayoutPinRefusal> {
+    layout_qualification::acquire()
+}
+
+/// Borrows the existing cumulative meter and terminal; no Drop/reset/refund.
+/// Paid closed DTO operations are supplied only by their later reviewed slice.
+pub(crate) struct ReplayMemory<'loan, 'pool> {
+    work: &'loan mut BorrowedReplayWork<'pool>,
+    pin: ReviewedLayoutPin,
+}
+impl ReplayMemory<'_, '_> {
+    fn rules(&self) -> Result<&layout_qualification::ReviewedRulesV1, ReplayCodecFailureKind> {
+        self.pin.codec_rules()
+    }
+    pub(crate) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
+        self.work.finish()
+    }
+    pub(crate) fn refuse_codec(
+        &mut self,
+        kind: ReplayCodecFailureKind,
+        offset: Option<u64>,
+    ) -> ReplayTerminalFailure {
+        self.work.qualify_codec(kind, offset)
+    }
 }
 
 pub(super) const REVIEWED_LAYOUT_SPEC: &str =
