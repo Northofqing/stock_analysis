@@ -31,7 +31,7 @@ ENV_KEYS = {"PATH", "PROTOC", "PROTOC_INCLUDE", "CC", "CXX", "AR", "SDKROOT",
             "MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR", "SOURCE_DATE_EPOCH"}
 FORBIDDEN_ENV = {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_BOOTSTRAP",
                  "RUSTC_WORKSPACE_WRAPPER", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-                 "DYLD_FALLBACK_LIBRARY_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"}
+                 "LD_PRELOAD", "LD_LIBRARY_PATH"}
 
 
 class Refusal(Exception):
@@ -371,6 +371,27 @@ def selected_outputs(parsed, cwd, target):
     return result
 
 
+def sysroot_loader_path(sysroot):
+    """Only the complete inventoried lib tree supplies the owner loader path."""
+    require("lib" in sysroot["roots"], "IncompleteLoaderInventory")
+    path = Path(sysroot["root"]) / "lib"
+    require(path.is_absolute() and path.resolve() == path and path.is_dir()
+            and ":" not in str(path), "SysrootLoaderPath")
+    return str(path)
+
+
+def compiler_environment(env, session, sysroot, *, probe):
+    require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
+    expected = sysroot_loader_path(sysroot)
+    if not probe:
+        prefix = str(session / "target/debug/deps")
+        require(":" not in prefix, "SessionLoaderPath")
+        expected = prefix + ":" + expected
+    # Compare original bytes represented by Python's environment strings. Do not
+    # normalize, reorder, remove empty components, or trust ambient defaults.
+    require(env.get("DYLD_FALLBACK_LIBRARY_PATH") == expected, "CompilerEnvironmentInjection")
+
+
 def wrapper(session_id, args):
     require(ID.fullmatch(session_id), "SessionId")
     session = SESSIONS / ("pending-" + session_id)
@@ -392,8 +413,8 @@ def wrapper(session_id, args):
                 "cwd_hex": os.fsencode(os.getcwd()).hex(),
                 "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()}})
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
-    require(not any(os.environ.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     parsed = parse_rustc(args[1:])
+    compiler_environment(os.environ, session, inv["sysroot"], probe=parsed["probe"])
     options, codegen = parsed["options"], parsed["codegen"]
     if "--target" in options:
         require(options["--target"] == [TARGET], "WrongTarget")
@@ -631,6 +652,7 @@ def record():
     require(not any(name in {".cargo/config", ".cargo/config.toml"}
                     for name in inv["application"]["files"]), "SnapshotCargoConfig")
     validate_config_chain(ROOT, inv["ancestor_configs"])
+    loader_path = sysroot_loader_path(inv["sysroot"])
     SESSIONS.mkdir(mode=0o700, exist_ok=True)
     require(not SESSIONS.is_symlink() and SESSIONS.resolve() == SESSIONS, "SessionRoot")
     session_id = uuid.uuid4().hex
@@ -651,7 +673,8 @@ def record():
                         + repr(session_id) + ", *sys.argv[1:]])\n", encoding="utf-8")
     launcher.chmod(0o700)
     env = dict(inv["environment"], HOME=str(session / "home"), TMPDIR=str(session / "tmp"),
-               CARGO_HOME=str(session / "cargo-home"), RUSTC=inv["rustc"]["path"], RUSTC_WRAPPER=str(launcher))
+               CARGO_HOME=str(session / "cargo-home"), RUSTC=inv["rustc"]["path"], RUSTC_WRAPPER=str(launcher),
+               DYLD_FALLBACK_LIBRARY_PATH=loader_path)
     argv = [inv["cargo"]["path"], "build", "--locked", "--offline", "--lib", "--target", TARGET,
             "--message-format=json-render-diagnostics", "--manifest-path", str(session / "application/Cargo.toml"),
             "--target-dir", str(session / "target")]

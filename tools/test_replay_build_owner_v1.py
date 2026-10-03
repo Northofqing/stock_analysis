@@ -23,7 +23,11 @@ PYTHON = str(Path(sys.executable).resolve())
 FAKE_RUSTC = r'''
 import json, os, pathlib, sys
 args=sys.argv[1:]
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+if args==['-vV']:
+    (hits/'probe').write_text('entered');print('TEST_CODE_version_probe');sys.exit(0)
 def value(key): return args[args.index(key)+1]
+(hits/('compile-'+value('--crate-name'))).write_text('entered')
 name=value('--crate-name'); out=pathlib.Path(value('--out-dir')); out.mkdir(parents=True,exist_ok=True)
 source=pathlib.Path(args[-1]); body=source.read_bytes()
 if name=='build_script_build':
@@ -50,8 +54,26 @@ assert args[5]=='x86_64-apple-darwin'
 def value(key): return args[args.index(key)+1]
 app=pathlib.Path(value('--manifest-path')).parent; session=app.parent; target=pathlib.Path(value('--target-dir'))
 def emit(value): print(json.dumps(value),flush=True)
+sysroot_lib=str(pathlib.Path(os.environ['RUSTC']).parent/'sysroot/lib')
+assert os.environ['DYLD_FALLBACK_LIBRARY_PATH']==sysroot_lib
+prefix=str(target/'debug/deps')
+probe_env=dict(os.environ,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+if MODE=='probe_compile_path': probe_env['DYLD_FALLBACK_LIBRARY_PATH']=prefix+':'+sysroot_lib
+probe=subprocess.run([os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'-vV'],env=probe_env,stdout=subprocess.PIPE)
+if probe.returncode: emit({'reason':'build-finished','success':False});sys.exit(probe.returncode)
 def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
-    env=dict(os.environ,CARGO_MANIFEST_DIR=str(manifest)); env.update(env_extra or {})
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(manifest),FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+    env['DYLD_FALLBACK_LIBRARY_PATH']=prefix+':'+sysroot_lib
+    if name=='dep':
+        mutations={'loader_extra':prefix+':'+sysroot_lib+':/usr/local/lib',
+                   'loader_reversed':sysroot_lib+':'+prefix,
+                   'loader_foreign':str(session.parent/'pending-foreign/target/debug/deps')+':'+sysroot_lib,
+                   'loader_empty':'', 'loader_empty_component':prefix+'::'+sysroot_lib,
+                   'loader_duplicate':prefix+':'+prefix+':'+sysroot_lib}
+        if MODE in mutations: env['DYLD_FALLBACK_LIBRARY_PATH']=mutations[MODE]
+        if MODE=='loader_missing': del env['DYLD_FALLBACK_LIBRARY_PATH']
+        if MODE.startswith('forbidden_'): env[MODE[len('forbidden_'):]]='/TEST_CODE_FOREIGN'
+    env.update(env_extra or {})
     command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition','2021','--crate-type',kind,'--emit','dep-info,link' if kind=='bin' else 'dep-info,metadata,link','--out-dir',str(out),*extra,str(root)]
     if MODE=='wrong_sysroot' and name=='dep': command[2:2]=['--sysroot','/TEST_CODE_wrong_sysroot']
     result=subprocess.run(command,env=env)
@@ -148,7 +170,8 @@ class RecordingProtocolTests(unittest.TestCase):
         return json.loads(Path(reply["record_path"]).read_text())
 
     def test_missing_inventory_creates_no_build_session(self):
-        shutil.copyfile(TOOL.with_name("replay_build_pin_v1_manifest.json"), self.policy)
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly",
+                                           "profile": owner.PROFILE, "inventory": None}))
         result = self.invoke("record")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["reason"], "MissingInventory")
@@ -161,7 +184,8 @@ class RecordingProtocolTests(unittest.TestCase):
 
     def test_full_record_observes_extern_and_actual_generator_without_pin(self):
         inventory = self.prepare()
-        result = self.invoke("record", incoming={"RUSTFLAGS": "--sysroot /bad", "PROTOC": "/bad", "CARGO_HOME": "/bad"})
+        result = self.invoke("record", incoming={"RUSTFLAGS": "--sysroot /bad", "PROTOC": "/bad", "CARGO_HOME": "/bad",
+                                                "DYLD_FALLBACK_LIBRARY_PATH": "/TEST_CODE_CALLER", "LD_LIBRARY_PATH": "/TEST_CODE_CALLER"})
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         record = self.record_result(result)
         self.assertEqual(record["blockers"], [])
@@ -171,6 +195,19 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertNotIn("RUSTFLAGS", actual_owner["environment"])
         self.assertEqual(actual_owner["environment"]["PROTOC"], inventory["generators"]["PROTOC"]["path"])
         self.assertNotEqual(actual_owner["environment"]["CARGO_HOME"], "/bad")
+        self.assertNotIn("LD_LIBRARY_PATH", actual_owner["environment"])
+        sysroot_lib = str(Path(inventory["sysroot"]["root"]) / "lib")
+        self.assertEqual(actual_owner["environment"]["DYLD_FALLBACK_LIBRARY_PATH"], sysroot_lib)
+        session = record_path.parent
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()},
+                         {"probe", "compile-dep", "compile-build_script_build", "compile-stock_analysis"})
+        receipts = [json.loads(p.read_text()) for p in (session / "invocations").glob("*/receipt.json")]
+        self.assertEqual(sum(r["kind"] == "Probe" for r in receipts), 1)
+        self.assertEqual(sum(r["kind"] == "Compile" for r in receipts), 3)
+        for receipt in receipts:
+            env = {bytes.fromhex(k).decode(): bytes.fromhex(v).decode() for k, v in receipt["environment_hex"].items()}
+            expected = sysroot_lib if receipt["kind"] == "Probe" else str(session / "target/debug/deps") + ":" + sysroot_lib
+            self.assertEqual(env["DYLD_FALLBACK_LIBRARY_PATH"], expected)
         self.assertEqual(len(record["selected_library"]), 1)
         self.assertEqual(len(record["extern_edges"]), 1)
         self.assertEqual(len(record["extern_edges"][0]["producers"]), 1)
@@ -178,6 +215,75 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertTrue(any("generated_by" in item["owner"] for item in record["consumed_sources"]))
         self.assertEqual(sha(Path(inventory["application"]["root"]) / "Cargo.lock"), inventory["application"]["files"]["Cargo.lock"])
         self.assertFalse((self.root / "release").exists())
+
+    def rejected_loader_record(self, mode, expected_env, *, probe_rejected=False):
+        inventory = self.prepare(mode)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 2)
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        self.assertIn(b"CompilerEnvironmentInjection", (session / "cargo.stderr.raw").read_bytes())
+        self.assertIn("CargoDidNotFinishSuccessfully", record["blockers"])
+        self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+        self.assertEqual(record["selected_library"], [])
+        hit_root = session / "compiler-entry"
+        hits = {p.name for p in hit_root.iterdir()} if hit_root.exists() else set()
+        self.assertEqual(hits, set() if probe_rejected else {"probe"})
+        self.assertFalse(any((session / "target").rglob("*.rlib")))
+        calls = list((session / "invocations").iterdir())
+        rejected = [call for call in calls if not (call / "receipt.json").exists()]
+        self.assertEqual(len(rejected), 1)
+        self.assertFalse((rejected[0] / "invocation.json").exists())
+        request = json.loads((rejected[0] / "request.json").read_text())
+        env = {bytes.fromhex(k).decode(): bytes.fromhex(v).decode() for k, v in request["environment_hex"].items()}
+        expected = expected_env(session, str(Path(inventory["sysroot"]["root"]) / "lib"))
+        for key, value in expected.items():
+            if value is None:
+                self.assertNotIn(key, env)
+            else:
+                self.assertEqual(env[key], value)
+        receipts = [json.loads((c / "receipt.json").read_text()) for c in calls if (c / "receipt.json").exists()]
+        self.assertTrue(all(r["kind"] == "Probe" and r["outputs"] == [] for r in receipts))
+
+    def test_loader_mutations_refuse_before_compile_entry(self):
+        cases = {
+            "loader_extra": lambda s, lib: str(s / "target/debug/deps") + ":" + lib + ":/usr/local/lib",
+            "loader_reversed": lambda s, lib: lib + ":" + str(s / "target/debug/deps"),
+            "loader_foreign": lambda s, lib: str(s.parent / "pending-foreign/target/debug/deps") + ":" + lib,
+            "loader_empty": lambda s, lib: "",
+            "loader_missing": lambda s, lib: None,
+            "loader_empty_component": lambda s, lib: str(s / "target/debug/deps") + "::" + lib,
+            "loader_duplicate": lambda s, lib: str(s / "target/debug/deps") + ":" + str(s / "target/debug/deps") + ":" + lib,
+        }
+        for mode, value in cases.items():
+            with self.subTest(mode=mode):
+                self.rejected_loader_record(mode, lambda s, lib: {"DYLD_FALLBACK_LIBRARY_PATH": value(s, lib)})
+
+    def test_other_loader_flags_refuse_before_compile_entry(self):
+        for key in ("DYLD_LIBRARY_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
+            with self.subTest(key=key):
+                self.rejected_loader_record("forbidden_" + key, lambda s, lib: {key: "/TEST_CODE_FOREIGN"})
+        # Loading DYLD_INSERT_LIBRARIES before Python starts is outside the
+        # wrapper TCB; check this guard without asking dyld to load a fake dylib.
+        inventory = self.prepare()
+        with self.assertRaises(owner.Refusal):
+            owner.compiler_environment({"DYLD_INSERT_LIBRARIES": "/TEST_CODE_FOREIGN",
+                                        "DYLD_FALLBACK_LIBRARY_PATH": str(Path(inventory["sysroot"]["root"]) / "lib")},
+                                       self.root, inventory["sysroot"], probe=True)
+
+    def test_probe_rejects_compile_loader_path_before_compiler_entry(self):
+        self.rejected_loader_record("probe_compile_path", lambda s, lib: {
+            "DYLD_FALLBACK_LIBRARY_PATH": str(s / "target/debug/deps") + ":" + lib}, probe_rejected=True)
+
+    def test_loader_requires_complete_lib_inventory(self):
+        self.prepare()
+        policy = json.loads(self.policy.read_text())
+        policy["inventory"]["sysroot"]["roots"] = ["lib/test.bin"]
+        self.policy.write_text(json.dumps(policy))
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"IncompleteLoaderInventory", result.stderr)
+        self.assertFalse((self.root / ".replay-build-records").exists())
 
     def test_inventory_extras_and_symlinks_are_refused(self):
         inventory = self.prepare()
