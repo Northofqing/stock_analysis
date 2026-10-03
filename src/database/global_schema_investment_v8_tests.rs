@@ -579,4 +579,122 @@ mod investment8_tests {
             first.canonical_bytes()
         );
     }
+    fn probe(reset: bool) -> (usize, usize) {
+        crate::decision::investment_decision_v1::InvestmentDecisionId::decode_probe_for_test(reset)
+    }
+    fn replace_canonical_once(bytes: &[u8], needle: &str, replacement: &str) -> Vec<u8> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches(needle).count(), 1);
+        text.replacen(needle, replacement, 1).into_bytes()
+    }
+    fn assert_preflight_stored_refusal(db: &DatabaseManager, slot: i64, bytes: &[u8]) {
+        assert!(bytes.len() < 16 * 1024 * 1024);
+        corrupt_bytes(db, bytes); // Real BLOB + domain SHA + ID, trigger restored.
+        probe(true);
+        assert!(read(db, slot).is_err());
+        let (refused, owned) = probe(false);
+        assert!(
+            refused > 0,
+            "must reach the new preflight, not an earlier SQL gate"
+        );
+        assert_eq!(
+            owned, 0,
+            "corruption must not enter owned Record/enum decode"
+        );
+        assert_eq!(count(db), 1);
+    }
+    #[test]
+    fn investment8_actual_misplaced_scope_string_refused_before_owned_decode() {
+        let _serial = super::super::super::tests::PROSPECTIVE_TEST_SERIAL
+            .lock()
+            .unwrap();
+        let f = fixture8();
+        let first = record(
+            &f.db,
+            &config(),
+            Utc.with_ymd_and_hms(2030, 1, 2, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        probe(true);
+        assert_eq!(
+            read(&f.db, first.slot_start_unix_ms())
+                .unwrap()
+                .unwrap()
+                .canonical_bytes(),
+            first.canonical_bytes()
+        );
+        assert!(probe(false).1 > 0);
+        let large = "\"".repeat(1_048_577);
+        assert_eq!(large.len(), 1_048_577);
+        let needle =
+            r#""calendar":{"state":"Unavailable","reason":"ImmutableCalendarCoverageUnavailable"}"#;
+        let replacement = format!(
+            r#""calendar":{{"state":"Unavailable","reason":"ImmutableCalendarCoverageUnavailable","canonical_utf8":{}}}"#,
+            serde_json::to_string(&large).unwrap()
+        );
+        let bytes = replace_canonical_once(first.canonical_bytes(), needle, &replacement);
+        assert!(bytes.len() > 2 * 1024 * 1024);
+        assert_preflight_stored_refusal(&f.db, first.slot_start_unix_ms(), &bytes);
+    }
+    #[test]
+    fn investment8_actual_nested_reason_array_refused_before_owned_decode() {
+        let _serial = super::super::super::tests::PROSPECTIVE_TEST_SERIAL
+            .lock()
+            .unwrap();
+        let f = fixture8();
+        let first = record(
+            &f.db,
+            &config(),
+            Utc.with_ymd_and_hms(2030, 1, 2, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let leaf = vec![0u8; 64];
+        let branch = vec![leaf; 64];
+        let array = vec![branch; 64];
+        assert_eq!(
+            array.iter().flatten().map(Vec::len).sum::<usize>(),
+            64usize.pow(3)
+        );
+        let needle =
+            r#""calendar":{"state":"Unavailable","reason":"ImmutableCalendarCoverageUnavailable"}"#;
+        let replacement = format!(
+            r#""calendar":{{"state":"Unavailable","reason":{}}}"#,
+            serde_json::to_string(&array).unwrap()
+        );
+        let bytes = replace_canonical_once(first.canonical_bytes(), needle, &replacement);
+        assert_preflight_stored_refusal(&f.db, first.slot_start_unix_ms(), &bytes);
+    }
+    #[test]
+    fn investment8_actual_escaped_original_scope_retains_large_raw_metric() {
+        let _serial = super::super::super::tests::PROSPECTIVE_TEST_SERIAL
+            .lock()
+            .unwrap();
+        let f = fixture8();
+        let metric = "引号\"反斜\\\n".repeat(1600);
+        assert!(metric.len() > 16 * 1024 && metric.len() < 64 * 1024);
+        insert_candidate_scope_row(
+            &mut f.db.get_conn().unwrap(),
+            1,
+            "2026-09-28 09:15:00.000",
+            &metric,
+            None,
+        );
+        let first = record(&f.db, &config(), now()).unwrap();
+        assert_eq!(first.candidate_count(), 1);
+        let record_json: serde_json::Value =
+            serde_json::from_slice(first.canonical_bytes()).unwrap();
+        let scope = record_json["scope"]["canonical_utf8"].as_str().unwrap();
+        assert!(scope.len() > 16 * 1024);
+        assert!(scope.contains("\\\""));
+        probe(true);
+        let stored = read(&f.db, first.slot_start_unix_ms()).unwrap().unwrap();
+        assert_eq!(stored.canonical_bytes(), first.canonical_bytes());
+        assert!(probe(false).1 > 0);
+        // Raw source is deliberately uninterpreted. The exact metric string is
+        // preserved inside the embedded original raw11 scope, not reparsed JSON.
+        let raw: serde_json::Value = serde_json::from_str(scope).unwrap();
+        assert!(raw
+            .to_string()
+            .contains(&serde_json::to_string(&metric).unwrap()));
+    }
 }

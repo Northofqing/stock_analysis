@@ -454,13 +454,36 @@ fn encode<T: Serialize>(v: &T, limit: usize) -> Result<Vec<u8>, CodecError> {
     serde_json::to_writer(&mut w, v).map_err(|_| CodecError::Bounds)?;
     Ok(w.bytes)
 }
-fn value_copy<T: Serialize, D: for<'a> Deserialize<'a>>(v: &T) -> Result<D, CodecError> {
+#[derive(Clone, Copy)]
+enum ValueCopySchema {
+    Configuration,
+    BuiltinDescriptors,
+}
+fn value_copy<T: Serialize, D: for<'a> Deserialize<'a>>(
+    v: &T,
+    schema: ValueCopySchema,
+) -> Result<D, CodecError> {
     let bytes = encode(v, MAX_META)?;
-    preflight(&bytes)?;
+    // Internal Task4 ABI copies are closed fragments, not stored Records.
+    // Select their exact root explicitly; never auto-detect or fall back.
+    let (node, slot) = match schema {
+        ValueCopySchema::Configuration => (
+            Node::Object(Object::Configuration),
+            std::mem::size_of::<Configuration>(),
+        ),
+        ValueCopySchema::BuiltinDescriptors => (
+            Node::List(List::Descriptors),
+            std::mem::size_of::<Vec<RuleDescriptor>>(),
+        ),
+    };
+    preflight_root(&bytes, node, slot)?;
     serde_json::from_slice(&bytes).map_err(|_| CodecError::Invalid)
 }
 fn catalog() -> Result<Vec<RuleDescriptor>, CodecError> {
-    value_copy(builtin_rule_catalog_v1())
+    value_copy(
+        builtin_rule_catalog_v1(),
+        ValueCopySchema::BuiltinDescriptors,
+    )
 }
 fn validate_risk(r: &RiskCatalog) -> Result<(), CodecError> {
     let c = &r.configuration;
@@ -574,7 +597,7 @@ pub(super) fn build(
 ) -> Result<Vec<u8>, CodecError> {
     let snapshot = VetoConfigurationSnapshotV1::from_live_config(config)
         .map_err(|_| CodecError::Configuration)?;
-    let configuration: Configuration = value_copy(&snapshot)?;
+    let configuration: Configuration = value_copy(&snapshot, ValueCopySchema::Configuration)?;
     let risk_catalog = RiskCatalog {
         catalog_version: 1,
         config_version: 1,
@@ -694,7 +717,19 @@ pub(super) fn decode(
     if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
         return Err(CodecError::Bounds);
     }
-    preflight(bytes)?;
+    if let Err(error) = preflight(bytes) {
+        #[cfg(test)]
+        DECODE_PROBE.with(|p| {
+            let (refused, owned) = p.get();
+            p.set((refused + 1, owned));
+        });
+        return Err(error);
+    }
+    #[cfg(test)]
+    DECODE_PROBE.with(|p| {
+        let (refused, owned) = p.get();
+        p.set((refused, owned + 1));
+    });
     let r: Record = serde_json::from_slice(bytes).map_err(|_| CodecError::Invalid)?;
     validate(&r, o)?;
     if encode(&r, MAX_RECORD_BYTES)? != bytes {
@@ -703,248 +738,704 @@ pub(super) fn decode(
     Ok(r)
 }
 
-// Streaming limits precede owned Deserialize. Borrowed unescaped map keys have
-// a fixed whitelist; duplicates are refused while traversing, before any Vec.
+// This preflight borrows bytes only: serde is not called until all paths, types,
+// token lengths and cumulative reservations have been checked. Canonical order
+// is mandatory here, just as it is in the final byte-for-byte roundtrip.
+#[derive(Clone, Copy)]
+enum Node {
+    String,
+    ScopeCanonical,
+    Bool,
+    U8,
+    U16,
+    Usize,
+    I64,
+    Float,
+    Enum(&'static [&'static str]),
+    Object(Object),
+    List(List),
+    Calendar,
+    Assessment,
+    RuleEvaluation,
+    Thresholds,
+}
+#[derive(Clone, Copy)]
+enum Object {
+    Root,
+    Scope,
+    RiskCatalog,
+    Configuration,
+    RuleDescriptor,
+    InputDescriptor,
+    SubconditionDescriptor,
+    ConfiguredRule,
+    RequiredInput,
+    ConfiguredSubcondition,
+    BiasThresholds,
+    FlowThresholds,
+    FundamentalThresholds,
+    Candidate,
+    FieldAssessment,
+    RuleAssessment,
+    RuleInput,
+    RuleSubcondition,
+}
+#[derive(Clone, Copy)]
+enum List {
+    RequiredFields,
+    Candidates,
+    Descriptors,
+    ConfiguredRules,
+    InputDescriptors,
+    SubconditionDescriptors,
+    InputNames,
+    RequiredInputs,
+    ConfiguredSubconditions,
+    FieldAssessments,
+    RuleAssessments,
+    RuleInputs,
+    RuleSubconditions,
+}
+const REQUIRED_FIELD_NAMES: &[&str] = &[
+    "NativeIdentity",
+    "FactTime",
+    "Lifecycle",
+    "PriceBand",
+    "Suspension",
+    "IntegerPrice",
+    "Liquidity",
+    "Cost",
+    "Risk",
+    "Funding",
+    "ManualApproval",
+    "SourceProfile",
+];
+const REASON_NAMES: &[&str] = &[
+    "NativeIdentityUnavailable",
+    "SourceProfileNotDelivered",
+    "BlockedByNativeIdentity",
+    "IntegerPriceContractUnavailable",
+    "RiskPrerequisitesUnavailable",
+    "FundingAllocationNotDelivered",
+    "ManualApprovalNotDelivered",
+];
+const RULE_REASON_NAMES: &[&str] = &[
+    "GloballyDisabled",
+    "RuleDisabled",
+    "BlockedByNativeIdentity",
+];
+const DISPOSITIONS: &[&str] = &["DeniedBeforeFacts", "NoCandidates"];
+fn object_fields(kind: Object) -> &'static [(&'static str, Node)] {
+    use Node::*;
+    match kind {
+        self::Object::Root => &[
+            ("domain", String),
+            ("schema", String),
+            ("schema_version", U16),
+            ("strategy_id", String),
+            ("strategy_version", U16),
+            ("model_id", String),
+            ("model_version", U16),
+            ("evaluation_occurrence_id", String),
+            ("scope_policy_id", String),
+            ("slot_start_unix_ms", I64),
+            ("evaluation_revision", U16),
+            ("first_cutoff_utc", String),
+            ("shanghai_business_date", String),
+            ("scope", Object(self::Object::Scope)),
+            ("calendar", Calendar),
+            ("risk_catalog", Object(self::Object::RiskCatalog)),
+            ("required_fields", List(self::List::RequiredFields)),
+            ("candidate_evaluations", List(self::List::Candidates)),
+            ("disposition", Enum(DISPOSITIONS)),
+        ],
+        self::Object::Scope => &[
+            ("observation_row_id", I64),
+            ("observation_scope_id", String),
+            ("observation_occurrence_id", String),
+            ("observation_revision", U16),
+            ("scope_sha256", String),
+            ("canonical_utf8", ScopeCanonical),
+        ],
+        self::Object::RiskCatalog => &[
+            ("catalog_version", U16),
+            ("config_version", U16),
+            ("model_version", String),
+            ("descriptors", List(self::List::Descriptors)),
+            ("configuration", Object(self::Object::Configuration)),
+        ],
+        self::Object::Configuration => &[
+            ("schema_version", U16),
+            ("catalog_version", U16),
+            ("config_version", U16),
+            ("model_version", String),
+            ("enabled", Bool),
+            ("raw_mode", String),
+            ("effective_mode", String),
+            ("bias_rate_enabled", Bool),
+            ("bearish_alignment_enabled", Bool),
+            ("main_flow_enabled", Bool),
+            ("fundamental_enabled", Bool),
+            ("rules", List(self::List::ConfiguredRules)),
+        ],
+        self::Object::RuleDescriptor => &[
+            ("id", String),
+            ("version", U16),
+            ("priority", U8),
+            ("required_inputs", List(self::List::InputDescriptors)),
+            ("subconditions", List(self::List::SubconditionDescriptors)),
+        ],
+        self::Object::InputDescriptor => &[("field", String), ("required_when", String)],
+        self::Object::SubconditionDescriptor => &[
+            ("id", String),
+            ("required_inputs", List(self::List::InputNames)),
+        ],
+        self::Object::ConfiguredRule => &[
+            ("id", String),
+            ("version", U16),
+            ("priority", U8),
+            ("enabled", Bool),
+            ("required_inputs", List(self::List::RequiredInputs)),
+            ("subconditions", List(self::List::ConfiguredSubconditions)),
+            ("thresholds", Thresholds),
+        ],
+        self::Object::RequiredInput => &[("field", String), ("required", Bool)],
+        self::Object::ConfiguredSubcondition => &[("id", String), ("enabled", Bool)],
+        self::Object::BiasThresholds => &[("bias_threshold", Float)],
+        self::Object::FlowThresholds => &[
+            ("outflow_threshold", Float),
+            ("lure_pct_threshold", Float),
+            ("lure_outflow_threshold", Float),
+        ],
+        self::Object::FundamentalThresholds => {
+            &[("pe_upper", Float), ("profit_decline_threshold", Float)]
+        }
+        self::Object::Candidate => &[
+            ("ordinal", Usize),
+            ("source_row_id", I64),
+            ("raw_row_sha256", String),
+            ("required_fields", List(self::List::FieldAssessments)),
+            ("rules", List(self::List::RuleAssessments)),
+            ("disposition", Enum(DISPOSITIONS)),
+        ],
+        self::Object::FieldAssessment => &[
+            ("field", Enum(REQUIRED_FIELD_NAMES)),
+            (
+                "action_fact_state",
+                Enum(&["Admitted", "Missing", "Stale", "Conflict", "Unqualified"]),
+            ),
+            ("assessment", Assessment),
+        ],
+        self::Object::RuleAssessment => &[
+            ("rule_id", String),
+            ("rule_version", U16),
+            ("priority", U8),
+            ("enabled", Bool),
+            ("required_inputs", List(self::List::RuleInputs)),
+            ("subconditions", List(self::List::RuleSubconditions)),
+            ("evaluation", RuleEvaluation),
+        ],
+        self::Object::RuleInput => &[
+            ("field", String),
+            ("required", Bool),
+            (
+                "status",
+                Enum(&[
+                    "NotAcquiredBlockedByNativeIdentity",
+                    "NotRequiredByDisabledCondition",
+                ]),
+            ),
+        ],
+        self::Object::RuleSubcondition => &[
+            ("id", String),
+            ("enabled", Bool),
+            ("evaluation", RuleEvaluation),
+        ],
+    }
+}
+fn list_shape(kind: List) -> (Node, usize, usize, usize) {
+    use std::mem::size_of;
+    // Header and inline slots already belong to the containing DTO; only the
+    // element backing storage is charged in list(). All element types are nonzero.
+    match kind {
+        List::RequiredFields => (
+            Node::Enum(REQUIRED_FIELD_NAMES),
+            12,
+            12,
+            size_of::<RequiredField>(),
+        ),
+        List::Candidates => (
+            Node::Object(Object::Candidate),
+            0,
+            50,
+            size_of::<Candidate>(),
+        ),
+        List::Descriptors => (
+            Node::Object(Object::RuleDescriptor),
+            3,
+            3,
+            size_of::<RuleDescriptor>(),
+        ),
+        List::ConfiguredRules => (
+            Node::Object(Object::ConfiguredRule),
+            3,
+            3,
+            size_of::<ConfiguredRule>(),
+        ),
+        List::InputDescriptors => (
+            Node::Object(Object::InputDescriptor),
+            0,
+            5,
+            size_of::<InputDescriptor>(),
+        ),
+        List::SubconditionDescriptors => (
+            Node::Object(Object::SubconditionDescriptor),
+            0,
+            2,
+            size_of::<SubconditionDescriptor>(),
+        ),
+        List::InputNames => (Node::String, 0, 5, size_of::<String>()),
+        List::RequiredInputs => (
+            Node::Object(Object::RequiredInput),
+            0,
+            5,
+            size_of::<RequiredInput>(),
+        ),
+        List::ConfiguredSubconditions => (
+            Node::Object(Object::ConfiguredSubcondition),
+            0,
+            2,
+            size_of::<Subcondition>(),
+        ),
+        List::FieldAssessments => (
+            Node::Object(Object::FieldAssessment),
+            12,
+            12,
+            size_of::<FieldAssessment>(),
+        ),
+        List::RuleAssessments => (
+            Node::Object(Object::RuleAssessment),
+            3,
+            3,
+            size_of::<RuleAssessment>(),
+        ),
+        List::RuleInputs => (
+            Node::Object(Object::RuleInput),
+            0,
+            5,
+            size_of::<RuleInput>(),
+        ),
+        List::RuleSubconditions => (
+            Node::Object(Object::RuleSubcondition),
+            0,
+            2,
+            size_of::<RuleSubcondition>(),
+        ),
+    }
+}
 #[derive(Default)]
 struct DecodeBudget {
     metadata: usize,
-    row: usize,
+    row: Option<usize>,
     rows: usize,
 }
 impl DecodeBudget {
-    fn charge<E: serde::de::Error>(&mut self, amount: usize, in_row: bool) -> Result<(), E> {
+    fn charge(&mut self, amount: usize) -> Result<(), CodecError> {
         self.metadata = self
             .metadata
             .checked_add(amount)
-            .ok_or_else(|| E::custom("metadata overflow"))?;
+            .ok_or(CodecError::Bounds)?;
         if self.metadata > MAX_META {
-            return Err(E::custom("metadata bound"));
+            return Err(CodecError::Bounds);
         }
-        if in_row {
-            self.row = self
-                .row
-                .checked_add(amount)
-                .ok_or_else(|| E::custom("row overflow"))?;
-            if self.row > MAX_ROW {
-                return Err(E::custom("row bound"));
+        if let Some(row) = &mut self.row {
+            *row = row.checked_add(amount).ok_or(CodecError::Bounds)?;
+            if *row > MAX_ROW {
+                return Err(CodecError::Bounds);
             }
         }
         Ok(())
     }
 }
-struct Seed<'a> {
-    budget: &'a mut DecodeBudget,
-    depth: u8,
-    scope_string: bool,
-    max_items: usize,
-    candidate_list: bool,
-    in_row: bool,
+struct Preflight<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    budget: DecodeBudget,
 }
-impl<'de> serde::de::DeserializeSeed<'de> for Seed<'_> {
-    type Value = ();
-    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
-        if self.depth > 16 {
-            return Err(serde::de::Error::custom("depth"));
-        }
-        d.deserialize_any(self)
+impl Preflight<'_> {
+    fn byte(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
     }
-}
-const KEYS: &[&str] = &[
-    "domain",
-    "schema",
-    "schema_version",
-    "strategy_id",
-    "strategy_version",
-    "model_id",
-    "model_version",
-    "evaluation_occurrence_id",
-    "scope_policy_id",
-    "slot_start_unix_ms",
-    "evaluation_revision",
-    "first_cutoff_utc",
-    "shanghai_business_date",
-    "scope",
-    "calendar",
-    "risk_catalog",
-    "required_fields",
-    "candidate_evaluations",
-    "disposition",
-    "observation_row_id",
-    "observation_scope_id",
-    "observation_occurrence_id",
-    "observation_revision",
-    "scope_sha256",
-    "canonical_utf8",
-    "state",
-    "contract",
-    "authority_sha256",
-    "open",
-    "reason",
-    "catalog_version",
-    "config_version",
-    "descriptors",
-    "configuration",
-    "enabled",
-    "raw_mode",
-    "effective_mode",
-    "bias_rate_enabled",
-    "bearish_alignment_enabled",
-    "main_flow_enabled",
-    "fundamental_enabled",
-    "rules",
-    "id",
-    "version",
-    "priority",
-    "required_inputs",
-    "subconditions",
-    "thresholds",
-    "field",
-    "required",
-    "required_when",
-    "BiasRate",
-    "bias_threshold",
-    "MainFlow",
-    "outflow_threshold",
-    "lure_pct_threshold",
-    "lure_outflow_threshold",
-    "FundamentalDeterioration",
-    "pe_upper",
-    "profit_decline_threshold",
-    "ordinal",
-    "source_row_id",
-    "raw_row_sha256",
-    "action_fact_state",
-    "assessment",
-    "rule_id",
-    "rule_version",
-    "status",
-    "evaluation",
-];
-impl<'de> serde::de::Visitor<'de> for Seed<'_> {
-    type Value = ();
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("bounded investment canonical")
-    }
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<(), E> {
-        let limit = if self.scope_string {
-            8 * 1024 * 1024
-        } else {
-            16 * 1024
-        };
-        if v.len() > limit {
-            return Err(E::custom("scalar"));
+    fn take(&mut self, expected: &[u8]) -> Result<(), CodecError> {
+        if !self.bytes[self.at..].starts_with(expected) {
+            return Err(CodecError::Invalid);
         }
-        if !self.scope_string {
-            // Sixfold JSON escaping bound reserves row output before owned strings.
-            self.budget.charge::<E>(
-                v.len()
-                    .checked_mul(6)
-                    .and_then(|n| n.checked_add(16))
-                    .ok_or_else(|| E::custom("scalar overflow"))?,
-                self.in_row,
-            )?;
-        }
+        self.budget.charge(expected.len())?;
+        self.at += expected.len();
         Ok(())
     }
-    fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<(), E> {
-        self.visit_str(v)
+    fn key(&mut self, expected: &str) -> Result<(), CodecError> {
+        self.take(b"\"")?;
+        self.take(expected.as_bytes())?;
+        self.take(b"\":")
     }
-    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<(), E> {
-        if !v.is_finite() {
-            Err(E::custom("nonfinite"))
-        } else {
-            Ok(())
-        }
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        let mut n = 0;
-        loop {
-            if self.candidate_list {
-                self.budget.row = 0;
+    fn choice(&mut self, names: &[&str]) -> Result<usize, CodecError> {
+        // Closed enum tags/keys are canonical unescaped literals, never owned.
+        self.take(b"\"")?;
+        for (i, name) in names.iter().enumerate() {
+            let rest = &self.bytes[self.at..];
+            if rest.starts_with(name.as_bytes()) && rest.get(name.len()) == Some(&b'"') {
+                self.take(name.as_bytes())?;
+                self.take(b"\"")?;
+                return Ok(i);
             }
-            let exists = seq
-                .next_element_seed(Seed {
-                    budget: self.budget,
-                    depth: self.depth + 1,
-                    scope_string: false,
-                    max_items: 64,
-                    candidate_list: false,
-                    in_row: self.in_row || self.candidate_list,
-                })?
-                .is_some();
-            if !exists {
-                break;
+        }
+        Err(CodecError::Invalid)
+    }
+    fn fields(&mut self, fields: &[(&str, Node)], depth: u8) -> Result<(), CodecError> {
+        for (i, (key, node)) in fields.iter().enumerate() {
+            if i != 0 {
+                self.take(b",")?;
             }
-            n += 1;
-            if n > self.max_items {
-                return Err(serde::de::Error::custom("sequence bound"));
+            self.key(key)?;
+            self.node(*node, depth + 1)?;
+        }
+        Ok(())
+    }
+    fn tagged_reservation(&mut self) -> Result<(), CodecError> {
+        // Pinned serde 1.0.228 private/de.rs TaggedContentVisitor collects the
+        // NON-tag entries into Vec<(Content,Content)>. All our tagged variants
+        // contain <=3 such entries and only scalar values. Reserve four pairs.
+        // Content's largest payload is three words (Vec/String), plus a tag;
+        // using (u64,[usize;3]) is a conservative portable slot reservation.
+        // Vec header is transient, not part of the owned DTO slot.
+        let slot = std::mem::size_of::<(u64, [usize; 3])>();
+        let amount = slot
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Vec<()>>()))
+            .ok_or(CodecError::Bounds)?;
+        self.budget.charge(amount)
+    }
+    fn node(&mut self, node: Node, depth: u8) -> Result<(), CodecError> {
+        if depth > 16 {
+            return Err(CodecError::Bounds);
+        }
+        match node {
+            Node::String => self.string(false),
+            Node::ScopeCanonical => self.string(true),
+            Node::Bool => {
+                if self.byte() == Some(b't') {
+                    self.take(b"true")
+                } else {
+                    self.take(b"false")
+                }
             }
-            if self.candidate_list {
+            Node::U8 | Node::U16 | Node::Usize | Node::I64 | Node::Float => self.number(node),
+            Node::Enum(names) => self.choice(names).map(|_| ()),
+            Node::Object(kind) => {
+                self.take(b"{")?;
+                self.fields(object_fields(kind), depth)?;
+                self.take(b"}")
+            }
+            Node::List(kind) => self.list(kind, depth),
+            Node::Calendar => {
+                self.take(b"{")?;
+                self.key("state")?;
+                let variant = self.choice(&["Available", "Unavailable"])?;
+                self.tagged_reservation()?;
+                self.take(b",")?;
+                if variant == 0 {
+                    self.fields(
+                        &[
+                            ("contract", Node::String),
+                            ("authority_sha256", Node::String),
+                            ("open", Node::Bool),
+                        ],
+                        depth,
+                    )?;
+                } else {
+                    self.fields(&[("reason", Node::String)], depth)?;
+                }
+                self.take(b"}")
+            }
+            Node::Assessment | Node::RuleEvaluation => {
+                self.take(b"{")?;
+                self.key("state")?;
+                let reasons = if matches!(node, Node::Assessment) {
+                    self.choice(&["Unavailable", "NotEvaluated", "AcquisitionNotInvoked"])?;
+                    REASON_NAMES
+                } else {
+                    self.choice(&["NotEvaluated"])?;
+                    RULE_REASON_NAMES
+                };
+                self.tagged_reservation()?;
+                self.take(b",")?;
+                self.key("reason")?;
+                self.choice(reasons)?;
+                self.take(b"}")
+            }
+            Node::Thresholds => {
+                self.take(b"{")?;
+                let variant = self.choice(&["BiasRate", "MainFlow", "FundamentalDeterioration"])?;
+                self.take(b":")?;
+                self.node(
+                    Node::Object(match variant {
+                        0 => Object::BiasThresholds,
+                        1 => Object::FlowThresholds,
+                        _ => Object::FundamentalThresholds,
+                    }),
+                    depth + 1,
+                )?;
+                self.take(b"}")
+            }
+        }
+    }
+    fn list(&mut self, kind: List, depth: u8) -> Result<(), CodecError> {
+        let (element, min, max, element_size) = list_shape(kind);
+        self.take(b"[")?;
+        let mut count = 0usize;
+        let mut capacity = 0usize;
+        while self.byte() != Some(b']') {
+            if count == max {
+                return Err(CodecError::Bounds);
+            }
+            if count != 0 {
+                self.take(b",")?;
+            }
+            let candidate = matches!(kind, List::Candidates);
+            if candidate {
+                self.budget.row = Some(0);
+            }
+            // serde VecVisitor uses cautious(None)==0 then push. Reserve a
+            // power-of-two backing capacity, floor 8 for byte-size T, otherwise
+            // 4. This bounds ordinary growth without charging inline slots twice.
+            let needed = count.checked_add(1).ok_or(CodecError::Bounds)?;
+            let next_capacity = needed
+                .checked_next_power_of_two()
+                .ok_or(CodecError::Bounds)?
+                .max(if element_size == 1 { 8 } else { 4 });
+            let growth = next_capacity
+                .checked_sub(capacity)
+                .ok_or(CodecError::Bounds)?
+                .checked_mul(element_size)
+                .ok_or(CodecError::Bounds)?;
+            self.budget.charge(growth)?;
+            capacity = next_capacity;
+            self.node(element, depth + 1)?;
+            if candidate {
+                let row = self.budget.row.take().ok_or(CodecError::Invalid)?;
                 self.budget.rows = self
                     .budget
                     .rows
-                    .checked_add(self.budget.row)
-                    .ok_or_else(|| <A::Error as serde::de::Error>::custom("rows overflow"))?;
+                    .checked_add(row)
+                    .ok_or(CodecError::Bounds)?;
                 if self.budget.rows > MAX_ROWS {
-                    return Err(serde::de::Error::custom("rows bound"));
+                    return Err(CodecError::Bounds);
+                }
+            }
+            count = needed;
+        }
+        if count < min {
+            return Err(CodecError::Invalid);
+        }
+        self.take(b"]")
+    }
+    fn hex4(&mut self) -> Result<u16, CodecError> {
+        let mut n = 0u16;
+        for _ in 0..4 {
+            let digit = match self.byte().ok_or(CodecError::Invalid)? {
+                c @ b'0'..=b'9' => c - b'0',
+                c @ b'a'..=b'f' => c - b'a' + 10,
+                c @ b'A'..=b'F' => c - b'A' + 10,
+                _ => return Err(CodecError::Invalid),
+            };
+            self.at += 1;
+            n = n * 16 + u16::from(digit);
+        }
+        Ok(n)
+    }
+    fn string(&mut self, scope: bool) -> Result<(), CodecError> {
+        if self.byte() != Some(b'"') {
+            return Err(CodecError::Invalid);
+        }
+        let start = self.at;
+        self.at += 1;
+        let mut decoded = 0usize;
+        let mut saw_escape = false;
+        loop {
+            let c = self.byte().ok_or(CodecError::Invalid)?;
+            self.at += 1;
+            let width = match c {
+                b'"' => break,
+                0..=31 => return Err(CodecError::Invalid),
+                b'\\' => {
+                    saw_escape = true;
+                    let escaped = self.byte().ok_or(CodecError::Invalid)?;
+                    self.at += 1;
+                    match escaped {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => 1,
+                        b'u' => {
+                            let high = self.hex4()?;
+                            let code = if (0xd800..=0xdbff).contains(&high) {
+                                if !self.bytes[self.at..].starts_with(b"\\u") {
+                                    return Err(CodecError::Invalid);
+                                }
+                                self.at += 2;
+                                let low = self.hex4()?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return Err(CodecError::Invalid);
+                                }
+                                0x10000 + ((u32::from(high) - 0xd800) << 10) + u32::from(low)
+                                    - 0xdc00
+                            } else if (0xdc00..=0xdfff).contains(&high) {
+                                return Err(CodecError::Invalid);
+                            } else {
+                                u32::from(high)
+                            };
+                            char::from_u32(code).ok_or(CodecError::Invalid)?.len_utf8()
+                        }
+                        _ => return Err(CodecError::Invalid),
+                    }
+                }
+                _ => 1, // Raw UTF-8 bytes counted individually, validated below.
+            };
+            decoded = decoded.checked_add(width).ok_or(CodecError::Bounds)?;
+            if decoded > if scope { 8 * 1024 * 1024 } else { 16 * 1024 } {
+                return Err(CodecError::Bounds);
+            }
+        }
+        std::str::from_utf8(&self.bytes[start..self.at]).map_err(|_| CodecError::Invalid)?;
+        if !scope {
+            // Wire span + owned string + escaped-token scratch capacity.
+            // SliceRead borrows unescaped tokens. Reserve byte-Vec capacity with
+            // floor 8 for escaped tokens, cumulatively rather than reusing it.
+            let scratch = if saw_escape && decoded != 0 {
+                decoded
+                    .checked_next_power_of_two()
+                    .ok_or(CodecError::Bounds)?
+                    .max(8)
+            } else {
+                0
+            };
+            let amount = decoded
+                .checked_add(scratch)
+                .and_then(|n| n.checked_add(self.at - start))
+                .ok_or(CodecError::Bounds)?;
+            self.budget.charge(amount)?;
+        }
+        Ok(())
+    }
+    fn number(&mut self, node: Node) -> Result<(), CodecError> {
+        let start = self.at;
+        if self.byte() == Some(b'-') {
+            self.at += 1;
+        }
+        match self.byte() {
+            Some(b'0') => self.at += 1,
+            Some(b'1'..=b'9') => {
+                while matches!(self.byte(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                    if self.at - start > 64 {
+                        return Err(CodecError::Bounds);
+                    }
+                }
+            }
+            _ => return Err(CodecError::Invalid),
+        }
+        if matches!(node, Node::Float) {
+            if self.byte() == Some(b'.') {
+                self.at += 1;
+                let before = self.at;
+                while matches!(self.byte(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                    if self.at - start > 64 {
+                        return Err(CodecError::Bounds);
+                    }
+                }
+                if self.at == before {
+                    return Err(CodecError::Invalid);
+                }
+            }
+            if matches!(self.byte(), Some(b'e' | b'E')) {
+                self.at += 1;
+                if matches!(self.byte(), Some(b'+' | b'-')) {
+                    self.at += 1;
+                }
+                let before = self.at;
+                while matches!(self.byte(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                    if self.at - start > 64 {
+                        return Err(CodecError::Bounds);
+                    }
+                }
+                if self.at == before {
+                    return Err(CodecError::Invalid);
                 }
             }
         }
-        Ok(())
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        let mut seen = 0u128;
-        let mut n = 0;
-        while let Some(k) = map.next_key::<&str>()? {
-            let i = KEYS
-                .iter()
-                .position(|x| *x == k)
-                .ok_or_else(|| <A::Error as serde::de::Error>::custom("unknown key"))?;
-            if seen & (1u128 << i) != 0 {
-                return Err(serde::de::Error::custom("duplicate key"));
-            }
-            seen |= 1u128 << i;
-            n += 1;
-            if n > 32 {
-                return Err(serde::de::Error::custom("object"));
-            }
-            self.budget.charge::<A::Error>(k.len() + 32, self.in_row)?;
-            map.next_value_seed(Seed {
-                budget: self.budget,
-                depth: self.depth + 1,
-                scope_string: k == "canonical_utf8",
-                max_items: if k == "candidate_evaluations" { 50 } else { 64 },
-                candidate_list: k == "candidate_evaluations",
-                in_row: self.in_row,
-            })?;
+        if self.at - start > 64 {
+            return Err(CodecError::Bounds);
         }
-        Ok(())
+        let token =
+            std::str::from_utf8(&self.bytes[start..self.at]).map_err(|_| CodecError::Invalid)?;
+        let valid = match node {
+            Node::U8 => token.parse::<u8>().is_ok(),
+            Node::U16 => token.parse::<u16>().is_ok(),
+            Node::Usize => token.parse::<usize>().is_ok(),
+            Node::I64 => token.parse::<i64>().is_ok(),
+            Node::Float => token.parse::<f64>().is_ok_and(f64::is_finite),
+            _ => false,
+        };
+        if !valid {
+            return Err(CodecError::Invalid);
+        }
+        self.budget.charge(self.at - start)
     }
 }
 fn preflight(bytes: &[u8]) -> Result<(), CodecError> {
-    use serde::de::DeserializeSeed;
-    let mut d = serde_json::Deserializer::from_slice(bytes);
-    let mut budget = DecodeBudget::default();
-    Seed {
-        budget: &mut budget,
-        depth: 0,
-        scope_string: false,
-        max_items: 64,
-        candidate_list: false,
-        in_row: false,
+    // Every stored record still has exactly this root and this reservation.
+    preflight_root(
+        bytes,
+        Node::Object(Object::Root),
+        std::mem::size_of::<Record>(),
+    )
+}
+fn preflight_root(bytes: &[u8], root: Node, inline_slot: usize) -> Result<(), CodecError> {
+    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
+        return Err(CodecError::Bounds);
     }
-    .deserialize(&mut d)
-    .map_err(|_| CodecError::Bounds)?;
-    d.end().map_err(|_| CodecError::Invalid)
+    let mut p = Preflight {
+        bytes,
+        at: 0,
+        budget: DecodeBudget::default(),
+    };
+    // Covers all root inline slots/headers. Backing Vec slots and string bytes
+    // are charged separately, not each nested inline object a second time.
+    p.budget.charge(inline_slot)?;
+    p.node(root, 0)?;
+    if p.at != bytes.len() {
+        return Err(CodecError::Invalid);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DECODE_PROBE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+impl super::investment_decision_v1::InvestmentDecisionId {
+    // Access through an already visible type keeps the codec module private and
+    // adds no production ABI or third-file visibility change.
+    pub(crate) fn decode_probe_for_test(reset: bool) -> (usize, usize) {
+        DECODE_PROBE.with(|p| {
+            let value = p.get();
+            if reset {
+                p.set((0, 0));
+            }
+            value
+        })
+    }
 }
 
 #[cfg(test)]
@@ -987,5 +1478,140 @@ mod tests {
         assert_eq!(writer.write(b"abc").unwrap(), 3);
         assert!(writer.write(b"d").is_err());
         assert_eq!(writer.bytes, b"abc");
+    }
+    fn node_preflight(bytes: &[u8], node: Node) -> Result<(), CodecError> {
+        let mut p = Preflight {
+            bytes,
+            at: 0,
+            budget: DecodeBudget::default(),
+        };
+        p.node(node, 0)?;
+        if p.at != bytes.len() {
+            return Err(CodecError::Invalid);
+        }
+        Ok(())
+    }
+    #[test]
+    fn investment_record_preflight_closed_node_types_and_tagged_shapes() {
+        for bad in [
+            br#"{"state":"Unavailable","reason":[]}"#.as_slice(),
+            br#"{"state":"Unavailable","reason":0}"#,
+            br#"{"state":"Unavailable","reason":null}"#,
+            br#"{"state":"Unavailable","reason":"ok","canonical_utf8":"x"}"#,
+            br#"{"state":"Unavailable","canonical_utf8":"x","reason":"ok"}"#,
+            br#"{"state":"Unavailable","reason":"ok","reason":"duplicate"}"#,
+            br#"{"state":"Unavailable"}"#,
+            br#"{"reason":"ok","state":"Unavailable"}"#,
+            br#"{"state":"Future","reason":"ok"}"#,
+            br#"{"state":"Available","contract":"x","authority_sha256":"x","open":1}"#,
+        ] {
+            assert!(node_preflight(bad, Node::Calendar).is_err());
+        }
+        assert!(
+            node_preflight(br#"{"state":"Unavailable","reason":"ok"}"#, Node::Calendar).is_ok()
+        );
+        assert!(node_preflight(b"[[0]]", Node::List(List::InputNames)).is_err());
+        assert!(node_preflight(br#"["a","b","c","d","e"]"#, Node::List(List::InputNames)).is_ok());
+        assert!(node_preflight(
+            br#"["a","b","c","d","e","f"]"#,
+            Node::List(List::InputNames)
+        )
+        .is_err());
+        assert!(node_preflight(b"[]", Node::List(List::RequiredFields)).is_err());
+        for (bytes, node) in [
+            (b"256".as_slice(), Node::U8),
+            (b"65536", Node::U16),
+            (b"9223372036854775808", Node::I64),
+            (b"01", Node::U16),
+            (b"1.0", Node::U16),
+            (b"1e999", Node::Float),
+            (b"truex", Node::Bool),
+        ] {
+            assert!(node_preflight(bytes, node).is_err());
+        }
+    }
+    #[test]
+    fn investment_record_preflight_escaped_tokens_and_unique_scope_budget() {
+        for bad in [
+            br#""\x""#.as_slice(),
+            br#""\u123""#,
+            br#""\ud800""#,
+            br#""\udc00""#,
+            br#""\ud800\u0041""#,
+            b"\"unterminated",
+            b"\"\xff\"",
+        ] {
+            assert!(node_preflight(bad, Node::String).is_err());
+        }
+        assert!(node_preflight(r#""\ud83d\ude00\"\\\n雪""#.as_bytes(), Node::String).is_ok());
+        let exact = format!("\"{}\"", "\\u0061".repeat(16 * 1024));
+        assert!(node_preflight(exact.as_bytes(), Node::String).is_ok());
+        let excess = format!("\"{}\"", "\\u0061".repeat(16 * 1024 + 1));
+        assert!(node_preflight(excess.as_bytes(), Node::String).is_err());
+        let scope = format!("\"{}\"", "x".repeat(8 * 1024 * 1024));
+        assert!(node_preflight(scope.as_bytes(), Node::ScopeCanonical).is_ok());
+        assert!(node_preflight(scope.as_bytes(), Node::String).is_err());
+        let excess_scope = format!("\"{}\"", "x".repeat(8 * 1024 * 1024 + 1));
+        assert!(node_preflight(excess_scope.as_bytes(), Node::ScopeCanonical).is_err());
+    }
+    #[test]
+    fn investment_record_preflight_checked_cumulative_reservations() {
+        let mut b = DecodeBudget::default();
+        b.charge(MAX_META).unwrap();
+        assert!(b.charge(1).is_err());
+        let mut b = DecodeBudget {
+            metadata: usize::MAX,
+            ..DecodeBudget::default()
+        };
+        assert!(b.charge(1).is_err());
+        let mut b = DecodeBudget {
+            row: Some(MAX_ROW),
+            ..DecodeBudget::default()
+        };
+        assert!(b.charge(1).is_err());
+        // Each member is a legal short token, but the complete descriptor's
+        // encoded/owned/scratch reservation must fit the one metadata budget.
+        let token = format!("\"{}\"", "\\u0061".repeat(16 * 1024));
+        let value = format!("[{}]", vec![token; 5].join(","));
+        let mut p = Preflight {
+            bytes: value.as_bytes(),
+            at: 0,
+            budget: DecodeBudget::default(),
+        };
+        p.budget.charge(MAX_META / 2).unwrap();
+        assert!(p.node(Node::List(List::InputNames), 0).is_err());
+        let mut p = Preflight {
+            bytes: b"true",
+            at: 0,
+            budget: DecodeBudget::default(),
+        };
+        assert!(p.node(Node::Bool, 17).is_err());
+    }
+    #[test]
+    fn investment_record_preflight_explicit_task4_copy_roots_preserve_record_boundary() {
+        let snapshot = VetoConfigurationSnapshotV1::from_live_config(
+            &crate::config::LiveVetoConfig::default(),
+        )
+        .unwrap();
+        let config: Configuration = value_copy(&snapshot, ValueCopySchema::Configuration).unwrap();
+        let descriptors = catalog().unwrap();
+        assert_eq!(config.rules.len(), 3);
+        assert_eq!(descriptors.len(), 3);
+        let config_bytes = encode(&snapshot, MAX_META).unwrap();
+        let catalog_bytes = encode(builtin_rule_catalog_v1(), MAX_META).unwrap();
+        // No autodetection: the independently bounded fragments must remain
+        // invalid as stored Record roots, and cannot use each other's root.
+        assert!(preflight(&config_bytes).is_err());
+        assert!(preflight(&catalog_bytes).is_err());
+        assert!(value_copy::<_, Configuration>(
+            builtin_rule_catalog_v1(),
+            ValueCopySchema::Configuration
+        )
+        .is_err());
+        assert!(value_copy::<_, Vec<RuleDescriptor>>(
+            &snapshot,
+            ValueCopySchema::BuiltinDescriptors
+        )
+        .is_err());
     }
 }
