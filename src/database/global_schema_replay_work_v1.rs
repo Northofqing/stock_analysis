@@ -1,8 +1,8 @@
-//! Unconnected bounded-replay foundations. No financial entry or capability.
+//! Closed V1 SQL acquisition and cumulative replay work; no financial capability.
 //!
 //! Pure layout bounds describe reviewed source rules, not runtime qualification.
 //! Existing SQL loads and Historical replay are NOT protected by this module.
-#![allow(dead_code)] // Stage 1 deliberately has no production caller.
+#![allow(dead_code)] // Complete Target replay remains gated on later slices.
 
 use super::super::global_schema_catalog_v1::{RowsSpecDebitFailure, RowsSpecWork};
 use std::mem::{align_of, size_of, MaybeUninit};
@@ -29,70 +29,196 @@ pub(super) enum LayoutFailure {
 pub(super) enum ResourceCause {
     Debit(RowsSpecDebitFailure),
     Layout(LayoutFailure),
+    AllocationFailed,
 }
 
 // Fixed error escrow: reporting a resource failure never formats or copies data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReplayResourceFailure {
+pub(crate) struct ReplayResourceFailure {
     pub(super) site: ReplaySite,
     pub(super) cause: ResourceCause,
     pub(super) used: u64,
 }
 
-/// One borrower for an invocation; phases reborrow this same value. No owned
-/// meter, limit, reset, refund, Clone or success-after-first-failure operation.
-pub(super) struct BorrowedReplayWork<'a> {
-    metadata: &'a mut RowsSpecWork,
-    first_failure: Option<ReplayResourceFailure>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlOperation {
+    Encoding,
+    Prepare,
+    Bind,
+    Step,
+    Finalize,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplaySqlQualificationFailure {
+    Sqlite {
+        operation: SqlOperation,
+        code: Option<i32>,
+    },
+    Encoding,
+    Shape,
+    Null,
+    Utf8,
+    Extent,
+    PinUnavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayTerminalFailure {
+    Resource(ReplayResourceFailure),
+    Qualification(ReplaySqlQualificationFailure),
 }
 
+// Constructed once by the actual target owner, never by a phase borrower.
+pub(super) struct ReplayTerminalState {
+    first: Option<ReplayTerminalFailure>,
+}
+impl ReplayTerminalState {
+    pub(super) fn new(_: super::target::ReplayOwnerInit) -> Self {
+        Self { first: None }
+    }
+    pub(super) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
+        self.first.map_or(Ok(()), Err)
+    }
+    fn latch(&mut self, failure: ReplayTerminalFailure) -> ReplayTerminalFailure {
+        *self.first.get_or_insert(failure)
+    }
+}
+
+/// Short loans borrow both persistent fields; drop has no commit/reset action.
+/// Only the actual owner's opaque parts can construct a production borrower.
+pub(crate) struct BorrowedReplayWork<'a> {
+    metadata: &'a mut RowsSpecWork,
+    terminal: &'a mut ReplayTerminalState,
+    #[cfg(test)]
+    text_copy_requests: usize,
+    #[cfg(test)]
+    row_buffer_requests: usize,
+}
 impl<'a> BorrowedReplayWork<'a> {
-    pub(super) fn borrow(metadata: &'a mut RowsSpecWork) -> Self {
+    pub(super) fn borrow(parts: super::target::ReplayOwnerLoan<'a>) -> Self {
+        let (metadata, terminal) = parts.into_parts();
         Self {
             metadata,
-            first_failure: None,
+            terminal,
+            #[cfg(test)]
+            text_copy_requests: 0,
+            #[cfg(test)]
+            row_buffer_requests: 0,
         }
     }
-
-    fn fail(&mut self, site: ReplaySite, cause: ResourceCause) -> ReplayResourceFailure {
-        *self.first_failure.get_or_insert(ReplayResourceFailure {
-            site,
-            cause,
-            used: self.metadata.used(),
+    #[cfg(test)]
+    fn test_borrow(metadata: &'a mut RowsSpecWork, terminal: &'a mut ReplayTerminalState) -> Self {
+        Self {
+            metadata,
+            terminal,
+            #[cfg(test)]
+            text_copy_requests: 0,
+            #[cfg(test)]
+            row_buffer_requests: 0,
+        }
+    }
+    fn fail(&mut self, site: ReplaySite, cause: ResourceCause) -> ReplayTerminalFailure {
+        self.terminal
+            .latch(ReplayTerminalFailure::Resource(ReplayResourceFailure {
+                site,
+                cause,
+                used: self.metadata.used(),
+            }))
+    }
+    fn qualify(&mut self, cause: ReplaySqlQualificationFailure) -> ReplayTerminalFailure {
+        self.terminal
+            .latch(ReplayTerminalFailure::Qualification(cause))
+    }
+    fn sql<T>(
+        &mut self,
+        value: rusqlite::Result<T>,
+        operation: SqlOperation,
+    ) -> Result<T, ReplayTerminalFailure> {
+        value.map_err(|error| {
+            // Driver-owned error allocation has already happened. Never copy or
+            // format its message, retry, or downgrade it to financial unavailable.
+            let code = error.sqlite_error().map(|error| error.extended_code);
+            self.qualify(ReplaySqlQualificationFailure::Sqlite { operation, code })
         })
     }
-
     pub(super) fn reserve(
         &mut self,
         site: ReplaySite,
         bytes: u64,
-    ) -> Result<Reservation, ReplayResourceFailure> {
+    ) -> Result<Reservation, ReplayTerminalFailure> {
         self.finish()?;
         self.metadata
             .try_charge(bytes)
             .map_err(|cause| self.fail(site, ResourceCause::Debit(cause)))?;
         Ok(Reservation { bytes })
     }
-
     pub(super) fn reserve_array<T>(
         &mut self,
         site: ReplaySite,
         count: u64,
-    ) -> Result<Reservation, ReplayResourceFailure> {
+    ) -> Result<Reservation, ReplayTerminalFailure> {
         self.finish()?;
         let bytes = exact_array_bytes::<T>(count)
             .map_err(|cause| self.fail(site, ResourceCause::Layout(cause)))?;
         self.reserve(site, bytes)
     }
-
-    pub(super) fn finish(&self) -> Result<(), ReplayResourceFailure> {
-        self.first_failure.map_or(Ok(()), Err)
+    pub(super) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
+        self.terminal.finish()
     }
-
     pub(super) fn used(&self) -> u64 {
         self.metadata.used()
     }
 }
+
+pub(crate) struct V1RowsLoan<'a> {
+    connection: &'a rusqlite::Connection,
+    work: BorrowedReplayWork<'a>,
+}
+impl<'a> V1RowsLoan<'a> {
+    pub(super) fn from_retained(
+        reader: &'a super::target::RetainedTargetReader<'_>,
+        parts: super::target::ReplayOwnerLoan<'a>,
+    ) -> Self {
+        Self {
+            connection: reader.connection(),
+            work: BorrowedReplayWork::borrow(parts),
+        }
+    }
+    pub(crate) fn events(
+        &mut self,
+        id: &str,
+    ) -> Result<Vec<crate::trading::paper_ledger::EventRow>, ReplayTerminalFailure> {
+        let plan = sql_rows::preflight(self, id, SqlExtentKind::V1Event)?;
+        self.require_pin()?;
+        sql_rows::events(self, plan)
+    }
+    pub(crate) fn head(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<crate::trading::paper_ledger::HeadRow>, ReplayTerminalFailure> {
+        let plan = sql_rows::preflight(self, id, SqlExtentKind::V1Head)?;
+        self.require_pin()?;
+        sql_rows::head(self, plan)
+    }
+    fn require_pin(&mut self) -> Result<(), ReplayTerminalFailure> {
+        self.work.finish()?;
+        require_reviewed_layout_pin().map_err(|_| {
+            self.work
+                .qualify(ReplaySqlQualificationFailure::PinUnavailable)
+        })
+    }
+    pub(super) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
+        self.work.finish()
+    }
+    pub(super) fn latch_failure(&mut self, failure: ReplayTerminalFailure) {
+        self.work.terminal.latch(failure);
+    }
+    #[cfg(test)]
+    pub(super) fn used(&self) -> u64 {
+        self.work.used()
+    }
+}
+#[path = "global_schema_replay_sql_v1.rs"]
+mod sql_rows;
 
 /// Move-only evidence of a debit, not an allocation or qualification capability.
 /// Dropping or consuming it never refunds the cumulative meter.

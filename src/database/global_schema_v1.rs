@@ -48,7 +48,7 @@ mod prospective;
 #[path = "global_schema_rows_v1.rs"]
 mod rows;
 #[path = "global_schema_replay_work_v1.rs"]
-mod replay_work;
+pub(crate) mod replay_work;
 #[path = "global_schema_target_v1.rs"]
 mod target;
 
@@ -173,6 +173,9 @@ impl GlobalSchemaIdentity {
 
 #[derive(Debug, Error)]
 pub(crate) enum GlobalSchemaV1Error {
+    #[error("bounded replay refused: {0:?}")]
+    ReplayTerminal(replay_work::ReplayTerminalFailure),
+
     #[error("fixed global schema path is unsafe: {detail}")]
     UnsafeFixedPath { detail: String },
 
@@ -296,6 +299,7 @@ pub(crate) enum GlobalSchemaV1Error {
 impl GlobalSchemaV1Error {
     pub(crate) fn code(&self) -> &'static str {
         match self {
+            Self::ReplayTerminal(_) => "global_schema_replay_terminal",
             Self::UnsafeFixedPath { .. } => "global_schema_unsafe_fixed_path",
             Self::ModeBindingViolation { .. } => "global_schema_mode_binding_violation",
             Self::Io { .. } => "global_schema_io",

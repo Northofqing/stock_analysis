@@ -839,8 +839,9 @@ struct AccountRow {
     #[diesel(sql_type = Text)]
     manifest_bytes: String,
 }
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(QueryableByName)]
-struct EventRow {
+pub(crate) struct EventRow {
     #[diesel(sql_type = BigInt)]
     seq: i64,
     #[diesel(sql_type = Text)]
@@ -862,8 +863,9 @@ struct EventRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
     order_audit_id: Option<i64>,
 }
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[derive(QueryableByName)]
-struct HeadRow {
+pub(crate) struct HeadRow {
     #[diesel(sql_type = BigInt)]
     version: i64,
     #[diesel(sql_type = Text)]
@@ -873,6 +875,81 @@ struct HeadRow {
     #[diesel(sql_type = Text)]
     projection_hash: String,
 }
+impl EventRow {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_bounded_sql_parts(
+        seq: i64,
+        command_id: String,
+        previous_hash: String,
+        event_hash: String,
+        payload: String,
+        business_plan_id: Option<String>,
+        intent_hash: Option<String>,
+        is_terminal: i64,
+        paper_trade_id: Option<i64>,
+        order_audit_id: Option<i64>,
+    ) -> Self {
+        Self {
+            seq,
+            command_id,
+            previous_hash,
+            event_hash,
+            payload,
+            business_plan_id,
+            intent_hash,
+            is_terminal,
+            paper_trade_id,
+            order_audit_id,
+        }
+    }
+}
+impl HeadRow {
+    pub(crate) fn from_bounded_sql_parts(
+        version: i64,
+        event_hash: String,
+        projection_bytes: String,
+        projection_hash: String,
+    ) -> Self {
+        Self {
+            version,
+            event_hash,
+            projection_bytes,
+            projection_hash,
+        }
+    }
+}
+
+// Historical entrypoints always choose Historical. No complete Target replay
+// entry is exposed before account/codec/adjudication and all other reads close.
+#[allow(dead_code)]
+enum V1ReadSource<'a, 'loan> {
+    Historical(&'a mut SqliteConnection),
+    Bounded(&'a mut crate::database::global_schema_v1::replay_work::V1RowsLoan<'loan>),
+}
+#[allow(dead_code)]
+enum V1RowsError {
+    Historical(LedgerError),
+    Terminal(crate::database::global_schema_v1::replay_work::ReplayTerminalFailure),
+}
+impl V1ReadSource<'_, '_> {
+    fn events(&mut self, id: &str) -> Result<Vec<EventRow>, V1RowsError> {
+        match self {
+            Self::Historical(conn) => events_historical(conn, id).map_err(V1RowsError::Historical),
+            Self::Bounded(loan) => loan.events(id).map_err(V1RowsError::Terminal),
+        }
+    }
+    fn head(&mut self, binding: &AccountBinding) -> Result<Option<HeadRow>, V1RowsError> {
+        match self {
+            Self::Historical(conn) => {
+                head_historical(conn, binding).map_err(V1RowsError::Historical)
+            }
+            Self::Bounded(loan) => loan
+                .head(&binding.account_id)
+                .map_err(V1RowsError::Terminal),
+        }
+    }
+}
+
 fn account(conn: &mut SqliteConnection, id: &str) -> Result<Option<AccountRow>, LedgerError> {
     Ok(diesel::sql_query(
         "SELECT epoch_id,manifest_hash,manifest_bytes FROM paper_ledger_account WHERE account_id=?",
@@ -882,6 +959,13 @@ fn account(conn: &mut SqliteConnection, id: &str) -> Result<Option<AccountRow>, 
     .optional()?)
 }
 fn events(conn: &mut SqliteConnection, id: &str) -> Result<Vec<EventRow>, LedgerError> {
+    match V1ReadSource::Historical(conn).events(id) {
+        Ok(rows) => Ok(rows),
+        Err(V1RowsError::Historical(error)) => Err(error),
+        Err(V1RowsError::Terminal(_)) => unreachable!("Historical never borrows Target work"),
+    }
+}
+fn events_historical(conn: &mut SqliteConnection, id: &str) -> Result<Vec<EventRow>, LedgerError> {
     Ok(diesel::sql_query("SELECT seq,command_id,previous_hash,event_hash,payload,business_plan_id,intent_hash,is_terminal,paper_trade_id,order_audit_id FROM paper_ledger_event WHERE account_id=? ORDER BY seq").bind::<Text,_>(id).load(conn)?)
 }
 fn event_hash(
@@ -1001,7 +1085,14 @@ fn replay_through_inner(
         projection,
     })
 }
-fn head(
+fn head(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<Option<HeadRow>, LedgerError> {
+    match V1ReadSource::Historical(conn).head(binding) {
+        Ok(row) => Ok(row),
+        Err(V1RowsError::Historical(error)) => Err(error),
+        Err(V1RowsError::Terminal(_)) => unreachable!("Historical never borrows Target work"),
+    }
+}
+fn head_historical(
     conn: &mut SqliteConnection,
     binding: &AccountBinding,
 ) -> Result<Option<HeadRow>, LedgerError> {
@@ -1203,3 +1294,16 @@ fn replay_command(
 #[cfg(test)]
 #[path = "paper_ledger_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn test_historical_v1_sql_rows(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> (Vec<EventRow>, Option<HeadRow>) {
+    let binding = AccountBinding {
+        account_id: id.to_owned(),
+        epoch_id: String::new(),
+        manifest_hash: String::new(),
+    };
+    (events(conn, id).unwrap(), head(conn, &binding).unwrap())
+}

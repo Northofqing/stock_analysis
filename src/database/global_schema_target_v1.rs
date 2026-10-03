@@ -175,10 +175,29 @@ impl Options {
 /// Explicit FD copy/hash/readback and one cumulative target metadata pool.
 /// Original validation and both typed sides retain the original RowsWork.
 /// This does not claim to measure SQLite VFS cache traffic.
+// Private markers/parts prevent attaching a fresh terminal to an existing meter.
+pub(super) struct ReplayOwnerInit {
+    _private: (),
+}
+pub(super) struct ReplayOwnerLoan<'a> {
+    metadata: &'a mut RowsSpecWork,
+    terminal: &'a mut replay_work::ReplayTerminalState,
+}
+impl<'a> ReplayOwnerLoan<'a> {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        &'a mut RowsSpecWork,
+        &'a mut replay_work::ReplayTerminalState,
+    ) {
+        (self.metadata, self.terminal)
+    }
+}
 pub(super) struct TargetWork {
     limits: Limits,
     physical: u64,
     metadata: RowsSpecWork,
+    replay_terminal: replay_work::ReplayTerminalState,
     journal: u64,
 }
 impl TargetWork {
@@ -188,10 +207,41 @@ impl TargetWork {
             limits,
             physical: 0,
             metadata,
+            replay_terminal: replay_work::ReplayTerminalState::new(ReplayOwnerInit {
+                _private: (),
+            }),
             journal: 0,
         }
     }
+    pub(super) fn require_replay_clear(
+        &self,
+    ) -> std::result::Result<(), replay_work::ReplayTerminalFailure> {
+        self.replay_terminal.finish()
+    }
+    pub(super) fn with_v1_rows<T>(
+        &mut self,
+        reader: &RetainedTargetReader<'_>,
+        operation: impl for<'loan> FnOnce(
+            &mut replay_work::V1RowsLoan<'loan>,
+        )
+            -> std::result::Result<T, replay_work::ReplayTerminalFailure>,
+    ) -> std::result::Result<T, replay_work::ReplayTerminalFailure> {
+        self.require_replay_clear()?;
+        let parts = ReplayOwnerLoan {
+            metadata: &mut self.metadata,
+            terminal: &mut self.replay_terminal,
+        };
+        let mut loan = replay_work::V1RowsLoan::from_retained(reader, parts);
+        let result = operation(&mut loan);
+        if let Err(failure) = &result {
+            loan.latch_failure(*failure);
+        }
+        loan.finish()?;
+        result
+    }
     pub(super) fn metadata(&mut self, n: u64) -> Result<()> {
+        self.require_replay_clear()
+            .map_err(GlobalSchemaV1Error::ReplayTerminal)?;
         self.metadata
             .charge(n)
             .map_err(|_| fail("target metadata work exceeded before allocation"))
@@ -1043,10 +1093,17 @@ pub(super) fn prepare(
         options,
     };
     result.verify_final(2)?;
+    result
+        .work
+        .require_replay_clear()
+        .map_err(GlobalSchemaV1Error::ReplayTerminal)?;
     Ok(result)
 }
 impl VerifiedUnapprovedRequalificationTarget {
     fn verify_final(&mut self, required_streams: u64) -> Result<()> {
+        self.work
+            .require_replay_clear()
+            .map_err(GlobalSchemaV1Error::ReplayTerminal)?;
         self.workspace.verify_records(&mut self.work)?;
         self.workspace.sidecars_absent()?;
         self.options.phase(Phase::BeforeReader)?;
@@ -1168,6 +1225,9 @@ impl VerifiedUnapprovedRequalificationTarget {
             Ok(())
         })?;
         self.options.event("target_immutable_tail_complete");
+        self.work
+            .require_replay_clear()
+            .map_err(GlobalSchemaV1Error::ReplayTerminal)?;
         Ok(())
     }
     pub(super) fn render_unapproved(mut self) -> Result<String> {
@@ -1228,8 +1288,74 @@ impl VerifiedUnapprovedRequalificationTarget {
         let bytes = self
             .work
             .encode_metadata(&review, self.options.limits.review)?;
+        self.work
+            .require_replay_clear()
+            .map_err(GlobalSchemaV1Error::ReplayTerminal)?;
         String::from_utf8(bytes).map_err(|_| fail("target review encoding refused"))
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_replay_terminal() -> replay_work::ReplayTerminalState {
+    replay_work::ReplayTerminalState::new(ReplayOwnerInit { _private: () })
+}
+#[cfg(test)]
+pub(super) fn test_replay_owner(limit: u64) -> TargetWork {
+    let mut limits = Limits::production();
+    limits.metadata = limit;
+    TargetWork {
+        limits,
+        physical: 0,
+        metadata: RowsSpecWork::new(limit, 0, 0),
+        replay_terminal: test_replay_terminal(),
+        journal: 0,
+    }
+}
+#[cfg(test)]
+pub(super) fn test_with_retained_v1_reader<T>(
+    owner: &mut TargetWork,
+    path: &std::path::Path,
+    operation: impl for<'loan> FnOnce(
+        &mut replay_work::V1RowsLoan<'loan>,
+    ) -> std::result::Result<T, replay_work::ReplayTerminalFailure>,
+) -> std::result::Result<T, replay_work::ReplayTerminalFailure> {
+    // Fixture setup is outside the replay meter. This is a real immutable
+    // file-backed reader, never a fake pin or a production Connection factory.
+    let retained = std::fs::File::open(path).unwrap();
+    let before = retained.metadata().unwrap();
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        use std::fmt::Write;
+        write!(&mut uri, "%{byte:02X}").unwrap();
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    let connection = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    connection.execute_batch("PRAGMA query_only=ON").unwrap();
+    assert!(connection
+        .is_readonly(rusqlite::DatabaseName::Main)
+        .unwrap());
+    let options = Options::production();
+    let result = owner.with_v1_rows(
+        &RetainedTargetReader {
+            connection: &connection,
+            options: &options,
+        },
+        operation,
+    );
+    connection.close().unwrap();
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.len()),
+        (after.dev(), after.ino(), after.len())
+    );
+    owner.require_replay_clear()?;
+    result
 }
 
 #[cfg(test)]
@@ -1239,6 +1365,7 @@ mod tests {
     fn test_work(limits: Limits) -> TargetWork {
         TargetWork {
             metadata: RowsSpecWork::new(limits.metadata, 0, 0),
+            replay_terminal: replay_work::ReplayTerminalState::new(ReplayOwnerInit { _private: () }),
             limits,
             physical: 0,
             journal: 0,

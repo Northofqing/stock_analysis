@@ -54,7 +54,8 @@ fn phases_reborrow_one_meter_without_reset_or_refund() {
     let mut metadata = RowsSpecWork::new(20, 1, 1);
     metadata.charge(2).unwrap(); // preexisting catalog work is retained
     {
-        let mut work = BorrowedReplayWork::borrow(&mut metadata);
+        let mut terminal = super::super::target::test_replay_terminal();
+        let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
         {
             let prepare = &mut work;
             assert_eq!(
@@ -80,15 +81,16 @@ fn phases_reborrow_one_meter_without_reset_or_refund() {
 #[test]
 fn first_debit_failure_stays_sticky_across_phase_reborrows() {
     let mut metadata = RowsSpecWork::new(3, 1, 1);
-    let mut work = BorrowedReplayWork::borrow(&mut metadata);
+    let mut terminal = super::super::target::test_replay_terminal();
+    let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
     let first = work.reserve(ReplaySite::Collection, 4).err().unwrap();
     assert_eq!(
         first,
-        ReplayResourceFailure {
+        ReplayTerminalFailure::Resource(ReplayResourceFailure {
             site: ReplaySite::Collection,
             cause: ResourceCause::Debit(RowsSpecDebitFailure::Exceeded),
             used: 4,
-        }
+        })
     );
     {
         let render = &mut work;
@@ -108,7 +110,8 @@ fn first_debit_failure_stays_sticky_across_phase_reborrows() {
 #[test]
 fn layout_failure_prevents_later_success_even_without_a_debit() {
     let mut metadata = RowsSpecWork::new(u64::MAX, 1, 1);
-    let mut work = BorrowedReplayWork::borrow(&mut metadata);
+    let mut terminal = super::super::target::test_replay_terminal();
+    let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
     let mut reached_owned_operation = false;
     let result = work.reserve_array::<u64>(ReplaySite::SqlRows, u64::MAX);
     if result.is_ok() {
@@ -116,7 +119,7 @@ fn layout_failure_prevents_later_success_even_without_a_debit() {
     }
     let first = result.err().unwrap();
     assert!(!reached_owned_operation);
-    assert!(matches!(first.cause, ResourceCause::Layout(_)));
+    assert!(matches!(resource(first).cause, ResourceCause::Layout(_)));
     assert_eq!(work.used(), 0);
     assert_eq!(work.reserve(ReplaySite::SqlRows, 1).err(), Some(first));
     assert_eq!(work.finish(), Err(first));
@@ -126,13 +129,14 @@ fn layout_failure_prevents_later_success_even_without_a_debit() {
 fn borrower_overflow_records_prior_used_and_cannot_be_cleared() {
     let mut metadata = RowsSpecWork::new(u64::MAX, 1, 1);
     metadata.try_charge(u64::MAX).unwrap();
-    let mut work = BorrowedReplayWork::borrow(&mut metadata);
+    let mut terminal = super::super::target::test_replay_terminal();
+    let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
     let failure = work.reserve(ReplaySite::Collection, 1).err().unwrap();
     assert_eq!(
-        failure.cause,
+        resource(failure).cause,
         ResourceCause::Debit(RowsSpecDebitFailure::Overflow)
     );
-    assert_eq!(failure.used, u64::MAX);
+    assert_eq!(resource(failure).used, u64::MAX);
     assert_eq!(work.reserve(ReplaySite::Collection, 0).err(), Some(failure));
 }
 
@@ -341,4 +345,31 @@ fn scalar_byte_and_row_overflow_leave_no_successful_summary() {
         assert_eq!(acc.summary.text_bytes, bytes);
         assert_eq!(acc.finish(), Err(ScalarExtentFailure::Overflow));
     }
+}
+
+fn resource(failure: ReplayTerminalFailure) -> ReplayResourceFailure {
+    match failure {
+        ReplayTerminalFailure::Resource(resource) => resource,
+        other => panic!("expected resource: {other:?}"),
+    }
+}
+#[test]
+fn dropping_and_forgetting_short_loans_cannot_clear_persistent_failure() {
+    let mut metadata = RowsSpecWork::new(5, 1, 1);
+    let mut terminal = super::super::target::test_replay_terminal();
+    let first;
+    {
+        let mut prepare = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        first = prepare
+            .reserve_array::<u64>(ReplaySite::Collection, u64::MAX)
+            .err()
+            .unwrap();
+        std::mem::forget(prepare); // no Drop-based latch commit is required
+    }
+    {
+        let mut render = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+        assert_eq!(render.reserve(ReplaySite::SqlRows, 0).err(), Some(first));
+    }
+    assert_eq!(terminal.finish(), Err(first));
+    assert_eq!(metadata.used(), 0);
 }
