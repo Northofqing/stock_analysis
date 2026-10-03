@@ -8,8 +8,8 @@
     ],
     "application": {
       "files": {
-        "Cargo.lock": "3ec57e0ae4142d9bb0b7fc8a3d651d29c2786d8ce23f3c542c0ed9328a8d4fc0",
-        "Cargo.toml": "e42f1a8a8741bca2be8b25dbba0459f4d92a8fc11e64d5aeb9aede29748da8a9",
+        "Cargo.lock": "faddf716d7d223acc2ae833bf9fe23254439a706c0454036f4c7aea13a80f514",
+        "Cargo.toml": "b623141a703d779b3dc0605a50c0a8e3bfd64b4b1e1895a720543d56d93dd593",
         "build.rs": "40caddcd622b6cad97f46cdd332bf90c7bd4bf507f44d8dff8834a4d98f8ca91",
         "config/a_share_market_holidays.csv": "bcdf3ef8181e866ff27fafbde95bae7bf9e6ae4c80f55aeb2da7d8f51f181322",
         "config/br196_non_production_feishu_targets.toml": "e351650d70e0716eae3895a8092908c8b6facaea1a9d405da514cbeadacd16ba",
@@ -971,7 +971,7 @@
         "sha256": "91d60b39e4207cb8d7c16c340f20979b5cf34f7220443aa6271244dd3a399366"
       }
     },
-    "owner_sha256": "6d31fa569659b7b21fb83ea1ad3a4c14a69298f092134c651930349dcf31151a",
+    "owner_sha256": "448fa1c0d09f45de8c7bde8e7b53b6e41e2801d4b42f95dabd36850783a64827",
     "packages": [
       {
         "id": "registry+https://github.com/rust-lang/crates.io-index#adler2@2.0.1",
