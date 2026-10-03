@@ -537,11 +537,253 @@ def capture_autocfg_stdin(call, context):
     return body, evidence
 
 
+
+RUSTIX_KIND = "RustixMetadataProbe"
+RUSTIX_FEATURES = {"alloc", "default", "fs", "std", "stdio", "termios"}
+RUSTIX_BODIES = (
+    b"const unsafe fn foo(p: *const u8) -> isize { p.offset_from(p) }\n",
+    b"fn a(x: &core::num::NonZeroI32, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::LowerExp::fmt(x, f) }\n",
+    b"#[diagnostic::on_unimplemented()] trait Foo {}\n",
+)
+RUSTIX_CFGS = ("static_assertions", "lower_upper_exp_for_non_zero", "rustc_diagnostics")
+FRAMEWORK_LITERAL = "framework=SystemConfiguration"
+
+
+def fixed_source_package(name, version, cwd, env, session, inv, sources):
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    root = session / "vendor" / name
+    require(inv["packages"].count(package) == 1 and cwd == root
+            and env.get("CARGO_MANIFEST_DIR") == str(root)
+            and env.get("CARGO_PKG_NAME") == name and env.get("CARGO_PKG_VERSION") == version,
+            "FixedPackageContext")
+    for source in ("Cargo.toml", "build.rs", *sources):
+        path = root / source
+        regular(path)
+        require(path.resolve() == path and inv["vendor"]["files"].get(name + "/" + source)
+                == file_hash(path), "FixedPackageSource")
+    raw = env.get("OUT_DIR", "")
+    out = Path(raw)
+    require(out.is_absolute() and str(out) == raw and out.resolve() == out and out.is_dir()
+            and not out.is_symlink() and out.name == "out"
+            and out.parent.parent == session / "target" / TARGET / "debug/build"
+            and re.fullmatch(r"[A-Za-z0-9_-]+", out.parent.name), "FixedPackageOutDir")
+    return package, root, out
+
+
+def framework_context(args, env, cwd, session, inv):
+    raw = args[1:]
+    if not any(a == "-l" or a.startswith("-l") or a.startswith("--extern-native") for a in raw):
+        return None
+    require(raw[-2:] == ["-l", FRAMEWORK_LITERAL]
+            and sum(a == "-l" or a.startswith("-l") for a in raw) == 1, "FrameworkTemplate")
+    package, root, out = fixed_source_package("system-configuration-sys", "0.6.0", cwd, env,
+                                            session, inv, ("src/lib.rs",))
+    parsed = parse_rustc(raw[:-2])
+    options = parsed["options"]
+    require(not parsed["probe"] and parsed["inputs"] == [str(root / "src/lib.rs")]
+            and options.get("--crate-name") == ["system_configuration_sys"]
+            and options.get("--crate-type") == ["lib"] and options.get("--target") == [TARGET]
+            and options.get("--out-dir") == [str(session / "target" / TARGET / "debug/deps")]
+            and options.get("--emit") == ["dep-info,metadata,link"]
+            and not any(k in parsed["codegen"] for k in ("link-arg", "linker"))
+            and all(value in {"dependency=" + str(session / "target" / TARGET / "debug/deps"),
+                              "dependency=" + str(session / "target/debug/deps")}
+                    for value in options.get("-L", [])),
+            "FrameworkCompileContext")
+    options["-l"] = [FRAMEWORK_LITERAL]
+    return parsed, {"kind": "DirectCargoCompile", "framework_declaration": FRAMEWORK_LITERAL,
+                    "package_id": package["id"], "manifest": str(root), "out_dir": str(out)}
+
+
+def rustix_context(args, env, cwd, session, inv):
+    raw = args[1:]
+    if "-o" not in raw:
+        return None
+    package, root, out = fixed_source_package("rustix", "1.1.4", cwd, env, session, inv, ())
+    require(raw == ["--crate-type=rlib", "--emit=metadata", "--target", TARGET,
+                    "-o", str(out / "rustix_test_can_compile"), "-"], "RustixTemplate")
+    require(env.get("RUSTC") == inv["rustc"]["path"]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not env.get("RUSTC_WORKSPACE_WRAPPER")
+            and env.get("HOST") == TARGET and env.get("TARGET") == TARGET,
+            "RustixCompilerContext")
+    expected = {"CARGO_CFG_TARGET_ARCH": "x86_64", "CARGO_CFG_TARGET_OS": "macos",
+                "CARGO_CFG_TARGET_ENDIAN": "little", "CARGO_CFG_TARGET_POINTER_WIDTH": "64",
+                "CARGO_CFG_TARGET_ABI": "", "CARGO_CFG_TARGET_ENV": ""}
+    require(all(env.get(k) == v for k, v in expected.items())
+            and {k: v for k, v in env.items() if k.startswith("CARGO_FEATURE_")} ==
+                {"CARGO_FEATURE_" + f.upper(): "1" for f in RUSTIX_FEATURES}
+            and not any(k in env for k in ("CARGO_CFG_MIRI", "CARGO_CFG_RUSTIX_USE_EXPERIMENTAL_FEATURES",
+                "CARGO_CFG_RUSTIX_USE_EXPERIMENTAL_ASM", "CARGO_CFG_RUSTIX_USE_LIBC", "CARGO_CFG_RUSTIX_NO_LINUX_RAW"))
+            and not env.get("CARGO_ENCODED_RUSTFLAGS"), "RustixConfiguration")
+    return ({"options": {"--crate-type": ["rlib"], "--emit": ["metadata"], "--target": [TARGET],
+                         "-o": [str(out / "rustix_test_can_compile")]},
+             "codegen": {}, "inputs": ["-"], "probe": False},
+            {"kind": RUSTIX_KIND, "package_id": package["id"], "manifest": str(root), "out_dir": str(out)})
+
+
+def capture_rustix_stdin(call):
+    raw, eof = bytearray(), False
+    while len(raw) < 123:
+        block = os.read(0, 123 - len(raw))
+        if not block:
+            eof = True
+            break
+        raw.extend(block)
+    body = bytes(raw)
+    with open(call / "stdin.raw", "xb") as stream:
+        stream.write(body)
+    index = RUSTIX_BODIES.index(body) if body in RUSTIX_BODIES else None
+    evidence = {"snapshot": "stdin.raw", "length": len(body), "sha256": digest(body),
+                "eof": eof, "truncated": not eof, "template_index": index}
+    atomic_json(call / "stdin.json", evidence)
+    require(eof and index is not None, "RustixStdinTemplate")
+    return body, evidence
+
+
+def metadata_state(call, path, phase):
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False}
+    regular(path)
+    require(path.resolve() == path, "RustixMetadataAlias")
+    snapshot = call / ("metadata-" + phase + ".raw")
+    with open(path, "rb") as source, open(snapshot, "xb") as dest:
+        shutil.copyfileobj(source, dest)
+    sha = file_hash(snapshot)
+    require(file_hash(path) == sha, "RustixMetadataChanged")
+    return {"exists": True, "sha256": sha, "snapshot": snapshot.name}
+
+
+def state_identity(state):
+    return (state["exists"], state.get("sha256"))
+
+
+def rustix_predecessor(session, call, context, index, pre):
+    previous = {}
+    for directory in (session / "invocations").iterdir():
+        if directory == call or not (directory / "invocation.json").is_file():
+            continue
+        request = strict_json((directory / "invocation.json").read_bytes())
+        other = request.get("context", {})
+        if other.get("kind") != RUSTIX_KIND or (other.get("package_id"), other.get("out_dir")) != (context["package_id"], context["out_dir"]):
+            continue
+        require((directory / "receipt.json").is_file(), "RustixPredecessorIncomplete")
+        receipt = strict_json((directory / "receipt.json").read_bytes())
+        number = receipt["stdin"]["template_index"]
+        require(number not in previous and receipt["exit_code"] in (0, 1) and not receipt["blockers"],
+                "RustixPredecessor")
+        previous[number] = (directory.name, receipt)
+    require(set(previous) == set(range(index)), "RustixSequence")
+    if index == 0:
+        require(not pre["exists"], "RustixInitialMetadata")
+        return None
+    identifier, receipt = previous[index - 1]
+    require(state_identity(pre) == state_identity(receipt["metadata_post"]), "RustixPrestate")
+    return identifier
+
+
+def verify_metadata_state(directory, state, phase):
+    require(isinstance(state, dict) and type(state.get("exists")) is bool, "RustixMetadataEvidence")
+    if not state["exists"]:
+        require(state == {"exists": False}, "RustixMetadataEvidence")
+        return
+    require(set(state) == {"exists", "sha256", "snapshot"}
+            and state["snapshot"] == "metadata-" + phase + ".raw", "RustixMetadataEvidence")
+    path = directory / state["snapshot"]
+    regular(path)
+    require(path.resolve() == path and file_hash(path) == state["sha256"], "RustixMetadataEvidence")
+
+
+def verify_rustix_evidence(directory, receipt):
+    path = directory / "stdin.raw"
+    regular(path)
+    require(path.resolve() == path and path.stat().st_size <= 122, "RustixStdinEvidence")
+    body = path.read_bytes()
+    index = RUSTIX_BODIES.index(body) if body in RUSTIX_BODIES else None
+    expected = {"snapshot": "stdin.raw", "length": len(body), "sha256": digest(body),
+                "eof": True, "truncated": False, "template_index": index}
+    metadata = directory / "stdin.json"
+    regular(metadata)
+    require(index is not None and metadata.resolve() == metadata and receipt["stdin"] == expected
+            and strict_json(metadata.read_bytes()) == expected, "RustixStdinEvidence")
+    initial = strict_json((directory / "invocation.json").read_bytes())
+    require(all(initial[k] == receipt[k] for k in ("context", "stdin", "declared_outputs", "metadata_pre", "predecessor_invocation",
+                                                   "argv_hex", "environment_hex", "parsed", "role", "kind")),
+            "RustixInvocationEvidence")
+    output = str(Path(receipt["context"]["out_dir"]) / "rustix_test_can_compile")
+    require(receipt["kind"] == "TransientProbe" and receipt["declared_outputs"] == [{"path": output, "kind": "metadata"}],
+            "RustixDeclarationEvidence")
+    for phase in ("pre", "post"):
+        verify_metadata_state(directory, receipt["metadata_" + phase], phase)
+    post = receipt["metadata_post"]
+    expected_outputs = ([{"path": output, "kind": "metadata", "sha256": post["sha256"],
+                         "snapshot": post["snapshot"], "observation_only": True}] if post["exists"] else [])
+    require(receipt["outputs"] == expected_outputs and (receipt["exit_code"] != 0 or post["exists"]),
+            "RustixOutputEvidence")
+
+
+def new_role_graphs(receipts, associations):
+    blockers, declarations = [], []
+    by_id = {r["invocation_id"]: r for r in receipts}
+    def origin(context, name):
+        found = [a for a in associations if a["package_id"] == context["package_id"] and a["out_dir"] == context["out_dir"]]
+        require(len(found) == 1, name + "Origin")
+        association = found[0]
+        builder = by_id[association["producer_invocation"]]
+        require(builder["kind"] == "Compile" and builder["role"] == "Host" and builder["exit_code"] == 0
+                and not builder["blockers"] and builder["source"] == str(Path(context["manifest"]) / "build.rs")
+                and builder["package"]["id"] == context["package_id"], name + "Builder")
+        return association, builder
+    groups = {}
+    for r in receipts:
+        c = r.get("context", {})
+        if c.get("kind") == RUSTIX_KIND:
+            groups.setdefault((c["package_id"], c["out_dir"]), []).append(r)
+        if "framework_declaration" in c:
+            try:
+                association, _ = origin(c, "Framework")
+                event = association["cargo_event"]
+                require(r["kind"] == "Compile" and r["role"] == "Target" and r["exit_code"] == 0 and not r["blockers"]
+                        and c["framework_declaration"] == FRAMEWORK_LITERAL and r["parsed"]["options"].get("-l") == [FRAMEWORK_LITERAL]
+                        and event["linked_libs"] == [FRAMEWORK_LITERAL]
+                        and all(event[k] == [] for k in ("linked_paths", "cfgs", "env")), "FrameworkDeclaration")
+                declarations.append({"state": "RecordingOnly", "consumer_invocation": r["invocation_id"],
+                                     "producer_invocation": association["producer_invocation"],
+                                     "declaration": FRAMEWORK_LITERAL, "out_dir": c["out_dir"]})
+            except (Refusal, KeyError, TypeError) as error:
+                blockers.append("FrameworkGraph:" + str(error))
+    for group in groups.values():
+        try:
+            association, builder = origin(group[0]["context"], "Rustix")
+            require(len(builder["parsed"]["options"].get("--cfg", [])) == len(RUSTIX_FEATURES)
+                    and set(builder["parsed"]["options"].get("--cfg", [])) == {'feature="' + f + '"' for f in RUSTIX_FEATURES},
+                    "RustixBuilderFeatures")
+            indexed = {r["stdin"]["template_index"]: r for r in group}
+            require(len(group) == 3 and set(indexed) == {0, 1, 2}, "RustixSequence")
+            previous, post = None, {"exists": False}
+            cfgs = []
+            for index in range(3):
+                r = indexed[index]
+                require(r["exit_code"] in (0, 1) and not r["blockers"]
+                        and r["predecessor_invocation"] == previous
+                        and state_identity(r["metadata_pre"]) == state_identity(post), "RustixSequence")
+                previous, post = r["invocation_id"], r["metadata_post"]
+                if r["exit_code"] == 0:
+                    cfgs.append(RUSTIX_CFGS[index])
+            event = association["cargo_event"]
+            require(event["cfgs"] == cfgs + ["libc", "apple", "bsd"]
+                    and all(event[k] == [] for k in ("linked_libs", "linked_paths", "env")), "RustixCfgGraph")
+        except (Refusal, KeyError, TypeError) as error:
+            blockers.append("RustixGraph:" + str(error))
+    return blockers, declarations
+
+
 def compiler_environment(env, session, sysroot, *, probe, context=None):
     require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     expected = sysroot_loader_path(sysroot)
     kind = (context or {}).get("kind")
-    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe"} | AUTOCFG_KINDS:
+    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS:
         relative = "lib/rustlib/" + TARGET + "/lib"
         host_lib = Path(sysroot["root"]) / relative
         require(host_lib.is_dir() and host_lib.resolve() == host_lib
@@ -626,7 +868,11 @@ def wrapper(session_id, args):
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
     cwd = Path.cwd().resolve()
     require(inside(cwd, session), "CompilerCwd")
-    special = autocfg_context(args, os.environ, cwd, session, inv)
+    special = rustix_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        special = framework_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        special = autocfg_context(args, os.environ, cwd, session, inv)
     if special is None:
         parsed = parse_rustc(args[1:])
         context = invocation_context(args, parsed, os.environ, cwd, session, inv)
@@ -643,7 +889,13 @@ def wrapper(session_id, args):
     externs, package, source, outputs = [], None, None, []
     stdin_bytes, stdin_evidence = None, None
     autocfg_stdin = context["kind"] == "NumTraitsAutocfgStdinProbe"
-    if autocfg_stdin:
+    rustix_stdin = context["kind"] == RUSTIX_KIND
+    if rustix_stdin:
+        stdin_bytes, stdin_evidence = capture_rustix_stdin(call)
+        outputs = [{"path": str(Path(context["out_dir"]) / "rustix_test_can_compile"), "kind": "metadata"}]
+        pre = metadata_state(call, Path(outputs[0]["path"]), "pre")
+        predecessor = rustix_predecessor(session, call, context, stdin_evidence["template_index"], pre)
+    elif autocfg_stdin:
         stdin_bytes, stdin_evidence = capture_autocfg_stdin(call, context)
         outputs = [{"path": str(Path(context["out_dir"]) / (context["crate_name"] + ".ll")),
                     "kind": "llvm-ir"}]
@@ -677,7 +929,7 @@ def wrapper(session_id, args):
         for value in codegen.get("linker", []):
             require(value in {v["path"] for v in inv["generators"].values()}, "UnpinnedLinker")
         outputs = selected_outputs(parsed, cwd, target)
-    transient = context["kind"] == "ProcMacro2FeatureProbe" or autocfg_stdin
+    transient = context["kind"] == "ProcMacro2FeatureProbe" or autocfg_stdin or rustix_stdin
     record = {"state": "RecordingOnly", "kind": "TransientProbe" if transient else (
                   "Probe" if parsed["probe"] else "Compile"), "context": context,
               "argv_hex": [os.fsencode(value).hex() for value in args], "parsed": parsed,
@@ -687,6 +939,8 @@ def wrapper(session_id, args):
               "externs": externs, "declared_outputs": outputs, "compiler_sha256": file_hash(Path(args[0]))}
     if stdin_evidence is not None:
         record["stdin"] = stdin_evidence
+    if rustix_stdin:
+        record.update(metadata_pre=pre, predecessor_invocation=predecessor)
     atomic_json(call / "invocation.json", record)
     stdin_failures = []
     code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
@@ -698,7 +952,15 @@ def wrapper(session_id, args):
     record["outputs"], record["blockers"] = [], []
     if transient:
         try:
-            record["outputs"], record["blockers"] = capture_transient_outputs(call, outputs, code)
+            if rustix_stdin:
+                post = metadata_state(call, Path(outputs[0]["path"]), "post")
+                record["metadata_post"] = post
+                if post["exists"]:
+                    record["outputs"] = [dict(outputs[0], sha256=post["sha256"], snapshot=post["snapshot"], observation_only=True)]
+                elif code == 0:
+                    record["blockers"].append("MissingDeclaredOutput:" + outputs[0]["path"])
+            else:
+                record["outputs"], record["blockers"] = capture_transient_outputs(call, outputs, code)
         except (Refusal, OSError) as error:
             # Preserve the actual compiler status even when evidence retention fails.
             record["blockers"].append("TransientEvidence:" + str(error))
@@ -826,6 +1088,22 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("ChangedInvocationBytes:" + directory.name)
         receipts.append(receipt)
         blockers.extend(receipt["blockers"])
+        initial = strict_json((directory / "invocation.json").read_bytes())
+        if "framework_declaration" in initial.get("context", {}) or "framework_declaration" in receipt.get("context", {}):
+            try:
+                request = strict_json((directory / "request.json").read_bytes())
+                require(all(initial[k] == receipt[k] for k in ("context", "argv_hex", "environment_hex", "parsed", "source", "package", "role", "kind"))
+                        and request["argv_hex"] == receipt["argv_hex"]
+                        and request["environment_hex"] == receipt["environment_hex"], "FrameworkInvocationEvidence")
+                require([os.fsdecode(bytes.fromhex(a)) for a in receipt["argv_hex"]][-2:] == ["-l", FRAMEWORK_LITERAL],
+                        "FrameworkInvocationEvidence")
+            except (Refusal, KeyError, TypeError, ValueError) as error:
+                blockers.append("ChangedFrameworkEvidence:" + directory.name + ":" + str(error))
+        if receipt.get("context", {}).get("kind") == RUSTIX_KIND:
+            try:
+                verify_rustix_evidence(directory, receipt)
+            except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+                blockers.append("ChangedRustixEvidence:" + directory.name + ":" + str(error))
         if receipt.get("context", {}).get("kind") == "NumTraitsAutocfgStdinProbe":
             try:
                 evidence = receipt["stdin"]
@@ -936,7 +1214,7 @@ def seal_record(session, policy, cargo_exit):
     nested_origins = []
     for receipt in receipts:
         context = receipt.get("context", {})
-        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe"} | AUTOCFG_KINDS:
+        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS:
             matches = [a for a in associations if a["package_id"] == context["package_id"]
                        and a["out_dir"] == context["out_dir"]]
             if len(matches) != 1:
@@ -956,6 +1234,8 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("UnresolvedExternProducer:" + edge["path"])
             edges.append(dict(edge, consumer=receipt["invocation_id"], producers=producers))
     blockers.extend(autocfg_graph_blockers(receipts, associations, edges))
+    new_blockers, declarations = new_role_graphs(receipts, associations)
+    blockers.extend(new_blockers)
     consumed = []
     for receipt in receipts:
         if receipt["invocation_id"] in transient_collisions:
@@ -1003,7 +1283,7 @@ def seal_record(session, policy, cargo_exit):
     seal = {"schema": SCHEMA, "state": "RecordingOnly", "review_gate": "IndependentPolicyReviewRequired",
             "cargo_exit_code": cargo_exit, "blockers": sorted(set(blockers)), "selected_library": selected,
             "extern_edges": edges, "build_script_associations": associations, "consumed_sources": consumed,
-            "nested_origins": nested_origins,
+            "nested_origins": nested_origins, "native_link_declarations": declarations,
             # This binds the owner receipt; its nested owner_sha256 binds tool source.
             "owner_sha256": file_hash(session / "owner.json"),
             "policy_sha256": digest(POLICY.read_bytes()),

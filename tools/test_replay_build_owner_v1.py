@@ -155,9 +155,47 @@ else:
 (out/'generated.rs').write_text('pub const TEST_CODE_AUTOCFG: u8 = 1;')
 '''
 
+RUSTIX_BUILDER = r'''
+import fcntl,json,os,pathlib,subprocess,sys
+bodies=(b'const unsafe fn foo(p: *const u8) -> isize { p.offset_from(p) }\n', b"fn a(x: &core::num::NonZeroI32, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::LowerExp::fmt(x, f) }\n", b'#[diagnostic::on_unimplemented()] trait Foo {}\n')
+case=os.environ['FIXTURE_RUSTIX_CASE'];out=pathlib.Path(os.environ['OUT_DIR']);out.mkdir(parents=True,exist_ok=True)
+order=[0,1,2]
+if case=='reorder':order=[1,0,2]
+if case=='duplicate':order=[0,0,2]
+if case=='skip':order=[0,2]
+for number in order:
+    if number==1 and case=='prestate':(out/'rustix_test_can_compile').write_bytes(b'TEST_CODE_CHANGED')
+    body=bodies[number]
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-type=rlib','--emit=metadata','--target','x86_64-apple-darwin','-o',str(out/'rustix_test_can_compile'),'-']
+    if number==0:
+        if case=='body':body=b'fn main() {}\n'
+        if case=='empty':body=b''
+        if case=='no_lf':body=body[:-1]
+        if case=='extra_lf':body+=b'\n'
+        if case=='nul':body+=b'\0'
+        if case=='overflow':body=b'X'*123
+        if case=='extra':command.append('--edition=2021')
+        if case=='target_arg':command[5]='TEST_CODE'
+        if case=='emit':command[3]='--emit=link'
+        if case=='output':command[7]=str(out/'other')
+        if case=='output_alias':command[7]=str(out)+'/./rustix_test_can_compile'
+        if case=='native':command+=['-l','framework=SystemConfiguration']
+    env=dict(os.environ)
+    read,write=os.pipe();canary=fcntl.fcntl(read,fcntl.F_DUPFD,200)
+    try:
+        os.write(write,b'J')
+        env.update(CARGO_MAKEFLAGS=f'-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}',FIXTURE_RUSTIX_FDS=f'{read},{write},{canary}')
+        result=subprocess.run(command,input=body,cwd=os.environ.get('FIXTURE_RUSTIX_CWD',os.environ['CARGO_MANIFEST_DIR']),env=env,pass_fds=(read,write,canary),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    finally:
+        for fd in (read,write,canary):os.close(fd)
+    with open(out/'statuses.jsonl','a') as log:log.write(json.dumps({'index':number,'code':result.returncode,'stderr_hex':result.stderr.hex()})+'\n')
+    if result.returncode not in (0,1):sys.exit(result.returncode)
+'''
+
 FAKE_RUSTC = r'''
 import errno, fcntl, json, os, pathlib, stat, sys
 AUTOCFG_BUILDER=__AUTOCFG_BUILDER__
+RUSTIX_BUILDER=__RUSTIX_BUILDER__
 args=sys.argv[1:]
 hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
 if args==['-vV']:
@@ -187,6 +225,30 @@ if args and args[-1]=='-' and '--emit=llvm-ir' in args:
     print('X'*70000)
     print(json.dumps({'fixture_argv':args,'stdin_hex':body.hex(),'pipe':True}),file=sys.stderr)
     if os.environ.get('FIXTURE_AUTOCFG_SIGNAL'):os.kill(os.getpid(),9)
+    sys.exit(code)
+
+
+if args and args[-1]=='-' and '--emit=metadata' in args:
+    body=sys.stdin.buffer.read();assert stat.S_ISFIFO(os.fstat(0).st_mode)
+    bodies=(b'const unsafe fn foo(p: *const u8) -> isize { p.offset_from(p) }\n', b"fn a(x: &core::num::NonZeroI32, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::LowerExp::fmt(x, f) }\n", b'#[diagnostic::on_unimplemented()] trait Foo {}\n');index=bodies.index(body)
+    (hits/('rustix-'+str(index))).write_bytes(body)
+    read,write,canary=map(int,os.environ['FIXTURE_RUSTIX_FDS'].split(','))
+    assert stat.S_ISFIFO(os.fstat(read).st_mode) and stat.S_ISFIFO(os.fstat(write).st_mode)
+    try:os.fstat(canary)
+    except OSError as e:assert e.errno==errno.EBADF
+    else:raise AssertionError('canary leaked')
+    assert os.read(read,1)==b'J';os.write(write,b'J')
+    (hits/('rustix-fds-'+str(index))).write_text('same pair and closed canary')
+    code=json.loads(os.environ['FIXTURE_RUSTIX_CODES'])[index];out=pathlib.Path(value('-o'))
+    case=os.environ['FIXTURE_RUSTIX_CASE']
+    if code==0 and case!='missing_output':out.write_bytes(b'TEST_CODE_METADATA:'+str(index).encode()+b':'+body)
+    if code==1 and case=='remove_failed' and out.exists():out.unlink()
+    if case=='symlink':
+        if out.exists():out.unlink()
+        out.symlink_to(pathlib.Path(os.environ['CARGO_MANIFEST_DIR'])/'build.rs')
+    print('X'*70000);print('Y'*70000,file=sys.stderr)
+    print(json.dumps({'fixture_argv':args,'stdin_hex':body.hex()}),file=sys.stderr)
+    if case=='signal':os.kill(os.getpid(),9)
     sys.exit(code)
 
 if '--cfg=procmacro2_build_probe' in args:
@@ -233,6 +295,8 @@ for command in json.loads(os.environ.get('FIXTURE_NESTED_COMMANDS','[]')):
 """)
     if os.environ.get('FIXTURE_BUILD_AUTOCFG'):
         executable.write_text("#!"+sys.executable+chr(10)+AUTOCFG_BUILDER)
+    if os.environ.get('FIXTURE_BUILD_RUSTIX'):
+        executable.write_text('#!'+sys.executable+chr(10)+RUSTIX_BUILDER)
     executable.chmod(0o700)
 else:
     for suffix in ['.rmeta','.rlib']:
@@ -494,6 +558,93 @@ if MODE.startswith('autocfg:'):
     emit({'reason':'build-finished','success':True});sys.exit(0)
 '''
 
+FIX5_CARGO_FLOW = r'''
+if MODE.startswith('fix5:'):
+    family,case=MODE.split(':')[1:]
+    app_builder=compile('build_script_build',app/'build.rs',app,'bin','TEST_CODE_app',target/'app-builder')
+    app_out=target/'app-out';subprocess.run([app_builder],env=dict(os.environ,OUT_DIR=str(app_out)),check=True)
+    emit({'reason':'build-script-executed','package_id':'TEST_CODE_app','out_dir':str(app_out),'cfgs':[],'env':[],'linked_libs':[],'linked_paths':[]})
+    name,version=('rustix','1.1.4') if family=='rustix' else ('system-configuration-sys','0.6.0')
+    package='registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version
+    root=session/'vendor'/name;out=target/'x86_64-apple-darwin/debug/build'/('TEST_CODE_'+name)/'out';out.mkdir(parents=True)
+    cfgs=['feature="'+f+'"' for f in ['alloc','default','fs','std','stdio','termios']]
+    extra=[a for c in cfgs for a in ('--cfg',c)] if family=='rustix' else []
+    if case=='builder_features':extra=[]
+    builder=compile('build_script_build',root/'build.rs',root,'bin',package,target/'debug/build'/('TEST_CODE_builder_'+name),extra=extra,env_extra={'FIXTURE_BUILD_RUSTIX':'1'} if family=='rustix' else {})
+    native=['framework=SystemConfiguration'] if family=='framework' else []
+    event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'cfgs':[],'env':[],'linked_libs':native,'linked_paths':[]}
+    if family=='rustix':
+        hostlib=str(pathlib.Path(sysroot_lib)/'rustlib/x86_64-apple-darwin/lib')
+        loader=':'.join([str(target/'debug'),str(target/'debug/deps'),hostlib,sysroot_lib])
+        codes=[int(c) for c in case[-3:]] if case.startswith('codes') else [0,0,0]
+        if case=='exit2':codes=[2,0,0]
+        if case=='remove_failed':codes=[0,1,0]
+        if case.startswith('absent_'):codes=[1,1,1]
+        env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_PKG_NAME=name,CARGO_PKG_VERSION=version,HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',OUT_DIR=str(out),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),FIXTURE_RUSTIX_CASE=case,FIXTURE_RUSTIX_CODES=json.dumps(codes))
+        env.update({'CARGO_FEATURE_'+f.upper():'1' for f in ['alloc','default','fs','std','stdio','termios']})
+        env.update(CARGO_CFG_TARGET_ARCH='x86_64',CARGO_CFG_TARGET_OS='macos',CARGO_CFG_TARGET_ENDIAN='little',CARGO_CFG_TARGET_POINTER_WIDTH='64',CARGO_CFG_TARGET_ABI='',CARGO_CFG_TARGET_ENV='',CARGO_ENCODED_RUSTFLAGS='')
+        mutations={'package':('CARGO_PKG_NAME','other'),'version':('CARGO_PKG_VERSION','1.1.5'),'target_env':('TARGET','other'),'std':('CARGO_FEATURE_STD','0'),'extra_feature':('CARGO_FEATURE_NET','1'),'encoded':('CARGO_ENCODED_RUSTFLAGS','TEST_CODE'),'loader':('DYLD_FALLBACK_LIBRARY_PATH',loader+':/other'),'outdir':('OUT_DIR',str(target/'other'))}
+        if case in mutations:env.update([mutations[case]])
+        if case=='outdir':pathlib.Path(env['OUT_DIR']).mkdir()
+        if case=='cwd':env['FIXTURE_RUSTIX_CWD']=str(app)
+        if case=='preexisting':(out/'rustix_test_can_compile').write_bytes(b'TEST_CODE_EXISTING')
+        if case=='source':(root/'build.rs').chmod(0o644);(root/'build.rs').write_text('changed')
+        result=subprocess.run([builder],env=env)
+        if case=='source':(root/'build.rs').write_text('// TEST_CODE fixed5 generator\n')
+        if result.returncode:emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+        success_cfg=['static_assertions','lower_upper_exp_for_non_zero','rustc_diagnostics']
+        event['cfgs']=[c for c,code in zip(success_cfg,codes) if code==0]+['libc','apple','bsd']
+    else:
+        subprocess.run([builder],env=dict(os.environ,OUT_DIR=str(out)),check=True)
+    if case=='cfg':event['cfgs']=['TEST_CODE_WRONG']
+    if case=='linked_libs':event['linked_libs']=['framework=Other']
+    if case=='linked_paths':event['linked_paths']=['framework=/other']
+    if case=='wrong_origin':event['package_id']='TEST_CODE_WRONG'
+    if case!='missing_origin':emit(event)
+    if case=='duplicate_origin':emit(event)
+    if family=='framework':
+        env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_PKG_NAME=name,CARGO_PKG_VERSION=version,OUT_DIR=str(out),DYLD_FALLBACK_LIBRARY_PATH=prefix+':'+sysroot_lib,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+        env_mutations={'package':('CARGO_PKG_NAME','other'),'version':('CARGO_PKG_VERSION','0.6.1'),'outdir':('OUT_DIR',str(target/'other'))}
+        if case in env_mutations:env.update([env_mutations[case]])
+        if case=='outdir':pathlib.Path(env['OUT_DIR']).mkdir()
+        dest=target/'x86_64-apple-darwin/debug/deps';dest.mkdir(parents=True,exist_ok=True)
+        command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name','system_configuration_sys','--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),'--target','x86_64-apple-darwin',str(root/'src/lib.rs'),'-l','framework=SystemConfiguration']
+        if case=='other_framework':command[-1]='framework=Other'
+        if case=='modifier':command[-1]='framework:+bundle=SystemConfiguration'
+        if case=='attached':command[-2:]=['-lframework=SystemConfiguration']
+        if case=='duplicate_flag':command+=command[-2:]
+        if case=='reordered':command=command[:-3]+command[-2:]+command[-3:-2]
+        if case=='link_arg':command[-2:-2]=['-C','link-arg=-lOther']
+        if case=='native_search':command[-2:-2]=['-L','native='+str(target)]
+        if case=='output':command[command.index('--out-dir')+1]=str(target/'other')
+        if case=='source':command[command.index(str(root/'src/lib.rs'))]=str(app/'src/lib.rs')
+        result=subprocess.run(command,env=env,cwd=root)
+        if result.returncode:emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+        emit({'reason':'compiler-artifact','package_id':package,'target':{'src_path':str(root/'src/lib.rs'),'kind':['lib'],'name':'system_configuration_sys','crate_types':['lib']},'filenames':[str(dest/'libsystem_configuration_sys.rlib'),str(dest/'libsystem_configuration_sys.rmeta')],'executable':None,'fresh':False})
+    final_env={'OUT_DIR':str(app_out)};extra=[];path=out/'rustix_test_can_compile'
+    alias_case=case.removeprefix('absent_')
+    if family=='rustix' and alias_case in ('ordinary_alias','artifact_alias','artifact_dot','nontransient_alias'):
+        alias=str(target/'legitimate_alias') if case=='nontransient_alias' else str(path)
+        if alias_case=='artifact_dot':alias=str(out)+'/./'+path.name
+        final_env['FIXTURE_ORDINARY_REUSE' if alias_case=='ordinary_alias' else 'FIXTURE_ARTIFACT_ALIAS']=alias
+    if family=='rustix' and case in ('extern','consumed'):
+        if case=='extern':extra=['--extern','probe='+str(path)]
+        else:final_env={'OUT_DIR':str(out),'FIXTURE_GENERATED_NAME':path.name}
+    compile('stock_analysis',app/'src/lib.rs',app,'rlib','TEST_CODE_app',target/'deps',extra=extra,env_extra=final_env)
+    if family=='rustix' and case.startswith('tamper_'):
+        receipts=[p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('context',{}).get('kind')=='RustixMetadataProbe']
+        receipts.sort(key=lambda p:json.loads(p.read_text())['stdin']['template_index'])
+        p=receipts[1];r=json.loads(p.read_text());part=case[7:]
+        if part in ('stdin','pre','post','missing_snapshot'):
+            leaf='stdin.raw' if part=='stdin' else ('metadata-pre.raw' if part=='pre' else 'metadata-post.raw')
+            if part=='missing_snapshot':(p.parent/leaf).unlink()
+            else:(p.parent/leaf).write_bytes(b'TEST_CODE_CHANGED')
+        elif part=='eof':r['stdin']['eof']=False;p.write_text(json.dumps(r))
+        elif part=='predecessor':r['predecessor_invocation']=None;p.write_text(json.dumps(r))
+        elif part=='declaration':r['declared_outputs'][0]['path']=str(target/'other');p.write_text(json.dumps(r))
+    emit({'reason':'build-finished','success':True});sys.exit(0)
+'''
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -539,7 +690,7 @@ class RecordingProtocolTests(unittest.TestCase):
         write(vendor / "dep/.cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
         sysroot = self.root / "sysroot"
         write(sysroot / "lib/test.bin", "TEST_CODE_SYSROOT")
-        if mode.startswith(("nested:", "autocfg:")):
+        if mode.startswith(("nested:", "autocfg:", "fix5:")):
             write(sysroot / "lib/rustlib/x86_64-apple-darwin/lib/test.bin", "TEST_CODE_HOST_SYSROOT")
             for name, version in (("libc", "0.2.184"), ("proc-macro2", "1.0.106")):
                 write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
@@ -553,8 +704,13 @@ class RecordingProtocolTests(unittest.TestCase):
                 write(vendor / name / "build.rs", "// TEST_CODE autocfg generator\n")
                 for source in ("lib.rs", "rustc.rs", "version.rs"):
                     write(vendor / name / "src" / source, "// TEST_CODE " + name + " " + source + "\n")
-        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC.replace("__AUTOCFG_BUILDER__", repr(AUTOCFG_BUILDER)))
-        cargo_source = FAKE_CARGO.replace("compile('dep',session/", NESTED_CARGO_FLOW + AUTOCFG_CARGO_FLOW + "\ncompile('dep',session/", 1)
+        if mode.startswith("fix5:"):
+            for name, version in (("rustix", "1.1.4"), ("system-configuration-sys", "0.6.0")):
+                write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+                write(vendor / name / "build.rs", "// TEST_CODE fixed5 generator\n")
+                write(vendor / name / "src/lib.rs", "pub fn fixture() {}\n")
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC.replace("__AUTOCFG_BUILDER__", repr(AUTOCFG_BUILDER)).replace("__RUSTIX_BUILDER__", repr(RUSTIX_BUILDER)))
+        cargo_source = FAKE_CARGO.replace("compile('dep',session/", NESTED_CARGO_FLOW + AUTOCFG_CARGO_FLOW + FIX5_CARGO_FLOW + "\ncompile('dep',session/", 1)
         cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_source.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)).replace("__WRITEABLE_LINTS__", repr(WRITEABLE_LINTS)))
         rustc.chmod(0o700); cargo.chmod(0o700)
         def pin(path): return {"path": str(path), "sha256": sha(path)}
@@ -577,6 +733,11 @@ class RecordingProtocolTests(unittest.TestCase):
             inventory["packages"].extend({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
                                            "tree": "vendor", "manifest": name + "/Cargo.toml"}
                                           for name, version in (("num-traits", "0.2.19"), ("autocfg", "1.5.0")))
+        if mode.startswith("fix5:"):
+            inventory["vendor"] = snapshot(vendor, ["dep", "rustix", "system-configuration-sys"])
+            inventory["packages"].extend({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                                          for name, version in (("rustix", "1.1.4"), ("system-configuration-sys", "0.6.0")))
         self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
         return inventory
 
@@ -1160,6 +1321,130 @@ class RecordingProtocolTests(unittest.TestCase):
                 session, record, _ = self.autocfg_result("nontransient_alias") if family == "autocfg" else self.nested_result("nontransient_alias")
                 self.assertEqual(record["blockers"], [])
                 self.assertEqual(record["selected_library"][0]["files"], [str(session / "target/TEST_CODE_legitimate_alias")])
+
+
+    def fix5_result(self, family, case="normal", status=0):
+        self.prepare("fix5:" + family + ":" + case)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def test_framework_exact_literal_has_recording_only_producer_join(self):
+        session, record, receipts = self.fix5_result("framework")
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["native_link_declarations"]), 1)
+        declaration = record["native_link_declarations"][0]
+        self.assertEqual(declaration["state"], "RecordingOnly")
+        self.assertEqual(declaration["declaration"], "framework=SystemConfiguration")
+        path, receipt = next((p, r) for p, r in receipts if p.name == declaration["consumer_invocation"])
+        args = [bytes.fromhex(a).decode() for a in receipt["argv_hex"]]
+        self.assertEqual(args[-2:], ["-l", "framework=SystemConfiguration"])
+        self.assertEqual(json.loads((path / "stderr.raw").read_text())["fixture_argv"], args[1:])
+        self.assertTrue(any(a["producer_invocation"] == declaration["producer_invocation"] for a in record["build_script_associations"]))
+        self.assertFalse(any("SystemConfiguration" in c["path"] for c in record["consumed_sources"]))
+
+    def test_framework_finite_argv_and_origin_controls(self):
+        for case in ("package", "version", "outdir", "other_framework", "modifier", "attached", "duplicate_flag", "reordered", "output", "source", "link_arg", "native_search"):
+            with self.subTest(case=case):
+                session, record, _ = self.fix5_result("framework", case, 2)
+                self.assertFalse((session / "compiler-entry/compile-system_configuration_sys").exists())
+                self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+        for case in ("missing_origin", "wrong_origin", "duplicate_origin", "linked_libs", "linked_paths", "cfg"):
+            with self.subTest(case=case):
+                session, record, _ = self.fix5_result("framework", case, 2)
+                self.assertTrue((session / "compiler-entry/compile-system_configuration_sys").exists())
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertTrue(any(b.startswith("FrameworkGraph:") or b.startswith("DuplicateBuildScriptOutDir:") for b in record["blockers"]))
+
+    def test_rustix_three_pipe_bodies_eight_status_branches_and_overwrite_chain(self):
+        for bits in range(8):
+            codes = [(bits >> i) & 1 for i in range(3)]
+            with self.subTest(codes=codes):
+                session, record, receipts = self.fix5_result("rustix", "codes" + "".join(map(str, codes)))
+                self.assertEqual(record["blockers"], [])
+                probes = sorted(((p, r) for p, r in receipts if r["context"]["kind"] == "RustixMetadataProbe"), key=lambda pr: pr[1]["stdin"]["template_index"])
+                self.assertEqual(len(probes), 3)
+                previous, post = None, {"exists": False}
+                for index, (path, receipt) in enumerate(probes):
+                    self.assertEqual(receipt["exit_code"], codes[index])
+                    self.assertEqual((path / "stdin.raw").read_bytes(), owner.RUSTIX_BODIES[index])
+                    self.assertTrue(receipt["stdin"]["eof"])
+                    self.assertEqual(receipt["predecessor_invocation"], previous)
+                    self.assertEqual(owner.state_identity(receipt["metadata_pre"]), owner.state_identity(post))
+                    self.assertTrue((session / ("compiler-entry/rustix-fds-" + str(index))).exists())
+                    self.assertGreater((path / "stdout.raw").stat().st_size, 65536)
+                    self.assertGreater((path / "stderr.raw").stat().st_size, 65536)
+                    raw = json.loads((path / "stderr.raw").read_text().splitlines()[-1])
+                    self.assertEqual(raw["fixture_argv"], [bytes.fromhex(a).decode() for a in receipt["argv_hex"]][1:])
+                    for output in receipt["outputs"]:
+                        self.assertTrue(output["observation_only"])
+                        self.assertEqual(sha(path / output["snapshot"]), output["sha256"])
+                    previous, post = path.name, receipt["metadata_post"]
+                transient = probes[0][1]["declared_outputs"][0]["path"]
+                self.assertFalse(any(e["path"] == transient and e["producers"] for e in record["extern_edges"]))
+                self.assertFalse(any(str(Path(a["out_dir"]) / k) == transient for a in record["build_script_associations"] for k in a["generated_files"]))
+        _, record, _ = self.fix5_result("rustix", "remove_failed")
+        self.assertEqual(record["blockers"], [])
+
+    def test_rustix_invalid_input_refuses_before_compiler(self):
+        cases = ("body", "empty", "no_lf", "extra_lf", "nul", "overflow", "extra", "target_arg", "emit", "output", "output_alias", "native", "package", "version", "target_env", "std", "extra_feature", "encoded", "loader", "outdir", "cwd", "source", "reorder", "preexisting")
+        for case in cases:
+            with self.subTest(case=case):
+                session, record, _ = self.fix5_result("rustix", case, 2)
+                self.assertEqual(list((session / "compiler-entry").glob("rustix-*")), [])
+                self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+                raw = list((session / "invocations").glob("*/stdin.raw"))
+                if case in ("body", "empty", "no_lf", "extra_lf", "nul", "overflow", "reorder"):
+                    self.assertEqual(len(raw), 1)
+                if case == "overflow":
+                    self.assertEqual(raw[0].read_bytes(), b"X" * 123)
+                    meta = json.loads(raw[0].with_name("stdin.json").read_text())
+                    self.assertFalse(meta["eof"]); self.assertTrue(meta["truncated"])
+        for case in ("duplicate", "skip", "prestate"):
+            session, record, _ = self.fix5_result("rustix", case, 2)
+            self.assertTrue((session / "compiler-entry/rustix-0").exists())
+            self.assertFalse((session / "compiler-entry/rustix-1").exists())
+            statuses = [json.loads(line) for line in next((session / "target").rglob("statuses.jsonl")).read_text().splitlines()]
+            self.assertIn(b"RustixPrestate" if case == "prestate" else b"RustixSequence", bytes.fromhex(statuses[-1]["stderr_hex"]))
+            self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+
+    def test_rustix_evidence_and_source_graph_refuse_with_designated_blockers(self):
+        for case in ("tamper_stdin", "tamper_pre", "tamper_post", "tamper_missing_snapshot", "tamper_eof", "tamper_predecessor", "tamper_declaration", "builder_features", "cfg", "missing_origin", "wrong_origin", "duplicate_origin"):
+            with self.subTest(case=case):
+                _, record, receipts = self.fix5_result("rustix", case, 2)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(sum(r["context"]["kind"] == "RustixMetadataProbe" for _, r in receipts), 3)
+                self.assertTrue(any(b.startswith(("ChangedRustixEvidence:", "ChangedTransientEvidence:", "RustixGraph:", "DuplicateBuildScriptOutDir:")) for b in record["blockers"]))
+        for case in ("missing_output", "symlink", "exit2", "signal"):
+            with self.subTest(case=case):
+                _, record, receipts = self.fix5_result("rustix", case, 2)
+                probe = next(r for _, r in receipts if r["context"]["kind"] == "RustixMetadataProbe")
+                if case in ("missing_output", "symlink"):
+                    self.assertEqual(probe["exit_code"], 0)
+                    self.assertTrue(any(b.startswith(("MissingDeclaredOutput:", "TransientEvidence:")) for b in probe["blockers"]))
+                else:
+                    self.assertNotIn(probe["exit_code"], (0, 1)); self.assertIn("CompilerFailed", probe["blockers"])
+                self.assertTrue(record["blockers"])
+
+    def test_rustix_declared_path_never_becomes_output_artifact_or_selected_authority(self):
+        for case, blocker in (("ordinary_alias", "TransientOrdinaryOutput:"), ("artifact_alias", "TransientCargoArtifact:"), ("artifact_dot", "TransientCargoArtifact:"), ("absent_ordinary_alias", "TransientOrdinaryOutput:"), ("absent_artifact_alias", "TransientCargoArtifact:"), ("extern", "TransientExtern:"), ("consumed", "TransientConsumedSource:")):
+            with self.subTest(case=case):
+                _, record, receipts = self.fix5_result("rustix", case, 2)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertTrue(any(b.startswith(blocker) for b in record["blockers"]))
+                probes = [r for _, r in receipts if r["context"]["kind"] == "RustixMetadataProbe"]
+                transient = probes[0]["declared_outputs"][0]["path"]
+                self.assertTrue(all(r["exit_code"] in (0, 1) and not r["blockers"] for r in probes))
+                if case.startswith("absent_"):self.assertTrue(all(not r["metadata_post"]["exists"] for r in probes))
+                if "alias" in case or case == "artifact_dot":self.assertEqual(record["selected_library"], [])
+                self.assertFalse(any(e["path"] == transient and e["producers"] for e in record["extern_edges"]))
+                self.assertFalse(any(c["path"] == transient for c in record["consumed_sources"]))
+                self.assertFalse(any(str(Path(a["out_dir"]) / n) == transient for a in record["build_script_associations"] for n in a["generated_files"]))
+        _, record, _ = self.fix5_result("rustix", "nontransient_alias")
+        self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:
