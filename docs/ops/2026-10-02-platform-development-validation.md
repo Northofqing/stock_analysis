@@ -689,3 +689,30 @@ Task4 逐项风控已完成独立全任务 spec/quality 审查：均 Approved，
 实际13项定向 PASS（4新、9相关旧），包括真实重新计算 hash 的 NoChanges ledger 重开攻击与 owned-entry 计数，以及旧连接 prepare/confirm/consume、NoChanges、response/event 预算和 controls。新例日志 SHA `8c6c4ba296f410301ea400e781750aa835e7b193af593cd259285dbd1e8c16ed`，旧例 SHA `6729348844a63d29cc442f0abca9297a1299c9bea6934ee51837903ecce9b529`；同源封存 harness SHA `4003f4ad3a5130e1a0aa31631067a83ba7c603360f30a0ac19a70bb4bf871209`。凭据 `dev-20261003-wg07-reviewfix2-acceptance.json` 保留四文件和制品绑定。初版123及前次27的证据保留，未重复运行；本次未运行正常bin、全库、release或部署。I2范围独立复核待完成。
 
 F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Important 指向新存档 codec 的字段位置与错误节点类型预检。先前79项实际通过仍为原版证据；它们未覆盖该攻击，F2暂不算完成。原作者正在独立修复，只改 codec 与真实存档攻击回归，不改变财务重放、Global、风险与正向交易资格。
+
+
+### 2026-10-03：并行开发检查点与实际剩余工作
+
+用户明确授权并行，作者在独立 scratch 分别实施，root 独占源码应用、Cargo 与提交。最新三个切片已完成定向运行和独立审查：
+
+| 切片 | 源码检查点 | 最新验证与审查 |
+| --- | --- | --- |
+| 完整不可变 F2 拒绝记录的存档预检修复 | e650ba05 | 12 distinct PASS（7新、5旧），原审查 I1 ADDRESSED，Spec/Quality Approved；原79项保留为此前证据 |
+| WG07 保存 request 的资源边界修复 | 29d809e4 | 6 distinct PASS（1新、2扩展、3旧），I2 ADDRESSED；I1/I3/M1已于前次闭合，Spec/Quality Approved；原123/27/13项没有重跑 |
+| 完整回放资源预算基础 | 18001755 | 16 distinct PASS（15新、1旧真实非空副本/冷重开），全切片 Spec/Quality Approved；尚未接入完整金融 replay |
+
+三组共34项，以同一实际 library 编译和封存 harness 验证，857个 Rust/Cargo/build 输入冻结；每组凭据明确列出另外两组的额外编译输入与独立源码审查范围。harness SHA `45cfeeeb7d9f2c10a73dae34d655a3bf9d685007e959329c460b7ad27efbff48`。旧副本测试的诊断输出拆开状态行，root验收脚本曾漏识别，已从原日志的 exact1PASS/exit0修正凭据，未重跑或隐瞒运行失败。F2修复初次真实创建失败保留，已由原作者修正两个内部 copy root 并验证。
+
+存证纯值核心检查点 **1f2ff79b**：17项实际 PASS，340.465秒含编译，实际测试10.95秒；独立审查 NeedsFixes，I1是日根排序前尚未扣扫描预算，M1是极小 hex 缓冲容量的局部计量偏差。原作者正在窄修，暂不标该切片完成。它只有 Unverified draft、存储声明校验和 Incomplete/Unsigned root；真实远端留存与四类完整事实封存没有由这些声明产生。其单独860输入及新 harness/receipt不与旧34项混称。
+
+仍需继续完成的内容：
+
+| 剩余内容 | 当前边界与下一步 |
+| --- | --- |
+| 完整历史回放与迁移 | 预算基础已审；实际 compiler/dependency pin 录制工具、same-snapshot SQL预检与owned加载正在并行开发/设计。V1、execution、adjudication、legacy/FIFO完整累计回放以及固定6→8 recipe、全历史迁移、批准切换与crash恢复尚未闭合；同6副本不是全代际迁移 |
+| 正式正向 F2 与 paper 闭环 | 当前不可变拒绝记录保留全部原候选和实际风险状态。真实身份/时点/价格单位/交易状态等事实资格、正向决策、明确资金 B/策略分配/seed/cutover和正式订单/成交/撤单/对账接线仍需完成；默认资金不是批准 |
+| 完整 WORM 存证 | 先修纯值核心审查发现，再完成真实四owner范围封存、持久outbox/Unknown恢复、已配置远端精确version读取与1830天保留、日根非对称签名、独立冷端恢复/逐日对账。云厂商/地域/账号/密钥责任尚未确认 |
+| 真实上游和两端一致验收 | WG07真实生产source profile仍未交付，Test profile只验证本地完整链路。实际native字段、同源完整窗口/生命周期与时点证据、同版SDK/server/client pins需真实闭合 |
+| 运行与研究验收 | 52Unit同事实shadow、单一物理owner/promotion、统一健康/Quiet-Halted/OutcomeTracker剩余接线、AI比较与PIT/样本外/成本后检验仍需逐项真实证据；至少2个合资格交易日/5个自然日等观察不能由测试压缩 |
+
+本段是开发状态，不把单片 Approved 视为全平台完成。实际验证仅上述 targeted lib 路径及先前已记载范围，没有新增正常bin/release、全库或生产切换。消息链路10/3恢复证据仍在前段记录，开发检查点未取代原生产制品。
