@@ -273,7 +273,10 @@ def parse_rustc(args):
             name, value = arg.split("=", 1)
             require(re.fullmatch(r"(?:clippy::)?[a-z_][a-z0-9_]*", value) or value in {
                 "clippy::unnecessary-wraps", "clippy::or-fun-call",
-                "clippy::branches-sharing-code", "clippy::alloc-instead-of-core"},
+                "clippy::branches-sharing-code", "clippy::alloc-instead-of-core"} or arg in {
+                # Record6 indexmap: exact observed level/name pairs, not normalization.
+                "--deny=unsafe-code", "--deny=unreachable-pub", "--deny=unnameable-types",
+                "--deny=private-interfaces", "--deny=private-bounds", "--warn=rust-2018-idioms"},
                     "UnsupportedLintArgument")
             key = {"--allow": "-A", "--warn": "-W", "--deny": "-D"}[name]
         elif arg.split("=", 1)[0] in values:

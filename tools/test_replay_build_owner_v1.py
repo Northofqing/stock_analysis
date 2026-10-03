@@ -665,6 +665,111 @@ def snapshot(root, roots):
     return {"root": str(root), "roots": roots, "files": files}
 
 
+
+# Immutable record6 data. Only paths are substituted by this synthetic fixture.
+# It does not compile actual indexmap or assert effective deny under cap-lints allow.
+INDEXMAP6_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#indexmap@2.13.1"
+INDEXMAP6_LINTS = ["--deny=unsafe-code", "--deny=unreachable-pub", "--deny=unnameable-types",
+                  "--allow=clippy::style", "--warn=rust-2018-idioms",
+                  "--deny=private-interfaces", "--deny=private-bounds"]
+INDEXMAP6_ARGS = ["--crate-name", "indexmap", "--edition=2021", "{source}",
+    "--error-format=json", "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+    "--crate-type", "lib", "--emit=dep-info,metadata,link", "-C", "embed-bitcode=no",
+    "-C", "debuginfo=1", "-C", "split-debuginfo=unpacked", *INDEXMAP6_LINTS,
+    "--cfg", 'feature="default"', "--cfg", 'feature="serde"', "--cfg", 'feature="std"',
+    "--check-cfg", 'cfg(docsrs,test)', "--check-cfg",
+    'cfg(feature, values("arbitrary", "borsh", "default", "quickcheck", "rayon", "serde", "std", "sval", "test_debug"))',
+    "-C", "metadata=d0299001596b1a09", "-C", "extra-filename=-b765f9793bf2700c",
+    "--out-dir", "{dest}", "--target", "x86_64-apple-darwin", "-L", "dependency={dest}",
+    "-L", "dependency={host}", "--extern", "equivalent={dest}/libequivalent-3595038e0683f798.rmeta",
+    "--extern", "hashbrown={dest}/libhashbrown-b209ce0ec345b471.rmeta",
+    "--extern", "serde_core={dest}/libserde_core-d3ba454884ccf462.rmeta", "--cap-lints", "allow"]
+INDEXMAP6_MANIFEST = ('[package]\nname="indexmap"\nversion="2.13.1"\n'
+    '[lints.rust]\nprivate-bounds="deny"\nprivate-interfaces="deny"\n'
+    'rust-2018-idioms="warn"\nunnameable-types="deny"\nunreachable-pub="deny"\nunsafe-code="deny"\n'
+    '[lints.clippy]\nstyle="allow"\n')
+INDEXMAP6_REJECTIONS = {
+    "unknown_hyphen": (["--deny=unknown-rust-lint"], "UnsupportedLintArgument"),
+    "unsafe_level": (["--allow=unsafe-code"], "UnsupportedLintArgument"),
+    "unreachable_level": (["--warn=unreachable-pub"], "UnsupportedLintArgument"),
+    "unnameable_level": (["--allow=unnameable-types"], "UnsupportedLintArgument"),
+    "interfaces_level": (["--warn=private-interfaces"], "UnsupportedLintArgument"),
+    "bounds_level": (["--allow=private-bounds"], "UnsupportedLintArgument"),
+    "idioms_level": (["--deny=rust-2018-idioms"], "UnsupportedLintArgument"),
+    "double_hyphen": (["--deny=unsafe--code"], "UnsupportedLintArgument"),
+    "trailing_hyphen": (["--deny=unsafe-code-"], "UnsupportedLintArgument"),
+    "foreign_namespace": (["--deny=other::unsafe-code"], "UnsupportedLintArgument"),
+    "clippy_namespace": (["--deny=clippy::unsafe-code"], "UnsupportedLintArgument"),
+    "nested_namespace": (["--deny=clippy::rust::unsafe-code"], "UnsupportedLintArgument"),
+    "comma": (["--deny=unsafe-code,private-bounds"], "UnsupportedLintArgument"),
+    "equals": (["--deny=private-bounds=1"], "UnsupportedLintArgument"),
+    "space": (["--deny=unsafe-code "], "UnsupportedLintArgument"),
+    "newline": (["--deny=unsafe-code\n"], "UnsupportedLintArgument"),
+    "tab": (["--deny=unsafe-code\t"], "UnsupportedLintArgument"),
+    "control": (["--deny=unsafe-code\x07"], "UnsupportedLintArgument"),
+    "path": (["--deny=../unsafe-code"], "UnsupportedLintArgument"),
+    "forbid": (["--forbid=unsafe-code"], "UnsupportedRustcArgument:--forbid=unsafe-code"),
+    "force_warn": (["--force-warn=rust-2018-idioms"], "UnsupportedRustcArgument:--force-warn=rust-2018-idioms"),
+    "separated": (["--deny", "unsafe-code"], "UnsupportedRustcArgument:--deny"),
+    "unknown_codegen": (["-C", "TEST_CODE_unknown=yes"], "UnsupportedCodegen"),
+    "unstable": (["-Zrandomize-layout"], "UnsupportedRustcArgument:-Zrandomize-layout"),
+}
+
+INDEXMAP6_RUSTC = r"""
+import json,os,pathlib,sys
+args=sys.argv[1:]
+def value(key):
+    inline=[a.split('=',1)[1] for a in args if a.startswith(key+'=')]
+    return inline[0] if inline else args[args.index(key)+1]
+name=value('--crate-name');source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+codegen=[args[i+1] for i,a in enumerate(args) if a=='-C']
+suffix=next((v.split('=',1)[1] for v in codegen if v.startswith('extra-filename=')),'')
+base=name+suffix;out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+(hits/('compile-'+name)).write_text(json.dumps(args))
+for ext in ('.rmeta','.rlib'):(out/('lib'+base+ext)).write_bytes(name.encode()+b':'+source.read_bytes())
+def escape(text):return text.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+(out/(base+'.d')).write_text(escape(str(out/('lib'+base+'.rlib')))+': '+escape(str(source))+chr(10))
+print(json.dumps({'fixture_argv':args}),file=sys.stderr)
+"""
+
+INDEXMAP6_CARGO = r"""
+import json,os,pathlib,subprocess,sys
+CASE=__CASE__;MUTATIONS=__MUTATIONS__;TEMPLATE=__TEMPLATE__;PACKAGE=__PACKAGE__
+args=sys.argv[1:];assert args[:6]==['build','--locked','--offline','--lib','--target','x86_64-apple-darwin']
+app=pathlib.Path(args[args.index('--manifest-path')+1]).parent;session=app.parent
+root=session/'vendor/indexmap';dest=session/'target/x86_64-apple-darwin/debug/deps';host=session/'target/debug/deps'
+source=root/'src/lib.rs';original=source.read_bytes()
+def emit(value):print(json.dumps(value),flush=True)
+def compile(argv,manifest,package):
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(manifest),FIXTURE_HIT_ROOT=str(session/'compiler-entry'),
+             DYLD_FALLBACK_LIBRARY_PATH=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+    if manifest==root:env.update(CARGO_PKG_NAME='indexmap',CARGO_PKG_VERSION='2.13.1')
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],*argv]
+    if manifest==root:
+        (session/'fix6-attempt.json').write_text(json.dumps({'argv_hex':[os.fsencode(v).hex() for v in command[1:]]}))
+        if CASE=='package_mismatch':env['CARGO_MANIFEST_DIR']=str(app)
+        if CASE=='source_mismatch':source.chmod(0o644);source.write_bytes(b'// TEST_CODE_CHANGED\n')
+    try:result=subprocess.run(command,env=env,cwd=manifest)
+    finally:
+        if manifest==root and CASE=='source_mismatch':source.write_bytes(original);source.chmod(0o444)
+    if result.returncode:emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+    name=argv[argv.index('--crate-name')+1];src=next(a for a in argv if a.endswith('.rs'))
+    suffix=next((v.split('=',1)[1] for v in argv if v.startswith('extra-filename=')),'')
+    files=[str(dest/('lib'+name+suffix+ext)) for ext in ('.rlib','.rmeta')]
+    emit({'reason':'compiler-artifact','package_id':package,'target':{'src_path':src,'kind':['lib'],'name':name,'crate_types':['lib']},'filenames':files,'executable':None,'fresh':False})
+if CASE=='normal':
+    for name,suffix in [('equivalent','-3595038e0683f798'),('hashbrown','-b209ce0ec345b471'),('serde_core','-d3ba454884ccf462')]:
+        pkg=session/'vendor'/name
+        compile(['--crate-name',name,'--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),'--target','x86_64-apple-darwin','-C','extra-filename='+suffix,str(pkg/'src/lib.rs')],pkg,'TEST_CODE_'+name)
+argv=[v.format(source=source,dest=dest,host=host) for v in TEMPLATE]
+if CASE in MUTATIONS:argv=MUTATIONS[CASE][0]+argv
+compile(argv,root,PACKAGE)
+assert CASE=='normal'
+compile(['--crate-name','stock_analysis','--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),'--target','x86_64-apple-darwin','--extern','indexmap='+str(dest/'libindexmap-b765f9793bf2700c.rmeta'),str(app/'src/lib.rs')],app,'TEST_CODE_app')
+emit({'reason':'build-finished','success':True})
+"""
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -1445,6 +1550,140 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertFalse(any(str(Path(a["out_dir"]) / n) == transient for a in record["build_script_associations"] for n in a["generated_files"]))
         _, record, _ = self.fix5_result("rustix", "nontransient_alias")
         self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+
+
+    def prepare_indexmap6(self, case="normal"):
+        # Reuse unchanged base inventory setup; replace only this case's fake tools.
+        inventory = self.prepare()
+        vendor = self.root / "vendor-origin"
+        write(vendor / "indexmap/Cargo.toml", INDEXMAP6_MANIFEST)
+        write(vendor / "indexmap/src/lib.rs", "// TEST_CODE synthetic indexmap source\n")
+        write(vendor / "indexmap/.cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+        roots = ["dep", "indexmap"]
+        inventory["packages"].append({"id": INDEXMAP6_PACKAGE, "tree": "vendor", "manifest": "indexmap/Cargo.toml"})
+        for name in ("equivalent", "hashbrown", "serde_core"):
+            roots.append(name)
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="0.0.0"\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE prerequisite " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id": "TEST_CODE_" + name, "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        inventory["vendor"] = snapshot(vendor, roots)
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + INDEXMAP6_RUSTC)
+        cargo_text = INDEXMAP6_CARGO.replace("__CASE__", repr(case)).replace("__MUTATIONS__", repr(INDEXMAP6_REJECTIONS)).replace("__TEMPLATE__", repr(INDEXMAP6_ARGS)).replace("__PACKAGE__", repr(INDEXMAP6_PACKAGE))
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_text)
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inventory["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}
+        inventory["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
+        return inventory
+
+    def indexmap6_rejection(self, case, marker):
+        self.prepare_indexmap6(case)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 2, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        self.assertEqual(record["selected_library"], [])
+        self.assertEqual(record["cargo_exit_code"], 2)
+        rejected = list((session / "invocations").iterdir())
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual({p.name for p in rejected[0].iterdir()}, {"request.json"})
+        self.assertEqual(record["blockers"], sorted(["CargoDidNotFinishSuccessfully",
+            "IncompleteInvocation:" + rejected[0].name, "UnresolvedSelectedLibrary"]))
+        self.assertFalse((session / "compiler-entry").exists())
+        self.assertFalse(list((session / "target").rglob("*.rlib")))
+        diagnostics = [json.loads(line) for line in (session / "cargo.stderr.raw").read_text().splitlines()]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["reason"], "Refused")
+        self.assertEqual(diagnostics[0]["detail"], marker)
+        request = json.loads((rejected[0] / "request.json").read_text())
+        attempt = json.loads((session / "fix6-attempt.json").read_text())
+        self.assertEqual(request["argv_hex"], attempt["argv_hex"])
+        return session, request, record
+
+    def test_record6_exact_lint_pairs_preserve_parser_input(self):
+        base = ["--crate-name", "x", "--out-dir", "/tmp/test", "--emit=dep-info", "src/lib.rs"]
+        new = [v for v in INDEXMAP6_LINTS if v != "--allow=clippy::style"]
+        old = ["--allow=unknown_but_syntactically_valid", "--warn=unsafe_code", "--deny=private_bounds",
+               "--allow=clippy::unnecessary-wraps", "--warn=clippy::or-fun-call",
+               "--deny=clippy::branches-sharing-code", "--allow=clippy::alloc-instead-of-core"]
+        for literal in new + old:
+            with self.subTest(literal=literal):
+                args = [literal, *base]; original = list(args)
+                parsed = owner.parse_rustc(args)
+                prefix, name = literal.split("=", 1)
+                self.assertEqual(parsed["options"][{"--allow": "-A", "--warn": "-W", "--deny": "-D"}[prefix]], [name])
+                self.assertEqual(args, original)
+        args = [*new, "--warn=unsafe_code", "--deny=unsafe-code", "-A", "old-short-form", "-Wold_short", *base]
+        original = list(args); parsed = owner.parse_rustc(args)
+        self.assertEqual(args, original)
+        self.assertEqual(parsed["options"]["-D"], ["unsafe-code", "unreachable-pub", "unnameable-types", "private-interfaces", "private-bounds", "unsafe-code"])
+        self.assertEqual(parsed["options"]["-W"], ["rust-2018-idioms", "unsafe_code", "old_short"])
+        self.assertEqual(parsed["options"]["-A"], ["old-short-form"])
+        for case, (tokens, marker) in INDEXMAP6_REJECTIONS.items():
+            with self.subTest(case=case):
+                args = [*tokens, *base]; original = list(args)
+                with self.assertRaises(owner.Refusal) as raised:
+                    owner.parse_rustc(args)
+                self.assertEqual(str(raised.exception), marker)
+                self.assertEqual(args, original)
+
+    def test_record6_indexmap_argv_receipts_and_source_producers(self):
+        inventory = self.prepare_indexmap6()
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(record["review_gate"], "IndependentPolicyReviewRequired")
+        self.assertEqual(len(record["selected_library"]), 1)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        paths = list((session / "invocations").glob("*/receipt.json"))
+        self.assertEqual(len(paths), 5)
+        receipts = [(p, json.loads(p.read_text())) for p in paths]
+        path, receipt = next((p, r) for p, r in receipts if r["parsed"]["options"]["--crate-name"] == ["indexmap"])
+        expected = [inventory["rustc"]["path"], *[v.format(source=session / "vendor/indexmap/src/lib.rs",
+            dest=session / "target/x86_64-apple-darwin/debug/deps", host=session / "target/debug/deps") for v in INDEXMAP6_ARGS]]
+        expected_hex = [os.fsencode(v).hex() for v in expected]
+        for name in ("request.json", "invocation.json", "receipt.json"):
+            self.assertEqual(json.loads((path.parent / name).read_text())["argv_hex"], expected_hex)
+        self.assertEqual(json.loads((path.parent / "stderr.raw").read_text())["fixture_argv"], expected[1:])
+        self.assertEqual(json.loads((session / "compiler-entry/compile-indexmap").read_text()), expected[1:])
+        self.assertEqual(receipt["parsed"]["options"]["-D"], ["unsafe-code", "unreachable-pub", "unnameable-types", "private-interfaces", "private-bounds"])
+        self.assertEqual(receipt["parsed"]["options"]["-W"], ["rust-2018-idioms"])
+        self.assertEqual(receipt["parsed"]["options"]["--cap-lints"], ["allow"])
+        self.assertEqual(receipt["package"], {"id": INDEXMAP6_PACKAGE, "tree": "vendor", "manifest": "indexmap/Cargo.toml"})
+        self.assertEqual(receipt["source"], str(session / "vendor/indexmap/src/lib.rs"))
+        self.assertEqual(receipt["context"], {"kind": "DirectCargoCompile"})
+        self.assertEqual(receipt["role"], "Target")
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(sha(session / "vendor/indexmap/src/lib.rs"), inventory["vendor"]["files"]["indexmap/src/lib.rs"])
+        self.assertEqual(sha(session / "vendor/indexmap/Cargo.toml"), inventory["vendor"]["files"]["indexmap/Cargo.toml"])
+        self.assertEqual((session / "vendor/indexmap/Cargo.toml").read_text(), INDEXMAP6_MANIFEST)
+        edges = [e for e in record["extern_edges"] if e["consumer"] == path.parent.name]
+        self.assertEqual(len(edges), 3)
+        self.assertEqual({e["name"] for e in edges}, {"equivalent", "hashbrown", "serde_core"})
+        self.assertTrue(all(len(e["producers"]) == 1 for e in edges))
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()},
+                         {"compile-equivalent", "compile-hashbrown", "compile-serde_core", "compile-indexmap", "compile-stock_analysis"})
+
+    def test_record6_lints_do_not_authorize_mismatched_sources(self):
+        for case, marker in (("package_mismatch", "UnresolvedSourcePackage"), ("source_mismatch", "SourceMismatch")):
+            with self.subTest(case=case):
+                session, request, record = self.indexmap6_rejection(case, marker)
+                argv = [os.fsdecode(bytes.fromhex(v)) for v in request["argv_hex"]]
+                self.assertEqual([v for v in argv if v.startswith(("--deny=", "--warn=", "--allow="))], INDEXMAP6_LINTS)
+                self.assertEqual(argv[-2:], ["--cap-lints", "allow"])
+                self.assertEqual(record["invocations"], [])
+                self.assertEqual((session / "vendor/indexmap/src/lib.rs").read_text(), "// TEST_CODE synthetic indexmap source\n")
+
+    def test_record6_unknown_lints_and_flags_refuse_before_compiler(self):
+        for case, (tokens, marker) in INDEXMAP6_REJECTIONS.items():
+            with self.subTest(case=case):
+                _, request, record = self.indexmap6_rejection(case, marker)
+                argv = [os.fsdecode(bytes.fromhex(v)) for v in request["argv_hex"]]
+                self.assertEqual(argv[1:1 + len(tokens)], tokens)
+                self.assertEqual(record["invocations"], [])
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:
