@@ -35,6 +35,8 @@ pub mod instrument_identity;
 pub mod intraday_shape;
 pub mod market_capabilities;
 pub mod market_data;
+pub mod ordinary_daily_change_window;
+pub(crate) mod ordinary_daily_change_window_contract;
 pub mod outcome_daily_bars;
 pub mod position_chain;
 pub mod qualified_trading_facts;

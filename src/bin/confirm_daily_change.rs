@@ -27,8 +27,22 @@ struct Args {
     database: Option<PathBuf>,
     #[arg(long)]
     code: Option<String>,
-    #[arg(long, default_value_t = 60)]
-    days: usize,
+    #[arg(long)]
+    days: Option<usize>,
+    #[arg(long, conflicts_with_all=["candidate_id","confirm","reject","renew","days","previous_date","current_date","evidence_token","operator","reason"])]
+    prepare_window: bool,
+    #[arg(long, requires = "prepare_window")]
+    exchange: Option<String>,
+    #[arg(long, requires = "prepare_window")]
+    from: Option<NaiveDate>,
+    #[arg(long, requires = "prepare_window")]
+    to: Option<NaiveDate>,
+    #[arg(long, requires = "prepare_window")]
+    as_of: Option<chrono::DateTime<Utc>>,
+    #[arg(long, requires = "prepare_window")]
+    source_profile: Option<String>,
+    #[arg(long, requires = "prepare_window")]
+    client_bundle: Option<PathBuf>,
     #[arg(long,conflicts_with_all=["reject","renew"])]
     confirm: bool,
     #[arg(long,conflicts_with_all=["confirm","renew"])]
@@ -56,6 +70,29 @@ fn exact<'a>(flag: &str, value: Option<&'a str>) -> anyhow::Result<&'a str> {
     Ok(value)
 }
 fn validate(args: &Args) -> anyhow::Result<()> {
+    if args.prepare_window {
+        exact("--code", args.code.as_deref())?;
+        anyhow::ensure!(
+            matches!(args.exchange.as_deref(), Some("Shanghai" | "Shenzhen")),
+            "--exchange must be Shanghai or Shenzhen"
+        );
+        anyhow::ensure!(
+            args.from.is_some()
+                && args.to.is_some()
+                && args.as_of.is_some()
+                && args.database.is_some()
+                && args.client_bundle.is_some(),
+            "prepare requires --from --to --as-of --client-bundle --database"
+        );
+        let profile = exact("--source-profile", args.source_profile.as_deref())?;
+        let (id, version) = profile
+            .rsplit_once('@')
+            .ok_or_else(|| anyhow::anyhow!("--source-profile requires id@version"))?;
+        anyhow::ensure!(
+            !id.is_empty() && version.parse::<u32>().is_ok_and(|v| v > 0),
+            "profile version must be positive"
+        );
+    }
     if let Some(code) = &args.code {
         anyhow::ensure!(
             code.len() == 6
@@ -68,7 +105,7 @@ fn validate(args: &Args) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        (2..=usize::from(u16::MAX)).contains(&args.days),
+        (2..=usize::from(u16::MAX)).contains(&args.days.unwrap_or(60)),
         "--days outside 2..65535"
     );
     if args.candidate_id.is_some() {
@@ -129,11 +166,39 @@ fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<SqliteConnectio
     Ok(conn)
 }
 
+fn window_request(
+    args: &Args,
+) -> anyhow::Result<
+    stock_analysis::data_gateway::ordinary_daily_change_window::OrdinaryDailyChangeWindowRequest,
+> {
+    use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
+    Ok(stock_analysis::data_gateway::ordinary_daily_change_window::OrdinaryDailyChangeWindowRequest {
+        instrument:InstrumentId::new(if args.exchange.as_deref()==Some("Shanghai"){Exchange::Shanghai}else{Exchange::Shenzhen},exact("--code",args.code.as_deref())?,AssetClass::Equity).map_err(|e|anyhow::anyhow!(e.to_string()))?,
+        from:args.from.ok_or_else(||anyhow::anyhow!("--from required"))?,to:args.to.ok_or_else(||anyhow::anyhow!("--to required"))?,as_of:args.as_of.ok_or_else(||anyhow::anyhow!("--as-of required"))?,source_profile:exact("--source-profile",args.source_profile.as_deref())?.into(),
+    })
+}
+
 async fn run(args: Args, output: &mut impl Write) -> anyhow::Result<()> {
     validate(&args)?;
+    if args.prepare_window {
+        let request = window_request(&args)?;
+        let receipt = stock_analysis::data_gateway::ordinary_daily_change_window::prepare_window(
+            request,
+            args.client_bundle.as_deref().unwrap(),
+            args.database.as_deref().unwrap(),
+        )
+        .await?;
+        serde_json::to_writer(&mut *output, &receipt)?;
+        writeln!(output)?;
+        output.flush()?;
+        return Ok(());
+    }
     let Some(candidate_id) = args.candidate_id.as_deref() else {
         HistoricalBarsGateway::new()
-            .pending_daily_change_confirmations_async(args.code.as_deref().unwrap(), args.days)
+            .pending_daily_change_confirmations_async(
+                args.code.as_deref().unwrap(),
+                args.days.unwrap_or(60),
+            )
             .await?;
         anyhow::bail!(
             "daily_change_discovery_unavailable_v1: no persisted candidate discovery contract"
@@ -249,6 +314,65 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("daily_change_discovery_unavailable_v1"));
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    fn args() -> Vec<&'static str> {
+        vec![
+            "confirm_daily_change",
+            "--prepare-window",
+            "--exchange",
+            "Shanghai",
+            "--code",
+            "600519",
+            "--from",
+            "2026-09-11",
+            "--to",
+            "2026-09-15",
+            "--as-of",
+            "2026-09-16T08:00:00Z",
+            "--source-profile",
+            "TEST_CODE_SYNTHETIC@1",
+            "--client-bundle",
+            "TEST_CODE.bundle",
+            "--database",
+            "TEST_CODE.sqlite",
+        ]
+    }
+    #[test]
+    fn wg07_cli_explicit_window_fields_and_legacy_days_default() {
+        let a = Args::try_parse_from(args()).unwrap();
+        validate(&a).unwrap();
+        let r = window_request(&a).unwrap();
+        assert_eq!(r.instrument.code(), "600519");
+        assert_eq!(r.from.to_string(), "2026-09-11");
+        assert_eq!(r.source_profile, "TEST_CODE_SYNTHETIC@1");
+        assert!(a.days.is_none());
+        let a = Args::try_parse_from(["confirm_daily_change", "--code", "300005"]).unwrap();
+        assert_eq!(a.days.unwrap_or(60), 60);
+        for extra in [
+            vec!["--days", "60"],
+            vec!["--confirm"],
+            vec!["--candidate-id", "x"],
+            vec!["--renew"],
+        ] {
+            let mut input = args();
+            input.extend(extra);
+            assert!(Args::try_parse_from(input).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn wg07_cli_calls_public_prepare_owner_without_creating_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.sqlite");
+        let mut a = Args::try_parse_from(args()).unwrap();
+        a.database = Some(path.clone());
+        let error = run(a, &mut Vec::new()).await.unwrap_err().to_string();
+        assert!(error.contains("UnsupportedProfileOrVersion"));
         assert!(!path.exists());
     }
 }

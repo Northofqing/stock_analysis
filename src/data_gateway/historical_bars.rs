@@ -42,6 +42,13 @@ pub(crate) struct QualifiedDailyChangeDiscovery {
 }
 
 impl QualifiedDailyChangeDiscovery {
+    pub(crate) fn from_window_pair(
+        pair: super::ordinary_daily_change_window::QualifiedPair,
+    ) -> Self {
+        Self {
+            snapshot: pair.into_snapshot(),
+        }
+    }
     pub(crate) fn snapshot(&self) -> &crate::database::daily_change_review::ReviewSnapshot {
         &self.snapshot
     }

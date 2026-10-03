@@ -597,8 +597,15 @@ impl GrpcMarketClient {
     async fn get_external_health_observed(
         &mut self,
     ) -> Result<(ExternalHealthResponse, Vec<u8>), GrpcError> {
+        self.get_external_health_retaining()
+            .await
+            .map_err(|failure| failure.error)
+    }
+    async fn get_external_health_retaining(
+        &mut self,
+    ) -> Result<(ExternalHealthResponse, Vec<u8>), ExternalControlObservationFailure> {
         if !matches!(&self.system, SystemTransport::External(_)) {
-            return Err(system_profile_mismatch());
+            return Err(system_profile_mismatch().into());
         }
         let request_id = crate::grpc_client::envelope::new_request_id();
         let mut request = tonic::Request::new(ExternalHealthRequest {
@@ -610,13 +617,27 @@ impl GrpcMarketClient {
         self.attach_request_auth(&mut request)?;
         match self.execute_external_health(request).await {
             ExternalSystemCall::Response(response, bytes) => {
-                self.observe_external_health(&request_id, &response)?;
+                if let Err(error) = self.observe_external_health(&request_id, &response) {
+                    return Err(ExternalControlObservationFailure {
+                        error,
+                        response_bytes: Some(bytes),
+                        status: None,
+                    });
+                }
                 Ok((response, bytes))
             }
-            ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
-                status,
-                StatusErrorContext::control(ContractProfile::ExternalV1, &request_id),
-            )),
+            ExternalSystemCall::UnaryStatus(status) => {
+                let actual_status = status.clone();
+                let error = self.external_status_error(
+                    status,
+                    StatusErrorContext::control(ContractProfile::ExternalV1, &request_id),
+                );
+                Err(ExternalControlObservationFailure {
+                    error,
+                    response_bytes: None,
+                    status: Some(actual_status),
+                })
+            }
         }
     }
 
@@ -632,8 +653,15 @@ impl GrpcMarketClient {
     async fn get_external_capabilities_observed(
         &mut self,
     ) -> Result<(ExternalCapabilitiesResponse, Vec<u8>), GrpcError> {
+        self.get_external_capabilities_retaining()
+            .await
+            .map_err(|failure| failure.error)
+    }
+    async fn get_external_capabilities_retaining(
+        &mut self,
+    ) -> Result<(ExternalCapabilitiesResponse, Vec<u8>), ExternalControlObservationFailure> {
         if !matches!(&self.system, SystemTransport::External(_)) {
-            return Err(system_profile_mismatch());
+            return Err(system_profile_mismatch().into());
         }
         self.require_external_qualification()?;
         let request_id = crate::grpc_client::envelope::new_request_id();
@@ -646,13 +674,27 @@ impl GrpcMarketClient {
         self.attach_request_auth(&mut request)?;
         match self.execute_external_capabilities(request).await {
             ExternalSystemCall::Response(response, bytes) => {
-                self.accept_external_capabilities(&request_id, &response)?;
+                if let Err(error) = self.accept_external_capabilities(&request_id, &response) {
+                    return Err(ExternalControlObservationFailure {
+                        error,
+                        response_bytes: Some(bytes),
+                        status: None,
+                    });
+                }
                 Ok((response, bytes))
             }
-            ExternalSystemCall::UnaryStatus(status) => Err(self.external_status_error(
-                status,
-                StatusErrorContext::control(ContractProfile::ExternalV1, &request_id),
-            )),
+            ExternalSystemCall::UnaryStatus(status) => {
+                let actual_status = status.clone();
+                let error = self.external_status_error(
+                    status,
+                    StatusErrorContext::control(ContractProfile::ExternalV1, &request_id),
+                );
+                Err(ExternalControlObservationFailure {
+                    error,
+                    response_bytes: None,
+                    status: Some(actual_status),
+                })
+            }
         }
     }
 
@@ -2051,5 +2093,22 @@ mod tests {
     #[test]
     fn client_bundle_constructor_is_exposed_without_reading_a_real_bundle() {
         let _constructor = GrpcMarketClient::connect_client_bundle;
+    }
+}
+
+/// A private observed-control failure. Response bytes exist only when the
+/// decoder returned a response; a status never fabricates response material.
+struct ExternalControlObservationFailure {
+    error: GrpcError,
+    response_bytes: Option<Vec<u8>>,
+    status: Option<tonic::Status>,
+}
+impl From<GrpcError> for ExternalControlObservationFailure {
+    fn from(error: GrpcError) -> Self {
+        Self {
+            error,
+            response_bytes: None,
+            status: None,
+        }
     }
 }

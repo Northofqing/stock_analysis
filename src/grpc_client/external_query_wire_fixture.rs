@@ -108,6 +108,7 @@ enum ExternalQueryWireReply {
     FlowIncomplete,
     FlowRecordUnavailable,
     Historical(HistoricalQueryReply),
+    Window,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +147,7 @@ enum ExternalCapabilitiesBehavior {
     FuturesDelivery,
     Flows,
     Historical(HistoricalCapabilityBehavior),
+    Window,
 }
 
 #[derive(Default)]
@@ -154,6 +156,8 @@ struct ExternalQueryWireState {
     reply: ExternalQueryWireReply,
     capabilities_behavior: ExternalCapabilitiesBehavior,
     invalid_health_identity: bool,
+    invalid_window_capabilities: bool,
+    window_reply: Option<Arc<dyn Fn(&QueryRequest) -> Result<QueryResponse, Status> + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -373,6 +377,29 @@ impl SystemService for ExternalQueryWireService {
                     })
                     .collect(),
             },
+            ExternalCapabilitiesBehavior::Window => CapabilitiesResponse {
+                request_id: if self
+                    .state
+                    .lock()
+                    .expect("TEST_CODE caps mutation")
+                    .invalid_window_capabilities
+                {
+                    "TEST_CODE_WRONG_WG07_CAPS_ID".into()
+                } else {
+                    request_id
+                },
+                capabilities: vec![Capability {
+                    operation: Operation::HistoricalBars as i32,
+                    provider: "HithinkFinance".into(),
+                    repository_admission: AdmissionState::Admitted as i32,
+                    runtime_available: true,
+                    exact_scope:
+                        crate::data_gateway::ordinary_daily_change_window_contract::TEST_SCOPE
+                            .into(),
+                    blocker: String::new(),
+                    diagnostic_available: false,
+                }],
+            },
             ExternalCapabilitiesBehavior::Historical(behavior) => CapabilitiesResponse {
                 request_id,
                 capabilities: historical_capabilities(behavior),
@@ -476,6 +503,19 @@ impl ExternalQueryWireService {
             .lock()
             .expect("TEST_CODE External query wire reply mode")
             .reply;
+        if reply == ExternalQueryWireReply::Window {
+            if operation != Operation::HistoricalBars {
+                return Err(Status::invalid_argument("TEST_CODE WG07 method"));
+            }
+            let handler = self
+                .state
+                .lock()
+                .expect("TEST_CODE WG07 handler")
+                .window_reply
+                .clone()
+                .ok_or_else(|| Status::internal("TEST_CODE missing WG07 handler"))?;
+            return handler(&request).map(Response::new);
+        }
         if let ExternalQueryWireReply::Historical(reply) = reply {
             let payload = request
                 .payload
@@ -642,6 +682,11 @@ impl ExternalQueryWireService {
             ExternalQueryWireReply::FlowIncomplete => None,
             ExternalQueryWireReply::FlowRecordUnavailable => None,
             ExternalQueryWireReply::Historical(_) => unreachable!(),
+            ExternalQueryWireReply::Window => {
+                unreachable!(
+                    "TEST_CODE WG07 HistoricalBars reply returned before provider attempts"
+                )
+            }
         };
         if let Some((provider_attempts, provider)) = attempt_status {
             let details = ErrorDetail {
@@ -1241,6 +1286,35 @@ pub(crate) struct ExternalQueryWireFixture {
 }
 
 impl ExternalQueryWireFixture {
+    pub(crate) async fn bind_window(
+        handler: impl Fn(&QueryRequest) -> Result<QueryResponse, Status> + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let fixture = Self::bind_with_route_reply_and_capabilities(
+            ExternalQueryWireRoute::Generated,
+            ExternalQueryWireReply::Window,
+            ExternalCapabilitiesBehavior::Window,
+        )
+        .await?;
+        fixture
+            .state
+            .lock()
+            .expect("TEST_CODE WG07 install handler")
+            .window_reply = Some(Arc::new(handler));
+        Ok(fixture)
+    }
+    pub(crate) fn window_invalid_capabilities(&self) {
+        self.state
+            .lock()
+            .expect("TEST_CODE caps control")
+            .invalid_window_capabilities = true;
+    }
+    pub(crate) fn window_scope_unavailable(&self) {
+        self.state
+            .lock()
+            .expect("TEST_CODE WG07 capability mutation")
+            .capabilities_behavior =
+            ExternalCapabilitiesBehavior::Historical(HistoricalCapabilityBehavior::Ready);
+    }
     pub(crate) async fn bind_historical(
         reply: HistoricalQueryReply,
         capabilities: HistoricalCapabilityBehavior,

@@ -1,0 +1,6 @@
+{
+  "note": "Synthetic protocol only; never a provider admission receipt. Digests independently calculated from literal canonical bytes.",
+  "scope": "be0aa363001b9dbfe2506cd8952cfa550b3f4b211995f0f5a2a841a6806740d9",
+  "fact": "db136d6eada54e696d7a0109364daed4864e1c6f7627b3446f74ba643616456b",
+  "pair_fact_json_bytes": 1165
+}

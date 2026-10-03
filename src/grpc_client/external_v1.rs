@@ -849,3 +849,51 @@ mod tests {
         }
     }
 }
+
+/// Only the frozen WG07 owner can create this request; production dispatch first
+/// requires a genuinely delivered compiled profile.
+pub(crate) struct ExternalOrdinaryDailyChangeWindowQuery(QueryRequest);
+impl ExternalOrdinaryDailyChangeWindowQuery {
+    pub(crate) fn into_request(self) -> QueryRequest {
+        self.0
+    }
+    pub(crate) fn wire_bytes(
+        &self,
+    ) -> Result<Vec<u8>, crate::data_gateway::ordinary_daily_change_window::DiscoveryFailure> {
+        use crate::data_gateway::ordinary_daily_change_window_contract::{failure, MIB};
+        use prost::Message;
+        if self.0.encoded_len() > MIB {
+            return Err(failure(
+                crate::data_gateway::ordinary_daily_change_window::FailureKind::InvalidRequest,
+                "request byte limit",
+            ));
+        }
+        Ok(self.0.encode_to_vec())
+    }
+}
+pub(crate) fn build_ordinary_window_query(
+    frozen: &crate::data_gateway::ordinary_daily_change_window_contract::FrozenRequest,
+    profile: &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
+) -> Result<
+    ExternalOrdinaryDailyChangeWindowQuery,
+    crate::data_gateway::ordinary_daily_change_window::DiscoveryFailure,
+> {
+    use crate::data_gateway::ordinary_daily_change_window_contract::{encode, MIB, REQUEST_SCHEMA};
+    let data = encode(&frozen.request, MIB)?;
+    let q = ExternalOrdinaryDailyChangeWindowQuery(QueryRequest {
+        context: Some(RequestContext {
+            protocol_version: 1,
+            request_id: crate::grpc_client::envelope::new_request_id(),
+        }),
+        preferred_provider: profile.provider.into(),
+        allow_unadmitted: false,
+        payload: Some(CanonicalPayload {
+            schema: REQUEST_SCHEMA.into(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".into(),
+            data,
+        }),
+    });
+    q.wire_bytes()?;
+    Ok(q)
+}

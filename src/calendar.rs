@@ -1018,3 +1018,24 @@ mod tests {
         let _ = session_label();
     }
 }
+
+/// Original checked-in SSE authority metadata, without relabeling venue scope.
+pub(crate) fn ordinary_window_calendar_metadata(
+) -> Result<(&'static str, u32, NaiveDate, NaiveDate), VerifiedCalendarError> {
+    let c = verified_calendar()?;
+    let first = *c
+        .coverage_years
+        .iter()
+        .min()
+        .ok_or_else(|| VerifiedCalendarError::unavailable("calendar_coverage", false))?;
+    let last = *c
+        .coverage_years
+        .iter()
+        .max()
+        .ok_or_else(|| VerifiedCalendarError::unavailable("calendar_coverage", false))?;
+    let from = NaiveDate::from_ymd_opt(first, 1, 1)
+        .ok_or_else(|| VerifiedCalendarError::unavailable("calendar_bounds", false))?;
+    let to = NaiveDate::from_ymd_opt(last, 12, 31)
+        .ok_or_else(|| VerifiedCalendarError::unavailable("calendar_bounds", false))?;
+    Ok(("checked-in-sse-calendar", 1, from, to))
+}

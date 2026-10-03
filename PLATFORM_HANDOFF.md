@@ -217,3 +217,13 @@ Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需
 
 
 Task2 I1 范围独立复核已通过：原 reservation 在原校验/回调之前累计扣保留的原 meter，fresh/cold 路径及四项日志/源码/hash核验一致；无新 Critical/Important、无其余观察。源码检查点 f6bebc2f。完整 Task2 审查与唯一 I1 修复闭合，当前开发片完成，仍无批准迁移、切换、上线或 Paper 资格。继续 Task3 WG07 完整窗口与既有复核账本/后续精确消费。
+
+### 2026-10-03 WG07 窗口链路与并行后继（运行审查未闭合）
+
+新增完整显式窗口 prepare/consume 与 `confirm_daily_change --prepare-window`。新 request/result schema1、原复核 snapshot schema2 分域；实际 mTLS/Health/Caps/原始 wire、native 解释、损失为零的十进制 bars、原 IMMEDIATE 全窗口记录及重新取数后的逐事实确认消费均已接通。旧 days 默认60、旧 wire/confirmation 域保持。生产 profile registry 仍为空，合成 profile 仅 cfg(test)，没有真实上游交付或上线资格。
+
+实际31项新 library tests 与87项去重受影响旧回归通过；复用同 SHA 封存 harness，未跑全库。首次编译遗漏 Test fixture 分支、首次正常库编译发现前 Task2 的 Test enum 条件编译遗漏，失败日志均保留；前者已修，后者窄修检查点 f879c330。命令行目标正在正常编译重验，独立任务审查待进行，不据此宣布本片全部完成。
+
+用户明确授权并行：逐规则风险矩阵/两个技术开关独立修复、完整不可变 F2 拒绝记录/Catalog8 分别在独立 scratch 实施，root 统一应用、Cargo 与提交。普通缺输入/异常规则会如实记录不完整且不授 formal pass，沿用原分析政策；真正报告或聚合失败在 enabled exact-live Buy 路径保留失败并阻断。F2 第一片保原全部 Top50 raw 候选，缺 native identity 则明确未调用事实 Gateway，完整拒绝理由与实际冻结风险配置持久保存，不能伪造资金/批准/可交易结果。
+
+WG07 当前运行门禁已通过：31新lib、87去重旧lib及5个命令行cases，共123 distinct PASS。正常lib由确认工具目标编译通过，修后命令行日志SHA `caaae3ddfda580972f802e90c2bb2b14f13a067e6fdefc92fbf4bfa04b71cc53`。之前 cfg(test) 行为不变的库证据明确复用，没有宣称重跑；源码以 f879c330 为任务审查BASE提交。独立 fulltask spec/quality 审查尚待完成。

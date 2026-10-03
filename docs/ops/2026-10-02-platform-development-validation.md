@@ -646,3 +646,13 @@ Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需
 
 
 Task2 I1 范围独立复核已通过：原 reservation 在原校验/回调之前累计扣保留的原 meter，fresh/cold 路径及四项日志/源码/hash核验一致；无新 Critical/Important、无其余观察。源码检查点 f6bebc2f。完整 Task2 审查与唯一 I1 修复闭合，当前开发片完成，仍无批准迁移、切换、上线或 Paper 资格。继续 Task3 WG07 完整窗口与既有复核账本/后续精确消费。
+
+### 2026-10-03 Task3 WG07 actual window validation in progress
+
+Applied the approved WG07 request/native proof/prepare/admission implementation plus one cfg(test) fixture enum-arm repair. Initial library compile failed E0004 before tests (raw log SHA `48230ce3d9c0011e465da4882af3afab1512ebb9786d84be01033a3043b368c4`). Exact connected mTLS prepare/reopen/confirm/consume then passed through actual owners; log `ff028355775620b739abde66640a0b9d5d56a11ad204312960f30961119d30dc`.
+
+The same actually compiled sealed library harness SHA `13c990c2614dbf91b201bf54fbf14e1bb4cffcbe448afbb2703598acc43ccab2` passed the remaining30 new cases (log `2944f7a4a25d80ca81fa7bd1b3a772caed43e15c92ca3ed316f97c1d6a28fe2f`) and87 distinct old affected cases (log `0d0bdf0e5276e58e7c6aa913ab0d06a57f0636752f9dfd91036819d42affabb9`). Old scopes cover WG06, task8 review/history, confirmation, external transport/control and route compatibility with overlaps removed. No full-suite/check/build/clippy/release or real source-profile acceptance was claimed.
+
+Normal library compilation via `cargo test --locked --offline --bin confirm_daily_change -- --test-threads=1 --nocapture` found a previous Task2 unconditional reference to cfg(test) Test mode; EXIT101, raw log `51fb8b9d1af0b52d1e6b9b30f113353186123ebf5f1d96e05bd774831076f5d7`, no binary tests ran. Original author supplied minimal conditional repair; checkpoint f879c330 preserves the exact test-mode comparison and makes normal mode return false. The normal binary retry is pending. Task3 source checkpoint and independent fulltask review remain pending; new source is undeployed, no positive profile/funds/production permission exists.
+
+Task3 runtime gate passed: normal binary retry EXIT0/180.530s,5/5 cases including2 new cases; log SHA `caaae3ddfda580972f802e90c2bb2b14f13a067e6fdefc92fbf4bfa04b71cc53`. Total123 distinct PASS =31 new lib+87 old lib+5 binary. Acceptance receipt `dev-20261003-wg07-fix1-acceptance.json` records every exact source/log/harness hash and cfg-only reuse. No redundant check/build/clippy/all-tests. Independent task spec/quality gate pending.

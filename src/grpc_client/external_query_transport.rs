@@ -18,6 +18,19 @@ use tonic::transport::Channel;
 pub(crate) const EXTERNAL_QUERY_DECODE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES: usize =
     EXTERNAL_QUERY_DECODE_LIMIT_BYTES + 5;
+#[derive(Clone, Copy)]
+pub(crate) enum ExternalQueryLimit {
+    Existing,
+    OrdinaryWindow,
+}
+impl ExternalQueryLimit {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Existing => EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
+            Self::OrdinaryWindow => 8 * 1024 * 1024,
+        }
+    }
+}
 const EXTERNAL_WIRE_MATERIAL: &str = "external-unary-response-evidence-v1";
 // The 2026-10-01.3 public bundle compiles to this client descriptor. The VM
 // build identity's server contract digest is a distinct release identity.
@@ -220,10 +233,26 @@ impl ExternalWireEvidenceV1 {
         )
     }
 
+    pub(crate) fn validate_window(&self, descriptor: &str) -> Result<(), GrpcError> {
+        self.validate_bound_limit(
+            ExternalQueryMethod::HistoricalBars,
+            self.client_descriptor_sha256 == descriptor
+                && super::external_decoder::ExternalDecoder::for_descriptor(descriptor).is_ok(),
+            ExternalQueryLimit::OrdinaryWindow,
+        )
+    }
     fn validate_bound(
         &self,
         method: ExternalQueryMethod,
         descriptor_valid: bool,
+    ) -> Result<(), GrpcError> {
+        self.validate_bound_limit(method, descriptor_valid, ExternalQueryLimit::Existing)
+    }
+    fn validate_bound_limit(
+        &self,
+        method: ExternalQueryMethod,
+        descriptor_valid: bool,
+        limit: ExternalQueryLimit,
     ) -> Result<(), GrpcError> {
         if self.material != EXTERNAL_WIRE_MATERIAL
             || self.profile != "ExternalV1"
@@ -238,7 +267,7 @@ impl ExternalWireEvidenceV1 {
                 payload_sha256,
                 decode_limit_bytes,
             } => {
-                if *decode_limit_bytes != EXTERNAL_QUERY_DECODE_LIMIT_BYTES
+                if *decode_limit_bytes != limit.bytes()
                     || protobuf_payload.len() > *decode_limit_bytes
                     || *payload_sha256 != hex::encode(Sha256::digest(protobuf_payload))
                 {
@@ -248,7 +277,7 @@ impl ExternalWireEvidenceV1 {
             ExternalWireMaterialV1::Missing {
                 framed_body_limit_bytes,
             } => {
-                if *framed_body_limit_bytes != EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES {
+                if *framed_body_limit_bytes != limit.bytes() + 5 {
                     return Err(wire_error("external_response_wire_invalid"));
                 }
             }
@@ -256,7 +285,7 @@ impl ExternalWireEvidenceV1 {
                 framed_body_limit_bytes,
                 observed_framed_body_bytes_at_least,
             } => {
-                if *framed_body_limit_bytes != EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES
+                if *framed_body_limit_bytes != limit.bytes() + 5
                     || *observed_framed_body_bytes_at_least <= *framed_body_limit_bytes
                 {
                     return Err(wire_error("external_response_wire_invalid"));
@@ -268,11 +297,12 @@ impl ExternalWireEvidenceV1 {
                 body_sha256,
                 framed_body_limit_bytes,
             } => {
-                if *framed_body_limit_bytes != EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES
+                if *framed_body_limit_bytes != limit.bytes() + 5
                     || grpc_body_bytes.is_empty()
                     || grpc_body_bytes.len() > *framed_body_limit_bytes
                     || *body_sha256 != hex::encode(Sha256::digest(grpc_body_bytes))
-                    || parse_uncompressed_unary_frame(grpc_body_bytes).err() != Some(*failure)
+                    || parse_uncompressed_unary_frame_limit(grpc_body_bytes, limit.bytes()).err()
+                        != Some(*failure)
                 {
                     return Err(wire_error("external_response_wire_invalid"));
                 }
@@ -302,20 +332,44 @@ pub(crate) enum ExternalQueryCall {
 #[derive(Clone)]
 pub(crate) struct ExternalQueryTransport {
     client: MarketDataServiceClient<CapturedExternalChannel>,
+    channel: Channel,
 }
 
 impl ExternalQueryTransport {
     pub(crate) fn new(channel: Channel) -> Self {
-        let client = MarketDataServiceClient::new(CapturedExternalChannel(channel))
+        let client = MarketDataServiceClient::new(CapturedExternalChannel(channel.clone()))
             .max_decoding_message_size(EXTERNAL_QUERY_DECODE_LIMIT_BYTES);
-        Self { client }
+        Self { client, channel }
     }
 
     pub(crate) async fn call_with_descriptor(
         &mut self,
         method: ExternalQueryMethod,
+        request: tonic::Request<QueryRequest>,
+        descriptor: &str,
+    ) -> ExternalQueryCall {
+        self.call_with_limit(method, request, descriptor, ExternalQueryLimit::Existing)
+            .await
+    }
+    pub(crate) async fn call_window(
+        &mut self,
+        request: tonic::Request<QueryRequest>,
+        descriptor: &str,
+    ) -> ExternalQueryCall {
+        self.call_with_limit(
+            ExternalQueryMethod::HistoricalBars,
+            request,
+            descriptor,
+            ExternalQueryLimit::OrdinaryWindow,
+        )
+        .await
+    }
+    async fn call_with_limit(
+        &mut self,
+        method: ExternalQueryMethod,
         mut request: tonic::Request<QueryRequest>,
         descriptor: &str,
+        limit: ExternalQueryLimit,
     ) -> ExternalQueryCall {
         if let Err(error) = super::external_decoder::ExternalDecoder::for_descriptor(descriptor)
             .and_then(|decoder| {
@@ -325,33 +379,54 @@ impl ExternalQueryTransport {
             let mut evidence = ExternalWireEvidenceV1::new(
                 method,
                 ExternalWireMaterialV1::Missing {
-                    framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+                    framed_body_limit_bytes: limit.bytes() + 5,
                 },
             );
             evidence.client_descriptor_sha256 = descriptor.to_owned();
             return ExternalQueryCall::LocalWireFailure { error, evidence };
         }
-        let capture = CaptureHandle::new(method);
+        let capture = CaptureHandle::with_limit(method, limit);
         request.extensions_mut().insert(capture.clone());
-        let response = match method {
-            ExternalQueryMethod::HistoricalBars => self.client.historical_bars(request).await,
-            ExternalQueryMethod::MoneyFlows => self.client.money_flows(request).await,
-            ExternalQueryMethod::BoardFlows => self.client.board_flows(request).await,
-            ExternalQueryMethod::FuturesDelivery => self.client.futures_delivery(request).await,
-            ExternalQueryMethod::SecurityMetadata => self.client.security_metadata(request).await,
-            ExternalQueryMethod::MarketAnnouncements => {
-                self.client.market_announcements(request).await
+        let mut client = self.client.clone().max_decoding_message_size(limit.bytes());
+        let response = if matches!(limit, ExternalQueryLimit::OrdinaryWindow) {
+            let mut grpc = tonic::client::Grpc::new(CapturedExternalChannel(self.channel.clone()))
+                .max_decoding_message_size(limit.bytes());
+            match grpc.ready().await {
+                Err(e) => Err(tonic::Status::unavailable(e.to_string())),
+                Ok(()) => {
+                    request.extensions_mut().insert(tonic::GrpcMethod::new(
+                        ExternalQueryMethod::SERVICE,
+                        method.generated_method(),
+                    ));
+                    grpc.unary(
+                        request,
+                        http::uri::PathAndQuery::from_static(method.path()),
+                        WindowCodec,
+                    )
+                    .await
+                }
             }
-            ExternalQueryMethod::GlobalNews => self.client.global_news(request).await,
-            ExternalQueryMethod::InstrumentNews => self.client.instrument_news(request).await,
-            ExternalQueryMethod::CurrentAuctionObservations => {
-                self.client.current_auction_observations(request).await
-            }
-            ExternalQueryMethod::EconomicReleaseObservations => {
-                self.client.economic_release_observations(request).await
-            }
-            ExternalQueryMethod::EconomicReleaseSchedule => {
-                self.client.economic_release_schedule(request).await
+        } else {
+            match method {
+                ExternalQueryMethod::HistoricalBars => client.historical_bars(request).await,
+                ExternalQueryMethod::MoneyFlows => client.money_flows(request).await,
+                ExternalQueryMethod::BoardFlows => client.board_flows(request).await,
+                ExternalQueryMethod::FuturesDelivery => client.futures_delivery(request).await,
+                ExternalQueryMethod::SecurityMetadata => client.security_metadata(request).await,
+                ExternalQueryMethod::MarketAnnouncements => {
+                    client.market_announcements(request).await
+                }
+                ExternalQueryMethod::GlobalNews => client.global_news(request).await,
+                ExternalQueryMethod::InstrumentNews => client.instrument_news(request).await,
+                ExternalQueryMethod::CurrentAuctionObservations => {
+                    client.current_auction_observations(request).await
+                }
+                ExternalQueryMethod::EconomicReleaseObservations => {
+                    client.economic_release_observations(request).await
+                }
+                ExternalQueryMethod::EconomicReleaseSchedule => {
+                    client.economic_release_schedule(request).await
+                }
             }
         };
         let bind = |mut evidence: ExternalWireEvidenceV1| {
@@ -456,6 +531,7 @@ impl Service<http::Request<Body>> for CapturedExternalChannel {
 struct CaptureHandle {
     state: Arc<Mutex<CaptureState>>,
     method: ExternalQueryMethod,
+    limit: ExternalQueryLimit,
 }
 
 #[derive(Default)]
@@ -468,9 +544,13 @@ struct CaptureState {
 
 impl CaptureHandle {
     fn new(method: ExternalQueryMethod) -> Self {
+        Self::with_limit(method, ExternalQueryLimit::Existing)
+    }
+    fn with_limit(method: ExternalQueryMethod, limit: ExternalQueryLimit) -> Self {
         Self {
             state: Arc::new(Mutex::new(CaptureState::default())),
             method,
+            limit,
         }
     }
 
@@ -480,25 +560,25 @@ impl CaptureHandle {
         let state = self.state.lock().expect("external capture mutex poisoned");
         let material = if state.overflow {
             ExternalWireMaterialV1::Overflow {
-                framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+                framed_body_limit_bytes: self.limit.bytes() + 5,
                 observed_framed_body_bytes_at_least: state.observed,
             }
         } else if !state.ended || state.bytes.is_empty() {
             ExternalWireMaterialV1::Missing {
-                framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+                framed_body_limit_bytes: self.limit.bytes() + 5,
             }
         } else {
-            match parse_uncompressed_unary_frame(&state.bytes) {
+            match parse_uncompressed_unary_frame_limit(&state.bytes, self.limit.bytes()) {
                 Ok(payload) => ExternalWireMaterialV1::Payload {
                     protobuf_payload: payload.to_vec(),
                     payload_sha256: hex::encode(Sha256::digest(payload)),
-                    decode_limit_bytes: EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
+                    decode_limit_bytes: self.limit.bytes(),
                 },
                 Err(failure) => ExternalWireMaterialV1::InvalidFrame {
                     failure,
                     grpc_body_bytes: state.bytes.clone(),
                     body_sha256: hex::encode(Sha256::digest(&state.bytes)),
-                    framed_body_limit_bytes: EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+                    framed_body_limit_bytes: self.limit.bytes() + 5,
                 },
             }
         };
@@ -508,7 +588,11 @@ impl CaptureHandle {
     fn evidence(&self) -> Result<ExternalWireEvidenceV1, (GrpcError, ExternalWireEvidenceV1)> {
         let evidence = self.observed();
         match &evidence.evidence {
-            ExternalWireMaterialV1::Payload { .. } => match evidence.validate(self.method) {
+            ExternalWireMaterialV1::Payload { .. } => match evidence.validate_bound_limit(
+                self.method,
+                compiled_descriptor_sha256() == EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+                self.limit,
+            ) {
                 Ok(()) => Ok(evidence),
                 Err(error) => Err((error, evidence)),
             },
@@ -540,7 +624,7 @@ impl http_body::Body for CapturedBody {
                         .lock()
                         .expect("external capture mutex poisoned");
                     state.observed = state.observed.saturating_add(data.len());
-                    if state.observed <= EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES {
+                    if state.observed <= self.capture.limit.bytes() + 5 {
                         state.bytes.extend_from_slice(data);
                     } else {
                         state.overflow = true;
@@ -577,6 +661,12 @@ impl http_body::Body for CapturedBody {
 }
 
 fn parse_uncompressed_unary_frame(bytes: &[u8]) -> Result<&[u8], ExternalFrameFailureV1> {
+    parse_uncompressed_unary_frame_limit(bytes, EXTERNAL_QUERY_DECODE_LIMIT_BYTES)
+}
+fn parse_uncompressed_unary_frame_limit(
+    bytes: &[u8],
+    limit: usize,
+) -> Result<&[u8], ExternalFrameFailureV1> {
     if bytes.len() < 5 {
         return Err(ExternalFrameFailureV1::HeaderTruncated);
     }
@@ -584,7 +674,7 @@ fn parse_uncompressed_unary_frame(bytes: &[u8]) -> Result<&[u8], ExternalFrameFa
         return Err(ExternalFrameFailureV1::CompressionUnsupported);
     }
     let declared = u32::from_be_bytes(bytes[1..5].try_into().expect("five-byte header")) as usize;
-    if declared > EXTERNAL_QUERY_DECODE_LIMIT_BYTES {
+    if declared > limit {
         return Err(ExternalFrameFailureV1::PayloadLengthExceedsLimit);
     }
     let expected = declared + 5;
@@ -645,3 +735,141 @@ pub(crate) fn admit_external_payload(payload: &[u8]) -> Result<(), GrpcError> {
 #[cfg(test)]
 #[path = "external_query_transport_tests.rs"]
 mod tests;
+
+/// WG07 checks protobuf scalar and canonical JSON limits before Prost creates
+/// owned strings/vectors. The old generated codec and its wire bytes are unchanged.
+struct WindowCodec;
+struct WindowDecoder;
+impl tonic::codec::Codec for WindowCodec {
+    type Encode = QueryRequest;
+    type Decode = QueryResponse;
+    type Encoder = tonic_prost::ProstEncoder<QueryRequest>;
+    type Decoder = WindowDecoder;
+    fn encoder(&mut self) -> Self::Encoder {
+        tonic_prost::ProstEncoder::new(tonic::codec::BufferSettings::default())
+    }
+    fn decoder(&mut self) -> Self::Decoder {
+        WindowDecoder
+    }
+}
+impl tonic::codec::Decoder for WindowDecoder {
+    type Item = QueryResponse;
+    type Error = tonic::Status;
+    fn decode(
+        &mut self,
+        buf: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<QueryResponse>, tonic::Status> {
+        use prost::Message;
+        let remaining = buf.remaining();
+        if remaining > 8 * 1024 * 1024 || buf.chunk().len() != remaining {
+            return Err(tonic::Status::resource_exhausted("WG07 decode buffer"));
+        }
+        preflight_window_protobuf(buf.chunk(), false)
+            .map_err(|_| tonic::Status::resource_exhausted("WG07 response resource limit"))?;
+        QueryResponse::decode(buf)
+            .map(Some)
+            .map_err(|_| tonic::Status::data_loss("WG07 protobuf"))
+    }
+}
+fn preflight_window_protobuf(mut bytes: &[u8], record: bool) -> Result<(), GrpcError> {
+    let mut records = 0;
+    while !bytes.is_empty() {
+        let (tag, wire) =
+            decode_key(&mut bytes).map_err(|_| wire_error("ordinary_window_protobuf"))?;
+        if wire == WireType::LengthDelimited {
+            let len = usize::try_from(
+                decode_varint(&mut bytes).map_err(|_| wire_error("ordinary_window_protobuf"))?,
+            )
+            .map_err(|_| wire_error("ordinary_window_protobuf"))?;
+            if len > bytes.len() {
+                return Err(wire_error("ordinary_window_protobuf"));
+            }
+            let value = &bytes[..len];
+            bytes = &bytes[len..];
+            if !record && tag == 9 {
+                records += 1;
+                if records > 1 {
+                    return Err(wire_error("ordinary_window_record_count"));
+                }
+                preflight_window_protobuf(value, true)?;
+            } else if record && tag == 4 {
+                crate::data_gateway::ordinary_daily_change_window_contract::preflight(
+                    value,
+                    8 * 1024 * 1024,
+                )
+                .map_err(|_| wire_error("ordinary_window_json_limit"))?;
+            } else if len > 16 * 1024 {
+                return Err(wire_error("ordinary_window_scalar_limit"));
+            }
+        } else {
+            skip_field(wire, tag, &mut bytes, DecodeContext::default())
+                .map_err(|_| wire_error("ordinary_window_protobuf"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod window_limit_tests {
+    use super::*;
+    #[test]
+    fn wg07_closed_eight_mib_limit_preserves_old_wire_bytes_and_default() {
+        let old = ExternalWireEvidenceV1::new(
+            ExternalQueryMethod::HistoricalBars,
+            ExternalWireMaterialV1::Missing {
+                framed_body_limit_bytes: 4194309,
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"material":"external-unary-response-evidence-v1","profile":"ExternalV1","method":"OPERATION_HISTORICAL_BARS","client_descriptor_sha256":"41db4b931010d7dfed7240dd1713ad85dac91ddee6338265737fcc6970ace90b","evidence":{"Missing":{"framed_body_limit_bytes":4194309}}}"#
+        );
+        assert!(old.validate(ExternalQueryMethod::HistoricalBars).is_ok());
+        assert!(old
+            .validate_window(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
+            .is_err());
+        let window = ExternalWireEvidenceV1::new(
+            ExternalQueryMethod::HistoricalBars,
+            ExternalWireMaterialV1::Missing {
+                framed_body_limit_bytes: 8388613,
+            },
+        );
+        assert!(window
+            .validate_window(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256)
+            .is_ok());
+        assert!(window
+            .validate(ExternalQueryMethod::HistoricalBars)
+            .is_err());
+        let n = EXTERNAL_QUERY_DECODE_LIMIT_BYTES + 1;
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(n as u32).to_be_bytes());
+        frame.resize(n + 5, 0);
+        assert!(parse_uncompressed_unary_frame(&frame).is_err());
+        assert_eq!(
+            parse_uncompressed_unary_frame_limit(&frame, 8 * 1024 * 1024)
+                .unwrap()
+                .len(),
+            n
+        );
+    }
+    #[test]
+    fn wg07_protobuf_preflight_rejects_large_scalars_before_owned_decode() {
+        use prost::Message;
+        let response = QueryResponse {
+            request_id: "x".repeat(16385),
+            ..Default::default()
+        };
+        assert!(preflight_window_protobuf(&response.encode_to_vec(), false).is_err());
+        let record = crate::grpc_client::external_pb::magic::market::v1::CanonicalPayload {
+            schema: "x".into(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".into(),
+            data: format!("{{\"sessions\":[{}]}}", vec!["{}"; 261].join(",")).into_bytes(),
+        };
+        let response = QueryResponse {
+            records: vec![record],
+            ..Default::default()
+        };
+        assert!(preflight_window_protobuf(&response.encode_to_vec(), false).is_err());
+    }
+}

@@ -59,6 +59,29 @@ impl ExternalHistoricalReadClient {
         &mut self,
         query: ExternalHistoricalBarsQuery,
     ) -> Result<ExternalHistoricalObservation, GrpcError> {
+        let mut retained = WindowTransportEvidence::default();
+        self.query_observed(query.into_request(), None, &mut retained)
+            .await
+    }
+
+    pub(crate) async fn query_window(
+        &mut self,
+        query: super::super::external_v1::ExternalOrdinaryDailyChangeWindowQuery,
+        profile: &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
+        retained: &mut WindowTransportEvidence,
+    ) -> Result<ExternalHistoricalObservation, GrpcError> {
+        self.query_observed(query.into_request(), Some(profile), retained)
+            .await
+    }
+
+    async fn query_observed(
+        &mut self,
+        request: crate::grpc_client::external_pb::magic::market::v1::QueryRequest,
+        profile: Option<
+            &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
+        >,
+        retained: &mut WindowTransportEvidence,
+    ) -> Result<ExternalHistoricalObservation, GrpcError> {
         let operation = ExternalOperation::HistoricalBars;
         let method = ExternalQueryMethod::HistoricalBars;
         if self.client.profile != ContractProfile::ExternalV1 {
@@ -66,17 +89,55 @@ impl ExternalHistoricalReadClient {
                 details: Box::default(),
             });
         }
-        let request = query.into_request();
-        let (health, health_wire) = self.client.get_external_health_observed().await?;
+        retained.stage = "Health".into();
+        let (health, health_wire) = if profile.is_some() {
+            self.client
+                .get_external_health_retaining()
+                .await
+                .map_err(|failure| {
+                    retained.health_hex = failure.response_bytes.as_ref().map(hex::encode);
+                    retained.health_status =
+                        failure.status.as_ref().map(WindowStatusEvidence::capture);
+                    failure.error
+                })?
+        } else {
+            self.client.get_external_health_observed().await?
+        };
+        if profile.is_some() {
+            retained.health_hex = Some(hex::encode(&health_wire));
+        }
         let connection_identity = self.client.external_connection_identity()?;
+        if profile.is_some() {
+            retained.connection_identity = Some(connection_identity.clone());
+        }
         let server_build_identity = health
             .build_identity
             .clone()
             .ok_or_else(|| crate::grpc_client::connection_qualification::unqualified())?;
-        let (capabilities_response, capabilities_wire) =
-            self.client.get_external_capabilities_observed().await?;
-        let capability =
-            require_historical_capability(&capabilities_response.capabilities)?.clone();
+        retained.stage = "Capabilities".into();
+        let (capabilities_response, capabilities_wire) = if profile.is_some() {
+            self.client
+                .get_external_capabilities_retaining()
+                .await
+                .map_err(|failure| {
+                    retained.capabilities_hex = failure.response_bytes.as_ref().map(hex::encode);
+                    retained.capabilities_status =
+                        failure.status.as_ref().map(WindowStatusEvidence::capture);
+                    failure.error
+                })?
+        } else {
+            self.client.get_external_capabilities_observed().await?
+        };
+        if profile.is_some() {
+            retained.capabilities_hex = Some(hex::encode(&capabilities_wire));
+        }
+        let capability = match profile {
+            None => require_historical_capability(&capabilities_response.capabilities)?,
+            Some(profile) => {
+                require_window_capability(&capabilities_response.capabilities, profile)?
+            }
+        }
+        .clone();
 
         let request_id = request
             .context
@@ -89,6 +150,10 @@ impl ExternalHistoricalReadClient {
             crate::grpc_client::errors::request_id_correlation(&request_id)
                 .ok_or_else(|| wire_error("external_request_context_missing"))?;
         let request_bytes = request.encode_to_vec();
+        if profile.is_some() {
+            retained.request_hex = Some(hex::encode(&request_bytes));
+        }
+        retained.stage = "Authorization".into();
         let authority = self
             .client
             .acquisition_authority
@@ -97,14 +162,20 @@ impl ExternalHistoricalReadClient {
         let mut authorized = tonic::Request::new(request);
         self.client.attach_request_auth(&mut authorized)?;
         self.client.require_external_qualification()?;
+        retained.stage = "HistoricalBars".into();
         let outcome = match &mut self.client.data {
             DataTransport::External(data) => {
-                data.call_with_descriptor(
-                    method,
-                    authorized,
-                    &connection_identity.descriptor_sha256,
-                )
-                .await
+                if profile.is_some() {
+                    data.call_window(authorized, &connection_identity.descriptor_sha256)
+                        .await
+                } else {
+                    data.call_with_descriptor(
+                        method,
+                        authorized,
+                        &connection_identity.descriptor_sha256,
+                    )
+                    .await
+                }
             }
             DataTransport::Local(_) => {
                 return Err(GrpcError::Unimplemented {
@@ -118,8 +189,12 @@ impl ExternalHistoricalReadClient {
         );
         let (wire, status, result) = match outcome {
             ExternalQueryCall::Response { message, evidence } => {
-                let result = evidence
-                    .validate_descriptor(method, &connection_identity.descriptor_sha256)
+                let validated = if profile.is_some() {
+                    evidence.validate_window(&connection_identity.descriptor_sha256)
+                } else {
+                    evidence.validate_descriptor(method, &connection_identity.descriptor_sha256)
+                };
+                let result = validated
                     .and_then(|()| {
                         admit_external_payload(
                             evidence
@@ -136,7 +211,23 @@ impl ExternalHistoricalReadClient {
                         )
                         .map_err(GrpcError::from)
                     })
-                    .and_then(observe_historical_envelope);
+                    .and_then(|result| match profile {
+                        None => observe_historical_envelope(result),
+                        Some(profile) => {
+                            if result.admission != QueryAdmission::Admitted
+                                || !result.diagnostic_blocker.is_empty()
+                                || !result.complete
+                                || result.selected_provider != profile.provider
+                            {
+                                Err(historical_gate_error(
+                                    "ordinary_window_envelope_rejected",
+                                    false,
+                                ))
+                            } else {
+                                Ok(result)
+                            }
+                        }
+                    });
                 (evidence, None, result)
             }
             ExternalQueryCall::UnaryStatus { status, evidence } => {
@@ -172,6 +263,17 @@ impl ExternalHistoricalReadClient {
             }
             ExternalQueryCall::LocalWireFailure { error, evidence } => (evidence, None, Err(error)),
         };
+        if profile.is_some() {
+            retained.request_hex = Some(hex::encode(&request_bytes));
+        }
+        if profile.is_some() {
+            retained.wire = Some(wire.clone());
+        }
+        if profile.is_some() {
+            retained.status = status
+                .as_ref()
+                .map(|s| WindowStatusEvidence::capture(&s.raw_status));
+        }
         Ok(ExternalHistoricalObservation {
             connection_identity,
             health,
@@ -263,3 +365,74 @@ fn observe_historical_envelope(result: QueryResult) -> Result<QueryResult, GrpcE
 #[cfg(test)]
 #[path = "external_historical_read_tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct WindowTransportEvidence {
+    pub(crate) stage: String,
+    pub(crate) connection_identity: Option<ConnectionIdentity>,
+    pub(crate) health_hex: Option<String>,
+    pub(crate) capabilities_hex: Option<String>,
+    pub(crate) request_hex: Option<String>,
+    pub(crate) wire: Option<ExternalWireEvidenceV1>,
+    pub(crate) status: Option<WindowStatusEvidence>,
+    pub(crate) health_status: Option<WindowStatusEvidence>,
+    pub(crate) capabilities_status: Option<WindowStatusEvidence>,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct WindowStatusEvidence {
+    code: i32,
+    message: String,
+    details_hex: String,
+    trailer: ExternalHistoricalTrailerMaterial,
+    trailer_encoded: Option<Vec<u8>>,
+}
+pub(crate) fn require_window_capability<'a>(
+    capabilities: &'a [Capability],
+    profile: &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
+) -> Result<&'a Capability, GrpcError> {
+    let mut found = capabilities.iter().filter(|c| {
+        c.operation == ExternalOperation::HistoricalBars as i32 && c.provider == profile.provider
+    });
+    let c = found
+        .next()
+        .ok_or_else(|| historical_gate_error("ordinary_window_capability_missing", false))?;
+    if found.next().is_some()
+        || c.repository_admission != AdmissionState::Admitted as i32
+        || !c.blocker.is_empty()
+        || !c.runtime_available
+        || c.exact_scope != profile.scope
+    {
+        return Err(historical_gate_error(
+            "ordinary_window_capability_scope",
+            false,
+        ));
+    }
+    Ok(c)
+}
+
+impl WindowStatusEvidence {
+    fn capture(status: &tonic::Status) -> Self {
+        let (code, details, trailer) = super::unary_attempt::capture_status_material(status);
+        let trailer = match trailer {
+            super::unary_attempt::UnaryTrailerMaterial::Absent => {
+                ExternalHistoricalTrailerMaterial::Absent
+            }
+            super::unary_attempt::UnaryTrailerMaterial::Bytes(bytes) => {
+                ExternalHistoricalTrailerMaterial::Bytes(bytes)
+            }
+            super::unary_attempt::UnaryTrailerMaterial::Malformed => {
+                ExternalHistoricalTrailerMaterial::Malformed
+            }
+        };
+        Self {
+            code,
+            message: status.message().into(),
+            details_hex: hex::encode(details),
+            trailer,
+            trailer_encoded: status
+                .metadata()
+                .get_bin("magic-error-detail-bin")
+                .map(|v| v.as_encoded_bytes().to_vec()),
+        }
+    }
+}

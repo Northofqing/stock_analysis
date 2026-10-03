@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::daily_change_confirmation::{self as legacy, DailyChangeConfirmationQuery};
+use crate::data_gateway::ordinary_daily_change_window::{
+    self as window, CompleteWindowProof, PreparedWindowReceipt, QualifiedDailyChangeWindow,
+    WindowStatus,
+};
+use crate::data_gateway::ordinary_daily_change_window_contract as window_contract;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +176,15 @@ enum Event {
     Decision {
         fact: DecisionFact,
     },
+    WindowObservation {
+        window_id: String,
+        request_identity: String,
+        proof_identity: String,
+        acquisition_identity: String,
+        proof: CompleteWindowProof,
+        receipt: PreparedWindowReceipt,
+        observed_at: DateTime<Utc>,
+    },
 }
 
 #[derive(diesel::QueryableByName)]
@@ -197,6 +211,7 @@ struct Row {
     record_hash: String,
 }
 
+#[derive(Clone)]
 struct CandidateState {
     review: CandidateReview,
     scope: String,
@@ -205,9 +220,10 @@ struct CandidateState {
     observations: Vec<ReviewSnapshot>,
     renewal_of: Option<String>,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct State {
     candidates: BTreeMap<String, CandidateState>,
+    windows: BTreeMap<String, (CompleteWindowProof, PreparedWindowReceipt)>,
     latest: BTreeMap<String, String>,
     seq: i64,
     head: String,
@@ -233,6 +249,18 @@ fn hash(value: &impl Serialize) -> ReviewResult<String> {
     Ok(hex::encode(h.finalize()))
 }
 fn identities(snapshot: &ReviewSnapshot) -> ReviewResult<(String, String)> {
+    if snapshot.schema_version == 2 {
+        let (_, _, stable) = window::snapshot_fact(snapshot).map_err(|e| audit(e.to_string()))?;
+        return Ok((
+            hash(&(
+                "scope",
+                &snapshot.instrument,
+                snapshot.query.previous_date,
+                snapshot.query.current_date,
+            ))?,
+            stable,
+        ));
+    }
     require(
         snapshot.schema_version == 1
             && snapshot.discovery_contract == "outcome-provider-sequence-v1",
@@ -312,6 +340,14 @@ fn row_hash(row: &Row) -> ReviewResult<String> {
     ))
 }
 fn acquisition(snapshot: &ReviewSnapshot) -> ReviewResult<String> {
+    if snapshot.schema_version == 2 {
+        let (_, a, _) = window::snapshot_fact(snapshot).map_err(|e| audit(e.to_string()))?;
+        return Ok(window_contract::digest(
+            b"BR171_ORDINARY_PAIR_ACQUISITION_V1\0",
+            &window_contract::encode(&a, window_contract::PROOF_LIMIT)
+                .map_err(|e| audit(e.to_string()))?,
+        ));
+    }
     hash(&(
         "acquisition",
         &snapshot.query.daily_batch_id,
@@ -327,6 +363,13 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
     if !super::daily_change_review_schema_v1::is_present(conn)? {
         return Err(ReviewError::Unavailable);
     }
+    #[derive(diesel::QueryableByName)]
+    struct Oversized {
+        #[diesel(sql_type=BigInt)]
+        n: i64,
+    }
+    let oversized:Oversized=diesel::sql_query("SELECT count(*) AS n FROM daily_change_review_event WHERE length(CAST(payload AS BLOB))>8388608 OR length(CAST(command_id AS BLOB))>16384 OR length(CAST(scope_key AS BLOB))>16384 OR length(CAST(candidate_id AS BLOB))>16384 OR length(CAST(previous_hash AS BLOB))>16384 OR length(CAST(record_hash AS BLOB))>16384").get_result(conn)?;
+    require(oversized.n == 0, "review row resource bound")?;
     let rows:Vec<Row> = diesel::sql_query("SELECT seq,schema_version,command_id,scope_key,candidate_id,revision,kind,payload,previous_hash,record_hash FROM daily_change_review_event ORDER BY seq").load(conn)?;
     let mut state = State::default();
     for row in rows {
@@ -337,6 +380,16 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
                 && row.record_hash == row_hash(&row)?,
             "review chain mismatch",
         )?;
+        require(
+            row.payload.len() <= window_contract::PROOF_LIMIT,
+            "review event byte limit",
+        )?;
+        if row.payload.starts_with("{\"kind\":\"WindowObservation\"")
+            || row.payload.contains("\"schema_version\":2")
+        {
+            window_contract::preflight(row.payload.as_bytes(), window_contract::PROOF_LIMIT)
+                .map_err(|e| audit(e.to_string()))?;
+        }
         let event: Event = serde_json::from_str(&row.payload).map_err(|e| audit(e.to_string()))?;
         require(json(&event)? == row.payload, "noncanonical review event")?;
         match event {
@@ -452,7 +505,8 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
                         && fact.reason.trim() == fact.reason,
                     "invalid decision",
                 )?;
-                if fact.decision == ReviewDecision::Confirm {
+                if fact.decision == ReviewDecision::Confirm && c.review.snapshot.schema_version == 1
+                {
                     let receipt = legacy::exact_daily_change_confirmation_receipt_on_conn(
                         conn,
                         &c.review.snapshot.query,
@@ -470,6 +524,37 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
                 }
                 c.decision = Some(fact);
             }
+            Event::WindowObservation {
+                window_id,
+                request_identity,
+                proof_identity,
+                acquisition_identity,
+                proof,
+                receipt,
+                observed_at,
+            } => {
+                require(
+                    row.kind == "Observation"
+                        && row.revision == 1
+                        && window_id == format!("br171_window_{acquisition_identity}")
+                        && row.candidate_id == window_id
+                        && row.scope_key == format!("window:{request_identity}")
+                        && row.command_id == format!("window:{acquisition_identity}")
+                        && observed_at == proof.frozen.invoked_at
+                        && receipt.request_identity == request_identity
+                        && receipt.proof_identity == proof_identity
+                        && receipt.acquisition_identity == acquisition_identity,
+                    "window row identity",
+                )?;
+                validate_window_receipt(&state, &proof, &receipt)?;
+                require(
+                    state
+                        .windows
+                        .insert(acquisition_identity, (proof, receipt))
+                        .is_none(),
+                    "duplicate window acquisition",
+                )?;
+            }
         }
         state.seq = row.seq;
         state.head = row.record_hash;
@@ -481,6 +566,7 @@ fn load(conn: &mut SqliteConnection) -> ReviewResult<State> {
     }
     let high: HighWater = diesel::sql_query("SELECT coalesce(max(seq),0) AS seq FROM sqlite_sequence WHERE name='daily_change_review_event'").get_result(conn)?;
     require(high.seq == state.seq, "review chain truncated")?;
+    validate_window_closure(&state)?;
     Ok(state)
 }
 
@@ -492,24 +578,50 @@ fn append(
     kind: &str,
     command: &str,
     event: &Event,
-) -> ReviewResult<()> {
+) -> ReviewResult<String> {
+    append_identity(
+        conn,
+        state,
+        &c.candidate_id,
+        c.revision,
+        scope,
+        kind,
+        command,
+        event,
+    )
+}
+fn append_identity(
+    conn: &mut SqliteConnection,
+    state: &State,
+    candidate_id: &str,
+    revision: i64,
+    scope: &str,
+    kind: &str,
+    command: &str,
+    event: &Event,
+) -> ReviewResult<String> {
     let mut row = Row {
         seq: state.seq + 1,
         schema_version: 1,
         command_id: command.into(),
         scope_key: scope.into(),
-        candidate_id: c.candidate_id.clone(),
-        revision: c.revision,
+        candidate_id: candidate_id.into(),
+        revision,
         kind: kind.into(),
-        payload: json(event)?,
+        payload: String::from_utf8(
+            window_contract::encode(event, window_contract::PROOF_LIMIT)
+                .map_err(|e| audit(e.to_string()))?,
+        )
+        .map_err(|e| audit(e.to_string()))?,
         previous_hash: state.head.clone(),
         record_hash: String::new(),
     };
     row.record_hash = row_hash(&row)?;
     let n=diesel::sql_query("INSERT INTO daily_change_review_event(seq,schema_version,command_id,scope_key,candidate_id,revision,kind,payload,previous_hash,record_hash) VALUES (?,1,?,?,?,?,?,?,?,?)")
         .bind::<BigInt,_>(row.seq).bind::<Text,_>(row.command_id).bind::<Text,_>(row.scope_key).bind::<Text,_>(row.candidate_id)
-        .bind::<BigInt,_>(row.revision).bind::<Text,_>(row.kind).bind::<Text,_>(row.payload).bind::<Text,_>(row.previous_hash).bind::<Text,_>(row.record_hash).execute(conn)?;
-    require(n == 1, "event append did not affect exactly one row")
+        .bind::<BigInt,_>(row.revision).bind::<Text,_>(row.kind).bind::<Text,_>(row.payload).bind::<Text,_>(row.previous_hash).bind::<Text,_>(&row.record_hash).execute(conn)?;
+    require(n == 1, "event append did not affect exactly one row")?;
+    Ok(row.record_hash)
 }
 fn view(state: &State, id: &str, now: DateTime<Utc>) -> ReviewResult<CandidateReview> {
     let c = state.candidates.get(id).ok_or(ReviewError::NotFound)?;
@@ -538,30 +650,41 @@ pub(crate) fn discover_on_conn(
     now: DateTime<Utc>,
 ) -> ReviewResult<CandidateReview> {
     conn.immediate_transaction::<_, ReviewError, _>(|conn| {
-        let state = load(conn)?;
-        let snapshot = evidence.snapshot();
-        let (scope, stable_fact) = identities(snapshot)?;
-        let revision = if let Some(id) = state.latest.get(&scope) {
-            let existing = &state.candidates[id];
-            if existing.stable_fact == stable_fact {
-                let key = acquisition(snapshot)?;
-                for old in
-                    std::iter::once(&existing.review.snapshot).chain(existing.observations.iter())
-                {
-                    if acquisition(old)? == key {
-                        if old != snapshot {
-                            return Err(ReviewError::Conflict);
-                        }
-                        return view(&state, id, now);
+        let mut state = load(conn)?;
+        discover_in_transaction(conn, &mut state, evidence, now, true)
+    })
+}
+fn discover_in_transaction(
+    conn: &mut SqliteConnection,
+    state: &mut State,
+    evidence: &crate::data_gateway::historical_bars::QualifiedDailyChangeDiscovery,
+    now: DateTime<Utc>,
+    persist: bool,
+) -> ReviewResult<CandidateReview> {
+    let snapshot = evidence.snapshot();
+    let (scope, stable_fact) = identities(snapshot)?;
+    let revision = if let Some(id) = state.latest.get(&scope).cloned() {
+        let existing = &state.candidates[&id];
+        if existing.stable_fact == stable_fact {
+            let key = acquisition(snapshot)?;
+            for old in
+                std::iter::once(&existing.review.snapshot).chain(existing.observations.iter())
+            {
+                if acquisition(old)? == key {
+                    if old != snapshot {
+                        return Err(ReviewError::Conflict);
                     }
+                    return view(state, &id, now);
                 }
-                require(
-                    now >= existing.review.discovered_at,
-                    "observation clock regressed",
-                )?;
+            }
+            require(
+                now >= existing.review.discovered_at,
+                "observation clock regressed",
+            )?;
+            let head = if persist {
                 append(
                     conn,
-                    &state,
+                    state,
                     &existing.review,
                     &scope,
                     "Observation",
@@ -571,26 +694,43 @@ pub(crate) fn discover_on_conn(
                         snapshot: snapshot.clone(),
                         observed_at: now,
                     },
-                )?;
-                return view(&load(conn)?, id, now);
-            }
-            require(
-                now >= existing.review.discovered_at,
-                "revision clock regressed",
-            )?;
-            existing.review.revision + 1
-        } else {
-            if legacy::exact_daily_change_confirmation_receipt_on_conn(conn, &snapshot.query)?
+                )?
+            } else {
+                String::new()
+            };
+            state.head = head;
+            state.seq += 1;
+            state
+                .candidates
+                .get_mut(&id)
+                .ok_or(ReviewError::NotFound)?
+                .observations
+                .push(snapshot.clone());
+            return view(state, &id, now);
+        }
+        require(
+            now >= existing.review.discovered_at,
+            "revision clock regressed",
+        )?;
+        existing
+            .review
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| audit("revision overflow"))?
+    } else {
+        if snapshot.schema_version == 1
+            && legacy::exact_daily_change_confirmation_receipt_on_conn(conn, &snapshot.query)?
                 .is_some()
-            {
-                return Err(ReviewError::AlreadyConfirmed);
-            }
-            1
-        };
-        let review = candidate(snapshot, revision, now)?;
+        {
+            return Err(ReviewError::AlreadyConfirmed);
+        }
+        1
+    };
+    let review = candidate(snapshot, revision, now)?;
+    let head = if persist {
         append(
             conn,
-            &state,
+            state,
             &review,
             &scope,
             "Candidate",
@@ -598,12 +738,30 @@ pub(crate) fn discover_on_conn(
             &Event::Candidate {
                 review: review.clone(),
                 scope: scope.clone(),
-                stable_fact,
+                stable_fact: stable_fact.clone(),
                 renewal_of: None,
             },
-        )?;
-        Ok(review)
-    })
+        )?
+    } else {
+        String::new()
+    };
+    state.head = head;
+    state.seq += 1;
+    state
+        .latest
+        .insert(scope.clone(), review.candidate_id.clone());
+    state.candidates.insert(
+        review.candidate_id.clone(),
+        CandidateState {
+            review: review.clone(),
+            scope,
+            stable_fact,
+            decision: None,
+            observations: Vec::new(),
+            renewal_of: None,
+        },
+    );
+    Ok(review)
 }
 
 pub fn review_on_conn(
@@ -652,26 +810,27 @@ pub fn decide_on_conn(
                 && reason.trim() == reason,
             "invalid decision input",
         )?;
-        let confirmation = if decision == ReviewDecision::Confirm {
-            let receipt = match legacy::exact_daily_change_confirmation_receipt_on_conn(
-                conn,
-                &c.review.snapshot.query,
-            )? {
-                Some(receipt) => receipt,
-                None => legacy::append_daily_change_confirmation_in_transaction(
+        let confirmation =
+            if decision == ReviewDecision::Confirm && c.review.snapshot.schema_version == 1 {
+                let receipt = match legacy::exact_daily_change_confirmation_receipt_on_conn(
                     conn,
-                    &legacy::DailyChangeConfirmationInput {
-                        query: c.review.snapshot.query.clone(),
-                        operator_identity: operator.into(),
-                        reason: reason.into(),
-                        confirmed_at: now.fixed_offset(),
-                    },
-                )?,
+                    &c.review.snapshot.query,
+                )? {
+                    Some(receipt) => receipt,
+                    None => legacy::append_daily_change_confirmation_in_transaction(
+                        conn,
+                        &legacy::DailyChangeConfirmationInput {
+                            query: c.review.snapshot.query.clone(),
+                            operator_identity: operator.into(),
+                            reason: reason.into(),
+                            confirmed_at: now.fixed_offset(),
+                        },
+                    )?,
+                };
+                Some((receipt.confirmation_id, receipt.record_hash))
+            } else {
+                None
             };
-            Some((receipt.confirmation_id, receipt.record_hash))
-        } else {
-            None
-        };
         let fact = DecisionFact {
             candidate_id: candidate.into(),
             token: token.into(),
@@ -745,24 +904,281 @@ pub(crate) fn admit_on_conn(
     conn.transaction::<_, ReviewError, _>(|conn| {
         let (scope, stable) = identities(snapshot)?;
         if !super::daily_change_review_schema_v1::is_present(conn)? {
-            return Ok(legacy::has_exact_daily_change_confirmation_on_conn(
-                conn,
-                &snapshot.query,
-            )?);
+            return if snapshot.schema_version == 2 {
+                Ok(false)
+            } else {
+                Ok(legacy::has_exact_daily_change_confirmation_on_conn(
+                    conn,
+                    &snapshot.query,
+                )?)
+            };
         }
         let state = load(conn)?;
-        if let Some(id) = state.latest.get(&scope) {
-            let c = &state.candidates[id];
-            return Ok(c.stable_fact == stable
-                && c.decision
-                    .as_ref()
-                    .is_some_and(|d| d.decision == ReviewDecision::Confirm));
+        if let Some(allowed) = admit_in_state(&state, &scope, &stable) {
+            return Ok(allowed);
         }
-        Ok(legacy::has_exact_daily_change_confirmation_on_conn(
-            conn,
-            &snapshot.query,
-        )?)
+        if snapshot.schema_version == 2 {
+            Ok(false)
+        } else {
+            Ok(legacy::has_exact_daily_change_confirmation_on_conn(
+                conn,
+                &snapshot.query,
+            )?)
+        }
     })
+}
+fn admit_in_state(state: &State, scope: &str, stable: &str) -> Option<bool> {
+    state.latest.get(scope).map(|id| {
+        let c = &state.candidates[id];
+        c.stable_fact == stable
+            && c.decision
+                .as_ref()
+                .is_some_and(|d| d.decision == ReviewDecision::Confirm)
+    })
+}
+pub(crate) fn require_window_store(conn: &mut SqliteConnection) -> ReviewResult<()> {
+    conn.transaction::<_, ReviewError, _>(|conn| load(conn).map(|_| ()))
+}
+pub(crate) fn admit_window_on_conn(
+    conn: &mut SqliteConnection,
+    window: &QualifiedDailyChangeWindow,
+) -> ReviewResult<Vec<String>> {
+    conn.transaction::<_, ReviewError, _>(|conn| {
+        let state = load(conn)?;
+        let mut ids = Vec::new();
+        for evidence in window.candidates() {
+            let (scope, stable) = identities(evidence.snapshot())?;
+            if admit_in_state(&state, &scope, &stable) != Some(true) {
+                return Err(audit("manual_confirmation_required"));
+            }
+            ids.push(state.latest[&scope].clone());
+        }
+        Ok(ids)
+    })
+}
+pub(crate) fn prepare_window_on_conn(
+    conn: &mut SqliteConnection,
+    window: &QualifiedDailyChangeWindow,
+    now: DateTime<Utc>,
+) -> ReviewResult<PreparedWindowReceipt> {
+    prepare_window_transaction(conn, window, now, |_| Ok(()))
+}
+fn window_receipt(
+    window: &QualifiedDailyChangeWindow,
+    candidates: Vec<CandidateReview>,
+) -> PreparedWindowReceipt {
+    PreparedWindowReceipt {
+        request_identity: window.request_identity().into(),
+        proof_identity: window.proof_identity().into(),
+        acquisition_identity: window.acquisition_identity().into(),
+        window_status: if candidates.is_empty() {
+            WindowStatus::NoChanges
+        } else {
+            WindowStatus::Candidates
+        },
+        candidates,
+    }
+}
+fn window_event(window: &QualifiedDailyChangeWindow, receipt: &PreparedWindowReceipt) -> Event {
+    Event::WindowObservation {
+        window_id: format!("br171_window_{}", receipt.acquisition_identity),
+        request_identity: receipt.request_identity.clone(),
+        proof_identity: receipt.proof_identity.clone(),
+        acquisition_identity: receipt.acquisition_identity.clone(),
+        proof: window.proof().clone(),
+        receipt: receipt.clone(),
+        observed_at: window.proof().frozen.invoked_at,
+    }
+}
+fn prepare_window_transaction(
+    conn: &mut SqliteConnection,
+    window: &QualifiedDailyChangeWindow,
+    now: DateTime<Utc>,
+    after_load: impl FnOnce(&mut SqliteConnection) -> ReviewResult<()>,
+) -> ReviewResult<PreparedWindowReceipt> {
+    conn.immediate_transaction::<_, ReviewError, _>(|conn| {
+        let mut state = load(conn)?;
+        if let Some((proof, receipt)) = state.windows.get(window.acquisition_identity()) {
+            if proof != window.proof() {
+                return Err(ReviewError::Conflict);
+            }
+            return Ok(receipt.clone());
+        }
+        require(
+            now == window.proof().frozen.invoked_at,
+            "window invocation clock mismatch",
+        )?;
+        // Reserve all new serialized event/snapshot/receipt bytes before any DB append.
+        let mut planned = state.clone();
+        let mut previews = Vec::new();
+        let mut total = 0usize;
+        for evidence in window.candidates() {
+            total = total
+                .checked_add(
+                    window_contract::encode(evidence.snapshot(), window_contract::PROOF_LIMIT)
+                        .map_err(|e| audit(e.to_string()))?
+                        .len(),
+                )
+                .ok_or_else(|| audit("window total overflow"))?;
+            require(
+                total <= window_contract::PREPARE_LIMIT,
+                "window snapshot budget",
+            )?;
+            previews.push(discover_in_transaction(
+                conn,
+                &mut planned,
+                evidence,
+                now,
+                false,
+            )?);
+        }
+        let expected = window_receipt(window, previews);
+        total = total
+            .checked_add(
+                window_contract::encode(&expected, window_contract::PREPARE_LIMIT)
+                    .map_err(|e| audit(e.to_string()))?
+                    .len(),
+            )
+            .ok_or_else(|| audit("window total overflow"))?;
+        require(
+            total <= window_contract::PREPARE_LIMIT,
+            "window snapshot/receipt budget",
+        )?;
+        let event_bytes = window_contract::encode(
+            &window_event(window, &expected),
+            window_contract::PROOF_LIMIT,
+        )
+        .map_err(|e| audit(e.to_string()))?;
+        window_contract::preflight(&event_bytes, window_contract::PROOF_LIMIT)
+            .map_err(|e| audit(e.to_string()))?;
+        validate_window_receipt(&planned, window.proof(), &expected)?;
+        after_load(conn)?;
+        let mut candidates = Vec::new();
+        for evidence in window.candidates() {
+            candidates.push(discover_in_transaction(
+                conn, &mut state, evidence, now, true,
+            )?);
+        }
+        let receipt = window_receipt(window, candidates);
+        require(receipt == expected, "window transaction receipt changed")?;
+        let id = format!("br171_window_{}", receipt.acquisition_identity);
+        let head = append_identity(
+            conn,
+            &state,
+            &id,
+            1,
+            &format!("window:{}", receipt.request_identity),
+            "Observation",
+            &format!("window:{}", receipt.acquisition_identity),
+            &window_event(window, &receipt),
+        )?;
+        state.head = head;
+        state.seq += 1;
+        state.windows.insert(
+            receipt.acquisition_identity.clone(),
+            (window.proof().clone(), receipt.clone()),
+        );
+        validate_window_closure(&state)?;
+        Ok(receipt)
+    })
+}
+
+fn validate_window_receipt(
+    state: &State,
+    proof: &CompleteWindowProof,
+    receipt: &PreparedWindowReceipt,
+) -> ReviewResult<()> {
+    let ids = window::proof_identities(proof).map_err(|e| audit(e.to_string()))?;
+    require(
+        ids == (
+            receipt.request_identity.clone(),
+            receipt.proof_identity.clone(),
+            receipt.acquisition_identity.clone(),
+        ),
+        "window proof identities",
+    )?;
+    let interpreted = window::inspect_proof(proof).map_err(|e| audit(e.to_string()))?;
+    require(
+        receipt.candidates.len() == interpreted.pairs.len()
+            && receipt.window_status
+                == if interpreted.pairs.is_empty() {
+                    WindowStatus::NoChanges
+                } else {
+                    WindowStatus::Candidates
+                },
+        "window status/cardinality",
+    )?;
+    for (i, (view, pair)) in receipt
+        .candidates
+        .iter()
+        .zip(&interpreted.pairs)
+        .enumerate()
+    {
+        let c = state
+            .candidates
+            .get(&view.candidate_id)
+            .ok_or_else(|| audit("window candidate absent"))?;
+        require(
+            *view == self::view(state, &view.candidate_id, proof.frozen.invoked_at)?,
+            "window receipt current view mismatch",
+        )?;
+        require(
+            view.revision == c.review.revision
+                && view.evidence_token == c.review.evidence_token
+                && view.discovered_at == c.review.discovered_at
+                && view.expires_at == c.review.expires_at
+                && view.snapshot == c.review.snapshot,
+            "window candidate receipt",
+        )?;
+        let matching = std::iter::once(&c.review.snapshot)
+            .chain(c.observations.iter())
+            .find(|s| {
+                window::snapshot_fact(s).is_ok_and(|(f, a, _)| {
+                    f == *pair
+                        && a.window_acquisition_identity == receipt.acquisition_identity
+                        && a.proof_identity == receipt.proof_identity
+                        && a.pair_index == i
+                })
+            });
+        require(matching.is_some(), "window pair acquisition missing")?;
+        let (_, a, _) =
+            window::snapshot_fact(matching.unwrap()).map_err(|e| audit(e.to_string()))?;
+        let refs: Vec<_> = interpreted
+            .evidence
+            .sessions
+            .iter()
+            .filter(|s| s.date >= pair.previous.date && s.date <= pair.current.date)
+            .flat_map(|s| s.evidence_refs.clone())
+            .collect();
+        require(
+            a.daily_batch_id == interpreted.evidence.source.batch_id && a.pair_evidence == refs,
+            "pair native provenance",
+        )?;
+    }
+    Ok(())
+}
+fn validate_window_closure(state: &State) -> ReviewResult<()> {
+    for c in state.candidates.values() {
+        for s in std::iter::once(&c.review.snapshot).chain(c.observations.iter()) {
+            if s.schema_version != 2 {
+                continue;
+            }
+            let (_, a, _) = window::snapshot_fact(s).map_err(|e| audit(e.to_string()))?;
+            let (_, receipt) = state
+                .windows
+                .get(&a.window_acquisition_identity)
+                .ok_or_else(|| audit("orphan window candidate"))?;
+            require(
+                receipt.proof_identity == a.proof_identity
+                    && receipt.candidates.get(a.pair_index).is_some_and(|v| {
+                        v.candidate_id == c.review.candidate_id
+                            || renewal_descends_from(state, c, &v.candidate_id)
+                    }),
+                "window reference closure",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -774,3 +1190,26 @@ pub(crate) fn install_owned_test_fixture(conn: &mut SqliteConnection) {
 #[cfg(test)]
 #[path = "daily_change_review_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "daily_change_review_window_tests.rs"]
+mod window_tests;
+
+fn renewal_descends_from(state: &State, candidate: &CandidateState, ancestor: &str) -> bool {
+    let mut current = candidate;
+    let mut remaining = state.candidates.len();
+    while let Some(id) = &current.renewal_of {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        if id == ancestor {
+            return true;
+        }
+        let Some(parent) = state.candidates.get(id) else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
