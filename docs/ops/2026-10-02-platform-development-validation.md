@@ -557,3 +557,11 @@ Rows v2 本地最终源码针对四路径；`global_schema_v1.rs` 的V6夹具证
 准确限定 Cargo 结果：V6关闭池及重定位用例 **1/1 PASS**；Rows新增 owner/sequence/attack/预算 **11/11 PASS**，typed comparator **5/5 PASS**，catalog形态/metadata/TEMP **3/3 PASS**；既有 backup 安全门禁 **24/24 PASS**；prospective 安全门禁 **14/14 PASS**。全部命令为`cargo test --locked --offline --lib`并以真实模块限定名执行，测试库由首轮编译生成；另 `rustfmt --check --edition 2021 --config skip_children=true` 覆盖本批5个Rust文件，`git diff --check`与`git diff --cached --check`均通过。一次遗漏私有`rows`模块限定名的过滤器实际运行0项，不计为PASS；随后用`database::global_schema_v1::rows::tests`真实路径补跑并通过。全库测试、macOS以外的原生FD路径及生产输入未由本片验证。
 
 本片只授予并证明原始同一IMMEDIATE事务与真实Copied只读备份逐表逐行/SQLite类型/value/rowid/sequence相等，严格限额和最后hook-free尾验证。没有target/application、apply、restore、exchange、restart或部署能力；未更改生产服务。候选3作者静态检查材料可用，Root另复核当前最终差异及实际回归；本会话未取得另一个独立审阅者的新签收。提交前工作树仍是`f8e583b44b9d30cc7373b4b8b15c614ff964ca28`基础，目标远端为feature branch `stock_analysis/codex/platform-roadmap-implementation-20261002`。
+
+### Rows 提交后的远端核验与独立复核
+
+Rows 正式提交 `5075d9ba4a93b47e2f661cb857643dbf4f3d2209` 已推送至上述功能分支；实际 `git ls-remote` OID与本地HEAD一致，upstream +0/-0、tracked工作树干净。本片源码仍未部署生产。
+
+独立静态复核 `/root/temp_sql_root_cause` 已审阅5075相对f8的四个功能路径及必要调用链：无P1，发现1项P2。Rows预检以`length(CAST(TEXT AS BLOB))`计费，而rusqlite `ValueRef::Text`取得UTF-8字节；当main采用UTF-16时，中文可能按每字2字节通过预检、实际按3字节计费，复制角色创建后才拒绝。实际计费仍会拒绝，不会错误签发Rows cap，但违反复制前预算检查的合同。该结论为静态源码证据，尚未实际SQL复现。
+
+下一窄修先做隔离UTF-16精确目录回归，证明拒绝发生在intent/复制角色创建前；在Rows capture预检前限定main为UTF-8，保留原typed比较与全部固定预算。Rows审阅暂未收口。既有持久顺序继续为Rows问题闭合→正式F2评估/真实来源与明确资金激活→Global目标库及apply恢复→逐Unit生产验收和Gate P/自然观察。
