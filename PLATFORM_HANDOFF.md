@@ -190,3 +190,8 @@ TDX native bar缺返回issuer/venue；Hithink v2是observation-only，source exh
 实际80项主harness检查全PASS：新candidate_catalog7 12、identity golden1、旧global_catalog6 22、原f2_candidate_scope6、受影响paper_book_v2_execution39；两项ignored仅供父测试精确reexec的子进程，由父测试实际运行并验证，非跳过关键行为。库构建4m39s；新12项运行43.80s，日志SHA2560f3376d71831707df13ed762197e2f3f251a44bdd17ca3050561e1588d8f55c8。累计检查复用同一复制且SHA核验harness，未重复Cargo build/check/clippy或运行全量。编译后仅清除新增unused import，静态确认无引用、rustfmt与diff check通过；behavior-neutral清理另有SHA记录。新源码尚未部署，独立spec/quality review尚待完成。
 
 Catalog7独立全任务spec/quality复核已完成：无Critical/Important或需修改Minor；80项实际验证与未上线边界被复核。源码提交d2d1667b，紧接消息修复09a9370a。下一task严格限定实际amended6未批准target producer；不拿7观察或旧JSON/hash颁发migration/apply资格。
+
+
+### 2026-10-03 M1/Catalog7 实际整合验证
+
+在源码d12be0ed完成一次 `cargo build --locked --offline --bin monitor`，exit0（6m52s）；保存private复制并SHA核验的实际monitor制品，SHA256 `8b2308dc690884dda5f32874a42aa6aaecbb6b9dbf2ad993516aceda81ae745f`。执行 `monitor --test --push-dry-run`，独立TEST_CODE审计路径：59模板、4batches、failed0、external_process_attempted0、receipt_audit_appended0、live_opt_in=false。首次进程exit0但继承warn日志过滤导致验收计数不可见，保留该不足证据；同sealed制品显式info补取后计数完整，exit0（3.557s），实际日志SHA256 `15bbdb0f5a1249baea22159004f04a6d4929ae3d9b8ac5cc4e8d26d6150d0975`。未启用真实外发、未更换生产制品。现有counted-binding缺口仍原样拒绝，模板检查不代表正式业务source或生产验收通过。
