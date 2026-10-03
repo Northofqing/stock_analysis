@@ -168,3 +168,14 @@ TDX native bar缺返回issuer/venue；Hithink v2是observation-only，source exh
 ## 9. 可直接给接手会话的指令
 
 > 请先阅读仓库根目录 PLATFORM_HANDOFF.md、AGENTS.md 和 CLAUDE.md，核对实际HEAD、未提交改动和当前执行owner。沿用 codex/platform-roadmap-implementation-20261002；从最后已验证源码 b005457e 开始下一片 Catalog7 closed reference/borrower 与不可变观察持久owner，验证原cutoff exact retry/conflict、tail、独立reader、race/cold reopen和Unknown保留，再提交推送该feature。继续M0–M7全部上线及M8有证据裁定目标。不要把Top50来源捕获或固定DDL当正式F2/生产资格；不要复跑未改范围或绕过精确生产/VM运行/资金门禁。协调Windows时先读既有D14包，完成Mac WG07合同/caller前置，避免重复派发。
+
+
+## 2026-10-03 接续：消息恢复与 ExternalV1 缓存鉴权修复
+
+本轮源码由当前接续 chat 的 root 独占修改与 Cargo 验证，沿用原 feature worktree。生产恢复与开发验证分开：10/3 18:01 CST 已取得真实 Feishu DataMode Accepted/Delivered 和69条新闻；Windows兼容服务与Mac原Wave0制品已恢复。新开发源码尚未部署，78条历史 Uncertain 没有自动重发或裁定。生产恢复凭据在 `/Users/zhangzhen/.local/share/stock-analysis-runtime/ops/recovery-20261003/production-verification.json`，旧9:28 snapshot仅为历史事实。
+
+修复两条实际行为：NewsAI人工复核提示以稳定notice identity、合法 `Denied` / `internal_audit` 事件发布，成功后才确认数据库notice；不是消息送达或人工裁定。ExternalV1 在每次获取连接时重新核验Health身份和Capabilities，缓存移出后再等待，失败或取消即释放原缓存；返回刚核验的连接，避免重新读缓存的并发panic。失败请求不在同次获取内重拨，下一次独立请求才重新准备bundle并完整鉴权。关闭reason-code映射新增已知 `external_connection_unqualified`，拒绝分类保持不变。
+
+实际验证46项通过：`cargo test --locked --offline --lib external_cached_ -- --nocapture` 5项；同一已编译库harness覆盖公告路由4项、外部配置3项、开盘能力22项、notice数据库恢复1项；`cargo test --locked --offline --bin monitor news_ai_shadow::tests::br172_ -- --nocapture` 11项。库最终日志SHA256 `c081ea48ca6891eb36913a79b393fdb8f640582f61676c798df4c82505f7ce04`，monitor日志SHA256 `b87ac2a1726b0b28bf7453981c78ff2506c2f611f3d451efee97f8ceac3cac88`。首轮3PASS/1FAIL揭示reason映射遗漏，失败日志保留。独立复核发现测试服务器abort/join不能证明所有TCP连接已关闭；已改为有界等待tonic正常graceful shutdown完成再重绑定，窄复核无剩余发现。`git diff --check`通过；未执行release/生产切换或全量测试。
+
+下一片 Catalog7 whole-catalog borrower 与不可变负面候选观察已在独立scratch完成，待root应用、实际测试及独立复核。它不是正式InvestmentDecisionId、资金批准或Paper执行资格；后续Global target、真实source合同、完整risk评估、资金seed/cutover、WORM及自然窗口仍需继续完成。

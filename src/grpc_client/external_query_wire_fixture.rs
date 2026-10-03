@@ -153,6 +153,7 @@ struct ExternalQueryWireState {
     observation: ExternalQueryWireObservation,
     reply: ExternalQueryWireReply,
     capabilities_behavior: ExternalCapabilitiesBehavior,
+    invalid_health_identity: bool,
 }
 
 #[derive(Clone)]
@@ -174,10 +175,11 @@ impl SystemService for ExternalQueryWireService {
             .and_then(|value| value.to_str().ok())
             == Some(TEST_AUTHORIZATION);
         let request = request.into_inner();
-        {
+        let invalid_health_identity = {
             let mut state = self.state.lock().expect("TEST_CODE auction Health state");
             state.observation.health_calls += 1;
-        }
+            state.invalid_health_identity
+        };
         if !authorized {
             return Err(Status::unauthenticated(
                 "TEST_CODE auction Health bearer required",
@@ -189,13 +191,17 @@ impl SystemService for ExternalQueryWireService {
             .ok_or_else(|| Status::invalid_argument("TEST_CODE auction Health context missing"))?
             .request_id
             .clone();
+        let mut build_identity = test_external_build_identity();
+        if invalid_health_identity {
+            build_identity.binary_sha256 = "f".repeat(64);
+        }
         Ok(Response::new(HealthResponse {
             request_id,
             live: true,
             ready: true,
             state: "TEST_CODE_AUCTION_READY".to_owned(),
             observability: Some(test_external_observability()),
-            build_identity: Some(test_external_build_identity()),
+            build_identity: Some(build_identity),
         }))
     }
 
@@ -1231,6 +1237,7 @@ pub(crate) struct ExternalQueryWireFixture {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
     temp_dir: Option<tempfile::TempDir>,
+    route: ExternalQueryWireRoute,
 }
 
 impl ExternalQueryWireFixture {
@@ -1455,6 +1462,41 @@ impl ExternalQueryWireFixture {
             .map_err(|error| format!("TEST_CODE External query wire tempdir: {error}"))?;
         let bundle_path =
             write_test_code_bundle(temp_dir.path(), "valid", &endpoint, TEST_TLS_SERVER_NAME)?;
+        let state = Arc::new(Mutex::new(ExternalQueryWireState {
+            reply,
+            capabilities_behavior,
+            ..ExternalQueryWireState::default()
+        }));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let capabilities_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (shutdown, task) =
+            Self::spawn_server(listener, &state, &release, &capabilities_release, route)?;
+        Ok(Self {
+            bundle_path,
+            endpoint,
+            state,
+            release,
+            capabilities_release,
+            shutdown: Some(shutdown),
+            task: Some(task),
+            temp_dir: Some(temp_dir),
+            route,
+        })
+    }
+
+    fn spawn_server(
+        listener: tokio::net::TcpListener,
+        state: &Arc<Mutex<ExternalQueryWireState>>,
+        release: &Arc<tokio::sync::Semaphore>,
+        capabilities_release: &Arc<tokio::sync::Semaphore>,
+        route: ExternalQueryWireRoute,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        String,
+    > {
         let tls = ServerTlsConfig::new()
             .identity(Identity::from_pem(
                 TEST_CODE_MTLS_SERVER_CERT,
@@ -1466,19 +1508,12 @@ impl ExternalQueryWireFixture {
         let mut builder = tonic::transport::Server::builder()
             .tls_config(tls)
             .map_err(|error| format!("TEST_CODE External query wire TLS config: {error}"))?;
-        let state = Arc::new(Mutex::new(ExternalQueryWireState {
-            reply,
-            capabilities_behavior,
-            ..ExternalQueryWireState::default()
-        }));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let capabilities_release = Arc::new(tokio::sync::Semaphore::new(0));
         let service = ExternalQueryWireService {
-            state: Arc::clone(&state),
-            release: Arc::clone(&release),
-            capabilities_release: Arc::clone(&capabilities_release),
+            state: Arc::clone(state),
+            release: Arc::clone(release),
+            capabilities_release: Arc::clone(capabilities_release),
         };
-        let accept_state = Arc::clone(&state);
+        let accept_state = Arc::clone(state);
         let incoming =
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |connection| {
                 if connection.is_ok() {
@@ -1500,16 +1535,43 @@ impl ExternalQueryWireFixture {
                 })
                 .await
         });
-        Ok(Self {
-            bundle_path,
-            endpoint,
-            state,
-            release,
-            capabilities_release,
-            shutdown: Some(shutdown),
-            task: Some(task),
-            temp_dir: Some(temp_dir),
-        })
+        Ok((shutdown, task))
+    }
+
+    /// Force a real server/TCP shutdown, then reopen the same mTLS endpoint.
+    /// Existing clients retain their spent one-dial generation.
+    pub(crate) async fn restart_transport(&mut self) -> Result<(), String> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(result) => return Err(format!("TEST_CODE restart shutdown: {result:?}")),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    return Err("TEST_CODE restart TCP shutdown deadline".to_owned());
+                }
+            }
+        }
+        let listener = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpListener::bind(self.endpoint.trim_start_matches("https://")),
+        )
+        .await
+        .map_err(|_| "TEST_CODE restart bind deadline".to_owned())?
+        .map_err(|error| format!("TEST_CODE restart bind: {error}"))?;
+        let (shutdown, task) = Self::spawn_server(
+            listener,
+            &self.state,
+            &self.release,
+            &self.capabilities_release,
+            self.route,
+        )?;
+        self.shutdown = Some(shutdown);
+        self.task = Some(task);
+        Ok(())
     }
 
     pub(crate) fn bundle_path(&self) -> &Path {
@@ -1534,6 +1596,13 @@ impl ExternalQueryWireFixture {
 
     pub(crate) fn release_capabilities(&self) {
         self.capabilities_release.add_permits(1);
+    }
+
+    pub(crate) fn set_invalid_health_identity(&self, invalid: bool) {
+        self.state
+            .lock()
+            .expect("TEST_CODE Health identity control")
+            .invalid_health_identity = invalid;
     }
 
     pub(crate) async fn finish(mut self) -> Result<(), String> {
