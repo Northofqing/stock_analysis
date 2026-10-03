@@ -650,3 +650,425 @@ pub(super) fn apply_fact(state: &mut Projection, fact: &Fact) -> Result<(), Ledg
     }
     Ok(())
 }
+
+// Finite replay DTO seeds stay with the owners of private fields.
+#[allow(dead_code, non_camel_case_types)]
+mod replay_codec_owner {
+    use super::*;
+    use crate::trading::paper_replay_codec_v1 as c;
+    use crate::trading::paper_replay_shapes_v1 as s;
+    use serde::de::{EnumAccess as _, VariantAccess as _};
+    impl c::sealed::Value for PriceIntent {}
+    impl c::Value for PriceIntent {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "FixedSignalPriceV1",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "SignalQuoteMarketV1",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_FixedSignalPriceV1<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_FixedSignalPriceV1<'de, '_, '_, '_> {
+                type Value = PriceIntent;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(PriceIntent::FixedSignalPriceV1)
+                }
+            }
+            struct Seed_SignalQuoteMarketV1<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_SignalQuoteMarketV1<'de, '_, '_, '_> {
+                type Value = PriceIntent;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(PriceIntent::SignalQuoteMarketV1)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = PriceIntent;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["FixedSignalPriceV1", "SignalQuoteMarketV1"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "FixedSignalPriceV1" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(PriceIntent::FixedSignalPriceV1)
+                        }
+                        "SignalQuoteMarketV1" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(PriceIntent::SignalQuoteMarketV1)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &["FixedSignalPriceV1", "SignalQuoteMarketV1"],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                PriceIntent::FixedSignalPriceV1 => PriceIntent::FixedSignalPriceV1,
+                PriceIntent::SignalQuoteMarketV1 => PriceIntent::SignalQuoteMarketV1,
+            })
+        }
+    }
+    impl c::sealed::Value for ValuationBatch {}
+    impl c::Value for ValuationBatch {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "binding",
+                    shape: &<AccountBinding as c::Value>::SHAPE,
+                    optional: <AccountBinding as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "command_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "expected_version",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "inventory_fingerprint",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "as_of",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "closing",
+                    shape: &<bool as c::Value>::SHAPE,
+                    optional: <bool as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "marks",
+                    shape: &<Vec<Mark> as c::Value>::SHAPE,
+                    optional: <Vec<Mark> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,ValuationBatch,true,{binding:AccountBinding=>false,command_id:String=>false,expected_version:i64=>false,inventory_fingerprint:String=>false,as_of:DateTime<Utc> =>false,closing:bool=>false,marks:Vec<Mark> =>false},ValuationBatch{binding,command_id,expected_version,inventory_fingerprint,as_of,closing,marks})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(ValuationBatch {
+                binding: c::Value::paid_copy(&self.binding, w)?,
+                command_id: c::Value::paid_copy(&self.command_id, w)?,
+                expected_version: c::Value::paid_copy(&self.expected_version, w)?,
+                inventory_fingerprint: c::Value::paid_copy(&self.inventory_fingerprint, w)?,
+                as_of: c::Value::paid_copy(&self.as_of, w)?,
+                closing: c::Value::paid_copy(&self.closing, w)?,
+                marks: c::Value::paid_copy(&self.marks, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for OrderFact {}
+    impl c::Value for OrderFact {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "plan_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "intent_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "direction",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "requested_price",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "price_intent",
+                    shape: &<PriceIntent as c::Value>::SHAPE,
+                    optional: <PriceIntent as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quote_price",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quote_observed_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_mode",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "data_mode",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "decision_basis",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_evidence",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "occurred_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "status",
+                    shape: &<LedgerStatus as c::Value>::SHAPE,
+                    optional: <LedgerStatus as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "reason",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash_delta",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "commission",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "stamp",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "realized_delta",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "lot_changes",
+                    shape: &<Vec<LotChange> as c::Value>::SHAPE,
+                    optional: <Vec<LotChange> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "marks",
+                    shape: &<BTreeMap<String, Mark> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, Mark> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "paper_trade_id",
+                    shape: &<Option<i64> as c::Value>::SHAPE,
+                    optional: <Option<i64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "audit",
+                    shape: &<AuditLink as c::Value>::SHAPE,
+                    optional: <AuditLink as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,OrderFact,true,{plan_id:String=>false,intent_hash:String=>false,code:String=>false,direction:String=>false,requested_price:Money=>false,price_intent:PriceIntent=>false,quantity:u32=>false,quote_price:Money=>false,quote_observed_at:DateTime<Utc> =>false,account_mode:String=>false,data_mode:String=>false,decision_basis:String=>false,source_evidence:String=>false,occurred_at:DateTime<Utc> =>false,status:LedgerStatus=>false,reason:Option<String> =>false,cash_delta:Money=>false,commission:Money=>false,stamp:Money=>false,realized_delta:Money=>false,lot_changes:Vec<LotChange> =>false,marks:BTreeMap<String, Mark> =>false,paper_trade_id:Option<i64> =>false,audit:AuditLink=>false},OrderFact{plan_id,intent_hash,code,direction,requested_price,price_intent,quantity,quote_price,quote_observed_at,account_mode,data_mode,decision_basis,source_evidence,occurred_at,status,reason,cash_delta,commission,stamp,realized_delta,lot_changes,marks,paper_trade_id,audit})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(OrderFact {
+                plan_id: c::Value::paid_copy(&self.plan_id, w)?,
+                intent_hash: c::Value::paid_copy(&self.intent_hash, w)?,
+                code: c::Value::paid_copy(&self.code, w)?,
+                direction: c::Value::paid_copy(&self.direction, w)?,
+                requested_price: c::Value::paid_copy(&self.requested_price, w)?,
+                price_intent: c::Value::paid_copy(&self.price_intent, w)?,
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+                quote_price: c::Value::paid_copy(&self.quote_price, w)?,
+                quote_observed_at: c::Value::paid_copy(&self.quote_observed_at, w)?,
+                account_mode: c::Value::paid_copy(&self.account_mode, w)?,
+                data_mode: c::Value::paid_copy(&self.data_mode, w)?,
+                decision_basis: c::Value::paid_copy(&self.decision_basis, w)?,
+                source_evidence: c::Value::paid_copy(&self.source_evidence, w)?,
+                occurred_at: c::Value::paid_copy(&self.occurred_at, w)?,
+                status: c::Value::paid_copy(&self.status, w)?,
+                reason: c::Value::paid_copy(&self.reason, w)?,
+                cash_delta: c::Value::paid_copy(&self.cash_delta, w)?,
+                commission: c::Value::paid_copy(&self.commission, w)?,
+                stamp: c::Value::paid_copy(&self.stamp, w)?,
+                realized_delta: c::Value::paid_copy(&self.realized_delta, w)?,
+                lot_changes: c::Value::paid_copy(&self.lot_changes, w)?,
+                marks: c::Value::paid_copy(&self.marks, w)?,
+                paper_trade_id: c::Value::paid_copy(&self.paper_trade_id, w)?,
+                audit: c::Value::paid_copy(&self.audit, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for LotChange {}
+    impl c::Value for LotChange {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "before",
+                    shape: &<Option<Lot> as c::Value>::SHAPE,
+                    optional: <Option<Lot> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "after",
+                    shape: &<Option<Lot> as c::Value>::SHAPE,
+                    optional: <Option<Lot> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,LotChange,true,{before:Option<Lot> =>false,after:Option<Lot> =>false},LotChange{before,after})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(LotChange {
+                before: c::Value::paid_copy(&self.before, w)?,
+                after: c::Value::paid_copy(&self.after, w)?,
+            })
+        }
+    }
+    impl c::sealed::Element for LotChange {}
+    impl c::ArrayElement for LotChange {}
+}
+#[cfg(test)]
+pub(crate) fn replay_codec_fixtures(
+    case: crate::trading::paper_replay_codec_v1::CodecFixtureCase,
+    work: &mut crate::database::global_schema_v1::replay_work::CodecMechanics<'_, '_>,
+) {
+}

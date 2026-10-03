@@ -709,3 +709,7 @@ mod tests {
         cmd_buy("X", "TEST_CODE_000001")
     }
 }
+
+// Closed bounded DTO mechanics; production acquisition remains profile gated.
+pub(crate) mod paper_replay_shapes_v1;
+pub(crate) mod paper_replay_codec_v1;

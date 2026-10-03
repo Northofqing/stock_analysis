@@ -1307,3 +1307,2120 @@ pub(crate) fn test_historical_v1_sql_rows(
     };
     (events(conn, id).unwrap(), head(conn, &binding).unwrap())
 }
+
+// Finite replay DTO seeds stay with the owners of private fields.
+#[allow(dead_code, non_camel_case_types)]
+mod replay_codec_owner {
+    use super::adjudication::AdjudicatedFact;
+    use super::execution::LotChange;
+    use super::*;
+    use crate::performance::snapshot::PerformanceSnapshot;
+    use crate::trading::paper_replay_codec_v1 as c;
+    use crate::trading::paper_replay_shapes_v1 as s;
+    use serde::de::{EnumAccess as _, VariantAccess as _};
+    impl c::sealed::Value for RiskPolicyV1 {}
+    impl c::Value for RiskPolicyV1 {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "max_position_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash_floor_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "max_slippage_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,RiskPolicyV1,true,{max_position_bps:u32=>false,cash_floor_bps:u32=>false,max_slippage_bps:u32=>false},RiskPolicyV1{max_position_bps,cash_floor_bps,max_slippage_bps})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(RiskPolicyV1 {
+                max_position_bps: c::Value::paid_copy(&self.max_position_bps, w)?,
+                cash_floor_bps: c::Value::paid_copy(&self.cash_floor_bps, w)?,
+                max_slippage_bps: c::Value::paid_copy(&self.max_slippage_bps, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for Mark {}
+    impl c::Value for Mark {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "price",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "observed_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,Mark,true,{code:String=>false,price:Money=>false,observed_at:DateTime<Utc> =>false,source:String=>false},Mark{code,price,observed_at,source})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(Mark {
+                code: c::Value::paid_copy(&self.code, w)?,
+                price: c::Value::paid_copy(&self.price, w)?,
+                observed_at: c::Value::paid_copy(&self.observed_at, w)?,
+                source: c::Value::paid_copy(&self.source, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for SeedLot {}
+    impl c::Value for SeedLot {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "name",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "reported_cost",
+                    shape: &<Option<Money> as c::Value>::SHAPE,
+                    optional: <Option<Money> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sellable_from",
+                    shape: &<Option<NaiveDate> as c::Value>::SHAPE,
+                    optional: <Option<NaiveDate> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sellability_evidence",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,SeedLot,true,{code:String=>false,name:String=>false,quantity:u32=>false,reported_cost:Option<Money> =>false,sellable_from:Option<NaiveDate> =>false,sellability_evidence:Option<String> =>false},SeedLot{code,name,quantity,reported_cost,sellable_from,sellability_evidence})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(SeedLot {
+                code: c::Value::paid_copy(&self.code, w)?,
+                name: c::Value::paid_copy(&self.name, w)?,
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+                reported_cost: c::Value::paid_copy(&self.reported_cost, w)?,
+                sellable_from: c::Value::paid_copy(&self.sellable_from, w)?,
+                sellability_evidence: c::Value::paid_copy(&self.sellability_evidence, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for SeedManifest {}
+    impl c::Value for SeedManifest {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "account_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "command_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_effective_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "positions_effective_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "approved_by",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "original_total",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "excluded_residual",
+                    shape: &<Option<Money> as c::Value>::SHAPE,
+                    optional: <Option<Money> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "lots",
+                    shape: &<Vec<SeedLot> as c::Value>::SHAPE,
+                    optional: <Vec<SeedLot> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "marks",
+                    shape: &<Vec<Mark> as c::Value>::SHAPE,
+                    optional: <Vec<Mark> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "policy",
+                    shape: &<RiskPolicyV1 as c::Value>::SHAPE,
+                    optional: <RiskPolicyV1 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,SeedManifest,true,{account_id:String=>false,epoch_id:String=>false,command_id:String=>false,cutover_at:DateTime<Utc> =>false,account_effective_at:DateTime<Utc> =>false,positions_effective_at:DateTime<Utc> =>false,source_reference:String=>false,source_hash:String=>false,approved_by:String=>false,cash:Money=>false,original_total:Money=>false,excluded_residual:Option<Money> =>false,lots:Vec<SeedLot> =>false,marks:Vec<Mark> =>false,policy:RiskPolicyV1=>false},SeedManifest{account_id,epoch_id,command_id,cutover_at,account_effective_at,positions_effective_at,source_reference,source_hash,approved_by,cash,original_total,excluded_residual,lots,marks,policy})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(SeedManifest {
+                account_id: c::Value::paid_copy(&self.account_id, w)?,
+                epoch_id: c::Value::paid_copy(&self.epoch_id, w)?,
+                command_id: c::Value::paid_copy(&self.command_id, w)?,
+                cutover_at: c::Value::paid_copy(&self.cutover_at, w)?,
+                account_effective_at: c::Value::paid_copy(&self.account_effective_at, w)?,
+                positions_effective_at: c::Value::paid_copy(&self.positions_effective_at, w)?,
+                source_reference: c::Value::paid_copy(&self.source_reference, w)?,
+                source_hash: c::Value::paid_copy(&self.source_hash, w)?,
+                approved_by: c::Value::paid_copy(&self.approved_by, w)?,
+                cash: c::Value::paid_copy(&self.cash, w)?,
+                original_total: c::Value::paid_copy(&self.original_total, w)?,
+                excluded_residual: c::Value::paid_copy(&self.excluded_residual, w)?,
+                lots: c::Value::paid_copy(&self.lots, w)?,
+                marks: c::Value::paid_copy(&self.marks, w)?,
+                policy: c::Value::paid_copy(&self.policy, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for AccountBinding {}
+    impl c::Value for AccountBinding {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "account_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "manifest_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,AccountBinding,true,{account_id:String=>false,epoch_id:String=>false,manifest_hash:String=>false},AccountBinding{account_id,epoch_id,manifest_hash})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(AccountBinding {
+                account_id: c::Value::paid_copy(&self.account_id, w)?,
+                epoch_id: c::Value::paid_copy(&self.epoch_id, w)?,
+                manifest_hash: c::Value::paid_copy(&self.manifest_hash, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for Lot {}
+    impl c::Value for Lot {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "lot_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "name",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "basis_price",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "buy_fee_remaining",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "acquired_on",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sellable_from",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "reported_cost",
+                    shape: &<Option<Money> as c::Value>::SHAPE,
+                    optional: <Option<Money> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,Lot,true,{lot_id:String=>false,code:String=>false,name:String=>false,quantity:u32=>false,basis_price:Money=>false,buy_fee_remaining:Money=>false,acquired_on:NaiveDate=>false,sellable_from:NaiveDate=>false,reported_cost:Option<Money> =>false},Lot{lot_id,code,name,quantity,basis_price,buy_fee_remaining,acquired_on,sellable_from,reported_cost})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(Lot {
+                lot_id: c::Value::paid_copy(&self.lot_id, w)?,
+                code: c::Value::paid_copy(&self.code, w)?,
+                name: c::Value::paid_copy(&self.name, w)?,
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+                basis_price: c::Value::paid_copy(&self.basis_price, w)?,
+                buy_fee_remaining: c::Value::paid_copy(&self.buy_fee_remaining, w)?,
+                acquired_on: c::Value::paid_copy(&self.acquired_on, w)?,
+                sellable_from: c::Value::paid_copy(&self.sellable_from, w)?,
+                reported_cost: c::Value::paid_copy(&self.reported_cost, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for Projection {}
+    impl c::Value for Projection {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "cash",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "lots",
+                    shape: &<Vec<Lot> as c::Value>::SHAPE,
+                    optional: <Vec<Lot> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "marks",
+                    shape: &<BTreeMap<String, Mark> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, Mark> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fees",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "realized_pnl",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "seed_equity",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "as_of",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "closes",
+                    shape: &<BTreeMap<NaiveDate, Money> as c::Value>::SHAPE,
+                    optional: <BTreeMap<NaiveDate, Money> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "economic_unavailable",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: true,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,Projection,true,{cash:Money=>false,lots:Vec<Lot> =>false,marks:BTreeMap<String, Mark> =>false,fees:Money=>false,realized_pnl:Money=>false,seed_equity:Money=>false,as_of:DateTime<Utc> =>false,closes:BTreeMap<NaiveDate, Money> =>false,economic_unavailable:Option<String> =>true},Projection{cash,lots,marks,fees,realized_pnl,seed_equity,as_of,closes,economic_unavailable})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(Projection {
+                cash: c::Value::paid_copy(&self.cash, w)?,
+                lots: c::Value::paid_copy(&self.lots, w)?,
+                marks: c::Value::paid_copy(&self.marks, w)?,
+                fees: c::Value::paid_copy(&self.fees, w)?,
+                realized_pnl: c::Value::paid_copy(&self.realized_pnl, w)?,
+                seed_equity: c::Value::paid_copy(&self.seed_equity, w)?,
+                as_of: c::Value::paid_copy(&self.as_of, w)?,
+                closes: c::Value::paid_copy(&self.closes, w)?,
+                economic_unavailable: c::Value::paid_copy(&self.economic_unavailable, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for LedgerStatus {}
+    impl c::Value for LedgerStatus {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Seeded",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Marked",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Filled",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "NotFilled",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Invalidated",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Rejected",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Adjudicated",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "SnapshotRecorded",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Seeded<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Seeded<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Seeded)
+                }
+            }
+            struct Seed_Marked<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Marked<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Marked)
+                }
+            }
+            struct Seed_Filled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Filled<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Filled)
+                }
+            }
+            struct Seed_NotFilled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_NotFilled<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::NotFilled)
+                }
+            }
+            struct Seed_Invalidated<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Invalidated<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Invalidated)
+                }
+            }
+            struct Seed_Rejected<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Rejected<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Rejected)
+                }
+            }
+            struct Seed_Adjudicated<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Adjudicated<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::Adjudicated)
+                }
+            }
+            struct Seed_SnapshotRecorded<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_SnapshotRecorded<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LedgerStatus::SnapshotRecorded)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = LedgerStatus;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &[
+                            "Seeded",
+                            "Marked",
+                            "Filled",
+                            "NotFilled",
+                            "Invalidated",
+                            "Rejected",
+                            "Adjudicated",
+                            "SnapshotRecorded",
+                        ],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Seeded" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Seeded)
+                        }
+                        "Marked" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Marked)
+                        }
+                        "Filled" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Filled)
+                        }
+                        "NotFilled" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::NotFilled)
+                        }
+                        "Invalidated" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Invalidated)
+                        }
+                        "Rejected" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Rejected)
+                        }
+                        "Adjudicated" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::Adjudicated)
+                        }
+                        "SnapshotRecorded" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LedgerStatus::SnapshotRecorded)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &[
+                    "Seeded",
+                    "Marked",
+                    "Filled",
+                    "NotFilled",
+                    "Invalidated",
+                    "Rejected",
+                    "Adjudicated",
+                    "SnapshotRecorded",
+                ],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                LedgerStatus::Seeded => LedgerStatus::Seeded,
+                LedgerStatus::Marked => LedgerStatus::Marked,
+                LedgerStatus::Filled => LedgerStatus::Filled,
+                LedgerStatus::NotFilled => LedgerStatus::NotFilled,
+                LedgerStatus::Invalidated => LedgerStatus::Invalidated,
+                LedgerStatus::Rejected => LedgerStatus::Rejected,
+                LedgerStatus::Adjudicated => LedgerStatus::Adjudicated,
+                LedgerStatus::SnapshotRecorded => LedgerStatus::SnapshotRecorded,
+            })
+        }
+    }
+    impl c::sealed::Value for AuditLink {}
+    impl c::Value for AuditLink {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "id",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "previous_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "record_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "created_at",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,AuditLink,true,{id:i64=>false,previous_hash:String=>false,record_hash:String=>false,created_at:String=>false},AuditLink{id,previous_hash,record_hash,created_at})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(AuditLink {
+                id: c::Value::paid_copy(&self.id, w)?,
+                previous_hash: c::Value::paid_copy(&self.previous_hash, w)?,
+                record_hash: c::Value::paid_copy(&self.record_hash, w)?,
+                created_at: c::Value::paid_copy(&self.created_at, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for Fact {}
+    impl c::Value for Fact {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Seeded",
+                body: s::Body::Record(
+                    &[
+                        s::Field {
+                            name: "manifest",
+                            shape: &<SeedManifest as c::Value>::SHAPE,
+                            optional: <SeedManifest as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                        s::Field {
+                            name: "legacy_high_water_id",
+                            shape: &<i64 as c::Value>::SHAPE,
+                            optional: <i64 as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                        s::Field {
+                            name: "legacy_audit_high_water",
+                            shape: &<String as c::Value>::SHAPE,
+                            optional: <String as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                    ],
+                    false,
+                ),
+            },
+            s::Variant {
+                name: "Order",
+                body: s::Body::Value(&<OrderFact as c::Value>::SHAPE),
+            },
+            s::Variant {
+                name: "Marked",
+                body: s::Body::Value(&<ValuationBatch as c::Value>::SHAPE),
+            },
+            s::Variant {
+                name: "AdjudicatedV1",
+                body: s::Body::Value(&<adjudication::AdjudicatedFact as c::Value>::SHAPE),
+            },
+            s::Variant {
+                name: "DerivedSnapshotV1",
+                body: s::Body::Value(&<SnapshotRevision as c::Value>::SHAPE),
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Seeded<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Seeded<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,Fact,true,{manifest:SeedManifest=>false,legacy_high_water_id:i64=>false,legacy_audit_high_water:String=>false},Fact::Seeded{manifest,legacy_high_water_id,legacy_audit_high_water})
+                }
+            }
+            struct Seed_Order<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Order<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <OrderFact as c::Value>::read(de, self.0).map(Fact::Order)
+                }
+            }
+            struct Seed_Marked<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Marked<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <ValuationBatch as c::Value>::read(de, self.0).map(Fact::Marked)
+                }
+            }
+            struct Seed_AdjudicatedV1<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_AdjudicatedV1<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <adjudication::AdjudicatedFact as c::Value>::read(de, self.0)
+                        .map(Fact::AdjudicatedV1)
+                }
+            }
+            struct Seed_DerivedSnapshotV1<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_DerivedSnapshotV1<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <SnapshotRevision as c::Value>::read(de, self.0).map(Fact::DerivedSnapshotV1)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = Fact;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &[
+                            "Seeded",
+                            "Order",
+                            "Marked",
+                            "AdjudicatedV1",
+                            "DerivedSnapshotV1",
+                        ],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Seeded" => {
+                            value.newtype_variant_seed(Seed_Seeded(self.0.child(span, origin)))
+                        }
+                        "Order" => {
+                            value.newtype_variant_seed(Seed_Order(self.0.child(span, origin)))
+                        }
+                        "Marked" => {
+                            value.newtype_variant_seed(Seed_Marked(self.0.child(span, origin)))
+                        }
+                        "AdjudicatedV1" => value
+                            .newtype_variant_seed(Seed_AdjudicatedV1(self.0.child(span, origin))),
+                        "DerivedSnapshotV1" => value.newtype_variant_seed(Seed_DerivedSnapshotV1(
+                            self.0.child(span, origin),
+                        )),
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &[
+                    "Seeded",
+                    "Order",
+                    "Marked",
+                    "AdjudicatedV1",
+                    "DerivedSnapshotV1",
+                ],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                Fact::Seeded {
+                    manifest,
+                    legacy_high_water_id,
+                    legacy_audit_high_water,
+                } => Fact::Seeded {
+                    manifest: c::Value::paid_copy(manifest, w)?,
+                    legacy_high_water_id: c::Value::paid_copy(legacy_high_water_id, w)?,
+                    legacy_audit_high_water: c::Value::paid_copy(legacy_audit_high_water, w)?,
+                },
+                Fact::Order(value) => Fact::Order(c::Value::paid_copy(value, w)?),
+                Fact::Marked(value) => Fact::Marked(c::Value::paid_copy(value, w)?),
+                Fact::AdjudicatedV1(value) => Fact::AdjudicatedV1(c::Value::paid_copy(value, w)?),
+                Fact::DerivedSnapshotV1(value) => {
+                    Fact::DerivedSnapshotV1(c::Value::paid_copy(value, w)?)
+                }
+            })
+        }
+    }
+    impl c::sealed::Value for FillFingerprint {}
+    impl c::Value for FillFingerprint {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "paper_trade_id",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "plan_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "event_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "raw_trade_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "audit_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fact_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "legacy_before_cutover",
+                    shape: &<bool as c::Value>::SHAPE,
+                    optional: <bool as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "legacy_no_terminal",
+                    shape: &<bool as c::Value>::SHAPE,
+                    optional: <bool as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,FillFingerprint,true,{paper_trade_id:i64=>false,plan_id:String=>false,event_hash:String=>false,raw_trade_hash:String=>false,audit_hash:String=>false,fact_at:DateTime<Utc> =>false,legacy_before_cutover:bool=>false,legacy_no_terminal:bool=>false},FillFingerprint{paper_trade_id,plan_id,event_hash,raw_trade_hash,audit_hash,fact_at,legacy_before_cutover,legacy_no_terminal})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(FillFingerprint {
+                paper_trade_id: c::Value::paid_copy(&self.paper_trade_id, w)?,
+                plan_id: c::Value::paid_copy(&self.plan_id, w)?,
+                event_hash: c::Value::paid_copy(&self.event_hash, w)?,
+                raw_trade_hash: c::Value::paid_copy(&self.raw_trade_hash, w)?,
+                audit_hash: c::Value::paid_copy(&self.audit_hash, w)?,
+                fact_at: c::Value::paid_copy(&self.fact_at, w)?,
+                legacy_before_cutover: c::Value::paid_copy(&self.legacy_before_cutover, w)?,
+                legacy_no_terminal: c::Value::paid_copy(&self.legacy_no_terminal, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for AdjudicationAction {}
+    impl c::Value for AdjudicationAction {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Quarantine",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "CorrectionDeclared",
+                body: s::Body::Record(
+                    &[
+                        s::Field {
+                            name: "price",
+                            shape: &<Money as c::Value>::SHAPE,
+                            optional: <Money as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                        s::Field {
+                            name: "quantity",
+                            shape: &<u32 as c::Value>::SHAPE,
+                            optional: <u32 as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                        s::Field {
+                            name: "fact_at",
+                            shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                            optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        },
+                    ],
+                    false,
+                ),
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Quarantine<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Quarantine<'de, '_, '_, '_> {
+                type Value = AdjudicationAction;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(AdjudicationAction::Quarantine)
+                }
+            }
+            struct Seed_CorrectionDeclared<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_CorrectionDeclared<'de, '_, '_, '_> {
+                type Value = AdjudicationAction;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,AdjudicationAction,true,{price:Money=>false,quantity:u32=>false,fact_at:DateTime<Utc> =>false},AdjudicationAction::CorrectionDeclared{price,quantity,fact_at})
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = AdjudicationAction;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["Quarantine", "CorrectionDeclared"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Quarantine" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(AdjudicationAction::Quarantine)
+                        }
+                        "CorrectionDeclared" => value.newtype_variant_seed(
+                            Seed_CorrectionDeclared(self.0.child(span, origin)),
+                        ),
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum("codec", &["Quarantine", "CorrectionDeclared"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                AdjudicationAction::Quarantine => AdjudicationAction::Quarantine,
+                AdjudicationAction::CorrectionDeclared {
+                    price,
+                    quantity,
+                    fact_at,
+                } => AdjudicationAction::CorrectionDeclared {
+                    price: c::Value::paid_copy(price, w)?,
+                    quantity: c::Value::paid_copy(quantity, w)?,
+                    fact_at: c::Value::paid_copy(fact_at, w)?,
+                },
+            })
+        }
+    }
+    impl c::sealed::Value for Adjudication {}
+    impl c::Value for Adjudication {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "binding",
+                    shape: &<AccountBinding as c::Value>::SHAPE,
+                    optional: <AccountBinding as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "request_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "expected_version",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "expected_head",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "expected_predecessor",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "original",
+                    shape: &<FillFingerprint as c::Value>::SHAPE,
+                    optional: <FillFingerprint as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "action",
+                    shape: &<AdjudicationAction as c::Value>::SHAPE,
+                    optional: <AdjudicationAction as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "reason",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "evidence",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "operator",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "decision_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,Adjudication,true,{binding:AccountBinding=>false,request_id:String=>false,expected_version:i64=>false,expected_head:String=>false,expected_predecessor:Option<String> =>false,original:FillFingerprint=>false,action:AdjudicationAction=>false,reason:String=>false,evidence:String=>false,operator:String=>false,source:String=>false,decision_at:DateTime<Utc> =>false},Adjudication{binding,request_id,expected_version,expected_head,expected_predecessor,original,action,reason,evidence,operator,source,decision_at})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(Adjudication {
+                binding: c::Value::paid_copy(&self.binding, w)?,
+                request_id: c::Value::paid_copy(&self.request_id, w)?,
+                expected_version: c::Value::paid_copy(&self.expected_version, w)?,
+                expected_head: c::Value::paid_copy(&self.expected_head, w)?,
+                expected_predecessor: c::Value::paid_copy(&self.expected_predecessor, w)?,
+                original: c::Value::paid_copy(&self.original, w)?,
+                action: c::Value::paid_copy(&self.action, w)?,
+                reason: c::Value::paid_copy(&self.reason, w)?,
+                evidence: c::Value::paid_copy(&self.evidence, w)?,
+                operator: c::Value::paid_copy(&self.operator, w)?,
+                source: c::Value::paid_copy(&self.source, w)?,
+                decision_at: c::Value::paid_copy(&self.decision_at, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for AdjudicatedFact {}
+    impl c::Value for AdjudicatedFact {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "request",
+                    shape: &<Adjudication as c::Value>::SHAPE,
+                    optional: <Adjudication as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "projection",
+                    shape: &<Projection as c::Value>::SHAPE,
+                    optional: <Projection as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "historical_projection",
+                    shape: &<Option<(String, Option<String>)> as c::Value>::SHAPE,
+                    optional: <Option<(String, Option<String>)> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,AdjudicatedFact,true,{request:Adjudication=>false,projection:Projection=>false,historical_projection:Option<(String, Option<String>)> =>false},AdjudicatedFact{request,projection,historical_projection})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(AdjudicatedFact {
+                request: c::Value::paid_copy(&self.request, w)?,
+                projection: c::Value::paid_copy(&self.projection, w)?,
+                historical_projection: c::Value::paid_copy(&self.historical_projection, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for SnapshotRevision {}
+    impl c::Value for SnapshotRevision {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "target_date",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "algorithm",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "projection",
+                    shape: &<EffectiveProjectionReceipt as c::Value>::SHAPE,
+                    optional: <EffectiveProjectionReceipt as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "metrics",
+                    shape: &<crate::performance::snapshot::PerformanceSnapshot as c::Value>::SHAPE,
+                    optional:
+                        <crate::performance::snapshot::PerformanceSnapshot as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_exclusions",
+                    shape: &<Vec<OpeningInventoryExit> as c::Value>::SHAPE,
+                    optional: <Vec<OpeningInventoryExit> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_realized_pnl",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "result_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,SnapshotRevision,true,{target_date:NaiveDate=>false,algorithm:String=>false,projection:EffectiveProjectionReceipt=>false,metrics:crate::performance::snapshot::PerformanceSnapshot=>false,opening_exclusions:Vec<OpeningInventoryExit> =>false,account_realized_pnl:Money=>false,result_hash:String=>false},SnapshotRevision{target_date,algorithm,projection,metrics,opening_exclusions,account_realized_pnl,result_hash})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(SnapshotRevision {
+                target_date: c::Value::paid_copy(&self.target_date, w)?,
+                algorithm: c::Value::paid_copy(&self.algorithm, w)?,
+                projection: c::Value::paid_copy(&self.projection, w)?,
+                metrics: c::Value::paid_copy(&self.metrics, w)?,
+                opening_exclusions: c::Value::paid_copy(&self.opening_exclusions, w)?,
+                account_realized_pnl: c::Value::paid_copy(&self.account_realized_pnl, w)?,
+                result_hash: c::Value::paid_copy(&self.result_hash, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for EffectiveFillScope {}
+    impl c::Value for EffectiveFillScope {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "LegacyRaw",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Epoch",
+                body: s::Body::Value(&<AccountBinding as c::Value>::SHAPE),
+            },
+            s::Variant {
+                name: "LegacyBeforeCutover",
+                body: s::Body::Value(&<AccountBinding as c::Value>::SHAPE),
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_LegacyRaw<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_LegacyRaw<'de, '_, '_, '_> {
+                type Value = EffectiveFillScope;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(EffectiveFillScope::LegacyRaw)
+                }
+            }
+            struct Seed_Epoch<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Epoch<'de, '_, '_, '_> {
+                type Value = EffectiveFillScope;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <AccountBinding as c::Value>::read(de, self.0).map(EffectiveFillScope::Epoch)
+                }
+            }
+            struct Seed_LegacyBeforeCutover<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_LegacyBeforeCutover<'de, '_, '_, '_> {
+                type Value = EffectiveFillScope;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <AccountBinding as c::Value>::read(de, self.0)
+                        .map(EffectiveFillScope::LegacyBeforeCutover)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = EffectiveFillScope;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["LegacyRaw", "Epoch", "LegacyBeforeCutover"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "LegacyRaw" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(EffectiveFillScope::LegacyRaw)
+                        }
+                        "Epoch" => {
+                            value.newtype_variant_seed(Seed_Epoch(self.0.child(span, origin)))
+                        }
+                        "LegacyBeforeCutover" => value.newtype_variant_seed(
+                            Seed_LegacyBeforeCutover(self.0.child(span, origin)),
+                        ),
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &["LegacyRaw", "Epoch", "LegacyBeforeCutover"],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                EffectiveFillScope::LegacyRaw => EffectiveFillScope::LegacyRaw,
+                EffectiveFillScope::Epoch(value) => {
+                    EffectiveFillScope::Epoch(c::Value::paid_copy(value, w)?)
+                }
+                EffectiveFillScope::LegacyBeforeCutover(value) => {
+                    EffectiveFillScope::LegacyBeforeCutover(c::Value::paid_copy(value, w)?)
+                }
+            })
+        }
+    }
+    impl c::sealed::Value for EffectiveHistory {}
+    impl c::Value for EffectiveHistory {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "AsKnown",
+                body: s::Body::Record(
+                    &[s::Field {
+                        name: "ledger_version",
+                        shape: &<Option<i64> as c::Value>::SHAPE,
+                        optional: <Option<i64> as c::Value>::OPTIONAL,
+                        positional_default: false,
+                    }],
+                    false,
+                ),
+            },
+            s::Variant {
+                name: "RestatedLatest",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_AsKnown<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_AsKnown<'de, '_, '_, '_> {
+                type Value = EffectiveHistory;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,EffectiveHistory,true,{ledger_version:Option<i64> =>false},EffectiveHistory::AsKnown{ledger_version})
+                }
+            }
+            struct Seed_RestatedLatest<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_RestatedLatest<'de, '_, '_, '_> {
+                type Value = EffectiveHistory;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(EffectiveHistory::RestatedLatest)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = EffectiveHistory;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["AsKnown", "RestatedLatest"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "AsKnown" => {
+                            value.newtype_variant_seed(Seed_AsKnown(self.0.child(span, origin)))
+                        }
+                        "RestatedLatest" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(EffectiveHistory::RestatedLatest)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum("codec", &["AsKnown", "RestatedLatest"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                EffectiveHistory::AsKnown { ledger_version } => EffectiveHistory::AsKnown {
+                    ledger_version: c::Value::paid_copy(ledger_version, w)?,
+                },
+                EffectiveHistory::RestatedLatest => EffectiveHistory::RestatedLatest,
+            })
+        }
+    }
+    impl c::sealed::Value for EffectiveFillRequest {}
+    impl c::Value for EffectiveFillRequest {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "scope",
+                    shape: &<EffectiveFillScope as c::Value>::SHAPE,
+                    optional: <EffectiveFillScope as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "history",
+                    shape: &<EffectiveHistory as c::Value>::SHAPE,
+                    optional: <EffectiveHistory as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "as_of",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,EffectiveFillRequest,true,{scope:EffectiveFillScope=>false,history:EffectiveHistory=>false,as_of:NaiveDate=>false},EffectiveFillRequest{scope,history,as_of})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(EffectiveFillRequest {
+                scope: c::Value::paid_copy(&self.scope, w)?,
+                history: c::Value::paid_copy(&self.history, w)?,
+                as_of: c::Value::paid_copy(&self.as_of, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for EffectiveProjectionReceipt {}
+    impl c::Value for EffectiveProjectionReceipt {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "request",
+                    shape: &<EffectiveFillRequest as c::Value>::SHAPE,
+                    optional: <EffectiveFillRequest as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "raw_high_water",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "raw_source_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "ledger_head",
+                    shape: &<Option<(i64, String)> as c::Value>::SHAPE,
+                    optional: <Option<(i64, String)> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "inventory_fingerprint",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "economic_head",
+                    shape: &<Option<(i64, String)> as c::Value>::SHAPE,
+                    optional: <Option<(i64, String)> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "adjudication_head",
+                    shape: &<Option<(i64, String)> as c::Value>::SHAPE,
+                    optional: <Option<(i64, String)> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_at",
+                    shape: &<Option<DateTime<Utc>> as c::Value>::SHAPE,
+                    optional: <Option<DateTime<Utc>> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_raw_high_water",
+                    shape: &<Option<i64> as c::Value>::SHAPE,
+                    optional: <Option<i64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "rule_version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "projection_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "catalog_generation",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "catalog_objects_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,EffectiveProjectionReceipt,true,{request:EffectiveFillRequest=>false,raw_high_water:i64=>false,raw_source_hash:String=>false,ledger_head:Option<(i64, String)> =>false,inventory_fingerprint:Option<String> =>false,economic_head:Option<(i64, String)> =>false,adjudication_head:Option<(i64, String)> =>false,cutover_at:Option<DateTime<Utc>> =>false,cutover_raw_high_water:Option<i64> =>false,rule_version:String=>false,projection_hash:String=>false,catalog_generation:i64=>false,catalog_objects_hash:String=>false},EffectiveProjectionReceipt{request,raw_high_water,raw_source_hash,ledger_head,inventory_fingerprint,economic_head,adjudication_head,cutover_at,cutover_raw_high_water,rule_version,projection_hash,catalog_generation,catalog_objects_hash})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(EffectiveProjectionReceipt {
+                request: c::Value::paid_copy(&self.request, w)?,
+                raw_high_water: c::Value::paid_copy(&self.raw_high_water, w)?,
+                raw_source_hash: c::Value::paid_copy(&self.raw_source_hash, w)?,
+                ledger_head: c::Value::paid_copy(&self.ledger_head, w)?,
+                inventory_fingerprint: c::Value::paid_copy(&self.inventory_fingerprint, w)?,
+                economic_head: c::Value::paid_copy(&self.economic_head, w)?,
+                adjudication_head: c::Value::paid_copy(&self.adjudication_head, w)?,
+                cutover_at: c::Value::paid_copy(&self.cutover_at, w)?,
+                cutover_raw_high_water: c::Value::paid_copy(&self.cutover_raw_high_water, w)?,
+                rule_version: c::Value::paid_copy(&self.rule_version, w)?,
+                projection_hash: c::Value::paid_copy(&self.projection_hash, w)?,
+                catalog_generation: c::Value::paid_copy(&self.catalog_generation, w)?,
+                catalog_objects_hash: c::Value::paid_copy(&self.catalog_objects_hash, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for OpeningInventoryExit {}
+    impl c::Value for OpeningInventoryExit {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "fill_id",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "original_quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "strategy_quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "seed_lot_ids",
+                    shape: &<Vec<String> as c::Value>::SHAPE,
+                    optional: <Vec<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_basis",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_buy_fee",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_sell_fee",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "opening_net_pnl",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,OpeningInventoryExit,true,{fill_id:i64=>false,original_quantity:u32=>false,opening_quantity:u32=>false,strategy_quantity:u32=>false,seed_lot_ids:Vec<String> =>false,opening_basis:Money=>false,opening_buy_fee:Money=>false,opening_sell_fee:Money=>false,opening_net_pnl:Money=>false},OpeningInventoryExit{fill_id,original_quantity,opening_quantity,strategy_quantity,seed_lot_ids,opening_basis,opening_buy_fee,opening_sell_fee,opening_net_pnl})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(OpeningInventoryExit {
+                fill_id: c::Value::paid_copy(&self.fill_id, w)?,
+                original_quantity: c::Value::paid_copy(&self.original_quantity, w)?,
+                opening_quantity: c::Value::paid_copy(&self.opening_quantity, w)?,
+                strategy_quantity: c::Value::paid_copy(&self.strategy_quantity, w)?,
+                seed_lot_ids: c::Value::paid_copy(&self.seed_lot_ids, w)?,
+                opening_basis: c::Value::paid_copy(&self.opening_basis, w)?,
+                opening_buy_fee: c::Value::paid_copy(&self.opening_buy_fee, w)?,
+                opening_sell_fee: c::Value::paid_copy(&self.opening_sell_fee, w)?,
+                opening_net_pnl: c::Value::paid_copy(&self.opening_net_pnl, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for PerformanceSnapshot {}
+    impl c::Value for PerformanceSnapshot {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "id",
+                    shape: &<i32 as c::Value>::SHAPE,
+                    optional: <i32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "date",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "total_trades",
+                    shape: &<i32 as c::Value>::SHAPE,
+                    optional: <i32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "winning_trades",
+                    shape: &<i32 as c::Value>::SHAPE,
+                    optional: <i32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "losing_trades",
+                    shape: &<i32 as c::Value>::SHAPE,
+                    optional: <i32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "total_pnl",
+                    shape: &<f64 as c::Value>::SHAPE,
+                    optional: <f64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sharpe_ratio",
+                    shape: &<Option<f64> as c::Value>::SHAPE,
+                    optional: <Option<f64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sortino_ratio",
+                    shape: &<Option<f64> as c::Value>::SHAPE,
+                    optional: <Option<f64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "win_rate",
+                    shape: &<Option<f64> as c::Value>::SHAPE,
+                    optional: <Option<f64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "max_drawdown",
+                    shape: &<Option<f64> as c::Value>::SHAPE,
+                    optional: <Option<f64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "info_ratio",
+                    shape: &<Option<f64> as c::Value>::SHAPE,
+                    optional: <Option<f64> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "created_at",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,PerformanceSnapshot,true,{id:i32=>false,date:String=>false,total_trades:i32=>false,winning_trades:i32=>false,losing_trades:i32=>false,total_pnl:f64=>false,sharpe_ratio:Option<f64> =>false,sortino_ratio:Option<f64> =>false,win_rate:Option<f64> =>false,max_drawdown:Option<f64> =>false,info_ratio:Option<f64> =>false,created_at:String=>false},PerformanceSnapshot{id,date,total_trades,winning_trades,losing_trades,total_pnl,sharpe_ratio,sortino_ratio,win_rate,max_drawdown,info_ratio,created_at})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(PerformanceSnapshot {
+                id: c::Value::paid_copy(&self.id, w)?,
+                date: c::Value::paid_copy(&self.date, w)?,
+                total_trades: c::Value::paid_copy(&self.total_trades, w)?,
+                winning_trades: c::Value::paid_copy(&self.winning_trades, w)?,
+                losing_trades: c::Value::paid_copy(&self.losing_trades, w)?,
+                total_pnl: c::Value::paid_copy(&self.total_pnl, w)?,
+                sharpe_ratio: c::Value::paid_copy(&self.sharpe_ratio, w)?,
+                sortino_ratio: c::Value::paid_copy(&self.sortino_ratio, w)?,
+                win_rate: c::Value::paid_copy(&self.win_rate, w)?,
+                max_drawdown: c::Value::paid_copy(&self.max_drawdown, w)?,
+                info_ratio: c::Value::paid_copy(&self.info_ratio, w)?,
+                created_at: c::Value::paid_copy(&self.created_at, w)?,
+            })
+        }
+    }
+    impl c::sealed::Element for SeedLot {}
+    impl c::ArrayElement for SeedLot {}
+    impl c::sealed::Element for Mark {}
+    impl c::ArrayElement for Mark {}
+    impl c::sealed::Element for Lot {}
+    impl c::ArrayElement for Lot {}
+    impl c::sealed::Element for OpeningInventoryExit {}
+    impl c::ArrayElement for OpeningInventoryExit {}
+    impl c::sealed::Entry for (String, Mark) {}
+    impl c::MapEntry for (String, Mark) {}
+    impl c::sealed::Entry for (NaiveDate, Money) {}
+    impl c::MapEntry for (NaiveDate, Money) {}
+    impl c::sealed::Value for Money {}
+    impl c::Value for Money {
+        const SHAPE: s::Shape = <i64 as c::Value>::SHAPE;
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            <i64 as c::Value>::read(de, input).map(Money::from_micros)
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(*self)
+        }
+    }
+    impl c::sealed::Root for SeedManifest {}
+    impl c::Root for SeedManifest {
+        const ROOT: s::RootKind = s::RootKind::Seed;
+        const CANONICAL: bool = false;
+    }
+    impl c::sealed::Root for AccountBinding {}
+    impl c::Root for AccountBinding {
+        const ROOT: s::RootKind = s::RootKind::Binding;
+        const CANONICAL: bool = false;
+    }
+    impl c::sealed::Root for Projection {}
+    impl c::Root for Projection {
+        const ROOT: s::RootKind = s::RootKind::Projection;
+        const CANONICAL: bool = false;
+    }
+    impl c::sealed::Root for Fact {}
+    impl c::Root for Fact {
+        const ROOT: s::RootKind = s::RootKind::V1Fact;
+        const CANONICAL: bool = false;
+    }
+}
+#[cfg(test)]
+pub(crate) fn replay_codec_fixtures(
+    case: crate::trading::paper_replay_codec_v1::CodecFixtureCase,
+    work: &mut crate::database::global_schema_v1::replay_work::CodecMechanics<'_, '_>,
+) {
+    crate::trading::paper_replay_codec_v1::exercise_root::<SeedManifest>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<AccountBinding>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<Projection>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<Fact>(case, work);
+}
+
+#[cfg(test)]
+pub(crate) fn replay_codec_nonfinite(
+    work: &mut crate::database::global_schema_v1::replay_work::CodecMechanics<'_, '_>,
+) {
+    use crate::trading::paper_replay_codec_v1 as c;
+    let bytes = c::fixed_snapshot_fixture();
+    let mut fact: Fact = serde_json::from_slice(&bytes).unwrap();
+    let Fact::DerivedSnapshotV1(ref mut snapshot) = fact else {
+        unreachable!()
+    };
+    snapshot.metrics.total_pnl = f64::NAN;
+    snapshot.metrics.sharpe_ratio = Some(f64::INFINITY);
+    snapshot.metrics.sortino_ratio = Some(f64::NEG_INFINITY);
+    let expected = serde_json::to_vec(&fact).unwrap();
+    assert!(std::str::from_utf8(&expected)
+        .unwrap()
+        .contains("\"total_pnl\":null"));
+    assert_eq!(c::encode_core(&fact, work).unwrap(), expected);
+    let copied = c::Value::paid_copy(&fact, work).unwrap();
+    assert_eq!(c::encode_core(&copied, work).unwrap(), expected);
+}

@@ -2216,3 +2216,2544 @@ pub(crate) fn open_for_isolated_test(
 #[cfg(test)]
 #[path = "paper_book_v2_execution_tests.rs"]
 mod tests;
+
+// Finite replay DTO seeds stay with the owners of private fields.
+#[allow(dead_code, non_camel_case_types)]
+mod replay_codec_owner {
+    use super::budget::{InitialLotAllocation, ProfitPolicy};
+    use super::fill_model::NoFillReason;
+    use super::*;
+    use crate::decision::approved_paper_intent_v1::TimeInForce;
+    use crate::trading::paper_replay_codec_v1 as c;
+    use crate::trading::paper_replay_shapes_v1 as s;
+    use serde::de::{EnumAccess as _, VariantAccess as _};
+    impl c::sealed::Value for ProfitPolicy {}
+    impl c::Value for ProfitPolicy {
+        const SHAPE: s::Shape = s::Shape::External(&[s::Variant {
+            name: "ReinvestWithinFixedAuthorizedBudget",
+            body: s::Body::Unit,
+        }]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_ReinvestWithinFixedAuthorizedBudget<'de, 'w, 'loan, 'pool>(
+                c::Input<'de, 'w, 'loan, 'pool>,
+            );
+            impl<'de> serde::de::DeserializeSeed<'de>
+                for Seed_ReinvestWithinFixedAuthorizedBudget<'de, '_, '_, '_>
+            {
+                type Value = ProfitPolicy;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ProfitPolicy::ReinvestWithinFixedAuthorizedBudget)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = ProfitPolicy;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["ReinvestWithinFixedAuthorizedBudget"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "ReinvestWithinFixedAuthorizedBudget" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ProfitPolicy::ReinvestWithinFixedAuthorizedBudget)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum("codec", &["ReinvestWithinFixedAuthorizedBudget"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                ProfitPolicy::ReinvestWithinFixedAuthorizedBudget => {
+                    ProfitPolicy::ReinvestWithinFixedAuthorizedBudget
+                }
+            })
+        }
+    }
+    impl c::sealed::Value for LotDisposition {}
+    impl c::Value for LotDisposition {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "AllocatedToStrategy",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "UnassignedReadOnly",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_AllocatedToStrategy<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_AllocatedToStrategy<'de, '_, '_, '_> {
+                type Value = LotDisposition;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LotDisposition::AllocatedToStrategy)
+                }
+            }
+            struct Seed_UnassignedReadOnly<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_UnassignedReadOnly<'de, '_, '_, '_> {
+                type Value = LotDisposition;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(LotDisposition::UnassignedReadOnly)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = LotDisposition;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["AllocatedToStrategy", "UnassignedReadOnly"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "AllocatedToStrategy" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LotDisposition::AllocatedToStrategy)
+                        }
+                        "UnassignedReadOnly" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(LotDisposition::UnassignedReadOnly)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &["AllocatedToStrategy", "UnassignedReadOnly"],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                LotDisposition::AllocatedToStrategy => LotDisposition::AllocatedToStrategy,
+                LotDisposition::UnassignedReadOnly => LotDisposition::UnassignedReadOnly,
+            })
+        }
+    }
+    impl c::sealed::Value for InitialLotAllocation {}
+    impl c::Value for InitialLotAllocation {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "lot_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "original_quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "disposition",
+                    shape: &<LotDisposition as c::Value>::SHAPE,
+                    optional: <LotDisposition as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "chain_id",
+                    shape: &<Option<String> as c::Value>::SHAPE,
+                    optional: <Option<String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,InitialLotAllocation,true,{lot_id:String=>false,original_quantity:u32=>false,disposition:LotDisposition=>false,chain_id:Option<String> =>false},InitialLotAllocation{lot_id,original_quantity,disposition,chain_id})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(InitialLotAllocation {
+                lot_id: c::Value::paid_copy(&self.lot_id, w)?,
+                original_quantity: c::Value::paid_copy(&self.original_quantity, w)?,
+                disposition: c::Value::paid_copy(&self.disposition, w)?,
+                chain_id: c::Value::paid_copy(&self.chain_id, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for BudgetRecord {}
+    impl c::Value for BudgetRecord {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "family_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "effective_from",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "effective_through",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "authorized_budget_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "initial_strategy_cash_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "concentration_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "chain_exposure_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash_floor_bps",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "max_order_exposure_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "original_seed_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "review_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "profit_policy",
+                    shape: &<ProfitPolicy as c::Value>::SHAPE,
+                    optional: <ProfitPolicy as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "initial_lots",
+                    shape: &<Vec<InitialLotAllocation> as c::Value>::SHAPE,
+                    optional: <Vec<InitialLotAllocation> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,BudgetRecord,true,{version:String=>false,family_id:String=>false,effective_from:NaiveDate=>false,effective_through:NaiveDate=>false,authorized_budget_micro_cny:i64=>false,initial_strategy_cash_micro_cny:i64=>false,concentration_bps:u32=>false,chain_exposure_bps:u32=>false,cash_floor_bps:u32=>false,max_order_exposure_micro_cny:i64=>false,original_seed_reference:String=>false,review_reference:String=>false,profit_policy:ProfitPolicy=>false,initial_lots:Vec<InitialLotAllocation> =>false},BudgetRecord{version,family_id,effective_from,effective_through,authorized_budget_micro_cny,initial_strategy_cash_micro_cny,concentration_bps,chain_exposure_bps,cash_floor_bps,max_order_exposure_micro_cny,original_seed_reference,review_reference,profit_policy,initial_lots})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(BudgetRecord {
+                version: c::Value::paid_copy(&self.version, w)?,
+                family_id: c::Value::paid_copy(&self.family_id, w)?,
+                effective_from: c::Value::paid_copy(&self.effective_from, w)?,
+                effective_through: c::Value::paid_copy(&self.effective_through, w)?,
+                authorized_budget_micro_cny: c::Value::paid_copy(
+                    &self.authorized_budget_micro_cny,
+                    w,
+                )?,
+                initial_strategy_cash_micro_cny: c::Value::paid_copy(
+                    &self.initial_strategy_cash_micro_cny,
+                    w,
+                )?,
+                concentration_bps: c::Value::paid_copy(&self.concentration_bps, w)?,
+                chain_exposure_bps: c::Value::paid_copy(&self.chain_exposure_bps, w)?,
+                cash_floor_bps: c::Value::paid_copy(&self.cash_floor_bps, w)?,
+                max_order_exposure_micro_cny: c::Value::paid_copy(
+                    &self.max_order_exposure_micro_cny,
+                    w,
+                )?,
+                original_seed_reference: c::Value::paid_copy(&self.original_seed_reference, w)?,
+                review_reference: c::Value::paid_copy(&self.review_reference, w)?,
+                profit_policy: c::Value::paid_copy(&self.profit_policy, w)?,
+                initial_lots: c::Value::paid_copy(&self.initial_lots, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for CashPartitions {}
+    impl c::Value for CashPartitions {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "account_cash",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "strategy_cash",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "unassigned_cash",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,CashPartitions,true,{account_cash:i64=>false,strategy_cash:i64=>false,unassigned_cash:i64=>false},CashPartitions{account_cash,strategy_cash,unassigned_cash})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(CashPartitions {
+                account_cash: c::Value::paid_copy(&self.account_cash, w)?,
+                strategy_cash: c::Value::paid_copy(&self.strategy_cash, w)?,
+                unassigned_cash: c::Value::paid_copy(&self.unassigned_cash, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for WorkingReservation {}
+    impl c::Value for WorkingReservation {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "parent_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "chain_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "buy_max_notional",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_reserve",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash_reserve",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,WorkingReservation,true,{parent_id:String=>false,code:String=>false,chain_id:String=>false,buy_max_notional:i64=>false,fee_reserve:i64=>false,cash_reserve:i64=>false},WorkingReservation{parent_id,code,chain_id,buy_max_notional,fee_reserve,cash_reserve})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(WorkingReservation {
+                parent_id: c::Value::paid_copy(&self.parent_id, w)?,
+                code: c::Value::paid_copy(&self.code, w)?,
+                chain_id: c::Value::paid_copy(&self.chain_id, w)?,
+                buy_max_notional: c::Value::paid_copy(&self.buy_max_notional, w)?,
+                fee_reserve: c::Value::paid_copy(&self.fee_reserve, w)?,
+                cash_reserve: c::Value::paid_copy(&self.cash_reserve, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for TimeInForce {}
+    impl c::Value for TimeInForce {
+        const SHAPE: s::Shape = s::Shape::External(&[s::Variant {
+            name: "DaySession",
+            body: s::Body::Unit,
+        }]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_DaySession<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_DaySession<'de, '_, '_, '_> {
+                type Value = TimeInForce;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(TimeInForce::DaySession)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = TimeInForce;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["DaySession"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "DaySession" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(TimeInForce::DaySession)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum("codec", &["DaySession"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                TimeInForce::DaySession => TimeInForce::DaySession,
+            })
+        }
+    }
+    impl c::sealed::Value for IntentRecord {}
+    impl c::Value for IntentRecord {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "execution_manifest_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "parent_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "investment_decision_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "family_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "chain_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "instrument_code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "instrument_name",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "side",
+                    shape: &<Side as c::Value>::SHAPE,
+                    optional: <Side as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "limit_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_price_cap_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "session_date",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "time_in_force",
+                    shape: &<TimeInForce as c::Value>::SHAPE,
+                    optional: <TimeInForce as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "approved_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "approval_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_window",
+                    shape: &<WindowRecord as c::Value>::SHAPE,
+                    optional: <WindowRecord as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,IntentRecord,true,{version:String=>false,account_id:String=>false,epoch_id:String=>false,execution_manifest_hash:String=>false,parent_id:String=>false,investment_decision_id:String=>false,family_id:String=>false,chain_id:String=>false,instrument_code:String=>false,instrument_name:String=>false,side:Side=>false,quantity:u32=>false,limit_micro_cny:i64=>false,fee_price_cap_micro_cny:i64=>false,session_date:NaiveDate=>false,time_in_force:TimeInForce=>false,approved_at:DateTime<Utc> =>false,approval_reference:String=>false,source_window:WindowRecord=>false},IntentRecord{version,account_id,epoch_id,execution_manifest_hash,parent_id,investment_decision_id,family_id,chain_id,instrument_code,instrument_name,side,quantity,limit_micro_cny,fee_price_cap_micro_cny,session_date,time_in_force,approved_at,approval_reference,source_window})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(IntentRecord {
+                version: c::Value::paid_copy(&self.version, w)?,
+                account_id: c::Value::paid_copy(&self.account_id, w)?,
+                epoch_id: c::Value::paid_copy(&self.epoch_id, w)?,
+                execution_manifest_hash: c::Value::paid_copy(&self.execution_manifest_hash, w)?,
+                parent_id: c::Value::paid_copy(&self.parent_id, w)?,
+                investment_decision_id: c::Value::paid_copy(&self.investment_decision_id, w)?,
+                family_id: c::Value::paid_copy(&self.family_id, w)?,
+                chain_id: c::Value::paid_copy(&self.chain_id, w)?,
+                instrument_code: c::Value::paid_copy(&self.instrument_code, w)?,
+                instrument_name: c::Value::paid_copy(&self.instrument_name, w)?,
+                side: c::Value::paid_copy(&self.side, w)?,
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+                limit_micro_cny: c::Value::paid_copy(&self.limit_micro_cny, w)?,
+                fee_price_cap_micro_cny: c::Value::paid_copy(&self.fee_price_cap_micro_cny, w)?,
+                session_date: c::Value::paid_copy(&self.session_date, w)?,
+                time_in_force: c::Value::paid_copy(&self.time_in_force, w)?,
+                approved_at: c::Value::paid_copy(&self.approved_at, w)?,
+                approval_reference: c::Value::paid_copy(&self.approval_reference, w)?,
+                source_window: c::Value::paid_copy(&self.source_window, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for Side {}
+    impl c::Value for Side {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Buy",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Sell",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Buy<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Buy<'de, '_, '_, '_> {
+                type Value = Side;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Side::Buy)
+                }
+            }
+            struct Seed_Sell<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Sell<'de, '_, '_, '_> {
+                type Value = Side;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Side::Sell)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = Side;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["Buy", "Sell"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Buy" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(Side::Buy)
+                        }
+                        "Sell" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(Side::Sell)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum("codec", &["Buy", "Sell"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                Side::Buy => Side::Buy,
+                Side::Sell => Side::Sell,
+            })
+        }
+    }
+    impl c::sealed::Value for WindowRecord {}
+    impl c::Value for WindowRecord {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "observation_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "instrument_code",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "session_date",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "observed_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fresh_through",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "source_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "facts_contract",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "facts_batch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "facts_source",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "facts_source_at",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "facts_observed_at",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_segment",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "listed",
+                    shape: &<bool as c::Value>::SHAPE,
+                    optional: <bool as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "suspended",
+                    shape: &<bool as c::Value>::SHAPE,
+                    optional: <bool as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "tick_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "lower_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "upper_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "regime_version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "price_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "modeled_available_quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,WindowRecord,true,{version:String=>false,observation_id:String=>false,instrument_code:String=>false,session_date:NaiveDate=>false,source_at:DateTime<Utc> =>false,observed_at:DateTime<Utc> =>false,fresh_through:DateTime<Utc> =>false,source_reference:String=>false,facts_contract:String=>false,facts_batch_id:String=>false,facts_source:String=>false,facts_source_at:String=>false,facts_observed_at:String=>false,fee_segment:String=>false,listed:bool=>false,suspended:bool=>false,tick_micro_cny:i64=>false,lower_micro_cny:i64=>false,upper_micro_cny:i64=>false,regime_version:String=>false,price_micro_cny:i64=>false,modeled_available_quantity:u32=>false},WindowRecord{version,observation_id,instrument_code,session_date,source_at,observed_at,fresh_through,source_reference,facts_contract,facts_batch_id,facts_source,facts_source_at,facts_observed_at,fee_segment,listed,suspended,tick_micro_cny,lower_micro_cny,upper_micro_cny,regime_version,price_micro_cny,modeled_available_quantity})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(WindowRecord {
+                version: c::Value::paid_copy(&self.version, w)?,
+                observation_id: c::Value::paid_copy(&self.observation_id, w)?,
+                instrument_code: c::Value::paid_copy(&self.instrument_code, w)?,
+                session_date: c::Value::paid_copy(&self.session_date, w)?,
+                source_at: c::Value::paid_copy(&self.source_at, w)?,
+                observed_at: c::Value::paid_copy(&self.observed_at, w)?,
+                fresh_through: c::Value::paid_copy(&self.fresh_through, w)?,
+                source_reference: c::Value::paid_copy(&self.source_reference, w)?,
+                facts_contract: c::Value::paid_copy(&self.facts_contract, w)?,
+                facts_batch_id: c::Value::paid_copy(&self.facts_batch_id, w)?,
+                facts_source: c::Value::paid_copy(&self.facts_source, w)?,
+                facts_source_at: c::Value::paid_copy(&self.facts_source_at, w)?,
+                facts_observed_at: c::Value::paid_copy(&self.facts_observed_at, w)?,
+                fee_segment: c::Value::paid_copy(&self.fee_segment, w)?,
+                listed: c::Value::paid_copy(&self.listed, w)?,
+                suspended: c::Value::paid_copy(&self.suspended, w)?,
+                tick_micro_cny: c::Value::paid_copy(&self.tick_micro_cny, w)?,
+                lower_micro_cny: c::Value::paid_copy(&self.lower_micro_cny, w)?,
+                upper_micro_cny: c::Value::paid_copy(&self.upper_micro_cny, w)?,
+                regime_version: c::Value::paid_copy(&self.regime_version, w)?,
+                price_micro_cny: c::Value::paid_copy(&self.price_micro_cny, w)?,
+                modeled_available_quantity: c::Value::paid_copy(
+                    &self.modeled_available_quantity,
+                    w,
+                )?,
+            })
+        }
+    }
+    impl c::sealed::Value for NoFillReason {}
+    impl c::Value for NoFillReason {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Suspended",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "OutsideLimit",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "LessThanWholeLot",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Suspended<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Suspended<'de, '_, '_, '_> {
+                type Value = NoFillReason;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(NoFillReason::Suspended)
+                }
+            }
+            struct Seed_OutsideLimit<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_OutsideLimit<'de, '_, '_, '_> {
+                type Value = NoFillReason;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(NoFillReason::OutsideLimit)
+                }
+            }
+            struct Seed_LessThanWholeLot<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_LessThanWholeLot<'de, '_, '_, '_> {
+                type Value = NoFillReason;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(NoFillReason::LessThanWholeLot)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = NoFillReason;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &["Suspended", "OutsideLimit", "LessThanWholeLot"],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Suspended" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(NoFillReason::Suspended)
+                        }
+                        "OutsideLimit" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(NoFillReason::OutsideLimit)
+                        }
+                        "LessThanWholeLot" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(NoFillReason::LessThanWholeLot)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &["Suspended", "OutsideLimit", "LessThanWholeLot"],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                NoFillReason::Suspended => NoFillReason::Suspended,
+                NoFillReason::OutsideLimit => NoFillReason::OutsideLimit,
+                NoFillReason::LessThanWholeLot => NoFillReason::LessThanWholeLot,
+            })
+        }
+    }
+    impl c::sealed::Value for ModeledFill {}
+    impl c::Value for ModeledFill {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "price_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "notional_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "commission_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "stamp_tax_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "total_fee_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_policy_instance_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "stamp_tax_bracket",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sellable_from",
+                    shape: &<NaiveDate as c::Value>::SHAPE,
+                    optional: <NaiveDate as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,ModeledFill,true,{quantity:u32=>false,price_micro_cny:i64=>false,notional_micro_cny:i64=>false,commission_micro_cny:i64=>false,stamp_tax_micro_cny:i64=>false,total_fee_micro_cny:i64=>false,fee_policy_instance_id:String=>false,stamp_tax_bracket:String=>false,sellable_from:NaiveDate=>false},ModeledFill{quantity,price_micro_cny,notional_micro_cny,commission_micro_cny,stamp_tax_micro_cny,total_fee_micro_cny,fee_policy_instance_id,stamp_tax_bracket,sellable_from})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(ModeledFill {
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+                price_micro_cny: c::Value::paid_copy(&self.price_micro_cny, w)?,
+                notional_micro_cny: c::Value::paid_copy(&self.notional_micro_cny, w)?,
+                commission_micro_cny: c::Value::paid_copy(&self.commission_micro_cny, w)?,
+                stamp_tax_micro_cny: c::Value::paid_copy(&self.stamp_tax_micro_cny, w)?,
+                total_fee_micro_cny: c::Value::paid_copy(&self.total_fee_micro_cny, w)?,
+                fee_policy_instance_id: c::Value::paid_copy(&self.fee_policy_instance_id, w)?,
+                stamp_tax_bracket: c::Value::paid_copy(&self.stamp_tax_bracket, w)?,
+                sellable_from: c::Value::paid_copy(&self.sellable_from, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for ExecutionManifest {}
+    impl c::Value for ExecutionManifest {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "genesis_event_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "genesis_projection_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_descriptor",
+                    shape: &<Vec<u8> as c::Value>::SHAPE,
+                    optional: <Vec<u8> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_policy_instance_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "budget",
+                    shape: &<BudgetRecord as c::Value>::SHAPE,
+                    optional: <BudgetRecord as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fill_model_version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "approved_reference",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,ExecutionManifest,true,{version:String=>false,account_id:String=>false,epoch_id:String=>false,cutover_id:String=>false,genesis_event_hash:String=>false,genesis_projection_hash:String=>false,fee_descriptor:Vec<u8> =>false,fee_policy_instance_id:String=>false,budget:BudgetRecord=>false,fill_model_version:String=>false,approved_reference:String=>false},ExecutionManifest{version,account_id,epoch_id,cutover_id,genesis_event_hash,genesis_projection_hash,fee_descriptor,fee_policy_instance_id,budget,fill_model_version,approved_reference})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(ExecutionManifest {
+                version: c::Value::paid_copy(&self.version, w)?,
+                account_id: c::Value::paid_copy(&self.account_id, w)?,
+                epoch_id: c::Value::paid_copy(&self.epoch_id, w)?,
+                cutover_id: c::Value::paid_copy(&self.cutover_id, w)?,
+                genesis_event_hash: c::Value::paid_copy(&self.genesis_event_hash, w)?,
+                genesis_projection_hash: c::Value::paid_copy(&self.genesis_projection_hash, w)?,
+                fee_descriptor: c::Value::paid_copy(&self.fee_descriptor, w)?,
+                fee_policy_instance_id: c::Value::paid_copy(&self.fee_policy_instance_id, w)?,
+                budget: c::Value::paid_copy(&self.budget, w)?,
+                fill_model_version: c::Value::paid_copy(&self.fill_model_version, w)?,
+                approved_reference: c::Value::paid_copy(&self.approved_reference, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for ParentStatus {}
+    impl c::Value for ParentStatus {
+        const SHAPE: s::Shape = s::Shape::External(&[
+            s::Variant {
+                name: "Working",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "PartiallyFilled",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Filled",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Cancelled",
+                body: s::Body::Unit,
+            },
+            s::Variant {
+                name: "Expired",
+                body: s::Body::Unit,
+            },
+        ]);
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Working<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Working<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ParentStatus::Working)
+                }
+            }
+            struct Seed_PartiallyFilled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_PartiallyFilled<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ParentStatus::PartiallyFilled)
+                }
+            }
+            struct Seed_Filled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Filled<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ParentStatus::Filled)
+                }
+            }
+            struct Seed_Cancelled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Cancelled<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ParentStatus::Cancelled)
+                }
+            }
+            struct Seed_Expired<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Expired<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(ParentStatus::Expired)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = ParentStatus;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_enum<A: serde::de::EnumAccess<'de>>(
+                    mut self,
+                    a: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let (tag, value) = a.variant_seed(c::KeySeed {
+                        names: &[
+                            "Working",
+                            "PartiallyFilled",
+                            "Filled",
+                            "Cancelled",
+                            "Expired",
+                        ],
+                    })?;
+                    let object = self.0.bytes[self.0.span.start] == b'{';
+                    let span = if object {
+                        self.0
+                            .span
+                            .children(self.0.bytes)
+                            .next()
+                            .ok_or_else(c::span_error)?
+                            .1
+                    } else {
+                        self.0.span
+                    };
+                    let origin = self.0.origin;
+                    match tag {
+                        "Working" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ParentStatus::Working)
+                        }
+                        "PartiallyFilled" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ParentStatus::PartiallyFilled)
+                        }
+                        "Filled" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ParentStatus::Filled)
+                        }
+                        "Cancelled" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ParentStatus::Cancelled)
+                        }
+                        "Expired" => {
+                            if object {
+                                value.newtype_variant_seed(c::UnitPayload(
+                                    self.0.child(span, origin),
+                                ))?;
+                            } else {
+                                value.unit_variant()?;
+                            }
+                            Ok(ParentStatus::Expired)
+                        }
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_enum(
+                "codec",
+                &[
+                    "Working",
+                    "PartiallyFilled",
+                    "Filled",
+                    "Cancelled",
+                    "Expired",
+                ],
+                EV(input),
+            )
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                ParentStatus::Working => ParentStatus::Working,
+                ParentStatus::PartiallyFilled => ParentStatus::PartiallyFilled,
+                ParentStatus::Filled => ParentStatus::Filled,
+                ParentStatus::Cancelled => ParentStatus::Cancelled,
+                ParentStatus::Expired => ParentStatus::Expired,
+            })
+        }
+    }
+    impl c::sealed::Value for LotClaim {}
+    impl c::Value for LotClaim {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "lot_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "quantity",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,LotClaim,true,{lot_id:String=>false,quantity:u32=>false},LotClaim{lot_id,quantity})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(LotClaim {
+                lot_id: c::Value::paid_copy(&self.lot_id, w)?,
+                quantity: c::Value::paid_copy(&self.quantity, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for ParentState {}
+    impl c::Value for ParentState {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "intent",
+                    shape: &<IntentRecord as c::Value>::SHAPE,
+                    optional: <IntentRecord as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "status",
+                    shape: &<ParentStatus as c::Value>::SHAPE,
+                    optional: <ParentStatus as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "filled",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "remaining",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cancelled",
+                    shape: &<u32 as c::Value>::SHAPE,
+                    optional: <u32 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "reservation",
+                    shape: &<WorkingReservation as c::Value>::SHAPE,
+                    optional: <WorkingReservation as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "sell_claims",
+                    shape: &<Vec<LotClaim> as c::Value>::SHAPE,
+                    optional: <Vec<LotClaim> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,ParentState,true,{intent:IntentRecord=>false,status:ParentStatus=>false,filled:u32=>false,remaining:u32=>false,cancelled:u32=>false,reservation:WorkingReservation=>false,sell_claims:Vec<LotClaim> =>false},ParentState{intent,status,filled,remaining,cancelled,reservation,sell_claims})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(ParentState {
+                intent: c::Value::paid_copy(&self.intent, w)?,
+                status: c::Value::paid_copy(&self.status, w)?,
+                filled: c::Value::paid_copy(&self.filled, w)?,
+                remaining: c::Value::paid_copy(&self.remaining, w)?,
+                cancelled: c::Value::paid_copy(&self.cancelled, w)?,
+                reservation: c::Value::paid_copy(&self.reservation, w)?,
+                sell_claims: c::Value::paid_copy(&self.sell_claims, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for FillRecord {}
+    impl c::Value for FillRecord {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "fill_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "parent_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "observation_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "executed_at",
+                    shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                    optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "side",
+                    shape: &<Side as c::Value>::SHAPE,
+                    optional: <Side as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "model",
+                    shape: &<ModeledFill as c::Value>::SHAPE,
+                    optional: <ModeledFill as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "inherited_buy_fee_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "realized_pnl_micro_cny",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,FillRecord,true,{fill_id:String=>false,parent_id:String=>false,observation_id:String=>false,executed_at:DateTime<Utc> =>false,side:Side=>false,model:ModeledFill=>false,inherited_buy_fee_micro_cny:i64=>false,realized_pnl_micro_cny:i64=>false},FillRecord{fill_id,parent_id,observation_id,executed_at,side,model,inherited_buy_fee_micro_cny,realized_pnl_micro_cny})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(FillRecord {
+                fill_id: c::Value::paid_copy(&self.fill_id, w)?,
+                parent_id: c::Value::paid_copy(&self.parent_id, w)?,
+                observation_id: c::Value::paid_copy(&self.observation_id, w)?,
+                executed_at: c::Value::paid_copy(&self.executed_at, w)?,
+                side: c::Value::paid_copy(&self.side, w)?,
+                model: c::Value::paid_copy(&self.model, w)?,
+                inherited_buy_fee_micro_cny: c::Value::paid_copy(
+                    &self.inherited_buy_fee_micro_cny,
+                    w,
+                )?,
+                realized_pnl_micro_cny: c::Value::paid_copy(&self.realized_pnl_micro_cny, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for ExecutionProjection {}
+    impl c::Value for ExecutionProjection {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account",
+                    shape: &<Projection as c::Value>::SHAPE,
+                    optional: <Projection as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cash",
+                    shape: &<CashPartitions as c::Value>::SHAPE,
+                    optional: <CashPartitions as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "lot_assignments",
+                    shape: &<BTreeMap<String, Option<String>> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, Option<String>> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "parents",
+                    shape: &<BTreeMap<String, ParentState> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, ParentState> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "used_windows",
+                    shape: &<BTreeMap<String, String> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, String> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fills",
+                    shape: &<Vec<FillRecord> as c::Value>::SHAPE,
+                    optional: <Vec<FillRecord> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "valuation_windows",
+                    shape: &<BTreeMap<String, WindowRecord> as c::Value>::SHAPE,
+                    optional: <BTreeMap<String, WindowRecord> as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,ExecutionProjection,true,{version:String=>false,account:Projection=>false,cash:CashPartitions=>false,lot_assignments:BTreeMap<String, Option<String>> =>false,parents:BTreeMap<String, ParentState> =>false,used_windows:BTreeMap<String, String> =>false,fills:Vec<FillRecord> =>false,valuation_windows:BTreeMap<String, WindowRecord> =>false},ExecutionProjection{version,account,cash,lot_assignments,parents,used_windows,fills,valuation_windows})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(ExecutionProjection {
+                version: c::Value::paid_copy(&self.version, w)?,
+                account: c::Value::paid_copy(&self.account, w)?,
+                cash: c::Value::paid_copy(&self.cash, w)?,
+                lot_assignments: c::Value::paid_copy(&self.lot_assignments, w)?,
+                parents: c::Value::paid_copy(&self.parents, w)?,
+                used_windows: c::Value::paid_copy(&self.used_windows, w)?,
+                fills: c::Value::paid_copy(&self.fills, w)?,
+                valuation_windows: c::Value::paid_copy(&self.valuation_windows, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for HeadIdentity {}
+    impl c::Value for HeadIdentity {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "version",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "event_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,HeadIdentity,true,{version:i64=>false,event_hash:String=>false},HeadIdentity{version,event_hash})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(HeadIdentity {
+                version: c::Value::paid_copy(&self.version, w)?,
+                event_hash: c::Value::paid_copy(&self.event_hash, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for CommandRecord {}
+    impl c::Value for CommandRecord {
+        const SHAPE: s::Shape = s::Shape::Adjacent(
+            "operation",
+            "request",
+            &[
+                s::Variant {
+                    name: "Open",
+                    body: s::Body::Record(
+                        &[s::Field {
+                            name: "manifest",
+                            shape: &<ExecutionManifest as c::Value>::SHAPE,
+                            optional: <ExecutionManifest as c::Value>::OPTIONAL,
+                            positional_default: false,
+                        }],
+                        true,
+                    ),
+                },
+                s::Variant {
+                    name: "Submit",
+                    body: s::Body::Record(
+                        &[
+                            s::Field {
+                                name: "expected",
+                                shape: &<HeadIdentity as c::Value>::SHAPE,
+                                optional: <HeadIdentity as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "intent",
+                                shape: &<IntentRecord as c::Value>::SHAPE,
+                                optional: <IntentRecord as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                        ],
+                        true,
+                    ),
+                },
+                s::Variant {
+                    name: "Evaluate",
+                    body: s::Body::Record(
+                        &[
+                            s::Field {
+                                name: "expected",
+                                shape: &<HeadIdentity as c::Value>::SHAPE,
+                                optional: <HeadIdentity as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "parent_id",
+                                shape: &<String as c::Value>::SHAPE,
+                                optional: <String as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "window",
+                                shape: &<WindowRecord as c::Value>::SHAPE,
+                                optional: <WindowRecord as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                        ],
+                        true,
+                    ),
+                },
+                s::Variant {
+                    name: "Cancel",
+                    body: s::Body::Record(
+                        &[
+                            s::Field {
+                                name: "expected",
+                                shape: &<HeadIdentity as c::Value>::SHAPE,
+                                optional: <HeadIdentity as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "parent_id",
+                                shape: &<String as c::Value>::SHAPE,
+                                optional: <String as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "at",
+                                shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                                optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                        ],
+                        true,
+                    ),
+                },
+                s::Variant {
+                    name: "Expire",
+                    body: s::Body::Record(
+                        &[
+                            s::Field {
+                                name: "expected",
+                                shape: &<HeadIdentity as c::Value>::SHAPE,
+                                optional: <HeadIdentity as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "parent_id",
+                                shape: &<String as c::Value>::SHAPE,
+                                optional: <String as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "at",
+                                shape: &<DateTime<Utc> as c::Value>::SHAPE,
+                                optional: <DateTime<Utc> as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                        ],
+                        true,
+                    ),
+                },
+                s::Variant {
+                    name: "QualifiedMarks",
+                    body: s::Body::Record(
+                        &[
+                            s::Field {
+                                name: "expected",
+                                shape: &<HeadIdentity as c::Value>::SHAPE,
+                                optional: <HeadIdentity as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                            s::Field {
+                                name: "windows",
+                                shape: &<Vec<WindowRecord> as c::Value>::SHAPE,
+                                optional: <Vec<WindowRecord> as c::Value>::OPTIONAL,
+                                positional_default: false,
+                            },
+                        ],
+                        true,
+                    ),
+                },
+            ],
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Open<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Open<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{manifest:ExecutionManifest=>false},CommandRecord::Open{manifest})
+                }
+            }
+            struct Seed_Submit<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Submit<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{expected:HeadIdentity=>false,intent:IntentRecord=>false},CommandRecord::Submit{expected,intent})
+                }
+            }
+            struct Seed_Evaluate<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Evaluate<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{expected:HeadIdentity=>false,parent_id:String=>false,window:WindowRecord=>false},CommandRecord::Evaluate{expected,parent_id,window})
+                }
+            }
+            struct Seed_Cancel<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Cancel<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{expected:HeadIdentity=>false,parent_id:String=>false,at:DateTime<Utc> =>false},CommandRecord::Cancel{expected,parent_id,at})
+                }
+            }
+            struct Seed_Expire<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Expire<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{expected:HeadIdentity=>false,parent_id:String=>false,at:DateTime<Utc> =>false},CommandRecord::Expire{expected,parent_id,at})
+                }
+            }
+            struct Seed_QualifiedMarks<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_QualifiedMarks<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    let input = self.0;
+                    c::record_read!(de,input,CommandRecord,false,{expected:HeadIdentity=>false,windows:Vec<WindowRecord> =>false},CommandRecord::QualifiedMarks{expected,windows})
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = CommandRecord;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    mut self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let s::Shape::Adjacent(tagname, contentname, variants) =
+                        <CommandRecord as c::Value>::SHAPE
+                    else {
+                        unreachable!()
+                    };
+                    let (selected, _, origin) = s::adjacent(
+                        self.0.bytes,
+                        self.0.span,
+                        tagname,
+                        contentname,
+                        variants,
+                        self.0.origin,
+                    )
+                    .ok_or_else(c::span_error)?;
+                    let mut out = None;
+                    let mut spans = self.0.span.children(self.0.bytes);
+                    while let Some(key) = map.next_key_seed(c::KeySeed {
+                        names: &["operation", "request"],
+                    })? {
+                        let span = spans.next().ok_or_else(c::span_error)?.1;
+                        match key {
+                            "operation" => {
+                                let tag_origin = self.0.origin;
+                                let found = map.next_value_seed(c::TagSeed {
+                                    names: &[
+                                        "Open",
+                                        "Submit",
+                                        "Evaluate",
+                                        "Cancel",
+                                        "Expire",
+                                        "QualifiedMarks",
+                                    ],
+                                    input: self.0.child(span, tag_origin),
+                                })?;
+                                if found != selected.name {
+                                    return Err(c::span_error());
+                                }
+                            }
+                            "request" => {
+                                out = Some(match selected.name {
+                                    "Open" => {
+                                        map.next_value_seed(Seed_Open(self.0.child(span, origin)))?
+                                    }
+                                    "Submit" => map
+                                        .next_value_seed(Seed_Submit(self.0.child(span, origin)))?,
+                                    "Evaluate" => map.next_value_seed(Seed_Evaluate(
+                                        self.0.child(span, origin),
+                                    ))?,
+                                    "Cancel" => map
+                                        .next_value_seed(Seed_Cancel(self.0.child(span, origin)))?,
+                                    "Expire" => map
+                                        .next_value_seed(Seed_Expire(self.0.child(span, origin)))?,
+                                    "QualifiedMarks" => map.next_value_seed(
+                                        Seed_QualifiedMarks(self.0.child(span, origin)),
+                                    )?,
+                                    _ => return Err(c::span_error()),
+                                });
+                            }
+                            _ => return Err(c::span_error()),
+                        }
+                    }
+                    if let Some(v) = out {
+                        return Ok(v);
+                    }
+                    match selected.name {
+                        _ => Err(self.0.error(c::K::MissingField, "codec missing")),
+                    }
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    mut self,
+                    mut seq: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut spans = self.0.span.children(self.0.bytes);
+                    let _ = spans.next().ok_or_else(c::span_error)?;
+                    let tag = seq
+                        .next_element_seed(c::KeySeed {
+                            names: &[
+                                "Open",
+                                "Submit",
+                                "Evaluate",
+                                "Cancel",
+                                "Expire",
+                                "QualifiedMarks",
+                            ],
+                        })?
+                        .ok_or_else(c::span_error)?;
+                    let span = spans.next().ok_or_else(c::span_error)?.1;
+                    let origin = self.0.origin;
+                    match tag {
+                        "Open" => seq
+                            .next_element_seed(Seed_Open(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Submit" => seq
+                            .next_element_seed(Seed_Submit(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Evaluate" => seq
+                            .next_element_seed(Seed_Evaluate(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Cancel" => seq
+                            .next_element_seed(Seed_Cancel(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Expire" => seq
+                            .next_element_seed(Seed_Expire(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "QualifiedMarks" => seq
+                            .next_element_seed(Seed_QualifiedMarks(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_struct("codec", &["operation", "request"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                CommandRecord::Open { manifest } => CommandRecord::Open {
+                    manifest: c::Value::paid_copy(manifest, w)?,
+                },
+                CommandRecord::Submit { expected, intent } => CommandRecord::Submit {
+                    expected: c::Value::paid_copy(expected, w)?,
+                    intent: c::Value::paid_copy(intent, w)?,
+                },
+                CommandRecord::Evaluate {
+                    expected,
+                    parent_id,
+                    window,
+                } => CommandRecord::Evaluate {
+                    expected: c::Value::paid_copy(expected, w)?,
+                    parent_id: c::Value::paid_copy(parent_id, w)?,
+                    window: c::Value::paid_copy(window, w)?,
+                },
+                CommandRecord::Cancel {
+                    expected,
+                    parent_id,
+                    at,
+                } => CommandRecord::Cancel {
+                    expected: c::Value::paid_copy(expected, w)?,
+                    parent_id: c::Value::paid_copy(parent_id, w)?,
+                    at: c::Value::paid_copy(at, w)?,
+                },
+                CommandRecord::Expire {
+                    expected,
+                    parent_id,
+                    at,
+                } => CommandRecord::Expire {
+                    expected: c::Value::paid_copy(expected, w)?,
+                    parent_id: c::Value::paid_copy(parent_id, w)?,
+                    at: c::Value::paid_copy(at, w)?,
+                },
+                CommandRecord::QualifiedMarks { expected, windows } => {
+                    CommandRecord::QualifiedMarks {
+                        expected: c::Value::paid_copy(expected, w)?,
+                        windows: c::Value::paid_copy(windows, w)?,
+                    }
+                }
+            })
+        }
+    }
+    impl c::sealed::Value for Effect {}
+    impl c::Value for Effect {
+        const SHAPE: s::Shape = s::Shape::Adjacent(
+            "effect",
+            "record",
+            &[
+                s::Variant {
+                    name: "Opened",
+                    body: s::Body::Unit,
+                },
+                s::Variant {
+                    name: "Submitted",
+                    body: s::Body::Value(&<ParentState as c::Value>::SHAPE),
+                },
+                s::Variant {
+                    name: "ObservedNoFill",
+                    body: s::Body::Value(&<fill_model::NoFillReason as c::Value>::SHAPE),
+                },
+                s::Variant {
+                    name: "Filled",
+                    body: s::Body::Value(&<FillRecord as c::Value>::SHAPE),
+                },
+                s::Variant {
+                    name: "Cancelled",
+                    body: s::Body::Unit,
+                },
+                s::Variant {
+                    name: "Expired",
+                    body: s::Body::Unit,
+                },
+                s::Variant {
+                    name: "Marks",
+                    body: s::Body::Unit,
+                },
+            ],
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            struct Seed_Opened<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Opened<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Effect::Opened)
+                }
+            }
+            struct Seed_Submitted<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Submitted<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <ParentState as c::Value>::read(de, self.0).map(Effect::Submitted)
+                }
+            }
+            struct Seed_ObservedNoFill<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_ObservedNoFill<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <fill_model::NoFillReason as c::Value>::read(de, self.0)
+                        .map(Effect::ObservedNoFill)
+                }
+            }
+            struct Seed_Filled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Filled<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    <FillRecord as c::Value>::read(de, self.0).map(Effect::Filled)
+                }
+            }
+            struct Seed_Cancelled<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Cancelled<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Effect::Cancelled)
+                }
+            }
+            struct Seed_Expired<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Expired<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Effect::Expired)
+                }
+            }
+            struct Seed_Marks<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::DeserializeSeed<'de> for Seed_Marks<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    self,
+                    de: D,
+                ) -> Result<Self::Value, D::Error> {
+                    c::adjacent_unit(de)?;
+                    Ok(Effect::Marks)
+                }
+            }
+            struct EV<'de, 'w, 'loan, 'pool>(c::Input<'de, 'w, 'loan, 'pool>);
+            impl<'de> serde::de::Visitor<'de> for EV<'de, '_, '_, '_> {
+                type Value = Effect;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    c::expected(f)
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    mut self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let s::Shape::Adjacent(tagname, contentname, variants) =
+                        <Effect as c::Value>::SHAPE
+                    else {
+                        unreachable!()
+                    };
+                    let (selected, _, origin) = s::adjacent(
+                        self.0.bytes,
+                        self.0.span,
+                        tagname,
+                        contentname,
+                        variants,
+                        self.0.origin,
+                    )
+                    .ok_or_else(c::span_error)?;
+                    let mut out = None;
+                    let mut spans = self.0.span.children(self.0.bytes);
+                    while let Some(key) = map.next_key_seed(c::KeySeed {
+                        names: &["effect", "record"],
+                    })? {
+                        let span = spans.next().ok_or_else(c::span_error)?.1;
+                        match key {
+                            "effect" => {
+                                let tag_origin = self.0.origin;
+                                let found = map.next_value_seed(c::TagSeed {
+                                    names: &[
+                                        "Opened",
+                                        "Submitted",
+                                        "ObservedNoFill",
+                                        "Filled",
+                                        "Cancelled",
+                                        "Expired",
+                                        "Marks",
+                                    ],
+                                    input: self.0.child(span, tag_origin),
+                                })?;
+                                if found != selected.name {
+                                    return Err(c::span_error());
+                                }
+                            }
+                            "record" => {
+                                out = Some(match selected.name {
+                                    "Opened" => map
+                                        .next_value_seed(Seed_Opened(self.0.child(span, origin)))?,
+                                    "Submitted" => map.next_value_seed(Seed_Submitted(
+                                        self.0.child(span, origin),
+                                    ))?,
+                                    "ObservedNoFill" => map.next_value_seed(
+                                        Seed_ObservedNoFill(self.0.child(span, origin)),
+                                    )?,
+                                    "Filled" => map
+                                        .next_value_seed(Seed_Filled(self.0.child(span, origin)))?,
+                                    "Cancelled" => map.next_value_seed(Seed_Cancelled(
+                                        self.0.child(span, origin),
+                                    ))?,
+                                    "Expired" => map.next_value_seed(Seed_Expired(
+                                        self.0.child(span, origin),
+                                    ))?,
+                                    "Marks" => {
+                                        map.next_value_seed(Seed_Marks(self.0.child(span, origin)))?
+                                    }
+                                    _ => return Err(c::span_error()),
+                                });
+                            }
+                            _ => return Err(c::span_error()),
+                        }
+                    }
+                    if let Some(v) = out {
+                        return Ok(v);
+                    }
+                    match selected.name {
+                        "Opened" => Ok(Effect::Opened),
+                        "Cancelled" => Ok(Effect::Cancelled),
+                        "Expired" => Ok(Effect::Expired),
+                        "Marks" => Ok(Effect::Marks),
+                        _ => Err(self.0.error(c::K::MissingField, "codec missing")),
+                    }
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    mut self,
+                    mut seq: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut spans = self.0.span.children(self.0.bytes);
+                    let _ = spans.next().ok_or_else(c::span_error)?;
+                    let tag = seq
+                        .next_element_seed(c::KeySeed {
+                            names: &[
+                                "Opened",
+                                "Submitted",
+                                "ObservedNoFill",
+                                "Filled",
+                                "Cancelled",
+                                "Expired",
+                                "Marks",
+                            ],
+                        })?
+                        .ok_or_else(c::span_error)?;
+                    let span = spans.next().ok_or_else(c::span_error)?.1;
+                    let origin = self.0.origin;
+                    match tag {
+                        "Opened" => seq
+                            .next_element_seed(Seed_Opened(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Submitted" => seq
+                            .next_element_seed(Seed_Submitted(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "ObservedNoFill" => seq
+                            .next_element_seed(Seed_ObservedNoFill(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Filled" => seq
+                            .next_element_seed(Seed_Filled(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Cancelled" => seq
+                            .next_element_seed(Seed_Cancelled(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Expired" => seq
+                            .next_element_seed(Seed_Expired(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        "Marks" => seq
+                            .next_element_seed(Seed_Marks(self.0.child(span, origin)))?
+                            .ok_or_else(c::span_error),
+                        _ => Err(self.0.error(c::K::UnknownVariant, "codec variant")),
+                    }
+                }
+            }
+            de.deserialize_struct("codec", &["effect", "record"], EV(input))
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(match self {
+                Effect::Opened => Effect::Opened,
+                Effect::Submitted(value) => Effect::Submitted(c::Value::paid_copy(value, w)?),
+                Effect::ObservedNoFill(value) => {
+                    Effect::ObservedNoFill(c::Value::paid_copy(value, w)?)
+                }
+                Effect::Filled(value) => Effect::Filled(c::Value::paid_copy(value, w)?),
+                Effect::Cancelled => Effect::Cancelled,
+                Effect::Expired => Effect::Expired,
+                Effect::Marks => Effect::Marks,
+            })
+        }
+    }
+    impl c::sealed::Value for Fact {}
+    impl c::Value for Fact {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "request",
+                    shape: &<CommandRecord as c::Value>::SHAPE,
+                    optional: <CommandRecord as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "effect",
+                    shape: &<Effect as c::Value>::SHAPE,
+                    optional: <Effect as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            true,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,Fact,true,{request:CommandRecord=>false,effect:Effect=>false},Fact{request,effect})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(Fact {
+                request: c::Value::paid_copy(&self.request, w)?,
+                effect: c::Value::paid_copy(&self.effect, w)?,
+            })
+        }
+    }
+    impl c::sealed::Element for InitialLotAllocation {}
+    impl c::ArrayElement for InitialLotAllocation {}
+    impl c::sealed::Element for LotClaim {}
+    impl c::ArrayElement for LotClaim {}
+    impl c::sealed::Element for FillRecord {}
+    impl c::ArrayElement for FillRecord {}
+    impl c::sealed::Element for WindowRecord {}
+    impl c::ArrayElement for WindowRecord {}
+    impl c::sealed::Entry for (String, Option<String>) {}
+    impl c::MapEntry for (String, Option<String>) {}
+    impl c::sealed::Entry for (String, ParentState) {}
+    impl c::MapEntry for (String, ParentState) {}
+    impl c::sealed::Entry for (String, String) {}
+    impl c::MapEntry for (String, String) {}
+    impl c::sealed::Entry for (String, WindowRecord) {}
+    impl c::MapEntry for (String, WindowRecord) {}
+    impl c::sealed::Root for ExecutionManifest {}
+    impl c::Root for ExecutionManifest {
+        const ROOT: s::RootKind = s::RootKind::ExecutionManifest;
+        const CANONICAL: bool = true;
+    }
+    impl c::sealed::Root for Fact {}
+    impl c::Root for Fact {
+        const ROOT: s::RootKind = s::RootKind::ExecutionFact;
+        const CANONICAL: bool = true;
+    }
+    impl c::sealed::Root for ExecutionProjection {}
+    impl c::Root for ExecutionProjection {
+        const ROOT: s::RootKind = s::RootKind::ExecutionProjection;
+        const CANONICAL: bool = true;
+    }
+}
+#[cfg(test)]
+pub(crate) fn replay_codec_fixtures(
+    case: crate::trading::paper_replay_codec_v1::CodecFixtureCase,
+    work: &mut crate::database::global_schema_v1::replay_work::CodecMechanics<'_, '_>,
+) {
+    crate::trading::paper_replay_codec_v1::exercise_root::<ExecutionManifest>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<Fact>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<ExecutionProjection>(case, work);
+}

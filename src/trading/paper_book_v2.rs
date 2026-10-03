@@ -752,3 +752,202 @@ pub(crate) fn read_verified_genesis_body_on(
         fee_policy_instance_id: account.fee_policy_instance_id,
     })
 }
+
+// Finite replay DTO seeds stay with the owners of private fields.
+#[allow(dead_code, non_camel_case_types)]
+mod replay_codec_owner {
+    use super::*;
+    use crate::trading::paper_replay_codec_v1 as c;
+    use crate::trading::paper_replay_shapes_v1 as s;
+    use serde::de::{EnumAccess as _, VariantAccess as _};
+    impl c::sealed::Value for CutoverManifestV1 {}
+    impl c::Value for CutoverManifestV1 {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "schema",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "account_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "command_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_epoch_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_manifest_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_head_version",
+                    shape: &<i64 as c::Value>::SHAPE,
+                    optional: <i64 as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_head_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_projection_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_equity",
+                    shape: &<Money as c::Value>::SHAPE,
+                    optional: <Money as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_policy_instance_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,CutoverManifestV1,true,{schema:String=>false,account_id:String=>false,epoch_id:String=>false,cutover_id:String=>false,command_id:String=>false,v1_epoch_id:String=>false,v1_manifest_hash:String=>false,v1_head_version:i64=>false,v1_head_hash:String=>false,v1_projection_hash:String=>false,v1_equity:Money=>false,fee_policy_instance_id:String=>false},CutoverManifestV1{schema,account_id,epoch_id,cutover_id,command_id,v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,v1_equity,fee_policy_instance_id})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(CutoverManifestV1 {
+                schema: c::Value::paid_copy(&self.schema, w)?,
+                account_id: c::Value::paid_copy(&self.account_id, w)?,
+                epoch_id: c::Value::paid_copy(&self.epoch_id, w)?,
+                cutover_id: c::Value::paid_copy(&self.cutover_id, w)?,
+                command_id: c::Value::paid_copy(&self.command_id, w)?,
+                v1_epoch_id: c::Value::paid_copy(&self.v1_epoch_id, w)?,
+                v1_manifest_hash: c::Value::paid_copy(&self.v1_manifest_hash, w)?,
+                v1_head_version: c::Value::paid_copy(&self.v1_head_version, w)?,
+                v1_head_hash: c::Value::paid_copy(&self.v1_head_hash, w)?,
+                v1_projection_hash: c::Value::paid_copy(&self.v1_projection_hash, w)?,
+                v1_equity: c::Value::paid_copy(&self.v1_equity, w)?,
+                fee_policy_instance_id: c::Value::paid_copy(&self.fee_policy_instance_id, w)?,
+            })
+        }
+    }
+    impl c::sealed::Value for GenesisPayloadV1 {}
+    impl c::Value for GenesisPayloadV1 {
+        const SHAPE: s::Shape = s::Shape::Record(
+            &[
+                s::Field {
+                    name: "schema",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "manifest_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_head_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "v1_projection_hash",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "fee_policy_instance_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+                s::Field {
+                    name: "cutover_id",
+                    shape: &<String as c::Value>::SHAPE,
+                    optional: <String as c::Value>::OPTIONAL,
+                    positional_default: false,
+                },
+            ],
+            false,
+            true,
+        );
+        fn read<'de, D: serde::Deserializer<'de>>(
+            de: D,
+            input: c::Input<'de, '_, '_, '_>,
+        ) -> Result<Self, D::Error> {
+            c::record_read!(de,input,GenesisPayloadV1,true,{schema:String=>false,manifest_hash:String=>false,v1_head_hash:String=>false,v1_projection_hash:String=>false,fee_policy_instance_id:String=>false,cutover_id:String=>false},GenesisPayloadV1{schema,manifest_hash,v1_head_hash,v1_projection_hash,fee_policy_instance_id,cutover_id})
+        }
+        fn paid_copy(
+            &self,
+            w: &mut c::CodecMechanics<'_, '_>,
+        ) -> Result<Self, c::ReplayTerminalFailure> {
+            w.finish()?;
+            Ok(GenesisPayloadV1 {
+                schema: c::Value::paid_copy(&self.schema, w)?,
+                manifest_hash: c::Value::paid_copy(&self.manifest_hash, w)?,
+                v1_head_hash: c::Value::paid_copy(&self.v1_head_hash, w)?,
+                v1_projection_hash: c::Value::paid_copy(&self.v1_projection_hash, w)?,
+                fee_policy_instance_id: c::Value::paid_copy(&self.fee_policy_instance_id, w)?,
+                cutover_id: c::Value::paid_copy(&self.cutover_id, w)?,
+            })
+        }
+    }
+    impl c::sealed::Root for CutoverManifestV1 {}
+    impl c::Root for CutoverManifestV1 {
+        const ROOT: s::RootKind = s::RootKind::Cutover;
+        const CANONICAL: bool = true;
+    }
+    impl c::sealed::Root for GenesisPayloadV1 {}
+    impl c::Root for GenesisPayloadV1 {
+        const ROOT: s::RootKind = s::RootKind::Genesis;
+        const CANONICAL: bool = true;
+    }
+}
+#[cfg(test)]
+pub(crate) fn replay_codec_fixtures(
+    case: crate::trading::paper_replay_codec_v1::CodecFixtureCase,
+    work: &mut crate::database::global_schema_v1::replay_work::CodecMechanics<'_, '_>,
+) {
+    crate::trading::paper_replay_codec_v1::exercise_root::<CutoverManifestV1>(case, work);
+    crate::trading::paper_replay_codec_v1::exercise_root::<GenesisPayloadV1>(case, work);
+}

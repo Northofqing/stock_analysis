@@ -341,6 +341,484 @@ impl ReplayMemory<'_, '_> {
     }
 }
 
+// The mechanics core owns no qualification. Only the genuine loan supplies it
+// in production; the fixed cfg(test) dispatcher below can exercise this same core.
+pub(crate) struct CodecMechanics<'loan, 'pool> {
+    work: &'loan mut BorrowedReplayWork<'pool>,
+    #[cfg(test)]
+    pub(crate) hits: CodecHits,
+    #[cfg(test)]
+    fault: Option<crate::trading::paper_replay_codec_v1::SeedFaultCase>,
+    #[cfg(test)]
+    pub(crate) scratch: crate::trading::paper_replay_shapes_v1::ScratchObservation,
+}
+#[cfg(test)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodecHits {
+    pub(crate) frames: usize,
+    pub(crate) decoder: usize,
+    pub(crate) scratch_plans: usize,
+    pub(crate) escrows: usize,
+    pub(crate) escrow_bytes: u64,
+    pub(crate) unit_maps: usize,
+    pub(crate) active_seeds: usize,
+    pub(crate) max_active_seeds: usize,
+    pub(crate) denial_depth: usize,
+    pub(crate) denial_strings: usize,
+    pub(crate) denial_vectors: usize,
+    pub(crate) denial_maps: usize,
+    pub(crate) denial_units: usize,
+    pub(crate) strings: usize,
+    pub(crate) vectors: usize,
+    pub(crate) maps: usize,
+    pub(crate) outputs: usize,
+}
+impl<'loan, 'pool> ReplayMemory<'loan, 'pool> {
+    pub(crate) fn mechanics<'short>(
+        &'short mut self,
+    ) -> Result<CodecMechanics<'short, 'pool>, ReplayTerminalFailure> {
+        self.finish()?;
+        if let Err(kind) = self.rules() {
+            return Err(self.work.qualify_codec(kind, None));
+        }
+        Ok(CodecMechanics {
+            work: self.work,
+            #[cfg(test)]
+            hits: CodecHits::default(),
+            #[cfg(test)]
+            fault: None,
+            #[cfg(test)]
+            scratch: Default::default(),
+        })
+    }
+}
+impl CodecMechanics<'_, '_> {
+    pub(crate) fn finish(&self) -> Result<(), ReplayTerminalFailure> {
+        self.work.finish()
+    }
+    pub(crate) fn refuse(
+        &mut self,
+        kind: ReplayCodecFailureKind,
+        offset: Option<u64>,
+    ) -> ReplayTerminalFailure {
+        self.work.qualify_codec(kind, offset)
+    }
+    fn layout_error(&mut self, site: ReplaySite, error: LayoutFailure) -> ReplayTerminalFailure {
+        self.work.fail(site, ResourceCause::Layout(error))
+    }
+    pub(crate) fn scratch_layout_failure(&mut self) -> ReplayTerminalFailure {
+        self.layout_error(ReplaySite::CodecScratch, LayoutFailure::Overflow)
+    }
+    fn allocation_error(&mut self, site: ReplaySite) -> ReplayTerminalFailure {
+        self.work.fail(site, ResourceCause::AllocationFailed)
+    }
+    pub(crate) fn frames(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<crate::trading::paper_replay_shapes_v1::ScanFrame>, ReplayTerminalFailure> {
+        use crate::trading::paper_replay_shapes_v1::ScanFrame;
+        self.work
+            .reserve_array::<ScanFrame>(ReplaySite::CodecScratch, count as u64)?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.frames += 1;
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(count)
+            .map_err(|_| self.allocation_error(ReplaySite::CodecScratch))?;
+        Ok(frames)
+    }
+    pub(crate) fn decode_escrow(
+        &mut self,
+        root: crate::trading::paper_replay_shapes_v1::RootKind,
+    ) -> Result<(), ReplayTerminalFailure> {
+        let bytes = serde_error_box_bound()
+            .and_then(|e| add(mul(root.q() + 2, e.bytes())?, 88))
+            .map_err(|e| self.layout_error(ReplaySite::ErrorStorage, e))?;
+        self.work
+            .reserve(ReplaySite::ErrorStorage, bytes)?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.escrows += 1;
+            self.hits.escrow_bytes += bytes;
+        }
+        Ok(())
+    }
+    pub(crate) fn decoder_scratch(
+        &mut self,
+        trace: &crate::trading::paper_replay_shapes_v1::ScratchTrace,
+    ) -> Result<(), ReplayTerminalFailure> {
+        self.work
+            .reserve(ReplaySite::CodecScratch, trace.requested())?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.scratch_plans += 1;
+            self.scratch = trace.observation();
+        }
+        Ok(())
+    }
+    pub(crate) fn serializer_escrow(&mut self) -> Result<(), ReplayTerminalFailure> {
+        let bytes = serde_error_box_bound()
+            .map_err(|e| self.layout_error(ReplaySite::ErrorStorage, e))?
+            .bytes();
+        self.work
+            .reserve(ReplaySite::ErrorStorage, bytes)?
+            .consume();
+        Ok(())
+    }
+    pub(crate) fn string(&mut self, value: &str) -> Result<String, ReplayTerminalFailure> {
+        #[cfg(test)]
+        self.fixture_deplete(
+            crate::trading::paper_replay_codec_v1::SeedFaultCase::StringAfterUnit,
+            value.len() as u64,
+            self.hits.unit_maps > 0,
+        )?;
+        self.work
+            .reserve_array::<u8>(ReplaySite::StateCopy, value.len() as u64)?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.strings += 1;
+        }
+        let mut result = String::new();
+        result
+            .try_reserve_exact(value.len())
+            .map_err(|_| self.allocation_error(ReplaySite::StateCopy))?;
+        result.push_str(value);
+        Ok(result)
+    }
+    pub(crate) fn vector<T: crate::trading::paper_replay_codec_v1::ArrayElement>(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<T>, ReplayTerminalFailure> {
+        #[cfg(test)]
+        {
+            let cost = exact_array_bytes::<T>(count as u64)
+                .map_err(|e| self.layout_error(ReplaySite::Collection, e))?;
+            self.fixture_deplete(
+                crate::trading::paper_replay_codec_v1::SeedFaultCase::Vector,
+                cost,
+                true,
+            )?;
+        }
+        self.work
+            .reserve_array::<T>(ReplaySite::Collection, count as u64)?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.vectors += 1;
+        }
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| self.allocation_error(ReplaySite::Collection))?;
+        Ok(result)
+    }
+    pub(crate) fn insert<K: Ord, V>(
+        &mut self,
+        map: &mut std::collections::BTreeMap<K, V>,
+        key: K,
+        value: V,
+    ) -> Result<(), ReplayTerminalFailure>
+    where
+        (K, V): crate::trading::paper_replay_codec_v1::MapEntry,
+    {
+        let n = map.len() as u64;
+        let bytes = (|| {
+            let next = add(n, 1)?;
+            let height = if next <= 1 {
+                0
+            } else {
+                u64::from(u64::BITS - (next - 1).leading_zeros())
+            };
+            let (_, internal) = btree_node_bounds::<K, V>()?;
+            mul(add(height, 2)?, internal.bytes())
+        })()
+        .map_err(|e| self.layout_error(ReplaySite::Collection, e))?;
+        #[cfg(test)]
+        self.fixture_deplete(
+            crate::trading::paper_replay_codec_v1::SeedFaultCase::Map,
+            bytes,
+            true,
+        )?;
+        self.work.reserve(ReplaySite::Collection, bytes)?.consume();
+        #[cfg(test)]
+        {
+            self.hits.maps += 1;
+        }
+        map.insert(key, value);
+        Ok(())
+    }
+    pub(crate) fn output(&mut self, count: usize) -> Result<Vec<u8>, ReplayTerminalFailure> {
+        self.work
+            .reserve_array::<u8>(ReplaySite::Formatting, count as u64)?
+            .consume();
+        #[cfg(test)]
+        {
+            self.hits.outputs += 1;
+        }
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| self.allocation_error(ReplaySite::Formatting))?;
+        Ok(result)
+    }
+    pub(crate) fn hex_digest(
+        &mut self,
+        digest: &[u8; 32],
+    ) -> Result<String, ReplayTerminalFailure> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut bytes = [0u8; 64];
+        for (i, byte) in digest.iter().enumerate() {
+            bytes[2 * i] = HEX[(byte >> 4) as usize];
+            bytes[2 * i + 1] = HEX[(byte & 15) as usize];
+        }
+        self.string(std::str::from_utf8(&bytes).expect("hex is ASCII"))
+    }
+    #[cfg(test)]
+    fn fixture_deplete(
+        &mut self,
+        site: crate::trading::paper_replay_codec_v1::SeedFaultCase,
+        cost: u64,
+        enabled: bool,
+    ) -> Result<(), ReplayTerminalFailure> {
+        self.finish()?;
+        if self.fault == Some(site)
+            && enabled
+            && cost > 0
+            && self.hits.active_seeds > 0
+            && self.hits.strings > 0
+        {
+            self.fault = None;
+            let leave = cost - 1;
+            let debit = (16 * 1024 * 1024_u64)
+                .checked_sub(self.used())
+                .unwrap()
+                .checked_sub(leave)
+                .unwrap();
+            self.work.reserve(ReplaySite::StateCopy, debit)?.consume();
+            self.hits.denial_depth = self.hits.active_seeds;
+            self.hits.denial_strings = self.hits.strings;
+            self.hits.denial_vectors = self.hits.vectors;
+            self.hits.denial_maps = self.hits.maps;
+            self.hits.denial_units = self.hits.unit_maps;
+        }
+        Ok(())
+    }
+    // Fixed test-only denied one-byte request while the second (disposition)
+    // empty-unit-map visitor and its eight real serde container frames are live.
+    #[cfg(test)]
+    pub(crate) fn fixture_unit_failure(&mut self) -> Result<(), ReplayTerminalFailure> {
+        use crate::trading::paper_replay_codec_v1::SeedFaultCase;
+        self.finish()?;
+        if self.fault == Some(SeedFaultCase::UnitMap) && self.hits.unit_maps == 2 {
+            self.fault = None;
+            let debit=16*1024*1024-self.used();
+            self.work.reserve(ReplaySite::StateCopy,debit)?.consume();
+            self.hits.denial_depth = self.hits.active_seeds;
+            self.hits.denial_strings = self.hits.strings;
+            self.hits.denial_vectors = self.hits.vectors;
+            self.hits.denial_maps = self.hits.maps;
+            self.hits.denial_units = self.hits.unit_maps;
+            self.string("x")?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn seeded_failure_matches(
+        &self,
+        kind: crate::trading::paper_replay_codec_v1::SeedFaultCase,
+    ) -> bool {
+        use crate::trading::paper_replay_codec_v1::SeedFaultCase as F;
+        let site = match kind {
+            F::UnitMap | F::StringAfterUnit => ReplaySite::StateCopy,
+            F::Vector | F::Map => ReplaySite::Collection,
+        };
+        matches!(self.finish(),Err(ReplayTerminalFailure::Resource(f)) if f.site==site)
+    }
+    #[cfg(test)]
+    pub(crate) fn failure_kind(&self) -> Option<ReplayCodecFailureKind> {
+        match self.finish().err() {
+            Some(ReplayTerminalFailure::CodecQualification(f)) => Some(f.kind),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> u64 {
+        self.work.used()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codec_fixture(case: crate::trading::paper_replay_codec_v1::CodecFixtureCase) {
+    // No caller limit/callback or pin construction. Repeated work inside a case
+    // retains this one real meter and the actual target terminal.
+    let mut metadata = RowsSpecWork::new(16 * 1024 * 1024, 1, 1);
+    let mut terminal = super::target::test_replay_terminal();
+    let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+    if matches!(
+        case,
+        crate::trading::paper_replay_codec_v1::CodecFixtureCase::Qualification
+    ) {
+        assert!(work.codec_memory().is_err());
+        assert!(work.finish().is_err());
+        return;
+    }
+    let mut core = CodecMechanics {
+        work: &mut work,
+        hits: CodecHits::default(),
+        fault: if let crate::trading::paper_replay_codec_v1::CodecFixtureCase::SeedFault(kind) =
+            case
+        {
+            Some(kind)
+        } else {
+            None
+        },
+        scratch: Default::default(),
+    };
+    if let crate::trading::paper_replay_codec_v1::CodecFixtureCase::Boundary(kind) = case {
+        codec_boundary(kind, &mut core);
+        return;
+    }
+    crate::trading::paper_replay_codec_v1::run_fixture(case, &mut core);
+    if matches!(
+        case,
+        crate::trading::paper_replay_codec_v1::CodecFixtureCase::SeedFault(
+            crate::trading::paper_replay_codec_v1::SeedFaultCase::StringAfterUnit
+                | crate::trading::paper_replay_codec_v1::SeedFaultCase::UnitMap
+        )
+    ) {
+        assert_eq!(core.hits.escrows, 1);
+        assert_eq!(
+            core.hits.escrow_bytes,
+            10 * serde_error_box_bound().unwrap().bytes() + 88
+        );
+        assert!(core.hits.unit_maps > 0);
+    }
+}
+
+#[cfg(test)]
+fn codec_boundary(
+    case: crate::trading::paper_replay_codec_v1::BoundaryCase,
+    core: &mut CodecMechanics<'_, '_>,
+) {
+    use crate::trading::paper_replay_codec_v1::BoundaryCase as B;
+    use crate::trading::paper_replay_shapes_v1::{RootKind, ScanFrame};
+    if matches!(case, B::LengthOverflow) {
+        assert!(matches!(
+            core.frames(usize::MAX),
+            Err(ReplayTerminalFailure::Resource(_))
+        ));
+        assert_eq!(core.hits.frames, 0);
+        assert_eq!(core.used(), 0);
+        let first = core.finish().unwrap_err();
+        assert_eq!(core.frames(1).err(), Some(first));
+        assert_eq!(core.hits.frames, 0);
+        assert_eq!(core.used(), 0);
+        return;
+    }
+    let e = serde_error_box_bound().unwrap().bytes();
+    let cost = match case {
+        B::FramesExact | B::FramesShort => 3 * std::mem::size_of::<ScanFrame>() as u64,
+        B::Escrow8Exact | B::Escrow8Short => 10 * e + 88,
+        B::Escrow4Exact | B::Escrow4Short => 6 * e + 88,
+        B::ScratchExact | B::ScratchShort => 135,
+        B::VectorExact | B::VectorShort => 2 * std::mem::size_of::<String>() as u64,
+        B::MapExact | B::MapShort => 2 * btree_node_bounds::<String, String>().unwrap().1.bytes(),
+        B::OutputExact | B::OutputShort => 47,
+        B::LengthOverflow => unreachable!(),
+    };
+    let short = matches!(
+        case,
+        B::FramesShort
+            | B::Escrow8Short
+            | B::Escrow4Short
+            | B::ScratchShort
+            | B::VectorShort
+            | B::MapShort
+            | B::OutputShort
+    );
+    let remaining = cost - u64::from(short);
+    core.work
+        .reserve(ReplaySite::StateCopy, 16 * 1024 * 1024 - remaining)
+        .unwrap()
+        .consume();
+    let before = core.used();
+    let hits = core.hits;
+    let result = match case {
+        B::FramesExact | B::FramesShort => core.frames(3).map(|v| assert!(v.capacity() >= 3)),
+        B::Escrow8Exact | B::Escrow8Short => core.decode_escrow(RootKind::ExecutionFact),
+        B::Escrow4Exact | B::Escrow4Short => core.decode_escrow(RootKind::ExecutionManifest),
+        B::ScratchExact | B::ScratchShort => {
+            let t = crate::trading::paper_replay_shapes_v1::fixed_scratch_trace();
+            assert_eq!(t.requested(), 135);
+            core.decoder_scratch(&t)
+        }
+        B::VectorExact | B::VectorShort => {
+            core.vector::<String>(2).map(|v| assert!(v.capacity() >= 2))
+        }
+        B::MapExact | B::MapShort => {
+            let mut map = std::collections::BTreeMap::new();
+            let r = core.insert(&mut map, String::new(), String::new());
+            assert_eq!(map.len(), usize::from(!short));
+            r
+        }
+        B::OutputExact | B::OutputShort => core.output(47).map(|v| assert!(v.capacity() >= 47)),
+        B::LengthOverflow => unreachable!(),
+    };
+    if short {
+        let site = match case {
+            B::FramesShort | B::ScratchShort => ReplaySite::CodecScratch,
+            B::Escrow8Short | B::Escrow4Short => ReplaySite::ErrorStorage,
+            B::VectorShort | B::MapShort => ReplaySite::Collection,
+            B::OutputShort => ReplaySite::Formatting,
+            _ => unreachable!("fixed short case"),
+        };
+        // The original meter keeps the attempted debit before reporting Exceeded.
+        // The denied owned operation does not run; its budget debit is not refunded.
+        let attempted = before + cost;
+        assert_eq!(attempted, 16 * 1024 * 1024 + 1);
+        let expected = ReplayTerminalFailure::Resource(ReplayResourceFailure {
+            site,
+            cause: ResourceCause::Debit(RowsSpecDebitFailure::Exceeded),
+            used: attempted,
+        });
+        assert_eq!(result, Err(expected));
+        assert_eq!(core.finish(), Err(expected));
+        assert_eq!(core.used(), attempted);
+        assert_eq!(core.hits, hits);
+    } else {
+        result.unwrap();
+        assert_eq!(core.used() - before, cost);
+        assert_eq!(core.used(), 16 * 1024 * 1024);
+        assert!(core.finish().is_ok());
+    }
+    let h = core.hits;
+    let latched = core.finish().err();
+    let first = core.output(1).unwrap_err();
+    if let Some(previous) = latched {
+        assert_eq!(first, previous, "retry preserves the original denied site");
+    } else {
+        assert_eq!(
+            first,
+            ReplayTerminalFailure::Resource(ReplayResourceFailure {
+                site: ReplaySite::Formatting,
+                cause: ResourceCause::Debit(RowsSpecDebitFailure::Exceeded),
+                used: 16 * 1024 * 1024 + 1,
+            })
+        );
+    }
+    assert_eq!(core.finish(), Err(first));
+    assert_eq!(core.used(), 16 * 1024 * 1024 + 1);
+    assert_eq!(core.output(1).err(), Some(first));
+    assert_eq!(core.used(), 16 * 1024 * 1024 + 1);
+    assert_eq!(core.hits, h);
+}
+
 pub(super) const REVIEWED_LAYOUT_SPEC: &str =
     "rustc-59807616e1fa2540724bfbac14d7976d7e4a3860/x86_64-apple-darwin/hashbrown-0.16.1/serde_json-1.0.149";
 
