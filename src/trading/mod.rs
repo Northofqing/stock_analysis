@@ -7,6 +7,7 @@
 
 pub mod order_safety;
 pub(crate) mod paper_book_v2;
+pub(crate) mod paper_funding_review_v1;
 pub(crate) mod paper_book_v2_budget_v1;
 pub(crate) mod paper_book_v2_fill_model;
 pub(crate) mod paper_book_v2_execution;
