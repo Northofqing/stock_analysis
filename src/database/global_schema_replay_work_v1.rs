@@ -16,6 +16,8 @@ pub(super) enum ReplaySite {
     StateCopy,
     Formatting,
     ErrorStorage,
+    CalendarCold,
+    CalendarQuery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,7 @@ pub(crate) enum ReplayTerminalFailure {
     Resource(ReplayResourceFailure),
     Qualification(ReplaySqlQualificationFailure),
     CodecQualification(ReplayCodecQualificationFailure),
+    CalendarQualification(ReplayCalendarQualificationFailure),
 }
 
 // Constructed once by the actual target owner, never by a phase borrower.
@@ -177,7 +180,11 @@ impl<'a> BorrowedReplayWork<'a> {
             .map_err(|_| self.qualify_codec(ReplayCodecFailureKind::PinUnavailable, None))?;
         pin.codec_rules()
             .map_err(|kind| self.qualify_codec(kind, None))?;
-        Ok(ReplayMemory { work: self, pin })
+        Ok(ReplayMemory {
+            work: self,
+            pin,
+            calendar_payment: paid_calendar::CalendarPaymentState::unpaid(),
+        })
     }
     fn sql<T>(
         &mut self,
@@ -273,6 +280,13 @@ impl<'a> V1RowsLoan<'a> {
 #[path = "global_schema_replay_sql_v1.rs"]
 mod sql_rows;
 
+#[path = "global_schema_replay_calendar_v1.rs"]
+mod paid_calendar;
+pub(crate) use paid_calendar::{
+    CalendarCallPermit, CalendarRequest, CalendarResponse, ReplayCalendarCallFailure,
+    ReplayCalendarQualificationFailure,
+};
+
 /// Move-only evidence of a debit, not an allocation or qualification capability.
 /// Dropping or consuming it never refunds the cumulative meter.
 #[must_use]
@@ -288,19 +302,34 @@ impl Reservation {
 // Ordinary generated code refuses. Future accepted issuance alone may create
 // this child-private token; no test factory or caller-supplied proof exists.
 mod layout_qualification {
-    use super::{LayoutPinRefusal, ReplayCodecFailureKind};
+    use super::{LayoutPinRefusal, ReplayCalendarQualificationFailure, ReplayCodecFailureKind};
 
     pub(crate) struct ReviewedLayoutPin {
         consumer_seed_sha256: [u8; 32],
         proof_rules_sha256: [u8; 32],
         rules: Option<ReviewedRulesV1>,
+        // Independent selected once_cell/std/URL/input proof; codec rules do not suffice.
+        calendar_rules: Option<ReviewedCalendarRulesV1>,
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum ReviewedRulesV1 {
         // Future issuance must bind actual serde_json default/std source/cfg.
         FiniteDtoV1,
     }
+    pub(super) enum ReviewedCalendarRulesV1 {
+        CalendarColdWaitStdAppleV1,
+    }
+    pub(super) fn require_calendar_rules(
+        rules: Option<&ReviewedCalendarRulesV1>,
+    ) -> Result<&ReviewedCalendarRulesV1, ReplayCalendarQualificationFailure> {
+        rules.ok_or(ReplayCalendarQualificationFailure::RuleUnavailable)
+    }
     impl ReviewedLayoutPin {
+        pub(super) fn calendar_rules(
+            &self,
+        ) -> Result<&ReviewedCalendarRulesV1, ReplayCalendarQualificationFailure> {
+            require_calendar_rules(self.calendar_rules.as_ref())
+        }
         pub(super) fn codec_rules(&self) -> Result<&ReviewedRulesV1, ReplayCodecFailureKind> {
             self.rules
                 .as_ref()
@@ -324,6 +353,7 @@ pub(crate) fn require_reviewed_layout_pin() -> Result<ReviewedLayoutPin, LayoutP
 pub(crate) struct ReplayMemory<'loan, 'pool> {
     work: &'loan mut BorrowedReplayWork<'pool>,
     pin: ReviewedLayoutPin,
+    calendar_payment: paid_calendar::CalendarPaymentState,
 }
 impl ReplayMemory<'_, '_> {
     fn rules(&self) -> Result<&layout_qualification::ReviewedRulesV1, ReplayCodecFailureKind> {

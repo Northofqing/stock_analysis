@@ -126,11 +126,128 @@ const VERIFIED_TRADING_CALENDAR_AUTHORITY_ORIGIN: &str =
     crate::data_gateway::OFFICIAL_SSE_AUTHORITY_ROOT;
 
 static VERIFIED_TRADING_CALENDAR: Lazy<Result<VerifiedTradingCalendar, String>> =
-    Lazy::new(|| parse_verified_trading_calendar(VERIFIED_TRADING_CALENDAR_RAW));
+    Lazy::new(|| {
+        #[cfg(test)]
+        paid_replay_test::initializer_entered();
+        parse_verified_trading_calendar(VERIFIED_TRADING_CALENDAR_RAW)
+    });
 
 const VERIFIED_TRADING_CALENDAR_RAW: &str = include_str!("../config/a_share_market_holidays.csv");
 
 const VERIFIED_REPLAY_CALENDAR_HASH_DOMAIN: &[u8] = b"BR251_VERIFIED_SSE_CALENDAR_V1\0";
+
+// The paid adapter is private to replay. Public Historical queries below retain
+// their original parser, force/error order, formatting and holiday semantics.
+use crate::database::global_schema_v1::replay_work::{
+    CalendarCallPermit, CalendarRequest, CalendarResponse, ReplayCalendarCallFailure,
+    ReplayCalendarQualificationFailure, ReplayTerminalFailure,
+};
+
+fn replay_input_matches(raw: &[u8]) -> bool {
+    // Exact fixed input is necessary but not sufficient: the opaque rule also
+    // binds the final parser/gateway/URL/once_cell/std source and producer cfg.
+    const EXPECTED: [u8; 32] = [188, 223, 62, 248, 24, 30, 134, 111, 242, 127, 175, 189, 233, 91, 174, 123, 249, 230, 174, 76, 128, 245, 90, 235, 45, 167, 216, 245, 31, 24, 19, 34];
+    let observed: [u8; 32] = Sha256::digest(raw).into();
+    observed == EXPECTED
+}
+fn replay_stored_ok(
+    calendar: &Lazy<Result<VerifiedTradingCalendar, String>>,
+) -> Result<(), ReplayCalendarQualificationFailure> {
+    if matches!(Lazy::get(calendar), Some(Err(_))) {
+        Err(ReplayCalendarQualificationFailure::ContradictoryStoredError)
+    } else {
+        Ok(())
+    }
+}
+fn replay_forced_ok(
+    calendar: &Result<VerifiedTradingCalendar, String>,
+) -> Result<(), ReplayCalendarQualificationFailure> {
+    if calendar.is_err() {
+        Err(ReplayCalendarQualificationFailure::ContradictoryStoredError)
+    } else {
+        Ok(())
+    }
+}
+pub(crate) fn replay_calendar_preflight() -> Result<(), ReplayCalendarQualificationFailure> {
+    if !replay_input_matches(VERIFIED_TRADING_CALENDAR_RAW.as_bytes()) {
+        return Err(ReplayCalendarQualificationFailure::InputMismatch);
+    }
+    replay_stored_ok(&VERIFIED_TRADING_CALENDAR)
+}
+
+pub(crate) fn replay_calendar_dispatch(
+    permit: CalendarCallPermit,
+) -> Result<CalendarResponse, ReplayCalendarCallFailure> {
+    let request = permit.into_request();
+    #[cfg(test)]
+    paid_replay_test::dispatch_entered();
+    // The original prev/next functions produce their arithmetic error before
+    // touching the Lazy. Only repeat their allocation-free initial lookahead.
+    let needs_force = match request {
+        CalendarRequest::Day(_) => true,
+        CalendarRequest::Prev(from) => from.checked_sub_signed(chrono::Duration::days(1)).is_some(),
+        CalendarRequest::Next(from) => from.checked_add_signed(chrono::Duration::days(1)).is_some(),
+    };
+    if needs_force {
+        #[cfg(test)]
+        paid_replay_test::force_entered();
+        replay_forced_ok(Lazy::force(&VERIFIED_TRADING_CALENDAR)).map_err(|reason| {
+            ReplayCalendarCallFailure::Terminal(ReplayTerminalFailure::CalendarQualification(reason))
+        })?;
+    }
+    // No caller callback and no alternate calendar algorithm. A contradictory
+    // parser Err is borrowed above, before these original helpers could clone it.
+    match request {
+        CalendarRequest::Day(day) => verified_a_share_trading_day(day).map(CalendarResponse::Day),
+        CalendarRequest::Prev(day) => verified_prev_a_share_trading_day(day).map(CalendarResponse::Date),
+        CalendarRequest::Next(day) => verified_next_a_share_trading_day(day).map(CalendarResponse::Date),
+    }.map_err(ReplayCalendarCallFailure::Historical)
+}
+
+#[cfg(test)]
+pub(crate) mod paid_replay_test {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    static INITIALIZERS: AtomicUsize = AtomicUsize::new(0);
+    static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+    static FORCES: AtomicUsize = AtomicUsize::new(0);
+    static HOLD: AtomicBool = AtomicBool::new(false);
+    pub(super) fn initializer_entered() {
+        INITIALIZERS.fetch_add(1, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while HOLD.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "calendar fixture initializer gate timed out");
+            std::thread::yield_now();
+        }
+    }
+    pub(super) fn dispatch_entered() { DISPATCHES.fetch_add(1, Ordering::SeqCst); }
+    pub(super) fn force_entered() { FORCES.fetch_add(1, Ordering::SeqCst); }
+    pub(crate) fn cold() -> bool { Lazy::get(&VERIFIED_TRADING_CALENDAR).is_none() }
+    pub(crate) fn counts() -> (usize, usize, usize) {
+        (INITIALIZERS.load(Ordering::SeqCst), DISPATCHES.load(Ordering::SeqCst), FORCES.load(Ordering::SeqCst))
+    }
+    pub(crate) fn hold_initializer() { HOLD.store(true, Ordering::SeqCst); }
+    pub(crate) fn release_initializer() { HOLD.store(false, Ordering::SeqCst); }
+    pub(crate) fn authority_hash() -> Option<&'static str> {
+        Lazy::get(&VERIFIED_TRADING_CALENDAR).and_then(|r| r.as_ref().ok()).map(|c| c.authority_hash.as_str())
+    }
+    pub(crate) fn changed_input() -> Result<(), ReplayCalendarQualificationFailure> {
+        if replay_input_matches(b"TEST_CODE changed calendar") { Ok(()) }
+        else { Err(ReplayCalendarQualificationFailure::InputMismatch) }
+    }
+    // These isolated contradiction controls never overwrite/reset the real Lazy.
+    // The String is constructed as fixture setup, not as a qualified parser path.
+    pub(crate) fn stored_error_guard() -> Result<(), ReplayCalendarQualificationFailure> {
+        let bad: Lazy<Result<VerifiedTradingCalendar, String>> = Lazy::new(|| Err("TEST_CODE stored parser failure".to_owned()));
+        let _ = Lazy::force(&bad);
+        replay_stored_ok(&bad)
+    }
+    pub(crate) fn fresh_error_guard() -> Result<(), ReplayCalendarQualificationFailure> {
+        let bad: Lazy<Result<VerifiedTradingCalendar, String>> = Lazy::new(|| Err("TEST_CODE fresh parser failure".to_owned()));
+        assert_eq!(replay_stored_ok(&bad), Ok(()));
+        replay_forced_ok(Lazy::force(&bad))
+    }
+}
 
 fn update_calendar_hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
