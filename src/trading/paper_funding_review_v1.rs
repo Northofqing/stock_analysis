@@ -351,6 +351,48 @@ fn checked_meta(m: &Meta) -> Result<usize, Error> {
 // SQL is fixed; scalar bounds are checked before any consumer text/blob load.
 const META_SQL:&str = "WITH wanted(id) AS (SELECT ?) SELECT (SELECT COUNT(*) FROM main.paper_book_owner_v2 WHERE account_id=(SELECT id FROM wanted)) AS owners,(SELECT COUNT(*) FROM main.paper_book_v2_account WHERE account_id=(SELECT id FROM wanted)) AS accounts,(SELECT COUNT(*) FROM main.paper_book_v2_head WHERE account_id=(SELECT id FROM wanted)) AS heads,COALESCE((SELECT CASE WHEN typeof(o.account_id)='text' AND length(CAST(o.account_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(o.active_epoch_id)='text' AND length(CAST(o.active_epoch_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(o.active_manifest_hash)='text' AND length(CAST(o.active_manifest_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(o.cutover_id)='text' AND length(CAST(o.cutover_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(o.active_generation)='integer' AND o.active_generation=2 AND typeof(o.owner_revision)='integer' AND o.owner_revision=2 THEN 0 ELSE 1 END FROM main.paper_book_owner_v2 o WHERE o.account_id=(SELECT id FROM wanted)),1)+COALESCE((SELECT CASE WHEN typeof(a.account_id)='text' AND length(CAST(a.account_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.epoch_id)='text' AND length(CAST(a.epoch_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.cutover_id)='text' AND length(CAST(a.cutover_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.manifest_hash)='text' AND length(CAST(a.manifest_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.v1_epoch_id)='text' AND length(CAST(a.v1_epoch_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.v1_manifest_hash)='text' AND length(CAST(a.v1_manifest_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.v1_head_hash)='text' AND length(CAST(a.v1_head_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.v1_projection_hash)='text' AND length(CAST(a.v1_projection_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.fee_policy_instance_id)='text' AND length(CAST(a.fee_policy_instance_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(a.v1_head_version)='integer' AND a.v1_head_version>0 THEN 0 ELSE 1 END FROM main.paper_book_v2_account a WHERE a.account_id=(SELECT id FROM wanted)),1)+COALESCE((SELECT CASE WHEN typeof(h.account_id)='text' AND length(CAST(h.account_id AS BLOB)) BETWEEN 1 AND 256 AND typeof(h.event_hash)='text' AND length(CAST(h.event_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(h.projection_hash)='text' AND length(CAST(h.projection_hash AS BLOB)) BETWEEN 1 AND 256 AND typeof(h.version)='integer' AND h.version=1 AND typeof(h.projection_bytes)='blob' THEN 0 ELSE 1 END FROM main.paper_book_v2_head h WHERE h.account_id=(SELECT id FROM wanted)),1) AS invalid,COALESCE((SELECT length(projection_bytes) FROM main.paper_book_v2_head WHERE account_id=(SELECT id FROM wanted)),0) AS bytes";
 const BINDING_SQL:&str = "SELECT a.account_id,a.epoch_id,a.cutover_id,a.manifest_hash AS genesis_manifest_hash,a.v1_epoch_id,a.v1_manifest_hash,a.v1_head_version,a.v1_head_hash,a.v1_projection_hash,h.version AS genesis_version,h.event_hash AS genesis_event_hash,h.projection_hash AS genesis_projection_hash,a.fee_policy_instance_id FROM main.paper_book_v2_account a JOIN main.paper_book_v2_head h ON h.account_id=a.account_id WHERE a.account_id=? LIMIT 2";
+const PAYLOAD_SQL: &str =
+    "SELECT projection_bytes AS value FROM main.paper_book_v2_head WHERE account_id=? LIMIT 2";
+#[derive(Clone, Copy)]
+enum FixedQuery {
+    Metadata,
+    Binding,
+    Payload,
+}
+impl FixedQuery {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Metadata => META_SQL,
+            Self::Binding => BINDING_SQL,
+            Self::Payload => PAYLOAD_SQL,
+        }
+    }
+    fn reservation(self) -> Result<usize, Error> {
+        self.sql()
+            .len()
+            .checked_add(std::mem::size_of::<diesel::query_builder::SqlQuery>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<&str>()))
+            .ok_or(Error::OwnedBudget)
+    }
+}
+// Application-owned SQL text and finite wrapper reservation, not a driver/RSS bound.
+fn fixed_query(
+    kind: FixedQuery,
+    work: &mut Work,
+) -> Result<diesel::query_builder::SqlQuery, Error> {
+    let result = (|| {
+        work.own(kind.reservation()?)?;
+        work.scan(kind.sql().len())?;
+        #[cfg(test)]
+        probe(match kind {
+            FixedQuery::Metadata => Probe::MetadataQuery,
+            FixedQuery::Binding => Probe::BindingQuery,
+            FixedQuery::Payload => Probe::PayloadQuery,
+        });
+        Ok(diesel::sql_query(kind.sql()))
+    })();
+    work.finish(result)
+}
 fn extract_inner(
     conn: &mut SqliteConnection,
     proof: &VerifiedCatalog8<'_>,
@@ -361,7 +403,7 @@ fn extract_inner(
     proof
         .require_decision_instance(conn)
         .map_err(|_| Error::CatalogUnavailable)?;
-    let m = diesel::sql_query(META_SQL)
+    let m = fixed_query(FixedQuery::Metadata, work)?
         .bind::<Text, _>(account)
         .get_result::<Meta>(conn)
         .map_err(|_| Error::SqlRead)?;
@@ -371,17 +413,15 @@ fn extract_inner(
     work.scan(4096 + n)?;
     #[cfg(test)]
     probe(Probe::Payload);
-    let b = diesel::sql_query(BINDING_SQL)
+    let b = fixed_query(FixedQuery::Binding, work)?
         .bind::<Text, _>(account)
         .get_result::<Binding>(conn)
         .map_err(|_| Error::SqlRead)?;
-    let raw = diesel::sql_query(
-        "SELECT projection_bytes AS value FROM main.paper_book_v2_head WHERE account_id=? LIMIT 2",
-    )
-    .bind::<Text, _>(account)
-    .get_result::<Blob>(conn)
-    .map_err(|_| Error::SqlRead)?
-    .value;
+    let raw = fixed_query(FixedQuery::Payload, work)?
+        .bind::<Text, _>(account)
+        .get_result::<Blob>(conn)
+        .map_err(|_| Error::SqlRead)?
+        .value;
     if raw.len() != n {
         return Err(Error::ChangedObservation);
     }
@@ -479,6 +519,8 @@ pub(crate) fn review_funding_proposal(
         &canonical,
         w,
     )?;
+    #[cfg(test)]
+    probe(Probe::Observed);
     Ok(ObservedFundingReviewV1 {
         authority: pending.authority,
         value: StoredFundingReviewV1 {
@@ -557,9 +599,13 @@ enum Probe {
     LegacyShape,
     LegacyInitialCash,
     LegacyCashPartitions,
+    MetadataQuery,
+    BindingQuery,
+    PayloadQuery,
+    Observed,
 }
 #[cfg(test)]
-thread_local! {static HITS:std::cell::Cell<[usize;6]>=const{std::cell::Cell::new([0;6])};static HOOK:RefCell<Option<Box<dyn FnMut(&mut SqliteConnection)->Result<(),Error>>>>=RefCell::new(None);}
+thread_local! {static HITS:std::cell::Cell<[usize;10]>=const{std::cell::Cell::new([0;10])};static HOOK:RefCell<Option<Box<dyn FnMut(&mut SqliteConnection)->Result<(),Error>>>>=RefCell::new(None);}
 #[cfg(test)]
 fn probe(p: Probe) {
     HITS.with(|h| {

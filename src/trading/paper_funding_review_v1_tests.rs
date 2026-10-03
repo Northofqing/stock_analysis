@@ -210,7 +210,7 @@ fn make_proposal(b: &Binding, g: &Projection) -> Proposal {
     }
 }
 fn reset() {
-    HITS.with(|h| h.set([0; 6]));
+    HITS.with(|h| h.set([0; 10]));
     HOOK.with(|h| *h.borrow_mut() = None);
     TAIL_FAIL.with(|h| h.set(false));
 }
@@ -297,24 +297,94 @@ fn funding_actual_selector_and_each_anchor_mismatch() {
         Error::MissingGenesis
     );
 }
+#[derive(QueryableByName)]
+struct CountValue {
+    #[diesel(sql_type=BigInt)]
+    value: i64,
+}
+fn query_hits() -> [usize; 3] {
+    HITS.with(|h| {
+        let x = h.get();
+        [
+            x[Probe::MetadataQuery as usize],
+            x[Probe::BindingQuery as usize],
+            x[Probe::PayloadQuery as usize],
+        ]
+    })
+}
+fn schema_fingerprint(c: &mut SqliteConnection) -> String {
+    diesel::sql_query("SELECT group_concat(type||':'||name||':'||sql,';') AS value FROM (SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name)").get_result::<TextValue>(c).unwrap().value
+}
+fn corrupt_financial_fixture(f: &Fixture, case: usize) {
+    let (trigger, mutation, evidence) = match case {
+        0 => ("paper_book_owner_v2_no_delete", "DELETE FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_FUNDING_ACCOUNT'", "SELECT COUNT(*) AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_FUNDING_ACCOUNT'"),
+        1 => ("paper_book_owner_v2_transition", "UPDATE paper_book_owner_v2 SET active_epoch_id='TEST_CODE_WRONG_OWNER_EPOCH' WHERE account_id='TEST_CODE_FUNDING_ACCOUNT'", "SELECT COUNT(*) AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_FUNDING_ACCOUNT' AND active_epoch_id='TEST_CODE_WRONG_OWNER_EPOCH' AND active_generation=2 AND owner_revision=2"),
+        2 => ("paper_book_owner_v2_no_reinsert", "INSERT INTO paper_book_owner_v2(account_id,active_generation,active_epoch_id,active_manifest_hash,owner_revision,cutover_id) VALUES('TEST_CODE_ORPHAN_ACCOUNT',1,'TEST_CODE_ORPHAN_EPOCH','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,NULL)", "SELECT COUNT(*) AS value FROM paper_book_owner_v2 o WHERE o.account_id='TEST_CODE_ORPHAN_ACCOUNT' AND NOT EXISTS(SELECT 1 FROM paper_ledger_account a WHERE a.account_id=o.account_id)"),
+        3 => ("paper_ledger_event_no_update", "UPDATE paper_ledger_event SET payload='{}' WHERE account_id='TEST_CODE_FUNDING_ACCOUNT' AND seq=1", "SELECT COUNT(*) AS value FROM paper_ledger_event WHERE account_id='TEST_CODE_FUNDING_ACCOUNT' AND seq=1 AND typeof(payload)='text' AND payload='{}'"),
+        _ => panic!("closed fixture mutation"),
+    };
+    let mut c = f.db.get_conn().unwrap();
+    let before = schema_fingerprint(&mut c);
+    let ddl =
+        diesel::sql_query("SELECT sql AS value FROM sqlite_schema WHERE type='trigger' AND name=?")
+            .bind::<Text, _>(trigger)
+            .get_result::<TextValue>(&mut c)
+            .unwrap()
+            .value;
+    c.batch_execute(&format!("DROP TRIGGER {trigger}")).unwrap();
+    assert_eq!(diesel::sql_query(mutation).execute(&mut c).unwrap(), 1);
+    c.batch_execute(&ddl).unwrap();
+    assert_eq!(schema_fingerprint(&mut c), before);
+    let changed = diesel::sql_query(evidence)
+        .get_result::<CountValue>(&mut c)
+        .unwrap()
+        .value;
+    assert_eq!(changed, if case == 0 { 0 } else { 1 });
+}
 #[test]
 fn funding_actual_missing_wrong_owner_and_corrupt_history_refuse() {
     let f = Fixture::new(0);
     let p = f.proposal();
-    f.db.get_conn()
-        .unwrap()
-        .batch_execute("PRAGMA user_version=7")
-        .unwrap();
     reset();
-    assert_eq!(f.review(&p).unwrap_err(), Error::CatalogUnavailable);
-    assert_eq!(HITS.with(|h| h.get())[0], 0);
-    let f = Fixture::new(0);
-    let p = f.proposal();
-    f.db.get_conn()
-        .unwrap()
-        .batch_execute("CREATE TABLE TEST_CODE_unexpected(value TEXT)")
-        .unwrap();
-    assert_eq!(f.review(&p).unwrap_err(), Error::CatalogUnavailable);
+    assert_eq!(
+        review_funding_proposal(
+            &f.db,
+            "TEST_CODE_MISSING_ACCOUNT",
+            &serde_json::to_vec(&p).unwrap()
+        )
+        .unwrap_err(),
+        Error::MissingGenesis
+    );
+    assert_eq!(query_hits(), [1, 0, 0]);
+    assert_eq!(HITS.with(|h| h.get())[Probe::Tail as usize], 0);
+    assert_eq!(HITS.with(|h| h.get())[Probe::Observed as usize], 0);
+    for case in 0..4 {
+        let f = Fixture::new(0);
+        let p = f.proposal();
+        corrupt_financial_fixture(&f, case);
+        reset();
+        assert_eq!(
+            f.review(&p).unwrap_err(),
+            Error::CatalogUnavailable,
+            "financial case {case}"
+        );
+        assert_eq!(query_hits(), [0, 0, 0], "financial case {case}");
+        assert_eq!(HITS.with(|h| h.get())[Probe::Tail as usize], 0);
+        assert_eq!(HITS.with(|h| h.get())[Probe::Observed as usize], 0);
+    }
+    // Retain the original catalog-only refusal controls, separately from data corruption.
+    for sql in [
+        "PRAGMA user_version=7",
+        "CREATE TABLE TEST_CODE_unexpected(value TEXT)",
+    ] {
+        let f = Fixture::new(0);
+        let p = f.proposal();
+        f.db.get_conn().unwrap().batch_execute(sql).unwrap();
+        reset();
+        assert_eq!(f.review(&p).unwrap_err(), Error::CatalogUnavailable);
+        assert_eq!(query_hits(), [0, 0, 0]);
+        assert_eq!(HITS.with(|h| h.get())[Probe::Observed as usize], 0);
+    }
 }
 #[test]
 fn funding_allocation_completeness_disposition_and_cash_boundaries() {
@@ -570,6 +640,33 @@ fn funding_wrong_path_escape_numeric_array_and_cardinality_attacks() {
 }
 #[test]
 fn funding_shared_work_exact_boundary_sticky_failure_and_tail_no_refund() {
+    for kind in [
+        FixedQuery::Metadata,
+        FixedQuery::Binding,
+        FixedQuery::Payload,
+    ] {
+        let cost = kind.reservation().unwrap();
+        for exact in [false, true] {
+            let w = &mut Work::new();
+            w.own(8 * codec::MIB - cost + usize::from(!exact)).unwrap();
+            reset();
+            let result = fixed_query(kind, w);
+            assert_eq!(query_hits().iter().sum::<usize>(), usize::from(exact));
+            if exact {
+                drop(result.unwrap());
+                assert_eq!(w.own(1), Err(Error::OwnedBudget));
+            } else {
+                assert_eq!(result.unwrap_err(), Error::OwnedBudget);
+                assert!(w.scan(0).is_err());
+            }
+        }
+        let w = &mut Work::new();
+        w.scan(32 * codec::MIB - kind.sql().len() + 1).unwrap();
+        reset();
+        assert_eq!(fixed_query(kind, w).unwrap_err(), Error::WorkBudget);
+        assert_eq!(query_hits(), [0, 0, 0]);
+        assert!(w.own(0).is_err());
+    }
     let f0 = Fixture::new(0);
     let p0 = f0.proposal();
     let g0 = f0.inputs().1;
@@ -655,21 +752,58 @@ fn funding_shared_work_exact_boundary_sticky_failure_and_tail_no_refund() {
     assert_eq!(HITS.with(|h| h.get())[1], 0);
     assert!(w.scan(0).is_err());
     let f = Fixture::new(0);
+    let proposal = f.proposal();
+    reset();
+    let observed = f.review(&proposal).unwrap();
+    assert_eq!(observed.outcome(), Outcome::ConsistentProposal);
+    assert_eq!(query_hits(), [2, 2, 2]);
+    assert_eq!(HITS.with(|h| h.get())[Probe::Observed as usize], 1);
+    // Positive proof, insufficient metadata reservation: no application constructor.
     investment_catalog8_session(&f.db)
         .unwrap()
         .with_readonly_catalog8(
             |c, p| {
                 let w = &mut Work::new();
-                extract(c, p, ACCOUNT, w)?;
-                w.own(8 * codec::MIB - 8192).unwrap();
+                w.own(8 * codec::MIB - FixedQuery::Metadata.reservation()? + 1)?;
                 reset();
-                assert!(extract(c, p, ACCOUNT, w).is_err());
-                assert_eq!(HITS.with(|h| h.get())[0], 0);
+                assert_eq!(extract(c, p, ACCOUNT, w).unwrap_err(), Error::OwnedBudget);
+                assert_eq!(query_hits(), [0, 0, 0]);
+                assert!(w.scan(0).is_err());
                 Ok::<_, Error>(())
             },
             |_, _, _| Ok(()),
         )
         .unwrap();
+    // The retained-reader tail shares the first extraction's debits, without refund.
+    let shared = RefCell::new(Work::new());
+    reset();
+    let result = investment_catalog8_session(&f.db)
+        .unwrap()
+        .with_readonly_catalog8(
+            |c, p| {
+                let w = &mut *shared.borrow_mut();
+                let (_, raw) = extract(c, p, ACCOUNT, w)?;
+                assert_eq!(query_hits(), [1, 1, 1]);
+                let spent = [
+                    FixedQuery::Metadata,
+                    FixedQuery::Binding,
+                    FixedQuery::Payload,
+                ]
+                .iter()
+                .try_fold(4096 + std::mem::size_of::<Binding>() + raw.len(), |n, q| {
+                    n.checked_add(q.reservation().ok()?)
+                })
+                .unwrap();
+                let remaining = FixedQuery::Metadata.reservation()? - 1;
+                w.own(8 * codec::MIB - spent - remaining)?;
+                Ok::<_, Error>(())
+            },
+            |c, p, _| extract(c, p, ACCOUNT, &mut shared.borrow_mut()).map(|_| ()),
+        );
+    assert!(matches!(result,Err(crate::database::global_schema_v1::investment_v8::InvestmentCatalog8ReadbackError::Consumer(Error::OwnedBudget))));
+    assert_eq!(query_hits(), [1, 1, 1]);
+    assert!(shared.borrow_mut().scan(0).is_err());
+    assert_eq!(HITS.with(|h| h.get())[Probe::Observed as usize], 0);
 }
 #[test]
 fn funding_production_origin_refuses_before_consumer_sql() {
