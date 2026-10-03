@@ -18,7 +18,11 @@
 //! - VetoChain 先执行 → veto_rules::evaluate 后执行
 //! - VetoContext 使用基础类型（不依赖 trend_analyzer），由 Pipeline 层负责转换
 
+use super::veto_execution_report_v1::{
+    RuleInputObservationV1, VetoExecutionReportV1, VetoReportFailureV1,
+};
 use log::{info, warn};
+use serde::Serialize;
 
 use crate::capital_flow::MoneyFlowDay;
 
@@ -56,7 +60,7 @@ pub struct VetoContext {
 // VetoVerdict — 单条规则的裁决结果
 // ============================================================================
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct VetoVerdict {
     /// 触发的风险标签 (用于日志/审计/DB 持久化)
     pub risk_flags: Vec<String>,
@@ -87,6 +91,11 @@ pub trait VetoRule: Send + Sync {
     /// 评估是否触发否决
     fn evaluate(&self, ctx: &VetoContext) -> VetoVerdict;
 
+    /// Legacy custom rules have no declared input contract; an empty verdict is not completeness.
+    fn observe_inputs(&self, _ctx: &VetoContext) -> RuleInputObservationV1 {
+        RuleInputObservationV1::legacy_unknown()
+    }
+
     /// 优先级 (数字越小越先执行，默认 50)
     fn priority(&self) -> u8 {
         50
@@ -102,7 +111,7 @@ pub trait VetoRule: Send + Sync {
 /// 按优先级排序执行，每个规则独立裁决，结果汇聚到 VetoOutcome。
 /// 单条规则 panic 不影响其他规则继续执行。
 pub struct VetoChain {
-    rules: Vec<Box<dyn VetoRule>>,
+    pub(super) rules: Vec<Box<dyn VetoRule>>,
 }
 
 impl VetoChain {
@@ -130,11 +139,7 @@ impl VetoChain {
                             verdict.score_penalty,
                             verdict.force_hold
                         );
-                        outcome.flags.extend(verdict.risk_flags);
-                        outcome.total_penalty += verdict.score_penalty;
-                        if verdict.force_hold {
-                            outcome.force_hold = true;
-                        }
+                        aggregate_verdict(&mut outcome, &verdict);
                     }
                 }
                 Err(e) => {
@@ -159,6 +164,11 @@ impl VetoChain {
         outcome
     }
 
+    /// Full observation; unlike the legacy aggregate, missing contracts and panic stay explicit.
+    pub fn evaluate_observed(&self, ctx: &VetoContext) -> VetoExecutionReportV1 {
+        super::veto_execution_engine_v1::evaluate(self, ctx, None)
+    }
+
     /// 规则数量 (测试用)
     pub fn len(&self) -> usize {
         self.rules.len()
@@ -174,14 +184,30 @@ impl VetoChain {
 // VetoOutcome — VetoChain 汇总结果
 // ============================================================================
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct VetoOutcome {
     /// 所有规则触发的风险标签
     pub flags: Vec<String>,
     /// 总评分下调量
     pub total_penalty: i32,
+    /// Overflow is retained explicitly; it never wraps or panics.
+    pub aggregation_failure: Option<VetoReportFailureV1>,
     /// 是否有规则要求强制 Hold
     pub force_hold: bool,
+}
+
+pub(super) fn aggregate_verdict(outcome: &mut VetoOutcome, verdict: &VetoVerdict) {
+    if verdict.is_empty() {
+        return;
+    }
+    outcome.flags.extend(verdict.risk_flags.iter().cloned());
+    if let Some(total) = outcome.total_penalty.checked_add(verdict.score_penalty) {
+        outcome.total_penalty = total;
+    } else {
+        outcome.aggregation_failure = Some(VetoReportFailureV1::PenaltyOverflow);
+        outcome.force_hold = true;
+    }
+    outcome.force_hold |= verdict.force_hold;
 }
 
 impl VetoOutcome {
@@ -225,7 +251,8 @@ impl Default for VetoChainConfig {
 }
 
 /// VetoChain 运行模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VetoMode {
     /// 仅记录日志，不修改 signal_score / buy_signal
     DryRun,

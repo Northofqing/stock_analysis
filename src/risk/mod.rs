@@ -23,3 +23,7 @@ pub mod veto_rules_live;
 // v12 PR1: 动作门 (与 veto_chain 并存, 不替换)
 pub mod account_mode;
 pub mod action_gate;
+
+/// Observed execution diagnostics; no risk approval capability.
+pub mod veto_execution_report_v1;
+mod veto_execution_engine_v1;

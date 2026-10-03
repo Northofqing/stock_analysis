@@ -52,6 +52,8 @@ pub struct StockAnalysisOutcome {
     pub code: String,
     pub business_identity: CliBusinessIdentity,
     pub analysis: Option<AnalysisResult>,
+    /// Observed risk execution for this occurrence; never a risk approval.
+    pub veto_execution: Option<crate::risk::veto_execution_report_v1::VetoExecutionReportV1>,
     pub saved: AnalysisSaveStatus,
     /// Present only when the report was handed to the notification path.
     pub report_snapshot: Option<CliReportSnapshot>,
@@ -69,6 +71,7 @@ impl StockAnalysisOutcome {
             business_identity: invocation.stock_business(&code, input_ordinal),
             code,
             analysis: None,
+            veto_execution: None,
             saved: AnalysisSaveStatus::NotAttempted,
             report_snapshot: None,
             notification: if notify {

@@ -227,3 +227,9 @@ Task2 I1 范围独立复核已通过：原 reservation 在原校验/回调之前
 用户明确授权并行：逐规则风险矩阵/两个技术开关独立修复、完整不可变 F2 拒绝记录/Catalog8 分别在独立 scratch 实施，root 统一应用、Cargo 与提交。普通缺输入/异常规则会如实记录不完整且不授 formal pass，沿用原分析政策；真正报告或聚合失败在 enabled exact-live Buy 路径保留失败并阻断。F2 第一片保原全部 Top50 raw 候选，缺 native identity 则明确未调用事实 Gateway，完整拒绝理由与实际冻结风险配置持久保存，不能伪造资金/批准/可交易结果。
 
 WG07 当前运行门禁已通过：31新lib、87去重旧lib及5个命令行cases，共123 distinct PASS。正常lib由确认工具目标编译通过，修后命令行日志SHA `caaae3ddfda580972f802e90c2bb2b14f13a067e6fdefc92fbf4bfa04b71cc53`。之前 cfg(test) 行为不变的库证据明确复用，没有宣称重跑；源码以 f879c330 为任务审查BASE提交。独立 fulltask spec/quality 审查尚待完成。
+
+### 2026-10-03 逐项风控执行记录：实际运行验收通过，独立审查待完成
+
+新增逐规则执行报告，冻结真实配置、阈值、输入与执行状态；包含关闭的规则，并分别执行两个技术条件开关。分析流程返回实际报告；输入缺失、无效或规则 panic 如实记为不完整，保持原 live/dry-run 决策政策，不授予正式风控通过。真实聚合、报告构造或编码失败在 enabled exact-live Buy 路径阻断并保留诊断。AnalysisResult 与推送格式没有改变。
+
+实际44项定向 PASS（17新、27旧）：15项新规则/边界测试、2项真实分析流程、24项旧规则/链、3项原流程回归。仅一次 scoped library Cargo 编译，后续复用同源 SHA 封存 harness；首段日志 SHA `ccdaa371216637aecfd9dd196da246bef5831a71e3576f0bbe967b94e58cf7c4`，其余29项日志 SHA `b0564ad9f542ebe0dcfefa07a734eefc4dce51f0136ce451061eb68bc54ceae7`。原建议清单的一项不存在的测试名已纠正，不计入通过数。凭据 `dev-20261003-risk-matrix-acceptance.json` 保留八文件与制品绑定。未运行全库、release 或部署；独立完整任务审查待进行。

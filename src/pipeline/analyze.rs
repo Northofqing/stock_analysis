@@ -629,14 +629,83 @@ fn position_risk_evidence(
     Some((regime, atr))
 }
 
+/// Apply the existing numerical outcome. Incomplete inputs remain observations;
+/// only failure to construct/aggregate/encode the report adds a live Buy block.
+fn apply_configured_veto(
+    trend: &mut crate::trend_analyzer::TrendAnalysisResult,
+    ctx: &crate::risk::veto_chain::VetoContext,
+    config: &crate::config::LiveVetoConfig,
+) -> crate::risk::veto_execution_report_v1::VetoExecutionReportV1 {
+    use crate::risk::veto_execution_report_v1::{
+        ConfiguredVetoChainV1, VetoConfigurationSnapshotV1, VetoExecutionReportV1,
+        VetoReportFailureV1,
+    };
+    use crate::trend_analyzer::BuySignal;
+    let mut report = match VetoConfigurationSnapshotV1::from_live_config(config) {
+        Ok(snapshot) => ConfiguredVetoChainV1::new(snapshot).evaluate(ctx),
+        Err(error) => VetoExecutionReportV1::failed(error),
+    };
+    let outcome = &report.aggregate;
+    if config.enabled && config.mode == "live" {
+        if !outcome.is_empty() {
+            if outcome.force_hold && ctx.is_buy_signal {
+                trend.signal_score = 55;
+                trend.buy_signal = BuySignal::Hold;
+            } else if ctx.is_buy_signal && outcome.total_penalty != 0 {
+                match trend.signal_score.checked_add(outcome.total_penalty) {
+                    Some(score) => trend.signal_score = score.clamp(0, 100),
+                    None => report.failures.push(VetoReportFailureV1::PenaltyOverflow),
+                }
+            }
+            trend.risk_factors.extend(outcome.flags.iter().cloned());
+            if outcome.force_hold && ctx.is_buy_signal {
+                info!(
+                    "[{}] 🛑 VetoChain[live] 拦截: force_hold, 评分压至55",
+                    ctx.code
+                );
+            }
+        }
+        if report.has_report_failure() && ctx.is_buy_signal {
+            trend.signal_score = 55;
+            trend.buy_signal = BuySignal::Hold;
+            report.blocked_by_report_failure = true;
+        }
+    } else if !outcome.is_empty() {
+        info!(
+            "[{}] 🔍 VetoChain[dry_run] 触发: flags={:?} penalty={} force_hold={} — 未实际拦截",
+            ctx.code, outcome.flags, outcome.total_penalty, outcome.force_hold
+        );
+    }
+    if report.has_report_failure() {
+        warn!(
+            "[{}] VetoChain observed report failure: {:?}; blocked={}",
+            ctx.code, report.failures, report.blocked_by_report_failure
+        );
+    }
+    report
+}
+
 impl AnalysisPipeline {
     /// 分析单只股票
+    #[cfg(test)]
     async fn analyze_stock(
         &self,
         code: &str,
         data: &[KlineData],
         kline_arc: Arc<Vec<KlineData>>,
         macro_context: Option<&str>,
+    ) -> Result<AnalysisResult> {
+        self.analyze_stock_with_veto_report(code, data, kline_arc, macro_context, &mut None)
+            .await
+    }
+
+    async fn analyze_stock_with_veto_report(
+        &self,
+        code: &str,
+        data: &[KlineData],
+        kline_arc: Arc<Vec<KlineData>>,
+        macro_context: Option<&str>,
+        veto_report: &mut Option<crate::risk::veto_execution_report_v1::VetoExecutionReportV1>,
     ) -> Result<AnalysisResult> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("数据为空"));
@@ -783,79 +852,30 @@ impl AnalysisPipeline {
         }
 
         // ===== VetoChain 实时否决 (替代原注释代码 686-740, 已重构为策略模式) =====
-        // 执行时机: 数据全部获取后 → VetoChain → score_to_advice
-        // 与 veto_rules (Phase 1/3 估值否决) 互补: VetoChain 做技术/资金/基本面实时拦截
+        // Execute against one frozen config and retain the observation before later awaits.
         {
             use crate::trend_analyzer::{BuySignal, TrendStatus};
-            let veto_config = crate::config::get_veto_config();
-            if let Some(chain) = crate::risk::veto_rules_live::build_chain(
-                &crate::risk::veto_chain::VetoChainConfig {
-                    enabled: veto_config.enabled,
-                    mode: veto_config
-                        .mode
-                        .parse()
-                        .unwrap_or(crate::risk::veto_chain::VetoMode::DryRun),
-                    bias_rate_enabled: veto_config.bias_rate_enabled,
-                    bearish_alignment_enabled: veto_config.bearish_alignment_enabled,
-                    main_flow_enabled: veto_config.main_flow_enabled,
-                    fundamental_enabled: veto_config.fundamental_enabled,
-                },
-            ) {
-                let is_buy = matches!(
+            let config = crate::config::get_veto_config();
+            let veto_ctx = crate::risk::veto_chain::VetoContext {
+                code: code.to_string(),
+                current_price: data[0].close,
+                signal_score: trend_result.signal_score,
+                is_buy_signal: matches!(
                     trend_result.buy_signal,
                     BuySignal::StrongBuy | BuySignal::Buy
-                );
-                let is_bearish = matches!(
+                ),
+                bias_ma5: trend_result.bias_ma5,
+                is_bearish: matches!(
                     trend_result.trend_status,
                     TrendStatus::StrongBear | TrendStatus::Bear
-                );
-                let mf_days = money_flow_raw.as_ref().map(|mf| mf.days.clone());
-
-                let veto_ctx = crate::risk::veto_chain::VetoContext {
-                    code: code.to_string(),
-                    current_price: data[0].close,
-                    signal_score: trend_result.signal_score,
-                    is_buy_signal: is_buy,
-                    bias_ma5: trend_result.bias_ma5,
-                    is_bearish,
-                    money_flow_days: mf_days,
-                    pct_chg: Some(data[0].pct_chg),
-                    pe_ratio: data[0].pe_ratio,
-                    net_profit_yoy: data[0].net_profit_yoy,
-                };
-
-                let outcome = chain.evaluate_all(&veto_ctx);
-
-                if !outcome.is_empty() {
-                    match veto_config.mode.as_str() {
-                        "live" => {
-                            // v17.1 (P1 fix): 仅 buy 信号 + force_hold 时压分 (避免影响 Sell/Hold)
-                            if outcome.force_hold && is_buy {
-                                trend_result.signal_score = 55;
-                                trend_result.buy_signal = BuySignal::Hold;
-                            } else if is_buy && outcome.total_penalty != 0 {
-                                trend_result.signal_score = (trend_result.signal_score
-                                    + outcome.total_penalty)
-                                    .clamp(0, 100);
-                            }
-                            // v17.2 (P2 fix): risk flags 始终传播 (不依赖 force_hold 分支)
-                            for flag in &outcome.flags {
-                                trend_result.risk_factors.push(flag.clone());
-                            }
-                            if outcome.force_hold && is_buy {
-                                info!("[{}] 🛑 VetoChain[live] 拦截: force_hold, 评分压至55", code);
-                            }
-                        }
-                        _ => {
-                            // dry_run: 记录日志但不实际修改信号
-                            info!(
-                                "[{}] 🔍 VetoChain[dry_run] 触发: flags={:?} penalty={} force_hold={} — 未实际拦截",
-                                code, outcome.flags, outcome.total_penalty, outcome.force_hold
-                            );
-                        }
-                    }
-                }
-            }
+                ),
+                // Rules consume only the actual last record, never a substituted quote field.
+                money_flow_days: money_flow_raw.as_ref().map(|mf| mf.days.clone()),
+                pct_chg: Some(data[0].pct_chg),
+                pe_ratio: data[0].pe_ratio,
+                net_profit_yoy: data[0].net_profit_yoy,
+            };
+            *veto_report = Some(apply_configured_veto(&mut trend_result, &veto_ctx, &config));
         }
 
         // 5. 评分→操作建议（与 AI 共用同一档位表）
@@ -1205,7 +1225,16 @@ impl AnalysisPipeline {
         } else {
             Some(&*macro_context)
         };
-        let mut result = match self.analyze_stock(&code, &data, data.clone(), mc).await {
+        let mut result = match self
+            .analyze_stock_with_veto_report(
+                &code,
+                &data,
+                data.clone(),
+                mc,
+                &mut outcome.veto_execution,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 error!("[{}] 分析失败: {}", code, e);
@@ -2183,6 +2212,12 @@ mod tests {
             crate::pipeline::AnalysisNotification::NotAttempted
         ));
         assert!(outcome.analysis.is_some());
+        let veto = outcome
+            .veto_execution
+            .as_ref()
+            .expect("report retained despite later save failure");
+        assert_eq!(veto.rules.len(), 3);
+        assert!(veto.encode_bounded().is_ok());
         assert!(outcome.ensure_cli_success().is_err());
     }
 
@@ -2672,5 +2707,109 @@ mod tests {
             .risk_factors
             .iter()
             .any(|flag| flag.contains("基本面极度恶化")));
+    }
+    #[test]
+    fn configured_veto_pipeline_applies_exact_live_and_retains_incomplete_inputs() {
+        use crate::risk::veto_chain::VetoContext;
+        use crate::risk::veto_execution_report_v1::RuleExecutionStatusV1;
+        let mut ctx = VetoContext {
+            code: "TEST_CODE_MATRIX".into(),
+            current_price: 10.0,
+            signal_score: 65,
+            is_buy_signal: true,
+            bias_ma5: 2.0,
+            is_bearish: false,
+            money_flow_days: None,
+            pct_chg: Some(8.0),
+            pe_ratio: None,
+            net_profit_yoy: None,
+        };
+        for mode in ["live", "dry_run", "Live", "unknown"] {
+            let config = crate::config::LiveVetoConfig {
+                mode: mode.into(),
+                ..Default::default()
+            };
+            let mut trend = TrendAnalysisResult {
+                signal_score: 65,
+                buy_signal: BuySignal::Buy,
+                ..Default::default()
+            };
+            let incomplete = super::apply_configured_veto(&mut trend, &ctx, &config);
+            assert_eq!(trend.signal_score, 65);
+            assert_eq!(trend.buy_signal, BuySignal::Buy);
+            assert_eq!(
+                incomplete.rules[1].status,
+                RuleExecutionStatusV1::InputMissing
+            );
+            assert!(!incomplete.has_report_failure());
+            assert!(!incomplete.blocked_by_report_failure);
+            ctx.bias_ma5 = 6.0;
+            let report = super::apply_configured_veto(&mut trend, &ctx, &config);
+            assert_eq!(trend.signal_score, if mode == "live" { 55 } else { 65 });
+            assert_eq!(
+                trend.buy_signal,
+                if mode == "live" {
+                    BuySignal::Hold
+                } else {
+                    BuySignal::Buy
+                }
+            );
+            assert_eq!(report.rules[0].status, RuleExecutionStatusV1::EvaluatedVeto);
+            assert!(!report.blocked_by_report_failure);
+            ctx.bias_ma5 = 2.0;
+        }
+        ctx.code = "x".repeat(257);
+        for (mode, enabled, buy, expected) in [
+            ("live", true, true, true),
+            ("dry_run", true, true, false),
+            ("Live", true, true, false),
+            ("live", false, true, false),
+            ("live", true, false, false),
+        ] {
+            ctx.is_buy_signal = buy;
+            let config = crate::config::LiveVetoConfig {
+                mode: mode.into(),
+                enabled,
+                ..Default::default()
+            };
+            let mut trend = TrendAnalysisResult {
+                signal_score: 65,
+                buy_signal: if buy { BuySignal::Buy } else { BuySignal::Sell },
+                ..Default::default()
+            };
+            let report = super::apply_configured_veto(&mut trend, &ctx, &config);
+            assert!(report.has_report_failure());
+            assert_eq!(report.blocked_by_report_failure, expected);
+            assert_eq!(trend.signal_score, if expected { 55 } else { 65 });
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_analysis_returns_observed_report_without_changing_result_schema() {
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let pipeline = test_pipeline(context, false);
+        let bars = Arc::new(analysis_bars());
+        let mut report = None;
+        let result = pipeline
+            .analyze_stock_with_veto_report(
+                "TEST_CODE_000001",
+                &bars,
+                bars.clone(),
+                None,
+                &mut report,
+            )
+            .await
+            .expect("resolved analysis");
+        let report = report.expect("actual analysis report returned before later stages");
+        assert_eq!(report.rules.len(), 3);
+        assert!(report.encode_bounded().is_ok());
+        let serialized = serde_json::to_value(result).unwrap();
+        assert!(serialized.get("veto_execution").is_none());
     }
 }

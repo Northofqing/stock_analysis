@@ -11,6 +11,11 @@
 use log::warn;
 
 use super::veto_chain::{VetoContext, VetoRule, VetoVerdict};
+use super::veto_execution_engine_v1::observe_builtin;
+use super::veto_execution_report_v1::{
+    configured_rule, BuiltinRuleIdV1 as Id, BuiltinThresholdsV1 as Thresholds,
+    RuleInputObservationV1, VetoConfigurationSnapshotV1,
+};
 
 // ============================================================================
 // BiasRateRule — 技术面极端危险形态拦截
@@ -46,6 +51,40 @@ impl VetoRule for BiasRateRule {
     }
 
     fn evaluate(&self, ctx: &VetoContext) -> VetoVerdict {
+        self.evaluate_enabled(ctx, true, true)
+    }
+    fn observe_inputs(&self, ctx: &VetoContext) -> RuleInputObservationV1 {
+        self.observe_enabled(ctx, true, true)
+    }
+}
+impl BiasRateRule {
+    fn high_bias(&self, ctx: &VetoContext) -> bool {
+        ctx.bias_ma5 > self.bias_threshold
+    }
+    fn bearish(&self, ctx: &VetoContext) -> bool {
+        ctx.is_bearish
+    }
+    fn observe_enabled(
+        &self,
+        ctx: &VetoContext,
+        bias: bool,
+        bearish: bool,
+    ) -> RuleInputObservationV1 {
+        observe_builtin(
+            ctx,
+            configured_rule(
+                Id::BiasRate,
+                bias || bearish,
+                bias,
+                bearish,
+                Thresholds::BiasRate {
+                    bias_threshold: self.bias_threshold,
+                },
+            ),
+            &[bias && self.high_bias(ctx), bearish && self.bearish(ctx)],
+        )
+    }
+    fn evaluate_enabled(&self, ctx: &VetoContext, bias: bool, bearish: bool) -> VetoVerdict {
         let mut verdict = VetoVerdict::default();
 
         // 仅对买入信号做拦截（Hold/Wait/Sell 无需拦截）
@@ -54,7 +93,7 @@ impl VetoRule for BiasRateRule {
         }
 
         // 条件 1: 乖离率过高 → 追高风险
-        if ctx.bias_ma5 > self.bias_threshold {
+        if bias && self.high_bias(ctx) {
             verdict.risk_flags.push(format!(
                 "❌ 乖离率超{:.0}%(当前{:.1}%)有大幅回调风险，严禁追高，强制降级至观望",
                 self.bias_threshold, ctx.bias_ma5
@@ -63,7 +102,7 @@ impl VetoRule for BiasRateRule {
         }
 
         // 条件 2: 空头排列 → 反弹诱多风险
-        if ctx.is_bearish {
+        if bearish && self.bearish(ctx) {
             verdict.risk_flags.push(
                 "❌ 整体处于空头排列，极其弱势，放弃短线博弈避开接飞刀，强制降级至观望".to_string(),
             );
@@ -106,6 +145,15 @@ impl Default for MainFlowRule {
     }
 }
 
+impl MainFlowRule {
+    fn heavy_outflow(&self, day: &crate::capital_flow::MoneyFlowDay) -> bool {
+        day.main_net < -self.outflow_threshold
+    }
+    fn price_rise_with_outflow(&self, day: &crate::capital_flow::MoneyFlowDay) -> bool {
+        day.pct_chg.is_some_and(|pct| pct > self.lure_pct_threshold)
+            && day.main_net < -self.lure_outflow_threshold
+    }
+}
 impl VetoRule for MainFlowRule {
     fn name(&self) -> &'static str {
         "MainFlowRule"
@@ -113,6 +161,28 @@ impl VetoRule for MainFlowRule {
 
     fn priority(&self) -> u8 {
         20
+    }
+
+    fn observe_inputs(&self, ctx: &VetoContext) -> RuleInputObservationV1 {
+        let last = ctx.money_flow_days.as_ref().and_then(|d| d.last());
+        observe_builtin(
+            ctx,
+            configured_rule(
+                Id::MainFlow,
+                true,
+                true,
+                true,
+                Thresholds::MainFlow {
+                    outflow_threshold: self.outflow_threshold,
+                    lure_pct_threshold: self.lure_pct_threshold,
+                    lure_outflow_threshold: self.lure_outflow_threshold,
+                },
+            ),
+            &[
+                last.is_some_and(|d| self.heavy_outflow(d)),
+                last.is_some_and(|d| self.price_rise_with_outflow(d)),
+            ],
+        )
     }
 
     fn evaluate(&self, ctx: &VetoContext) -> VetoVerdict {
@@ -137,7 +207,7 @@ impl VetoRule for MainFlowRule {
         let last_day = &days[days.len() - 1];
 
         // 条件 1: 单日主力大幅净流出
-        if last_day.main_net < -self.outflow_threshold {
+        if self.heavy_outflow(last_day) {
             verdict.risk_flags.push(format!(
                 "❌ 主力资金单日大幅流出({:.2}亿)，风险极高，强制取消买入建议",
                 last_day.main_net / 1_0000_0000.0
@@ -146,11 +216,7 @@ impl VetoRule for MainFlowRule {
         }
 
         // 条件 2: 价涨量增但资金大幅流出（诱多）
-        if last_day
-            .pct_chg
-            .is_some_and(|pct_chg| pct_chg > self.lure_pct_threshold)
-            && last_day.main_net < -self.lure_outflow_threshold
-        {
+        if self.price_rise_with_outflow(last_day) {
             verdict.risk_flags.push(
                 "❌ 股价大涨但主力净流出(典型诱多/拉高出货)，极其凶险，强制取消买入建议"
                     .to_string(),
@@ -191,6 +257,11 @@ impl Default for FundamentalDeteriorationRule {
     }
 }
 
+impl FundamentalDeteriorationRule {
+    fn deterioration(&self, pe: f64, np_yoy: f64) -> bool {
+        (pe < 0.0 || pe > self.pe_upper) && np_yoy < self.profit_decline_threshold
+    }
+}
 impl VetoRule for FundamentalDeteriorationRule {
     fn name(&self) -> &'static str {
         "FundamentalDeteriorationRule"
@@ -198,6 +269,27 @@ impl VetoRule for FundamentalDeteriorationRule {
 
     fn priority(&self) -> u8 {
         30
+    }
+
+    fn observe_inputs(&self, ctx: &VetoContext) -> RuleInputObservationV1 {
+        let triggered = ctx
+            .pe_ratio
+            .zip(ctx.net_profit_yoy)
+            .is_some_and(|(pe, np)| pe != 0.0 && self.deterioration(pe, np));
+        observe_builtin(
+            ctx,
+            configured_rule(
+                Id::FundamentalDeterioration,
+                true,
+                true,
+                true,
+                Thresholds::FundamentalDeterioration {
+                    pe_upper: self.pe_upper,
+                    profit_decline_threshold: self.profit_decline_threshold,
+                },
+            ),
+            &[triggered],
+        )
     }
 
     fn evaluate(&self, ctx: &VetoContext) -> VetoVerdict {
@@ -217,10 +309,7 @@ impl VetoRule for FundamentalDeteriorationRule {
             None => return verdict,
         };
 
-        let is_pe_abnormal = pe < 0.0 || pe > self.pe_upper;
-        let is_profit_crashing = np_yoy < self.profit_decline_threshold;
-
-        if is_pe_abnormal && is_profit_crashing {
+        if self.deterioration(pe, np_yoy) {
             verdict.risk_flags.push(format!(
                 "❌ 基本面极度恶化(PE={:.0} 业绩大幅下滑{:.0}% 且估值畸高/亏损)，底线拦截取消买入",
                 pe, np_yoy
@@ -238,6 +327,64 @@ impl VetoRule for FundamentalDeteriorationRule {
 
 use super::veto_chain::{VetoChain, VetoChainConfig};
 
+struct ConfiguredBiasRateRule {
+    rule: BiasRateRule,
+    bias: bool,
+    bearish: bool,
+}
+impl VetoRule for ConfiguredBiasRateRule {
+    fn name(&self) -> &'static str {
+        self.rule.name()
+    }
+    fn priority(&self) -> u8 {
+        self.rule.priority()
+    }
+    fn evaluate(&self, ctx: &VetoContext) -> VetoVerdict {
+        self.rule.evaluate_enabled(ctx, self.bias, self.bearish)
+    }
+    fn observe_inputs(&self, ctx: &VetoContext) -> RuleInputObservationV1 {
+        self.rule.observe_enabled(ctx, self.bias, self.bearish)
+    }
+}
+
+pub(super) fn build_configured_chain(config: &VetoConfigurationSnapshotV1) -> VetoChain {
+    // The immutable snapshot owns actual defaults; construct evaluators from those exact values.
+    let Thresholds::BiasRate { bias_threshold } = config.rules()[0].thresholds else {
+        unreachable!("fixed catalog")
+    };
+    let Thresholds::MainFlow {
+        outflow_threshold,
+        lure_pct_threshold,
+        lure_outflow_threshold,
+    } = config.rules()[1].thresholds
+    else {
+        unreachable!("fixed catalog")
+    };
+    let Thresholds::FundamentalDeterioration {
+        pe_upper,
+        profit_decline_threshold,
+    } = config.rules()[2].thresholds
+    else {
+        unreachable!("fixed catalog")
+    };
+    VetoChain::new(vec![
+        Box::new(ConfiguredBiasRateRule {
+            rule: BiasRateRule { bias_threshold },
+            bias: config.bias_rate_enabled(),
+            bearish: config.bearish_alignment_enabled(),
+        }),
+        Box::new(MainFlowRule {
+            outflow_threshold,
+            lure_pct_threshold,
+            lure_outflow_threshold,
+        }),
+        Box::new(FundamentalDeteriorationRule {
+            pe_upper,
+            profit_decline_threshold,
+        }),
+    ])
+}
+
 /// 根据配置构建 VetoChain。
 ///
 /// 返回 None 表示 VetoChain 总开关关闭，调用方应完全跳过。
@@ -249,7 +396,11 @@ pub fn build_chain(config: &VetoChainConfig) -> Option<VetoChain> {
     let mut rules: Vec<Box<dyn VetoRule>> = Vec::new();
 
     if config.bias_rate_enabled || config.bearish_alignment_enabled {
-        rules.push(Box::new(BiasRateRule::default()));
+        rules.push(Box::new(ConfiguredBiasRateRule {
+            rule: BiasRateRule::default(),
+            bias: config.bias_rate_enabled,
+            bearish: config.bearish_alignment_enabled,
+        }));
     }
     if config.main_flow_enabled {
         rules.push(Box::new(MainFlowRule::default()));
