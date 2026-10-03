@@ -325,3 +325,15 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 真实构建录制第二次已结束并保留失败：固定输入清单 `cd08bf35`、策略 checkpoint `e96bb6d3`；记录器不接受依赖实际使用的 `--allow=...` / `--warn=...` 参数形式，三个编译调用在进入编译器前被拒绝。没有产生应用 library 的可用 pin，后续构建资格和完整回放仍未闭合；15 项工具 fixture 通过不能代替这次真实构建。正在由原作者窄修参数解析，另有独立财务解码资源证明审阅和 SQLite 原生构建接线设计并行。
 
 SQLite 后续原则采用显式可选 bundled feature，普通默认构建继续现有路径；还须记录实际 C 编译与归档、最终程序的符号来源及同进程身份。源码清单、版本字符串或 library 编译本身不会签发 SQL provider。自然窗口、真实上游资格、正式资金批准和远端存证配置仍见上表。本轮没有上线或消息重发。
+
+### 2026-10-04 第三次真实录制与下一组并行实现
+
+构建记录器第二轮修正已完成：`fb99f143`，20 项 Python 工具测试实际通过，独立 Spec/Quality Approved。它支持已观察到的长 lint 参数，并仅透传经验证的 jobserver 管道描述符。第二次失败记录仍保留，测试结果没有替换真实构建证据。
+
+SQLite 可选 feature 的有限增量已完成：`9cb1279a` 新增 `replay-sqlite-bundled-v1`；实际离线 Cargo 解析只新增原有 libsqlite3-sys 的 cc 依赖边，没有更换 593 个包的身份、版本或 checksum。可选和默认路径的 locked metadata 均成功，独立审阅 Approved。这是依赖解析证据，尚未编译或签发原生 SQLite provider。
+
+更新后的固定录制清单为 `18f7fd87`，策略 checkpoint `fd98d59f`。第三次真实受控构建退出 2：49 个成功调用、5 个未完成调用，没有产生最终应用 library pin。新的具体阻塞是构建脚本内 rustc 探测的 loader 上下文、proc-macro2 会删除或复用的临时探测产物，以及 Cargo custom-build 的 null executable 与实际 host/target 生成文件关联。原始记录保留在 `.replay-build-records/pending-52f83cf76c624c7f8d343ecd67bea9c1/`；日志与诊断见 validation 下 `dev-20261004-replay-build-actual-record-3*`，不将这些失败改记为成功。
+
+当前并行推进三条工作：原作者修复上述有限录制路径；另一作者实现普通构建的确定拒绝 include、私有资格类型和同一持久预算借用接口；第三条补齐日历首次加载及竞争线程的源导出资源证明。完整财务解码契约已覆盖九个入口、全部记录变体及原有 JSON 接受语义，随后基于共同接口实现，避免并行修改同一 foundation。上述接口前置仍不包含 accepted pin 或完整金融重放。
+
+整个平台仍未完成：构建资格的实际签发、完整金融回放和迁移、正式资金/正向 F2/调度接线、真实数据源资格、远端存证与自然窗口验收保持开放。开发改动仍未部署；生产消息链路沿用前段恢复记录。
