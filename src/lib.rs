@@ -30,6 +30,7 @@ pub mod decision;
 pub mod durable_delivery;
 pub mod enums;
 pub mod errors;
+pub(crate) mod evidence_retention;
 pub mod indicators;
 pub mod lhb_analyzer;
 pub mod llm;
