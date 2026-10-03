@@ -287,3 +287,12 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 | 运行与研究验收 | 52Unit同事实shadow、单一物理owner/promotion、统一健康/Quiet-Halted/OutcomeTracker剩余接线、AI比较与PIT/样本外/成本后检验仍需逐项真实证据；至少2个合资格交易日/5个自然日等观察不能由测试压缩 |
 
 本段是开发状态，不把单片 Approved 视为全平台完成。实际验证仅上述 targeted lib 路径及先前已记载范围，没有新增正常bin/release、全库或生产切换。消息链路10/3恢复证据仍在前段记录，开发检查点未取代原生产制品。
+
+### 2026-10-03 23:45 后续并行进度（局部能力，不是整个平台完成）
+
+- 存证纯值模块第一阶段完成：原始 checkpoint `1f2ff79b`，比较阶段预付扫描及小 hex 精确容量修正 `b11074eb`；20 项模块测试通过（3 新增、17 原有），独立复审 Spec/Quality Approved，I1/M1 均关闭。它仍只产生 Unverified / Incomplete / Unsigned 值，不证明远端 WORM、四 owner seal、签名、真实保留或恢复。
+- 构建证据录制工具第一片 checkpoint `f49ee604`：11 项 Python fixture 测试通过，独立代码审查进行中。默认 `RecordingOnly / MissingInventory`，尚未进行真实受控 Cargo 录制，也没有可用 pin；完整 source/vendor/sysroot/tool 清单和实际编译观察、独立 policy 审查、后继发行仍待闭合。
+- 实际 SQL 读取及持久失败状态接线正在并行封存；本金/分配/起始持仓的核验功能在设计。正式 positive F2 的生产发行、调度入口、paper cutover/启动及执行资格尚未完成。
+- 余项仍包括完整历史金融重放与迁移、正式 paper 链、远端存证及恢复、52 单元观察、真实 source 资格和自然日验收。并行代码开发不能替代真实本金、批准、外部 owner/凭据或观察期。没有新 release/部署/消息重发。
+
+验证依据：`.planning/2026-10-02-platform-continued-implementation/validation/dev-20261003-retention-stage1-reviewfix1-acceptance.json`；`dev-20261003-replay-build-owner-record-acceptance.json`；详细任务与裁定见 `.superpowers/sdd/remaining-development-20261003/progress.md`。
