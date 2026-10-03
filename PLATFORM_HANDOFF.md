@@ -179,3 +179,12 @@ TDX native bar缺返回issuer/venue；Hithink v2是observation-only，source exh
 实际验证46项通过：`cargo test --locked --offline --lib external_cached_ -- --nocapture` 5项；同一已编译库harness覆盖公告路由4项、外部配置3项、开盘能力22项、notice数据库恢复1项；`cargo test --locked --offline --bin monitor news_ai_shadow::tests::br172_ -- --nocapture` 11项。库最终日志SHA256 `c081ea48ca6891eb36913a79b393fdb8f640582f61676c798df4c82505f7ce04`，monitor日志SHA256 `b87ac2a1726b0b28bf7453981c78ff2506c2f611f3d451efee97f8ceac3cac88`。首轮3PASS/1FAIL揭示reason映射遗漏，失败日志保留。独立复核发现测试服务器abort/join不能证明所有TCP连接已关闭；已改为有界等待tonic正常graceful shutdown完成再重绑定，窄复核无剩余发现。`git diff --check`通过；未执行release/生产切换或全量测试。
 
 下一片 Catalog7 whole-catalog borrower 与不可变负面候选观察已在独立scratch完成，待root应用、实际测试及独立复核。它不是正式InvestmentDecisionId、资金批准或Paper执行资格；后续Global target、真实source合同、完整risk评估、资金seed/cutover、WORM及自然窗口仍需继续完成。
+
+
+### 2026-10-03 Catalog7 持久候选观察（待独立复核）
+
+完成same-runtime legacy/transitional/amended固定7全参考、精确header/SQL/geometry/FK/payload闭合，以及复用唯一Global事务/namespace/lease/累计CopyWork引擎的独立7proof。旧6接口仍硬性要求6；7生产入口在checkout前拒绝，不是生产migration。财务校验只机械共享原完整row replay，新增固定7 fee入口，无PRAGMA替换或codec/业务算法变化。
+
+不可变观察owner自己取一次UTC时钟，policy固定intraday-unconsumed-pushed-row-top50-v1、30秒UTCslot和revision1。同原IMMEDIATE先读existing key：重试保存首次cutoff/bytes/ID，不重扫后续source；首次捕获原Top50后checked正数rowid append。类型/长度/digest/closed-canonical及流式JSON预算预检在owned decode前执行。最后hook之后验证原row及首次source，COMMIT后独立retained RO snapshot复核；真实子进程在fresh reader前改变source返回Unknown且保留已提交原事实。Scope/occurrence独立域及literal golden，不颁发InvestmentDecisionId、审批或Paper资格。
+
+实际80项主harness检查全PASS：新candidate_catalog7 12、identity golden1、旧global_catalog6 22、原f2_candidate_scope6、受影响paper_book_v2_execution39；两项ignored仅供父测试精确reexec的子进程，由父测试实际运行并验证，非跳过关键行为。库构建4m39s；新12项运行43.80s，日志SHA2560f3376d71831707df13ed762197e2f3f251a44bdd17ca3050561e1588d8f55c8。累计检查复用同一复制且SHA核验harness，未重复Cargo build/check/clippy或运行全量。编译后仅清除新增unused import，静态确认无引用、rustfmt与diff check通过；behavior-neutral清理另有SHA记录。新源码尚未部署，独立spec/quality review尚待完成。

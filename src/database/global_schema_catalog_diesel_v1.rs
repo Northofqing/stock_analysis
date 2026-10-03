@@ -357,6 +357,7 @@ fn tables(mode: GlobalSchemaCatalogMode) -> Result<BTreeSet<String>, PaperCatalo
                 .chain(super::super::paper_book_owner_schema_v2::OWNER_STATEMENTS.iter())
                 .chain(super::super::paper_book_v2_ledger_schema_v1::STATEMENTS.iter())
                 .chain(super::super::paper_book_v2_execution_schema_v1::STATEMENTS.iter())
+                .chain(super::super::candidate_scope_observation_schema_v1::STATEMENTS.iter())
                 .filter(|(k, _, _, _)| *k == "table")
                 .map(|(_, n, _, _)| (*n).to_owned()),
         )
@@ -730,6 +731,7 @@ fn classifier_copy_work(
     let state = match snapshot.identity.user_version {
         5 => &references.owner_v5,
         6 => &references.execution_v6,
+        7 => &references.candidate_v7,
         _ => return Err(PaperCatalog6Error::Catalog6RequalificationRequired),
     };
     let mut total = 0usize;
@@ -866,7 +868,10 @@ pub(in crate::database) fn initial_catalog_copy_work_for_test(
     snapshot: &CatalogSnapshot,
     references: &SameRuntimeCatalogReferences,
 ) -> Result<usize, PaperCatalog6Error> {
-    let state = &references.execution_v6;
+    let state = match snapshot.identity.user_version {
+        7 => &references.candidate_v7,
+        _ => &references.execution_v6,
+    };
     [
         &snapshot.objects,
         &state.legacy.objects,

@@ -1502,3 +1502,6 @@ fn global_catalog6_original_retained_reader_witness_rejects_original_committing_
         .unwrap();
     assert_eq!(f.daily_count(), 1);
 }
+
+#[path = "global_schema_candidate_v7_tests.rs"]
+mod candidate7_tests;

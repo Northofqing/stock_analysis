@@ -1288,12 +1288,24 @@ fn parent_matches(row: &ParentRow, intent: &IntentRecord) -> Result<(), LedgerEr
 pub(crate) fn verify_rows_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
     read_views_body_on(conn).map(|_| ())
 }
+/// Fixed7 pure historical replay, called after the sole Global catalog gate.
+pub(crate) fn verify_rows_on_catalog7(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    crate::database::paper_book_v2_execution_schema_v1::verify_objects_on(conn)?;
+    crate::database::paper_book_v2_schema::verify_v7_manifest_on(conn)
+        .map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+    read_views_rows_on(conn).map(|_| ())
+}
 fn read_views_body_on(
     conn: &mut SqliteConnection,
 ) -> Result<BTreeMap<String, RecordedExecutionView>, LedgerError> {
     crate::database::paper_book_v2_execution_schema_v1::verify_objects_on(conn)?;
     crate::database::paper_book_v2_schema::verify_v6_manifest_on(conn)
         .map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+    read_views_rows_on(conn)
+}
+fn read_views_rows_on(
+    conn: &mut SqliteConnection,
+) -> Result<BTreeMap<String, RecordedExecutionView>, LedgerError> {
     super::paper_book_v2::verify_owner_rows_on(conn)?;
     let rows = sql_rows(conn)?;
     let mut views = BTreeMap::new();

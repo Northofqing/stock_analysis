@@ -1,11 +1,12 @@
 //! Bounded observation of the actual legacy pushed-row scope.
 //! This is source preparation for F2, not a persisted investment decision.
+use crate::database::global_schema_v1::candidate_v7::VerifiedCatalog7;
 use crate::database::global_schema_v1::paper_v6::{PaperCatalog6Error, VerifiedCatalog6};
 use crate::database::DatabaseConnectionAuthority;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, SecondsFormat, Utc};
 use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const DOMAIN: &str = "stock_analysis.m4.bounded_pushed_row_scope_observation.v1";
@@ -98,6 +99,33 @@ pub(crate) fn capture_pushed_candidate_scope_at_for_test(
     capture_at(conn, proof, cutoff)
 }
 
+/// Only a live, exact7 loan can create this capture; stored bytes never can.
+pub(crate) fn capture_catalog7_at(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedCatalog7<'_>,
+    cutoff: DateTime<Utc>,
+) -> Result<CapturedPushedCandidateScope, CandidateScopeError> {
+    proof.validate_on(conn)?;
+    capture_validated(conn, proof.connection_authority(), cutoff)
+}
+impl CapturedPushedCandidateScope {
+    pub(crate) fn verify_catalog7_unchanged(
+        &self,
+        conn: &mut SqliteConnection,
+        proof: &VerifiedCatalog7<'_>,
+    ) -> Result<(), CandidateScopeError> {
+        if proof.connection_authority() != &self.authority {
+            return Err(CandidateScopeError::SourceAuthority);
+        }
+        let current = capture_catalog7_at(conn, proof, self.cutoff)?;
+        if current.canonical == self.canonical {
+            Ok(())
+        } else {
+            Err(CandidateScopeError::Changed)
+        }
+    }
+}
+
 #[derive(QueryableByName)]
 struct MainEncoding {
     #[diesel(sql_type = Text)]
@@ -139,7 +167,8 @@ struct RawPushRow {
     #[diesel(sql_type = Nullable<Binary>)]
     outcome: Option<Vec<u8>>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FrozenPushRow {
     id: i64,
     push_time: String,
@@ -250,11 +279,17 @@ fn capture_at(
     cutoff: DateTime<Utc>,
 ) -> Result<CapturedPushedCandidateScope, CandidateScopeError> {
     proof.validate_on(conn)?; // Wrong callback-local instance rejects with zero SQL.
+    capture_validated(conn, proof.connection_authority(), cutoff)
+}
+fn capture_validated(
+    conn: &mut SqliteConnection,
+    authority: &DatabaseConnectionAuthority,
+    cutoff: DateTime<Utc>,
+) -> Result<CapturedPushedCandidateScope, CandidateScopeError> {
     let encoding = diesel::sql_query("PRAGMA main.encoding").get_result::<MainEncoding>(conn)?;
     if encoding.encoding != "UTF-8" {
         return Err(CandidateScopeError::Encoding);
     }
-    let offset = FixedOffset::east_opt(8 * 3600).ok_or(CandidateScopeError::Cutoff)?;
     let upper_time = cutoff
         .checked_add_signed(Duration::hours(8))
         .ok_or(CandidateScopeError::Cutoff)?;
@@ -331,6 +366,35 @@ fn capture_at(
         .into_iter()
         .map(FrozenPushRow::try_from)
         .collect::<Result<Vec<_>, _>>()?;
+    let canonical = canonical_for(rows, cutoff)?;
+    let id = CandidateScopeCaptureId(format!(
+        "candidate-scope-capture-v1:{}",
+        hex::encode(Sha256::digest(&canonical))
+    ));
+    Ok(CapturedPushedCandidateScope {
+        authority: authority.clone(),
+        cutoff,
+        id,
+        canonical,
+    })
+}
+
+fn canonical_for(
+    rows: Vec<FrozenPushRow>,
+    cutoff: DateTime<Utc>,
+) -> Result<Vec<u8>, CandidateScopeError> {
+    let offset = FixedOffset::east_opt(8 * 3600).ok_or(CandidateScopeError::Cutoff)?;
+    let upper_time = cutoff
+        .checked_add_signed(Duration::hours(8))
+        .ok_or(CandidateScopeError::Cutoff)?;
+    if !(1..=9999).contains(&upper_time.year()) {
+        return Err(CandidateScopeError::Cutoff);
+    }
+    let lower_time = upper_time
+        .checked_sub_signed(Duration::hours(1))
+        .ok_or(CandidateScopeError::Cutoff)?;
+    let upper = upper_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let lower = lower_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let date = cutoff.with_timezone(&offset).date_naive();
     let calendar = match (
         crate::calendar::verified_a_share_trading_day(date),
@@ -370,14 +434,368 @@ fn capture_at(
     if canonical.len() > CANONICAL_BYTES {
         return Err(CandidateScopeError::Bounds);
     }
-    let id = CandidateScopeCaptureId(format!(
-        "candidate-scope-capture-v1:{}",
-        hex::encode(Sha256::digest(&canonical))
-    ));
-    Ok(CapturedPushedCandidateScope {
-        authority: proof.connection_authority().clone(),
-        cutoff,
-        id,
-        canonical,
-    })
+    Ok(canonical)
+}
+
+/// A value-only closed JSON check. It does not issue a capture or authority.
+pub(crate) fn validate_stored_canonical(
+    bytes: &[u8],
+    cutoff: DateTime<Utc>,
+) -> Result<(), CandidateScopeError> {
+    if bytes.is_empty() || bytes.len() > CANONICAL_BYTES {
+        return Err(CandidateScopeError::Bounds);
+    }
+    preflight_stored_json(bytes)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| CandidateScopeError::Canonical)?;
+    let candidates = value
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .ok_or(CandidateScopeError::Canonical)?;
+    if candidates.len() > 50 {
+        return Err(CandidateScopeError::Bounds);
+    }
+    let mut rows = Vec::with_capacity(candidates.len());
+    let mut total = 0usize;
+    let upper_time = cutoff
+        .checked_add_signed(Duration::hours(8))
+        .ok_or(CandidateScopeError::Cutoff)?;
+    let lower_time = upper_time
+        .checked_sub_signed(Duration::hours(1))
+        .ok_or(CandidateScopeError::Cutoff)?;
+    let upper = upper_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let lower = lower_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let mut previous: Option<(String, i64)> = None;
+    let mut row_ids = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let row: FrozenPushRow = serde_json::from_value(
+            candidate
+                .get("row")
+                .ok_or(CandidateScopeError::Canonical)?
+                .clone(),
+        )
+        .map_err(|_| CandidateScopeError::Canonical)?;
+        if row.push_time.as_bytes() <= lower.as_bytes()
+            || row.push_time.as_bytes() >= upper.as_bytes()
+            || !row_ids.insert(row.id)
+            || previous.as_ref().is_some_and(|(time, id)| {
+                (row.push_time.as_bytes(), row.id) >= (time.as_bytes(), *id)
+            })
+        {
+            return Err(CandidateScopeError::Canonical);
+        }
+        previous = Some((row.push_time.clone(), row.id));
+        let fields = [
+            Some(row.push_time.as_str()),
+            Some(row.push_kind.as_str()),
+            Some(row.code.as_str()),
+            Some(row.name.as_str()),
+            Some(row.metric_json.as_str()),
+            Some(row.source.as_str()),
+            row.consumed_at.as_deref(),
+            row.consumed_by.as_deref(),
+            row.outcome.as_deref(),
+        ];
+        let mut row_size = 18usize;
+        for (i, field) in fields.into_iter().enumerate() {
+            let limit = if i == 4 { METRIC_BYTES } else { FIELD_BYTES } as usize;
+            if field.is_some_and(|v| v.len() > limit) {
+                return Err(CandidateScopeError::Bounds);
+            }
+            row_size += field.map_or(1, |v| 9 + v.len());
+        }
+        if row_size > ROW_BYTES as usize
+            || row.consumed_at.is_some()
+            || !f64::from_bits(row.push_price_real_bits).is_finite()
+        {
+            return Err(CandidateScopeError::Bounds);
+        }
+        total += row_size;
+        if total > SCOPE_BYTES as usize {
+            return Err(CandidateScopeError::Bounds);
+        }
+        rows.push(row);
+    }
+    let expected = canonical_for(rows, cutoff)?;
+    if expected != bytes {
+        return Err(CandidateScopeError::Canonical);
+    }
+    Ok(())
+}
+
+// Streaming allocation preflight: do not construct a serde Value/Vec/String
+// until every container and source field has passed the original capture bounds.
+// serde_json may use its bounded input scratch for escaped strings; this visitor
+// never copies them and rejects them before any owned representation is built.
+#[derive(Clone, Copy)]
+enum JsonPart {
+    Root,
+    Candidates,
+    Candidate,
+    Row,
+    Facts,
+    Fact,
+    Calendar,
+    Text {
+        limit: usize,
+        raw: bool,
+        nullable: bool,
+    },
+    Number,
+    Boolean,
+}
+#[derive(Default)]
+struct JsonBudget {
+    selected: usize,
+    row: usize,
+}
+struct JsonSeed<'a> {
+    part: JsonPart,
+    budget: &'a mut JsonBudget,
+}
+impl<'de> serde::de::DeserializeSeed<'de> for JsonSeed<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+impl JsonBudget {
+    fn field<E: serde::de::Error>(&mut self, bytes: usize) -> Result<(), E> {
+        self.row = self
+            .row
+            .checked_add(bytes)
+            .ok_or_else(|| E::custom("row extent overflow"))?;
+        if self.row > ROW_BYTES as usize {
+            return Err(E::custom("row byte bound"));
+        }
+        Ok(())
+    }
+}
+impl<'de> serde::de::Visitor<'de> for JsonSeed<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bounded closed candidate observation JSON")
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+        match self.part {
+            JsonPart::Text { limit, raw, .. } if value.len() <= limit => {
+                if raw {
+                    self.budget.field(9 + value.len())?;
+                }
+                Ok(())
+            }
+            _ => Err(E::custom("text shape or byte bound")),
+        }
+    }
+    fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<(), E> {
+        self.visit_str(value)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        match self.part {
+            JsonPart::Text {
+                raw,
+                nullable: true,
+                ..
+            } => {
+                if raw {
+                    self.budget.field(1)?;
+                }
+                Ok(())
+            }
+            _ => Err(E::custom("unexpected null")),
+        }
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        if matches!(self.part, JsonPart::Number) {
+            Ok(())
+        } else {
+            Err(E::custom("unexpected integer"))
+        }
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        if matches!(self.part, JsonPart::Number) {
+            Ok(())
+        } else {
+            Err(E::custom("unexpected integer"))
+        }
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        if matches!(self.part, JsonPart::Boolean) {
+            Ok(())
+        } else {
+            Err(E::custom("unexpected boolean"))
+        }
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let (part, max) = match self.part {
+            JsonPart::Candidates => (JsonPart::Candidate, 50),
+            JsonPart::Facts => (JsonPart::Fact, 3),
+            _ => return Err(serde::de::Error::custom("unexpected array")),
+        };
+        struct Item<'a> {
+            part: JsonPart,
+            budget: &'a mut JsonBudget,
+            index: usize,
+            max: usize,
+        }
+        impl<'de> serde::de::DeserializeSeed<'de> for Item<'_> {
+            type Value = ();
+            fn deserialize<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<(), D::Error> {
+                if self.index >= self.max {
+                    return Err(serde::de::Error::custom("array item bound"));
+                }
+                serde::de::DeserializeSeed::deserialize(
+                    JsonSeed {
+                        part: self.part,
+                        budget: self.budget,
+                    },
+                    deserializer,
+                )
+            }
+        }
+        let mut count = 0;
+        while seq
+            .next_element_seed(Item {
+                part,
+                budget: self.budget,
+                index: count,
+                max,
+            })?
+            .is_some()
+        {
+            count += 1;
+        }
+        if matches!(self.part, JsonPart::Facts) && count != 3 {
+            return Err(serde::de::Error::custom("fact cardinality"));
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        use JsonPart::*;
+        let keys: &[&str] = match self.part {
+            Root => &[
+                "domain",
+                "policy",
+                "scope_query_sha256",
+                "predicate_clock",
+                "scope",
+                "source_layout",
+                "cutoff_utc",
+                "lower_exclusive_shanghai",
+                "upper_exclusive_shanghai",
+                "shanghai_civil_date",
+                "calendar",
+                "scope_state",
+                "candidates",
+            ],
+            Candidate => &[
+                "row",
+                "identity",
+                "facts",
+                "disposition",
+                "risk_inventory",
+                "risk_evaluation",
+                "cost_model",
+                "liquidity_model",
+                "budget_allocation",
+                "manual_approval",
+            ],
+            Row => &[
+                "id",
+                "push_time",
+                "push_kind",
+                "code",
+                "name",
+                "push_price_real_bits",
+                "metric_json",
+                "source",
+                "consumed_at",
+                "consumed_by",
+                "outcome",
+            ],
+            Fact => &["requirement", "state", "reason"],
+            Calendar => &["state", "contract", "authority_sha256", "open", "reason"],
+            _ => return Err(<A::Error as serde::de::Error>::custom("unexpected object")),
+        };
+        if matches!(self.part, Row) {
+            self.budget.row = 18;
+        }
+        let mut seen = 0u32;
+        // Canonical keys contain no escapes, so borrowing also forbids allocating
+        // a malicious escaped or oversized key before rejecting it.
+        while let Some(key) = map.next_key::<&str>()? {
+            let index = keys
+                .iter()
+                .position(|allowed| *allowed == key)
+                .ok_or_else(|| <A::Error as serde::de::Error>::custom("unknown field"))?;
+            let bit = 1u32 << index;
+            if seen & bit != 0 {
+                return Err(<A::Error as serde::de::Error>::custom("duplicate field"));
+            }
+            seen |= bit;
+            let part = match (self.part, key) {
+                (Root, "candidates") => Candidates,
+                (Root, "calendar") => Calendar,
+                (Candidate, "row") => Row,
+                (Candidate, "facts") => Facts,
+                (Row, "id" | "push_price_real_bits") => Number,
+                (Calendar, "open") => Boolean,
+                (Row, "metric_json") => Text {
+                    limit: METRIC_BYTES as usize,
+                    raw: true,
+                    nullable: false,
+                },
+                (Row, "consumed_at" | "consumed_by" | "outcome") => Text {
+                    limit: FIELD_BYTES as usize,
+                    raw: true,
+                    nullable: true,
+                },
+                (Row, _) => Text {
+                    limit: FIELD_BYTES as usize,
+                    raw: true,
+                    nullable: false,
+                },
+                _ => Text {
+                    limit: FIELD_BYTES as usize,
+                    raw: false,
+                    nullable: false,
+                },
+            };
+            map.next_value_seed(JsonSeed {
+                part,
+                budget: self.budget,
+            })?;
+        }
+        if !matches!(self.part, Calendar) && seen != (1u32 << keys.len()) - 1 {
+            return Err(<A::Error as serde::de::Error>::custom("missing field"));
+        }
+        if matches!(self.part, Row) {
+            self.budget.selected = self
+                .budget
+                .selected
+                .checked_add(self.budget.row)
+                .ok_or_else(|| <A::Error as serde::de::Error>::custom("scope extent overflow"))?;
+            if self.budget.selected > SCOPE_BYTES as usize {
+                return Err(<A::Error as serde::de::Error>::custom("scope byte bound"));
+            }
+        }
+        Ok(())
+    }
+}
+fn preflight_stored_json(bytes: &[u8]) -> Result<(), CandidateScopeError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    serde::de::DeserializeSeed::deserialize(
+        JsonSeed {
+            part: JsonPart::Root,
+            budget: &mut JsonBudget::default(),
+        },
+        &mut deserializer,
+    )
+    .map_err(|_| CandidateScopeError::Bounds)?;
+    deserializer
+        .end()
+        .map_err(|_| CandidateScopeError::Canonical)
 }

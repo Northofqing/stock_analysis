@@ -188,6 +188,21 @@ pub(crate) fn verify_v5_manifest_on(
 pub(crate) fn verify_v6_manifest_on(
     conn: &mut SqliteConnection,
 ) -> Result<(), StagedPaperBookV2Error> {
+    verify_execution_manifest_types_on(conn)?;
+    verify_manifest_row_on(conn, 6)
+}
+
+/// Fixed7 historical validation only; never an execution capability.
+pub(crate) fn verify_v7_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    verify_execution_manifest_types_on(conn)?;
+    verify_manifest_row_on(conn, 7)
+}
+
+fn verify_execution_manifest_types_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
     #[derive(QueryableByName)]
     struct InvalidRow {
         #[diesel(sql_type = BigInt)]
@@ -198,9 +213,13 @@ pub(crate) fn verify_v6_manifest_on(
          typeof(singleton)!='integer' OR singleton!=1 OR typeof(schema_id)!='text'
          OR typeof(policy_instance_id)!='text' OR typeof(descriptor_sha256)!='text'
          OR typeof(descriptor_bytes)!='blob'",
-    ).get_result::<InvalidRow>(conn)?.value;
-    if invalid != 0 { return Err(StagedPaperBookV2Error::ManifestMismatch); }
-    verify_manifest_row_on(conn, 6)
+    )
+    .get_result::<InvalidRow>(conn)?
+    .value;
+    if invalid != 0 {
+        return Err(StagedPaperBookV2Error::ManifestMismatch);
+    }
+    Ok(())
 }
 
 /// A complete inactive gen2 staging row may coexist with legacy V1 writes.
@@ -221,7 +240,7 @@ fn verify_manifest_row_on(
     }
     let mut reference = SqliteConnection::establish(":memory:")?;
     create_schema(&mut reference)?;
-    let matches_reference = if matches!(expected_user_version, 5 | 6) {
+    let matches_reference = if matches!(expected_user_version, 5 | 6 | 7) {
         fee_objects(conn)? == fee_objects(&mut reference)?
     } else {
         objects(conn)? == objects(&mut reference)?
