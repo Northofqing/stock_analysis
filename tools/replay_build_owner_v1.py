@@ -207,10 +207,12 @@ def package_id(package, session):
     return package["id"].replace("{application_uri}", (session / "application").as_uri())
 
 
-def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False, *, pass_fds=()):
+def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False, *, pass_fds=(),
+                 stdin_bytes=None, stdin_failures=None):
     """Preserve exact child bytes while forwarding both streams without buffering a tree."""
     process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               close_fds=True, pass_fds=pass_fds)
+                               close_fds=True, pass_fds=pass_fds,
+                               stdin=subprocess.PIPE if stdin_bytes is not None else None)
     failures = []
     def pump(source, path, fd):
         try:
@@ -230,6 +232,17 @@ def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False, *, pass_f
                threading.Thread(target=pump, args=(process.stderr, stderr_file, 2))]
     for thread in threads:
         thread.start()
+    if stdin_bytes is not None:
+        # Closed source is at most 60 bytes; both output pumps are already draining.
+        try:
+            process.stdin.write(stdin_bytes)
+            process.stdin.close()
+        except OSError as error:
+            stdin_failures.append("ChildStdinWrite:" + type(error).__name__)
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
     code = process.wait()
     for thread in threads:
         thread.join()
@@ -256,10 +269,13 @@ def parse_rustc(args):
             i += 1
         elif any(arg.startswith(prefix) and len(arg) > 2 for prefix in ("-C", "-L", "-A", "-W", "-D", "-F")):
             key, value = arg[:2], arg[2:]
-        elif arg.startswith(("--allow=", "--warn=")):
+        elif arg.startswith(("--allow=", "--warn=", "--deny=")):
             name, value = arg.split("=", 1)
-            require(re.fullmatch(r"(?:clippy::)?[a-z_][a-z0-9_]*", value), "UnsupportedLintArgument")
-            key = {"--allow": "-A", "--warn": "-W"}[name]
+            require(re.fullmatch(r"(?:clippy::)?[a-z_][a-z0-9_]*", value) or value in {
+                "clippy::unnecessary-wraps", "clippy::or-fun-call",
+                "clippy::branches-sharing-code", "clippy::alloc-instead-of-core"},
+                    "UnsupportedLintArgument")
+            key = {"--allow": "-A", "--warn": "-W", "--deny": "-D"}[name]
         elif arg.split("=", 1)[0] in values:
             key = arg.split("=", 1)[0]
             if "=" in arg:
@@ -443,11 +459,89 @@ def invocation_context(args, parsed, env, cwd, session, inv):
             "out_dir": str(out), "probe": probe}
 
 
+# Source-derived finite num-traits@0.2.19/autocfg@1.5.0 bodies, not caller Rust.
+AUTOCFG_BODIES = {
+    "EmptyStd": b"", "NoStd": b"#![no_std]",
+    "TotalCmp": b"pub fn probe() { let _ = 1f64.total_cmp(&2f64); }",
+    "NoStdTotalCmp": b"#![no_std]\npub fn probe() { let _ = 1f64.total_cmp(&2f64); }",
+}
+AUTOCFG_KINDS = {"NumTraitsAutocfgVersion", "NumTraitsAutocfgStdinProbe"}
+
+
+def autocfg_context(args, env, cwd, session, inv):
+    """Closed raw templates before generic parsing rejects verbose/stdin/LLVM IR."""
+    raw = args[1:]
+    if "--verbose" not in raw and "--emit=llvm-ir" not in raw:
+        return None
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#num-traits@0.2.19",
+               "tree": "vendor", "manifest": "num-traits/Cargo.toml"}
+    helper = {"id": "registry+https://github.com/rust-lang/crates.io-index#autocfg@1.5.0",
+              "tree": "vendor", "manifest": "autocfg/Cargo.toml"}
+    root = session / "vendor/num-traits"
+    require(inv["packages"].count(package) == 1 and inv["packages"].count(helper) == 1,
+            "AutocfgPackageInventory")
+    require(cwd == root and env.get("CARGO_MANIFEST_DIR") == str(root)
+            and env.get("CARGO_PKG_NAME") == "num-traits"
+            and env.get("RUSTC") == inv["rustc"]["path"]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not env.get("RUSTC_WORKSPACE_WRAPPER")
+            and env.get("HOST") == TARGET and env.get("TARGET") == TARGET, "AutocfgContext")
+    for name in ("num-traits/Cargo.toml", "num-traits/build.rs", "autocfg/Cargo.toml",
+                 "autocfg/src/lib.rs", "autocfg/src/rustc.rs", "autocfg/src/version.rs"):
+        path = session / "vendor" / name
+        regular(path)
+        require(path.resolve() == path and inv["vendor"]["files"].get(name) == file_hash(path),
+                "AutocfgSourceMismatch")
+    raw_out = env.get("OUT_DIR", "")
+    out = Path(raw_out)
+    require(out.is_absolute() and str(out) == raw_out and out.resolve() == out
+            and out.is_dir() and not out.is_symlink() and out.name == "out"
+            and out.parent.parent == session / "target" / TARGET / "debug/build"
+            and re.fullmatch(r"[A-Za-z0-9_-]+", out.parent.name), "AutocfgOutDir")
+    context = {"kind": "NumTraitsAutocfgVersion", "package_id": package["id"],
+               "manifest": str(root), "out_dir": str(out), "helper_package_id": helper["id"]}
+    if raw == ["--version", "--verbose"]:
+        return {"options": {"--version": [True], "--verbose": [True]}, "codegen": {},
+                "inputs": [], "probe": True}, context
+    require(len(raw) == 9 and raw[0] == "--crate-name", "AutocfgTemplate")
+    match = re.fullmatch(r"autocfg_([0-9a-f]{16})_([0-2])", raw[1])
+    require(match is not None and raw == ["--crate-name", raw[1], "--crate-type=lib", "--out-dir",
+            str(out), "--emit=llvm-ir", "--target", TARGET, "-"], "AutocfgTemplate")
+    context.update(kind="NumTraitsAutocfgStdinProbe", crate_name=raw[1],
+                   prefix=match.group(1), index=int(match.group(2)))
+    return {"options": {"--crate-name": [raw[1]], "--crate-type": ["lib"], "--out-dir": [str(out)],
+                        "--emit": ["llvm-ir"], "--target": [TARGET]},
+            "codegen": {}, "inputs": ["-"], "probe": False}, context
+
+
+def capture_autocfg_stdin(call, context):
+    raw, eof = bytearray(), False
+    while len(raw) < 61:
+        block = os.read(0, 61 - len(raw))
+        if not block:
+            eof = True
+            break
+        raw.extend(block)
+    body = bytes(raw)
+    path = call / "stdin.raw"
+    with open(path, "xb") as stream:
+        stream.write(body)
+    template = next((name for name, expected in AUTOCFG_BODIES.items() if body == expected), None)
+    evidence = {"snapshot": path.name, "length": len(body), "sha256": digest(body),
+                "eof": eof, "truncated": not eof, "template": template}
+    atomic_json(call / "stdin.json", evidence)
+    require(eof and template is not None, "AutocfgStdinTemplate")
+    allowed = {0: {"EmptyStd"}, 1: {"NoStd", "TotalCmp"},
+               2: {"TotalCmp", "NoStdTotalCmp"}}
+    require(template in allowed[context["index"]], "AutocfgStdinIndex")
+    return body, evidence
+
+
 def compiler_environment(env, session, sysroot, *, probe, context=None):
     require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     expected = sysroot_loader_path(sysroot)
     kind = (context or {}).get("kind")
-    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe"}:
+    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe"} | AUTOCFG_KINDS:
         relative = "lib/rustlib/" + TARGET + "/lib"
         host_lib = Path(sysroot["root"]) / relative
         require(host_lib.is_dir() and host_lib.resolve() == host_lib
@@ -530,10 +624,14 @@ def wrapper(session_id, args):
                 "cwd_hex": os.fsencode(os.getcwd()).hex(),
                 "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()}})
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
-    parsed = parse_rustc(args[1:])
     cwd = Path.cwd().resolve()
     require(inside(cwd, session), "CompilerCwd")
-    context = invocation_context(args, parsed, os.environ, cwd, session, inv)
+    special = autocfg_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        parsed = parse_rustc(args[1:])
+        context = invocation_context(args, parsed, os.environ, cwd, session, inv)
+    else:
+        parsed, context = special
     compiler_environment(os.environ, session, inv["sysroot"], probe=parsed["probe"], context=context)
     jobserver_fds = inherited_jobserver_fds(os.environ)
     options, codegen = parsed["options"], parsed["codegen"]
@@ -543,7 +641,13 @@ def wrapper(session_id, args):
         require(options["--sysroot"] == [inv["sysroot"]["root"]], "WrongSysroot")
     target = session / "target"
     externs, package, source, outputs = [], None, None, []
-    if not parsed["probe"]:
+    stdin_bytes, stdin_evidence = None, None
+    autocfg_stdin = context["kind"] == "NumTraitsAutocfgStdinProbe"
+    if autocfg_stdin:
+        stdin_bytes, stdin_evidence = capture_autocfg_stdin(call, context)
+        outputs = [{"path": str(Path(context["out_dir"]) / (context["crate_name"] + ".ll")),
+                    "kind": "llvm-ir"}]
+    elif not parsed["probe"]:
         source = (cwd / parsed["inputs"][0]).resolve()
         manifest_dir = Path(os.environ.get("CARGO_MANIFEST_DIR", ""))
         matches = []
@@ -573,7 +677,7 @@ def wrapper(session_id, args):
         for value in codegen.get("linker", []):
             require(value in {v["path"] for v in inv["generators"].values()}, "UnpinnedLinker")
         outputs = selected_outputs(parsed, cwd, target)
-    transient = context["kind"] == "ProcMacro2FeatureProbe"
+    transient = context["kind"] == "ProcMacro2FeatureProbe" or autocfg_stdin
     record = {"state": "RecordingOnly", "kind": "TransientProbe" if transient else (
                   "Probe" if parsed["probe"] else "Compile"), "context": context,
               "argv_hex": [os.fsencode(value).hex() for value in args], "parsed": parsed,
@@ -581,9 +685,13 @@ def wrapper(session_id, args):
               "role": "Probe" if parsed["probe"] else ("Target" if "--target" in options else "Host"),
               "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()},
               "externs": externs, "declared_outputs": outputs, "compiler_sha256": file_hash(Path(args[0]))}
+    if stdin_evidence is not None:
+        record["stdin"] = stdin_evidence
     atomic_json(call / "invocation.json", record)
+    stdin_failures = []
     code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
-                        echo=True, pass_fds=jobserver_fds)
+                        echo=True, pass_fds=jobserver_fds, stdin_bytes=stdin_bytes,
+                        stdin_failures=stdin_failures)
     record["exit_code"] = code
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
@@ -611,6 +719,7 @@ def wrapper(session_id, args):
             record["outputs"].append(output)
     else:
         record["blockers"].append("CompilerFailed")
+    record["blockers"].extend(stdin_failures)
     atomic_json(call / "receipt.json", record)
     return code if code != 0 else (0 if not record["blockers"] else 2)
 
@@ -656,6 +765,50 @@ def custom_build_producer(event, receipt, hashes):
     return {"path": alias, "sha256": sha, "link_path": links[0]["path"]}
 
 
+def autocfg_graph_blockers(receipts, associations, edges):
+    """Final observed branch and actual helper edge, never inferred from directory suffixes."""
+    blockers = []
+    calls = [r for r in receipts if r.get("context", {}).get("kind") in AUTOCFG_KINDS]
+    groups = {}
+    for call in calls:
+        context = call["context"]
+        groups.setdefault((context["package_id"], context["out_dir"]), []).append(call)
+    by_id = {r["invocation_id"]: r for r in receipts}
+    for (package, out), group in groups.items():
+        try:
+            origins = [a for a in associations if a["package_id"] == package and a["out_dir"] == out]
+            require(len(origins) == 1, "AutocfgOrigin")
+            builder = origins[0]["producer_invocation"]
+            helper_edges = [e for e in edges if e["consumer"] == builder and e["name"] == "autocfg"]
+            require(len(helper_edges) == 1 and len(helper_edges[0]["producers"]) == 1, "AutocfgHelperEdge")
+            helper = by_id[helper_edges[0]["producers"][0]]
+            require(helper["kind"] == "Compile" and helper["role"] == "Host"
+                    and helper["exit_code"] == 0 and not helper["blockers"]
+                    and helper["package"] == {"id": "registry+https://github.com/rust-lang/crates.io-index#autocfg@1.5.0",
+                                              "tree": "vendor", "manifest": "autocfg/Cargo.toml"}
+                    and helper["source"] == str(Path(group[0]["context"]["manifest"]).parent / "autocfg/src/lib.rs"),
+                    "AutocfgHelperProducer")
+            versions = [r for r in group if r["context"]["kind"] == "NumTraitsAutocfgVersion"]
+            probes = [r for r in group if r["context"]["kind"] == "NumTraitsAutocfgStdinProbe"]
+            require(len(versions) == 1 and versions[0]["exit_code"] == 0 and not versions[0]["blockers"],
+                    "AutocfgVersion")
+            require(len(probes) in (2, 3) and len({r["context"]["prefix"] for r in probes}) == 1,
+                    "AutocfgBranch")
+            indexed = {r["context"]["index"]: r for r in probes}
+            require(len(indexed) == len(probes) and set(indexed) == set(range(len(probes)))
+                    and all(r["exit_code"] in (0, 1) and not r["blockers"] for r in probes), "AutocfgBranch")
+            require(indexed[0]["stdin"]["template"] == "EmptyStd", "AutocfgBranch")
+            if indexed[0]["exit_code"] == 0:
+                require(len(probes) == 2 and indexed[1]["stdin"]["template"] == "TotalCmp", "AutocfgBranch")
+            else:
+                require(len(probes) == 3 and indexed[1]["stdin"]["template"] == "NoStd", "AutocfgBranch")
+                last = "NoStdTotalCmp" if indexed[1]["exit_code"] == 0 else "TotalCmp"
+                require(indexed[2]["stdin"]["template"] == last, "AutocfgBranch")
+        except (Refusal, KeyError, TypeError) as error:
+            blockers.append("AutocfgGraph:" + str(error))
+    return blockers
+
+
 def seal_record(session, policy, cargo_exit):
     """Resolve observed graph after Cargo; this is a diagnostic seal, never issuance."""
     events, blockers = cargo_events(session / "cargo.stdout.raw")
@@ -673,12 +826,39 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("ChangedInvocationBytes:" + directory.name)
         receipts.append(receipt)
         blockers.extend(receipt["blockers"])
-    output_owners, transient_paths = {}, set()
+        if receipt.get("context", {}).get("kind") == "NumTraitsAutocfgStdinProbe":
+            try:
+                evidence = receipt["stdin"]
+                path = directory / "stdin.raw"
+                regular(path)
+                require(path.resolve() == path and path.stat().st_size <= 60, "ChangedAutocfgStdin")
+                body = path.read_bytes()
+                metadata = directory / "stdin.json"
+                regular(metadata)
+                require(metadata.resolve() == metadata, "ChangedAutocfgStdin")
+                require(evidence == strict_json(metadata.read_bytes())
+                        and evidence["snapshot"] == "stdin.raw" and evidence["eof"] is True
+                        and evidence["truncated"] is False and evidence["length"] == len(body)
+                        and evidence["sha256"] == digest(body)
+                        and AUTOCFG_BODIES.get(evidence["template"]) == body,
+                        "ChangedAutocfgStdin")
+            except (Refusal, OSError, KeyError, TypeError, ValueError):
+                blockers.append("ChangedAutocfgStdin:" + directory.name)
+    # Collect all declared transient paths before registering any ordinary output.
+    # An unsupported probe may have no output file; its declared namespace is still excluded.
+    transient_paths = {str(Path(o["path"]).resolve()) for r in receipts if r["kind"] == "TransientProbe"
+                       for o in r["declared_outputs"] + r["outputs"]}
+    output_owners, transient_collisions = {}, set()
     for receipt in receipts:
+        if receipt["kind"] != "TransientProbe":
+            collisions = {str(Path(o["path"]).resolve()) for o in receipt["declared_outputs"] + receipt["outputs"]} & transient_paths
+            if collisions:
+                blockers.extend("TransientOrdinaryOutput:" + path for path in sorted(collisions))
+                transient_collisions.add(receipt["invocation_id"])
+                continue
         for output in receipt["outputs"]:
             path = Path(output["path"])
             if receipt["kind"] == "TransientProbe":
-                transient_paths.add(str(path))
                 snapshot = session / "invocations" / receipt["invocation_id"] / output["snapshot"]
                 if (snapshot.parent != session / "invocations" / receipt["invocation_id"]
                         or snapshot.resolve() != snapshot or not snapshot.is_file()
@@ -688,9 +868,6 @@ def seal_record(session, policy, cargo_exit):
             if not path.is_file() or path.is_symlink() or file_hash(path) != output["sha256"]:
                 blockers.append("ChangedOutput:" + str(path))
             output_owners.setdefault(str(path), []).append(receipt["invocation_id"])
-    for receipt in receipts:
-        if receipt["kind"] == "TransientProbe":
-            transient_paths.update(o["path"] for o in receipt["declared_outputs"])
     artifacts, associations, selected = [], [], []
     for event in events:
         if event["reason"] != "compiler-artifact":
@@ -700,6 +877,10 @@ def seal_record(session, policy, cargo_exit):
         filename_list = event.get("filenames")
         if not isinstance(root, str) or not isinstance(filename_list, list) or not all(isinstance(f, str) for f in filename_list):
             blockers.append("IncompleteArtifactEvent"); continue
+        forbidden = [f for f in filename_list if str(Path(f).resolve()) in transient_paths]
+        if forbidden:
+            blockers.extend("TransientCargoArtifact:" + f for f in forbidden)
+            continue
         hashes = {}
         for filename in filename_list:
             path = Path(filename)
@@ -707,7 +888,8 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("InvalidCargoArtifactPath:" + filename)
             else:
                 hashes[filename] = file_hash(path)
-        candidates = [r for r in receipts if r["kind"] == "Compile" and r["source"] == str(Path(root).resolve())
+        candidates = [r for r in receipts if r["kind"] == "Compile"
+                      and r["invocation_id"] not in transient_collisions and r["source"] == str(Path(root).resolve())
                       and package_id(r["package"], session) == event.get("package_id")
                       and len(hashes) == len(filename_list) and hashes
                       and set(hashes.values()) <= {o["sha256"] for o in r["outputs"]}]
@@ -746,7 +928,7 @@ def seal_record(session, policy, cargo_exit):
         for path in Path(out_dir).rglob("*"):
             if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                 blockers.append("GeneratedNonregular:" + str(path)); continue
-            if path.is_file() and str(path) not in transient_paths:
+            if path.is_file() and str(path.resolve()) not in transient_paths:
                 generated[path.relative_to(out_dir).as_posix()] = file_hash(path)
         associations.append({"out_dir": str(Path(out_dir).resolve()), "package_id": event["package_id"],
                              "producer_invocation": producers[0]["invocation_id"],
@@ -754,7 +936,7 @@ def seal_record(session, policy, cargo_exit):
     nested_origins = []
     for receipt in receipts:
         context = receipt.get("context", {})
-        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe"}:
+        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe"} | AUTOCFG_KINDS:
             matches = [a for a in associations if a["package_id"] == context["package_id"]
                        and a["out_dir"] == context["out_dir"]]
             if len(matches) != 1:
@@ -767,14 +949,17 @@ def seal_record(session, policy, cargo_exit):
     for receipt in receipts:
         for edge in receipt["externs"]:
             producers = output_owners.get(edge["path"], [])
-            if edge["path"] in transient_paths:
+            if str(Path(edge["path"]).resolve()) in transient_paths:
                 blockers.append("TransientExtern:" + edge["path"])
                 producers = []
             if len(producers) != 1:
                 blockers.append("UnresolvedExternProducer:" + edge["path"])
             edges.append(dict(edge, consumer=receipt["invocation_id"], producers=producers))
+    blockers.extend(autocfg_graph_blockers(receipts, associations, edges))
     consumed = []
     for receipt in receipts:
+        if receipt["invocation_id"] in transient_collisions:
+            continue
         for output in receipt["outputs"]:
             for value in output.get("dep_info", {}).get("paths", []):
                 path = (Path(receipt["cwd"]) / value).resolve()

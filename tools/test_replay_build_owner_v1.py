@@ -87,20 +87,77 @@ LINT_MUTATIONS = {'empty': ['--allow='],
  'comma': ['--allow=unused,dead_code'],
  'newline': ['--allow=unused\n'],
  'separated': ['--allow', 'unused'],
- 'deny': ['--deny=unused'],
+ 'deny': ['--deny=unused=value'],
+ 'deny_empty': ['--deny='],
+ 'deny_space': ['--deny=unused name'],
+ 'deny_namespace': ['--deny=other::unused'],
+ 'deny_comma': ['--deny=unused,dead_code'],
+ 'deny_separated': ['--deny', 'unused'],
+ 'hyphen_unknown': ['--warn=clippy::unnecessary-wraps-extra'],
+ 'hyphen_path': ['--warn=clippy::or-fun-call/'],
+ 'hyphen_prefix': ['--allow=clippy::branches-sharing-code=other'],
+ 'hyphen_space': ['--deny=clippy::alloc-instead-of-core other'],
  'forbid': ['--forbid=unused'],
  'force_warn': ['--force-warn=unused'],
  'response': ['@response'],
  'unknown_codegen': ['-C', 'TEST_CODE_unknown=yes'],
  'unstable': ['-Zrandomize-layout']}
 
+WRITEABLE_LINTS = ['--warn=clippy::wildcard_dependencies', '--warn=clippy::useless_transmute', '--warn=unused_qualifications', '--warn=unused_macro_rules', '--warn=unused_lifetimes', '--warn=clippy::unnecessary-wraps', '--warn=unexpected_cfgs', '--deny=clippy::trivially_copy_pass_by_ref', '--deny=trivial_numeric_casts', '--warn=clippy::transmutes_expressible_as_ptr_casts', '--warn=clippy::transmute_undefined_repr', '--warn=clippy::transmute_ptr_to_ref', '--warn=clippy::transmute_ptr_to_ptr', '--warn=clippy::transmute_int_to_non_zero', '--warn=clippy::transmute_int_to_bool', '--warn=clippy::transmute_bytes_to_str', '--warn=clippy::todo', '--warn=clippy::same_functions_in_if_condition', '--warn=clippy::or-fun-call', '--warn=clippy::negative_feature_names', '--warn=clippy::missing_transmute_annotations', '--warn=clippy::missing_fields_in_debug', '--deny=missing_debug_implementations', '--warn=clippy::mismatching_type_param_order', '--warn=clippy::large_stack_arrays', '--warn=clippy::infinite_loop', '--warn=clippy::fn_to_numeric_cast_any', '--deny=clippy::exhaustive_structs', '--deny=clippy::exhaustive_enums', '--warn=clippy::doc_markdown', '--warn=clippy::debug_assert_with_mut_call', '--warn=clippy::dbg_macro', '--warn=clippy::crosspointer_transmute', '--warn=clippy::collection_is_never_read', '--warn=clippy::branches-sharing-code', '--warn=clippy::alloc-instead-of-core']
+
 JOBSERVER_MUTATIONS = (
     "mismatch", "reversed", "duplicate", "stdio", "negative", "overflow", "noncanonical",
     "closed", "regular", "empty", "fifo", "extra", "whitespace", "makeflags", "mflags",
 )
 
+AUTOCFG_BUILDER = r'''
+import json,os,pathlib,subprocess,sys
+out=pathlib.Path(os.environ['OUT_DIR']);out.mkdir(parents=True,exist_ok=True)
+case=os.environ['FIXTURE_AUTOCFG_CASE'];cwd=os.environ.get('FIXTURE_AUTOCFG_CWD',os.environ['CARGO_MANIFEST_DIR'])
+base=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC']]
+version=subprocess.run(base+['--version','--verbose'],cwd=cwd,stdout=subprocess.PIPE)
+if version.returncode: sys.exit(version.returncode)
+bodies=[b'',b'#![no_std]',b'pub fn probe() { let _ = 1f64.total_cmp(&2f64); }']
+count=0
+prefix='0123456789abcdef'
+def probe(body):
+    global count
+    index=count;count+=1
+    name='autocfg_'+prefix+'_'+str(index)
+    if case=='bad_index' and index==0:name='autocfg_'+prefix+'_3'
+    if case=='bad_hex' and index==0:name='autocfg_TEST_CODE_0'
+    if case=='mixed_prefix' and index==1:name='autocfg_fedcba9876543210_1'
+    if case=='duplicate_index' and index==1:name='autocfg_'+prefix+'_0';body=b''
+    command=base+['--crate-name',name,'--crate-type=lib','--out-dir',str(out),'--emit=llvm-ir','--target','x86_64-apple-darwin','-']
+    if index==0:
+        if case=='body':body=b'fn main(){}'
+        if case=='newline':body=b'\n'
+        if case=='nul':body=b'\0'
+        if case=='oversize':body=b'X'*61
+        if case=='extra':command.append('--edition=2021')
+        if case=='native':command.append('-lTEST_CODE')
+        if case=='target_arg':command[-2]='TEST_CODE'
+        if case=='emit':command[-4]='--emit=metadata'
+    result=subprocess.run(command,input=body,cwd=cwd,stdout=subprocess.PIPE)
+    with open(os.environ['FIXTURE_AUTOCFG_STATUS'],'a') as log:log.write(json.dumps({'name':name,'body_hex':body.hex(),'code':result.returncode})+'\n')
+    if result.returncode==0:
+        try:(out/(name+'.ll')).unlink()
+        except FileNotFoundError:pass
+    if result.returncode not in (0,1):sys.exit(result.returncode)
+    return result.returncode
+std=probe(bodies[0])
+if std==0:
+    if case=='wrong_branch':probe(bodies[1])
+    else:probe(bodies[2])
+else:
+    no_std=probe(bodies[1])
+    probe((b'#![no_std]\n' if no_std==0 else b'')+bodies[2])
+(out/'generated.rs').write_text('pub const TEST_CODE_AUTOCFG: u8 = 1;')
+'''
+
 FAKE_RUSTC = r'''
 import errno, fcntl, json, os, pathlib, stat, sys
+AUTOCFG_BUILDER=__AUTOCFG_BUILDER__
 args=sys.argv[1:]
 hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
 if args==['-vV']:
@@ -111,6 +168,27 @@ def value(key):
 if args==['--version']:
     (hits/'nested-version').write_text('entered');print('TEST_CODE_nested_version')
     sys.exit(int(os.environ.get('FIXTURE_VERSION_EXIT','0')))
+
+if args==['--version','--verbose']:
+    (hits/'autocfg-version').write_text('entered')
+    print('rustc TEST_CODE\nrelease: 1.95.0')
+    sys.exit(int(os.environ.get('FIXTURE_AUTOCFG_VERSION_EXIT','0')))
+if args and args[-1]=='-' and '--emit=llvm-ir' in args:
+    name=value('--crate-name');index=int(name.rsplit('_',1)[1]);body=sys.stdin.buffer.read()
+    assert stat.S_ISFIFO(os.fstat(0).st_mode)
+    (hits/('autocfg-'+str(index))).write_bytes(body)
+    codes=json.loads(os.environ.get('FIXTURE_AUTOCFG_CODES','[0,0,0]'));code=codes[index]
+    out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True);output=out/(name+'.ll')
+    if not os.environ.get('FIXTURE_AUTOCFG_MISSING') and (code==0 or os.environ.get('FIXTURE_AUTOCFG_FAILED_OUTPUT')):
+        output.write_bytes(b'TEST_CODE_LL:'+name.encode()+b':'+body)
+    if os.environ.get('FIXTURE_AUTOCFG_SYMLINK'):
+        if output.exists():output.unlink()
+        output.symlink_to(pathlib.Path(os.environ['CARGO_MANIFEST_DIR'])/'build.rs')
+    print('X'*70000)
+    print(json.dumps({'fixture_argv':args,'stdin_hex':body.hex(),'pipe':True}),file=sys.stderr)
+    if os.environ.get('FIXTURE_AUTOCFG_SIGNAL'):os.kill(os.getpid(),9)
+    sys.exit(code)
+
 if '--cfg=procmacro2_build_probe' in args:
     source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
     (hits/('nested-'+source.stem)).write_text('entered')
@@ -153,10 +231,16 @@ for command in json.loads(os.environ.get('FIXTURE_NESTED_COMMANDS','[]')):
     if command[-1]=='--version' and result.returncode: sys.exit(result.returncode)
     if command[-1]!='--version' and result.returncode not in (0,1): sys.exit(result.returncode)
 """)
+    if os.environ.get('FIXTURE_BUILD_AUTOCFG'):
+        executable.write_text("#!"+sys.executable+chr(10)+AUTOCFG_BUILDER)
     executable.chmod(0o700)
 else:
     for suffix in ['.rmeta','.rlib']:
         (out/('lib'+name+suffix)).write_bytes(name.encode()+b':'+body)
+    for emit in value('--emit').split(','):
+        if emit.startswith('link='):
+            explicit=pathlib.Path(emit.split('=',1)[1]);explicit.parent.mkdir(parents=True,exist_ok=True)
+            explicit.write_bytes((out/('lib'+name+'.rlib')).read_bytes())
 inputs=[str(source)]
 if name=='stock_analysis': inputs.append(str(pathlib.Path(os.environ['OUT_DIR'])/os.environ.get('FIXTURE_GENERATED_NAME','generated.rs')))
 def escape(x): return x.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
@@ -231,7 +315,10 @@ def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
         if MODE.startswith('forbidden_'): env[MODE[len('forbidden_'):]]='/TEST_CODE_FOREIGN'
     env.update(env_extra or {})
     command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition','2021','--crate-type',kind,'--emit','dep-info,link' if kind=='bin' else 'dep-info,metadata,link','--out-dir',str(out),*extra,str(root)]
+    if name=='stock_analysis' and env.get('FIXTURE_ORDINARY_REUSE'):
+        command[command.index('--emit')+1]='dep-info,link='+env['FIXTURE_ORDINARY_REUSE']
     if MODE=='wrong_sysroot' and name=='dep': command[2:2]=['--sysroot','/TEST_CODE_wrong_sysroot']
+    if MODE=='writeable_lints': command[2:2]=__WRITEABLE_LINTS__
     if MODE=='lint_equals':
         command[2:2]=LINTS[name]+(['--target','x86_64-apple-darwin'] if name=='stock_analysis' else [])
     if MODE.startswith('lint_invalid:') and name=='dep': command[2:2]=ARG_CASES[MODE.split(':',1)[1]]
@@ -241,6 +328,10 @@ def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
     if kind=='bin':
         alias=out/'build-script-build';shutil.copy2(out/name,alias);files=[str(alias)];executable=str(alias)
     else: files=[str(out/('lib'+name+'.rlib')),str(out/('lib'+name+'.rmeta'))];executable=None
+    if name=='stock_analysis' and env.get('FIXTURE_ARTIFACT_ALIAS'):
+        alias=pathlib.Path(env['FIXTURE_ARTIFACT_ALIAS']);alias.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copy2(out/('lib'+name+'.rlib'),alias)
+        files=[env['FIXTURE_ARTIFACT_ALIAS']]
     if MODE.startswith('nested:') and kind=='bin':
         event_executable=None
         if MODE=='nested:nonnull_mismatch': event_executable=str(out/'TEST_CODE_wrong')
@@ -332,8 +423,14 @@ if MODE.startswith('nested:'):
     out=target/'x86_64-apple-darwin/debug/build/TEST_CODE_output_libc/out'
     generated_name='private.rs'
     if case=='transient_consumed': out=probe.parent;generated_name='probe/libproc_macro2.rmeta'
+    final_env={'OUT_DIR':str(out),'FIXTURE_GENERATED_NAME':generated_name}
+    if case in ('artifact_alias','artifact_alias_dot','ordinary_alias','unsupported_artifact_alias','unsupported_ordinary_alias','nontransient_alias'):
+        reused=target/'debug/build/TEST_CODE_output_proc-macro2/out/probe/libproc_macro2.rmeta'
+        alias=str(target/'TEST_CODE_legitimate_alias') if case=='nontransient_alias' else str(reused)
+        if case=='artifact_alias_dot':alias=str(reused.parent)+'/./'+reused.name
+        final_env['FIXTURE_ORDINARY_REUSE' if 'ordinary' in case else 'FIXTURE_ARTIFACT_ALIAS']=alias
     compile('stock_analysis',app/'src/lib.rs',app,'rlib','TEST_CODE_app',target/'deps',
-            extra=['--target','x86_64-apple-darwin']+(['--extern','probe='+str(probe/'libproc_macro2.rmeta')] if case=='transient_extern' else []),env_extra={'OUT_DIR':str(out),'FIXTURE_GENERATED_NAME':generated_name})
+            extra=['--target','x86_64-apple-darwin']+(['--extern','probe='+str(probe/'libproc_macro2.rmeta')] if case=='transient_extern' else []),env_extra=final_env)
     if case in ('snapshot_tamper','snapshot_missing'):
         snapshot=next((session/'invocations').glob('*/probe-output-*.raw'))
         if case=='snapshot_tamper': snapshot.write_bytes(b'TEST_CODE_CHANGED')
@@ -341,6 +438,61 @@ if MODE.startswith('nested:'):
     emit({'reason':'build-finished','success':True});sys.exit(0)
 '''
 
+
+AUTOCFG_CARGO_FLOW = r'''
+if MODE.startswith('autocfg:'):
+    case=MODE.split(':',1)[1]
+    package='registry+https://github.com/rust-lang/crates.io-index#num-traits@0.2.19'
+    helper_package='registry+https://github.com/rust-lang/crates.io-index#autocfg@1.5.0'
+    root=session/'vendor/num-traits';helper=session/'vendor/autocfg'
+    compile('autocfg',helper/'src/lib.rs',helper,'rlib',helper_package,target/'debug/deps')
+    helper_path=target/'debug/deps/libautocfg.rlib'
+    extras=[] if case=='missing_helper' else ['--extern','autocfg='+str(helper_path)]
+    if case=='wrong_helper':
+        compile('dep',session/'vendor/dep/src/lib.rs',session/'vendor/dep','rlib','TEST_CODE_dep',target/'deps')
+        extras=['--extern','autocfg='+str(target/'deps/libdep.rlib')]
+    builder=compile('build_script_build',root/'build.rs',root,'bin',package,target/'debug/build/TEST_CODE_numtraits_builder',extra=extras,env_extra={'FIXTURE_BUILD_AUTOCFG':'1'})
+    out=target/'x86_64-apple-darwin/debug/build/TEST_CODE_numtraits_output/out';out.mkdir(parents=True)
+    hostlib=str(pathlib.Path(sysroot_lib)/'rustlib/x86_64-apple-darwin/lib')
+    loader=':'.join([str(target/'debug'),str(target/'debug/deps'),hostlib,sysroot_lib])
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_PKG_NAME='num-traits',HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',OUT_DIR=str(out),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),FIXTURE_AUTOCFG_CASE=case,FIXTURE_AUTOCFG_CWD=str(root),FIXTURE_AUTOCFG_STATUS=str(session/'autocfg-status.jsonl'))
+    codes={'nostd':[1,0,0],'neither':[1,1,1],'expr_unsupported':[0,1,0],'exit2':[2,0,0],
+           'unsupported_artifact_alias':[0,1,0],'unsupported_ordinary_alias':[0,1,0]}
+    env['FIXTURE_AUTOCFG_CODES']=json.dumps(codes.get(case,[0,0,0]))
+    if case=='version_failure':env['FIXTURE_AUTOCFG_VERSION_EXIT']='1'
+    if case=='signal':env['FIXTURE_AUTOCFG_SIGNAL']='1'
+    if case=='symlink':env['FIXTURE_AUTOCFG_SYMLINK']='1'
+    if case=='missing_output':env['FIXTURE_AUTOCFG_MISSING']='1'
+    if case=='neither':env['FIXTURE_AUTOCFG_FAILED_OUTPUT']='1'
+    if case=='loader':env['DYLD_FALLBACK_LIBRARY_PATH']=loader+':/TEST_CODE'
+    if case in ('package','manifest','target_env','outdir'):
+        key={'package':'CARGO_PKG_NAME','manifest':'CARGO_MANIFEST_DIR','target_env':'TARGET','outdir':'OUT_DIR'}[case]
+        env[key]=str(target/'TEST_CODE_other') if case=='outdir' else 'TEST_CODE'
+    if case=='cwd':env['FIXTURE_AUTOCFG_CWD']=str(app)
+    result=subprocess.run([builder],env=env)
+    if result.returncode:emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+    event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'cfgs':[],'env':[],'linked_libs':[],'linked_paths':[]}
+    if case!='missing_origin':emit(event)
+    extra=['--target','x86_64-apple-darwin'];generated='generated.rs'
+    if case in ('transient_extern','transient_consumed'):
+        probe=out/'autocfg_0123456789abcdef_0.ll';probe.write_bytes(b'TEST_CODE_RECREATED')
+        if case=='transient_extern':extra+=['--extern','probe='+str(probe)]
+        else:generated=probe.name
+    final_env={'OUT_DIR':str(out),'FIXTURE_GENERATED_NAME':generated}
+    if case in ('artifact_alias','artifact_alias_dot','ordinary_alias','unsupported_artifact_alias','unsupported_ordinary_alias','nontransient_alias'):
+        reused=out/('autocfg_0123456789abcdef_'+('1' if case.startswith('unsupported') else '0')+'.ll')
+        alias=str(target/'TEST_CODE_legitimate_alias') if case=='nontransient_alias' else str(reused)
+        if case=='artifact_alias_dot':alias=str(reused.parent)+'/./'+reused.name
+        final_env['FIXTURE_ORDINARY_REUSE' if 'ordinary' in case else 'FIXTURE_ARTIFACT_ALIAS']=alias
+    compile('stock_analysis',app/'src/lib.rs',app,'rlib','TEST_CODE_app',target/'deps',extra=extra,env_extra=final_env)
+    if case in ('stdin_tamper','stdin_missing','stdin_meta','snapshot_tamper','snapshot_missing'):
+        pattern='*/probe-output-*.raw' if case.startswith('snapshot') else '*/stdin.raw'
+        path=next((session/'invocations').glob(pattern))
+        if case.endswith('missing'):path.unlink()
+        elif case=='stdin_meta':path.with_name('stdin.json').write_text('{}')
+        else:path.write_bytes(b'TEST_CODE_CHANGED')
+    emit({'reason':'build-finished','success':True});sys.exit(0)
+'''
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -387,7 +539,7 @@ class RecordingProtocolTests(unittest.TestCase):
         write(vendor / "dep/.cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
         sysroot = self.root / "sysroot"
         write(sysroot / "lib/test.bin", "TEST_CODE_SYSROOT")
-        if mode.startswith("nested:"):
+        if mode.startswith(("nested:", "autocfg:")):
             write(sysroot / "lib/rustlib/x86_64-apple-darwin/lib/test.bin", "TEST_CODE_HOST_SYSROOT")
             for name, version in (("libc", "0.2.184"), ("proc-macro2", "1.0.106")):
                 write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
@@ -395,9 +547,15 @@ class RecordingProtocolTests(unittest.TestCase):
                 for probe in ("proc_macro_span", "proc_macro_span_file", "proc_macro_span_location"):
                     write(vendor / name / ("src/probe/" + probe + ".rs"), "// TEST_CODE " + probe + "\n")
 
-        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC)
-        cargo_source = FAKE_CARGO.replace("compile('dep',session/", NESTED_CARGO_FLOW + "\ncompile('dep',session/", 1)
-        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_source.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)))
+        if mode.startswith("autocfg:"):
+            for name, version in (("num-traits", "0.2.19"), ("autocfg", "1.5.0")):
+                write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+                write(vendor / name / "build.rs", "// TEST_CODE autocfg generator\n")
+                for source in ("lib.rs", "rustc.rs", "version.rs"):
+                    write(vendor / name / "src" / source, "// TEST_CODE " + name + " " + source + "\n")
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC.replace("__AUTOCFG_BUILDER__", repr(AUTOCFG_BUILDER)))
+        cargo_source = FAKE_CARGO.replace("compile('dep',session/", NESTED_CARGO_FLOW + AUTOCFG_CARGO_FLOW + "\ncompile('dep',session/", 1)
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_source.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)).replace("__WRITEABLE_LINTS__", repr(WRITEABLE_LINTS)))
         rustc.chmod(0o700); cargo.chmod(0o700)
         def pin(path): return {"path": str(path), "sha256": sha(path)}
         inventory = {"owner_sha256": sha(self.tool), "cargo": pin(cargo), "rustc": pin(rustc),
@@ -414,6 +572,11 @@ class RecordingProtocolTests(unittest.TestCase):
             inventory["packages"].extend({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
                                            "tree": "vendor", "manifest": name + "/Cargo.toml"}
                                           for name, version in (("libc", "0.2.184"), ("proc-macro2", "1.0.106")))
+        if mode.startswith("autocfg:"):
+            inventory["vendor"] = snapshot(vendor, ["dep", "num-traits", "autocfg"])
+            inventory["packages"].extend({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                                          for name, version in (("num-traits", "0.2.19"), ("autocfg", "1.5.0")))
         self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
         return inventory
 
@@ -843,6 +1006,160 @@ class RecordingProtocolTests(unittest.TestCase):
             with self.assertRaises(owner.Refusal):
                 owner.custom_build_producer(event, dict(base, **change), {"/TEST_CODE/alias": "TEST_CODE_SHA"})
 
+
+    def autocfg_result(self, case="normal", status=0):
+        self.prepare("autocfg:" + case)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def test_autocfg_actual_stdin_pipe_and_success_branch(self):
+        session, record, receipts = self.autocfg_result()
+        probes = sorted(((p, r) for p, r in receipts if r["context"]["kind"] == "NumTraitsAutocfgStdinProbe"),
+                        key=lambda pair: pair[1]["context"]["index"])
+        self.assertEqual(len(probes), 2)
+        self.assertEqual([r["stdin"]["template"] for _, r in probes], ["EmptyStd", "TotalCmp"])
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["nested_origins"]), 3)
+        self.assertEqual(len(record["selected_library"]), 1)
+        for path, receipt in probes:
+            evidence = receipt["stdin"]; body = (path.parent / "stdin.raw").read_bytes()
+            self.assertEqual(body, owner.AUTOCFG_BODIES[evidence["template"]])
+            self.assertEqual(sha(path.parent / "stdin.raw"), evidence["sha256"])
+            self.assertTrue(evidence["eof"]); self.assertFalse(evidence["truncated"])
+            observed = json.loads((path.parent / "stderr.raw").read_text())
+            self.assertTrue(observed["pipe"])
+            self.assertEqual(observed["stdin_hex"], body.hex())
+            self.assertEqual(observed["fixture_argv"], [bytes.fromhex(a).decode() for a in receipt["argv_hex"]][1:])
+            self.assertGreater((path.parent / "stdout.raw").stat().st_size, 65536)
+            self.assertEqual(len(receipt["outputs"]), 1)
+            output = receipt["outputs"][0]
+            self.assertEqual(output["kind"], "llvm-ir")
+            self.assertFalse(Path(output["path"]).exists())
+            self.assertEqual(sha(path.parent / output["snapshot"]), output["sha256"])
+        self.assertTrue(any(e["name"] == "autocfg" and len(e["producers"]) == 1 for e in record["extern_edges"]))
+
+    def test_autocfg_supported_and_unsupported_closed_branches(self):
+        for case, templates, codes in (
+            ("nostd", ["EmptyStd", "NoStd", "NoStdTotalCmp"], [1, 0, 0]),
+            ("neither", ["EmptyStd", "NoStd", "TotalCmp"], [1, 1, 1]),
+            ("expr_unsupported", ["EmptyStd", "TotalCmp"], [0, 1]),
+        ):
+            with self.subTest(case=case):
+                _, record, receipts = self.autocfg_result(case)
+                probes = sorted((r for _, r in receipts if r["context"]["kind"] == "NumTraitsAutocfgStdinProbe"),
+                                key=lambda r: r["context"]["index"])
+                self.assertEqual([r["stdin"]["template"] for r in probes], templates)
+                self.assertEqual([r["exit_code"] for r in probes], codes)
+                self.assertEqual(record["blockers"], [])
+                if case == "expr_unsupported": self.assertEqual(probes[-1]["outputs"], [])
+                if case == "neither": self.assertTrue(all(len(r["outputs"]) == 1 for r in probes))
+
+    def test_autocfg_refuses_unapproved_bytes_and_context_before_compiler(self):
+        cases = ("body", "newline", "nul", "oversize", "bad_index", "bad_hex", "extra", "native", "target_arg",
+                 "emit", "loader", "package", "manifest", "target_env", "outdir", "cwd")
+        for case in cases:
+            with self.subTest(case=case):
+                session, record, _ = self.autocfg_result(case, 2)
+                self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+                self.assertFalse(any(p.name.startswith("autocfg-") and p.name != "autocfg-version"
+                                     for p in (session / "compiler-entry").iterdir()))
+                rejected = [p for p in (session / "invocations").iterdir() if not (p / "receipt.json").exists()]
+                self.assertEqual(len(rejected), 1)
+                self.assertTrue((rejected[0] / "request.json").is_file())
+                self.assertFalse((rejected[0] / "invocation.json").exists())
+                if case == "oversize":
+                    evidence = json.loads((rejected[0] / "stdin.json").read_text())
+                    self.assertEqual((rejected[0] / "stdin.raw").read_bytes(), b"X" * 61)
+                    self.assertEqual(evidence["length"], 61)
+                    self.assertTrue(evidence["truncated"]); self.assertFalse(evidence["eof"])
+
+    def test_autocfg_evidence_and_transient_authority_fail_closed(self):
+        for case, blocker in (("stdin_tamper", "ChangedAutocfgStdin:"), ("stdin_missing", "ChangedAutocfgStdin:"),
+                              ("stdin_meta", "ChangedAutocfgStdin:"), ("snapshot_tamper", "ChangedTransientEvidence:"),
+                              ("snapshot_missing", "ChangedTransientEvidence:"), ("missing_output", "MissingDeclaredOutput:"),
+                              ("symlink", "TransientEvidence:"), ("exit2", "CompilerFailed"),
+                              ("signal", "CompilerFailed"), ("version_failure", "CompilerFailed"),
+                              ("transient_extern", "TransientExtern:"), ("transient_consumed", "TransientConsumedSource:")):
+            with self.subTest(case=case):
+                _, record, receipts = self.autocfg_result(case, 2)
+                self.assertTrue(any(b.startswith(blocker) for b in record["blockers"]), record["blockers"])
+                if case == "exit2": self.assertTrue(any(r["exit_code"] == 2 for _, r in receipts))
+                if case == "signal": self.assertTrue(any(r["exit_code"] == -9 for _, r in receipts))
+
+    def test_autocfg_branch_and_actual_helper_origin_must_join(self):
+        for case in ("mixed_prefix", "duplicate_index", "wrong_branch", "missing_helper", "wrong_helper", "missing_origin"):
+            with self.subTest(case=case):
+                _, record, _ = self.autocfg_result(case, 2)
+                self.assertTrue(any(b.startswith("AutocfgGraph:") for b in record["blockers"]), record["blockers"])
+
+    def test_writeable_reached_deny_and_hyphen_lints_preserve_original_argv(self):
+        self.prepare("writeable_lints")
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        self.assertEqual(record["blockers"], [])
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        count = 0
+        for path in (session / "invocations").glob("*/receipt.json"):
+            receipt = json.loads(path.read_text())
+            if receipt["kind"] != "Compile": continue
+            args = [bytes.fromhex(a).decode() for a in receipt["argv_hex"]][1:]
+            observed = json.loads((path.parent / "stderr.raw").read_text())
+            self.assertEqual(observed["fixture_argv"], args)
+            self.assertEqual(args[:len(WRITEABLE_LINTS)], WRITEABLE_LINTS)
+            count += 1
+        self.assertEqual(count, 3)
+        for bad in ("--deny=", "--deny=unused=value", "--deny=other::lint", "--deny=unused,dead_code",
+                    "--warn=clippy::unnecessary-wraps-extra", "--warn=clippy::or-fun-call/", "--forbid=unused"):
+            with self.subTest(argument=bad), self.assertRaises(owner.Refusal):
+                owner.parse_rustc([bad])
+
+    def test_transient_declared_paths_cannot_reenter_ordinary_or_selected_authority(self):
+        cases = (("autocfg", "artifact_alias"), ("autocfg", "artifact_alias_dot"),
+                 ("autocfg", "ordinary_alias"), ("autocfg", "unsupported_artifact_alias"),
+                 ("autocfg", "unsupported_ordinary_alias"), ("nested", "artifact_alias"),
+                 ("nested", "ordinary_alias"))
+        for family, case in cases:
+            with self.subTest(family=family, case=case):
+                result = self.autocfg_result(case, 2) if family == "autocfg" else self.nested_result(case, 2)
+                session, record, receipts = result
+                prefix = "TransientOrdinaryOutput:" if "ordinary" in case else "TransientCargoArtifact:"
+                self.assertTrue(any(b.startswith(prefix) for b in record["blockers"]), record["blockers"])
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(record["selected_library"], [])
+                self.assertFalse(any(b.startswith(("CargoDidNotFinish", "ChangedOutput:", "IncompleteInvocation:",
+                                                  "UnresolvedBuildScriptProducer", "UnresolvedNestedOrigin:", "AutocfgGraph:"))
+                                     for b in record["blockers"]), record["blockers"])
+                transient = {o["path"] for _, r in receipts if r["kind"] == "TransientProbe" for o in r["declared_outputs"]}
+                app = next(r for _, r in receipts if r["kind"] == "Compile" and r["source"] == str(session / "application/src/lib.rs"))
+                self.assertEqual(app["exit_code"], 0)
+                self.assertEqual(app["blockers"], [])
+                events = [json.loads(line) for line in (session / "cargo.stdout.raw").read_text().splitlines()]
+                event = next(e for e in events if e["reason"] == "compiler-artifact" and e["target"]["src_path"] == app["source"])
+                if "ordinary" in case:
+                    reused = next(o["path"] for o in app["outputs"] if o["path"] in transient)
+                    self.assertTrue(all(sha(Path(f)) in {o["sha256"] for o in app["outputs"]} for f in event["filenames"]))
+                else:
+                    reused = str(Path(event["filenames"][0]).resolve())
+                    self.assertIn(reused, transient)
+                    self.assertIn(sha(Path(reused)), {o["sha256"] for o in app["outputs"]})
+                if case.startswith("unsupported") or family == "nested":
+                    self.assertTrue(any(r["kind"] == "TransientProbe" and r["exit_code"] == 1
+                                        and reused in {o["path"] for o in r["declared_outputs"]}
+                                        and reused not in {o["path"] for o in r["outputs"]} for _, r in receipts))
+                self.assertFalse(any(e["path"] in transient and e["producers"] for e in record["extern_edges"]))
+                self.assertFalse(any(c["path"] in transient for c in record["consumed_sources"]))
+                self.assertFalse(any(str(Path(a["out_dir"]) / name) in transient
+                                     for a in record["build_script_associations"] for name in a["generated_files"]))
+        for family in ("autocfg", "nested"):
+            with self.subTest(nontransient_alias=family):
+                session, record, _ = self.autocfg_result("nontransient_alias") if family == "autocfg" else self.nested_result("nontransient_alias")
+                self.assertEqual(record["blockers"], [])
+                self.assertEqual(record["selected_library"][0]["files"], [str(session / "target/TEST_CODE_legitimate_alias")])
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:
