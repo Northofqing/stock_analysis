@@ -294,3 +294,59 @@ fn wg07_review_fix_i2_event_discriminator_precedes_owned_decode() {
     );
     EVENT_OWNED_DECODE_HITS.with(|hits| assert_eq!(hits.get(), 1));
 }
+
+#[tokio::test]
+async fn wg07_review_fix2_rehashed_no_changes_reopen_rejects_before_owned_decode() {
+    use crate::data_gateway::ordinary_daily_change_window::tests::{
+        empty_reply, oversized_stored_proofs, reset_stored_decode_hits, stored_decode_hits,
+    };
+    let q = acquire_fixture(empty_reply).await;
+    assert!(q.candidates().is_empty());
+    let mut cases = vec![(q.proof().clone(), [1, 1, 1, 1])];
+    cases.extend(oversized_stored_proofs(q.proof()));
+    for (index, (proof, expected_hits)) in cases.into_iter().enumerate() {
+        let (_dir, path) = database();
+        let mut conn = window::open_existing(&path, false).unwrap();
+        let state = load(&mut conn).unwrap();
+        let (request_identity, proof_identity, acquisition_identity) =
+            window::proof_identities(&proof).unwrap();
+        let receipt = PreparedWindowReceipt {
+            request_identity: request_identity.clone(),
+            proof_identity: proof_identity.clone(),
+            acquisition_identity: acquisition_identity.clone(),
+            window_status: WindowStatus::NoChanges,
+            candidates: Vec::new(),
+        };
+        let window_id = format!("br171_window_{acquisition_identity}");
+        let event = Event::WindowObservation {
+            window_id: window_id.clone(),
+            request_identity: request_identity.clone(),
+            proof_identity,
+            acquisition_identity: acquisition_identity.clone(),
+            observed_at: proof.frozen.invoked_at,
+            proof,
+            receipt,
+        };
+        append_identity(
+            &mut conn,
+            &state,
+            &window_id,
+            1,
+            &format!("window:{request_identity}"),
+            "Observation",
+            &format!("window:{acquisition_identity}"),
+            &event,
+        )
+        .unwrap();
+        assert_eq!(rows(&mut conn), 1);
+        drop(conn);
+        let mut reopened = window::open_existing(&path, true).unwrap();
+        reset_stored_decode_hits();
+        let result = load(&mut reopened);
+        assert_eq!(result.is_ok(), index == 0, "case {index}");
+        assert_eq!(stored_decode_hits(), expected_hits, "case {index}");
+        if let Ok(state) = result {
+            assert_eq!(state.windows.len(), 1);
+        }
+    }
+}

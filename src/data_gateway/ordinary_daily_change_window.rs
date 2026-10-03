@@ -276,6 +276,16 @@ pub(crate) fn proof_identities(proof: &CompleteWindowProof) -> c::Result<(String
 #[cfg(test)]
 thread_local! {
     static REPLAY_RESPONSE_DECODE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Health, Capabilities, request canonical, request generated owned calls.
+    static REPLAY_STORED_DECODE_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+#[cfg(test)]
+fn stored_decode_hit(index: usize) {
+    REPLAY_STORED_DECODE_HITS.with(|hits| {
+        let mut counts = hits.get();
+        counts[index] += 1;
+        hits.set(counts);
+    });
 }
 /// Reconstruct recorded facts without minting live transport authority. Used by
 /// strict ledger replay; it does not call public acquisition or perform I/O.
@@ -306,9 +316,22 @@ pub(crate) fn inspect_proof(proof: &CompleteWindowProof) -> c::Result<c::Interpr
         &proof.connection.descriptor_sha256,
     )
     .map_err(|_| c::failure(FailureKind::ConnectionQualification, "descriptor"))?;
+    use crate::grpc_client::external_query_transport::{
+        preflight_window_stored, WindowStoredMessage,
+    };
+    let health_bytes = unhex(&proof.health_hex, c::PROOF_LIMIT)?;
+    preflight_window_stored(WindowStoredMessage::HealthResponse, &health_bytes).map_err(|_| {
+        c::failure(
+            FailureKind::ConnectionQualification,
+            "health resource preflight",
+        )
+    })?;
+    #[cfg(test)]
+    stored_decode_hit(0);
     let health = decoder
-        .health(&unhex(&proof.health_hex, c::PROOF_LIMIT)?)
+        .health(&health_bytes)
         .map_err(|_| c::failure(FailureKind::ConnectionQualification, "health bytes"))?;
+    drop(health_bytes);
     let trust = crate::grpc_client::build_identity::BuildIdentityTrust::bundled()
         .map_err(|_| c::failure(FailureKind::ConnectionQualification, "recorded trust"))?;
     trust
@@ -323,18 +346,40 @@ pub(crate) fn inspect_proof(proof: &CompleteWindowProof) -> c::Result<c::Interpr
                 "recorded Health identity",
             )
         })?;
+    let caps_bytes = unhex(&proof.capabilities_hex, c::PROOF_LIMIT)?;
+    preflight_window_stored(WindowStoredMessage::CapabilitiesResponse, &caps_bytes).map_err(
+        |_| {
+            c::failure(
+                FailureKind::CapabilityUnavailable,
+                "capabilities resource preflight",
+            )
+        },
+    )?;
+    #[cfg(test)]
+    stored_decode_hit(1);
     let caps = decoder
-        .capabilities(&unhex(&proof.capabilities_hex, c::PROOF_LIMIT)?)
+        .capabilities(&caps_bytes)
         .map_err(|_| c::failure(FailureKind::CapabilityUnavailable, "capabilities bytes"))?;
+    drop(caps_bytes);
     crate::grpc_client::client::external_historical_read::require_window_capability(
         &caps.capabilities,
         &p,
     )
     .map_err(|_| c::failure(FailureKind::CapabilityUnavailable, "exact capability"))?;
     let request_bytes = unhex(&proof.request_hex, c::MIB)?;
+    preflight_window_stored(WindowStoredMessage::QueryRequest, &request_bytes).map_err(|_| {
+        c::failure(
+            FailureKind::RequestBindingMismatch,
+            "request resource preflight",
+        )
+    })?;
+    #[cfg(test)]
+    stored_decode_hit(2);
     decoder
         .query_request(&request_bytes)
         .map_err(|_| c::failure(FailureKind::RequestBindingMismatch, "request wire"))?;
+    #[cfg(test)]
+    stored_decode_hit(3);
     let request = crate::grpc_client::external_pb::magic::market::v1::QueryRequest::decode(
         request_bytes.as_slice(),
     )

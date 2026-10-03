@@ -771,6 +771,124 @@ impl tonic::codec::Decoder for WindowDecoder {
             .map_err(|_| tonic::Status::data_loss("WG07 protobuf"))
     }
 }
+/// Closed WG07 stored-proof messages; this does not select an RPC or decoder.
+#[derive(Clone, Copy)]
+pub(crate) enum WindowStoredMessage {
+    QueryRequest,
+    HealthResponse,
+    CapabilitiesResponse,
+}
+#[derive(Clone, Copy)]
+enum StoredShape {
+    Request,
+    Context,
+    Payload,
+    Health,
+    BuildIdentity,
+    Observability,
+    Capabilities,
+    Capability,
+}
+#[derive(Clone, Copy)]
+enum StoredField {
+    Number,
+    Scalar,
+    Message(StoredShape),
+    Json,
+    Unknown,
+}
+impl StoredShape {
+    fn field(self, tag: u32) -> StoredField {
+        use StoredField::*;
+        use StoredShape::*;
+        // Current and the two explicitly archived decoder layouts share these
+        // field numbers. Descriptor/canonical acceptance remains decoder-owned.
+        match (self, tag) {
+            (Request, 1) => Message(Context),
+            (Request, 2) => Scalar,
+            (Request, 3) => Message(Payload),
+            (Request, 4) | (Context, 1) | (Payload, 2) => Number,
+            (Context, 2) | (Payload, 1 | 3) => Scalar,
+            (Payload, 4) => Json,
+            (Health, 1 | 4) => Scalar,
+            (Health, 2 | 3) => Number,
+            (Health, 5) => Message(Observability),
+            (Health, 6) => Message(BuildIdentity),
+            (BuildIdentity, 1..=5) => Scalar,
+            (Observability, 1..=15) => Number,
+            (Capabilities, 1) => Scalar,
+            (Capabilities, 2) => Message(Capability),
+            (Capability, 1..=3 | 7) => Number,
+            (Capability, 4..=6) => Scalar,
+            _ => Unknown,
+        }
+    }
+}
+/// Borrowed resource checks before the existing canonical owned decoders.
+/// Known nesting is finite; capability count is constrained only by byte budget.
+pub(crate) fn preflight_window_stored(
+    message: WindowStoredMessage,
+    bytes: &[u8],
+) -> Result<(), GrpcError> {
+    use crate::data_gateway::ordinary_daily_change_window_contract::{MIB, PROOF_LIMIT};
+    let (shape, limit) = match message {
+        WindowStoredMessage::QueryRequest => (StoredShape::Request, MIB),
+        WindowStoredMessage::HealthResponse => (StoredShape::Health, PROOF_LIMIT),
+        WindowStoredMessage::CapabilitiesResponse => (StoredShape::Capabilities, PROOF_LIMIT),
+    };
+    if bytes.len() > limit {
+        return Err(wire_error("ordinary_window_stored_message_limit"));
+    }
+    preflight_stored_fields(shape, bytes)
+}
+fn preflight_stored_fields(shape: StoredShape, mut bytes: &[u8]) -> Result<(), GrpcError> {
+    while !bytes.is_empty() {
+        let (tag, wire) =
+            decode_key(&mut bytes).map_err(|_| wire_error("ordinary_window_stored_wire"))?;
+        let field = shape.field(tag);
+        match field {
+            StoredField::Number if wire != WireType::Varint => {
+                return Err(wire_error("ordinary_window_stored_numeric_wire"));
+            }
+            StoredField::Scalar | StoredField::Message(_) | StoredField::Json
+                if wire != WireType::LengthDelimited =>
+            {
+                return Err(wire_error("ordinary_window_stored_length_wire"));
+            }
+            _ => {}
+        }
+        if wire != WireType::LengthDelimited {
+            skip_field(wire, tag, &mut bytes, DecodeContext::default())
+                .map_err(|_| wire_error("ordinary_window_stored_wire"))?;
+            continue;
+        }
+        let len = usize::try_from(
+            decode_varint(&mut bytes).map_err(|_| wire_error("ordinary_window_stored_length"))?,
+        )
+        .map_err(|_| wire_error("ordinary_window_stored_length"))?;
+        if len > bytes.len() {
+            return Err(wire_error("ordinary_window_stored_truncated"));
+        }
+        let value = &bytes[..len];
+        bytes = &bytes[len..];
+        match field {
+            StoredField::Message(child) => preflight_stored_fields(child, value)?,
+            StoredField::Json => {
+                use crate::data_gateway::ordinary_daily_change_window_contract as contract;
+                contract::preflight(value, contract::MIB)
+                    .map_err(|_| wire_error("ordinary_window_stored_request_json"))?;
+            }
+            _ if value.len() > 16 * 1024 => {
+                // Unknown length fields include the additive TEST_CODE B127
+                // string. A future large bytes field needs explicit map review.
+                return Err(wire_error("ordinary_window_stored_scalar_limit"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The closed WG07 response budget, shared by live transport and recorded proof replay.
 pub(crate) fn preflight_window_response(bytes: &[u8]) -> Result<(), GrpcError> {
     if bytes.len() > 8 * 1024 * 1024 {
@@ -878,5 +996,141 @@ mod window_limit_tests {
             ..Default::default()
         };
         assert!(preflight_window_protobuf(&response.encode_to_vec(), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stored_window_limit_tests {
+    use super::*;
+    use crate::grpc_client::external_pb::magic::market::v1::{
+        BuildIdentity, CanonicalPayload, CapabilitiesResponse, Capability, HealthResponse,
+        RequestContext,
+    };
+    use prost::Message;
+
+    #[test]
+    fn wg07_review_fix2_stored_scalar_limits_allow_large_nested_messages_and_capability_lists() {
+        for length in [16384, 16385] {
+            let text = "x".repeat(length);
+            let health = HealthResponse {
+                request_id: text.clone(),
+                build_identity: Some(BuildIdentity {
+                    service_version: text.clone(),
+                    source_revision: text.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(health.encoded_len() > 16384);
+            assert_eq!(
+                preflight_window_stored(
+                    WindowStoredMessage::HealthResponse,
+                    &health.encode_to_vec()
+                )
+                .is_ok(),
+                length == 16384
+            );
+            let request = QueryRequest {
+                context: Some(RequestContext {
+                    protocol_version: 1,
+                    request_id: text.clone(),
+                }),
+                payload: Some(CanonicalPayload {
+                    schema: text.clone(),
+                    content_type: text.clone(),
+                    data: b"{}".to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(request.encoded_len() > 16384);
+            assert_eq!(
+                preflight_window_stored(
+                    WindowStoredMessage::QueryRequest,
+                    &request.encode_to_vec()
+                )
+                .is_ok(),
+                length == 16384
+            );
+            let caps = CapabilitiesResponse {
+                request_id: text.clone(),
+                capabilities: vec![Capability {
+                    provider: text.clone(),
+                    exact_scope: text,
+                    ..Default::default()
+                }],
+            };
+            assert_eq!(
+                preflight_window_stored(
+                    WindowStoredMessage::CapabilitiesResponse,
+                    &caps.encode_to_vec()
+                )
+                .is_ok(),
+                length == 16384
+            );
+        }
+        let caps = CapabilitiesResponse {
+            request_id: "TEST_CODE".into(),
+            capabilities: vec![
+                Capability {
+                    provider: "TEST_CODE_provider".into(),
+                    ..Default::default()
+                };
+                1025
+            ],
+        };
+        assert!(caps.encoded_len() > 16384);
+        assert!(preflight_window_stored(
+            WindowStoredMessage::CapabilitiesResponse,
+            &caps.encode_to_vec()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn wg07_review_fix2_stored_wire_and_request_json_limits_precede_owned_copy() {
+        // Health.live is varint, not a length field; Health.request_id is a
+        // string, not a varint. A declared string longer than remaining bytes
+        // must also fail without allocating its claimed length.
+        for raw in [
+            &[0x12, 0x00][..],
+            &[0x08, 0x01][..],
+            &[0x0a, 0x03, b'x'][..],
+        ] {
+            assert!(preflight_window_stored(WindowStoredMessage::HealthResponse, raw).is_err());
+        }
+        let request = QueryRequest {
+            payload: Some(CanonicalPayload {
+                data: format!("{{\"short\":\"{}\"}}", "x".repeat(16385)).into_bytes(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(preflight_window_stored(
+            WindowStoredMessage::QueryRequest,
+            &request.encode_to_vec()
+        )
+        .is_err());
+        assert!(preflight_window_stored(
+            WindowStoredMessage::QueryRequest,
+            &vec![0; 1024 * 1024 + 1]
+        )
+        .is_err());
+        assert!(preflight_window_stored(
+            WindowStoredMessage::HealthResponse,
+            &vec![0; 8 * 1024 * 1024 + 1]
+        )
+        .is_err());
+        // Additive test release B's127 string is covered by the conservative
+        // unknown-length fallback without authorizing any descriptor here.
+        for length in [16384usize, 16385] {
+            let mut raw = vec![0xfa, 0x07];
+            prost::encoding::encode_varint(length as u64, &mut raw);
+            raw.extend(std::iter::repeat_n(b'x', length));
+            assert_eq!(
+                preflight_window_stored(WindowStoredMessage::HealthResponse, &raw).is_ok(),
+                length == 16384
+            );
+        }
     }
 }

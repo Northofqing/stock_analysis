@@ -204,7 +204,7 @@ pub(crate) fn reply(request: &QueryRequest) -> Result<QueryResponse, tonic::Stat
     seal_native(&mut e);
     Ok(response(&e))
 }
-fn empty_reply(request: &QueryRequest) -> Result<QueryResponse, tonic::Status> {
+pub(crate) fn empty_reply(request: &QueryRequest) -> Result<QueryResponse, tonic::Status> {
     let mut e = evidence(request);
     for s in &mut e.sessions {
         if let Terminal::Bar { bar } = &mut s.terminal {
@@ -1202,4 +1202,89 @@ async fn wg07_review_fix_m1_transport_setup_failure_reports_known_context_only()
         .iter()
         .all(|f| f.instrument.as_ref() == Some(&input().instrument)
             && f.range == Some((input().from, input().to))));
+}
+
+pub(crate) fn reset_stored_decode_hits() {
+    REPLAY_STORED_DECODE_HITS.with(|hits| hits.set([0; 4]));
+}
+pub(crate) fn stored_decode_hits() -> [usize; 4] {
+    REPLAY_STORED_DECODE_HITS.with(|hits| hits.get())
+}
+pub(crate) fn oversized_stored_proofs(
+    original: &CompleteWindowProof,
+) -> Vec<(CompleteWindowProof, [usize; 4])> {
+    use crate::grpc_client::external_pb::magic::market::v1::{
+        CapabilitiesResponse, HealthResponse,
+    };
+    let oversized = "x".repeat(16385);
+    let mut cases = Vec::new();
+    for field in 0..5 {
+        let mut request =
+            QueryRequest::decode(hex::decode(&original.request_hex).unwrap().as_slice()).unwrap();
+        match field {
+            0 => request.context.as_mut().unwrap().request_id = oversized.clone(),
+            1 => request.preferred_provider = oversized.clone(),
+            2 => request.payload.as_mut().unwrap().schema = oversized.clone(),
+            3 => request.payload.as_mut().unwrap().content_type = oversized.clone(),
+            _ => {
+                request.payload.as_mut().unwrap().data =
+                    serde_json::to_vec(&serde_json::json!({"short":oversized})).unwrap()
+            }
+        }
+        let raw = request.encode_to_vec();
+        assert!(raw.len() < c::MIB);
+        let mut proof = original.clone();
+        proof.request_hex = hex::encode(raw);
+        cases.push((proof, [1, 1, 0, 0]));
+    }
+    for field in 0..7 {
+        let mut health =
+            HealthResponse::decode(hex::decode(&original.health_hex).unwrap().as_slice()).unwrap();
+        match field {
+            0 => health.request_id = oversized.clone(),
+            1 => health.state = oversized.clone(),
+            2 => health.build_identity.as_mut().unwrap().service_version = oversized.clone(),
+            3 => health.build_identity.as_mut().unwrap().source_revision = oversized.clone(),
+            4 => health.build_identity.as_mut().unwrap().contract_sha256 = oversized.clone(),
+            5 => health.build_identity.as_mut().unwrap().binary_sha256 = oversized.clone(),
+            _ => health.build_identity.as_mut().unwrap().identity_error = oversized.clone(),
+        }
+        let mut proof = original.clone();
+        proof.health_hex = hex::encode(health.encode_to_vec());
+        cases.push((proof, [0, 0, 0, 0]));
+    }
+    for field in 0..4 {
+        let mut caps = CapabilitiesResponse::decode(
+            hex::decode(&original.capabilities_hex).unwrap().as_slice(),
+        )
+        .unwrap();
+        match field {
+            0 => caps.request_id = oversized.clone(),
+            1 => caps.capabilities[0].provider = oversized.clone(),
+            2 => caps.capabilities[0].exact_scope = oversized.clone(),
+            _ => caps.capabilities[0].blocker = oversized.clone(),
+        }
+        let mut proof = original.clone();
+        proof.capabilities_hex = hex::encode(caps.encode_to_vec());
+        cases.push((proof, [1, 0, 0, 0]));
+    }
+    cases
+}
+
+#[tokio::test]
+async fn wg07_review_fix2_stored_controls_and_request_reject_before_each_owned_decoder() {
+    let q = acquire_fixture(reply).await;
+    reset_stored_decode_hits();
+    assert!(inspect_proof(q.proof()).is_ok());
+    assert_eq!(stored_decode_hits(), [1, 1, 1, 1]);
+    let cases = oversized_stored_proofs(q.proof());
+    assert_eq!(cases.len(), 16);
+    for (index, (proof, expected_hits)) in cases.into_iter().enumerate() {
+        // These are canonical, within aggregate proof/request bounds; the
+        // offending short field must be refused before its first owned call.
+        proof_identities(&proof).unwrap();
+        reset_stored_decode_hits();
+        assert!(inspect_proof(&proof).is_err(), "mutation {index}");
+        assert_eq!(stored_decode_hits(), expected_hits, "mutation {index}");
+    }
 }

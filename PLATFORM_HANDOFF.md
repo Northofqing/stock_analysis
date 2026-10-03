@@ -251,3 +251,12 @@ Task4 逐项风控已完成独立全任务 spec/quality 审查：均 Approved，
 实际79 distinct PASS：18新library、56受影响旧library、5正常命令行。新例包含真实非空财务 fixture、完整Top50/同code多row、独立literal golden、不可变/rowid溢出、配置变更原key重试、真实两coordinator与postcommit child、严格catalog/codec/资源界、历史日历A→B和局部review8/unknown9。旧例覆盖6/7原Global/捕获、fee、6条实际完整financial路径，以及原6目标真实副本/冷重开与7拒绝；不把其他未改纯金融用例宣称重跑。仅一次lib和一次正常bin Cargo，其他检查复用同SHA封存harness，无全量/check/build/clippy/release/部署。
 
 凭据 `dev-20261003-investment8-acceptance.json` 绑定16文件、所有日志及制品；新例日志SHA `26f3c974957b4d82b3a781498a05a34ef77d60d1e2c3e51016136c93411d8d9b` / `5371a8302ed6867f532cdcdb86b449eb11f413629e728c9b2da701d2bdba8c04`，旧56日志SHA `e36ee45eb1c28c2bf2848cc6dc9e125c5259eb83b23c85e312858ffb17f1a87b`，正常5日志SHA `7e29c5463af1b53f85b84a5be92366be3819a2d2234c5ced8385af171fb0b604`。独立完整任务审查待进行，正式事实/资金/正向F2、production、WORM和自然窗口仍未完成。
+
+
+### Task3 保存的 control/request：解码前限制补齐，范围复核待完成
+
+上一轮范围复核确认来源闭合、退市区间和上下文已修正，但 I2 仍有保存的 Health/Capabilities/request 在 scalar 检查前执行 owned decode 的缺口。现以新窗口专属、借用 bytes 的闭合 protobuf 字段图先检查所有短字段、已知 nested/data 与 request JSON；旧普通 transport、control 行为、descriptor 与默认限额保持。未知 length-delimited 字段仍检查短字段限额，合法大型 nested message 与完整 capability 列表保留。
+
+实际13项定向 PASS（4新、9相关旧），包括真实重新计算 hash 的 NoChanges ledger 重开攻击与 owned-entry 计数，以及旧连接 prepare/confirm/consume、NoChanges、response/event 预算和 controls。新例日志 SHA `8c6c4ba296f410301ea400e781750aa835e7b193af593cd259285dbd1e8c16ed`，旧例 SHA `6729348844a63d29cc442f0abca9297a1299c9bea6934ee51837903ecce9b529`；同源封存 harness SHA `4003f4ad3a5130e1a0aa31631067a83ba7c603360f30a0ac19a70bb4bf871209`。凭据 `dev-20261003-wg07-reviewfix2-acceptance.json` 保留四文件和制品绑定。初版123及前次27的证据保留，未重复运行；本次未运行正常bin、全库、release或部署。I2范围独立复核待完成。
+
+F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Important 指向新存档 codec 的字段位置与错误节点类型预检。先前79项实际通过仍为原版证据；它们未覆盖该攻击，F2暂不算完成。原作者正在独立修复，只改 codec 与真实存档攻击回归，不改变财务重放、Global、风险与正向交易资格。
