@@ -181,3 +181,9 @@ impl ReplayMemory<'_, '_> {
 #[cfg(test)]
 #[path = "global_schema_replay_calendar_v1_tests.rs"]
 mod tests;
+
+// Fixed lower financial fixtures share the original borrower and per-loan payment state.
+#[cfg(test)]
+pub(super) fn fixture_call_paid(work:&mut BorrowedReplayWork<'_>, payment:&mut CalendarPaymentState, request:CalendarRequest)->Result<CalendarResponse, ReplayCalendarCallFailure>{
+    call_paid(work, payment, request)
+}

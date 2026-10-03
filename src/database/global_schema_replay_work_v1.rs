@@ -18,6 +18,9 @@ pub(super) enum ReplaySite {
     ErrorStorage,
     CalendarCold,
     CalendarQuery,
+    TransitionText,
+    TransitionCollection,
+    TransitionSort,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +99,7 @@ pub(crate) enum ReplayTerminalFailure {
     Qualification(ReplaySqlQualificationFailure),
     CodecQualification(ReplayCodecQualificationFailure),
     CalendarQualification(ReplayCalendarQualificationFailure),
+    TransitionQualification(ReplayTransitionQualificationFailure),
 }
 
 // Constructed once by the actual target owner, never by a phase borrower.
@@ -123,6 +127,10 @@ pub(crate) struct BorrowedReplayWork<'a> {
     text_copy_requests: usize,
     #[cfg(test)]
     row_buffer_requests: usize,
+    #[cfg(test)]
+    transition_fault: Option<TransitionFixtureFault>,
+    #[cfg(test)]
+    transition_entries: [usize; 11],
 }
 impl<'a> BorrowedReplayWork<'a> {
     pub(super) fn borrow(parts: super::target::ReplayOwnerLoan<'a>) -> Self {
@@ -134,6 +142,10 @@ impl<'a> BorrowedReplayWork<'a> {
             text_copy_requests: 0,
             #[cfg(test)]
             row_buffer_requests: 0,
+            #[cfg(test)]
+            transition_fault: None,
+            #[cfg(test)]
+            transition_entries: [0; 11],
         }
     }
     #[cfg(test)]
@@ -145,6 +157,10 @@ impl<'a> BorrowedReplayWork<'a> {
             text_copy_requests: 0,
             #[cfg(test)]
             row_buffer_requests: 0,
+            #[cfg(test)]
+            transition_fault: None,
+            #[cfg(test)]
+            transition_entries: [0; 11],
         }
     }
     fn fail(&mut self, site: ReplaySite, cause: ResourceCause) -> ReplayTerminalFailure {
@@ -302,7 +318,7 @@ impl Reservation {
 // Ordinary generated code refuses. Future accepted issuance alone may create
 // this child-private token; no test factory or caller-supplied proof exists.
 mod layout_qualification {
-    use super::{LayoutPinRefusal, ReplayCalendarQualificationFailure, ReplayCodecFailureKind};
+    use super::{LayoutPinRefusal, ReplayCalendarQualificationFailure, ReplayCodecFailureKind, ReplayTransitionQualificationFailure};
 
     pub(crate) struct ReviewedLayoutPin {
         consumer_seed_sha256: [u8; 32],
@@ -310,6 +326,7 @@ mod layout_qualification {
         rules: Option<ReviewedRulesV1>,
         // Independent selected once_cell/std/URL/input proof; codec rules do not suffice.
         calendar_rules: Option<ReviewedCalendarRulesV1>,
+        transition_rules: Option<ReviewedTransitionRulesV1>,
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum ReviewedRulesV1 {
@@ -334,6 +351,12 @@ mod layout_qualification {
             self.rules
                 .as_ref()
                 .ok_or(ReplayCodecFailureKind::UnsupportedSerdeProfile)
+        }
+    }
+    pub(super) enum ReviewedTransitionRulesV1 { TransitionCollectionsStdV1 }
+    impl ReviewedLayoutPin {
+        pub(super) fn transition_rules(&self)->Result<&ReviewedTransitionRulesV1, ReplayTransitionQualificationFailure>{
+            self.transition_rules.as_ref().ok_or(ReplayTransitionQualificationFailure::RuleUnavailable)
         }
     }
     include!(env!("STOCK_REPLAY_PIN_INCLUDE"));
@@ -584,17 +607,14 @@ impl CodecMechanics<'_, '_> {
         Ok(())
     }
     pub(crate) fn output(&mut self, count: usize) -> Result<Vec<u8>, ReplayTerminalFailure> {
-        self.work
-            .reserve_array::<u8>(ReplaySite::Formatting, count as u64)?
-            .consume();
+        self.work .reserve_array::<u8>(ReplaySite::Formatting, count as u64)? .consume();
         #[cfg(test)]
         {
             self.hits.outputs += 1;
+            self.work.transition_entries[10] += 1;
         }
         let mut result = Vec::new();
-        result
-            .try_reserve_exact(count)
-            .map_err(|_| self.allocation_error(ReplaySite::Formatting))?;
+        result .try_reserve_exact(count) .map_err(|_| self.allocation_error(ReplaySite::Formatting))?;
         Ok(result)
     }
     pub(crate) fn hex_digest(
@@ -1138,3 +1158,390 @@ impl ScalarExtentAccumulator {
 #[cfg(test)]
 #[path = "global_schema_replay_work_v1_tests.rs"]
 mod tests;
+
+// Closed transition requests borrow the same persistent metadata and first failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionQualificationFailure {
+    RuleUnavailable,
+    WriterMismatch
+}
+pub(crate) struct TransitionOps<'loan, 'pool>{
+    work:&'loan mut BorrowedReplayWork<'pool>
+}
+impl<'loan, 'pool> ReplayMemory<'loan, 'pool>{
+    pub(crate) fn transition_ops<'short>(&'short mut self)->Result<TransitionOps<'short,
+    'pool>,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.pin.transition_rules().map_err(|e|self.work.terminal.latch(ReplayTerminalFailure::TransitionQualification(e)))?;
+        Ok(TransitionOps{
+            work:self.work
+        })
+    }
+}
+impl TransitionOps<'_, '_>{
+    #[cfg(test)]
+    fn boundary(&mut self, fault:TransitionFixtureFault, cost:u64)->Result<(),
+    ReplayTerminalFailure>{
+        self.finish()?;
+        let selected = self.work.transition_fault;
+        let exact = matches!((selected, fault), (Some(TransitionFixtureFault::NodeExact), TransitionFixtureFault::Node) | (Some(TransitionFixtureFault::GrowExact), TransitionFixtureFault::Grow) | (Some(TransitionFixtureFault::SortExact), TransitionFixtureFault::Sort) | (Some(TransitionFixtureFault::TextExact), TransitionFixtureFault::Text));
+        if cost > 0 && (selected == Some(fault) || exact) {
+            self.work.transition_fault = None;
+            let remaining = 16 * 1024 * 1024_u64 - self.work.used();
+            let available = if exact {
+                cost
+            } else {
+                cost - 1
+            };
+            let prefix = remaining.checked_sub(available).expect("fixed lower boundary fits");
+            // Deliberate test debt, not evidence of an owned financial prefix.
+            self.work.reserve(ReplaySite::StateCopy, prefix)?.consume();
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(&self)->Result<(),
+    ReplayTerminalFailure>{
+        self.work.finish()
+    }
+    fn node<K,
+    V>(&mut self, len:usize)->Result<(),
+    ReplayTerminalFailure>{
+        let bytes=(||{
+            let n=add(len as u64, 1)?;
+            let height=if n<=1{
+                0
+            } else{
+                u64::from(u64::BITS-(n-1).leading_zeros())
+            };
+            let(_, node)=btree_node_bounds::<K,
+            V>()?;
+            mul(add(height, 2)?, node.bytes())
+        })();
+        let bytes=bytes.map_err(|e|self.work.fail(ReplaySite::TransitionCollection, ResourceCause::Layout(e)))?;
+        #[cfg(test)]
+        self.boundary(TransitionFixtureFault::Node, bytes)?;
+        self.work.reserve(ReplaySite::TransitionCollection, bytes)?.consume();
+        Ok(())
+    }
+    pub(crate) fn str_set_insert<'a>(&mut self, set:&mut std::collections::BTreeSet<&'a str>, value:&'a str)->Result<bool,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.node::<&str,
+        ()>(set.len())?;
+        #[cfg(test)]
+        {
+            self.work.transition_entries[0] += 1;
+        }
+        Ok(set.insert(value))
+    }
+    pub(crate) fn lot_ref_insert<'a>(&mut self, map:&mut std::collections::BTreeMap<&'a str, &'a crate::trading::paper_ledger::Lot>, key:&'a str, value:&'a crate::trading::paper_ledger::Lot)->Result<Option<&'a crate::trading::paper_ledger::Lot>,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.node::<&str,
+        &crate::trading::paper_ledger::Lot>(map.len())?;
+        #[cfg(test)]
+        {
+            self.work.transition_entries[1] += 1;
+        }
+        Ok(map.insert(key, value))
+    }
+    pub(crate) fn descriptor_field_insert<'a>(&mut self, map:&mut std::collections::BTreeMap<&'a str, &'a str>, key:&'a str, value:&'a str)->Result<Option<&'a str>,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.node::<&str,
+        &str>(map.len())?;
+        #[cfg(test)]
+        {
+            self.work.transition_entries[2] += 1;
+        }
+        Ok(map.insert(key, value))
+    }
+    pub(crate) fn claim_slot<'m,
+    'a>(&mut self, map:&'m mut std::collections::BTreeMap<&'a str, u32>, key:&'a str)->Result<&'m mut u32,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.node::<&str,
+        u32>(map.len())?;
+        #[cfg(test)]
+        {
+            self.work.transition_entries[3] += 1;
+        }
+        Ok(map.entry(key).or_default())
+    }
+    pub(crate) fn exposure_slot<'m,
+    'a>(&mut self, map:&'m mut std::collections::BTreeMap<&'a str, i128>, key:&'a str)->Result<&'m mut i128,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        self.node::<&str,
+        i128>(map.len())?;
+        #[cfg(test)]
+        {
+            self.work.transition_entries[4] += 1;
+        }
+        Ok(map.entry(key).or_default())
+    }
+    pub(crate) fn push_transition<T:crate::trading::paper_replay_financial_work_v1::TransitionElement>(&mut self, vec:&mut Vec<T>, value:T)->Result<(),
+    ReplayTerminalFailure>{
+        self.finish()?;
+        if vec.len()==vec.capacity(){
+            let required=vec.len().checked_add(1).ok_or_else(||self.work.fail(ReplaySite::TransitionCollection, ResourceCause::Layout(LayoutFailure::Overflow)))?;
+            let bytes=amortized_vector_bytes::<T>(vec.capacity() as u64, required as u64).map_err(|e|self.work.fail(ReplaySite::TransitionCollection, ResourceCause::Layout(e)))?;
+            #[cfg(test)]
+            self.boundary(TransitionFixtureFault::Grow, bytes)?;
+            self.work.reserve(ReplaySite::TransitionCollection, bytes)?.consume();
+            #[cfg(test)]
+            {
+                self.work.transition_entries[5] += 1;
+            }
+            vec.try_reserve(1).map_err(|_|self.work.fail(ReplaySite::TransitionCollection, ResourceCause::AllocationFailed))?;
+        }
+        #[cfg(test)]
+        {
+            self.work.transition_entries[6] += 1;
+        }
+        vec.push(value);
+        Ok(())
+    }
+    pub(crate) fn sort_fifo_lots(&mut self, lots:&mut Vec<&crate::trading::paper_ledger::Lot>)->Result<(),
+    ReplayTerminalFailure>{
+        self.finish()?;
+        let bytes=stable_sort_scratch_bytes::<&crate::trading::paper_ledger::Lot>(lots.len() as u64).map_err(|e|self.work.fail(ReplaySite::TransitionSort, ResourceCause::Layout(e)))?;
+        #[cfg(test)]
+        self.boundary(TransitionFixtureFault::Sort, bytes)?;
+        self.work.reserve(ReplaySite::TransitionSort, bytes)?.consume();
+        #[cfg(test)]
+        {
+            self.work.transition_entries[7] += 1;
+        }
+        crate::trading::paper_book_v2_execution::sort_fifo_lots_owner(lots);
+        Ok(())
+    }
+    pub(crate) fn financial_output(&mut self, plan:crate::trading::paper_replay_financial_work_v1::FinancialOutput<'_>)->Result<Vec<u8>,
+    ReplayTerminalFailure>{
+        use crate::trading::paper_replay_financial_work_v1::FinancialSink;
+        self.finish()?;
+        let mut count=FinancialSink::Count(0);
+        plan.write(&mut count).map_err(|_|self.work.fail(ReplaySite::TransitionText, ResourceCause::Layout(LayoutFailure::Overflow)))?;
+        let n=count.count();
+        #[cfg(test)]
+        self.boundary(TransitionFixtureFault::Text, n as u64)?;
+        self.work.reserve_array::<u8>(ReplaySite::TransitionText, n as u64)?.consume();
+        #[cfg(test)]
+        {
+            self.work.transition_entries[8] += 1;
+        }
+        let mut bytes=Vec::new();
+        bytes.try_reserve_exact(n).map_err(|_|self.work.fail(ReplaySite::TransitionText, ResourceCause::AllocationFailed))?;
+        let limit=n;
+        #[cfg(test)]
+        let limit=if self.work.transition_fault==Some(TransitionFixtureFault::WriterMismatch){
+            self.work.transition_fault=None;
+            n.saturating_sub(1)
+        } else{
+            limit
+        };
+        #[cfg(test)]
+        {
+            self.work.transition_entries[9] += 1;
+        }
+        if plan.write(&mut FinancialSink::Output{
+            bytes:&mut bytes,
+            limit
+        }).is_err()||bytes.len()!=n{
+            return Err(self.work.terminal.latch(ReplayTerminalFailure::TransitionQualification(ReplayTransitionQualificationFailure::WriterMismatch)));
+        }
+        Ok(bytes)
+    }
+}
+// No successful pin or ReplayMemory is constructed by lower fixtures.
+#[cfg(test)]
+pub(crate) struct FinancialFixtureLoan<'loan, 'pool>{
+    work:&'loan mut BorrowedReplayWork<'pool>,
+    calendar_payment:paid_calendar::CalendarPaymentState,
+    pub(crate) hash_hits:[usize;4],
+    case: crate::trading::paper_replay_transition_v1_tests::Case,
+}
+#[cfg(test)]
+impl<'loan, 'pool> FinancialFixtureLoan<'loan, 'pool>{
+    pub(crate) fn finish(&self)->Result<(),
+    ReplayTerminalFailure>{
+        self.work.finish()
+    }
+    pub(crate) fn mechanics(&mut self)->Result<CodecMechanics<'_,
+    'pool>,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        Ok(CodecMechanics{
+            work:self.work,
+            hits:Default::default(),
+            fault:None,
+            scratch:Default::default()
+        })
+    }
+    pub(crate) fn transition_ops(&mut self)->Result<TransitionOps<'_,
+    'pool>,
+    ReplayTerminalFailure>{
+        self.finish()?;
+        Ok(TransitionOps{
+            work:self.work
+        })
+    }
+    pub(crate) fn decode<T:crate::trading::paper_replay_codec_v1::Root>(&mut self, bytes:&[u8])->Result<T,
+    ReplayTerminalFailure>{
+        use crate::trading::paper_replay_codec_v1 as c;
+        let mut m=self.mechanics()?;
+        let value=c::decode_core::<T>(bytes, &mut m)?;
+        if T::CANONICAL&&c::encode_core(&value, &mut m)?!=bytes{
+            return Err(m.refuse(ReplayCodecFailureKind::Noncanonical, None));
+        }
+        Ok(value)
+    }
+    pub(crate) fn calendar_day(&mut self, day:chrono::NaiveDate)->Result<bool,
+    ReplayCalendarCallFailure>{
+        match paid_calendar::fixture_call_paid(self.work, &mut self.calendar_payment, CalendarRequest::Day(day))?{
+            CalendarResponse::Day(v)=>Ok(v),
+            _=>unreachable!()
+        }
+    }
+    pub(crate) fn calendar_prev(&mut self, day:chrono::NaiveDate)->Result<chrono::NaiveDate,
+    ReplayCalendarCallFailure>{
+        match paid_calendar::fixture_call_paid(self.work, &mut self.calendar_payment, CalendarRequest::Prev(day))?{
+            CalendarResponse::Date(v)=>Ok(v),
+            _=>unreachable!()
+        }
+    }
+    pub(crate) fn calendar_next(&mut self, day:chrono::NaiveDate)->Result<chrono::NaiveDate,
+    ReplayCalendarCallFailure>{
+        match paid_calendar::fixture_call_paid(self.work, &mut self.calendar_payment, CalendarRequest::Next(day))?{
+            CalendarResponse::Date(v)=>Ok(v),
+            _=>unreachable!()
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransitionFixtureFault{
+    Node,
+    Grow,
+    Sort,
+    Text,
+    NodeExact,
+    GrowExact,
+    SortExact,
+    TextExact,
+    WriterMismatch
+}
+#[cfg(test)]
+impl FinancialFixtureLoan<'_, '_>{
+    pub(crate) fn used(&self)->u64{
+        self.work.used()
+    }
+    pub(crate) fn entries(&self)->[usize;11]{
+        self.work.transition_entries
+    }
+}
+#[cfg(test)]
+pub(crate) fn financial_fixture(case:crate::trading::paper_replay_transition_v1_tests::Case){
+    use crate::trading::paper_replay_transition_v1_tests::{
+        self as test,
+        Case
+    };
+    let mut metadata=RowsSpecWork::new(16*1024*1024, 1, 1);
+    let mut terminal=super::target::test_replay_terminal();
+    let mut work=BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
+    if matches!(case, Case::Qualification){
+        let e=work.codec_memory().err().expect("ordinary refuses");
+        assert_eq!(work.finish(), Err(e));
+        return;
+    }
+    work.transition_fault=match case{
+        Case::NodeShort|Case::LotMapShort|Case::DescriptorMapShort|Case::ClaimShort|Case::ExposureShort=>Some(TransitionFixtureFault::Node),
+        Case::SetExact|Case::LotMapExact|Case::DescriptorMapExact|Case::ClaimExact|Case::ExposureExact=>Some(TransitionFixtureFault::NodeExact),
+        Case::GrowExact=>Some(TransitionFixtureFault::GrowExact),
+        Case::SortExact=>Some(TransitionFixtureFault::SortExact),
+        Case::TextExact=>Some(TransitionFixtureFault::TextExact),
+        Case::GrowShort=>Some(TransitionFixtureFault::Grow),
+        Case::SortShort=>Some(TransitionFixtureFault::Sort),
+        Case::TextShort=>Some(TransitionFixtureFault::Text),
+        Case::WriterMismatch=>Some(TransitionFixtureFault::WriterMismatch),
+        _=>None
+    };
+    {
+        let loan=FinancialFixtureLoan{
+            work:&mut work,
+            calendar_payment:paid_calendar::CalendarPaymentState::unpaid(),
+            hash_hits:[0; 4],
+            case,
+        };
+        let mut financial=crate::trading::paper_replay_financial_work_v1::FinancialWork::Fixture(loan);
+        test::run(case, &mut financial);
+    }
+    if matches!(case, Case::NodeShort|Case::LotMapShort|Case::DescriptorMapShort|Case::ClaimShort|Case::ExposureShort|Case::GrowShort|Case::SortShort|Case::TextShort){
+        let e=work.finish().unwrap_err();
+        let site=match case{
+            Case::NodeShort|Case::LotMapShort|Case::DescriptorMapShort|Case::ClaimShort|Case::ExposureShort|Case::GrowShort=>ReplaySite::TransitionCollection,
+            Case::SortShort=>ReplaySite::TransitionSort,
+            _=>ReplaySite::TransitionText
+        };
+        assert_eq!(e, ReplayTerminalFailure::Resource(ReplayResourceFailure{
+            site,
+            cause:ResourceCause::Debit(RowsSpecDebitFailure::Exceeded),
+            used:16*1024*1024+1
+        }));
+        assert_eq!(work.used(), 16*1024*1024+1);
+    } else if matches!(case, Case::SetExact|Case::LotMapExact|Case::DescriptorMapExact|Case::ClaimExact|Case::ExposureExact|Case::GrowExact|Case::SortExact|Case::TextExact){
+        assert!(matches!(work.finish(), Err(ReplayTerminalFailure::Resource(_))));
+    } else if matches!(case, Case::WriterMismatch){
+        assert_eq!(work.finish(), Err(ReplayTerminalFailure::TransitionQualification(ReplayTransitionQualificationFailure::WriterMismatch)));
+    } else if matches!(case, Case::Cumulative|Case::OversizedResource|Case::StagedResource){
+        assert!(matches!(work.finish(), Err(ReplayTerminalFailure::Resource(_))));
+    } else{
+        assert_eq!(work.finish(), Ok(()));
+    }
+}
+#[cfg(test)]
+pub(crate) fn financial_fixture_serializer_escrow_bytes() -> u64 {
+    serde_error_box_bound().expect("reviewed pure error layout").bytes()
+}
+#[cfg(test)]
+impl FinancialFixtureLoan<'_, '_> {
+    // This is an assertion oracle only: no reserve, latch, mutation, or reset.
+    pub(crate) fn assert_resource(&self, expected_used: u64) {
+        use crate::trading::paper_replay_transition_v1_tests::Case;
+        let site = match self.case {
+            Case::OversizedResource => ReplaySite::Formatting,
+            Case::SortShort | Case::SortExact => ReplaySite::TransitionSort,
+            Case::TextShort | Case::TextExact => ReplaySite::TransitionText,
+            Case::NodeShort | Case::SetExact | Case::LotMapShort | Case::LotMapExact | Case::DescriptorMapShort | Case::DescriptorMapExact | Case::ClaimShort | Case::ClaimExact | Case::ExposureShort | Case::ExposureExact | Case::GrowShort | Case::GrowExact => ReplaySite::TransitionCollection,
+            _ => panic!("not a fixed resource boundary fixture"),
+        };
+        assert_eq!(self.work.used(), expected_used);
+        assert_eq!(self.work.finish(), Err(ReplayTerminalFailure::Resource(ReplayResourceFailure {
+            site,
+            cause: ResourceCause::Debit(RowsSpecDebitFailure::Exceeded),
+            used: expected_used,
+        })));
+    }
+    // Independent fixed-case expectation from the reviewed source bounds.
+    // The impending operation's private computed cost is not read here.
+    pub(crate) fn expected_boundary_cost(&self) -> u64 {
+        use crate::trading::paper_replay_transition_v1_tests::Case;
+        match self.case {
+            Case::NodeShort | Case::SetExact => 2 * btree_node_bounds::<&str,
+            ()>().unwrap().1.bytes(),
+            Case::LotMapShort | Case::LotMapExact => 2 * btree_node_bounds::<&str,
+            &crate::trading::paper_ledger::Lot>().unwrap().1.bytes(),
+            Case::DescriptorMapShort | Case::DescriptorMapExact => 2 * btree_node_bounds::<&str,
+            &str>().unwrap().1.bytes(),
+            Case::ClaimShort | Case::ClaimExact => 2 * btree_node_bounds::<&str,
+            u32>().unwrap().1.bytes(),
+            Case::ExposureShort | Case::ExposureExact => 2 * btree_node_bounds::<&str,
+            i128>().unwrap().1.bytes(),
+            Case::GrowShort | Case::GrowExact => exact_array_bytes::<String>(4).unwrap(),
+            Case::SortShort | Case::SortExact => exact_array_bytes::<&crate::trading::paper_ledger::Lot>(48).unwrap(),
+            Case::TextShort | Case::TextExact => b"paper-parent-projection/v1".len() as u64,
+            _ => panic!("not a fixed boundary fixture"),
+        }
+    }
+}

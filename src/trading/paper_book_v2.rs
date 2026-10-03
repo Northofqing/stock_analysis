@@ -1,6 +1,7 @@
 //! CatalogV5 zero-fill book cutover. The persistent reader validates both
 //! generations; the only writer is compiled for isolated tests.
 
+use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use crate::database::DatabaseManager;
 #[cfg(test)]
 use crate::trading::paper_ledger::verified_v1_snapshot_on;
@@ -219,98 +220,79 @@ fn v2_head(conn: &mut SqliteConnection, account_id: &str) -> Result<V2HeadRow, L
     .get_result(conn)?)
 }
 
-fn expected_manifest(
-    old: &V1AccountRow,
-    account: &V2AccountRow,
-    event: &V2EventRow,
-    snapshot: &VerifiedV1Snapshot,
-    fee: &FeeRow,
-) -> CutoverManifestV1 {
-    CutoverManifestV1 {
-        schema: MANIFEST_SCHEMA.into(),
-        account_id: old.account_id.clone(),
-        epoch_id: account.epoch_id.clone(),
-        cutover_id: account.cutover_id.clone(),
-        command_id: event.command_id.clone(),
-        v1_epoch_id: old.epoch_id.clone(),
-        v1_manifest_hash: old.manifest_hash.clone(),
+fn expected_manifest( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, ) -> CutoverManifestV1 {
+    fw::historical(expected_manifest_with_work(old, account, event, snapshot, fee, &mut FinancialWork::Historical)).expect("Historical manifest construction")
+}
+fn expected_manifest_with_work( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, w: &mut FinancialWork<'_, '_>, ) -> fw::Result<CutoverManifestV1> {
+    w.finish()?;
+    Ok(CutoverManifestV1 {
+        schema: w.text(Txt::CutoverSchema)?,
+        account_id: w.copy(&old.account_id)?,
+        epoch_id: w.copy(&account.epoch_id)?,
+        cutover_id: w.copy(&account.cutover_id)?,
+        command_id: w.copy(&event.command_id)?,
+        v1_epoch_id: w.copy(&old.epoch_id)?,
+        v1_manifest_hash: w.copy(&old.manifest_hash)?,
         v1_head_version: snapshot.version,
-        v1_head_hash: snapshot.event_hash.clone(),
-        v1_projection_hash: snapshot.projection_hash.clone(),
+        v1_head_hash: w.copy(&snapshot.event_hash)?,
+        v1_projection_hash: w.copy(&snapshot.projection_hash)?,
         v1_equity: snapshot.equity,
-        fee_policy_instance_id: fee.policy_instance_id.clone(),
-    }
+        fee_policy_instance_id: w.copy(&fee.policy_instance_id)?,
+    })
 }
 
-fn verify_genesis_rows(
-    old: &V1AccountRow,
-    account: &V2AccountRow,
-    event: &V2EventRow,
-    head: &V2HeadRow,
-    snapshot: &VerifiedV1Snapshot,
-    fee: &FeeRow,
-) -> Result<(), LedgerError> {
-    require(
-        account.account_id == old.account_id
-            && event.account_id == old.account_id
-            && head.account_id == old.account_id,
-        "genesis account mismatch",
-    )?;
-    require(
-        account.v1_epoch_id == old.epoch_id
-            && account.v1_manifest_hash == old.manifest_hash
-            && account.v1_head_version == snapshot.version
-            && account.v1_head_hash == snapshot.event_hash
-            && account.v1_projection_hash == snapshot.projection_hash,
-        "V1 source anchor mismatch",
-    )?;
-    require(
-        account.fee_policy_instance_id == fee.policy_instance_id,
-        "fee instance mismatch",
-    )?;
-    let manifest: CutoverManifestV1 = decode_canonical(&account.manifest_bytes)?;
-    require(
-        manifest == expected_manifest(old, account, event, snapshot, fee),
-        "manifest fields mismatch",
-    )?;
-    require(
-        account.manifest_hash == manifest_hash(&account.manifest_bytes),
-        "manifest hash mismatch",
-    )?;
+fn verify_genesis_rows( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, head: &V2HeadRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, ) -> Result<(), LedgerError> {
+    fw::historical(verify_genesis_rows_with_work(old, account, event, head, snapshot, fee, &mut FinancialWork::Historical))
+}
+fn verify_genesis_rows_with_work( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, head: &V2HeadRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+    w.finish()?;
+    {
+        let condition = account.account_id == old.account_id && event.account_id == old.account_id && head.account_id == old.account_id;
+        w.require(condition, Txt::Book(fw::BookText::GenesisAccountMismatch))
+    } ?;
+    {
+        let condition = account.v1_epoch_id == old.epoch_id && account.v1_manifest_hash == old.manifest_hash && account.v1_head_version == snapshot.version && account.v1_head_hash == snapshot.event_hash && account.v1_projection_hash == snapshot.projection_hash;
+        w.require(condition, Txt::Book(fw::BookText::V1SourceAnchorMismatch))
+    } ?;
+    {
+        let condition = account.fee_policy_instance_id == fee.policy_instance_id;
+        w.require(condition, Txt::Book(fw::BookText::FeeInstanceMismatch))
+    } ?;
+    let manifest: CutoverManifestV1 = decode_canonical_with_work(&account.manifest_bytes, w)?;
+    {
+        let condition = manifest == expected_manifest_with_work(old, account, event, snapshot, fee, w)?;
+        w.require(condition, Txt::Book(fw::BookText::ManifestFieldsMismatch))
+    } ?;
+    {
+        let condition = account.manifest_hash == w.cutover_hash(&account.manifest_bytes)?;
+        w.require(condition, Txt::Book(fw::BookText::ManifestHashMismatch))
+    } ?;
     let expected_payload = GenesisPayloadV1 {
-        schema: GENESIS_SCHEMA.into(),
-        manifest_hash: account.manifest_hash.clone(),
-        v1_head_hash: snapshot.event_hash.clone(),
-        v1_projection_hash: snapshot.projection_hash.clone(),
-        fee_policy_instance_id: fee.policy_instance_id.clone(),
-        cutover_id: account.cutover_id.clone(),
+        schema: w.text(Txt::GenesisSchema)?,
+        manifest_hash: w.copy(&account.manifest_hash)?,
+        v1_head_hash: w.copy(&snapshot.event_hash)?,
+        v1_projection_hash: w.copy(&snapshot.projection_hash)?,
+        fee_policy_instance_id: w.copy(&fee.policy_instance_id)?,
+        cutover_id: w.copy(&account.cutover_id)?,
     };
-    let payload: GenesisPayloadV1 = decode_canonical(&event.payload)?;
-    require(
-        payload == expected_payload
-            && event.kind == "Genesis"
-            && event.seq == 1
-            && event.previous_hash == snapshot.event_hash,
-        "genesis event mismatch",
-    )?;
-    require(
-        event.event_hash
-            == genesis_hash(
-                &old.account_id,
-                &event.command_id,
-                &event.previous_hash,
-                &event.payload,
-            )?,
-        "genesis hash mismatch",
-    )?;
-    require(
-        head.version == 1
-            && head.event_hash == event.event_hash
-            && head.projection_bytes.as_slice() == snapshot.projection_bytes.as_bytes()
-            && head.projection_hash == snapshot.projection_hash
-            && head.projection_hash == projection_hash(&head.projection_bytes),
-        "V2 projection mismatch",
-    )?;
+    let payload: GenesisPayloadV1 = decode_canonical_with_work(&event.payload, w)?;
+    {
+        let condition = payload == expected_payload && event.kind == "Genesis" && event.seq == 1 && event.previous_hash == snapshot.event_hash;
+        w.require(condition, Txt::Book(fw::BookText::GenesisEventMismatch))
+    } ?;
+    {
+        let condition = event.event_hash == w.fixed_hash(fw::ClosedFinancialHash::Genesis{
+            account:&old.account_id,
+            command:&event.command_id,
+            previous:&event.previous_hash,
+            payload:&event.payload
+        })?;
+        w.require(condition, Txt::Book(fw::BookText::GenesisHashMismatch))
+    } ?;
+    {
+        let condition = head.version == 1 && head.event_hash == event.event_hash && head.projection_bytes.as_slice() == snapshot.projection_bytes.as_bytes() && head.projection_hash == snapshot.projection_hash && head.projection_hash == w.raw_hash(&head.projection_bytes)?;
+        w.require(condition, Txt::Book(fw::BookText::V2ProjectionMismatch))
+    } ?;
     Ok(())
 }
 
@@ -950,4 +932,95 @@ pub(crate) fn replay_codec_fixtures(
 ) {
     crate::trading::paper_replay_codec_v1::exercise_root::<CutoverManifestV1>(case, work);
     crate::trading::paper_replay_codec_v1::exercise_root::<GenesisPayloadV1>(case, work);
+}
+
+fn decode_canonical_with_work<T:crate::trading::paper_replay_codec_v1::Root+serde::de::DeserializeOwned>(bytes:&[u8], w:&mut FinancialWork<'_, '_>)->fw::Result<T>{
+    w.finish()?;
+    if matches!(w, FinancialWork::Historical){
+        Ok(decode_canonical(bytes)?)
+    } else{
+        w.decode(bytes)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn transition_genesis_fixture(w:&mut FinancialWork<'_, '_>){
+    let old=V1AccountRow{
+        account_id:"account".into(),
+        epoch_id:"v1".into(),
+        manifest_hash:"v1m".into()
+    };
+    let projection=serde_json::to_string(&serde_json::json!({
+        "cash":100,
+        "lots":[],
+        "marks":{
+        },
+        "fees":0,
+        "realized_pnl":0,
+        "seed_equity":100,
+        "as_of":"2026-09-24T02:00:00Z",
+        "closes":{
+        }
+    })).unwrap();
+    let snapshot=VerifiedV1Snapshot{
+        version:7,
+        event_hash:"previous".into(),
+        projection_hash:projection_hash(projection.as_bytes()),
+        projection_bytes:projection,
+        equity:Money::from_micros(100)
+    };
+    let fee=FeeRow{
+        policy_instance_id:"fee".into(),
+        descriptor_bytes:vec![1]
+    };
+    let mut account=V2AccountRow{
+        account_id:old.account_id.clone(),
+        epoch_id:"v2".into(),
+        manifest_hash:String::new(),
+        manifest_bytes:Vec::new(),
+        fee_policy_instance_id:fee.policy_instance_id.clone(),
+        v1_epoch_id:old.epoch_id.clone(),
+        v1_manifest_hash:old.manifest_hash.clone(),
+        v1_head_version:snapshot.version,
+        v1_head_hash:snapshot.event_hash.clone(),
+        v1_projection_hash:snapshot.projection_hash.clone(),
+        cutover_id:"cutover".into()
+    };
+    let mut event=V2EventRow{
+        account_id:old.account_id.clone(),
+        seq:1,
+        command_id:"cutover-command".into(),
+        previous_hash:snapshot.event_hash.clone(),
+        event_hash:String::new(),
+        kind:"Genesis".into(),
+        payload:Vec::new()
+    };
+    let manifest=expected_manifest(&old, &account, &event, &snapshot, &fee);
+    account.manifest_bytes=canonical(&manifest).unwrap();
+    account.manifest_hash=manifest_hash(&account.manifest_bytes);
+    let payload=GenesisPayloadV1{
+        schema:GENESIS_SCHEMA.into(),
+        manifest_hash:account.manifest_hash.clone(),
+        v1_head_hash:snapshot.event_hash.clone(),
+        v1_projection_hash:snapshot.projection_hash.clone(),
+        fee_policy_instance_id:fee.policy_instance_id.clone(),
+        cutover_id:account.cutover_id.clone()
+    };
+    event.payload=canonical(&payload).unwrap();
+    event.event_hash=genesis_hash(&old.account_id, &event.command_id, &event.previous_hash, &event.payload).unwrap();
+    let head=V2HeadRow{
+        account_id:old.account_id.clone(),
+        version:1,
+        event_hash:event.event_hash.clone(),
+        projection_bytes:snapshot.projection_bytes.as_bytes().to_vec(),
+        projection_hash:snapshot.projection_hash.clone()
+    };
+    verify_genesis_rows(&old, &account, &event, &head, &snapshot, &fee).unwrap();
+    verify_genesis_rows_with_work(&old, &account, &event, &head, &snapshot, &fee, w).unwrap();
+    account.fee_policy_instance_id="wrong".into();
+    let error=verify_genesis_rows_with_work(&old, &account, &event, &head, &snapshot, &fee, w).unwrap_err();
+    match error{
+        FinancialFailure::Financial(LedgerError::IntegrityFailure(text))=>assert_eq!(text, "V2 book fee instance mismatch"),
+        other=>panic!("wrong branch: {other:?}")
+    };
 }

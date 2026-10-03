@@ -9,6 +9,7 @@ use diesel::{
     sql_types::{BigInt, Text},
 };
 use serde::{Deserialize, Serialize};
+use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -259,18 +260,28 @@ pub struct Projection {
     economic_unavailable: Option<String>,
 }
 impl Projection {
+    pub(crate) fn replay_unavailable_reason(&self)->Option<&str>{
+        self.economic_unavailable.as_deref()
+    }
+
     fn require_available(&self) -> Result<(), LedgerError> {
-        if let Some(reason) = &self.economic_unavailable {
-            return Err(LedgerError::EvidenceUnavailable(reason.clone()));
+        fw::historical(self.require_available_with_work(&mut FinancialWork::Historical))
+    }
+    fn require_available_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+        w.finish()?;
+        if self.economic_unavailable.is_some(){
+            return Err(LedgerError::EvidenceUnavailable(w.text(Txt::EconomicUnavailable(self))?).into());
         }
         Ok(())
     }
     pub fn equity(&self) -> Result<Money, LedgerError> {
+        fw::historical(self.equity_with_work(&mut FinancialWork::Historical))
+    }
+    pub(crate) fn equity_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<Money> {
+        w.finish()?;
         self.lots.iter().try_fold(self.cash, |equity, lot| {
-            let mark = self.marks.get(&lot.code).ok_or_else(|| {
-                LedgerError::EvidenceUnavailable(format!("missing mark {}", lot.code))
-            })?;
-            equity.add(mark.price.mul(lot.quantity)?)
+            let mark=w.option(self.marks.get(&lot.code), Txt::MissingMark(lot))?;
+            Ok(equity.add(mark.price.mul(lot.quantity)?)?)
         })
     }
     pub fn daily_pnl(&self) -> Option<Money> {
@@ -278,7 +289,11 @@ impl Projection {
         self.equity().ok()?.sub(*self.closes.get(&previous)?).ok()
     }
     pub fn inventory_fingerprint(&self) -> Result<String, LedgerError> {
-        Ok(digest(&encode(&self.lots)?))
+        fw::historical(self.inventory_fingerprint_with_work(&mut FinancialWork::Historical))
+    }
+    pub(crate) fn inventory_fingerprint_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<String> {
+        w.finish()?;
+        w.fixed_hash(fw::ClosedFinancialHash::Inventory(&self.lots))
     }
     /// Net unrealized result since cutover; seed reported cost is reference only.
     pub fn unrealized_pnl(&self) -> Result<Money, LedgerError> {
@@ -720,88 +735,61 @@ fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerEr
     Ok(())
 }
 fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
-    if [
-        &seed.account_id,
-        &seed.epoch_id,
-        &seed.command_id,
-        &seed.source_reference,
-        &seed.approved_by,
-    ]
-    .iter()
-    .any(|v| v.trim().is_empty())
-        || seed.source_hash.len() != 64
-        || !seed.source_hash.bytes().all(|c| c.is_ascii_hexdigit())
-        || seed.account_effective_at != seed.positions_effective_at
-        || seed.account_effective_at != seed.cutover_at
-        || seed.cash < Money::ZERO
-        || seed
-            .excluded_residual
-            .is_some_and(|residual| residual < Money::ZERO)
-        || seed.policy.max_position_bps > 10000
-        || seed.policy.cash_floor_bps > 10000
-    {
-        return Err(LedgerError::InvalidInput(
-            "invalid seed identity, effective time or policy".into(),
-        ));
+    fw::historical(seed_projection_with_work(seed, &mut FinancialWork::Historical))
+}
+pub(crate) fn seed_projection_with_work(seed: &SeedManifest, w: &mut FinancialWork<'_, '_>) -> fw::Result<Projection> {
+    w.finish()?;
+    if [ &seed.account_id, &seed.epoch_id, &seed.command_id, &seed.source_reference, &seed.approved_by, ] .iter() .any(|v| v.trim().is_empty()) || seed.source_hash.len() != 64 || !seed.source_hash.bytes().all(|c| c.is_ascii_hexdigit()) || seed.account_effective_at != seed.positions_effective_at || seed.account_effective_at != seed.cutover_at || seed.cash < Money::ZERO || seed .excluded_residual .is_some_and(|residual| residual < Money::ZERO) || seed.policy.max_position_bps > 10000 || seed.policy.cash_floor_bps > 10000 {
+        return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedIdentityEffectiveTimeOrPolicy))?);
     }
-    let next = crate::calendar::verified_next_a_share_trading_day(day(seed.cutover_at))
-        .map_err(LedgerError::EvidenceUnavailable)?;
+    let next = w.calendar_next(day(seed.cutover_at))?;
     let mut marks = BTreeMap::new();
     for mark in &seed.marks {
-        if mark.price <= Money::ZERO
-            || mark.observed_at != seed.cutover_at
-            || mark.source.trim().is_empty()
-            || marks.insert(mark.code.clone(), mark.clone()).is_some()
+        if mark.price <= Money::ZERO || mark.observed_at != seed.cutover_at || mark.source.trim().is_empty() || {
+            let key=w.copy(&mark.code)?;
+            let value=w.copy(mark)?;
+            let duplicate=marks.contains_key(&key);
+            w.insert(&mut marks, key, value)?;
+            duplicate
+        }
         {
-            return Err(LedgerError::InvalidInput("invalid seed mark".into()));
+            return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedMark))?);
         }
     }
     let mut lots = Vec::new();
     for (i, lot) in seed.lots.iter().enumerate() {
         if lot.quantity == 0 || !lot.quantity.is_multiple_of(100) || lot.code.trim().is_empty() {
-            return Err(LedgerError::InvalidInput("invalid seed lot".into()));
+            return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedLot))?);
         }
-        let mark = marks
-            .get(&lot.code)
-            .ok_or_else(|| LedgerError::EvidenceUnavailable("seed lot mark missing".into()))?;
+        let mark = w.option(marks.get(&lot.code), Txt::Seed(fw::SeedText::SeedLotMarkMissing))?;
         let sellable_from = match lot.sellable_from {
-            Some(date)
-                if lot
-                    .sellability_evidence
-                    .as_ref()
-                    .is_some_and(|e| !e.trim().is_empty()) =>
-            {
+            Some(date) if lot .sellability_evidence .as_ref() .is_some_and(|e| !e.trim().is_empty()) => {
                 date
             }
             None => next,
             _ => {
-                return Err(LedgerError::InvalidInput(
-                    "explicit sellability lacks evidence".into(),
-                ))
+                return Err(w.error(Txt::Seed(fw::SeedText::ExplicitSellabilityLacksEvidence))?)
             }
         };
-        lots.push(Lot {
-            lot_id: format!("seed:{i}"),
-            code: lot.code.clone(),
-            name: lot.name.clone(),
+        let incoming=Lot {
+            lot_id: w.text(Txt::SeedLotOrdinal(i))?,
+            code: w.copy(&lot.code)?,
+            name: w.copy(&lot.name)?,
             quantity: lot.quantity,
             basis_price: mark.price,
             buy_fee_remaining: Money::ZERO,
             acquired_on: day(seed.cutover_at),
             sellable_from,
             reported_cost: lot.reported_cost,
-        });
+        };
+        w.push(&mut lots, incoming)?;
     }
-    if marks.len()
-        != lots
-            .iter()
-            .map(|lot| &lot.code)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-    {
-        return Err(LedgerError::InvalidInput(
-            "seed mark coverage mismatch".into(),
-        ));
+    let mut codes=std::collections::BTreeSet::new();
+    for lot in &lots {
+        w.set(&mut codes, lot.code.as_str())?;
+    }
+    if marks.len()!=codes.len() {
+        return Err(w.error(Txt::Seed(fw::SeedText::SeedMarkCoverageMismatch))?);
     }
     let mut projection = Projection {
         cash: seed.cash,
@@ -814,14 +802,9 @@ fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
         closes: BTreeMap::new(),
         economic_unavailable: None,
     };
-    projection.seed_equity = projection.equity()?;
-    if projection.seed_equity <= Money::ZERO
-        || seed.original_total.sub(projection.seed_equity)?
-            != seed.excluded_residual.unwrap_or(Money::ZERO)
-    {
-        return Err(LedgerError::InvalidInput(
-            "unapproved seed residual/empty equity".into(),
-        ));
+    projection.seed_equity = projection.equity_with_work(w)?;
+    if projection.seed_equity <= Money::ZERO || seed.original_total.sub(projection.seed_equity)? != seed.excluded_residual.unwrap_or(Money::ZERO) {
+        return Err(w.error(Txt::Seed(fw::SeedText::UnapprovedSeedResidualEmptyEquity))?);
     }
     Ok(projection)
 }
@@ -3423,4 +3406,9 @@ pub(crate) fn replay_codec_nonfinite(
     assert_eq!(c::encode_core(&fact, work).unwrap(), expected);
     let copied = c::Value::paid_copy(&fact, work).unwrap();
     assert_eq!(c::encode_core(&copied, work).unwrap(), expected);
+}
+
+#[cfg(test)]
+pub(crate) fn transition_v1_fixture(state:Projection, w:&mut FinancialWork<'_, '_>){
+    execution::transition_fixture(state, w)
 }
