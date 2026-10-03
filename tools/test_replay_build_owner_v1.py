@@ -20,14 +20,105 @@ owner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(owner)
 PYTHON = str(Path(sys.executable).resolve())
 
+# Exact ordered lint tokens from immutable record2, copied as data; no live-session dependency.
+OBSERVED_LINTS = {'dep': ['--allow=unexpected_cfgs'],
+ 'build_script_build': ['--allow=clippy::used_underscore_binding',
+                        '--allow=unused_qualifications',
+                        '--warn=clippy::unnecessary_semicolon',
+                        '--allow=clippy::unnecessary_cast',
+                        '--allow=clippy::uninlined_format_args',
+                        '--warn=clippy::ptr_as_ptr',
+                        '--allow=clippy::non_minimal_cfg',
+                        '--allow=clippy::missing_safety_doc',
+                        '--warn=clippy::map_unwrap_or',
+                        '--warn=clippy::manual_assert',
+                        '--allow=clippy::identity_op',
+                        '--warn=clippy::explicit_iter_loop',
+                        '--allow=clippy::expl_impl_clone_on_copy'],
+ 'stock_analysis': ['--warn=clippy::unused_trait_names',
+                    '--warn=unreachable_pub',
+                    '--warn=unnameable_types',
+                    '--warn=unexpected_cfgs',
+                    '--warn=clippy::undocumented_unsafe_blocks',
+                    '--warn=clippy::transmute_undefined_repr',
+                    '--warn=clippy::trailing_empty_array',
+                    '--warn=single_use_lifetimes',
+                    '--warn=rust_2018_idioms',
+                    '--warn=clippy::pedantic',
+                    '--warn=non_ascii_idents',
+                    '--warn=clippy::inline_asm_x86_att_syntax',
+                    '--warn=improper_ctypes_definitions',
+                    '--warn=improper_ctypes',
+                    '--warn=deprecated_safe',
+                    '--warn=clippy::default_union_representation',
+                    '--warn=clippy::as_underscore',
+                    '--warn=clippy::as_ptr_cast_mut',
+                    '--warn=clippy::all',
+                    '--allow=clippy::type_complexity',
+                    '--allow=clippy::too_many_lines',
+                    '--allow=clippy::too_many_arguments',
+                    '--allow=clippy::struct_field_names',
+                    '--allow=clippy::struct_excessive_bools',
+                    '--allow=clippy::single_match_else',
+                    '--allow=clippy::single_match',
+                    '--allow=clippy::similar_names',
+                    '--allow=clippy::range_plus_one',
+                    '--allow=clippy::nonminimal_bool',
+                    '--allow=clippy::naive_bytecount',
+                    '--allow=clippy::module_name_repetitions',
+                    '--allow=clippy::missing_errors_doc',
+                    '--allow=clippy::manual_range_contains',
+                    '--allow=clippy::manual_assert',
+                    '--allow=clippy::incompatible_msrv',
+                    '--allow=clippy::float_cmp',
+                    '--allow=clippy::doc_markdown',
+                    '--allow=clippy::declare_interior_mutable_const',
+                    '--allow=clippy::collapsible_match',
+                    '--allow=clippy::cast_lossless',
+                    '--allow=clippy::borrow_as_ptr',
+                    '--allow=clippy::bool_assert_comparison']}
+
+LINT_MUTATIONS = {'empty': ['--allow='],
+ 'namespace': ['--warn=other::lint'],
+ 'nested_namespace': ['--allow=clippy::more::lint'],
+ 'space': ['--allow=unused name'],
+ 'equals': ['--warn=unused=value'],
+ 'path': ['--warn=../unused'],
+ 'comma': ['--allow=unused,dead_code'],
+ 'newline': ['--allow=unused\n'],
+ 'separated': ['--allow', 'unused'],
+ 'deny': ['--deny=unused'],
+ 'forbid': ['--forbid=unused'],
+ 'force_warn': ['--force-warn=unused'],
+ 'response': ['@response'],
+ 'unknown_codegen': ['-C', 'TEST_CODE_unknown=yes'],
+ 'unstable': ['-Zrandomize-layout']}
+
+JOBSERVER_MUTATIONS = (
+    "mismatch", "reversed", "duplicate", "stdio", "negative", "overflow", "noncanonical",
+    "closed", "regular", "empty", "fifo", "extra", "whitespace", "makeflags", "mflags",
+)
+
 FAKE_RUSTC = r'''
-import json, os, pathlib, sys
+import errno, fcntl, json, os, pathlib, stat, sys
 args=sys.argv[1:]
 hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
 if args==['-vV']:
     (hits/'probe').write_text('entered');print('TEST_CODE_version_probe');sys.exit(0)
 def value(key): return args[args.index(key)+1]
 (hits/('compile-'+value('--crate-name'))).write_text('entered')
+if 'FIXTURE_JOBSERVER_CHECK' in os.environ:
+    read,write=map(int,os.environ['FIXTURE_JOBSERVER_CHECK'].split(','))
+    assert stat.S_ISFIFO(os.fstat(read).st_mode) and stat.S_ISFIFO(os.fstat(write).st_mode)
+    assert fcntl.fcntl(read,fcntl.F_GETFL)&os.O_ACCMODE==os.O_RDONLY
+    assert fcntl.fcntl(write,fcntl.F_GETFL)&os.O_ACCMODE==os.O_WRONLY
+    canary=int(os.environ['FIXTURE_CLOSED_CANARY'])
+    try: os.fstat(canary)
+    except OSError as error: assert error.errno==errno.EBADF
+    else: raise AssertionError('unrelated descriptor leaked to compiler')
+    token=os.read(read,1);assert token==b'J';assert os.write(write,token)==1
+    (hits.parent/('jobserver-observed-'+value('--crate-name')+'.json')).write_text(json.dumps(
+        {'pair':[read,write],'canary':canary,'canary_closed':True,'token_hex':token.hex()}))
 name=value('--crate-name'); out=pathlib.Path(value('--out-dir')); out.mkdir(parents=True,exist_ok=True)
 source=pathlib.Path(args[-1]); body=source.read_bytes()
 if name=='build_script_build':
@@ -46,8 +137,10 @@ if os.environ.get('FIXTURE_FAIL')=='1': sys.exit(7)
 '''
 
 FAKE_CARGO = r'''
-import json, os, pathlib, shutil, subprocess, sys
+import contextlib, fcntl, json, os, pathlib, shutil, subprocess, sys
 MODE=__MODE__
+LINTS=__LINTS__
+ARG_CASES=__ARG_CASES__
 args=sys.argv[1:]
 assert args[:5]==['build','--locked','--offline','--lib','--target']
 assert args[5]=='x86_64-apple-darwin'
@@ -56,11 +149,45 @@ app=pathlib.Path(value('--manifest-path')).parent; session=app.parent; target=pa
 def emit(value): print(json.dumps(value),flush=True)
 sysroot_lib=str(pathlib.Path(os.environ['RUSTC']).parent/'sysroot/lib')
 assert os.environ['DYLD_FALLBACK_LIBRARY_PATH']==sysroot_lib
+assert not any(k in os.environ for k in ('CARGO_MAKEFLAGS','MAKEFLAGS','MFLAGS'))
 prefix=str(target/'debug/deps')
 probe_env=dict(os.environ,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
 if MODE=='probe_compile_path': probe_env['DYLD_FALLBACK_LIBRARY_PATH']=prefix+':'+sysroot_lib
 probe=subprocess.run([os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'-vV'],env=probe_env,stdout=subprocess.PIPE)
 if probe.returncode: emit({'reason':'build-finished','success':False});sys.exit(probe.returncode)
+@contextlib.contextmanager
+def jobserver(env,name):
+    if not MODE.startswith('jobserver_') or MODE=='jobserver_missing':
+        yield env,();return
+    read,write=os.pipe();owned=[read,write]
+    try:
+        canary_file=os.open(session/'fd-canary',os.O_CREAT|os.O_RDWR,0o600)
+        try: canary=fcntl.fcntl(canary_file,fcntl.F_DUPFD,200)
+        finally: os.close(canary_file)
+        owned.append(canary)
+        def flags(r,w): return f'-j --jobserver-fds={r},{w} --jobserver-auth={r},{w}'
+        child=dict(env,CARGO_MAKEFLAGS=flags(read,write),FIXTURE_JOBSERVER_CHECK=f'{read},{write}',
+                   FIXTURE_CLOSED_CANARY=str(canary))
+        if MODE.startswith('jobserver_invalid:') and name=='dep':
+            case=MODE.split(':',1)[1]
+            closed=fcntl.fcntl(read,fcntl.F_DUPFD,100);os.close(closed)
+            mutations={'mismatch':f'-j --jobserver-fds={read},{write} --jobserver-auth={write},{read}',
+                       'reversed':flags(write,read),'duplicate':flags(read,read),'stdio':flags(1,write),
+                       'negative':flags(-1,write),'overflow':flags(1<<100,write),
+                       'noncanonical':flags('0'+str(read),write),'closed':flags(closed,write),
+                       'regular':flags(canary,write),'empty':'','fifo':'-j --jobserver-auth=fifo:/TEST_CODE',
+                       'extra':flags(read,write)+' -j2','whitespace':' '+flags(read,write)}
+            if case in mutations: child['CARGO_MAKEFLAGS']=mutations[case]
+            elif case in ('makeflags','mflags'): child[case.upper()]=flags(read,write)
+            else: raise AssertionError(case)
+        os.write(write,b'J')
+        (session/('jobserver-attempt-'+name+'.json')).write_text(json.dumps({
+            'pair':[read,write],'canary':canary,'environment':{k:child[k] for k in
+                ('CARGO_MAKEFLAGS','MAKEFLAGS','MFLAGS') if k in child}}))
+        yield child,tuple(owned)
+    finally:
+        for fd in owned: os.close(fd)
+
 def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
     env=dict(os.environ,CARGO_MANIFEST_DIR=str(manifest),FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
     env['DYLD_FALLBACK_LIBRARY_PATH']=prefix+':'+sysroot_lib
@@ -76,7 +203,11 @@ def compile(name, root, manifest, kind, package, out, extra=(), env_extra=None):
     env.update(env_extra or {})
     command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition','2021','--crate-type',kind,'--emit','dep-info,link' if kind=='bin' else 'dep-info,metadata,link','--out-dir',str(out),*extra,str(root)]
     if MODE=='wrong_sysroot' and name=='dep': command[2:2]=['--sysroot','/TEST_CODE_wrong_sysroot']
-    result=subprocess.run(command,env=env)
+    if MODE=='lint_equals':
+        command[2:2]=LINTS[name]+(['--target','x86_64-apple-darwin'] if name=='stock_analysis' else [])
+    if MODE.startswith('lint_invalid:') and name=='dep': command[2:2]=ARG_CASES[MODE.split(':',1)[1]]
+    with jobserver(env,name) as (child,descriptors):
+        result=subprocess.run(command,env=child,pass_fds=descriptors)
     if result.returncode: emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
     if kind=='bin':
         alias=out/'build-script-build';shutil.copy2(out/name,alias);files=[str(alias)];executable=str(alias)
@@ -141,7 +272,7 @@ class RecordingProtocolTests(unittest.TestCase):
         sysroot = self.root / "sysroot"
         write(sysroot / "lib/test.bin", "TEST_CODE_SYSROOT")
         rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + FAKE_RUSTC)
-        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + FAKE_CARGO.replace("__MODE__", repr(mode)))
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + FAKE_CARGO.replace("__MODE__", repr(mode)).replace("__LINTS__", repr(OBSERVED_LINTS)).replace("__ARG_CASES__", repr(LINT_MUTATIONS)))
         rustc.chmod(0o700); cargo.chmod(0o700)
         def pin(path): return {"path": str(path), "sha256": sha(path)}
         inventory = {"owner_sha256": sha(self.tool), "cargo": pin(cargo), "rustc": pin(rustc),
@@ -185,7 +316,9 @@ class RecordingProtocolTests(unittest.TestCase):
     def test_full_record_observes_extern_and_actual_generator_without_pin(self):
         inventory = self.prepare()
         result = self.invoke("record", incoming={"RUSTFLAGS": "--sysroot /bad", "PROTOC": "/bad", "CARGO_HOME": "/bad",
-                                                "DYLD_FALLBACK_LIBRARY_PATH": "/TEST_CODE_CALLER", "LD_LIBRARY_PATH": "/TEST_CODE_CALLER"})
+                                                "DYLD_FALLBACK_LIBRARY_PATH": "/TEST_CODE_CALLER", "LD_LIBRARY_PATH": "/TEST_CODE_CALLER",
+                                                "CARGO_MAKEFLAGS": "TEST_CODE_AMBIENT", "MAKEFLAGS": "TEST_CODE_AMBIENT",
+                                                "MFLAGS": "TEST_CODE_AMBIENT"})
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         record = self.record_result(result)
         self.assertEqual(record["blockers"], [])
@@ -339,6 +472,125 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertTrue(any(b.startswith("UnknownCargoEvent:") for b in self.record_result(result)["blockers"]))
         raw = next((self.root / ".replay-build-records").glob("*/cargo.stdout.raw")).read_bytes()
         self.assertIn(b"TEST_CODE_unknown", raw)
+
+    def rejected_protocol_record(self, mode):
+        self.prepare(mode)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 2, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        self.assertIn("CargoDidNotFinishSuccessfully", record["blockers"])
+        self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+        self.assertEqual(record["selected_library"], [])
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()}, {"probe"})
+        self.assertFalse(any((session / "target").rglob("*.rlib")))
+        rejected = [p for p in (session / "invocations").iterdir() if not (p / "receipt.json").exists()]
+        self.assertEqual(len(rejected), 1)
+        self.assertFalse((rejected[0] / "invocation.json").exists())
+        request = json.loads((rejected[0] / "request.json").read_text())
+        return session, request
+
+    def test_equals_lints_preserve_raw_argv_and_record_success(self):
+        self.prepare("lint_equals")
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["selected_library"]), 1)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        count = 0
+        for path in (session / "invocations").glob("*/receipt.json"):
+            receipt = json.loads(path.read_text())
+            if receipt["kind"] == "Probe":
+                continue
+            name = receipt["parsed"]["options"]["--crate-name"][0]
+            argv = [bytes.fromhex(v).decode() for v in receipt["argv_hex"]]
+            tokens = [v for v in argv if v.startswith(("--allow=", "--warn="))]
+            self.assertEqual(tokens, OBSERVED_LINTS[name])
+            self.assertEqual(receipt["exit_code"], 0)
+            self.assertEqual(receipt["role"], "Target" if name == "stock_analysis" else "Host")
+            observed = json.loads((path.parent / "stderr.raw").read_text())["fixture_argv"]
+            self.assertEqual(observed, argv[1:])
+            for prefix, key in (("--allow=", "-A"), ("--warn=", "-W")):
+                self.assertEqual(receipt["parsed"]["options"].get(key, []),
+                                 [v[len(prefix):] for v in tokens if v.startswith(prefix)])
+            count += len(tokens)
+        self.assertEqual(count, 56)
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()},
+                         {"probe", "compile-dep", "compile-build_script_build", "compile-stock_analysis"})
+        parsed = owner.parse_rustc(["--crate-name=x", "--emit=dep-info", "--out-dir=/tmp/out",
+                                    "--allow=unused", "--warn=unused", "--allow=unused", "src/lib.rs"])
+        self.assertEqual(parsed["options"]["-A"], ["unused", "unused"])
+        self.assertEqual(parsed["options"]["-W"], ["unused"])
+
+    def test_equals_lint_mutations_refuse_before_compiler_entry(self):
+        for case, tokens in LINT_MUTATIONS.items():
+            with self.subTest(case=case):
+                session, request = self.rejected_protocol_record("lint_invalid:" + case)
+                argv = [bytes.fromhex(v).decode() for v in request["argv_hex"]]
+                self.assertEqual(argv[1:1 + len(tokens)], tokens)
+                self.assertIn(b"Refused", (session / "cargo.stderr.raw").read_bytes())
+
+    def test_jobserver_pipe_survives_wrapper_and_unrelated_fd_closes(self):
+        self.prepare("jobserver_valid")
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["selected_library"]), 1)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        seen = set()
+        for path in (session / "invocations").glob("*/receipt.json"):
+            receipt = json.loads(path.read_text())
+            env = {bytes.fromhex(k).decode(): bytes.fromhex(v).decode()
+                   for k, v in receipt["environment_hex"].items()}
+            if receipt["kind"] == "Probe":
+                self.assertNotIn("CARGO_MAKEFLAGS", env)
+                continue
+            name = receipt["parsed"]["options"]["--crate-name"][0]
+            attempt = json.loads((session / ("jobserver-attempt-" + name + ".json")).read_text())
+            observed = json.loads((session / ("jobserver-observed-" + name + ".json")).read_text())
+            self.assertEqual(observed["pair"], attempt["pair"])
+            self.assertEqual(observed["canary"], attempt["canary"])
+            self.assertTrue(observed["canary_closed"])
+            self.assertEqual(observed["token_hex"], "4a")
+            self.assertEqual(env["CARGO_MAKEFLAGS"], attempt["environment"]["CARGO_MAKEFLAGS"])
+            self.assertEqual(receipt["exit_code"], 0)
+            seen.add(name)
+        self.assertEqual(seen, {"dep", "build_script_build", "stock_analysis"})
+        self.assertEqual({p.name for p in (session / "compiler-entry").iterdir()},
+                         {"probe", "compile-dep", "compile-build_script_build", "compile-stock_analysis"})
+
+    def test_jobserver_mutations_refuse_before_compiler_entry(self):
+        for case in JOBSERVER_MUTATIONS:
+            with self.subTest(case=case):
+                session, request = self.rejected_protocol_record("jobserver_invalid:" + case)
+                env = {bytes.fromhex(k).decode(): bytes.fromhex(v).decode()
+                       for k, v in request["environment_hex"].items()}
+                attempt = json.loads((session / "jobserver-attempt-dep.json").read_text())
+                self.assertEqual({k: env[k] for k in ("CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS") if k in env},
+                                 attempt["environment"])
+                self.assertIn(b"Jobserver", (session / "cargo.stderr.raw").read_bytes())
+                self.assertFalse(list(session.glob("jobserver-observed-*.json")))
+
+    def test_record_owner_digest_binds_receipt_and_source_distinctly(self):
+        inventory = self.prepare("jobserver_missing")
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        self.assertEqual(record["blockers"], [])
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipt = json.loads((session / "owner.json").read_text())
+        self.assertEqual(record["owner_sha256"], sha(session / "owner.json"))
+        self.assertEqual(receipt["owner_sha256"], sha(self.tool))
+        self.assertEqual(receipt["owner_sha256"], inventory["owner_sha256"])
+        self.assertNotEqual(record["owner_sha256"], receipt["owner_sha256"])
+        for path in (session / "invocations").glob("*/receipt.json"):
+            invocation = json.loads(path.read_text())
+            env = {bytes.fromhex(k).decode(): bytes.fromhex(v).decode()
+                   for k, v in invocation["environment_hex"].items()}
+            self.assertNotIn("CARGO_MAKEFLAGS", env)
+            self.assertEqual(invocation["exit_code"], 0)
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:

@@ -7,6 +7,7 @@ Recordings are diagnostic evidence requiring subsequent independent policy revie
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -206,9 +207,10 @@ def package_id(package, session):
     return package["id"].replace("{application_uri}", (session / "application").as_uri())
 
 
-def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False):
+def run_streamed(argv, cwd, env, stdout_file, stderr_file, echo=False, *, pass_fds=()):
     """Preserve exact child bytes while forwarding both streams without buffering a tree."""
-    process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               close_fds=True, pass_fds=pass_fds)
     failures = []
     def pump(source, path, fd):
         try:
@@ -254,6 +256,10 @@ def parse_rustc(args):
             i += 1
         elif any(arg.startswith(prefix) and len(arg) > 2 for prefix in ("-C", "-L", "-A", "-W", "-D", "-F")):
             key, value = arg[:2], arg[2:]
+        elif arg.startswith(("--allow=", "--warn=")):
+            name, value = arg.split("=", 1)
+            require(re.fullmatch(r"(?:clippy::)?[a-z_][a-z0-9_]*", value), "UnsupportedLintArgument")
+            key = {"--allow": "-A", "--warn": "-W"}[name]
         elif arg.split("=", 1)[0] in values:
             key = arg.split("=", 1)[0]
             if "=" in arg:
@@ -392,6 +398,27 @@ def compiler_environment(env, session, sysroot, *, probe):
     require(env.get("DYLD_FALLBACK_LIBRARY_PATH") == expected, "CompilerEnvironmentInjection")
 
 
+def inherited_jobserver_fds(env):
+    """Forward only the original pipe pair from the trusted fixed Cargo parent."""
+    require("MAKEFLAGS" not in env and "MFLAGS" not in env, "UnsupportedJobserverEnvironment")
+    raw = env.get("CARGO_MAKEFLAGS")
+    if raw is None:
+        return ()
+    match = re.fullmatch(r"-j --jobserver-fds=([1-9][0-9]*),([1-9][0-9]*) "
+                         r"--jobserver-auth=\1,\2", raw)
+    require(match is not None, "UnsupportedJobserverFlags")
+    try:
+        read, write = (int(value) for value in match.groups())
+        require(read >= 3 and write >= 3 and read != write, "InvalidJobserverDescriptors")
+        for fd, access in ((read, os.O_RDONLY), (write, os.O_WRONLY)):
+            require(stat.S_ISFIFO(os.fstat(fd).st_mode), "InvalidJobserverDescriptors")
+            require(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == access,
+                    "InvalidJobserverDescriptors")
+    except (OSError, OverflowError, ValueError):
+        raise Refusal("InvalidJobserverDescriptors") from None
+    return (read, write)
+
+
 def wrapper(session_id, args):
     require(ID.fullmatch(session_id), "SessionId")
     session = SESSIONS / ("pending-" + session_id)
@@ -415,6 +442,7 @@ def wrapper(session_id, args):
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
     parsed = parse_rustc(args[1:])
     compiler_environment(os.environ, session, inv["sysroot"], probe=parsed["probe"])
+    jobserver_fds = inherited_jobserver_fds(os.environ)
     options, codegen = parsed["options"], parsed["codegen"]
     if "--target" in options:
         require(options["--target"] == [TARGET], "WrongTarget")
@@ -461,7 +489,8 @@ def wrapper(session_id, args):
               "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in os.environ.items()},
               "externs": externs, "declared_outputs": outputs, "compiler_sha256": file_hash(Path(args[0]))}
     atomic_json(call / "invocation.json", record)
-    code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw", echo=True)
+    code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
+                        echo=True, pass_fds=jobserver_fds)
     record["exit_code"] = code
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
@@ -631,6 +660,7 @@ def seal_record(session, policy, cargo_exit):
     seal = {"schema": SCHEMA, "state": "RecordingOnly", "review_gate": "IndependentPolicyReviewRequired",
             "cargo_exit_code": cargo_exit, "blockers": sorted(set(blockers)), "selected_library": selected,
             "extern_edges": edges, "build_script_associations": associations, "consumed_sources": consumed,
+            # This binds the owner receipt; its nested owner_sha256 binds tool source.
             "owner_sha256": file_hash(session / "owner.json"),
             "policy_sha256": digest(POLICY.read_bytes()),
             "invocations": [{key: r[key] for key in ("invocation_id", "receipt_sha256", "request_sha256", "invocation_sha256", "stdout_sha256", "stderr_sha256")} for r in receipts],
