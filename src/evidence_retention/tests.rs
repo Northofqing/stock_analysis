@@ -480,3 +480,108 @@ fn retention_receipt_and_root_collection_attacks_refuse_before_owned() {
     );
     OWNED_HITS.with(|h| assert_eq!(h.get(), 0));
 }
+
+#[test]
+fn retention_root_comparison_preflight_refuses_before_phase_entry() {
+    let first = draft_from_claims(claims(OwnerDomain::Data, "same-prefix-b"), b"").unwrap();
+    let second = draft_from_claims(claims(OwnerDomain::Data, "same-prefix-a"), b"").unwrap();
+    let refs = [
+        DraftAndReceiptRef {
+            draft: &first,
+            receipt: None,
+        },
+        DraftAndReceiptRef {
+            draft: &second,
+            receipt: None,
+        },
+    ];
+    let bound = root_comparison_scan_bound(refs.len()).unwrap();
+    let mut work = Work::new();
+    work.scan(32 * MIB - bound + 1).unwrap();
+    root_comparison_probe(true);
+    assert_eq!(
+        prepare_root_order(&root_claims(), &refs, &mut work).err(),
+        Some(ValueError::InputLimit)
+    );
+    assert_eq!(root_comparison_probe(false), (0, 0));
+    assert_eq!(work.scan(0), Err(ValueError::InputLimit));
+
+    let mut work = Work::new();
+    work.scan(32 * MIB - bound).unwrap();
+    root_comparison_probe(true);
+    assert_eq!(
+        prepare_root_order(&root_claims(), &refs, &mut work).unwrap(),
+        [1, 0]
+    );
+    assert_eq!(root_comparison_probe(false), (1, 1));
+    assert_eq!(work.scan(1), Err(ValueError::InputLimit));
+    assert_eq!(root_comparison_scan_bound(129), Err(ValueError::InputLimit));
+}
+
+#[test]
+fn retention_root_reverse_common_prefix_uses_prepaid_order() {
+    let prefix = "p".repeat(253);
+    let drafts: Vec<_> = (0..128)
+        .map(|i| {
+            let slot = format!("{prefix}{i:03}");
+            assert_eq!(slot.len(), 256);
+            draft_from_claims(claims(OwnerDomain::Data, &slot), b"").unwrap()
+        })
+        .collect();
+    let mut refs: Vec<_> = drafts
+        .iter()
+        .map(|draft| DraftAndReceiptRef {
+            draft,
+            receipt: None,
+        })
+        .collect();
+    root_comparison_probe(true);
+    let forward = build_daily_root(root_claims(), &refs).unwrap();
+    assert_eq!(root_comparison_probe(false), (1, 127));
+    refs.reverse();
+    root_comparison_probe(true);
+    let reverse = build_daily_root(root_claims(), &refs).unwrap();
+    assert_eq!(root_comparison_probe(false), (1, 128 * 127 / 2));
+    assert_eq!(reverse.as_canonical_bytes(), forward.as_canonical_bytes());
+    assert_eq!(reverse.id(), forward.id());
+    assert_eq!(
+        parse_daily_root(reverse.as_canonical_bytes()).unwrap().id(),
+        forward.id()
+    );
+    assert_eq!(reverse.trust(), TrustState::Unverified);
+    assert_eq!(reverse.coverage_state(), CoverageState::Incomplete);
+    assert_eq!(reverse.signature_state(), SignatureState::Unsigned);
+}
+
+#[test]
+fn retention_body_hex_tiny_exact_capacity_and_shared_reservation() {
+    let raw = [0xab, 0x00, 0xff];
+    for (len, expected) in ["", "ab", "ab00", "ab00ff"].into_iter().enumerate() {
+        let mut work = Work::new();
+        work.own(8 * MIB - 2 * len).unwrap();
+        let encoded = encode_body_hex(&raw[..len], &mut work).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.capacity(), 2 * len);
+        assert_eq!(work.own(1), Err(ValueError::AllocationLimit));
+        if len != 0 {
+            let mut work = Work::new();
+            work.own(8 * MIB - 2 * len + 1).unwrap();
+            assert_eq!(
+                encode_body_hex(&raw[..len], &mut work),
+                Err(ValueError::AllocationLimit)
+            );
+        }
+        let built =
+            draft_from_claims(claims(OwnerDomain::Data, "example-slot"), &raw[..len]).unwrap();
+        assert!(std::str::from_utf8(built.as_canonical_bytes())
+            .unwrap()
+            .contains(&format!("\"body_hex\":\"{expected}\"")));
+        assert_eq!(
+            parse_draft(built.as_canonical_bytes()).unwrap().id(),
+            built.id()
+        );
+        if len == 0 {
+            assert_eq!(built.as_canonical_bytes(), DRAFT_GOLDEN.as_bytes());
+        }
+    }
+}

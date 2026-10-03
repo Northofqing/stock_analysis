@@ -231,6 +231,25 @@ pub(crate) fn parse_draft(b: &[u8]) -> Result<UnverifiedEvidencePackageDraft, Va
     let b = codec_v1::copy(b, w)?;
     finish_draft(d, b, w)
 }
+// Exact requested capacity, including tiny bodies: no collect/Extend growth.
+fn encode_body_hex(raw: &[u8], work: &mut Work) -> Result<String, ValueError> {
+    if raw.len() > MIB {
+        return Err(ValueError::InputLimit);
+    }
+    let size = raw
+        .len()
+        .checked_mul(2)
+        .ok_or(ValueError::AllocationLimit)?;
+    work.own(size)?;
+    work.scan(raw.len())?;
+    let mut out = String::with_capacity(size);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in raw {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    Ok(out)
+}
 pub(crate) fn draft_from_claims(
     c: DraftClaimsRef<'_>,
     raw: &[u8],
@@ -265,9 +284,7 @@ pub(crate) fn draft_from_claims(
     }
     let w = &mut Work::new();
     w.own(std::mem::size_of::<DraftWire>())?;
-    w.own(raw.len() * 2)?;
-    w.scan(raw.len())?;
-    let body_hex = hex::encode(raw);
+    let body_hex = encode_body_hex(raw, w)?;
     let d = DraftWire {
         schema: codec_v1::text("retention-package-draft-v1", w)?,
         schema_version: 1,
@@ -707,32 +724,136 @@ pub(crate) fn parse_daily_root(b: &[u8]) -> Result<UnsignedOrIncompleteDailyRoot
         canonical: codec_v1::copy(b, w)?,
     })
 }
+// One builder-only envelope for comparisons/semantic byte inspections. Codec
+// decode/encode, body hashes and text copies keep their separate existing charges.
+// Both operands are reserved for comparisons, even when an earlier tuple field
+// decides their order. Typed carriers already seal all lengths used below.
+fn root_comparison_scan_bound(n: usize) -> Result<usize, ValueError> {
+    if n > 128 {
+        return Err(ValueError::InputLimit);
+    }
+    const DAY: usize = 10;
+    const SLOT: usize = 256;
+    const HASH: usize = 64;
+    const PACKAGE: usize = DP.len() + HASH;
+    const ROOT: usize = UP.len() + HASH;
+    const RECEIPT: usize = RP.len() + HASH;
+    const SCHEMA: usize = "retention-incomplete-daily-root-v1".len();
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(ValueError::InputLimit);
+    let adjacent = n.saturating_sub(1);
+    let pairs = mul(n, adjacent)?
+        .checked_div(2)
+        .ok_or(ValueError::InputLimit)?;
+    let terms = [
+        2 * (4 * DAY + 4 * ROOT), // Initial and completed-root claim validation.
+        mul(2 * DAY, n)?,         // Draft day equals root day.
+        mul(2 * (SLOT + PACKAGE), pairs)?, // Insertion comparator maximum.
+        mul(2 * SLOT, adjacent)?, // Early logical-slot duplicates.
+        mul(SLOT + 2 * PACKAGE + HASH + 2 * RECEIPT, n)?, // Entry format checks.
+        mul(4 * SLOT + 2 * PACKAGE, adjacent)?, // Final duplicate/order checks.
+        mul(2 * PACKAGE + 2 * HASH, n)?, // Optional receipt claim bindings.
+        4 * ROOT,                 // Two final previous-root/self-reference comparisons.
+        2 * SCHEMA,
+    ];
+    terms.into_iter().try_fold(0usize, |total, term| {
+        total.checked_add(term).ok_or(ValueError::InputLimit)
+    })
+}
+#[cfg(test)]
+std::thread_local! {
+    static ROOT_COMPARISON_PROBE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+fn root_comparison_probe(reset: bool) -> (usize, usize) {
+    ROOT_COMPARISON_PROBE.with(|probe| {
+        let value = probe.get();
+        if reset {
+            probe.set((0, 0));
+        }
+        value
+    })
+}
+fn prepare_root_order(
+    claims: &DailyRootClaimsRef<'_>,
+    refs: &[DraftAndReceiptRef<'_>],
+    work: &mut Work,
+) -> Result<Vec<usize>, ValueError> {
+    let bound = root_comparison_scan_bound(refs.len())?;
+    // Only O(1) lengths/scalars precede the charge; never inspect caller bytes.
+    if claims.business_day_claim.len() != 10
+        || !(1..=1_000_000).contains(&claims.revision)
+        || (claims.revision == 1) != claims.previous_revision_root_id_claim.is_none()
+    {
+        return Err(ValueError::InvalidScalar);
+    }
+    if [
+        claims.previous_day_root_id_claim,
+        claims.previous_revision_root_id_claim,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|s| s.len() != UP.len() + 64)
+    {
+        return Err(ValueError::InvalidHash);
+    }
+    work.scan(bound)?;
+    #[cfg(test)]
+    ROOT_COMPARISON_PROBE.with(|probe| {
+        let (phases, comparisons) = probe.get();
+        probe.set((phases + 1, comparisons));
+    });
+    valid_root_claims(claims)?;
+    work.own(
+        refs.len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or(ValueError::AllocationLimit)?,
+    )?;
+    let mut order = Vec::with_capacity(refs.len());
+    for (i, entry) in refs.iter().enumerate() {
+        if entry.draft.day != claims.business_day_claim {
+            return Err(ValueError::RootBindingMismatch);
+        }
+        order.push(i);
+    }
+    // At most sum(1..n) == n*(n-1)/2 comparisons, without sort-library bounds.
+    for i in 1..order.len() {
+        let key = order[i];
+        let mut j = i;
+        while j > 0 {
+            #[cfg(test)]
+            ROOT_COMPARISON_PROBE.with(|probe| {
+                let (phases, comparisons) = probe.get();
+                probe.set((phases, comparisons + 1));
+            });
+            let left = refs[order[j - 1]].draft;
+            let right = refs[key].draft;
+            if (left.owner, left.slot.as_bytes(), left.id.as_bytes())
+                <= (right.owner, right.slot.as_bytes(), right.id.as_bytes())
+            {
+                break;
+            }
+            order[j] = order[j - 1];
+            j -= 1;
+        }
+        order[j] = key;
+    }
+    for pair in order.windows(2) {
+        let left = refs[pair[0]].draft;
+        let right = refs[pair[1]].draft;
+        if left.owner == right.owner && left.slot == right.slot {
+            return Err(ValueError::LogicalSlotConflict);
+        }
+    }
+    // This prepaid phase also covers the builder's later validate_root and
+    // root_id self-reference checks, not their separately charged copies/hash.
+    Ok(order)
+}
 pub(crate) fn build_daily_root(
     c: DailyRootClaimsRef<'_>,
     refs: &[DraftAndReceiptRef<'_>],
 ) -> Result<UnsignedOrIncompleteDailyRoot, ValueError> {
-    valid_root_claims(&c)?;
-    if refs.len() > 128 {
-        return Err(ValueError::InputLimit);
-    }
     let w = &mut Work::new();
-    w.own(refs.len() * std::mem::size_of::<usize>())?;
-    let mut order = Vec::with_capacity(refs.len());
-    for (i, e) in refs.iter().enumerate() {
-        if e.draft.day != c.business_day_claim {
-            return Err(ValueError::RootBindingMismatch);
-        }
-        order.push(i)
-    }
-    order.sort_unstable_by(|a, b| {
-        let a = refs[*a].draft;
-        let b = refs[*b].draft;
-        (a.owner, a.slot.as_bytes(), a.id.as_bytes()).cmp(&(
-            b.owner,
-            b.slot.as_bytes(),
-            b.id.as_bytes(),
-        ))
-    });
+    let order = prepare_root_order(&c, refs, w)?;
     w.own(
         refs.len() * std::mem::size_of::<Entry>()
             + 4 * std::mem::size_of::<Coverage>()
@@ -743,12 +864,6 @@ pub(crate) fn build_daily_root(
     for i in order {
         let e = &refs[i];
         let d = e.draft;
-        if entries
-            .last()
-            .is_some_and(|p: &Entry| p.owner_domain == d.owner && p.logical_slot_claim == d.slot)
-        {
-            return Err(ValueError::LogicalSlotConflict);
-        }
         let consistency = match e.receipt {
             None => ReceiptConsistency::NoReceipt,
             Some(r) => match check_with(d, r, w)?.consistency {
