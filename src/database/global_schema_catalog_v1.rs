@@ -1205,7 +1205,15 @@ impl ClosedRequalificationRecipe {
         "requalification-exact-amended-catalog6-v1"
     }
     pub(super) fn is_test(&self) -> bool {
-        self.mode == GlobalSchemaCatalogMode::Test
+        #[cfg(test)]
+        {
+            self.mode == GlobalSchemaCatalogMode::Test
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self.mode;
+            false
+        }
     }
 }
 pub(super) struct WholeRowsTable {
