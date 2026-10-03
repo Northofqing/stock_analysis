@@ -1185,6 +1185,139 @@ impl Workspace {
         }
         Ok(())
     }
+    // No phase callbacks: this is the complete final reader, not the old
+    // hookful facade with a different name.
+    fn validate_outputs_without_hooks(
+        &mut self,
+        source: &mut prospective::Pending,
+        options: &prospective::Options,
+        settings: &Settings,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        self.verify_recorded(settings)?;
+        let (db, audit) = source.backup_expected();
+        self.validate_chain(&source.backup_binding(options)?, &db, audit.as_ref())?;
+        self.verify_role(Role::Database, source, options, settings)?;
+        if audit.is_some() {
+            self.verify_role(Role::Audit, source, options, settings)?;
+        } else if existing(&self.directory.file, Role::Audit.leaf(), false)?.is_some() {
+            return Err(refuse("rows tail absent audit role appeared"));
+        }
+        self.validate_output_names()?;
+        self.validate_record_names()?;
+        self.work.common(source, options, &settings.limits)?;
+        self.validate_directory()
+    }
+    fn copied_sidecars_absent(&self) -> Result<(), GlobalSchemaV1Error> {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let leaf = format!("{}{suffix}", Role::Database.leaf());
+            // Only genuine NotFound is absence. Unknown/nonregular/symlink
+            // sidecars are refused and are never removed or adopted.
+            match openat_component(
+                &self.directory.file,
+                OsStr::new(&leaf),
+                O_RDONLY_FLAG,
+                false,
+            ) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(refuse("copied database sidecar appeared")),
+            }
+        }
+        Ok(())
+    }
+    fn with_copied_rows<T>(
+        &mut self,
+        source: &mut prospective::Pending,
+        options: &prospective::Options,
+        settings: &Settings,
+        work: &mut rows::RowsWork,
+        read: impl for<'loan> FnOnce(
+            &OwnedBackupRowsView<'loan>,
+            &mut rows::RowsWork,
+        ) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        work.reserve_copy_route(
+            self.directory.path.as_os_str().len() as u64,
+            Role::Database.leaf().len() as u64,
+        )?;
+        self.validate_outputs_without_hooks(source, options, settings)?;
+        self.copied_sidecars_absent()?;
+        let expected = self
+            .copied(Role::Database)
+            .cloned()
+            .ok_or_else(|| refuse("rows loan has no durable Copied database"))?;
+        let file = existing(&self.directory.file, Role::Database.leaf(), false)?
+            .ok_or_else(|| refuse("rows Copied database missing"))?;
+        self.same_named(Role::Database.leaf(), &file, &expected.node)?;
+        let route = sqlite_open_route_from_retained_parent(
+            &self.directory.file,
+            OsStr::new(Role::Database.leaf()),
+        )
+        .map_err(|_| refuse("rows retained copy route unavailable"))?;
+        // immutable is restricted to this already closed durable Copied role
+        // with proven absent sidecars; it is never used for the live source.
+        let mut uri = String::from("file:");
+        for b in route.as_os_str().as_bytes() {
+            use std::fmt::Write;
+            write!(&mut uri, "%{b:02X}").map_err(|_| refuse("rows copy URI encoding"))?;
+        }
+        uri.push_str("?mode=ro&immutable=1");
+        let connection = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+            operation: "open closed Copied rows read-only",
+            source,
+        })?;
+        let result = (|| {
+            connection
+                .execute_batch("PRAGMA query_only=ON")
+                .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+                    operation: "restrict Copied rows loan",
+                    source,
+                })?;
+            if !connection
+                .is_readonly(rusqlite::DatabaseName::Main)
+                .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
+                    operation: "prove Copied reader is read-only",
+                    source,
+                })?
+            {
+                return Err(refuse("Copied rows reader is writable"));
+            }
+            let integrity = capture_selection_integrity(&connection)?;
+            let _ = integrity;
+            self.same_named(Role::Database.leaf(), &file, &expected.node)?;
+            self.copied_sidecars_absent()?;
+            read(
+                &OwnedBackupRowsView {
+                    connection: &connection,
+                },
+                work,
+            )
+        })();
+        connection
+            .close()
+            .map_err(|(_, source)| GlobalSchemaV1Error::SelectionSqlite {
+                operation: "close scoped Copied rows reader",
+                source,
+            })?;
+        self.copied_sidecars_absent()?;
+        if sqlite_open_route_from_retained_parent(
+            &self.directory.file,
+            OsStr::new(Role::Database.leaf()),
+        )
+        .map_err(|_| refuse("rows copy route disappeared"))?
+            != route
+        {
+            return Err(refuse("rows copy route changed"));
+        }
+        self.same_named(Role::Database.leaf(), &file, &expected.node)?;
+        self.validate_outputs_without_hooks(source, options, settings)?;
+        result
+    }
     pub(super) fn prepare(
         mut self,
         source: &mut prospective::Pending,
@@ -1239,6 +1372,29 @@ pub(super) struct Pending {
     workspace: Workspace,
 }
 impl Pending {
+    pub(super) fn with_copied_rows<T>(
+        &mut self,
+        source: &mut prospective::Pending,
+        options: &prospective::Options,
+        settings: &Settings,
+        work: &mut rows::RowsWork,
+        read: impl for<'loan> FnOnce(
+            &OwnedBackupRowsView<'loan>,
+            &mut rows::RowsWork,
+        ) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        self.workspace
+            .with_copied_rows(source, options, settings, work, read)
+    }
+    pub(super) fn validate_rows_before_commit_without_hooks(
+        &mut self,
+        source: &mut prospective::Pending,
+        options: &prospective::Options,
+        settings: &Settings,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        self.workspace
+            .validate_outputs_without_hooks(source, options, settings)
+    }
     pub(super) fn validate_before_commit(
         &mut self,
         source: &mut prospective::Pending,
@@ -1287,6 +1443,43 @@ pub(super) struct VerifiedUnapprovedByteBackup {
     settings: Settings,
 }
 impl VerifiedUnapprovedByteBackup {
+    pub(super) fn with_copied_rows<T>(
+        &mut self,
+        work: &mut rows::RowsWork,
+        read: impl for<'loan> FnOnce(
+            &OwnedBackupRowsView<'loan>,
+            &mut rows::RowsWork,
+        ) -> Result<T, GlobalSchemaV1Error>,
+    ) -> Result<T, GlobalSchemaV1Error> {
+        let (source, options, _, _) = self.source.backup_parts();
+        self.workspace
+            .with_copied_rows(source, options, &self.settings, work, read)
+    }
+    pub(super) fn validate_rows_preliminary(&mut self) -> Result<(), GlobalSchemaV1Error> {
+        self.validate_actual()
+    }
+    pub(super) fn before_rows_render(&mut self) -> Result<(), GlobalSchemaV1Error> {
+        self.settings.phase(Phase::BeforeRender)?;
+        self.validate_actual()
+    }
+    pub(super) fn validate_rows_tail_without_hooks(
+        &mut self,
+        tail: &rows::RetainedRowsSourceTail,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        let (source, options, database, audit) = self.source.backup_parts();
+        self.workspace
+            .validate_outputs_without_hooks(source, options, &self.settings)?;
+        if self.workspace.record(5).is_none() {
+            return Err(refuse("rows tail terminal missing"));
+        }
+        tail.validate_without_hooks(source, options, database, audit, true)?;
+        self.workspace.copied_sidecars_absent()?;
+        self.workspace.validate_output_names()?;
+        self.workspace.validate_record_names()?;
+        self.workspace
+            .work
+            .common(source, options, &self.settings.limits)
+    }
     fn validate_actual(&mut self) -> Result<(), GlobalSchemaV1Error> {
         self.source.backup_validate()?;
         {
@@ -1361,5 +1554,16 @@ impl VerifiedUnapprovedByteBackup {
         let (_, options, _, _) = self.source.backup_parts();
         let bytes = prospective::bounded_json(&review, options.max_review_bytes)?;
         String::from_utf8(bytes).map_err(|_| refuse("backup review encoding refused"))
+    }
+}
+
+/// Borrowed only inside the Copied-role reader. No raw/path constructor and
+/// no connection, statement, descriptor or maintenance authority can escape.
+pub(super) struct OwnedBackupRowsView<'loan> {
+    connection: &'loan Connection,
+}
+impl OwnedBackupRowsView<'_> {
+    pub(super) fn connection(&self) -> &Connection {
+        self.connection
     }
 }

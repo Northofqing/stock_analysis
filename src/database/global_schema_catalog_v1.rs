@@ -1184,6 +1184,464 @@ impl CatalogSnapshot {
     }
 }
 
+// These contracts have no caller factory. Only an exact whole-family capture
+// from the original owner's transaction can close the table set.
+pub(super) struct WholeRowsReadSpec {
+    tables: Vec<WholeRowsTable>,
+    mode: GlobalSchemaCatalogMode,
+    expected: CatalogSnapshot,
+}
+pub(super) struct WholeRowsTable {
+    name: String,
+    columns: Vec<WholeRowsColumn>,
+    sql: String,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct WholeRowsColumn {
+    cid: i64,
+    name: String,
+    declared_type: String,
+    not_null: i64,
+    default_sql: Option<String>,
+    primary_key: i64,
+    hidden: i64,
+}
+pub(super) struct RowsSpecWork {
+    used: u64,
+    limit: u64,
+    tables: u64,
+    columns: u64,
+}
+impl RowsSpecWork {
+    pub(super) fn new(limit: u64, tables: u64, columns: u64) -> Self {
+        Self {
+            used: 0,
+            limit,
+            tables,
+            columns,
+        }
+    }
+    pub(super) fn charge(&mut self, amount: u64) -> Result<(), GlobalSchemaCatalogError> {
+        self.used = self
+            .used
+            .checked_add(amount)
+            .ok_or_else(|| rows_catalog_error("metadata work overflow"))?;
+        if self.used > self.limit {
+            return Err(rows_catalog_error("metadata work exceeded"));
+        }
+        Ok(())
+    }
+    pub(super) fn used(&self) -> u64 {
+        self.used
+    }
+    fn before_rows_classifier(
+        &mut self,
+        actual: &CatalogSnapshot,
+        references: &SameRuntimeCatalogReferences,
+    ) -> Result<(), GlobalSchemaCatalogError> {
+        fn rows_extent(rows: &[CatalogObjectRow]) -> Result<u64, GlobalSchemaCatalogError> {
+            rows.iter().try_fold(0_u64, |n, r| {
+                n.checked_add(r.identity.name.len() as u64)
+                    .and_then(|n| n.checked_add(r.identity.table_name.len() as u64))
+                    .and_then(|n| n.checked_add(r.exact_sql.len() as u64))
+                    .and_then(|n| {
+                        n.checked_add(std::mem::size_of::<CatalogObjectRow>() as u64 + 128)
+                    })
+                    .ok_or_else(|| rows_catalog_error("classifier metadata extent overflow"))
+            })
+        }
+        let (legacy, transitional, amended) = match actual.identity.user_version {
+            6 => (
+                &references.execution_v6.legacy,
+                &references.execution_v6.transitional,
+                &references.execution_v6.amended,
+            ),
+            5 => (
+                &references.owner_v5.legacy,
+                &references.owner_v5.transitional,
+                &references.owner_v5.amended,
+            ),
+            4 => (
+                &references.owner_v4.legacy,
+                &references.owner_v4.transitional,
+                &references.owner_v4.amended,
+            ),
+            3 => (
+                &references.review_v3.legacy,
+                &references.review_v3.transitional,
+                &references.review_v3.amended,
+            ),
+            2 => (
+                &references.paper_v2.legacy,
+                &references.paper_v2.transitional,
+                &references.paper_v2.amended,
+            ),
+            _ => (
+                &references.legacy,
+                &references.transitional,
+                &references.amended,
+            ),
+        };
+        // Source canonical/digest/safety copies and the three selected frozen
+        // references. This reservation precedes the actual classifier.
+        let mut extent = rows_extent(&actual.objects)?
+            .checked_mul(4)
+            .ok_or_else(|| rows_catalog_error("classifier metadata extent overflow"))?;
+        for reference in [legacy, transitional, amended] {
+            extent = extent
+                .checked_add(
+                    rows_extent(&reference.objects)?
+                        .checked_mul(2)
+                        .ok_or_else(|| rows_catalog_error("classifier metadata extent overflow"))?,
+                )
+                .ok_or_else(|| rows_catalog_error("classifier metadata extent overflow"))?;
+        }
+        for g in &actual.managed_index_geometry {
+            let mut bytes = (std::mem::size_of::<ManagedIndexGeometry>() as u64)
+                .checked_add(g.table_name.len() as u64)
+                .and_then(|n| n.checked_add(g.index_name.len() as u64))
+                .and_then(|n| n.checked_add(g.origin.len() as u64))
+                .ok_or_else(|| rows_catalog_error("classifier geometry extent overflow"))?;
+            for t in &g.terms {
+                bytes = bytes
+                    .checked_add(std::mem::size_of::<IndexXinfoTerm>() as u64)
+                    .and_then(|n| n.checked_add(t.name.as_ref().map_or(0, |s| s.len()) as u64))
+                    .and_then(|n| n.checked_add(t.collation.as_ref().map_or(0, |s| s.len()) as u64))
+                    .ok_or_else(|| rows_catalog_error("classifier geometry extent overflow"))?;
+            }
+            extent = extent
+                .checked_add(
+                    bytes
+                        .checked_mul(4)
+                        .ok_or_else(|| rows_catalog_error("classifier geometry extent overflow"))?,
+                )
+                .ok_or_else(|| rows_catalog_error("classifier geometry extent overflow"))?;
+        }
+        self.charge(
+            extent
+                .checked_add(131072)
+                .ok_or_else(|| rows_catalog_error("classifier fixed metadata overflow"))?,
+        )
+    }
+    // Before the existing catalog capture allocates any new strings, reserve
+    // a conservative bound for repeated names/dependencies/runtime strings.
+    pub(super) fn before_catalog_capture(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), GlobalSchemaCatalogError> {
+        let (count, bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) FROM main.sqlite_schema", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(|e| sqlite_reference_build_error("rows-catalog-preflight", None, e))?;
+        let count =
+            u64::try_from(count).map_err(|_| rows_catalog_error("negative catalog extent"))?;
+        let bytes =
+            u64::try_from(bytes).map_err(|_| rows_catalog_error("negative catalog extent"))?;
+        // FK source names and index term names can repeat independently of
+        // sqlite_schema text length. Reserve their actual scalar extents and
+        // bounded geometric Vec capacity before the existing capture copies
+        // them. Capturing all main indexes over-reserves its managed subset.
+        for (sql, descriptor) in [
+            (
+                r#"SELECT COUNT(*),COALESCE(SUM(length(CAST(s.name AS BLOB))+length(CAST(f."table" AS BLOB))),0) FROM main.sqlite_schema s JOIN pragma_foreign_key_list(s.name,'main') f WHERE s.type='table' AND lower(substr(s.name,1,7))!='sqlite_'"#,
+                std::mem::size_of::<ForeignKeyDependency>() as u64,
+            ),
+            (
+                r#"SELECT COUNT(*),COALESCE(SUM(length(CAST(s.name AS BLOB))+length(CAST(i.name AS BLOB))+length(CAST(i.origin AS BLOB))),0) FROM main.sqlite_schema s JOIN pragma_index_list(s.name,'main') i WHERE s.type='table'"#,
+                std::mem::size_of::<ManagedIndexGeometry>() as u64 + 64,
+            ),
+            (
+                r#"SELECT COUNT(*),COALESCE(SUM(COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.coll AS BLOB)),0)),0) FROM main.sqlite_schema s JOIN pragma_index_xinfo(s.name,'main') x WHERE s.type='index'"#,
+                std::mem::size_of::<IndexXinfoTerm>() as u64,
+            ),
+        ] {
+            let (observations, payload): (i64, i64) = connection
+                .query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| sqlite_reference_build_error("rows-dependency-preflight", None, e))?;
+            let observations = u64::try_from(observations)
+                .map_err(|_| rows_catalog_error("negative dependency count"))?;
+            let payload = u64::try_from(payload)
+                .map_err(|_| rows_catalog_error("negative dependency extent"))?;
+            self.charge(
+                observations
+                    .checked_mul(descriptor)
+                    .and_then(|n| n.checked_add(payload))
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or_else(|| rows_catalog_error("dependency reservation overflow"))?,
+            )?;
+        }
+        self.charge(
+            bytes
+                .checked_mul(4)
+                .and_then(|n| count.checked_mul(1024).and_then(|m| n.checked_add(m)))
+                .and_then(|n| n.checked_add(65536))
+                .ok_or_else(|| rows_catalog_error("catalog metadata reservation overflow"))?,
+        )
+    }
+}
+pub(super) fn require_empty_temp_for_rows(
+    connection: &Connection,
+) -> Result<(), GlobalSchemaCatalogError> {
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM temp.sqlite_schema", [], |r| r.get(0))
+        .map_err(|e| sqlite_reference_build_error("rows-TEMP-empty", None, e))?;
+    if count != 0 {
+        return Err(rows_catalog_error("unexpected TEMP objects"));
+    }
+    Ok(())
+}
+fn rows_catalog_error(detail: &str) -> GlobalSchemaCatalogError {
+    GlobalSchemaCatalogError::CatalogMismatch {
+        detail: format!("whole rows: {detail}"),
+    }
+}
+fn rows_quote(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+fn whole_rows_shape(
+    connection: &Connection,
+    name: &str,
+    work: &mut RowsSpecWork,
+) -> Result<Vec<WholeRowsColumn>, GlobalSchemaCatalogError> {
+    work.charge(32)?; // fixed table-list type text before its String
+    let (kind, wr): (String, i64) = connection
+        .query_row(
+            "SELECT type,wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| sqlite_reference_build_error("rows-table-shape", None, e))?;
+    if kind != "table" || wr != 0 {
+        return Err(rows_catalog_error(
+            "virtual/shadow/WITHOUT ROWID table refused",
+        ));
+    }
+    let (count, bytes, hidden): (i64,i64,i64) = connection.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(type AS BLOB))+COALESCE(length(CAST(dflt_value AS BLOB)),0)),0),COALESCE(MAX(hidden),0) FROM pragma_table_xinfo(?1,'main')", [name],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).map_err(|e| sqlite_reference_build_error("rows-column-preflight", None, e))?;
+    if count <= 0 || u64::try_from(count).map_or(true, |n| n > work.columns) || hidden != 0 {
+        return Err(rows_catalog_error(
+            "empty/oversized/hidden/generated table shape refused",
+        ));
+    }
+    let allocation = u64::try_from(count)
+        .map_err(|_| rows_catalog_error("negative column count"))?
+        .checked_mul(std::mem::size_of::<WholeRowsColumn>() as u64)
+        .and_then(|n| u64::try_from(bytes).ok().and_then(|b| n.checked_add(b)))
+        .ok_or_else(|| rows_catalog_error("column metadata extent overflow"))?;
+    work.charge(allocation)?;
+    let capacity =
+        usize::try_from(count).map_err(|_| rows_catalog_error("column capacity overflow"))?;
+    let mut statement = connection.prepare("SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden FROM pragma_table_xinfo(?1,'main') ORDER BY cid").map_err(|e| sqlite_reference_build_error("rows-columns",None,e))?;
+    let mut cursor = statement
+        .query([name])
+        .map_err(|e| sqlite_reference_build_error("rows-columns", None, e))?;
+    let mut columns = Vec::with_capacity(capacity);
+    while let Some(r) = cursor
+        .next()
+        .map_err(|e| sqlite_reference_build_error("rows-columns", None, e))?
+    {
+        if columns.len() as u64 >= work.columns {
+            return Err(rows_catalog_error("column EOF sentinel exceeded"));
+        }
+        let column = WholeRowsColumn {
+            cid: r
+                .get(0)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            name: r
+                .get(1)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            declared_type: r
+                .get(2)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            not_null: r
+                .get(3)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            default_sql: r
+                .get(4)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            primary_key: r
+                .get(5)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+            hidden: r
+                .get(6)
+                .map_err(|e| sqlite_reference_build_error("rows-column", None, e))?,
+        };
+        if column.cid != columns.len() as i64 || column.hidden != 0 {
+            return Err(rows_catalog_error("nonordinary column shape refused"));
+        }
+        columns.push(column);
+    }
+    if columns.len() as i64 != count {
+        return Err(rows_catalog_error("column extent changed"));
+    }
+    if ["_rowid_", "rowid", "oid"]
+        .iter()
+        .all(|a| columns.iter().any(|c| c.name.eq_ignore_ascii_case(a)))
+    {
+        return Err(rows_catalog_error("all rowid aliases shadowed"));
+    }
+    Ok(columns)
+}
+impl WholeRowsTable {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+    pub(super) fn sql(&self) -> &str {
+        &self.sql
+    }
+    pub(super) fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+    pub(super) fn preflight_sql(&self) -> String {
+        let extents: Vec<String> = self.columns.iter().map(|c| format!("CASE typeof({0}) WHEN 'null' THEN 1 WHEN 'integer' THEN 9 WHEN 'real' THEN 9 ELSE 9+length(CAST({0} AS BLOB)) END",rows_quote(&c.name))).collect();
+        let cells: Vec<String> = self.columns.iter().map(|c| format!("CASE WHEN typeof({0}) IN ('text','blob') THEN length(CAST({0} AS BLOB)) ELSE 0 END",rows_quote(&c.name))).collect();
+        format!("SELECT COUNT(*),COALESCE(SUM(9+{}),0),COALESCE(MAX(9+{}),0),COALESCE(MAX(max(0,{})),0) FROM main.{}",extents.join("+"),extents.join("+"),cells.join(","),rows_quote(&self.name))
+    }
+}
+impl WholeRowsReadSpec {
+    pub(super) fn tables(&self) -> &[WholeRowsTable] {
+        &self.tables
+    }
+    pub(super) fn validate_connection(
+        &self,
+        authority: &SelectionCatalogCaptureAuthority,
+        connection: &Connection,
+        references: &SameRuntimeCatalogReferences,
+        work: &mut RowsSpecWork,
+    ) -> Result<(), GlobalSchemaCatalogError> {
+        require_empty_temp_for_rows(connection)?;
+        work.before_catalog_capture(connection)?;
+        let actual = capture_catalog_snapshot(authority, connection, self.mode)?;
+        // Exact full capture equality to the sole-classified original is
+        // stronger than another catalog digest comparison and avoids cloning
+        // three canonical reference catalogs on every Copied read.
+        if references.mode != self.mode || actual != self.expected {
+            return Err(rows_catalog_error("copy catalog/runtime/header differs"));
+        }
+        for table in &self.tables {
+            if whole_rows_shape(connection, &table.name, work)? != table.columns {
+                return Err(rows_catalog_error("copy column contract differs"));
+            }
+        }
+        Ok(())
+    }
+}
+pub(super) fn capture_whole_rows_read_spec(
+    authority: &SelectionCatalogCaptureAuthority,
+    transaction: &rusqlite::Transaction<'_>,
+    actual: &CatalogSnapshot,
+    references: &SameRuntimeCatalogReferences,
+    work: &mut RowsSpecWork,
+) -> Result<WholeRowsReadSpec, GlobalSchemaCatalogError> {
+    require_empty_temp_for_rows(transaction)?;
+    work.before_catalog_capture(transaction)?;
+    work.before_rows_classifier(actual, references)?;
+    let half = classify_database_half(actual, references)?;
+    match half {
+        DatabaseHalfDiagnostic::PreAmendment(_)
+        | DatabaseHalfDiagnostic::AmendedDatabaseHalf(_) => {}
+        _ => {
+            return Err(rows_catalog_error(
+                "absent/transitional family has no rows proof",
+            ))
+        }
+    };
+    // Rebind the supplied whole capture to the very transaction used below.
+    let expected = capture_catalog_snapshot(authority, transaction, actual.mode)?;
+    if expected != *actual {
+        return Err(rows_catalog_error(
+            "original capture is not this transaction",
+        ));
+    }
+    let table_count = actual
+        .objects
+        .iter()
+        .filter(|r| r.identity.kind == CatalogObjectKind::Table)
+        .count()
+        .checked_add(
+            actual
+                .sqlite_owned_objects
+                .iter()
+                .filter(|r| r.kind == CatalogObjectKind::Table)
+                .count(),
+        )
+        .ok_or_else(|| rows_catalog_error("table count overflow"))?;
+    if table_count == 0 || table_count as u64 > work.tables {
+        return Err(rows_catalog_error("table budget exceeded"));
+    }
+    work.charge(
+        (table_count as u64)
+            .checked_mul(std::mem::size_of::<WholeRowsTable>() as u64)
+            .ok_or_else(|| rows_catalog_error("table allocation overflow"))?,
+    )?;
+    let names = actual
+        .objects
+        .iter()
+        .filter(|r| r.identity.kind == CatalogObjectKind::Table)
+        .map(|r| r.identity.name.as_str())
+        .chain(
+            actual
+                .sqlite_owned_objects
+                .iter()
+                .filter(|r| r.kind == CatalogObjectKind::Table)
+                .map(|r| r.name.as_str()),
+        );
+    if actual
+        .sqlite_owned_objects
+        .iter()
+        .any(|r| r.kind == CatalogObjectKind::Table && r.name != "sqlite_sequence")
+    {
+        return Err(rows_catalog_error("unapproved sqlite-owned table"));
+    }
+    let mut tables = Vec::with_capacity(table_count);
+    for name in names {
+        work.charge(name.len() as u64)?;
+        let columns = whole_rows_shape(transaction, name, work)?;
+        let alias = ["_rowid_", "rowid", "oid"]
+            .into_iter()
+            .find(|a| !columns.iter().any(|c| c.name.eq_ignore_ascii_case(a)))
+            .ok_or_else(|| rows_catalog_error("all rowid aliases shadowed"))?;
+        // Reserve quote expansion, separators and both reusable SQL contracts
+        // before making their strings. The preflight uses actual storage types.
+        let initial_bound = (name.len() as u64)
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(512))
+            .ok_or_else(|| rows_catalog_error("SQL metadata extent overflow"))?;
+        let sql_bound = columns
+            .iter()
+            .try_fold(initial_bound, |n, c| {
+                (c.name.len() as u64)
+                    .checked_mul(48)
+                    .and_then(|b| b.checked_add(2048))
+                    .and_then(|b| n.checked_add(b))
+            })
+            .ok_or_else(|| rows_catalog_error("SQL metadata extent overflow"))?;
+        work.charge(sql_bound)?;
+        let projection = columns
+            .iter()
+            .map(|c| rows_quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {alias},{projection} FROM main.{} ORDER BY {alias}",
+            rows_quote(name)
+        );
+        tables.push(WholeRowsTable {
+            name: name.to_owned(),
+            columns,
+            sql,
+        });
+    }
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(WholeRowsReadSpec {
+        tables,
+        mode: actual.mode,
+        expected,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WholeApplicationSchemaCatalogSha256(String);
 
@@ -4648,5 +5106,87 @@ mod tests {
             .filter(|row| row.kind == CatalogObjectKind::Table)
             .map(|row| (row.name, value))
             .collect()
+    }
+    #[test]
+    fn rows_backup_shape_rejects_shadowed_without_rowid_hidden_and_virtual() {
+        for ddl in [
+            "CREATE TABLE sample(rowid TEXT,OID TEXT,_ROWID_ TEXT)",
+            "CREATE TABLE sample(id INTEGER PRIMARY KEY) WITHOUT ROWID",
+            "CREATE TABLE sample(v INTEGER,g INTEGER GENERATED ALWAYS AS(v+1) STORED)",
+            "CREATE VIRTUAL TABLE sample USING fts5(v)",
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            connection.execute_batch(ddl).unwrap();
+            let mut work = RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024);
+            assert!(
+                whole_rows_shape(&connection, "sample", &mut work).is_err(),
+                "{ddl}"
+            );
+        }
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sample(rowid TEXT,v BLOB)")
+            .unwrap();
+        let shape = whole_rows_shape(
+            &connection,
+            "sample",
+            &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024),
+        )
+        .unwrap();
+        assert_eq!(shape[0].name, "rowid");
+    }
+    #[test]
+    fn rows_backup_metadata_is_charged_before_capture_and_never_refunded() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sample(a TEXT,b BLOB)")
+            .unwrap();
+        let mut work = RowsSpecWork::new(1, 4096, 1024);
+        assert!(whole_rows_shape(&connection, "sample", &mut work).is_err());
+        assert!(work.used() > 1);
+        let mut work = RowsSpecWork::new(u64::MAX, 4096, 1024);
+        work.used = u64::MAX;
+        assert!(work.charge(1).is_err());
+        let mut work = RowsSpecWork::new(16 * 1024 * 1024, 4096, 1);
+        assert!(whole_rows_shape(&connection, "sample", &mut work).is_err());
+    }
+    #[test]
+    fn rows_backup_actual_temp_objects_reject_source_spec_and_copy_contract() {
+        let mut source = Connection::open_in_memory().unwrap();
+        install_legacy_catalog_for_prospective_test(&source).unwrap();
+        require_empty_temp_for_rows(&source).unwrap();
+        let authority = SelectionCatalogCaptureAuthority::for_test_code();
+        let references =
+            build_same_runtime_catalog_references(GlobalSchemaCatalogMode::Test).unwrap();
+        let tx = source
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let actual =
+            capture_catalog_snapshot(&authority, &tx, GlobalSchemaCatalogMode::Test).unwrap();
+        let spec = capture_whole_rows_read_spec(
+            &authority,
+            &tx,
+            &actual,
+            &references,
+            &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024),
+        )
+        .unwrap();
+        tx.execute_batch(
+            "CREATE TEMP TABLE unexpected(v TEXT); INSERT INTO unexpected VALUES('real TEMP')",
+        )
+        .unwrap();
+        assert!(require_empty_temp_for_rows(&tx).is_err());
+        assert!(
+            matches!(capture_whole_rows_read_spec(&authority,&tx,&actual,&references,&mut RowsSpecWork::new(16*1024*1024,4096,1024)),Err(GlobalSchemaCatalogError::CatalogMismatch{detail}) if detail.contains("unexpected TEMP objects"))
+        );
+        let copy = Connection::open_in_memory().unwrap();
+        install_legacy_catalog_for_prospective_test(&copy).unwrap();
+        copy.execute_batch("CREATE TEMP TABLE unexpected(v)")
+            .unwrap();
+        assert!(
+            matches!(spec.validate_connection(&authority,&copy,&references,&mut RowsSpecWork::new(16*1024*1024,4096,1024)),Err(GlobalSchemaCatalogError::CatalogMismatch{detail}) if detail.contains("unexpected TEMP objects"))
+        );
+        copy.execute_batch("DROP TABLE temp.unexpected").unwrap();
+        assert!(require_empty_temp_for_rows(&copy).is_ok());
     }
 }

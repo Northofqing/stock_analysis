@@ -535,3 +535,25 @@ PaperC5两精确cold reopen已在实际a8be compiled library d9411f6f各PASS1（
 10:48 CST最终开发门禁完成：普通默认debug `cargo build --locked --offline --bin monitor` **EXIT0/223.947s**，log `52b85fbcade782fc225552f2eeb268b0bd3ecc76b35c9c6ade508b044721876f`，未带profile/RUSTFLAGS覆写。实际monitor独立封存130951672B/`e8450dc8892b0999b88b7aecd80507f53d5b9c150cd053c3148bc3b402602d55`（0700、nlink1、fsync，非生产路径）。真实隔离dry-run **EXIT0/7.901s**，stderr `3200cc98fcc1fdb3c4d1fc5fc009618afe236123df341ad884cc3d4e7da1ad5b`；Test root、webhook隔离、rendered59、explicitdryrun59、failed0、external_process0、receipt_append0全部核验，源和tracked inputs前后相同。smoke0/0、live_opt_in=false及缺失数据降级保持，不声称真实数据正向或生产验收。库索引SHA `f2380df6ffc644901455ee770d6aa15fa1655cfad3c5c63d2b7ce27dea49fd20`；dry-run回执SHA `abba60654a19e3a3500864e506482ae5ec9b1f61537fd05f159e68e1c4fc0be5`。
 
 提交范围为当前18源码路径及本验收文档。后续Rows v2仍按四路径、同原TX与实际Copied RO逐行比较、所有hooks先于最后reader及完整无hook尾部实施；固定资金B的生产issuer/allocation/seed、同版36RPC、Uncertain人工作证、精确activation与自然观察仍独立待办，主heartbeat保持ACTIVE。
+
+
+### 10/3 11:40 CST：前批已推送，Rows 全行证明进入实际验收
+
+前批正式提交 `f8e583b44b9d30cc7373b4b8b15c614ff964ca28`，推送 `stock_analysis/codex/platform-roadmap-implementation-20261002` EXIT0，真实 ls-remote OID 一致；回执 `authorized-global-paper-c7-feature-push-20261003.json` SHA `2d601d78166c84f407dd3013c6133ee3f570199f99083f4ba618216006e6cf0f`。未修改 master 或生产。
+
+Rows v2 Candidate1 的四个数据库路径已固定，Root 按该精确 parent 和 before/after 原字节核验。新 source27-input patch `8d0e486491856d82c53a4bfd5fd6a8ddc247f6f74fabb94f0967cfd659888895` /115963B，source 回执 SHA `ba81c70dbb13869ff039c72163864e342c6fa1f3171b60cc722af56eb44a842e`。包括原 IMMEDIATE TX 与实际 Copied RO 全行类型和值比较、六次流累计预算、实际 TEMP 零对象检查、source/copy 完整目录逐字段 Eq、最后读取后无 hook 的文件/审计/锁尾部和19项相关测试。元数据按列/容器/URI及实际FK/index/xinfo标量提前收费，固定16MiB未提高。源码仍须实际编译、19测试及受影响旧安全门禁和独立最终复核；当前正在唯一 Cargo 验收，不提前称 PASS、目标库等价或 apply 完成。
+
+Windows D14 正式来源合同任务曾在10:55被实际确认开始。此后11:21和11:34的两次间隔只读快照均 Timeout，没有取得新交付；当前状态 Unknown，未重发、运行B/36RPC或推导失败。最近回执 `windows-d14-readonly-status-20261003033454634-cursor2-backoff-timeout.json` SHA `94c0afb10008adf26c4dc38cd4882d6fa2a412ff318d3c932466ee76600c6fc2`。生产仍仅沿用09:28历史只读观察，未刷新或切换；M0–M7全部上线目标未完成，主 heartbeat 保持 ACTIVE。
+
+
+Rows Candidate1 实际编译成功5m07s；19测试 EXIT101/316.786s，**9 passed/10 failed**，log `8a643fbe422f3b13eae431bf76b1eba2e7f3af612eaed23050f468af1a792aea`。唯一首业务失败：V6新夹具将固定 `stock_analysis.db` 传入原要求 `TEST_CODE_*.db` 的隔离构造器；后九项为串行mutex poison，未验证业务。不是预算拒绝或生产guard缺陷。独立静态review `b47cce7763254a8944bfcf91c65a3dd09ecadfe632a02e3e756dbbb8e08b68d5` 无P1/P2，静态不代替此RED。
+
+失败实际272129328B库产物已封存 `944c5288f68526cf6b445d10144dcbab08d6d6681017688a6e20a00b07895fa5`。仅复用此原harness单独验证未执行的全目录family case：**1/1 EXIT0/18.90s**，log `f904a1c00b5458fc7c00bec3b618084f33bf3fa837eed316bf1c15fb022c0fd0`；旧source范围的诊断，不称最终19全通过。下一窄修只改变该新V6 case：已知offline原inode移至真实TEST_CODE文件名，沿原constructor/finance/pools/sidecars，所有源关闭并验证原inode和bytes后移回固定Global路径。原guard、全部业务源码、固定预算和金融断言保持；须独立delta复核和新精确19实际验收。
+
+### 10/3 12:xx CST：Rows v2 实际验证收口（仅源↔封闭备份）
+
+Rows v2 本地最终源码针对四路径；`global_schema_v1.rs` 的V6夹具证明确认r2d2 0.8最终池Drop不保证触发release registry hook，因此删除registry-empty假设，改用真实进程FD快照核对main/WAL/SHM file-object identity和精确FD集合。Candidate3附带的临时`eprintln!`已从验收源码移除。另将review-byte预算拒绝用例改用独立新fixture，保留原fixture已创建的无intent目录作为明确断言。
+
+准确限定 Cargo 结果：V6关闭池及重定位用例 **1/1 PASS**；Rows新增 owner/sequence/attack/预算 **11/11 PASS**，typed comparator **5/5 PASS**，catalog形态/metadata/TEMP **3/3 PASS**；既有 backup 安全门禁 **24/24 PASS**；prospective 安全门禁 **14/14 PASS**。全部命令为`cargo test --locked --offline --lib`并以真实模块限定名执行，测试库由首轮编译生成；另 `rustfmt --check --edition 2021 --config skip_children=true` 覆盖本批5个Rust文件，`git diff --check`与`git diff --cached --check`均通过。一次遗漏私有`rows`模块限定名的过滤器实际运行0项，不计为PASS；随后用`database::global_schema_v1::rows::tests`真实路径补跑并通过。全库测试、macOS以外的原生FD路径及生产输入未由本片验证。
+
+本片只授予并证明原始同一IMMEDIATE事务与真实Copied只读备份逐表逐行/SQLite类型/value/rowid/sequence相等，严格限额和最后hook-free尾验证。没有target/application、apply、restore、exchange、restart或部署能力；未更改生产服务。候选3作者静态检查材料可用，Root另复核当前最终差异及实际回归；本会话未取得另一个独立审阅者的新签收。提交前工作树仍是`f8e583b44b9d30cc7373b4b8b15c614ff964ca28`基础，目标远端为feature branch `stock_analysis/codex/platform-roadmap-implementation-20261002`。

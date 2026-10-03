@@ -41,6 +41,8 @@ mod backup;
 pub(crate) mod paper_v6;
 #[path = "global_schema_prospective_v1.rs"]
 mod prospective;
+#[path = "global_schema_rows_v1.rs"]
+mod rows;
 
 pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
@@ -1039,7 +1041,9 @@ impl GlobalSchemaVersionOwner {
             SelectionSnapshotPurpose::Diagnostic,
         )? {
             SelectionOwnerObservation::Inspected(outcome) => Ok(outcome),
-            SelectionOwnerObservation::Prospective(_) | SelectionOwnerObservation::Backup(_) => {
+            SelectionOwnerObservation::Prospective(_)
+            | SelectionOwnerObservation::Backup(_)
+            | SelectionOwnerObservation::RowsBackup(_) => {
                 Err(prospective::refusal("unexpected prospective owner branch"))
             }
         }
@@ -1079,6 +1083,40 @@ impl GlobalSchemaVersionOwner {
         }
     }
 
+    fn prepare_fixed_selection_rows_backup(
+        &self,
+    ) -> Result<rows::VerifiedUnapprovedOriginalRowsBackup, GlobalSchemaV1Error> {
+        let writer = SelectionAuditWriter::production()
+            .map_err(|source| GlobalSchemaV1Error::SelectionAudit { source })?;
+        self.prepare_rows_backup_with_bound_paths(
+            ModeBoundPaths::production(),
+            &writer,
+            GlobalSchemaCatalogMode::Production,
+            rows::Options::production(),
+        )
+    }
+
+    fn prepare_rows_backup_with_bound_paths(
+        &self,
+        paths: ModeBoundPaths,
+        writer: &SelectionAuditWriter,
+        catalog_mode: GlobalSchemaCatalogMode,
+        mut options: rows::Options,
+    ) -> Result<rows::VerifiedUnapprovedOriginalRowsBackup, GlobalSchemaV1Error> {
+        options.validate_mode(paths.mode)?;
+        options.backup.bind_common_budget()?;
+        match self.observe_selection_with_optional_pinned_root(
+            paths,
+            None,
+            writer,
+            catalog_mode,
+            SelectionSnapshotPurpose::RowsBackup(options),
+        )? {
+            SelectionOwnerObservation::RowsBackup(result) => Ok(result),
+            _ => Err(prospective::refusal("unexpected rows backup owner branch")),
+        }
+    }
+
     fn prepare_fixed_selection_prospective(
         &self,
     ) -> Result<prospective::PreparedGlobalSchemaProspective, GlobalSchemaV1Error> {
@@ -1107,7 +1145,9 @@ impl GlobalSchemaVersionOwner {
             SelectionSnapshotPurpose::Prospective(options),
         )? {
             SelectionOwnerObservation::Prospective(observation) => Ok(observation),
-            SelectionOwnerObservation::Inspected(_) | SelectionOwnerObservation::Backup(_) => {
+            SelectionOwnerObservation::Inspected(_)
+            | SelectionOwnerObservation::Backup(_)
+            | SelectionOwnerObservation::RowsBackup(_) => {
                 Err(prospective::refusal("unexpected diagnostic owner branch"))
             }
         }
@@ -1144,6 +1184,13 @@ impl GlobalSchemaVersionOwner {
             SelectionSnapshotPurpose::Backup(options) => {
                 options.validate_mode(bound_mode)?;
                 Some(backup::Workspace::open(&maintenance, &options.settings)?)
+            }
+            SelectionSnapshotPurpose::RowsBackup(options) => {
+                options.validate_mode(bound_mode)?;
+                Some(backup::Workspace::open(
+                    &maintenance,
+                    &options.backup.settings,
+                )?)
             }
             _ => None,
         };
@@ -1222,6 +1269,7 @@ impl GlobalSchemaVersionOwner {
                 maintenance: &maintenance,
                 prospective_options: purpose.options(),
                 backup_options: purpose.backup_options(),
+                rows_options: purpose.rows_options(),
                 backup_workspace,
                 bound_mode,
             }
@@ -1244,6 +1292,14 @@ impl GlobalSchemaVersionOwner {
                     let backup_pending = prepared.backup_pending.take().ok_or_else(|| prospective::refusal("backup prepared IO missing"))?;
                     let source = pending.issue(options.source, database_file, database_identity, audit_parent, audit_file, maintenance)?;
                     Ok(SelectionOwnerObservation::Backup(backup_pending.issue(source, options.settings)?))
+                }
+                SelectionSnapshotPurpose::RowsBackup(options) => {
+                    let pending=prepared.prospective_pending.take().ok_or_else(||prospective::refusal("rows source material missing"))?;
+                    let backup_pending=prepared.backup_pending.take().ok_or_else(||prospective::refusal("rows actual backup missing"))?;
+                    let rows_pending=prepared.rows_pending.take().ok_or_else(||prospective::refusal("rows original pairs missing"))?;
+                    let source=pending.issue(options.backup.source,database_file,database_identity,audit_parent,audit_file,maintenance)?;
+                    let byte_backup=backup_pending.issue(source,options.backup.settings)?;
+                    Ok(SelectionOwnerObservation::RowsBackup(rows_pending.issue(byte_backup)?))
                 }
             },
             (Err(primary), Ok(())) => Err(primary),
@@ -1622,6 +1678,7 @@ enum SelectionSnapshotPurpose {
     Diagnostic,
     Prospective(prospective::Options),
     Backup(backup::Options),
+    RowsBackup(rows::Options),
 }
 impl SelectionSnapshotPurpose {
     fn options(&self) -> Option<&prospective::Options> {
@@ -1629,11 +1686,21 @@ impl SelectionSnapshotPurpose {
             Self::Diagnostic => None,
             Self::Prospective(options) => Some(options),
             Self::Backup(options) => Some(&options.source),
+            Self::RowsBackup(options) => Some(&options.backup.source),
         }
     }
     fn backup_options(&self) -> Option<&backup::Options> {
         match self {
             Self::Backup(options) => Some(options),
+            Self::RowsBackup(options) => Some(&options.backup),
+            _ => None,
+        }
+    }
+}
+impl SelectionSnapshotPurpose {
+    fn rows_options(&self) -> Option<&rows::Options> {
+        match self {
+            Self::RowsBackup(options) => Some(options),
             _ => None,
         }
     }
@@ -1642,6 +1709,7 @@ enum SelectionOwnerObservation {
     Inspected(SelectionSchemaInspectionOutcome),
     Prospective(prospective::PreparedGlobalSchemaProspective),
     Backup(backup::VerifiedUnapprovedByteBackup),
+    RowsBackup(rows::VerifiedUnapprovedOriginalRowsBackup),
 }
 
 struct VerifiedSelectionSchemaSnapshot<'locks, 'sidecars> {
@@ -1664,6 +1732,7 @@ struct VerifiedSelectionSchemaSnapshot<'locks, 'sidecars> {
     maintenance: &'sidecars ExclusiveGlobalSchemaMaintenanceLease,
     prospective_options: Option<&'sidecars prospective::Options>,
     backup_options: Option<&'sidecars backup::Options>,
+    rows_options: Option<&'sidecars rows::Options>,
     backup_workspace: Option<backup::Workspace>,
     bound_mode: BoundMode,
 }
@@ -1676,6 +1745,7 @@ struct PreparedSelectionSchemaInspection {
     exact_amended: bool,
     prospective_pending: Option<prospective::Pending>,
     backup_pending: Option<backup::Pending>,
+    rows_pending: Option<rows::Pending>,
 }
 
 impl PreparedSelectionSchemaInspection {
@@ -1766,6 +1836,15 @@ impl VerifiedSelectionSchemaSnapshot<'_, '_> {
             }
             None => None,
         };
+        // Close the whole family and reserve all six row streams before
+        // Workspace.prepare can create either durable role.
+        let mut rows_pending = match (self.rows_options, prospective_pending.as_ref()) {
+            (Some(options), Some(source)) => {
+                Some(rows::Pending::capture(&self, &references, source, options)?)
+            }
+            (None, _) => None,
+            _ => return Err(prospective::refusal("rows pre-copy source missing")),
+        };
         let mut backup_pending = match (
             self.backup_workspace.take(),
             self.backup_options,
@@ -1784,6 +1863,23 @@ impl VerifiedSelectionSchemaSnapshot<'_, '_> {
             (None, None, _, _) => None,
             _ => return Err(prospective::refusal("backup owner state mismatch")),
         };
+        if let (Some(row_match), Some(backup), Some(source), Some(options), Some(settings)) = (
+            &mut rows_pending,
+            &mut backup_pending,
+            &mut prospective_pending,
+            self.prospective_options,
+            self.backup_options,
+        ) {
+            row_match.pair(
+                &self,
+                &references,
+                backup,
+                source,
+                options,
+                &settings.settings,
+                false,
+            )?;
+        }
         let final_catalog =
             capture_catalog_snapshot(&self.authority, &self.transaction, self.catalog_mode)
                 .map_err(|source| GlobalSchemaV1Error::SelectionCatalog { source })?;
@@ -1840,6 +1936,31 @@ impl VerifiedSelectionSchemaSnapshot<'_, '_> {
                 material.validate_snapshot(&self, options)?;
             }
         }
+        // Every hookful validation above completes before this last direct
+        // pair. From reader close through COMMIT only full hook-free tails run.
+        if let (Some(row_match), Some(backup), Some(source), Some(options), Some(settings)) = (
+            &mut rows_pending,
+            &mut backup_pending,
+            &mut prospective_pending,
+            self.prospective_options,
+            self.backup_options,
+        ) {
+            row_match.pair(
+                &self,
+                &references,
+                backup,
+                source,
+                options,
+                &settings.settings,
+                true,
+            )?;
+            backup.validate_rows_before_commit_without_hooks(
+                source,
+                options,
+                &settings.settings,
+            )?;
+            row_match.before_commit_tail(&mut self, source, options)?;
+        }
         self.transaction
             .commit()
             .map_err(|source| GlobalSchemaV1Error::SelectionSqlite {
@@ -1858,6 +1979,9 @@ impl VerifiedSelectionSchemaSnapshot<'_, '_> {
                 detail: "audit finish high-water differs from captured high-water".to_owned(),
             });
         }
+        if let Some(pending) = &mut rows_pending {
+            pending.transaction_finished(references)?;
+        }
         Ok(PreparedSelectionSchemaInspection {
             database_half,
             authority_state,
@@ -1866,6 +1990,7 @@ impl VerifiedSelectionSchemaSnapshot<'_, '_> {
             exact_amended,
             prospective_pending,
             backup_pending,
+            rows_pending,
         })
     }
 }
@@ -4013,6 +4138,822 @@ mod tests {
         }
         let writer = fixture.pinned_audit_writer();
         (fixture, writer)
+    }
+
+    fn rows_test_prepare(
+        fixture: &TestFixture,
+        writer: &SelectionAuditWriter,
+        options: rows::Options,
+    ) -> Result<rows::VerifiedUnapprovedOriginalRowsBackup, GlobalSchemaV1Error> {
+        GlobalSchemaVersionOwner::for_test_code().prepare_rows_backup_with_bound_paths(
+            fixture.binding(),
+            writer,
+            GlobalSchemaCatalogMode::Test,
+            options,
+        )
+    }
+    fn rows_test_seed(fixture: &TestFixture) {
+        prospective_with_offline_fixture_connection(fixture, |c| {
+            c.execute("INSERT INTO ledger(date,total_value,cash,market_value,daily_pnl,created_at) VALUES('2026-09-28',123.25,12.25,111,0,'TEST_CODE_ROWS_PRIVATE_TEXT')",[]).unwrap();
+            c.execute("INSERT INTO stock_daily(code,date,open,high,low,close,volume) VALUES('TEST_CODE_ROWS_SENTINEL','2026-09-28',10,10,10,10,100)",[]).unwrap();
+            // Preserve a deleted high allocation and duplicate/unknown actual
+            // sequence facts; an AUTOINCREMENT owner set is not a row set.
+            c.execute("INSERT INTO ledger(id,date,total_value,cash,market_value,daily_pnl,created_at) VALUES(90,'2026-09-29',0,0,0,0,'deleted')",[]).unwrap();
+            c.execute("DELETE FROM ledger WHERE id=90", []).unwrap();
+            c.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('ledger',91),('TEST_CODE_UNKNOWN_COUNTER',X'3100FF')",[]).unwrap();
+        });
+    }
+    fn rows_test_report(rendered: &str) -> serde_json::Value {
+        serde_json::from_str(rendered).unwrap()
+    }
+    fn rows_test_names(report: &serde_json::Value) -> Vec<String> {
+        report["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+    #[test]
+    fn rows_backup_actual_all_legacy_tables_and_sequence_keep_source_and_lease() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-all-legacy", 0, false);
+        rows_test_seed(&fixture);
+        backup_test_append_audit(&writer);
+        let expected = prospective_with_offline_fixture_connection(&fixture, |c| {
+            c.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        });
+        let before = fs::read(fixture.database()).unwrap();
+        let audit = fs::read(writer.path()).unwrap();
+        let cap = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        assert!(matches!(
+            fixture.acquire_exclusive(),
+            Err(GlobalSchemaV1Error::ExclusiveProcessMaintenanceLeaseUnavailable)
+        ));
+        let rendered = cap.render_unapproved().unwrap();
+        let report = rows_test_report(&rendered);
+        assert_eq!(rows_test_names(&report), expected);
+        let sequence = report["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "sqlite_sequence")
+            .unwrap();
+        assert!(sequence["rows"].as_u64().unwrap() >= 3);
+        assert_eq!(report["streams"], 6);
+        assert_eq!(report["row_preservation_proof"], true);
+        assert_eq!(report["target_row_preservation_proof"], false);
+        assert_eq!(report["approval"], "not_granted");
+        assert_eq!(report["apply_supported"], false);
+        assert_eq!(
+            report["apply_blocker"],
+            crate::database::selection_v2::SELECTION_V2_APPLY_BLOCKER
+        );
+        assert!(!rendered.contains("TEST_CODE_ROWS_PRIVATE_TEXT"));
+        assert!(!rendered.contains("TEST_CODE_ROWS_SENTINEL"));
+        assert_eq!(fs::read(fixture.database()).unwrap(), before);
+        assert_eq!(fs::read(writer.path()).unwrap(), audit);
+        prospective_assert_fixture_offline(&fixture);
+        drop(fixture.acquire_exclusive().unwrap());
+    }
+    #[test]
+    fn rows_backup_exact_catalog_families_include_whole_selection_and_paper() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for generation in [0, 2, 3, 4, 5] {
+            for final_catalog in [false, true] {
+                if generation == 0 && final_catalog {
+                    continue;
+                } // Amended1 requires original receipts.
+                let (fixture, writer) =
+                    prospective_test_fixture("rows-families", generation, final_catalog);
+                let expected = prospective_with_offline_fixture_connection(&fixture, |c| {
+                    c.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                        .unwrap()
+                        .query_map([], |r| r.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap()
+                });
+                let rendered = rows_test_prepare(&fixture, &writer, rows::Options::production())
+                    .unwrap()
+                    .render_unapproved()
+                    .unwrap();
+                assert_eq!(
+                    rows_test_names(&rows_test_report(&rendered)),
+                    expected,
+                    "family {generation}/{final_catalog}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn rows_backup_restart_requires_fresh_original_pairs_and_preserves_terminal() {
+        use std::sync::{Arc, Mutex};
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-restart", 0, false);
+        rows_test_seed(&fixture);
+        rows_test_prepare(&fixture, &writer, rows::Options::production())
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        let original = backup_test_known_bytes(&fixture);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut options = rows::Options::production();
+        options.trace = Some(Arc::clone(&trace));
+        rows_test_prepare(&fixture, &writer, options)
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        let events = trace.lock().unwrap();
+        assert!(events.contains(&"rows_initial_pair_closed"));
+        assert!(events.contains(&"rows_final_pair_closed"));
+        assert!(events.contains(&"rows_issue_reader_closed"));
+        assert!(events.contains(&"rows_render_reader_closed"));
+        assert_eq!(backup_test_known_bytes(&fixture), original);
+        prospective_with_offline_fixture_connection(&fixture, |c| {
+            c.execute("UPDATE ledger SET cash=cash+1", []).unwrap();
+        });
+        assert!(rows_test_prepare(&fixture, &writer, rows::Options::production()).is_err());
+        assert_eq!(backup_test_known_bytes(&fixture), original);
+    }
+    #[test]
+    fn rows_backup_shared_preflight_limits_fail_before_any_role_or_copy() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for boundary in [
+            "table", "column", "cell", "row", "rows", "bytes", "metadata",
+        ] {
+            let (fixture, writer) = prospective_test_fixture("rows-precopy-budget", 0, false);
+            rows_test_seed(&fixture);
+            let before = fs::read(fixture.database()).unwrap();
+            let mut options = rows::Options::production();
+            match boundary {
+                "table" => options.limits.tables = 1,
+                "column" => options.limits.columns = 1,
+                "cell" => options.limits.cell_bytes = 1,
+                "row" => options.limits.row_bytes = 1,
+                "rows" => options.limits.row_observations = 1,
+                "bytes" => options.limits.observation_bytes = 1,
+                _ => options.limits.metadata_bytes = 1,
+            }
+            assert!(
+                rows_test_prepare(&fixture, &writer, options).is_err(),
+                "{boundary}"
+            );
+            let directory = backup_test_directory(&fixture);
+            for leaf in [
+                "stock_analysis.db.backup",
+                "selection-audit.jsonl.backup",
+                "000-intent.json",
+                "001-created-db.json",
+                "002-copied-db.json",
+            ] {
+                assert!(!directory.join(leaf).exists(), "{boundary}/{leaf}");
+            }
+            assert_eq!(fs::read(fixture.database()).unwrap(), before);
+            prospective_assert_fixture_offline(&fixture);
+        }
+    }
+    #[test]
+    fn rows_backup_six_pass_reservation_and_finite_review_are_enforced() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-six-budget", 0, false);
+        rows_test_seed(&fixture);
+        // Count actual rows in every actual main table, including allocation
+        // facts, and leave enough for five streams but not the promised six.
+        let count = prospective_with_offline_fixture_connection(&fixture, |c| {
+            let names = c
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            names
+                .iter()
+                .map(|n| {
+                    c.query_row(
+                        &format!("SELECT COUNT(*) FROM \"{}\"", n.replace('"', "\"\"")),
+                        [],
+                        |r| r.get::<_, u64>(0),
+                    )
+                    .unwrap()
+                })
+                .sum::<u64>()
+        });
+        assert!(count > 0);
+        let mut options = rows::Options::production();
+        options.limits.row_observations = count * 6 - 1;
+        assert!(rows_test_prepare(&fixture, &writer, options).is_err());
+        assert!(!backup_test_directory(&fixture)
+            .join("stock_analysis.db.backup")
+            .exists());
+        let gap_directory = backup_test_directory(&fixture);
+        assert!(gap_directory.is_dir());
+        assert!(!gap_directory.join("000-intent.json").exists());
+        // Workspace.open already created this invocation's no-intent gap.
+        // Preserve it; an independent review-limit case needs a fresh owner.
+        let (review_fixture, review_writer) =
+            prospective_test_fixture("rows-review-budget", 0, false);
+        rows_test_seed(&review_fixture);
+        let mut options = rows::Options::production();
+        options.limits.review_bytes = 8;
+        let cap = rows_test_prepare(&review_fixture, &review_writer, options).unwrap();
+        assert!(cap.render_unapproved().is_err());
+        drop(review_fixture.acquire_exclusive().unwrap());
+        assert!(gap_directory.is_dir());
+        assert!(!gap_directory.join("000-intent.json").exists());
+    }
+    fn rows_test_mutate_same_inode_text(copy: &Path) {
+        use std::os::unix::fs::FileExt as UnixFileExt;
+        let marker = b"TEST_CODE_ROWS_PRIVATE_TEXT";
+        let bytes = fs::read(copy).unwrap();
+        let hits = bytes
+            .windows(marker.len())
+            .enumerate()
+            .filter_map(|(i, b)| (b == marker).then_some(i))
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(copy)
+            .unwrap();
+        let before = file.metadata().unwrap();
+        let mut replacement = marker.to_vec();
+        replacement[0] = b'U';
+        file.write_all_at(&replacement, hits[0] as u64).unwrap();
+        file.sync_all().unwrap();
+        let mut actual = vec![0; marker.len()];
+        assert_eq!(
+            file.read_at(&mut actual, hits[0] as u64).unwrap(),
+            marker.len()
+        );
+        assert_eq!(actual, replacement);
+        let after = file.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+    }
+    #[test]
+    fn rows_backup_issue_last_source_hook_mutation_cannot_keep_old_typed_proof() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-issue-last-hook", 0, false);
+        rows_test_seed(&fixture);
+        let source = fs::read(fixture.database()).unwrap();
+        let directory = backup_test_directory(&fixture);
+        let hit = Arc::new(AtomicBool::new(false));
+        let mark = Arc::clone(&hit);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&seen);
+        let mut options = rows::Options::production();
+        options.backup.source.hook = Some(Box::new(move |phase| {
+            if phase == prospective::Phase::AfterPhysicalReads
+                && directory.join("005-backup-verified.json").exists()
+            {
+                // Byte issue's two probes, then rows preliminary's two probes.
+                // The fourth is the last hook after its preceding copy hash.
+                if count.fetch_add(1, Ordering::SeqCst) + 1 == 4 {
+                    rows_test_mutate_same_inode_text(&directory.join("stock_analysis.db.backup"));
+                    mark.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }));
+        assert!(rows_test_prepare(&fixture, &writer, options).is_err());
+        assert!(hit.load(Ordering::SeqCst));
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+        assert_eq!(fs::read(fixture.database()).unwrap(), source);
+        assert!(
+            fs::read(backup_test_directory(&fixture).join("stock_analysis.db.backup"))
+                .unwrap()
+                .windows(b"UEST_CODE_ROWS_PRIVATE_TEXT".len())
+                .any(|b| b == b"UEST_CODE_ROWS_PRIVATE_TEXT")
+        );
+    }
+    #[test]
+    fn rows_backup_render_last_source_hook_mutation_cannot_keep_old_typed_proof() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-render-last-hook", 0, false);
+        rows_test_seed(&fixture);
+        let copy = backup_test_directory(&fixture).join("stock_analysis.db.backup");
+        let armed = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&armed);
+        let hit = Arc::new(AtomicBool::new(false));
+        let mark = Arc::clone(&hit);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&seen);
+        let mut options = rows::Options::production();
+        options.backup.source.hook = Some(Box::new(move |phase| {
+            if trigger.load(Ordering::SeqCst)
+                && phase == prospective::Phase::AfterPhysicalReads
+                && count.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                rows_test_mutate_same_inode_text(&copy);
+                mark.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+        let cap = rows_test_prepare(&fixture, &writer, options).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        assert!(cap.render_unapproved().is_err());
+        assert!(hit.load(Ordering::SeqCst));
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn rows_backup_final_reader_trace_has_no_later_phase_hooks() {
+        use std::sync::{Arc, Mutex};
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-trace", 0, false);
+        rows_test_seed(&fixture);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::clone(&trace);
+        let backup = Arc::clone(&trace);
+        let mut options = rows::Options::production();
+        options.trace = Some(Arc::clone(&trace));
+        options.backup.source.hook = Some(Box::new(move |_| {
+            source.lock().unwrap().push("source_hook");
+            Ok(())
+        }));
+        options.backup.settings.hook = Some(Box::new(move |_| {
+            backup.lock().unwrap().push("backup_hook");
+            Ok(())
+        }));
+        let cap = rows_test_prepare(&fixture, &writer, options).unwrap();
+        {
+            let events = trace.lock().unwrap();
+            let last = events
+                .iter()
+                .rposition(|e| *e == "rows_issue_reader_closed")
+                .unwrap();
+            assert_eq!(
+                &events[last..],
+                &["rows_issue_reader_closed", "rows_hook_free_tail_complete"]
+            );
+        }
+        cap.render_unapproved().unwrap();
+        let events = trace.lock().unwrap();
+        let last = events
+            .iter()
+            .rposition(|e| *e == "rows_render_reader_closed")
+            .unwrap();
+        assert_eq!(
+            &events[last..],
+            &["rows_render_reader_closed", "rows_hook_free_tail_complete"]
+        );
+        let last_pair = events
+            .iter()
+            .position(|e| *e == "rows_final_pair_closed")
+            .unwrap();
+        assert_eq!(events[last_pair + 1], "rows_precommit_tail_complete");
+    }
+    #[test]
+    fn rows_backup_render_rejects_sidecar_new_inode_and_replaced_lock_without_heal() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        for attack in ["sidecar", "inode", "lock"] {
+            let (fixture, writer) = prospective_test_fixture("rows-final-physical", 0, false);
+            rows_test_seed(&fixture);
+            let cap = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+            let directory = backup_test_directory(&fixture);
+            let copy = directory.join("stock_analysis.db.backup");
+            let before = fs::read(&copy).unwrap();
+            match attack {
+                "sidecar" => {
+                    fs::write(sidecar_path(&copy, "-wal"), b"UNKNOWN_SIDECAR").unwrap();
+                }
+                "inode" => {
+                    fs::rename(&copy, directory.join("held-original.db")).unwrap();
+                    fs::write(&copy, &before).unwrap();
+                    fs::set_permissions(&copy, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                _ => {
+                    let lock = fixture.lock_file();
+                    fs::rename(&lock, lock.with_extension("displaced")).unwrap();
+                    fs::write(&lock, b"").unwrap();
+                }
+            }
+            assert!(cap.render_unapproved().is_err(), "{attack}");
+            assert_eq!(fs::read(&copy).unwrap(), before);
+            if attack == "sidecar" {
+                assert_eq!(
+                    fs::read(sidecar_path(&copy, "-wal")).unwrap(),
+                    b"UNKNOWN_SIDECAR"
+                );
+            }
+        }
+    }
+    #[test]
+    fn rows_backup_old_byte_renderer_still_denies_rows_and_target_authority() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-old-byte", 0, false);
+        rows_test_seed(&fixture);
+        let rendered = backup_test_prepare(&fixture, &writer, backup::Options::production())
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(report["row_preservation_proof"], false);
+        assert_eq!(report["apply_supported"], false);
+        assert_eq!(
+            report["apply_blocker"],
+            crate::database::selection_v2::SELECTION_V2_APPLY_BLOCKER
+        );
+        assert_eq!(
+            backup_test_known_bytes(&fixture)
+                .iter()
+                .filter(|(n, _)| n.ends_with(".json"))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn rows_backup_actual_v6_seed_genesis_financial_family_closes_original_pools() {
+        use crate::trading::paper_book_v2::{
+            cutover_for_isolated_test, TestCutoverFault, TestCutoverRequest,
+        };
+        use crate::trading::paper_ledger::{
+            Money, PaperCommand, PaperLedger, RiskPolicyV1, SeedManifest,
+        };
+        use chrono::{TimeZone, Utc};
+        use diesel::connection::SimpleConnection;
+        use std::sync::Arc;
+        fn instant() -> chrono::DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 9, 28, 1, 30, 0).unwrap()
+        }
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = prospective_test_fixture("rows-real-v6", 2, false);
+        // The real descriptor-pool fixture requires its own TEST_CODE leaf.
+        // Relocate only this already closed Pre2 inode; preserve the fixed
+        // Rows-owner fixture path and the constructor's original path guard.
+        prospective_assert_fixture_offline(&fixture);
+        let fixed_database = fixture.database();
+        let pool_database = fixture.root.join("TEST_CODE_rows_v6.db");
+        assert!(matches!(
+            fs::symlink_metadata(&pool_database),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(matches!(
+                fs::symlink_metadata(sidecar_path(&pool_database, suffix)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ));
+        }
+        let pre2_identity = FileIdentity::from_metadata(&fs::metadata(&fixed_database).unwrap());
+        assert!(pre2_identity.length > 0);
+        let pre2_bytes = fs::read(&fixed_database).unwrap();
+        fs::rename(&fixed_database, &pool_database).unwrap();
+        assert!(matches!(
+            fs::symlink_metadata(&fixed_database),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(&pool_database).unwrap()),
+            pre2_identity
+        );
+        assert_eq!(fs::read(&pool_database).unwrap(), pre2_bytes);
+        let db = Arc::new(
+            DatabaseManager::open_frozen_catalog_for_isolated_test(pool_database.clone()).unwrap(),
+        );
+        let ledger = PaperLedger::open(&db, &instant);
+        let seed = SeedManifest {
+            account_id: "TEST_CODE_ACCOUNT_G6".into(),
+            epoch_id: "TEST_CODE_EPOCH_G6_V1".into(),
+            command_id: "TEST_CODE_SEED_G6".into(),
+            cutover_at: instant(),
+            account_effective_at: instant(),
+            positions_effective_at: instant(),
+            source_reference: "TEST_CODE_explicit_seed".into(),
+            source_hash: "a".repeat(64),
+            approved_by: "TEST_CODE_explicit_approval".into(),
+            cash: Money::from_cny(100_000.0).unwrap(),
+            original_total: Money::from_cny(100_000.0).unwrap(),
+            excluded_residual: None,
+            lots: vec![],
+            marks: vec![],
+            policy: RiskPolicyV1::default(),
+        };
+        let binding = seed.binding().unwrap();
+        ledger.apply(PaperCommand::Seed(seed)).unwrap();
+        // Preserve a real nonempty original V1 position and its order audit,
+        // not only an empty seed. This is the original isolated recipe.
+        let view = ledger.read(&binding).unwrap();
+        ledger
+            .apply(PaperCommand::Execute(
+                crate::trading::paper_ledger::ExecuteIntent {
+                    price_intent: crate::trading::paper_ledger::PriceIntent::FixedSignalPriceV1,
+                    binding: binding.clone(),
+                    command_id: "TEST_CODE_G6_BUY_V1".into(),
+                    expected_version: view.version,
+                    inventory_fingerprint: view.inventory_fingerprint().unwrap(),
+                    signal: crate::trading::paper_trade::PaperSignal {
+                        plan_id: format!("paper:{}:TEST_CODE_G6_PLAN_V1", binding.epoch_id),
+                        code: "TEST_CODE_000001".into(),
+                        name: "fixture".into(),
+                        direction: crate::trading::paper_trade::Direction::Buy,
+                        price: 10.0,
+                        quantity: 100,
+                        virtual_reason: "TEST_CODE_evidence".into(),
+                        is_limit_up: false,
+                        is_limit_down: false,
+                        is_suspended: false,
+                        limit_up_price: Some(11.0),
+                        limit_down_price: Some(9.0),
+                        secondary_confirmed: false,
+                        quote_observed_at: instant(),
+                        risk_context: crate::trading::paper_trade::PaperRiskContext::new(
+                            crate::risk::action_gate::AccountMode::Normal,
+                            crate::monitor::data_mode::DataMode::Full,
+                        ),
+                    },
+                    quote_price: Money::from_cny(10.0).unwrap(),
+                    marks: vec![crate::trading::paper_ledger::Mark {
+                        code: "TEST_CODE_000001".into(),
+                        price: Money::from_cny(10.0).unwrap(),
+                        observed_at: instant(),
+                        source: "TEST_CODE_realtime".into(),
+                    }],
+                },
+            ))
+            .unwrap();
+
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        {
+            let mut conn = db.get_conn().unwrap();
+            crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
+            conn.batch_execute("PRAGMA user_version=3").unwrap();
+            crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
+                &mut conn, &policy,
+            )
+            .unwrap();
+            crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(
+                &mut conn,
+            )
+            .unwrap();
+        }
+        let old = crate::trading::paper_ledger::verified_v1_snapshot_on(
+            &mut db.get_conn().unwrap(),
+            &binding,
+        )
+        .unwrap();
+        cutover_for_isolated_test(
+            &db,
+            &TestCutoverRequest {
+                old_binding: binding.clone(),
+                new_epoch_id: "TEST_CODE_EPOCH_G6_V2".into(),
+                cutover_id: "TEST_CODE_CUTOVER_G6".into(),
+                command_id: "TEST_CODE_GENESIS_G6".into(),
+                expected_v1_version: old.version,
+                expected_v1_head_hash: old.event_hash,
+                expected_v1_projection_hash: old.projection_hash,
+                reviewed_fee_policy: policy,
+            },
+            TestCutoverFault::None,
+        )
+        .unwrap();
+        paper_v6::prepare_final_selection_for_isolated_v5_test(&db).unwrap();
+
+        paper_v6::migrate_catalog6_for_isolated_test(&db).unwrap();
+        {
+            let mut session = paper_v6::paper_catalog6_session(&db).unwrap();
+            session
+                .with_immediate_catalog6(
+                    |conn, _, proof| {
+                        proof.validate_on(conn)?;
+                        Ok::<_, paper_v6::PaperCatalog6Error>(())
+                    },
+                    |_, _, _, _| Ok(()),
+                )
+                .unwrap();
+        }
+        drop(ledger);
+        let source = Arc::clone(db.attribution_connection_source.as_ref().unwrap());
+        let mut pool_paths = fixture.binding();
+        pool_paths.database = pool_database.clone();
+        pool_paths.wal = sidecar_path(&pool_database, "-wal");
+        pool_paths.shm = sidecar_path(&pool_database, "-shm");
+        let namespace = PinnedNamespace::open(&pool_paths).unwrap();
+        let sidecars = {
+            let mut conn = db.get_conn().unwrap();
+            conn.batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            crate::database::registered_descriptor_connection_authority(&source, &mut conn)
+                .unwrap();
+            let evidence = crate::database::current_descriptor_pool_evidence(&source)
+                .unwrap()
+                .unwrap();
+            let wal = pin_owner_created_sidecar(&namespace, &pool_database, "-wal").unwrap();
+            let shm = pin_owner_created_sidecar(&namespace, &pool_database, "-shm").unwrap();
+            assert_eq!(
+                crate::database::FileObjectIdentity::from_file(&wal.file).unwrap(),
+                evidence
+                    .expected_objects
+                    .identity(crate::database::SqliteObjectRole::Wal)
+            );
+            assert_eq!(
+                crate::database::FileObjectIdentity::from_file(&shm.file).unwrap(),
+                evidence
+                    .expected_objects
+                    .identity(crate::database::SqliteObjectRole::Shm)
+            );
+            let sidecars = OwnerCreatedSqliteSidecars { wal, shm };
+            prospective::require_zero_owned_wal(&sidecars).unwrap();
+            sidecars
+        };
+        assert_eq!(
+            db.pool.state().connections,
+            db.pool.state().idle_connections
+        );
+        let attribution = db.attribution_pool.as_ref().unwrap().state();
+        assert_eq!(attribution.connections, attribution.idle_connections);
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
+        // A residual background r2d2 owner is a concrete unavailable fixture,
+        // not permission to sleep/retry or remove unknown sidecars.
+        assert_eq!(
+            Arc::strong_count(&source),
+            1,
+            "all original source pool owners must actually close"
+        );
+        let readback = source.readback_connection.lock().unwrap().take();
+        if let Some(readback) = readback {
+            crate::database::release_descriptor_connection(&source, readback);
+        }
+        // r2d2's final idle-pool destruction closes native connections without
+        // calling on_release. Its registry may retain stale raw-FD metadata;
+        // prove actual closure rather than clearing or trusting that registry.
+        fn require_exact_object_fds(
+            snapshot: &crate::database::ProcessDescriptorSnapshot,
+            identity: crate::database::FileObjectIdentity,
+            known: &std::collections::BTreeSet<std::os::fd::RawFd>,
+            role: &str,
+        ) {
+            for descriptor in known {
+                assert_eq!(
+                    snapshot.identity_of(*descriptor),
+                    Some(identity),
+                    "{role}: a concrete retained FD disappeared or changed identity"
+                );
+            }
+            // Known-subset membership plus exact cardinality proves set
+            // equality; an extra same-object FD is never accepted by count.
+            assert_eq!(
+                snapshot.count_matching(identity),
+                known.len(),
+                "{role}: extra native/unknown descriptors remain"
+            );
+        }
+        let main_identity =
+            crate::database::FileObjectIdentity::from_file(&source.database_anchor).unwrap();
+        let wal_identity =
+            crate::database::FileObjectIdentity::from_file(&sidecars.wal.file).unwrap();
+        let shm_identity =
+            crate::database::FileObjectIdentity::from_file(&sidecars.shm.file).unwrap();
+        let main_pins = std::collections::BTreeSet::from([source.database_anchor.as_raw_fd()]);
+        let wal_pins = std::collections::BTreeSet::from([sidecars.wal.file.as_raw_fd()]);
+        let shm_pins = {
+            let evidence = source.pool_evidence.lock().unwrap();
+            let evidence = evidence.as_ref().unwrap();
+            assert_eq!(
+                main_identity,
+                evidence
+                    .expected_objects
+                    .identity(crate::database::SqliteObjectRole::Main)
+            );
+            assert_eq!(
+                wal_identity,
+                evidence
+                    .expected_objects
+                    .identity(crate::database::SqliteObjectRole::Wal)
+            );
+            assert_eq!(
+                shm_identity,
+                evidence
+                    .expected_objects
+                    .identity(crate::database::SqliteObjectRole::Shm)
+            );
+            assert_eq!(
+                crate::database::FileObjectIdentity::from_file(&evidence.shared_shm_anchor)
+                    .unwrap(),
+                shm_identity
+            );
+            std::collections::BTreeSet::from([
+                evidence.shared_shm_anchor.as_raw_fd(),
+                sidecars.shm.file.as_raw_fd(),
+            ])
+        };
+        let source_pins_only = crate::database::ProcessDescriptorSnapshot::capture().unwrap();
+        require_exact_object_fds(
+            &source_pins_only,
+            main_identity,
+            &main_pins,
+            "main/source pins",
+        );
+        require_exact_object_fds(
+            &source_pins_only,
+            wal_identity,
+            &wal_pins,
+            "WAL/fixture pin",
+        );
+        require_exact_object_fds(
+            &source_pins_only,
+            shm_identity,
+            &shm_pins,
+            "SHM/source and fixture pins",
+        );
+        drop(source);
+        let fixture_pins_only = crate::database::ProcessDescriptorSnapshot::capture().unwrap();
+        require_exact_object_fds(
+            &fixture_pins_only,
+            main_identity,
+            &std::collections::BTreeSet::new(),
+            "main/closed source",
+        );
+        require_exact_object_fds(
+            &fixture_pins_only,
+            wal_identity,
+            &wal_pins,
+            "WAL/fixture pin after source drop",
+        );
+        require_exact_object_fds(
+            &fixture_pins_only,
+            shm_identity,
+            &std::collections::BTreeSet::from([sidecars.shm.file.as_raw_fd()]),
+            "SHM/fixture pin after source drop",
+        );
+        sidecars
+            .cleanup_after_connection_close(&namespace, &pool_database)
+            .unwrap();
+        require_no_live_sidecars_for_bound_namespace(&namespace, &pool_database).unwrap();
+        let v6_identity = FileIdentity::from_metadata(&fs::metadata(&pool_database).unwrap());
+        assert_eq!(v6_identity.device, pre2_identity.device);
+        assert_eq!(v6_identity.inode, pre2_identity.inode);
+        let v6_bytes = fs::read(&pool_database).unwrap();
+        drop(namespace);
+        // All original SQL owners closed; only the exact fixture pins remained
+        // before their owned sidecar cleanup. No registry metadata was cleared.
+        // Return this exact offline V6 inode to the fixed Rows-owner path.
+        assert!(matches!(
+            fs::symlink_metadata(&fixed_database),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        prospective_assert_fixture_offline(&fixture);
+        fs::rename(&pool_database, &fixed_database).unwrap();
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(&fixed_database).unwrap()),
+            v6_identity
+        );
+        assert_eq!(fs::read(&fixed_database).unwrap(), v6_bytes);
+        assert!(matches!(
+            fs::symlink_metadata(&pool_database),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(matches!(
+                fs::symlink_metadata(sidecar_path(&pool_database, suffix)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            ));
+        }
+        prospective_assert_fixture_offline(&fixture);
+        let before = fs::read(fixture.database()).unwrap();
+        let rendered = rows_test_prepare(&fixture, &writer, rows::Options::production())
+            .unwrap()
+            .render_unapproved()
+            .unwrap();
+        let names = rows_test_names(&rows_test_report(&rendered));
+        let expected = prospective_with_offline_fixture_connection(&fixture, |c| {
+            c.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        });
+        assert_eq!(names, expected);
+        assert_eq!(fs::read(fixture.database()).unwrap(), before);
+        assert!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("paper_book_v2_"))
+                .count()
+                > 4
+        );
     }
 
     fn backup_test_prepare(

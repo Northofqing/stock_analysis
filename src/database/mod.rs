@@ -2245,8 +2245,10 @@ struct SqliteConnectionConfiguration {
 struct SqliteConnectionCustomizer;
 
 /// Pool customizer for descriptor-attested sources. Its release hook runs on
-/// every r2d2 drop path and hands the closing connection's main descriptor
-/// back to the source before SQLite parks it for reuse.
+/// r2d2 discard/reap paths and hands the closing connection's main descriptor
+/// back to the source before SQLite parks it for reuse. Final idle-pool Drop
+/// closes native connections directly in r2d2 0.8; retained proof metadata and
+/// pins remain owned by the source until its teardown.
 #[derive(Debug)]
 struct DescriptorSqliteConnectionCustomizer {
     source: Arc<DescriptorSqliteSource>,
