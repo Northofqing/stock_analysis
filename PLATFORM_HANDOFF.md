@@ -241,3 +241,13 @@ Task4 逐项风控已完成独立全任务 spec/quality 审查：均 Approved，
 原独立审查发现三个 Important：后续 Observation 未逐项核对真实 native batch/refs；事件预算选择可被 JSON 字段位置或转义绕过，保存的 response 重放也缺解码前预检；同源退市早于上市未拒绝。原作者以共享事实重构核对完整来源、固定栈结构判断与同一 response 预检、生命周期区间约束修正，并补齐早期失败的实际上下文与阶段。限定六文件，无公共 ABI、DDL 或生产 profile 改动。
 
 修正后实际27项定向 PASS（7新、20相关旧）。仅一次 scoped lib Cargo 编译，旧例复用同 SHA 封存 harness；新日志 SHA `471c2957650c958137197c5feefa79cc6b28fabce58ab3687a489573c01a4c79`，旧例日志 SHA `3b065fc36e3d530a847fa15036a5b4080aa5746371b279a959e25d731c6b016b`，harness SHA `8a525e0a32de6fdbe99b566746a757a205b4585e249a0b6e99e4c7d95e816bdd`。初版123项证据作为 baseline 保留，未宣称本次重跑。原审查者范围复核待进行；另请其检查保存的 request 在 owned decode 前的 scalar 限制是否也需闭合。未据测试通过宣布整个 WG07 或平台完成，真实上游与上线门禁保持。
+
+### 2026-10-03 完整 F2 不可变拒绝记录：运行门禁通过，独立审查待完成
+
+完整保留策略选定 Top50 原始候选、首次 cutoff/slot/revision、Scope/Occurrence，以及实际冻结风险配置。每项候选有完整 required-field 和配置规则矩阵；身份未取得资格时明确 DeniedBeforeFacts、后续事实获取未调用、成本/流动性等未评估，不伪造 positiveRisk、资金批准或 Paper intent。InvestmentDecisionId 由完整 canonical 历史记录独立派生。重试读首次原记录，日历更新不重写历史证据。
+
+新增固定完整 Catalog8 参考、不可变 SQL 存储、原唯一 Global 机械借用引擎、IMMEDIATE 与末次 hook/COMMIT 后独立只读校验。原6/7硬界、完整财务 replay、原始金融 bytes 和行仍保留；生产8在 checkout 前拒绝，不是生产迁移。新 F2 codec/存储有分配前资源检查，不能据此声称原完整金融历史 replay 已具有新 target 所需的累计分配预算。
+
+实际79 distinct PASS：18新library、56受影响旧library、5正常命令行。新例包含真实非空财务 fixture、完整Top50/同code多row、独立literal golden、不可变/rowid溢出、配置变更原key重试、真实两coordinator与postcommit child、严格catalog/codec/资源界、历史日历A→B和局部review8/unknown9。旧例覆盖6/7原Global/捕获、fee、6条实际完整financial路径，以及原6目标真实副本/冷重开与7拒绝；不把其他未改纯金融用例宣称重跑。仅一次lib和一次正常bin Cargo，其他检查复用同SHA封存harness，无全量/check/build/clippy/release/部署。
+
+凭据 `dev-20261003-investment8-acceptance.json` 绑定16文件、所有日志及制品；新例日志SHA `26f3c974957b4d82b3a781498a05a34ef77d60d1e2c3e51016136c93411d8d9b` / `5371a8302ed6867f532cdcdb86b449eb11f413629e728c9b2da701d2bdba8c04`，旧56日志SHA `e36ee45eb1c28c2bf2848cc6dc9e125c5259eb83b23c85e312858ffb17f1a87b`，正常5日志SHA `7e29c5463af1b53f85b84a5be92366be3819a2d2234c5ced8385af171fb0b604`。独立完整任务审查待进行，正式事实/资金/正向F2、production、WORM和自然窗口仍未完成。

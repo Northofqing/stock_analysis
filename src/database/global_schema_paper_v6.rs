@@ -19,6 +19,8 @@ pub(crate) enum PaperCatalog6Error {
     Catalog6RequalificationRequired,
     #[error("Catalog7RequalificationRequired")]
     Catalog7RequalificationRequired,
+    #[error("Catalog8RequalificationRequired")]
+    Catalog8RequalificationRequired,
     #[error("borrowed SQLite connection instance differs")]
     ConnectionInstanceMismatch,
     #[error("catalog copy-work budget exceeded")]
@@ -67,18 +69,21 @@ impl<E> From<diesel::result::Error> for PaperCatalog6ReadbackError<E> {
 enum ClosedGeneration {
     Six,
     Seven,
+    Eight,
 }
 impl ClosedGeneration {
     fn number(self) -> i64 {
         match self {
             Self::Six => 6,
             Self::Seven => 7,
+            Self::Eight => 8,
         }
     }
     fn error(self) -> PaperCatalog6Error {
         match self {
             Self::Six => PaperCatalog6Error::Catalog6RequalificationRequired,
             Self::Seven => PaperCatalog6Error::Catalog7RequalificationRequired,
+            Self::Eight => PaperCatalog6Error::Catalog8RequalificationRequired,
         }
     }
 }
@@ -93,6 +98,14 @@ impl<'s> std::ops::Deref for VerifiedCatalog6<'s> {
     }
 }
 impl<'s> std::ops::Deref for VerifiedCatalog7<'s> {
+    type Target = ClosedCatalogProof<'s>;
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+pub(crate) struct VerifiedCatalog8<'s>(&'s ClosedCatalogProof<'s>);
+impl<'s> std::ops::Deref for VerifiedCatalog8<'s> {
     type Target = ClosedCatalogProof<'s>;
     fn deref(&self) -> &Self::Target {
         self.0
@@ -148,6 +161,14 @@ impl VerifiedCatalog7<'_> {
         self.0.loan.require_instance(conn)
     }
 }
+impl VerifiedCatalog8<'_> {
+    pub(crate) fn require_decision_instance(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<(), PaperCatalog6Error> {
+        self.0.loan.require_instance(conn)
+    }
+}
 impl ClosedCatalogProof<'_> {
     /// Original opaque object authority of this actual borrowed snapshot.
     pub(crate) fn connection_authority(&self) -> &DatabaseConnectionAuthority {
@@ -190,6 +211,9 @@ impl ClosedCatalogProof<'_> {
             ClosedGeneration::Six => crate::trading::paper_book_v2_execution::verify_rows_on(conn),
             ClosedGeneration::Seven => {
                 crate::trading::paper_book_v2_execution::verify_rows_on_catalog7(conn)
+            }
+            ClosedGeneration::Eight => {
+                crate::trading::paper_book_v2_execution::verify_rows_on_catalog8(conn)
             }
         }
         .map_err(|_| PaperCatalog6Error::Catalog("financial replay failed".into()))?;
@@ -356,6 +380,18 @@ pub(super) fn candidate_catalog7_session(
     session.generation = ClosedGeneration::Seven;
     Ok(session)
 }
+pub(super) fn investment_catalog8_session(
+    db: &DatabaseManager,
+) -> Result<PaperCatalog6Session<'_>, PaperCatalog6Error> {
+    let mut session = paper_catalog6_session(db).map_err(|e| match e {
+        PaperCatalog6Error::Catalog6RequalificationRequired => {
+            PaperCatalog6Error::Catalog8RequalificationRequired
+        }
+        e => e,
+    })?;
+    session.generation = ClosedGeneration::Eight;
+    Ok(session)
+}
 
 impl PaperCatalog6Session<'_> {
     pub(crate) fn with_immediate_catalog6<T, E>(
@@ -434,6 +470,45 @@ impl PaperCatalog6Session<'_> {
         self.with_readonly_closed(
             |c, p| operation(c, &VerifiedCatalog7(p)),
             |c, p, v| tail(c, &VerifiedCatalog7(p), v),
+        )
+    }
+    pub(super) fn with_immediate_catalog8<T, E>(
+        &mut self,
+        operation: impl for<'s> FnOnce(
+            &mut SqliteConnection,
+            &DatabaseConnectionAuthority,
+            &VerifiedCatalog8<'s>,
+        ) -> Result<T, E>,
+        mut tail: impl for<'s> FnMut(
+            &mut SqliteConnection,
+            &DatabaseConnectionAuthority,
+            &VerifiedCatalog8<'s>,
+            &T,
+        ) -> Result<(), E>,
+    ) -> Result<T, PaperCatalog6TransactionError<E>> {
+        if self.generation != ClosedGeneration::Eight {
+            return Err(PaperCatalog6TransactionError::BeforeCommit(
+                ClosedGeneration::Eight.error(),
+            ));
+        }
+        self.with_immediate_closed(
+            |c, a, p| operation(c, a, &VerifiedCatalog8(p)),
+            |c, a, p, v| tail(c, a, &VerifiedCatalog8(p), v),
+        )
+    }
+    pub(super) fn with_readonly_catalog8<T, E>(
+        &mut self,
+        operation: impl for<'s> FnOnce(&mut SqliteConnection, &VerifiedCatalog8<'s>) -> Result<T, E>,
+        mut tail: impl for<'s> FnMut(&mut SqliteConnection, &VerifiedCatalog8<'s>, &T) -> Result<(), E>,
+    ) -> Result<T, PaperCatalog6ReadbackError<E>> {
+        if self.generation != ClosedGeneration::Eight {
+            return Err(PaperCatalog6ReadbackError::ObservationUnavailable(
+                ClosedGeneration::Eight.error(),
+            ));
+        }
+        self.with_readonly_closed(
+            |c, p| operation(c, &VerifiedCatalog8(p)),
+            |c, p, v| tail(c, &VerifiedCatalog8(p), v),
         )
     }
     pub(crate) fn with_committed_readback<T, E>(
@@ -593,7 +668,10 @@ impl PaperCatalog6Session<'_> {
                 };
                 hook(TestPhase::AfterCommit, conn)
                     .map_err(PaperCatalog6ReadbackError::ObservationUnavailable)?;
-                if generation == ClosedGeneration::Seven {
+                if matches!(
+                    generation,
+                    ClosedGeneration::Seven | ClosedGeneration::Eight
+                ) {
                     // First main read fixes the snapshot before catalog/source validation.
                     capture::int(conn, "SELECT COUNT(*) AS value FROM main.sqlite_schema")
                         .map_err(PaperCatalog6ReadbackError::ObservationUnavailable)?;
@@ -857,5 +935,76 @@ pub(super) fn migrate_catalog7_for_isolated_test(
 }
 
 #[cfg(test)]
-#[path = "global_schema_paper_v6_tests.rs"]
-mod tests;
+pub(super) fn migrate_catalog8_for_isolated_test(
+    db: &DatabaseManager,
+) -> Result<(), PaperCatalog6TransactionError<PaperCatalog6Error>> {
+    let mut session =
+        investment_catalog8_session(db).map_err(PaperCatalog6TransactionError::BeforeCommit)?;
+    let source = Arc::clone(&session.checkout.source);
+    let namespace = &session.namespace;
+    let references = session.references;
+    let work = &session.work;
+    let mut ready = false;
+    let result = session.checkout.immediate_transaction_with_authority(
+        |_| PaperCatalog6TransactionError::BeforeCommit(PaperCatalog6Error::Authority),
+        |conn, authority| {
+            let scope = LoanScope;
+            let before = ClosedCatalogProof {
+                loan: CatalogLoan::new(conn, &scope),
+                authority,
+                source: &source,
+                namespace,
+                references,
+                work,
+                purpose: Purpose::Writer,
+                generation: ClosedGeneration::Seven,
+            };
+            before
+                .validate_on(conn)
+                .map_err(PaperCatalog6TransactionError::BeforeCommit)?;
+            crate::database::investment_decision_schema_v1::create_schema(conn)?;
+            diesel::sql_query("PRAGMA user_version=8").execute(conn)?;
+            hook(TestPhase::DuringMigration, conn)
+                .map_err(PaperCatalog6TransactionError::BeforeCommit)?;
+            let after = ClosedCatalogProof {
+                generation: ClosedGeneration::Eight,
+                ..before
+            };
+            after
+                .validate_on(conn)
+                .map_err(PaperCatalog6TransactionError::BeforeCommit)?;
+            after
+                .hook_free_check(conn)
+                .map_err(PaperCatalog6TransactionError::BeforeCommit)?;
+            ready = true;
+            Ok(authority.clone())
+        },
+    );
+    let authority = match result {
+        Ok(a) => a,
+        Err(PaperCatalog6TransactionError::BeforeCommit(e)) if ready => {
+            return Err(PaperCatalog6TransactionError::CommitOutcomeUnknown(e))
+        }
+        Err(e) => return Err(e),
+    };
+    session
+        .with_committed_readback_closed(
+            &authority,
+            |_, _| Ok::<_, PaperCatalog6Error>(()),
+            |_, _, _| Ok(()),
+        )
+        .map_err(|e| match e {
+            PaperCatalog6ReadbackError::ObservationUnavailable(e) => {
+                PaperCatalog6TransactionError::CommitOutcomeUnknown(e)
+            }
+            PaperCatalog6ReadbackError::Consumer(e) => {
+                PaperCatalog6TransactionError::CommittedConsumerOutcomeUnknown(e)
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    include!("global_schema_paper_v6_tests.rs");
+    include!("global_schema_investment_v8_tests.rs");
+}

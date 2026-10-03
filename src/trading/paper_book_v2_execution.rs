@@ -1295,6 +1295,13 @@ pub(crate) fn verify_rows_on_catalog7(conn: &mut SqliteConnection) -> Result<(),
         .map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
     read_views_rows_on(conn).map(|_| ())
 }
+/// Fixed8 complete historical replay after the unique Global gate.
+pub(crate) fn verify_rows_on_catalog8(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    crate::database::paper_book_v2_execution_schema_v1::verify_objects_on(conn)?;
+    crate::database::paper_book_v2_schema::verify_v8_manifest_on(conn)
+        .map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+    read_views_rows_on(conn).map(|_| ())
+}
 fn read_views_body_on(
     conn: &mut SqliteConnection,
 ) -> Result<BTreeMap<String, RecordedExecutionView>, LedgerError> {

@@ -6899,3 +6899,5 @@ mod tests {
             .expect("cleanup upsert test position");
     }
 }
+
+pub(crate) mod investment_decision_schema_v1;

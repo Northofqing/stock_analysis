@@ -39,6 +39,8 @@ use crate::selection::audit::{
 mod backup;
 #[path = "global_schema_candidate_v7.rs"]
 pub(crate) mod candidate_v7;
+#[path = "global_schema_investment_v8.rs"]
+pub(crate) mod investment_v8;
 #[path = "global_schema_paper_v6.rs"]
 pub(crate) mod paper_v6;
 #[path = "global_schema_prospective_v1.rs"]
@@ -4669,7 +4671,7 @@ mod tests {
 
     fn actual_offline_catalog6_fixture() -> (TestFixture, SelectionAuditWriter) {
         use crate::trading::paper_book_v2::{
-            TestCutoverFault, TestCutoverRequest, cutover_for_isolated_test,
+            cutover_for_isolated_test, TestCutoverFault, TestCutoverRequest,
         };
         use crate::trading::paper_ledger::{
             Money, PaperCommand, PaperLedger, RiskPolicyV1, SeedManifest,
@@ -5103,16 +5105,12 @@ mod tests {
             let writable = connection
                 .db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA)
                 .unwrap();
-            assert!(
-                !connection
-                    .set_db_config(SQLITE_DBCONFIG_DEFENSIVE, false)
-                    .unwrap()
-            );
-            assert!(
-                connection
-                    .set_db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA, true)
-                    .unwrap()
-            );
+            assert!(!connection
+                .set_db_config(SQLITE_DBCONFIG_DEFENSIVE, false)
+                .unwrap());
+            assert!(connection
+                .set_db_config(SQLITE_DBCONFIG_WRITABLE_SCHEMA, true)
+                .unwrap());
             let attacked = connection.execute_batch(mutation);
             assert_eq!(
                 connection
@@ -5255,6 +5253,23 @@ mod tests {
                 c.execute_batch(ddl).unwrap();
             }
             c.execute_batch("PRAGMA user_version=7").unwrap();
+        });
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        assert!(target::prepare(original, target::Options::production()).is_err());
+        assert!(!fixture.root.join("global-schema-targets").exists());
+    }
+    #[test]
+    fn target_actual_catalog8_is_ineligible_before_any_target_creation() {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        prospective_with_offline_fixture_connection(&fixture, |c| {
+            for (_, _, _, ddl) in super::super::candidate_scope_observation_schema_v1::STATEMENTS {
+                c.execute_batch(ddl).unwrap();
+            }
+            for (_, _, _, ddl) in super::super::investment_decision_schema_v1::STATEMENTS {
+                c.execute_batch(ddl).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version=8").unwrap();
         });
         let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
         assert!(target::prepare(original, target::Options::production()).is_err());

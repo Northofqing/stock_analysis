@@ -166,6 +166,7 @@ const PAPER_BOOK_PREPARED_CATALOG_GENERATION: i64 =
     super::paper_book_owner_schema_v2::CATALOG_GENERATION;
 const PAPER_BOOK_EXECUTION_CATALOG_GENERATION: i64 = 6;
 const CANDIDATE_OBSERVATION_CATALOG_GENERATION: i64 = 7;
+const INVESTMENT_DECISION_CATALOG_GENERATION: i64 = 8;
 const SQLITE_MINIMUM_LIBVERSION_NUMBER: i32 = 3_035_000;
 const SQLITE_NEXT_MAJOR_LIBVERSION_NUMBER: i32 = 4_000_000;
 
@@ -1128,6 +1129,7 @@ pub(crate) struct SameRuntimeCatalogReferences {
     owner_v5: PaperBookOwnerCatalogV5References,
     execution_v6: PaperBookOwnerCatalogV5References,
     candidate_v7: PaperBookOwnerCatalogV5References,
+    investment_v8: PaperBookOwnerCatalogV5References,
 }
 
 impl SameRuntimeCatalogReferences {
@@ -1276,6 +1278,11 @@ impl RowsSpecWork {
             })
         }
         let (legacy, transitional, amended) = match actual.identity.user_version {
+            8 => (
+                &references.investment_v8.legacy,
+                &references.investment_v8.transitional,
+                &references.investment_v8.amended,
+            ),
             7 => (
                 &references.candidate_v7.legacy,
                 &references.candidate_v7.transitional,
@@ -1766,11 +1773,11 @@ pub(crate) fn classify_database_half(
             .collect(),
     )?;
     if actual.identity.application_id == STOCK_ANALYSIS_SQLITE_APPLICATION_ID
-        && actual.identity.user_version > CANDIDATE_OBSERVATION_CATALOG_GENERATION
+        && actual.identity.user_version > INVESTMENT_DECISION_CATALOG_GENERATION
     {
         return Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
             actual: actual.identity.user_version,
-            supported: CANDIDATE_OBSERVATION_CATALOG_GENERATION,
+            supported: INVESTMENT_DECISION_CATALOG_GENERATION,
         });
     }
     validate_catalog_safety(
@@ -1825,7 +1832,14 @@ pub(crate) fn classify_database_half(
     let owner_v5 = actual.identity.user_version == PAPER_BOOK_PREPARED_CATALOG_GENERATION;
     let execution_v6 = actual.identity.user_version == PAPER_BOOK_EXECUTION_CATALOG_GENERATION;
     let candidate_v7 = actual.identity.user_version == CANDIDATE_OBSERVATION_CATALOG_GENERATION;
-    let (legacy_reference, transitional_reference, amended_reference) = if candidate_v7 {
+    let investment_v8 = actual.identity.user_version == INVESTMENT_DECISION_CATALOG_GENERATION;
+    let (legacy_reference, transitional_reference, amended_reference) = if investment_v8 {
+        (
+            &references.investment_v8.legacy,
+            &references.investment_v8.transitional,
+            &references.investment_v8.amended,
+        )
+    } else if candidate_v7 {
         (
             &references.candidate_v7.legacy,
             &references.candidate_v7.transitional,
@@ -1921,10 +1935,19 @@ pub(crate) fn classify_database_half(
             ),
         });
     };
-    if paper_v2 || review_v3 || owner_v4 || owner_v5 || execution_v6 || candidate_v7 {
+    if paper_v2
+        || review_v3
+        || owner_v4
+        || owner_v5
+        || execution_v6
+        || candidate_v7
+        || investment_v8
+    {
         expected_identity = DatabaseSchemaIdentity {
             application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
-            user_version: if candidate_v7 {
+            user_version: if investment_v8 {
+                INVESTMENT_DECISION_CATALOG_GENERATION
+            } else if candidate_v7 {
                 CANDIDATE_OBSERVATION_CATALOG_GENERATION
             } else if execution_v6 {
                 PAPER_BOOK_EXECUTION_CATALOG_GENERATION
@@ -1976,7 +1999,14 @@ pub(crate) fn classify_database_half(
         mode: actual.mode,
         identity: actual.identity,
         runtime: actual.runtime.clone(),
-        whole_application_catalog_sha256: if candidate_v7 {
+        whole_application_catalog_sha256: if investment_v8 {
+            WholeApplicationSchemaCatalogSha256(catalog_digest(
+                b"stock_analysis.global_schema_catalog.v8.investment_decision.v1",
+                actual.mode,
+                &actual.runtime,
+                &actual.objects,
+            ))
+        } else if candidate_v7 {
             WholeApplicationSchemaCatalogSha256(catalog_digest(
                 b"stock_analysis.global_schema_catalog.v7.candidate_observation.v1",
                 actual.mode,
@@ -2162,7 +2192,7 @@ pub(super) fn prospective_target_reference(
     };
     let generation = match source.identity.user_version {
         0 | 1 => STOCK_ANALYSIS_DB_SCHEMA_GENERATION,
-        2..=7 => source.identity.user_version,
+        2..=8 => source.identity.user_version,
         _ => {
             return Err(GlobalSchemaCatalogError::CatalogMismatch {
                 detail: "unsupported prospective target generation".into(),
@@ -2177,6 +2207,7 @@ pub(super) fn prospective_target_reference(
         5 => &references.owner_v5.amended,
         6 => &references.execution_v6.amended,
         7 => &references.candidate_v7.amended,
+        8 => &references.investment_v8.amended,
         _ => unreachable!("closed generation above"),
     };
     // The target's SQL bytes were actually emitted by this linked SQLite in
@@ -2560,6 +2591,36 @@ fn build_same_runtime_catalog_state_with_candidate_v7(
     execution_v6: bool,
     candidate_v7: bool,
 ) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
+    build_same_runtime_catalog_state_with_investment_v8(
+        mode,
+        phase,
+        paper_v2,
+        review_v3,
+        owner_v4,
+        owner_v5,
+        execution_v6,
+        candidate_v7,
+        false,
+    )
+}
+
+fn build_same_runtime_catalog_state_with_investment_v8(
+    mode: GlobalSchemaCatalogMode,
+    phase: Option<SelectionCatalogDdlPhase>,
+    paper_v2: bool,
+    review_v3: bool,
+    owner_v4: bool,
+    owner_v5: bool,
+    execution_v6: bool,
+    candidate_v7: bool,
+    investment_v8: bool,
+) -> Result<(SqliteRuntimeIdentity, OwnerBuiltCatalogState), GlobalSchemaCatalogError> {
+    if investment_v8 && !candidate_v7 {
+        return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
+            catalog: "investment-decision-v8",
+            detail: "Catalog8 requires complete exact7".into(),
+        });
+    }
     if candidate_v7 && !execution_v6 {
         return Err(GlobalSchemaCatalogError::InvalidCatalogReference {
             catalog: "candidate-observation-v7",
@@ -2795,6 +2856,38 @@ fn build_same_runtime_catalog_state_with_candidate_v7(
             if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
                 return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch {
                     catalog: "candidate-observation-v7",
+                    detail: "duplicate DDL identity".into(),
+                });
+            }
+            expected_registry.push(entry);
+        }
+    }
+    if investment_v8 {
+        for (i, (kind, name, table, sql)) in super::investment_decision_schema_v1::STATEMENTS
+            .iter()
+            .enumerate()
+        {
+            let entry = FrozenCatalogRegistryEntry {
+                identity: CatalogObjectIdentity {
+                    kind: parse_catalog_object_kind("investment-decision-v8", kind)?,
+                    name: (*name).into(),
+                    table_name: (*table).into(),
+                },
+                ddl_id: format!("investment-decision-v8:{name}"),
+                source_line: i + 1,
+            };
+            connection.execute_batch(sql).map_err(|e| {
+                sqlite_reference_build_error("execute-investment-v8", Some(&entry.ddl_id), e)
+            })?;
+            capture_exact_catalog_object(
+                &connection,
+                &entry.identity,
+                &entry.ddl_id,
+                "investment-decision-v8",
+            )?;
+            if !executed_ddl_ids.insert(entry.ddl_id.clone()) {
+                return Err(GlobalSchemaCatalogError::GeneratedRegistryMismatch {
+                    catalog: "investment-decision-v8",
                     detail: "duplicate DDL identity".into(),
                 });
             }
@@ -3260,6 +3353,7 @@ fn capture_managed_index_geometry(
                 .chain(super::paper_book_owner_schema_v2::OWNER_STATEMENTS.iter())
                 .chain(super::paper_book_v2_execution_schema_v1::STATEMENTS.iter())
                 .chain(super::candidate_scope_observation_schema_v1::STATEMENTS.iter())
+                .chain(super::investment_decision_schema_v1::STATEMENTS.iter())
                 .filter(|(kind, _, _, _)| *kind == "table")
                 .map(|(_, name, _, _)| (*name).to_owned()),
         )
@@ -3563,6 +3657,44 @@ fn issue_same_runtime_catalog_references(
     {
         return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
     }
+    let (investment_runtime, investment_legacy) =
+        build_same_runtime_catalog_state_with_investment_v8(
+            built.mode, None, true, true, false, true, true, true, true,
+        )?;
+    let (investment_transitional_runtime, investment_transitional) =
+        build_same_runtime_catalog_state_with_investment_v8(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Transitional),
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )?;
+    let (investment_amended_runtime, investment_amended) =
+        build_same_runtime_catalog_state_with_investment_v8(
+            built.mode,
+            Some(SelectionCatalogDdlPhase::Final),
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )?;
+    if [
+        investment_runtime,
+        investment_transitional_runtime,
+        investment_amended_runtime,
+    ]
+    .iter()
+    .any(|r| r != &built.runtime)
+    {
+        return Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch);
+    }
     Ok(SameRuntimeCatalogReferences {
         mode: built.mode,
         runtime: built.runtime,
@@ -3588,6 +3720,11 @@ fn issue_same_runtime_catalog_references(
             legacy: prepared_legacy.reference,
             transitional: prepared_transitional.reference,
             amended: prepared_amended.reference,
+        },
+        investment_v8: PaperBookOwnerCatalogV5References {
+            legacy: investment_legacy.reference,
+            transitional: investment_transitional.reference,
+            amended: investment_amended.reference,
         },
         candidate_v7: PaperBookOwnerCatalogV5References {
             legacy: candidate_legacy.reference,
@@ -3798,6 +3935,7 @@ fn validate_catalog_safety(
         .chain(super::paper_book_owner_schema_v2::OWNER_STATEMENTS.iter())
         .chain(super::paper_book_v2_execution_schema_v1::STATEMENTS.iter())
         .chain(super::candidate_scope_observation_schema_v1::STATEMENTS.iter())
+        .chain(super::investment_decision_schema_v1::STATEMENTS.iter())
         .filter(|(kind, _, _, _)| *kind == "table")
         .map(|(_, name, _, _)| *name)
         .collect::<BTreeSet<_>>();
@@ -4722,15 +4860,71 @@ mod tests {
     }
 
     #[test]
+    fn investment_catalog8_full_reference_families_and_geometry_are_closed() {
+        for mode in [
+            GlobalSchemaCatalogMode::Test,
+            GlobalSchemaCatalogMode::Production,
+        ] {
+            let references = same_runtime_references(mode);
+            for state in [
+                DatabaseHalfState::PreAmendment,
+                DatabaseHalfState::Transitional,
+                DatabaseHalfState::Amended,
+            ] {
+                let mut actual = snapshot_for_state(&references, state);
+                let reference = match state {
+                    DatabaseHalfState::PreAmendment => &references.investment_v8.legacy,
+                    DatabaseHalfState::Transitional => &references.investment_v8.transitional,
+                    DatabaseHalfState::Amended => &references.investment_v8.amended,
+                };
+                actual.identity = DatabaseSchemaIdentity {
+                    application_id: STOCK_ANALYSIS_SQLITE_APPLICATION_ID,
+                    user_version: 8,
+                };
+                actual.objects = reference.objects.clone();
+                actual.managed_index_geometry = reference.managed_index_geometry.clone();
+                actual.foreign_keys = reference.foreign_keys.clone();
+                actual.sqlite_owned_objects = reference.sqlite_owned_objects.clone();
+                assert!(classify_database_half(&actual, &references).is_ok());
+                let original_fks = actual.foreign_keys.clone();
+                actual
+                    .foreign_keys
+                    .retain(|fk| fk.source_table != "investment_decisions_v1");
+                assert!(classify_database_half(&actual, &references).is_err());
+                actual.foreign_keys = original_fks;
+                let original_objects = actual.objects.clone();
+                actual
+                    .objects
+                    .retain(|o| o.identity.name != "investment_decisions_v1_no_reinsert");
+                assert!(classify_database_half(&actual, &references).is_err());
+                actual.objects = original_objects.clone();
+                actual
+                    .objects
+                    .iter_mut()
+                    .find(|o| o.identity.name == "investment_decisions_v1")
+                    .unwrap()
+                    .exact_sql
+                    .push(' ');
+                assert!(classify_database_half(&actual, &references).is_err());
+                actual.objects = original_objects;
+                actual
+                    .managed_index_geometry
+                    .retain(|index| index.table_name != "investment_decisions_v1");
+                assert!(classify_database_half(&actual, &references).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn future_generation_and_incomplete_final_payload_fail_closed() {
         let references = same_runtime_references(GlobalSchemaCatalogMode::Test);
         let mut actual = snapshot_for_state(&references, DatabaseHalfState::Amended);
-        actual.identity.user_version = 8;
+        actual.identity.user_version = 9;
         assert!(matches!(
             classify_database_half(&actual, &references),
             Err(GlobalSchemaCatalogError::UnsupportedFutureGeneration {
-                actual: 8,
-                supported: 7,
+                actual: 9,
+                supported: 8,
             })
         ));
 

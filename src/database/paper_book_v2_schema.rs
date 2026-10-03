@@ -200,6 +200,14 @@ pub(crate) fn verify_v7_manifest_on(
     verify_manifest_row_on(conn, 7)
 }
 
+/// Fixed8 historical validation only; never execution authority.
+pub(crate) fn verify_v8_manifest_on(
+    conn: &mut SqliteConnection,
+) -> Result<(), StagedPaperBookV2Error> {
+    verify_execution_manifest_types_on(conn)?;
+    verify_manifest_row_on(conn, 8)
+}
+
 fn verify_execution_manifest_types_on(
     conn: &mut SqliteConnection,
 ) -> Result<(), StagedPaperBookV2Error> {
@@ -240,7 +248,7 @@ fn verify_manifest_row_on(
     }
     let mut reference = SqliteConnection::establish(":memory:")?;
     create_schema(&mut reference)?;
-    let matches_reference = if matches!(expected_user_version, 5 | 6 | 7) {
+    let matches_reference = if matches!(expected_user_version, 5 | 6 | 7 | 8) {
         fee_objects(conn)? == fee_objects(&mut reference)?
     } else {
         objects(conn)? == objects(&mut reference)?

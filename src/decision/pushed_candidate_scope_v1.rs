@@ -1,6 +1,7 @@
 //! Bounded observation of the actual legacy pushed-row scope.
 //! This is source preparation for F2, not a persisted investment decision.
 use crate::database::global_schema_v1::candidate_v7::VerifiedCatalog7;
+use crate::database::global_schema_v1::investment_v8::VerifiedCatalog8;
 use crate::database::global_schema_v1::paper_v6::{PaperCatalog6Error, VerifiedCatalog6};
 use crate::database::DatabaseConnectionAuthority;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, SecondsFormat, Utc};
@@ -126,6 +127,33 @@ impl CapturedPushedCandidateScope {
     }
 }
 
+/// Only a live, exact8 loan can create this capture; stored bytes never can.
+pub(crate) fn capture_catalog8_at(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedCatalog8<'_>,
+    cutoff: DateTime<Utc>,
+) -> Result<CapturedPushedCandidateScope, CandidateScopeError> {
+    proof.validate_on(conn)?;
+    capture_validated(conn, proof.connection_authority(), cutoff)
+}
+impl CapturedPushedCandidateScope {
+    pub(crate) fn verify_catalog8_unchanged(
+        &self,
+        conn: &mut SqliteConnection,
+        proof: &VerifiedCatalog8<'_>,
+    ) -> Result<(), CandidateScopeError> {
+        if proof.connection_authority() != &self.authority {
+            return Err(CandidateScopeError::SourceAuthority);
+        }
+        let current = capture_catalog8_at(conn, proof, self.cutoff)?;
+        if current.canonical == self.canonical {
+            Ok(())
+        } else {
+            Err(CandidateScopeError::Changed)
+        }
+    }
+}
+
 #[derive(QueryableByName)]
 struct MainEncoding {
     #[diesel(sql_type = Text)]
@@ -167,10 +195,10 @@ struct RawPushRow {
     #[diesel(sql_type = Nullable<Binary>)]
     outcome: Option<Vec<u8>>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FrozenPushRow {
-    id: i64,
+pub(super) struct FrozenPushRow {
+    pub(super) id: i64,
     push_time: String,
     push_kind: String,
     code: String,
@@ -244,16 +272,16 @@ impl From<FrozenPushRow> for DeniedRow {
         }
     }
 }
-#[derive(Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum CalendarObservation {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum CalendarObservation {
     Covered {
-        contract: &'static str,
-        authority_sha256: &'static str,
+        contract: String,
+        authority_sha256: String,
         open: bool,
     },
     Unavailable {
-        reason: &'static str,
+        reason: String,
     },
 }
 #[derive(Serialize)]
@@ -379,9 +407,58 @@ fn capture_validated(
     })
 }
 
+#[cfg(test)]
+thread_local! { static CALENDAR_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) struct CalendarOverrideGuard(Option<String>);
+#[cfg(test)]
+impl Drop for CalendarOverrideGuard {
+    fn drop(&mut self) {
+        CALENDAR_OVERRIDE.with(|v| *v.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn calendar_override_for_test(hash: String) -> CalendarOverrideGuard {
+    CalendarOverrideGuard(CALENDAR_OVERRIDE.with(|v| v.borrow_mut().replace(hash)))
+}
+fn calendar_for(date: chrono::NaiveDate) -> CalendarObservation {
+    #[cfg(test)]
+    if let Some(hash) = CALENDAR_OVERRIDE.with(|v| v.borrow().clone()) {
+        return CalendarObservation::Covered {
+            contract: "checked-in-a-share-calendar-replay-v1".into(),
+            authority_sha256: hash,
+            open: true,
+        };
+    }
+    match (
+        crate::calendar::verified_a_share_trading_day(date),
+        crate::calendar::verified_a_share_calendar_authority_hash(date),
+    ) {
+        (Ok(open), Ok(authority_sha256)) => CalendarObservation::Covered {
+            contract: "checked-in-a-share-calendar-replay-v1".into(),
+            authority_sha256: authority_sha256.into(),
+            open,
+        },
+        _ => CalendarObservation::Unavailable {
+            reason: "immutable_calendar_coverage_unavailable".into(),
+        },
+    }
+}
 fn canonical_for(
     rows: Vec<FrozenPushRow>,
     cutoff: DateTime<Utc>,
+) -> Result<Vec<u8>, CandidateScopeError> {
+    let offset = FixedOffset::east_opt(8 * 3600).ok_or(CandidateScopeError::Cutoff)?;
+    canonical_with_calendar(
+        rows,
+        cutoff,
+        calendar_for(cutoff.with_timezone(&offset).date_naive()),
+    )
+}
+fn canonical_with_calendar(
+    rows: Vec<FrozenPushRow>,
+    cutoff: DateTime<Utc>,
+    calendar: CalendarObservation,
 ) -> Result<Vec<u8>, CandidateScopeError> {
     let offset = FixedOffset::east_opt(8 * 3600).ok_or(CandidateScopeError::Cutoff)?;
     let upper_time = cutoff
@@ -396,19 +473,6 @@ fn canonical_for(
     let upper = upper_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let lower = lower_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let date = cutoff.with_timezone(&offset).date_naive();
-    let calendar = match (
-        crate::calendar::verified_a_share_trading_day(date),
-        crate::calendar::verified_a_share_calendar_authority_hash(date),
-    ) {
-        (Ok(open), Ok(authority_sha256)) => CalendarObservation::Covered {
-            contract: "checked-in-a-share-calendar-replay-v1",
-            authority_sha256,
-            open,
-        },
-        _ => CalendarObservation::Unavailable {
-            reason: "immutable_calendar_coverage_unavailable",
-        },
-    };
     // At most 1 MiB of UTF-8 text can expand sixfold under JSON escaping;
     // bounded row descriptors fit within the remaining canonical allowance.
     let canonical = serde_json::to_vec(&Canonical {
@@ -442,6 +506,17 @@ pub(crate) fn validate_stored_canonical(
     bytes: &[u8],
     cutoff: DateTime<Utc>,
 ) -> Result<(), CandidateScopeError> {
+    decode_historical_scope(bytes, cutoff).map(|_| ())
+}
+/// Value-only historical projection, never a live capture or writer proof.
+pub(super) struct HistoricalScope {
+    pub(super) rows: Vec<FrozenPushRow>,
+    pub(super) calendar: CalendarObservation,
+}
+pub(super) fn decode_historical_scope(
+    bytes: &[u8],
+    cutoff: DateTime<Utc>,
+) -> Result<HistoricalScope, CandidateScopeError> {
     if bytes.is_empty() || bytes.len() > CANONICAL_BYTES {
         return Err(CandidateScopeError::Bounds);
     }
@@ -516,11 +591,32 @@ pub(crate) fn validate_stored_canonical(
         }
         rows.push(row);
     }
-    let expected = canonical_for(rows, cutoff)?;
+    let calendar: CalendarObservation = serde_json::from_value(
+        value
+            .get("calendar")
+            .ok_or(CandidateScopeError::Canonical)?
+            .clone(),
+    )
+    .map_err(|_| CandidateScopeError::Canonical)?;
+    match &calendar {
+        CalendarObservation::Covered {
+            contract,
+            authority_sha256,
+            ..
+        } if contract == "checked-in-a-share-calendar-replay-v1"
+            && authority_sha256.len() == 64
+            && authority_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+        CalendarObservation::Unavailable { reason }
+            if reason == "immutable_calendar_coverage_unavailable" => {}
+        _ => return Err(CandidateScopeError::Canonical),
+    }
+    let expected = canonical_with_calendar(rows.clone(), cutoff, calendar.clone())?;
     if expected != bytes {
         return Err(CandidateScopeError::Canonical);
     }
-    Ok(())
+    Ok(HistoricalScope { rows, calendar })
 }
 
 // Streaming allocation preflight: do not construct a serde Value/Vec/String
@@ -798,4 +894,27 @@ fn preflight_stored_json(bytes: &[u8]) -> Result<(), CandidateScopeError> {
     deserializer
         .end()
         .map_err(|_| CandidateScopeError::Canonical)
+}
+
+#[cfg(test)]
+mod historical_calendar_tests {
+    use super::*;
+    #[test]
+    fn candidate_scope_historical_calendar_closed_shape_rejects_unknown_and_malformed() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-09-28T01:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let bytes = canonical_for(Vec::new(), cutoff).unwrap();
+        for calendar in [
+            serde_json::json!({"state":"covered","contract":"unknown","authority_sha256":"a".repeat(64),"open":true}),
+            serde_json::json!({"state":"covered","contract":"checked-in-a-share-calendar-replay-v1","authority_sha256":"a".repeat(63),"open":true}),
+            serde_json::json!({"state":"unavailable","reason":"guess"}),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["calendar"] = calendar;
+            assert!(
+                validate_stored_canonical(&serde_json::to_vec(&value).unwrap(), cutoff).is_err()
+            );
+        }
+    }
 }

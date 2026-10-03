@@ -9,6 +9,7 @@ use crate::database::global_schema_v1::candidate_v7::{
     candidate_catalog7_session, CandidateCatalog7Error, CandidateCatalog7ReadbackError,
     CandidateCatalog7TransactionError, VerifiedCatalog7,
 };
+use crate::database::global_schema_v1::investment_v8::VerifiedCatalog8;
 use crate::database::{DatabaseConnectionAuthority, DatabaseManager};
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Binary, Text};
@@ -67,7 +68,10 @@ impl StoredCandidateScopeObservation {
     pub(crate) fn slot_start_unix_ms(&self) -> i64 {
         self.slot
     }
-    fn same_record(&self, other: &Self) -> bool {
+    pub(super) fn row_id(&self) -> i64 {
+        self.row_id
+    }
+    pub(super) fn same_record(&self, other: &Self) -> bool {
         self.authority == other.authority
             && self.row_id == other.row_id
             && self.slot == other.slot
@@ -78,8 +82,8 @@ impl StoredCandidateScopeObservation {
             && self.occurrence_id == other.occurrence_id
     }
 }
-struct ObservationAttempt {
-    record: StoredCandidateScopeObservation,
+pub(super) struct ObservationAttempt {
+    pub(super) record: StoredCandidateScopeObservation,
     // Only a first append retains live capture. An existing key never gets one.
     captured: Option<CapturedPushedCandidateScope>,
 }
@@ -141,9 +145,31 @@ struct Maximum {
     value: i64,
 }
 
+#[derive(Clone, Copy)]
+enum ObservationLoan<'a, 's> {
+    Seven(&'a VerifiedCatalog7<'s>),
+    Eight(&'a VerifiedCatalog8<'s>),
+}
+impl ObservationLoan<'_, '_> {
+    fn require_observation_instance(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<(), CandidateCatalog7Error> {
+        match self {
+            Self::Seven(p) => p.require_observation_instance(conn),
+            Self::Eight(p) => p.require_decision_instance(conn),
+        }
+    }
+    fn connection_authority(&self) -> &DatabaseConnectionAuthority {
+        match self {
+            Self::Seven(p) => p.connection_authority(),
+            Self::Eight(p) => p.connection_authority(),
+        }
+    }
+}
 fn load_record(
     conn: &mut SqliteConnection,
-    proof: &VerifiedCatalog7<'_>,
+    proof: ObservationLoan<'_, '_>,
     slot: i64,
 ) -> Result<Option<StoredCandidateScopeObservation>, ObservationError> {
     // Validate the callback-local instance before even the metadata SQL.
@@ -219,7 +245,7 @@ fn observe_at(
     let slot = slot_for(now).map_err(CandidateCatalog7TransactionError::Consumer)?;
     session.with_immediate_catalog7(
         |conn, _, proof| {
-            if let Some(record) = load_record(conn, proof, slot)? {
+            if let Some(record) = load_record(conn, ObservationLoan::Seven(proof), slot)? {
                 return Ok(ObservationAttempt { record, captured:None });
             }
             let captured = source::capture_catalog7_at(conn, proof, now)?;
@@ -229,13 +255,13 @@ fn observe_at(
             let digest = scope_digest(captured.canonical_bytes());
             diesel::sql_query("INSERT INTO main.candidate_scope_observations_v1(observation_row_id,policy_id,slot_start_unix_ms,evaluation_revision,cutoff_unix_seconds,cutoff_subsec_nanos,scope_sha256,scope_canonical) VALUES(?,?,?,1,?,?,?,?)")
                 .bind::<BigInt,_>(row_id).bind::<Text,_>(POLICY).bind::<BigInt,_>(slot).bind::<BigInt,_>(now.timestamp()).bind::<BigInt,_>(i64::from(now.timestamp_subsec_nanos())).bind::<Binary,_>(&digest).bind::<Binary,_>(captured.canonical_bytes()).execute(conn)?;
-            let record = load_record(conn, proof, slot)?.ok_or(ObservationError::Conflict)?;
+            let record = load_record(conn, ObservationLoan::Seven(proof), slot)?.ok_or(ObservationError::Conflict)?;
             if record.row_id != row_id || record.cutoff != now || record.canonical != captured.canonical_bytes() || record.digest != digest { return Err(ObservationError::Conflict); }
             Ok(ObservationAttempt { record, captured:Some(captured) })
         },
         |conn, authority, proof, attempt| {
             if authority != &attempt.record.authority || proof.connection_authority() != &attempt.record.authority { return Err(ObservationError::Authority); }
-            let actual = load_record(conn, proof, slot)?.ok_or(ObservationError::Conflict)?;
+            let actual = load_record(conn, ObservationLoan::Seven(proof), slot)?.ok_or(ObservationError::Conflict)?;
             if !actual.same_record(&attempt.record) { return Err(ObservationError::Conflict); }
             if let Some(captured) = &attempt.captured { captured.verify_catalog7_unchanged(conn, proof)?; }
             Ok(())
@@ -257,9 +283,9 @@ pub(crate) fn read_candidate_scope_observation(
     let mut session = candidate_catalog7_session(db)
         .map_err(CandidateCatalog7ReadbackError::ObservationUnavailable)?;
     session.with_readonly_catalog7(
-        |conn, proof| load_record(conn, proof, slot),
+        |conn, proof| load_record(conn, ObservationLoan::Seven(proof), slot),
         |conn, proof, original| {
-            let current = load_record(conn, proof, slot)?;
+            let current = load_record(conn, ObservationLoan::Seven(proof), slot)?;
             match (original, current) {
                 (None, None) => Ok(()),
                 (Some(a), Some(b)) if a.same_record(&b) => Ok(()),
@@ -283,4 +309,63 @@ mod tests {
         assert_ne!(identities(0, &digest).1, identities(30000, &digest).1);
         assert_ne!(digest, Sha256::digest(b"[]").to_vec());
     }
+}
+
+/// A fixed8 borrower can only use the actual callback-local witness.
+pub(super) fn load_catalog8_scope(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedCatalog8<'_>,
+    slot: i64,
+) -> Result<Option<StoredCandidateScopeObservation>, ObservationError> {
+    load_record(conn, ObservationLoan::Eight(proof), slot)
+}
+pub(super) fn observe_catalog8_scope(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedCatalog8<'_>,
+    now: DateTime<Utc>,
+) -> Result<ObservationAttempt, ObservationError> {
+    let slot = slot_for(now)?;
+    if let Some(record) = load_catalog8_scope(conn, proof, slot)? {
+        return Ok(ObservationAttempt {
+            record,
+            captured: None,
+        });
+    }
+    let captured = source::capture_catalog8_at(conn, proof, now)?;
+    source::validate_stored_canonical(captured.canonical_bytes(), now)?;
+    let max = diesel::sql_query("SELECT COALESCE(MAX(observation_row_id),0) AS value FROM main.candidate_scope_observations_v1").get_result::<Maximum>(conn)?.value;
+    let row_id = max
+        .checked_add(1)
+        .filter(|id| *id > 0)
+        .ok_or(ObservationError::RowIdExhausted)?;
+    let digest = scope_digest(captured.canonical_bytes());
+    diesel::sql_query("INSERT INTO main.candidate_scope_observations_v1(observation_row_id,policy_id,slot_start_unix_ms,evaluation_revision,cutoff_unix_seconds,cutoff_subsec_nanos,scope_sha256,scope_canonical) VALUES(?,?,?,1,?,?,?,?)")
+        .bind::<BigInt,_>(row_id).bind::<Text,_>(POLICY).bind::<BigInt,_>(slot).bind::<BigInt,_>(now.timestamp()).bind::<BigInt,_>(i64::from(now.timestamp_subsec_nanos())).bind::<Binary,_>(&digest).bind::<Binary,_>(captured.canonical_bytes()).execute(conn)?;
+    let record = load_catalog8_scope(conn, proof, slot)?.ok_or(ObservationError::Conflict)?;
+    if record.row_id != row_id
+        || record.cutoff != now
+        || record.canonical != captured.canonical_bytes()
+        || record.digest != digest
+    {
+        return Err(ObservationError::Conflict);
+    }
+    Ok(ObservationAttempt {
+        record,
+        captured: Some(captured),
+    })
+}
+pub(super) fn verify_catalog8_scope(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedCatalog8<'_>,
+    attempt: &ObservationAttempt,
+) -> Result<(), ObservationError> {
+    let actual =
+        load_catalog8_scope(conn, proof, attempt.record.slot)?.ok_or(ObservationError::Conflict)?;
+    if !actual.same_record(&attempt.record) {
+        return Err(ObservationError::Conflict);
+    }
+    if let Some(captured) = &attempt.captured {
+        captured.verify_catalog8_unchanged(conn, proof)?;
+    }
+    Ok(())
 }

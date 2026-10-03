@@ -1,0 +1,16 @@
+//! Fixed Catalog8 storage; no startup migration or production qualification.
+use diesel::{RunQueryDsl, SqliteConnection};
+pub(crate) const STRATEGY: &str = "intraday-pushed-research-v1";
+pub(crate) const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const STATEMENTS: &[(&str, &str, &str, &str)] = &[
+    ("table", "investment_decisions_v1", "investment_decisions_v1", "CREATE TABLE investment_decisions_v1 (\n decision_row_id INTEGER PRIMARY KEY NOT NULL CHECK(typeof(decision_row_id)='integer' AND decision_row_id>0),\n strategy_id TEXT NOT NULL CHECK(typeof(strategy_id)='text' AND strategy_id='intraday-pushed-research-v1'),\n scope_policy_id TEXT NOT NULL CHECK(typeof(scope_policy_id)='text' AND scope_policy_id='intraday-unconsumed-pushed-row-top50-v1'),\n slot_start_unix_ms INTEGER NOT NULL CHECK(typeof(slot_start_unix_ms)='integer' AND slot_start_unix_ms BETWEEN 0 AND 253402300770000 AND slot_start_unix_ms%30000=0),\n evaluation_revision INTEGER NOT NULL CHECK(typeof(evaluation_revision)='integer' AND evaluation_revision=1),\n observation_row_id INTEGER NOT NULL CHECK(typeof(observation_row_id)='integer' AND observation_row_id>0),\n cutoff_unix_seconds INTEGER NOT NULL CHECK(typeof(cutoff_unix_seconds)='integer' AND cutoff_unix_seconds>=slot_start_unix_ms/1000 AND cutoff_unix_seconds<slot_start_unix_ms/1000+30),\n cutoff_subsec_nanos INTEGER NOT NULL CHECK(typeof(cutoff_subsec_nanos)='integer' AND cutoff_subsec_nanos BETWEEN 0 AND 999999999),\n decision_id TEXT NOT NULL UNIQUE CHECK(typeof(decision_id)='text' AND length(CAST(decision_id AS BLOB))=87 AND substr(decision_id,1,23)='investment-decision-v1:'),\n record_sha256 BLOB NOT NULL CHECK(typeof(record_sha256)='blob' AND length(record_sha256)=32),\n record_canonical BLOB NOT NULL CHECK(typeof(record_canonical)='blob' AND length(record_canonical) BETWEEN 1 AND 16777216),\n UNIQUE(strategy_id,scope_policy_id,slot_start_unix_ms,evaluation_revision),\n FOREIGN KEY(observation_row_id) REFERENCES candidate_scope_observations_v1(observation_row_id)\n)"),
+    ("trigger", "investment_decisions_v1_no_update", "investment_decisions_v1", "CREATE TRIGGER investment_decisions_v1_no_update BEFORE UPDATE ON investment_decisions_v1 BEGIN SELECT RAISE(ABORT,'immutable investment decision'); END"),
+    ("trigger", "investment_decisions_v1_no_delete", "investment_decisions_v1", "CREATE TRIGGER investment_decisions_v1_no_delete BEFORE DELETE ON investment_decisions_v1 BEGIN SELECT RAISE(ABORT,'immutable investment decision'); END"),
+    ("trigger", "investment_decisions_v1_no_reinsert", "investment_decisions_v1", "CREATE TRIGGER investment_decisions_v1_no_reinsert BEFORE INSERT ON investment_decisions_v1 WHEN EXISTS(SELECT 1 FROM investment_decisions_v1 WHERE decision_row_id=NEW.decision_row_id OR decision_id=NEW.decision_id OR (strategy_id=NEW.strategy_id AND scope_policy_id=NEW.scope_policy_id AND slot_start_unix_ms=NEW.slot_start_unix_ms AND evaluation_revision=NEW.evaluation_revision)) BEGIN SELECT RAISE(ABORT,'immutable investment decision'); END"),
+ ];
+pub(crate) fn create_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    for (_, _, _, sql) in STATEMENTS {
+        diesel::sql_query(*sql).execute(conn)?;
+    }
+    Ok(())
+}
