@@ -150,7 +150,7 @@ def load_policy():
     policy = strict_json(raw)
     keys(policy, {"schema", "mode", "profile", "inventory"})
     require(policy["schema"] == SCHEMA and policy["mode"] == "RecordingOnly"
-            and policy["profile"] == PROFILE, "PolicyIdentity")
+            and policy["profile"] in {PROFILE, BUNDLED_PROFILE}, "PolicyIdentity")
     if policy["inventory"] is None:
         return policy, digest(raw)
     inv = policy["inventory"]
@@ -184,6 +184,10 @@ def load_policy():
         require(package["manifest"] in inv[package["tree"]]["files"], "UninventoriedManifest")
         seen.add(package["id"])
     require("Cargo.toml" in inv["application"]["files"] and "Cargo.lock" in inv["application"]["files"], "ApplicationManifest")
+    if policy["profile"] == BUNDLED_PROFILE:
+        require({"CC", "AR"} <= set(inv["generators"]), "NativeToolInventory")
+        require(sum(p["id"] == SQLITE_PACKAGE for p in inv["packages"]) == 1
+                and sum(p["id"] == CC_PACKAGE for p in inv["packages"]) == 1, "NativePackageInventory")
     return policy, digest(raw)
 
 
@@ -1289,6 +1293,647 @@ def verify_sysroot_extern_declaration(directory, receipt, session, inv):
     return expected
 
 
+# Closed bundled acquisition only; this evidence never issues a provider.
+BUNDLED_PROFILE = "normaldev-library-bundledsqlite-v1"
+NATIVE_SCHEMA = "stock-analysis-replay-native-record-v1"
+SQLITE_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#libsqlite3-sys@0.28.0"
+SQLITE_FEATURES = ("bundled", "bundled_bindings", "cc", "default", "min_sqlite_version_3_14_0", "pkg-config", "vcpkg")
+CC_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59"
+PROBE_LITERAL = "cc/src/detect_compiler_family.c"
+PROBE_DIGEST = "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+SQLITE_MEMBERS = ("build.rs", "Cargo.toml", "src/lib.rs", "sqlite3/sqlite3.c", "sqlite3/sqlite3.h", "sqlite3/bindgen_bundled_version.rs")
+SQLITE_DEFINES = frozenset(("SQLITE_CORE", "SQLITE_DEFAULT_FOREIGN_KEYS=1", "SQLITE_ENABLE_API_ARMOR",
+    "SQLITE_ENABLE_COLUMN_METADATA", "SQLITE_ENABLE_DBSTAT_VTAB", "SQLITE_ENABLE_FTS3",
+    "SQLITE_ENABLE_FTS3_PARENTHESIS", "SQLITE_ENABLE_FTS5", "SQLITE_ENABLE_JSON1",
+    "SQLITE_ENABLE_LOAD_EXTENSION=1", "SQLITE_ENABLE_MEMORY_MANAGEMENT", "SQLITE_ENABLE_RTREE",
+    "SQLITE_ENABLE_STAT2", "SQLITE_ENABLE_STAT4", "SQLITE_SOUNDEX", "SQLITE_THREADSAFE=1",
+    "SQLITE_USE_URI", "HAVE_USLEEP=1", "_POSIX_THREAD_SAFE_FUNCTIONS", "HAVE_ISNAN", "HAVE_LOCALTIME_R"))
+
+
+def native_launchers(session, inv):
+    result = {}
+    for role in ("cc", "ar"):
+        path = session / ("native-" + role)
+        text = ("#!" + inv["python"]["path"] + " -I\nimport os,sys\nos.execv("
+                + repr(inv["python"]["path"]) + ", [" + repr(inv["python"]["path"])
+                + ", '-I', " + repr(str(Path(__file__).resolve())) + ", '_native', "
+                + repr(session.name.removeprefix("pending-")) + ", " + repr(role) + ", *sys.argv[1:]])\n")
+        with open(path, "x", encoding="utf-8") as dest:
+            dest.write(text)
+        path.chmod(0o700)
+        result[role] = {"path": str(path), "sha256": file_hash(path)}
+    return result
+
+
+def native_control(session, policy, owner):
+    inv = policy["inventory"]
+    require(policy["profile"] == BUNDLED_PROFILE and owner["profile"] == BUNDLED_PROFILE
+            and owner["state"] == "RecordingOnly" and owner["session"] == session.name.removeprefix("pending-")
+            and owner["policy_sha256"] == digest(POLICY.read_bytes())
+            and owner["owner_sha256"] == file_hash(Path(__file__)), "NativeSessionIdentity")
+    for role in ("cc", "ar"):
+        pin = owner["native_launchers"][role]
+        require(pin["path"] == str(session / ("native-" + role)), "NativeLauncher")
+        pinned_file(pin)
+        pinned_file(inv["generators"][role.upper()])
+    return inv
+
+
+def native_context(env, cwd, session, inv):
+    package, root, out = fixed_source_package("libsqlite3-sys", "0.28.0", cwd, env, session, inv, SQLITE_MEMBERS)
+    require(package["id"] == SQLITE_PACKAGE and env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and re.fullmatch(r"libsqlite3-sys-[0-9a-f]{16}", out.parent.name), "NativePackage")
+    require(env.get("HOST") == TARGET and env.get("TARGET") == TARGET
+            and env.get("OPT_LEVEL") == "0" and env.get("DEBUG") == "true"
+            and {k: v for k, v in env.items() if k.startswith("CARGO_FEATURE_")} ==
+                {"CARGO_FEATURE_" + f.upper().replace("-", "_"): "1" for f in SQLITE_FEATURES}, "NativeConfiguration")
+    for member in ("cc/Cargo.toml", "cc/src/lib.rs", "cc/src/tool.rs", "cc/src/tempfile.rs", PROBE_LITERAL):
+        path = session / "vendor" / member
+        regular(path)
+        require(path.resolve() == path and inv["vendor"]["files"].get(member) == file_hash(path), "NativeCcSource")
+    require(inv["vendor"]["files"].get(PROBE_LITERAL) == PROBE_DIGEST, "NativeProbeLiteral")
+    return {"package_id": SQLITE_PACKAGE, "manifest": str(root), "out_dir": str(out)}
+
+
+def native_environment(env, session, inv):
+    for k, v in env.items():
+        forbidden = (re.match(r"^(?:(?:HOST|TARGET)_)?(?:CFLAGS|CXXFLAGS|CPPFLAGS|ARFLAGS)(?:_|$)", k)
+            or re.match(r"^(?:CC|CXX|AR)(?:_|-)", k)
+            or re.match(r"^(?:HOST|TARGET)_(?:CC|CXX|AR)$", k)
+            or k.startswith(("SQLITE", "SQLCIPHER", "OPENSSL", "LIBSQLITE3", "BINDGEN", "SCCACHE", "CCACHE", "CCC_", "CLANG_"))
+            or (k.startswith("CARGO_") and k.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER"))
+                and not (k == "CARGO_ENCODED_RUSTFLAGS" and v == ""))
+            or k in {"CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "COMPILER_PATH",
+                     "GCC_EXEC_PREFIX", "RUSTC_LINKER", "RUSTC_WRAPPER_CUSTOM", "CRATE_CC_NO_DEFAULTS"})
+        require(not forbidden, "NativeEnvironmentInjection:" + k)
+    require(env.get("RUSTC") == inv["rustc"]["path"] and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and ("ZERO_AR_DATE" not in env or env["ZERO_AR_DATE"] == "1"), "NativeEnvironment")
+    require(env.get("CC") == str(session / "native-cc") and env.get("AR") == str(session / "native-ar")
+            and all(env.get(k) == inv["environment"].get(k) for k in ENV_KEYS - {"CC", "AR"}), "NativeEnvironment")
+    compiler_environment(env, session, inv["sysroot"], probe=False, context={"kind": "LibcBuildVersion"})
+
+
+def native_snapshot(call, path, leaf, *, absent=False, bound=None):
+    path = Path(path)
+    require(path.is_absolute() and path.resolve() == path, "NativePathAlias")
+    if not path.exists():
+        require(absent and not path.is_symlink(), "NativeInputMissing")
+        return {"exists": False, "path": str(path)}
+    regular(path)
+    before = path.stat()
+    require(before.st_nlink == 1, "NativeFileAlias")
+    snapshot = call / leaf
+    with open(path, "rb") as source, open(snapshot, "xb") as dest:
+        opened = os.fstat(source.fileno())
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), "NativeFileChanged")
+        size = 0
+        while True:
+            block = source.read(min(65536, bound + 1 - size) if bound is not None else 65536)
+            if not block:
+                break
+            dest.write(block); size += len(block)
+            require(bound is None or size <= bound, "NativeInputExtent")
+        after = os.fstat(source.fileno())
+    now = path.stat()
+    identity = lambda st: [st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns]
+    require(identity(before) == identity(opened) == identity(after) == identity(now)
+            and size == before.st_size and file_hash(path) == file_hash(snapshot), "NativeFileChanged")
+    return {"exists": True, "path": str(path), "identity": identity(now), "length": size,
+            "sha256": file_hash(snapshot), "snapshot": leaf}
+
+
+def native_state_key(state):
+    return {k: v for k, v in state.items() if k != "snapshot"}
+
+
+def native_state_check(call, state, *, live=False, retire=False):
+    path = Path(state["path"])
+    if not state["exists"]:
+        if live:
+            require(not path.exists() and not path.is_symlink(), "NativeVersionChanged")
+        return "Absent"
+    snapshot = call / state["snapshot"]
+    regular(snapshot)
+    require(snapshot.parent == call and snapshot.resolve() == snapshot and snapshot.stat().st_nlink == 1
+            and snapshot.stat().st_size == state["length"] and file_hash(snapshot) == state["sha256"], "NativeSnapshotChanged")
+    if live:
+        if retire and not path.exists() and not path.is_symlink():
+            return "RetiredAfterCcReturn"
+        regular(path);st = path.stat()
+        require(path.resolve() == path and st.st_nlink == 1
+                and [st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns] == state["identity"]
+                and file_hash(path) == state["sha256"], "NativeVersionChanged")
+    return "Present"
+
+
+def native_prior(session, context):
+    rows = []
+    for call in (session / "native-invocations").iterdir():
+        if (call / "receipt.json").is_file():
+            r = strict_json((call / "receipt.json").read_bytes())
+            if r.get("context") == context:
+                rows.append((call, r))
+    return rows
+
+
+def native_classify(role, args, context, env, session, inv, *, inspector=False, history=None):
+    root, out = Path(context["manifest"]), Path(context["out_dir"])
+    rows = native_prior(session, context) if history is None else history
+    if inspector:
+        require(role == "ar" and ((len(args) == 2 and args[0] == "t")
+                or (len(args) == 3 and args[0] == "p" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.o", args[2])))
+                and args[1] == str(out / "libsqlite3.a"), "NativeInspectorForm")
+        return {"class": "ArchiveInspector", "archive": args[1], "member": args[2] if len(args) == 3 else None}
+    if role == "cc" and args and args[0] == "-E":
+        retry = len(args) == 3 and args[1] == "--"
+        require(len(args) == (3 if retry else 2), "NativeProbeForm")
+        path = Path(args[-1]);match = re.fullmatch(r"(0|[1-9][0-9]{0,19})detect_compiler_family\.c", path.name)
+        require(match and int(match[1]) <= 2**64-1 and path.parent == out and str(path) == args[-1], "NativeProbePath")
+        prior = [(c, r) for c, r in rows if r.get("operation", {}).get("source") == str(path)]
+        require((not retry and not prior) or (retry and len(prior) == 1), "NativeProbePredecessor")
+        predecessor = None
+        if retry:
+            c, r = prior[0]
+            require(r["protocol_state"] == "Completed" and r["operation"]["class"] == "CompilerFamilyFileProbe"
+                    and not r["operation"]["retry"]
+                    and any(b"-Wslash-u-filename" in (c / (stream + ".raw")).read_bytes() for stream in ("stdout", "stderr")),
+                    "NativeProbePredecessor")
+            native_state_check(c, r["input_post"], live=history is None)
+            predecessor = c.name
+        return {"class": "CompilerFamilyFileProbe", "source": str(path), "retry": retry, "predecessor": predecessor}
+    if role == "cc":
+        source = root / "sqlite3/sqlite3.c"
+        require(args.count("-c") == 1 and args.count("-o") == 1, "NativeCompileForm")
+        src_at, out_at = args.index("-c") + 1, args.index("-o") + 1
+        require(src_at < len(args) and out_at < len(args), "NativeCompileForm")
+        require(args[src_at] in ("sqlite3/sqlite3.c", str(source)), "NativeCompileSource")
+        output = Path(args[out_at])
+        require(output.parent == out and output.resolve() == output and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.o", output.name), "NativeCompileOutput")
+        ignored = {src_at-1, src_at, out_at-1, out_at};i = 0;defines=[]
+        flags = {"-O0", "-ffunction-sections", "-fdata-sections", "-fPIC", "-g", "-gdwarf-2", "-gdwarf-4",
+                 "-fno-omit-frame-pointer", "-m64", "-w", "-Wall", "-Wextra", "-std=c99", "-std=c11"}
+        while i < len(args):
+            if i in ignored:
+                i += 1;continue
+            arg=args[i]
+            if arg.startswith("-D"):
+                require(arg[2:] in SQLITE_DEFINES and arg[2:] not in defines, "NativeCompileMacro")
+                defines.append(arg[2:])
+            elif arg in ("-arch", "-isysroot", "--target", "-target"):
+                require(i+1 < len(args) and i+1 not in ignored, "NativeCompileFlags")
+                expected={"-arch":"x86_64", "-isysroot":env.get("SDKROOT"), "--target":TARGET, "-target":TARGET}[arg]
+                require(expected is not None and args[i+1] == expected, "NativeCompileFlags");i+=1
+            elif arg.startswith("-mmacosx-version-min="):
+                require(env.get("MACOSX_DEPLOYMENT_TARGET") is not None and arg.split("=",1)[1] == env["MACOSX_DEPLOYMENT_TARGET"], "NativeCompileFlags")
+            else:
+                require(arg in flags, "NativeCompileFlags:" + arg)
+            i+=1
+        require("SQLITE_CORE" in defines and not any(r.get("operation",{}).get("class")=="SqliteObjectCompile" for _,r in rows), "NativeObjectProducer")
+        return {"class":"SqliteObjectCompile", "source":str(source), "output":str(output)}
+    require(role == "ar" and len(args) in (2,3) and args[0] in {"cqD", "cq", "sD", "s"}
+            and args[1] == str(out / "libsqlite3.a"), "NativeArchiveForm")
+    mode=args[0];mutators=[(c,r) for c,r in rows if r.get("operation",{}).get("class") in {"ArchiveAppend","ArchiveIndex"}]
+    objects=[(c,r) for c,r in rows if r.get("operation",{}).get("class")=="SqliteObjectCompile"
+             and r.get("protocol_state")=="Completed" and r.get("tool_result")==0]
+    require(len(objects)==1, "NativeObjectProducer")
+    oc, obj=objects[0];native_state_check(oc,obj["output_post"],live=history is None)
+    require(len(args)==(3 if mode in ("cqD","cq") else 2)
+            and (len(args)==2 or args[2]==obj["operation"]["output"]), "NativeArchiveObject")
+    predecessor=None
+    if not mutators:
+        require(mode=="cqD", "NativeArchiveTransition")
+    else:
+        referenced={r["operation"]["predecessor"] for _,r in mutators}
+        tails=[(c,r) for c,r in mutators if c.name not in referenced]
+        require(len(tails)==1, "NativeArchiveTransition")
+        pc, previous=tails[0];predecessor=pc.name
+        require(previous["protocol_state"]=="Completed", "NativeArchiveProtocol")
+        pm=previous["operation"]["mode"];code=previous["tool_result"]
+        require((pm=="cqD" and isinstance(code,int) and code>0 and mode=="cq" and len(mutators)==1)
+                or (pm=="cqD" and code==0 and mode=="sD" and len(mutators)==1)
+                or (pm=="cq" and code==0 and mode=="s" and len(mutators)==2), "NativeArchiveTransition")
+        native_state_check(pc,previous["archive_post"],live=history is None)
+    if mode in ("cqD","cq","s"):
+        require(env.get("ZERO_AR_DATE")=="1", "NativeArchiveEnvironment")
+    return {"class":"ArchiveAppend" if mode in ("cqD","cq") else "ArchiveIndex", "mode":mode,
+            "archive":args[1], "object":obj["operation"]["output"], "object_producer":oc.name, "predecessor":predecessor}
+
+
+def native_streamed(argv, cwd, env, call, pass_fds, bounds):
+    # Native stdin is always closed. Generic Rust streaming semantics are unchanged.
+    faults=[];code=None
+    try:
+        process=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,close_fds=True,pass_fds=pass_fds)
+    except OSError as error:
+        return None,["NativeSpawn:"+type(error).__name__]
+    def pump(source, name):
+        dest=None;count=0
+        try:
+            try:dest=open(call/(name+".raw"),"xb")
+            except OSError as error:faults.append("NativeCapture:"+name+":"+type(error).__name__)
+            while True:
+                block=source.read(65536)
+                if not block:break
+                count+=len(block)
+                limit=bounds.get(name)
+                if limit is not None and count>limit:
+                    if "NativeCaptureBound:"+name not in faults:faults.append("NativeCaptureBound:"+name)
+                    if dest:
+                        allowed=max(0,limit+1-(count-len(block)))
+                        try:dest.write(block[:allowed])
+                        except OSError as error:faults.append("NativeCapture:"+name+":"+type(error).__name__)
+                    continue
+                if dest:
+                    try:dest.write(block)
+                    except OSError as error:
+                        faults.append("NativeCapture:"+name+":"+type(error).__name__);dest.close();dest=None
+        except BaseException as error:faults.append("NativeCapture:"+name+":"+type(error).__name__)
+        finally:
+            if dest:
+                try:dest.close()
+                except OSError as error:faults.append("NativeCapture:"+name+":"+type(error).__name__)
+            source.close()
+    threads=[threading.Thread(target=pump,args=(process.stdout,"stdout")),threading.Thread(target=pump,args=(process.stderr,"stderr"))]
+    for t in threads:t.start()
+    try:code=process.wait()
+    except OSError as error:faults.append("NativeWait:"+type(error).__name__)
+    for t in threads:t.join()
+    return code, faults
+
+
+def native_jobserver_identity(fds):
+    """Self-only Darwin pipe endpoint observation; never read or write a token.
+
+    SDK 26.5 pipe_fdinfo is 184 bytes: pipeinfo at 24, handle at 160,
+    peerhandle at 168. This fixed recording ABI is not provider qualification.
+    """
+    import ctypes
+    require(sys.platform == "darwin" and sys.byteorder == "little"
+            and ctypes.sizeof(ctypes.c_void_p) == 8 and ctypes.sizeof(ctypes.c_int) == 4
+            and ctypes.sizeof(ctypes.c_uint64) == 8, "NativeJobserverIdentityABI")
+    require(len(fds) == 2 and all(isinstance(fd, int) and 3 <= fd <= 2**31-1 for fd in fds)
+            and fds[0] != fds[1], "InvalidJobserverDescriptors")
+    def endpoint(fd, access):
+        try:
+            st = os.fstat(fd); flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        except (OSError, OverflowError, ValueError):
+            raise Refusal("InvalidJobserverDescriptors") from None
+        require(stat.S_ISFIFO(st.st_mode) and flags & os.O_ACCMODE == access,
+                "InvalidJobserverDescriptors")
+        return {"fd": fd, "device": st.st_dev, "inode": st.st_ino,
+                "file_type": stat.S_IFMT(st.st_mode), "flags": flags, "access": access}
+    roles = (os.O_RDONLY, os.O_WRONLY)
+    before = [endpoint(fd, access) for fd, access in zip(fds, roles)]
+    buffer_type = ctypes.c_uint64 * 23
+    require(ctypes.sizeof(buffer_type) == 184 and ctypes.alignment(buffer_type) == 8,
+            "NativeJobserverIdentityABI")
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        query = library.proc_pidfdinfo
+        query.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        query.restype = ctypes.c_int
+        pid = os.getpid(); observations = []
+        for index, (fd, access) in enumerate(zip(fds, roles)):
+            buffer = buffer_type()
+            count = query(pid, fd, 6, buffer, 184)
+            require(count == 184, "NativeJobserverIdentityQuery")
+            after = endpoint(fd, access)
+            require(after == before[index], "NativeJobserverDescriptorChanged")
+            raw = bytes(buffer)
+            handle = int.from_bytes(raw[160:168], "little")
+            peer = int.from_bytes(raw[168:176], "little")
+            require(handle == before[index]["inode"] and handle != 0 and peer != 0,
+                    "NativeJobserverIdentityHandle")
+            observations.append(dict(before[index], returned_bytes=count, handle=handle, peer=peer))
+        require([endpoint(fd, access) for fd, access in zip(fds, roles)] == before,
+                "NativeJobserverDescriptorChanged")
+    except (OSError, AttributeError, ctypes.ArgumentError):
+        raise Refusal("NativeJobserverIdentityQuery") from None
+    require(observations[0]["handle"] == observations[1]["peer"]
+            and observations[1]["handle"] == observations[0]["peer"]
+            and observations[0]["handle"] != observations[1]["handle"], "NativeJobserverPair")
+    return {"state": "RecordingOnly", "platform": "darwin", "library": "/usr/lib/libproc.dylib",
+            "symbol": "proc_pidfdinfo", "pid": pid, "flavor": 6, "buffer_bytes": 184,
+            "pipe_info_offset": 24, "handle_offset": 160, "peer_offset": 168,
+            "endpoints": observations}
+
+
+def native_operation(session, policy, owner, role, args, cwd, env, *, inspector=False, bounds=None):
+    call=session/"native-invocations"/uuid.uuid4().hex;call.mkdir(mode=0o700)
+    request={"schema":NATIVE_SCHEMA,"state":"RecordingOnly","role":role,"args_hex":[os.fsencode(a).hex() for a in args],
+             "cwd_hex":os.fsencode(str(cwd)).hex(),"environment_hex":{os.fsencode(k).hex():os.fsencode(v).hex() for k,v in env.items()},
+             "owner_issued_inspector":inspector}
+    atomic_json(call/"request.json",request)
+    receipt=dict(request,operation_id=call.name,protocol_state="ProtocolRefused",tool_result=None,failures=[])
+    try:
+        inv=native_control(session,policy,owner);require(role in ("cc","ar"),"NativeRole")
+        context=native_context(env,cwd,session,inv);receipt["context"]=context
+        native_environment(env,session,inv)
+        operation=native_classify(role,args,context,env,session,inv,inspector=inspector);receipt["operation"]=operation
+        tool=pinned_file(inv["generators"][role.upper()]);receipt["tool_sha256"]=inv["generators"][role.upper()]["sha256"]
+        receipt["argv_hex"]=[os.fsencode(v).hex() for v in [tool,*args]]
+        kind=operation["class"]
+        if kind in {"CompilerFamilyFileProbe","SqliteObjectCompile"}:
+            bound=206 if kind=="CompilerFamilyFileProbe" else None
+            receipt["input_pre"]=native_snapshot(call,operation["source"],"input-pre.raw",bound=bound)
+            if bound:
+                require(receipt["input_pre"]["length"]==206 and receipt["input_pre"]["sha256"]==PROBE_DIGEST
+                        and (call/"input-pre.raw").read_bytes()==(session/"vendor"/PROBE_LITERAL).read_bytes(),"NativeProbeLiteral")
+            if kind=="SqliteObjectCompile":
+                require(receipt["input_pre"]["sha256"] == inv["vendor"]["files"]["libsqlite3-sys/sqlite3/sqlite3.c"], "NativeCompileSource")
+                receipt["output_pre"]=native_snapshot(call,operation["output"],"output-pre.raw",absent=True)
+                require(not receipt["output_pre"]["exists"],"NativeOutputAlreadyExists")
+        if "archive" in operation:
+            receipt["archive_pre"]=native_snapshot(call,operation["archive"],"archive-pre.raw",absent=kind=="ArchiveAppend")
+            if kind=="ArchiveAppend" and operation["predecessor"] is None:
+                require(not receipt["archive_pre"]["exists"],"NativeArchiveInitial")
+            if kind in {"ArchiveAppend", "ArchiveIndex"} and operation["predecessor"] is not None:
+                previous = strict_json((session/"native-invocations"/operation["predecessor"]/"receipt.json").read_bytes())
+                require(native_state_key(receipt["archive_pre"]) == native_state_key(previous["archive_post"]), "NativeArchivePredecessor")
+        fds=() if inspector else inherited_jobserver_fds(env)
+        receipt["jobserver_identity"] = native_jobserver_identity(fds) if fds else None
+        code,faults=native_streamed([tool,*args],cwd,env,call,fds,bounds or {})
+        receipt["tool_result"]=code;receipt["failures"].extend(faults)
+        if "input_pre" in receipt:
+            receipt["input_post"]=native_snapshot(call,operation["source"],"input-post.raw",bound=bound)
+            require(native_state_key(receipt["input_pre"])==native_state_key(receipt["input_post"]),"NativeInputChanged")
+        if kind=="SqliteObjectCompile":
+            receipt["output_post"]=native_snapshot(call,operation["output"],"output-post.raw",absent=code!=0)
+        if "archive" in operation:
+            receipt["archive_post"]=native_snapshot(call,operation["archive"],"archive-post.raw",absent=code!=0)
+            if inspector:require(native_state_key(receipt["archive_pre"])==native_state_key(receipt["archive_post"]),"NativeInspectorDrift")
+        native_control(session,policy,owner)
+        require(not receipt["failures"],"NativeProtocolCapture")
+        receipt["protocol_state"]="Completed"
+    except (Refusal,OSError,ValueError,KeyError,TypeError) as error:
+        receipt["failures"].append(str(error))
+    for stream in ("stdout","stderr"):
+        path=call/(stream+".raw")
+        if path.is_file():receipt[stream+"_sha256"]=file_hash(path)
+    # cc consumes actual streams/status, including its supported warning retry.
+    # A failed delivery is a sticky protocol failure, never an observed tool failure.
+    if not inspector:
+        for stream,fd in (("stdout",1),("stderr",2)):
+            path=call/(stream+".raw")
+            try:
+                if path.is_file():
+                    with open(path,"rb") as source:
+                        for block in iter(lambda:source.read(65536),b""):
+                            view=memoryview(block)
+                            while view:
+                                written=os.write(fd,view)
+                                require(written>0,"NativeForwardZero:"+stream)
+                                view=view[written:]
+            except (OSError,Refusal) as error:
+                receipt["protocol_state"]="ProtocolRefused"
+                receipt["failures"].append("NativeForward:"+stream+":"+str(error))
+    atomic_json(call/"receipt.json",receipt)
+    return call,receipt
+
+
+def native_wrapper(session_id, role, args):
+    require(ID.fullmatch(session_id),"SessionId")
+    session=SESSIONS/("pending-"+session_id)
+    require(session.is_dir() and session.resolve()==session and not session.is_symlink(),"MissingSession")
+    policy=strict_json(POLICY.read_bytes());owner=strict_json((session/"owner.json").read_bytes())
+    call,r=native_operation(session,policy,owner,role,args,Path.cwd(),dict(os.environ))
+    if r["protocol_state"]!="Completed":
+        raise Refusal("NativeProtocolRefused:"+call.name+":"+r["failures"][0])
+    code=r["tool_result"]
+    return code if code>=0 else 128-code
+
+
+def sqlite_rust_context(args, env, cwd, session, inv):
+    raw=args[1:]
+    if env.get("CARGO_PKG_NAME")!="libsqlite3-sys":return None
+    native=any(a.startswith("-l") for a in raw)
+    if not native:
+        parsed=parse_rustc(raw)
+        if parsed["probe"] or parsed["options"].get("--target")!=[TARGET] or parsed["options"].get("--crate-type")!=["lib"]:
+            return None
+    require(raw[-2:]==["-l","static=sqlite3"] and sum(a.startswith("-l") for a in raw)==1,"SqliteStaticTemplate")
+    parsed=parse_rustc(raw[:-2]);o=parsed["options"]
+    package,root,out=fixed_source_package("libsqlite3-sys","0.28.0",cwd,env,session,inv,SQLITE_MEMBERS)
+    require(package["id"]==SQLITE_PACKAGE and not parsed["probe"] and parsed["inputs"]==[str(root/"src/lib.rs")]
+            and o.get("--crate-name")==["libsqlite3_sys"] and o.get("--crate-type")==["lib"]
+            and o.get("--target")==[TARGET] and o.get("--out-dir")==[str(session/"target"/TARGET/"debug/deps")]
+            and o.get("--emit")==["dep-info,metadata,link"]
+            and sorted(o.get("--cfg",[]))==sorted('feature="'+f+'"' for f in SQLITE_FEATURES)
+            and [v for v in o.get("-L",[]) if v.startswith("native=")]==["native="+str(out)]
+            and all(v in {"native="+str(out),"dependency="+str(session/"target"/TARGET/"debug/deps"),
+                         "dependency="+str(session/"target/debug/deps")} for v in o.get("-L",[]))
+            and "--test" not in o and not any(k in parsed["codegen"] for k in ("link-arg","linker")),"SqliteRustContext")
+    require(env.get("CC")==str(session/"native-cc") and env.get("AR")==str(session/"native-ar")
+            and env.get("CARGO_MANIFEST_PATH")==str(root/"Cargo.toml"),"SqliteRustEnvironment")
+    o["-l"]=["static=sqlite3"]
+    return parsed,{"kind":"DirectCargoCompile","sqlite_static_declaration":"static=sqlite3",
+                   "package_id":SQLITE_PACKAGE,"manifest":str(root),"out_dir":str(out)}
+
+
+def native_evidence_paths(session):
+    """Quarantine declared native identities, including retired/request-only probes.
+
+    This collection denies ordinary ownership; it does not validate or grant a
+    native producer. Native seal separately validates every request/receipt.
+    """
+    paths, probes, blockers = set(), set(), []
+    for call in (session / "native-invocations").iterdir():
+        try:
+            request = strict_json((call / "request.json").read_bytes())
+            cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            require(cwd.is_absolute(), "NativePathAlias")
+            args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+            declared = []
+            if request["role"] == "cc" and args[:1] == ["-E"] and len(args) in (2, 3):
+                value = str((cwd / args[-1]).resolve())
+                probes.add(value); declared.append(value)
+            elif request["role"] == "cc":
+                declared.extend(args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-o")
+            elif request["role"] == "ar" and args:
+                if args[0] in {"cqD", "cq"}: declared.extend(args[1:])
+                elif args[0] in {"sD", "s", "t", "p"} and len(args) >= 2: declared.append(args[1])
+            paths.update(str((cwd / value).resolve()) for value in declared)
+            receipt_path = call / "receipt.json"
+            if receipt_path.is_file():
+                receipt = strict_json(receipt_path.read_bytes())
+                for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
+                    state = receipt.get(key, {})
+                    if "snapshot" in state: paths.add(str((call / state["snapshot"]).resolve()))
+        except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+            blockers.append("NativeNamespace:" + call.name + ":" + str(error))
+    return paths, probes, blockers
+
+
+def native_path_identity(value, receipt):
+    return str((Path(receipt["cwd"]) / value).resolve())
+
+
+def native_seal(session, policy, rust_receipts, associations, artifacts, events, edges):
+    owner=strict_json((session/"owner.json").read_bytes());inv=native_control(session,policy,owner)
+    calls={};failures=[];result={"schema":NATIVE_SCHEMA,"state":"RecordingOnly","profile":BUNDLED_PROFILE,
+                               "operations":[],"blockers":[],"artifact_selection":"not_observed"}
+    for call in (session/"native-invocations").iterdir():
+        try:
+            regular(call/"request.json");regular(call/"receipt.json")
+            request=strict_json((call/"request.json").read_bytes());r=strict_json((call/"receipt.json").read_bytes())
+            require(r["operation_id"]==call.name and all(r[k]==v for k,v in request.items()),"NativeReceiptBinding")
+            require(r["protocol_state"]=="Completed" and not r["failures"],"NativeProtocolSticky")
+            require(not request["owner_issued_inspector"],"NativeUnexpectedInspector")
+            env={os.fsdecode(bytes.fromhex(k)):os.fsdecode(bytes.fromhex(v)) for k,v in request["environment_hex"].items()}
+            cwd=Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            context=native_context(env,cwd,session,inv);native_environment(env,session,inv)
+            require(context==r["context"] and r["tool_sha256"]==inv["generators"][r["role"].upper()]["sha256"],"NativeReceiptBinding")
+            require(r["argv_hex"]==[os.fsencode(inv["generators"][r["role"].upper()]["path"]).hex(),*r["args_hex"]],"NativeReceiptBinding")
+            for stream in ("stdout","stderr"):
+                require(file_hash(call/(stream+".raw"))==r[stream+"_sha256"],"NativeStreamChanged")
+            for key in ("input_pre","input_post","output_pre","output_post","archive_pre","archive_post"):
+                if key in r:native_state_check(call,r[key])
+            calls[call.name]=(call,r,env,cwd)
+        except (Refusal,OSError,KeyError,ValueError,TypeError) as error:
+            failures.append("NativeOperation:"+call.name+":"+str(error))
+    try:
+        require(not failures,"NativeIncompleteOrProtocolRefused")
+        require(calls,"NativeMissingOperations")
+        contexts={json.dumps(r["context"],sort_keys=True) for _,r,_,_ in calls.values()}
+        require(len(contexts)==1,"NativeOriginAmbiguous")
+        context=next(iter(calls.values()))[1]["context"];out=Path(context["out_dir"])
+        objects=[v for v in calls.values() if v[1]["operation"]["class"]=="SqliteObjectCompile"]
+        require(len(objects)==1 and objects[0][1]["tool_result"]==0,"NativeObjectProducer")
+        oc,obj,_,_=objects[0];native_state_check(oc,obj["output_post"],live=True)
+        mutators={k:v for k,v in calls.items() if v[1]["operation"]["class"] in {"ArchiveAppend","ArchiveIndex"}}
+        predecessors={v[1]["operation"]["predecessor"] for v in mutators.values()}
+        tails=[k for k in mutators if k not in predecessors]
+        require(len(tails)==1,"NativeArchiveChain")
+        chain=[];cursor=tails[0]
+        while cursor is not None:
+            require(cursor in mutators and cursor not in chain,"NativeArchiveChain")
+            chain.append(cursor);cursor=mutators[cursor][1]["operation"]["predecessor"]
+        chain.reverse();require(set(chain)==set(mutators) and len(chain) in (2,3),"NativeArchiveChain")
+        history=[(oc,obj)]
+        for ident in chain:
+            call,r,env,cwd=calls[ident]
+            args=[os.fsdecode(bytes.fromhex(v)) for v in r["args_hex"]]
+            computed=native_classify(r["role"],args,context,env,session,inv,history=history)
+            require(computed==r["operation"],"NativeArchiveChain")
+            previous=r["operation"]["predecessor"]
+            if previous is None:require(not r["archive_pre"]["exists"],"NativeArchiveInitial")
+            else:require(native_state_key(r["archive_pre"])==native_state_key(calls[previous][1]["archive_post"]),"NativeArchivePredecessor")
+            history.append((call,r))
+        final_call,final,final_env,_=calls[chain[-1]]
+        require(final["operation"]["class"]=="ArchiveIndex" and final["tool_result"]==0,"NativeArchiveIndex")
+        for ident,(call,r,env,cwd) in calls.items():
+            kind=r["operation"]["class"]
+            if kind in {"ArchiveAppend","ArchiveIndex"}:continue
+            require(kind in {"SqliteObjectCompile","CompilerFamilyFileProbe"},"NativeOperationClass")
+            preceding=[];previous=r["operation"].get("predecessor")
+            if previous is not None:
+                require(previous in calls,"NativeProbePredecessor")
+                preceding=[calls[previous][:2]]
+            computed=native_classify(r["role"],[os.fsdecode(bytes.fromhex(v)) for v in r["args_hex"]],context,env,session,inv,history=preceding)
+            require(computed==r["operation"] and native_state_key(r["input_pre"])==native_state_key(r["input_post"]),"NativeInputChanged")
+            if kind=="CompilerFamilyFileProbe":
+                require(r["input_pre"]["length"]==206 and r["input_pre"]["sha256"]==PROBE_DIGEST,"NativeProbeLiteral")
+                r["input_final_state"]=native_state_check(call,r["input_post"],live=True,retire=True)
+            else:
+                require(r["input_pre"]["sha256"]==inv["vendor"]["files"]["libsqlite3-sys/sqlite3/sqlite3.c"],"NativeCompileSource")
+                native_state_check(call,r["input_post"],live=True)
+        probes=[(c,r) for c,r,_,_ in calls.values() if r["operation"]["class"]=="CompilerFamilyFileProbe"]
+        for source in {r["operation"]["source"] for _,r in probes}:
+            group=[(c,r) for c,r in probes if r["operation"]["source"]==source]
+            first=[c.name for c,r in group if not r["operation"]["retry"]]
+            require(len(first)==1 and len(group)<=2 and all(not r["operation"]["retry"]
+                    or r["operation"]["predecessor"]==first[0] for _,r in group),"NativeProbePredecessor")
+        origin=[a for a in associations if a["package_id"]==SQLITE_PACKAGE and a["out_dir"]==str(out)]
+        executed=[e for e in events if e["reason"]=="build-script-executed" and e.get("package_id")==SQLITE_PACKAGE]
+        require(len(origin)==len(executed)==1 and origin[0]["cargo_event"]==executed[0],"NativeCargoOrigin")
+        by_id={r["invocation_id"]:r for r in rust_receipts};builder=by_id[origin[0]["producer_invocation"]]
+        require(builder["role"]=="Host" and builder["kind"]=="Compile" and builder["exit_code"]==0
+                and not builder["blockers"] and builder["source"]==str(Path(context["manifest"])/"build.rs")
+                and sorted(builder["parsed"]["options"].get("--cfg",[]))==sorted('feature="'+f+'"' for f in SQLITE_FEATURES),"NativeBuilder")
+        builder_events=[e for e in events if e["reason"]=="compiler-artifact" and e.get("package_id")==SQLITE_PACKAGE
+                        and e.get("target",{}).get("kind")==["custom-build"]]
+        require(len(builder_events)==1 and sorted(builder_events[0].get("features",[]))==sorted(SQLITE_FEATURES),"NativeBuilder")
+        cc=[e for e in edges if e["consumer"]==builder["invocation_id"] and e["name"]=="cc"]
+        require(len(cc)==1 and len(cc[0]["producers"])==1,"NativeCcProducer")
+        cp=by_id[cc[0]["producers"][0]]
+        require(cp["package"]["id"]==CC_PACKAGE and cp["role"]=="Host" and cp["exit_code"]==0 and not cp["blockers"],"NativeCcProducer")
+        binding=out/"bindgen.rs";regular(binding)
+        require(file_hash(binding)==inv["vendor"]["files"]["libsqlite3-sys/sqlite3/bindgen_bundled_version.rs"]
+                and origin[0]["generated_files"].get("bindgen.rs")==file_hash(binding),"NativeBindings")
+        event=executed[0]
+        require(event["linked_libs"]==["static=sqlite3"] and event["linked_paths"]==["native="+str(out)],"NativeLinkDeclaration")
+        consumers=[r for r in rust_receipts if r.get("package",{}).get("id")==SQLITE_PACKAGE and r["role"]=="Target" and r["kind"]=="Compile"]
+        require(len(consumers)==1,"NativeRustConsumer")
+        consumer=consumers[0];rc=session/"invocations"/consumer["invocation_id"]
+        raw=strict_json((rc/"request.json").read_bytes());initial=strict_json((rc/"invocation.json").read_bytes())
+        raw_env={os.fsdecode(bytes.fromhex(k)):os.fsdecode(bytes.fromhex(v)) for k,v in raw["environment_hex"].items()}
+        special=sqlite_rust_context([os.fsdecode(bytes.fromhex(v)) for v in raw["argv_hex"]],raw_env,
+                 Path(os.fsdecode(bytes.fromhex(raw["cwd_hex"]))),session,inv)
+        require(special is not None and special[0]==consumer["parsed"] and special[1]==consumer["context"]
+                and all(initial[k]==consumer[k] for k in ("context","parsed","argv_hex","environment_hex","source","package","role","kind"))
+                and raw["argv_hex"]==consumer["argv_hex"] and raw["environment_hex"]==consumer["environment_hex"]
+                and consumer["exit_code"]==0 and not consumer["blockers"],"NativeRustConsumer")
+        ca=[a for a in artifacts if a["invocation_id"]==consumer["invocation_id"]]
+        ce=[e for e in events if e["reason"]=="compiler-artifact" and e.get("package_id")==SQLITE_PACKAGE and e.get("target",{}).get("kind")==["lib"]]
+        require(len(ca)==len(ce)==1 and sorted(ce[0].get("features",[]))==sorted(SQLITE_FEATURES)
+                and ce[0]["target"].get("src_path")==consumer["source"] and ca[0]["files"]==ce[0]["filenames"],"NativeRustConsumer")
+        for driver in ("registry+https://github.com/rust-lang/crates.io-index#diesel@2.3.7",
+                       "registry+https://github.com/rust-lang/crates.io-index#rusqlite@0.31.0"):
+            joined = [e for e in edges if e["producers"] == [consumer["invocation_id"]]
+                      and by_id[e["consumer"]].get("package", {}).get("id") == driver]
+            require(len(joined) == 1 and by_id[joined[0]["consumer"]]["exit_code"] == 0
+                    and not by_id[joined[0]["consumer"]]["blockers"], "NativeRustExtern")
+        forbidden_paths, _, namespace_blockers = native_evidence_paths(session)
+        require(not namespace_blockers, "NativeOutputRole")
+        require(not any(isinstance(r.get("source"), str) and native_path_identity(r["source"], r) in forbidden_paths
+                        for r in rust_receipts)
+                and not any(native_path_identity(o["path"], r) in forbidden_paths
+                        for r in rust_receipts for o in r["declared_outputs"] + r["outputs"])
+                and not any(native_path_identity(e["path"], by_id[e["consumer"]]) in forbidden_paths for e in edges)
+                and not any(native_path_identity(path, by_id[a["invocation_id"]]) in forbidden_paths
+                            for a in artifacts for path in a["files"])
+                and not any(native_path_identity(path, r) in forbidden_paths for r in rust_receipts for o in r["outputs"]
+                            for path in o.get("dep_info",{}).get("paths",[])), "NativeOutputRole")
+        native_state_check(final_call,final["archive_post"],live=True)
+        require(origin[0]["generated_files"].get("libsqlite3.a")==final["archive_post"]["sha256"],"NativeArchiveBinding")
+        # Inspector is an owner request after Cargo: never replay expired builder FDs.
+        inspector_env=dict(final_env)
+        for key in ("CARGO_MAKEFLAGS","MAKEFLAGS","MFLAGS"):inspector_env.pop(key,None)
+        atomic_json(session/"native-inspector-owner.json",{"state":"RecordingOnly","environment":inspector_env,
+                    "archive_version":chain[-1],"tool":inv["generators"]["AR"]})
+        name=Path(obj["operation"]["output"]).name
+        inspectors=[]
+        for args,limit in ((["t",str(out/"libsqlite3.a")],len(name.encode("ascii"))+1),
+                           (["p",str(out/"libsqlite3.a"),name],obj["output_post"]["length"])):
+            native_state_check(final_call,final["archive_post"],live=True)
+            ic,ir=native_operation(session,policy,owner,"ar",args,Path(context["manifest"]),inspector_env,
+                                   inspector=True,bounds={"stdout":limit,"stderr":0})
+            require(ir["protocol_state"]=="Completed" and ir["tool_result"]==0,"NativeInspectorFailed")
+            require((ic/"stderr.raw").stat().st_size==0,"NativeInspectorDiagnostic")
+            if args[0]=="t":require((ic/"stdout.raw").read_bytes()==name.encode("ascii")+b"\n","NativeInspectorMembers")
+            else:require((ic/"stdout.raw").stat().st_size==obj["output_post"]["length"]
+                         and file_hash(ic/"stdout.raw")==obj["output_post"]["sha256"],"NativeInspectorObject")
+            native_state_check(final_call,final["archive_post"],live=True);inspectors.append(ic.name)
+        native_state_check(oc,obj["output_post"],live=True)
+        result.update({"context":context,"builder":builder["invocation_id"],"cc_producer":cp["invocation_id"],
+            "object_producer":oc.name,"archive_chain":chain,"final_archive_writer":chain[-1],"inspectors":inspectors,
+            "rust_consumer":consumer["invocation_id"],"static_declaration":"static=sqlite3",
+            "native_producer_qualification":"not_issued"})
+    except (Refusal,OSError,KeyError,TypeError,ValueError,IndexError) as error:
+        failures.append("NativeSeal:"+str(error))
+    for call in sorted((session/"native-invocations").iterdir()):
+        item={"operation_id":call.name}
+        for leaf in ("request","receipt"):
+            try:item[leaf+"_sha256"]=file_hash(call/(leaf+".json"))
+            except (OSError,Refusal):failures.append("NativeIncomplete:"+call.name+":"+leaf)
+        if call.name in calls and "input_final_state" in calls[call.name][1]:item["input_final_state"]=calls[call.name][1]["input_final_state"]
+        result["operations"].append(item)
+    result["blockers"]=sorted(set(failures));native_control(session,policy,owner)
+    atomic_json(session/"native-record.json",result)
+    return result
+
+
 def wrapper(session_id, args):
     require(ID.fullmatch(session_id), "SessionId")
     session = SESSIONS / ("pending-" + session_id)
@@ -1313,6 +1958,9 @@ def wrapper(session_id, args):
     cwd = Path.cwd().resolve()
     require(inside(cwd, session), "CompilerCwd")
     special = rustix_context(args, os.environ, cwd, session, inv)
+    if special is None and policy["profile"] == BUNDLED_PROFILE:
+        native_control(session, policy, owner)
+        special = sqlite_rust_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = ring_static_context(args, os.environ, cwd, session, inv)
     if special is None:
@@ -1598,8 +2246,18 @@ def seal_record(session, policy, cargo_exit):
     # An unsupported probe may have no output file; its declared namespace is still excluded.
     transient_paths = {str(Path(o["path"]).resolve()) for r in receipts if r["kind"] == "TransientProbe"
                        for o in r["declared_outputs"] + r["outputs"]}
+    native_paths, native_probes = set(), set()
+    if policy["profile"] == BUNDLED_PROFILE:
+        native_paths, native_probes, namespace_blockers = native_evidence_paths(session)
+        blockers.extend(namespace_blockers)
     output_owners, transient_collisions = {}, set()
     for receipt in receipts:
+        if native_paths and ((isinstance(receipt.get("source"), str) and native_path_identity(receipt["source"], receipt) in native_paths)
+                or any(native_path_identity(o["path"], receipt) in native_paths
+                       for o in receipt["declared_outputs"] + receipt["outputs"])):
+            blockers.append("NativeOutputRole:" + receipt["invocation_id"])
+            transient_collisions.add(receipt["invocation_id"])
+            continue
         if receipt["kind"] != "TransientProbe":
             collisions = {str(Path(o["path"]).resolve()) for o in receipt["declared_outputs"] + receipt["outputs"]} & transient_paths
             if collisions:
@@ -1631,6 +2289,15 @@ def seal_record(session, policy, cargo_exit):
         if forbidden:
             blockers.extend("TransientCargoArtifact:" + f for f in forbidden)
             continue
+        # A relative Cargo filename has only the actual requesting receipt's cwd.
+        # No candidate may claim a native namespace through an alternate spelling.
+        if native_paths:
+            native_candidates = [r for r in receipts if isinstance(r.get("source"), str)
+                                 and native_path_identity(r["source"], r) == native_path_identity(root, r)
+                                 and package_id(r["package"], session) == event.get("package_id")]
+            if any(native_path_identity(f, r) in native_paths for r in native_candidates for f in filename_list):
+                blockers.append("NativeOutputRole:CargoArtifact")
+                continue
         hashes = {}
         for filename in filename_list:
             path = Path(filename)
@@ -1691,7 +2358,7 @@ def seal_record(session, policy, cargo_exit):
         for path in Path(out_dir).rglob("*"):
             if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                 blockers.append("GeneratedNonregular:" + str(path)); continue
-            if path.is_file() and str(path.resolve()) not in transient_paths:
+            if path.is_file() and str(path.resolve()) not in transient_paths | native_probes:
                 generated[path.relative_to(out_dir).as_posix()] = file_hash(path)
         associations.append({"out_dir": str(Path(out_dir).resolve()), "package_id": event["package_id"],
                              "producer_invocation": producers[0]["invocation_id"],
@@ -1711,6 +2378,10 @@ def seal_record(session, policy, cargo_exit):
     edges = []
     for receipt in receipts:
         for edge in receipt["externs"]:
+            if native_paths and native_path_identity(edge["path"], receipt) in native_paths:
+                blockers.append("NativeOutputRole:" + edge["path"])
+                edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[]))
+                continue
             producers = output_owners.get(edge["path"], [])
             if str(Path(edge["path"]).resolve()) in transient_paths:
                 blockers.append("TransientExtern:" + edge["path"])
@@ -1732,6 +2403,8 @@ def seal_record(session, policy, cargo_exit):
         for output in receipt["outputs"]:
             for value in output.get("dep_info", {}).get("paths", []):
                 path = (Path(receipt["cwd"]) / value).resolve()
+                if str(path) in native_paths:
+                    blockers.append("NativeOutputRole:" + str(path)); continue
                 if str(path) in transient_paths:
                     blockers.append("TransientConsumedSource:" + str(path)); continue
                 owner = None
@@ -1781,6 +2454,10 @@ def seal_record(session, policy, cargo_exit):
             "cargo_stderr_sha256": file_hash(session / "cargo.stderr.raw")}
     if bound_sysroot_declarations:
         seal["sysroot_extern_declarations"] = bound_sysroot_declarations
+    if policy["profile"] == BUNDLED_PROFILE:
+        native = native_seal(session, policy, receipts, associations, artifacts, events, edges)
+        seal["native_record_sha256"] = file_hash(session / "native-record.json")
+        seal["blockers"] = sorted(set(seal["blockers"] + native["blockers"]))
     atomic_json(session / "record.json", seal)
     return seal
 
@@ -1789,7 +2466,7 @@ def record():
     policy, policy_hash = load_policy()
     if policy["inventory"] is None:
         return {"schema": SCHEMA, "state": "RecordingOnly", "reason": "MissingInventory",
-                "profile": PROFILE, "policy_sha256": policy_hash}, 2
+                "profile": policy["profile"], "policy_sha256": policy_hash}, 2
     inv = policy["inventory"]
     for tree in ("application", "vendor", "sysroot"):
         inventory(inv[tree])
@@ -1823,9 +2500,18 @@ def record():
     argv = [inv["cargo"]["path"], "build", "--locked", "--offline", "--lib", "--target", TARGET,
             "--message-format=json-render-diagnostics", "--manifest-path", str(session / "application/Cargo.toml"),
             "--target-dir", str(session / "target")]
-    owner = {"schema": SCHEMA, "state": "RecordingOnly", "session": session_id, "profile": PROFILE,
+    native_wrappers = None
+    if policy["profile"] == BUNDLED_PROFILE:
+        (session / "native-invocations").mkdir(mode=0o700)
+        native_wrappers = native_launchers(session, inv)
+        env.update(CC=native_wrappers["cc"]["path"], AR=native_wrappers["ar"]["path"])
+        argv += ["--features", "replay-sqlite-bundled-v1"]
+    owner = {"schema": SCHEMA, "state": "RecordingOnly", "session": session_id, "profile": policy["profile"],
              "policy_sha256": policy_hash, "owner_sha256": file_hash(Path(__file__)), "argv": argv,
              "environment": env, "config_sha256": file_hash(config), "launcher_sha256": file_hash(launcher)}
+    if native_wrappers is not None:
+        owner["native_launchers"] = native_wrappers
+        owner["native_underlying_tools"] = {name: inv["generators"][name] for name in ("CC", "AR")}
     atomic_json(session / "owner.json", owner)
     code = run_streamed(argv, session / "application", env, session / "cargo.stdout.raw", session / "cargo.stderr.raw")
     require(digest(POLICY.read_bytes()) == policy_hash and file_hash(config) == owner["config_sha256"]
@@ -1845,6 +2531,8 @@ def main(argv):
             result, code = record()
             print(json.dumps(result, sort_keys=True))
             return code
+        if len(argv) >= 4 and argv[0] == "_native":
+            return native_wrapper(argv[1], argv[2], argv[3:])
         if len(argv) >= 3 and argv[0] == "_wrapper":
             return wrapper(argv[1], argv[2:])
         raise Refusal("Usage: replay_build_owner_v1.py record")

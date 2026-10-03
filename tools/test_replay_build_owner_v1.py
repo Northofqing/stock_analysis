@@ -1221,6 +1221,195 @@ emit({'reason':'build-finished','success':True})
 '''
 
 
+# D1 fixtures are synthetic subprocesses, never actual native acquisition.
+D1_PROBE = b'#ifdef __clang__\n#pragma message "clang"\n#endif\n\n#ifdef __GNUC__\n#pragma message "gcc"\n#endif\n\n#ifdef __EMSCRIPTEN__\n#pragma message "emscripten"\n#endif\n\n#ifdef __VXWORKS__\n#pragma message "VxWorks"\n#endif\n'
+D1_FEATURES = ['bundled','bundled_bindings','cc','default','min_sqlite_version_3_14_0','pkg-config','vcpkg']
+D1_NATIVE = r'''
+import hashlib,json,os,pathlib,sys
+args=sys.argv[1:];role=pathlib.Path(sys.argv[0]).name;case=os.environ.get('D1_CASE','normal')
+session=pathlib.Path(os.environ['D1_SESSION']);hits=session/'native-entry';hits.mkdir(exist_ok=True)
+ident=str(len(list(hits.iterdir())));entry={'role':role,'args':args,'stdin_eof':sys.stdin.buffer.read()==b'','jobserver':False,'canary_closed':True}
+entry['encoded_flags']=os.environ.get('CARGO_ENCODED_RUSTFLAGS')
+if 'CARGO_MAKEFLAGS' in os.environ:
+    pair=os.environ['CARGO_MAKEFLAGS'].split('--jobserver-fds=')[1].split()[0];r,w=map(int,pair.split(','))
+    token=os.read(r,1);os.write(w,token);entry['jobserver']=token==b'J'
+if 'D1_CANARY' in os.environ:
+    try:os.fstat(int(os.environ['D1_CANARY']));entry['canary_closed']=False
+    except OSError:pass
+(hits/ident).write_text(json.dumps(entry))
+if role=='fake-native-cc':
+    if args[0]=='-E':
+        source=pathlib.Path(args[-1]);body=source.read_bytes();assert len(body)==206
+        if case=='probe_post_missing':source.unlink()
+        if case=='probe_post_change':source.write_bytes(body.replace(b'clang',b'CLANG'))
+        if case=='probe_retry' and '--' not in args:
+            sys.stderr.write('-Wslash-u-filename\n');sys.exit(1)
+        sys.stdout.write('clang\n')
+    else:
+        out=pathlib.Path(args[args.index('-o')+1]);source=pathlib.Path(args[args.index('-c')+1])
+        out.write_bytes(b'TEST_CODE_OBJECT:'+source.read_bytes())
+        if case=='streams':sys.stdout.buffer.write(b'O'*100000);sys.stderr.buffer.write(b'E'*100000)
+        if case=='compile_fail':sys.exit(9)
+else:
+    mode=args[0];archive=pathlib.Path(args[1])
+    if mode in ('cqD','cq'):
+        obj=pathlib.Path(args[2]);members=[]
+        if archive.exists():members=json.loads(archive.read_text())['members']
+        if case in ('fallback','partial_fallback') and mode=='cqD':
+            if case=='partial_fallback':archive.write_text(json.dumps({'members':[[obj.name,obj.read_bytes().hex()]],'index':False}))
+            sys.stderr.write('TEST_CODE deterministic mode refused\n');sys.exit(3)
+        members.append([obj.name,obj.read_bytes().hex()]);archive.write_text(json.dumps({'members':members,'index':False}))
+    elif mode in ('sD','s'):
+        data=json.loads(archive.read_text())
+        if case!='identical_index':data['index']=True;archive.write_text(json.dumps(data))
+        if case=='index_fail':sys.exit(8)
+    elif mode=='t':
+        data=json.loads(archive.read_text());names=[n for n,_ in data['members']]
+        if case=='foreign_member':names=['foreign.o']
+        if case=='pseudo_member':names=['__.SYMDEF']+names
+        if case=='duplicate_member':names+=names
+        if case=='inspector_diagnostic':sys.stderr.write('unreviewed diagnostic\n')
+        sys.stdout.write('\n'.join(names)+'\n')
+    elif mode=='p':
+        data=json.loads(archive.read_text());body=bytes.fromhex(next(v for n,v in data['members'] if n==args[2]))
+        if case=='extract_change':body=b'X'+body[1:]
+        if case=='extract_overflow':body+=b'X'
+        sys.stdout.buffer.write(body)
+        if case=='inspector_archive_change':archive.write_bytes(b'TEST_CODE_DRIFT')
+    else:raise AssertionError(args)
+'''
+D1_BUILDER = r'''
+import json,os,pathlib,subprocess,sys
+root=pathlib.Path.cwd();out=pathlib.Path(os.environ['OUT_DIR']);session=pathlib.Path(os.environ['D1_SESSION']);case=os.environ['D1_CASE']
+env=dict(os.environ);probe=out/'42detect_compiler_family.c';probe.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())
+if case=='probe_literal':probe.write_bytes(b'X'+probe.read_bytes()[1:])
+if case=='probe_overflow':probe.write_bytes(probe.read_bytes()+b'X')
+if case=='probe_path':probe.rename(out/'042detect_compiler_family.c');probe=out/'042detect_compiler_family.c'
+if case=='package':env['CARGO_PKG_NAME']='ring'
+if case=='override':env['CFLAGS_x86_64-apple-darwin']='-ffast-math'
+if case=='host_override':env['HOST_CC']='/other'
+if case=='encoded_flags':env['CARGO_ENCODED_RUSTFLAGS']='-Clink-arg=foreign'
+if case=='target_flags':env['CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS']=''
+if case=='loader':env['DYLD_FALLBACK_LIBRARY_PATH']+=':/other'
+r,w=os.pipe();os.write(w,b'J');canary=os.open(root/'Cargo.toml',os.O_RDONLY);pair=(r,w)
+env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={r},{w} --jobserver-auth={r},{w}'
+env['D1_CANARY']=str(canary)
+if case=='fd_reversed':env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={w},{r} --jobserver-auth={w},{r}'
+if case=='fd_foreign':
+    r2,w2=os.pipe();pair=(r,w2);env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={r},{w2} --jobserver-auth={r},{w2}'
+if case=='fd_closed':os.close(r);pair=(w,)
+def run(role,args):
+    attempt={'role':role,'args_hex':[os.fsencode(a).hex() for a in args]}
+    with open(session/'native-attempts.jsonl','a') as f:f.write(json.dumps(attempt)+'\n')
+    result=subprocess.run([env[role],*args],env=env,pass_fds=(*pair,canary),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    with open(session/'builder-native-results.jsonl','a') as f:f.write(json.dumps({'code':result.returncode,'stdout':result.stdout.hex(),'stderr':result.stderr.hex()})+'\n')
+    return result
+p=run('CC',['-E',str(probe)])
+if case=='probe_retry':p=run('CC',['-E','--',str(probe)])
+if case=='unauthorized_retry':p=run('CC',['-E','--',str(probe)])
+if p.returncode:
+    if case=='capture_fault':pass
+    else:sys.exit(p.returncode)
+if case not in ('probe_survives','probe_consumed','probe_relative_consumed') and probe.exists():probe.unlink()
+obj=out/'sqlite3-test.o'
+ccargs=['-O0','-DSQLITE_CORE','-c','sqlite3/sqlite3.c','-o',str(obj)]
+if case=='compile_plugin':ccargs.insert(0,'-fplugin=/other')
+if case=='compile_source':ccargs[ccargs.index('-c')+1]='build.rs'
+c=run('CC',ccargs)
+if c.returncode:sys.exit(c.returncode)
+archive=out/'libsqlite3.a'
+if case=='archive_initial':archive.write_bytes(b'TEST_CODE_PREEXISTING')
+env['ZERO_AR_DATE']='1'
+a=run('AR',['cqD',str(archive),str(obj)])
+mode='sD'
+if a.returncode:
+    a=run('AR',['cq',str(archive),str(obj)]);mode='s'
+if a.returncode:sys.exit(a.returncode)
+if case=='predecessor_change':archive.write_bytes(b'TEST_CODE_REPLACED')
+i=run('AR',[mode,str(archive)])
+if i.returncode:sys.exit(i.returncode)
+if case=='extra_index':
+    result=run('AR',[mode,str(archive)])
+    if result.returncode:sys.exit(result.returncode)
+(out/'bindgen.rs').write_bytes((root/'sqlite3/bindgen_bundled_version.rs').read_bytes())
+if case=='object_drift':obj.write_bytes(b'TEST_CODE_OBJECT_DRIFT')
+if case=='archive_drift':archive.write_bytes(b'TEST_CODE_ARCHIVE_DRIFT')
+if case=='bindings_drift':(out/'bindgen.rs').write_bytes(b'TEST_CODE_BINDINGS_DRIFT')
+if case=='snapshot_drift':
+    file=next((session/'native-invocations').glob('*/input-pre.raw'));file.write_bytes(b'TEST_CODE_SNAPSHOT_DRIFT')
+os.close(w);os.close(canary)
+if case!='fd_closed':os.close(r)
+'''
+D1_RUSTC = r'''
+import json,os,pathlib,sys
+args=sys.argv[1:]
+def val(k):return next((a.split('=',1)[1] for a in args if a.startswith(k+'=')),None) or args[args.index(k)+1]
+name=val('--crate-name');source=next(pathlib.Path(a) for a in args if a.endswith('.rs'));out=pathlib.Path(val('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+hits=pathlib.Path(os.environ['D1_SESSION'])/'rust-entry';hits.mkdir(exist_ok=True);(hits/name).write_text(json.dumps(args))
+files=[out/name] if val('--crate-type')=='bin' else [out/('lib'+name+'.rlib'),out/('lib'+name+'.rmeta')]
+for f in files:
+    if name=='build_script_sqlite':f.write_text('#!'+sys.executable+' -I\n'+__BUILDER__);f.chmod(0o700)
+    else:f.write_bytes(b'TEST_CODE_RUST:'+source.read_bytes())
+def esc(s):return s.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+inputs=[str(source)]
+if name=='libsqlite3_sys':inputs.append(str(pathlib.Path(os.environ['OUT_DIR'])/'bindgen.rs'))
+if name=='libsqlite3_sys':
+    case=os.environ['D1_CASE'];outdir=pathlib.Path(os.environ['OUT_DIR'])
+    member={'probe_consumed':'42detect_compiler_family.c','probe_relative_consumed':'42detect_compiler_family.c',
+            'object_relative_consumed':'sqlite3-test.o','archive_relative_consumed':'libsqlite3.a'}.get(case)
+    if member:
+        path=str(outdir/member)
+        inputs.append(os.path.relpath(path,pathlib.Path.cwd()) if 'relative' in case else path)
+
+(out/(name+'.d')).write_text(esc(str(files[0]))+': '+' '.join(map(esc,inputs))+'\n')
+print(json.dumps({'fixture_argv':args}),file=sys.stderr)
+'''
+D1_CARGO = r'''
+import json,os,pathlib,shutil,subprocess,sys
+CASE=__CASE__;FEATURES=__FEATURES__;argv=sys.argv[1:]
+assert argv[-2:]==['--features','replay-sqlite-bundled-v1']
+app=pathlib.Path(argv[argv.index('--manifest-path')+1]).parent;session=app.parent;target=session/'target';host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+root=session/'vendor/libsqlite3-sys';out=target/'x86_64-apple-darwin/debug/build/libsqlite3-sys-0123456789abcdef/out';out.mkdir(parents=True)
+package='registry+https://github.com/rust-lang/crates.io-index#libsqlite3-sys@0.28.0'
+cfg=[v for f in FEATURES for v in ('--cfg','feature="'+f+'"')]
+base=dict(os.environ,D1_CASE=CASE,D1_SESSION=str(session),CARGO_ENCODED_RUSTFLAGS='')
+loader=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']
+def emit(e):print(json.dumps(e),flush=True)
+def compile(name,source,pkg,dest,kind='lib',extra=(),feats=()):
+    env=dict(base,CARGO_MANIFEST_DIR=str(source.parent if source.name=='build.rs' else source.parent.parent),CARGO_MANIFEST_PATH=str(source.parent/'Cargo.toml' if source.name=='build.rs' else source.parent.parent/'Cargo.toml'),DYLD_FALLBACK_LIBRARY_PATH=loader)
+    if pkg==package:env.update(CARGO_PKG_NAME='libsqlite3-sys',CARGO_PKG_VERSION='0.28.0',OUT_DIR=str(out))
+    args=['--crate-name',name,'--edition=2021',str(source),'--crate-type',kind,'--emit='+('dep-info,link' if kind=='bin' else 'dep-info,metadata,link'),'--out-dir',str(dest),*extra]
+    p=subprocess.run([env['RUSTC_WRAPPER'],env['RUSTC'],*args],env=env,cwd=env['CARGO_MANIFEST_DIR'])
+    if p.returncode:emit({'reason':'build-finished','success':False});sys.exit(p.returncode)
+    files=[dest/name] if kind=='bin' else [dest/('lib'+name+'.rlib'),dest/('lib'+name+'.rmeta')]
+    event={'reason':'compiler-artifact','package_id':pkg,'target':{'src_path':str(source),'name':name,'kind':['custom-build' if kind=='bin' else 'lib'],'crate_types':[kind]},'features':list(feats),'filenames':list(map(str,files)),'executable':None,'fresh':False}
+    if kind=='bin':
+        alias=dest/'build-script-build';shutil.copyfile(files[0],alias);alias.chmod(0o700);event['filenames']=[str(alias)]
+    if not (CASE=='missing_builder' and kind=='bin'):emit(event)
+    return files[0]
+cc=compile('cc',session/'vendor/cc/src/lib.rs','registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59',host)
+builder=compile('build_script_sqlite',root/'build.rs',package,target/'debug/build/libsqlite3-sys-fedcba9876543210','bin',cfg+['--extern','cc='+str(host/'libcc.rlib')],FEATURES)
+sysroot=pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']).parent
+native_loader=':'.join(map(str,(target/'debug',host,sysroot/'lib/rustlib/x86_64-apple-darwin/lib',sysroot/'lib')))
+env=dict(base,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),CARGO_PKG_NAME='libsqlite3-sys',CARGO_PKG_VERSION='0.28.0',OUT_DIR=str(out),HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',OPT_LEVEL='0',DEBUG='true',DYLD_FALLBACK_LIBRARY_PATH=native_loader)
+env.update({'CARGO_FEATURE_'+f.upper().replace('-','_'):'1' for f in FEATURES})
+p=subprocess.run([str(builder)],cwd=root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+(session/'builder.stdout.raw').write_bytes(p.stdout);(session/'builder.stderr.raw').write_bytes(p.stderr)
+if p.returncode:emit({'reason':'build-finished','success':False});sys.exit(p.returncode)
+event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'linked_libs':['static=sqlite3'],'linked_paths':['native='+str(out)],'cfgs':[],'env':[]}
+if CASE=='origin_outdir':event['out_dir']=str(out.parent/'other')
+if CASE=='link_directive':event['linked_libs']=['dylib=sqlite3']
+if CASE!='missing_origin':emit(event)
+if CASE=='duplicate_origin':emit(event)
+extra=cfg+['--target','x86_64-apple-darwin','-L','dependency='+str(deps),'-L','dependency='+str(host),'-L','native='+str(out),'-l','static=sqlite3']
+if CASE=='rust_missing_static':extra=extra[:-2]
+compile('libsqlite3_sys',root/'src/lib.rs',package,deps,extra=extra,feats=FEATURES)
+for name,version in [('diesel','2.3.7'),('rusqlite','0.31.0')]:
+    compile(name,session/'vendor'/name/'src/lib.rs','registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version,deps,extra=['--target','x86_64-apple-darwin','--extern','libsqlite3_sys='+str(deps/'liblibsqlite3_sys.rlib')])
+compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,extra=['--target','x86_64-apple-darwin','--extern','rusqlite='+str(deps/'librusqlite.rlib'),'--extern','diesel='+str(deps/'libdiesel.rlib')])
+emit({'reason':'build-finished','success':True})
+'''
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -2695,6 +2884,307 @@ class RecordingProtocolTests(unittest.TestCase):
         for args in (["-l", "static=other"], ["-lother"], ["--extern-native", "other"]):
             with self.subTest(args=args), self.assertRaisesRegex(owner.Refusal, "UnsupportedRustcArgument"):
                 owner.parse_rustc(args)
+
+    def prepare_d1(self, case="normal"):
+        inventory = self.prepare()
+        vendor = self.root / "vendor-origin"
+        specs = (("libsqlite3-sys", "0.28.0"), ("cc", "1.2.59"), ("diesel", "2.3.7"), ("rusqlite", "0.31.0"))
+        for name, version in specs:
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id":"registry+https://github.com/rust-lang/crates.io-index#"+name+"@"+version,
+                                           "tree":"vendor","manifest":name+"/Cargo.toml"})
+        for leaf in ("build.rs", "sqlite3/sqlite3.c", "sqlite3/sqlite3.h", "sqlite3/bindgen_bundled_version.rs"):
+            write(vendor / "libsqlite3-sys" / leaf, "// TEST_CODE fixed member " + leaf + "\n")
+        for leaf in ("src/tool.rs", "src/tempfile.rs"):
+            write(vendor / "cc" / leaf, "// TEST_CODE cc " + leaf + "\n")
+        (vendor / "cc/src/detect_compiler_family.c").write_bytes(D1_PROBE)
+        self.assertEqual(len(D1_PROBE), 206)
+        self.assertEqual(hashlib.sha256(D1_PROBE).hexdigest(), owner.PROBE_DIGEST)
+        inventory["vendor"] = snapshot(vendor, ["dep", *[name for name, _ in specs]])
+        sysroot = self.root / "sysroot"
+        write(sysroot / "lib/rustlib/x86_64-apple-darwin/lib/test.bin", "TEST_CODE host lib")
+        inventory["sysroot"] = snapshot(sysroot, ["lib"])
+        for name, body in (("fake-native-cc", D1_NATIVE), ("fake-native-ar", D1_NATIVE),
+                           ("fake-rustc", D1_RUSTC.replace("__BUILDER__", repr(D1_BUILDER))),
+                           ("fake-cargo", D1_CARGO.replace("__CASE__", repr(case)).replace("__FEATURES__", repr(D1_FEATURES)))):
+            path = write(self.root / name, "#!" + PYTHON + " -I\n" + body);path.chmod(0o700)
+        for role, name in (("CC", "fake-native-cc"), ("AR", "fake-native-ar")):
+            path = self.root / name
+            inventory["generators"][role] = {"path":str(path),"sha256":sha(path)}
+            inventory["environment"][role] = str(path)
+        for key, name in (("rustc", "fake-rustc"), ("cargo", "fake-cargo")):
+            inventory[key] = {"path":str(self.root / name),"sha256":sha(self.root / name)}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        inventory["environment"]["PROTOC"] = inventory["rustc"]["path"]
+        if case == "capture_fault":
+            # Isolated copied-owner fault site only; real child still runs and later calls succeed.
+            body = self.tool.read_text()
+            needle = 'try:dest=open(call/(name+".raw"),"xb")'
+            self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, 'try:\n                if name=="stderr" and "-E" in argv:raise OSError("TEST_CODE sink failure")\n                dest=open(call/(name+".raw"),"xb")')
+            self.tool.write_text(body)
+            inventory["owner_sha256"] = sha(self.tool)
+        self.policy.write_text(json.dumps({"schema":owner.SCHEMA,"mode":"RecordingOnly",
+                                           "profile":owner.BUNDLED_PROFILE,"inventory":inventory}))
+        return inventory
+
+    def d1_result(self, case="normal", code=0):
+        inventory = self.prepare_d1(case)
+        run = self.invoke("record")
+        self.assertEqual(run.returncode, code, run.stdout.decode(errors="replace") + run.stderr.decode(errors="replace"))
+        record = self.record_result(run)
+        session = Path(json.loads(run.stdout)["record_path"]).parent
+        native = json.loads((session / "native-record.json").read_text())
+        calls = [(p.parent, json.loads(p.read_text())) for p in (session / "native-invocations").glob("*/receipt.json")]
+        self.assertEqual(record["native_record_sha256"], sha(session / "native-record.json"))
+        return inventory, session, record, native, calls
+
+    def d1_refusal(self, case, marker, entries=None):
+        values = self.d1_result(case, 2)
+        _, session, record, native, calls = values
+        reasons = [f for _, r in calls for f in r["failures"]] + native["blockers"]
+        self.assertTrue(any(marker in reason for reason in reasons), reasons)
+        self.assertTrue(native["blockers"])
+        self.assertNotIn("final_archive_writer", native)
+        hits = list((session / "native-entry").iterdir()) if (session / "native-entry").exists() else []
+        if entries is not None:self.assertEqual(len(hits), entries)
+        attempts = [json.loads(line) for line in (session / "native-attempts.jsonl").read_text().splitlines()]
+        for attempt in attempts:
+            self.assertTrue(any(r["args_hex"] == attempt["args_hex"] for _, r in calls))
+        for _, r in calls:
+            self.assertNotIn("qualified", r)
+        return values
+
+    def test_d1_darwin_private_pipe_identity_and_receipts(self):
+        import ctypes
+        import fcntl
+        from unittest import mock
+        self.assertEqual(sys.platform, "darwin", "fixed D1 pipe ABI requires Darwin; no fallback")
+        opened = []
+        try:
+            read, write = os.pipe(); opened.extend((read, write))
+            other_read, other_write = os.pipe(); opened.extend((other_read, other_write))
+            dup_read, dup_write = os.dup(read), os.dup(write); opened.extend((dup_read, dup_write))
+            os.set_blocking(read, False)
+            os.write(write, b"J")
+            flags = {fd:fcntl.fcntl(fd, fcntl.F_GETFL) for fd in opened}
+            inheritance = {fd:os.get_inheritable(fd) for fd in opened}
+            original = owner.native_jobserver_identity((read, write))
+            duplicate = owner.native_jobserver_identity((dup_read, dup_write))
+            for observed in (original, duplicate):
+                self.assertEqual(observed["pid"], os.getpid())
+                self.assertEqual((observed["flavor"], observed["buffer_bytes"]), (6, 184))
+                left, right = observed["endpoints"]
+                self.assertEqual(left["handle"], right["peer"])
+                self.assertEqual(right["handle"], left["peer"])
+                for end in (left, right):
+                    self.assertEqual(end["returned_bytes"], 184)
+                    self.assertEqual(end["handle"], os.fstat(end["fd"]).st_ino)
+            self.assertEqual([e["handle"] for e in original["endpoints"]],
+                             [e["handle"] for e in duplicate["endpoints"]])
+            for pair, marker in (((write, read), "InvalidJobserverDescriptors"),
+                                 ((read, other_write), "NativeJobserverPair")):
+                with self.subTest(pair=pair), self.assertRaisesRegex(owner.Refusal, "^"+marker+"$"):
+                    owner.native_jobserver_identity(pair)
+            os.close(dup_read); opened.remove(dup_read)
+            with self.assertRaisesRegex(owner.Refusal, "^InvalidJobserverDescriptors$"):
+                owner.native_jobserver_identity((dup_read, write))
+            for count in (0, 183, 185):
+                with self.subTest(returned_bytes=count), mock.patch.object(ctypes, "CDLL") as library:
+                    query = library.return_value.proc_pidfdinfo
+                    query.return_value = count
+                    with self.assertRaisesRegex(owner.Refusal, "^NativeJobserverIdentityQuery$"):
+                        owner.native_jobserver_identity((read, write))
+                    self.assertEqual(query.call_count, 1)
+                    args = query.call_args.args
+                    self.assertEqual((args[0], args[1], args[2], args[4]), (os.getpid(), read, 6, 184))
+                    library.assert_called_once_with("/usr/lib/libproc.dylib", use_errno=True)
+            self.assertEqual(os.read(read, 2), b"J")
+            with self.assertRaises(BlockingIOError):os.read(read, 1)
+            self.assertTrue(all(fcntl.fcntl(fd, fcntl.F_GETFL) == flags[fd] for fd in opened))
+            self.assertTrue(all(os.get_inheritable(fd) == inheritance[fd] for fd in opened))
+        finally:
+            for fd in opened:os.close(fd)
+        _, _, record, native, calls = self.d1_result()
+        self.assertEqual(record["blockers"], [])
+        forwarded = [r for _, r in calls if not r["owner_issued_inspector"]]
+        inspectors = [r for _, r in calls if r["owner_issued_inspector"]]
+        self.assertEqual((len(forwarded), len(inspectors)), (4, 2))
+        for receipt in forwarded:
+            identity = receipt["jobserver_identity"]
+            self.assertEqual(identity["state"], "RecordingOnly")
+            self.assertEqual((identity["flavor"], identity["buffer_bytes"]), (6, 184))
+            left, right = identity["endpoints"]
+            self.assertEqual(left["handle"], right["peer"])
+            self.assertEqual(right["handle"], left["peer"])
+            self.assertTrue(all(e["returned_bytes"] == 184 and e["handle"] == e["inode"] for e in (left, right)))
+        for receipt in inspectors:
+            self.assertIsNone(receipt["jobserver_identity"])
+            for name in ("CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"):
+                self.assertNotIn(name.encode().hex(), receipt["environment_hex"])
+
+    def test_d1_connected_native_graph_is_recording_only(self):
+        inv, session, record, native, calls = self.d1_result()
+        self.assertEqual(record["blockers"], []);self.assertEqual(native["blockers"], [])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual({r["operation"]["class"] for _, r in calls},
+            {"CompilerFamilyFileProbe", "SqliteObjectCompile", "ArchiveAppend", "ArchiveIndex", "ArchiveInspector"})
+        self.assertEqual(native["artifact_selection"], "not_observed")
+        self.assertEqual(native["native_producer_qualification"], "not_issued")
+        self.assertEqual(native["static_declaration"], "static=sqlite3")
+        # Existing raw receipts identify their directories; final graph owns the ids.
+        rust = {p.parent.name:json.loads(p.read_text()) for p in (session / "invocations").glob("*/receipt.json")}
+        self.assertEqual(rust[native["builder"]]["role"], "Host")
+        self.assertEqual(rust[native["cc_producer"]]["package"]["id"], owner.CC_PACKAGE)
+        self.assertEqual(rust[native["rust_consumer"]]["parsed"]["options"]["-l"], ["static=sqlite3"])
+        self.assertTrue(any(e["producers"] == [native["rust_consumer"]] for e in record["extern_edges"]))
+        for call, r in calls:
+            self.assertEqual(r["protocol_state"], "Completed");self.assertEqual(r["tool_result"], 0)
+            self.assertEqual(json.loads((call / "request.json").read_text())["args_hex"], r["args_hex"])
+            self.assertEqual(sha(call / "stdout.raw"), r["stdout_sha256"])
+            self.assertEqual(r["environment_hex"][b"CARGO_ENCODED_RUSTFLAGS".hex()], "")
+        hits = [json.loads(p.read_text()) for p in (session / "native-entry").iterdir()]
+        self.assertEqual(len(hits), 6)
+        self.assertTrue(all(h["encoded_flags"] == "" for h in hits))
+        self.assertNotIn("accepted", record);self.assertEqual(record["review_gate"], "IndependentPolicyReviewRequired")
+
+    def test_d1_transient_probe_retirement_retry_and_survival(self):
+        for case, state, probes in (("normal","RetiredAfterCcReturn",1), ("probe_survives","Present",1),
+                                     ("probe_retry","RetiredAfterCcReturn",2)):
+            with self.subTest(case=case):
+                _, session, record, native, calls = self.d1_result(case)
+                detected = [(c,r) for c,r in calls if r["operation"]["class"] == "CompilerFamilyFileProbe"]
+                self.assertEqual(len(detected), probes)
+                for c,r in detected:
+                    item = next(v for v in native["operations"] if v["operation_id"] == c.name)
+                    self.assertEqual(item["input_final_state"], state)
+                    self.assertEqual((c / "input-pre.raw").read_bytes(), D1_PROBE)
+                    self.assertEqual(r["input_pre"]["identity"], r["input_post"]["identity"])
+                if probes == 2:
+                    retry = next(r for _,r in detected if r["operation"]["retry"])
+                    first = next(r for c,r in detected if c.name == retry["operation"]["predecessor"])
+                    self.assertEqual(first["tool_result"], 1)
+                self.assertEqual(record["blockers"], [])
+
+    def test_d1_native_admission_precedes_every_tool_entry(self):
+        for case, marker in (("probe_literal","NativeProbeLiteral"), ("probe_overflow","NativeInputExtent"),
+                ("probe_path","NativeProbePath"), ("package","FixedPackageContext"),
+                ("override","NativeEnvironmentInjection"), ("host_override","NativeEnvironmentInjection"),
+                ("encoded_flags","NativeEnvironmentInjection:CARGO_ENCODED_RUSTFLAGS"),
+                ("target_flags","NativeEnvironmentInjection:CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS"),
+                ("loader","CompilerEnvironmentInjection"), ("fd_reversed","InvalidJobserverDescriptors"),
+                ("fd_foreign","NativeJobserverPair"), ("fd_closed","InvalidJobserverDescriptors")):
+            with self.subTest(case=case):self.d1_refusal(case, marker, 0)
+        self.d1_refusal("unauthorized_retry", "NativeProbePredecessor", 1)
+
+    def test_d1_probe_post_return_and_snapshot_cannot_be_forgiven(self):
+        for case, marker in (("probe_post_missing","NativeInputMissing"), ("probe_post_change","NativeInputChanged"),
+                             ("snapshot_drift","NativeSnapshotChanged")):
+            with self.subTest(case=case):self.d1_refusal(case, marker)
+        # Permanent-object drift has no transient-retirement exemption.
+        self.d1_refusal("object_drift", "NativeVersionChanged")
+
+    def test_d1_archive_versions_include_real_failed_attempt(self):
+        for case, modes in (("normal",["cqD","sD"]), ("fallback",["cqD","cq","s"]),
+                             ("identical_index",["cqD","sD"])):
+            with self.subTest(case=case):
+                _, _, record, native, calls = self.d1_result(case)
+                by_id = {c.name:r for c,r in calls};chain = native["archive_chain"]
+                self.assertEqual([by_id[i]["operation"]["mode"] for i in chain], modes)
+                self.assertEqual(native["final_archive_writer"], chain[-1])
+                self.assertEqual(len(set(chain)), len(chain))
+                for prev, current in zip(chain, chain[1:]):
+                    self.assertEqual(by_id[current]["operation"]["predecessor"], prev)
+                    self.assertEqual(owner.native_state_key(by_id[current]["archive_pre"]), owner.native_state_key(by_id[prev]["archive_post"]))
+                if case == "fallback":self.assertEqual(by_id[chain[0]]["tool_result"], 3)
+                if case == "identical_index":self.assertEqual(by_id[chain[0]]["archive_post"]["sha256"], by_id[chain[1]]["archive_post"]["sha256"])
+                self.assertEqual(record["blockers"], [])
+
+    def test_d1_archive_invalid_edges_and_partial_fallback_refuse(self):
+        for case, marker in (("archive_initial","NativeArchiveInitial"), ("predecessor_change","NativeVersionChanged"),
+                ("extra_index","NativeArchiveTransition"), ("index_fail","NativeArchiveIndex"),
+                ("partial_fallback","NativeInspectorFailed"), ("compile_fail","NativeObjectProducer"),
+                ("archive_drift","NativeVersionChanged")):
+            with self.subTest(case=case):self.d1_refusal(case, marker)
+
+    def test_d1_inspector_exact_members_bytes_and_diagnostics(self):
+        for case, marker in (("foreign_member","NativeInspectorMembers"), ("pseudo_member","NativeInspectorFailed"),
+                ("duplicate_member","NativeInspectorFailed"), ("extract_change","NativeInspectorObject"),
+                ("extract_overflow","NativeInspectorFailed"), ("inspector_diagnostic","NativeInspectorFailed"),
+                ("inspector_archive_change","NativeInspectorFailed")):
+            with self.subTest(case=case):
+                _, session, record, native, calls = self.d1_refusal(case, marker)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertTrue(any(r["operation"]["class"] == "ArchiveInspector" for _,r in calls))
+                self.assertTrue((session / "native-inspector-owner.json").is_file())
+
+    def test_d1_subprocess_fds_eof_concurrent_streams_and_inspector_origin(self):
+        _, session, record, native, calls = self.d1_result("streams")
+        hits = [json.loads(p.read_text()) for p in (session / "native-entry").iterdir()]
+        self.assertEqual(len(hits), 6)
+        self.assertTrue(all(h["stdin_eof"] and h["canary_closed"] for h in hits))
+        self.assertEqual(sum(h["jobserver"] for h in hits), 4)
+        obj = next((c,r) for c,r in calls if r["operation"]["class"] == "SqliteObjectCompile")
+        self.assertEqual((obj[0]/"stdout.raw").read_bytes(), b"O"*100000)
+        self.assertEqual((obj[0]/"stderr.raw").read_bytes(), b"E"*100000)
+        forwarded = [r for _,r in calls if not r["owner_issued_inspector"]]
+        inspectors = [r for _,r in calls if r["owner_issued_inspector"]]
+        self.assertEqual(len(forwarded), 4);self.assertEqual(len(inspectors), 2)
+        for r in forwarded:self.assertIn(b"CARGO_MAKEFLAGS".hex(), r["environment_hex"])
+        for r in inspectors:
+            self.assertNotIn(b"CARGO_MAKEFLAGS".hex(), r["environment_hex"])
+            self.assertNotIn(b"MAKEFLAGS".hex(), r["environment_hex"])
+        self.assertEqual(record["blockers"], [])
+
+    def test_d1_capture_failure_is_sticky_despite_later_success(self):
+        _, _, record, native, calls = self.d1_refusal("capture_fault", "NativeProtocolSticky")
+        self.assertEqual(record["cargo_exit_code"], 0)
+        failed = [r for _,r in calls if r["protocol_state"] == "ProtocolRefused"]
+        self.assertEqual(len(failed), 1);self.assertEqual(failed[0]["tool_result"], 0)
+        self.assertTrue(any("NativeCapture:stderr" in f for f in failed[0]["failures"]))
+        self.assertTrue(any(r["operation"]["class"] == "ArchiveIndex" and r["tool_result"] == 0 for _,r in calls))
+
+    def test_d1_final_cargo_bindings_and_rust_static_join_are_required(self):
+        for case, marker in (("missing_origin","NativeCargoOrigin"), ("duplicate_origin","NativeCargoOrigin"),
+                ("missing_builder","NativeCargoOrigin"), ("origin_outdir","NativeCargoOrigin"),
+                ("link_directive","NativeLinkDeclaration"), ("bindings_drift","NativeBindings"),
+                ("rust_missing_static","NativeRustConsumer")):
+            with self.subTest(case=case):self.d1_refusal(case, marker)
+        self.d1_refusal("compile_plugin", "NativeCompileFlags")
+        self.d1_refusal("compile_source", "NativeCompileSource")
+        for case in ("probe_consumed", "probe_relative_consumed", "object_relative_consumed", "archive_relative_consumed"):
+            with self.subTest(case=case):
+                _, session, record, native, calls = self.d1_refusal(case, "NativeOutputRole", 4)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(native["blockers"], ["NativeSeal:NativeOutputRole"])
+                self.assertFalse(any(r["owner_issued_inspector"] for _, r in calls))
+                origin = next(a for a in record["build_script_associations"] if a["package_id"] == owner.SQLITE_PACKAGE)
+                self.assertIn("libsqlite3.a", origin["generated_files"])
+                self.assertNotIn("42detect_compiler_family.c", origin["generated_files"])
+                native_names = {"42detect_compiler_family.c", "sqlite3-test.o", "libsqlite3.a"}
+                self.assertFalse(any(Path(c["path"]).name in native_names for c in record["consumed_sources"]))
+                sqlite = next(json.loads(p.read_text()) for p in (session / "invocations").glob("*/receipt.json")
+                              if json.loads(p.read_text()).get("package", {}).get("id") == owner.SQLITE_PACKAGE
+                              and json.loads(p.read_text())["role"] == "Target")
+                paths = [v for o in sqlite["outputs"] for v in o.get("dep_info", {}).get("paths", [])]
+                path = next(v for v in paths if Path(v).name in native_names)
+                self.assertEqual(Path(path).is_absolute(), "relative" not in case)
+                self.assertTrue((Path(sqlite["cwd"]) / path).resolve().is_file())
+
+
+    def test_d1_public_cli_and_normal_profile_do_not_grant_native_dispatch(self):
+        self.prepare()
+        for args in (("record","--features","replay-sqlite-bundled-v1"), ("record",owner.BUNDLED_PROFILE),
+                     ("_native","bad","cc","-E","/tmp/foreign")):
+            self.assertEqual(self.invoke(*args).returncode, 2)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, 0)
+        record = self.record_result(result)
+        self.assertNotIn("native_record_sha256", record)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        self.assertFalse((session/"native-invocations").exists())
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:
