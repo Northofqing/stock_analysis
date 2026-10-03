@@ -1,0 +1,6 @@
+{
+  "schema": "stock-analysis-replay-build-record-v1",
+  "mode": "RecordingOnly",
+  "profile": "normaldev-library",
+  "inventory": null
+}
