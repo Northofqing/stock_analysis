@@ -1046,6 +1046,181 @@ if CASE.startswith('seal_'):
 finish(True)
 '''
 
+# Record9 literal argv data; fake archives/compilers below do not claim native provenance.
+RING9_ARGS = ['--crate-name', 'ring', '--edition=2021', '{source}', '--error-format=json', '--json=diagnostic-rendered-ansi,artifacts,future-incompat', '--crate-type', 'lib', '--emit=dep-info,metadata,link', '-C', 'embed-bitcode=no', '-C', 'debuginfo=1', '-C', 'split-debuginfo=unpacked', '--cfg', 'feature="alloc"', '--cfg', 'feature="default"', '--cfg', 'feature="dev_urandom_fallback"', '--cfg', 'feature="std"', '--check-cfg', 'cfg(docsrs,test)', '--check-cfg', 'cfg(feature, values("alloc", "default", "dev_urandom_fallback", "less-safe-getrandom-custom-or-rdrand", "less-safe-getrandom-espidf", "slow_tests", "std", "test_logging", "unstable-testing-arm-no-hw", "unstable-testing-arm-no-neon", "wasm32_unknown_unknown_js"))', '-C', 'metadata=862fd12a131d46d1', '-C', 'extra-filename=-caa7295bfcdb1ff4', '--out-dir', '{deps}', '--target', 'x86_64-apple-darwin', '-L', 'dependency={deps}', '-L', 'dependency={host}', '--extern', 'cfg_if={deps}/libcfg_if-cbe7c8951fbba95c.rmeta', '--extern', 'getrandom={deps}/libgetrandom-7d22719848931b99.rmeta', '--extern', 'untrusted={deps}/libuntrusted-3d1aaf426382159e.rmeta', '--cap-lints', 'allow', '-L', 'native={out}', '-l', 'static=ring_core_0_17_14_', '-l', 'static=ring_core_0_17_14__test']
+
+RING9_RUSTC = r'''
+import json,os,pathlib,sys
+args=sys.argv[1:]
+if args==['--print','sysroot']:
+    hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+    (hits/'probe-ring').write_text(json.dumps(args))
+    print(pathlib.Path(sys.argv[0]).parent/'sysroot');sys.exit(0)
+def value(k):
+    inline=[a.split('=',1)[1] for a in args if a.startswith(k+'=')]
+    return inline[0] if inline else args[args.index(k)+1]
+name=value('--crate-name');source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+(hits/('compile-'+name)).write_text(json.dumps(args))
+case=os.environ.get('RING9_CASE','normal')
+if name=='ring':
+    archive=pathlib.Path(os.environ['OUT_DIR'])/'libring_core_0_17_14_.a'
+    if case=='during_change':archive.write_bytes(b'TEST_CODE_CHANGED_DURING_CHILD')
+    if case=='post_missing':archive.unlink()
+out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+codegen=[args[i+1] for i,a in enumerate(args) if a=='-C']
+suffix=next((a.split('=',1)[1] for a in codegen if a.startswith('extra-filename=')),'')
+base=name+suffix
+files=[out/base] if value('--crate-type')=='bin' else [out/('lib'+base+'.rmeta'),out/('lib'+base+'.rlib')]
+for path in files:path.write_bytes(b'TEST_CODE_OUTPUT:'+name.encode()+b':'+source.read_bytes())
+def esc(s):return s.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+(out/(base+'.d')).write_text(esc(str(files[0]))+': '+esc(str(source))+'\n')
+print(json.dumps({'fixture_argv':args}),file=sys.stderr)
+if name=='ring' and case=='compiler_fail':sys.exit(7)
+'''
+
+RING9_CARGO = r'''
+import json,os,pathlib,shutil,subprocess,sys
+CASE=__CASE__;TEMPLATE=__TEMPLATE__
+args=sys.argv[1:]
+def value(k):return args[args.index(k)+1]
+app=pathlib.Path(value('--manifest-path')).parent;session=app.parent;target=pathlib.Path(value('--target-dir'))
+root=session/'vendor/ring';host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+for p in (host,deps):p.mkdir(parents=True,exist_ok=True)
+features=['alloc','default','dev_urandom_fallback','std'];cfg=[v for f in features for v in ('--cfg','feature="'+f+'"')]
+package='registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14'
+libs=['static=ring_core_0_17_14_','static=ring_core_0_17_14__test']
+out=target/'x86_64-apple-darwin/debug/build/ring-a2bdcca0b9c169e7/out';out.mkdir(parents=True)
+loader=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']
+def emit(e):print(json.dumps(e),flush=True)
+def artifact(pkg,source,name,kind,files,feats):
+    return {'reason':'compiler-artifact','package_id':pkg,'manifest_path':str(source.parent/'Cargo.toml'),
+        'target':{'src_path':str(source),'kind':[kind],'crate_types':['bin' if kind=='custom-build' else kind],'name':name,'edition':'2021'},
+        'features':feats,'filenames':[str(p) for p in files],'executable':None,'fresh':False}
+def compile(name,source,pkg,dest,kind='lib',extra=()):
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition=2021',str(source),'--crate-type',kind,'--emit='+('dep-info,link' if kind=='bin' else 'dep-info,metadata,link'),'--out-dir',str(dest),*extra]
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(source.parent if source.name=='build.rs' else source.parent.parent),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+    if pkg==package:
+        env.update(CARGO_PKG_NAME='ring',CARGO_PKG_VERSION='0.17.14')
+    result=subprocess.run(command,env=env,cwd=pathlib.Path(env['CARGO_MANIFEST_DIR']))
+    if result.returncode:raise RuntimeError('TEST_CODE prerequisite compile failed')
+    files=[dest/name] if kind=='bin' else [dest/('lib'+name+'.rmeta'),dest/('lib'+name+'.rlib')]
+    event=artifact(pkg,source,name,'custom-build' if kind=='bin' else kind,files,features if pkg==package else [])
+    if kind=='bin':
+        alias=dest/'build-script-build';shutil.copyfile(files[0],alias);event['filenames']=[str(alias)]
+    return event
+ccpkg='registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59'
+emit(compile('cc',session/'vendor/cc/src/lib.rs',ccpkg,host))
+builder=compile('build_script_build',root/'build.rs',package,target/'debug/build/ring-89fcb6af8728a6c7','bin',cfg+['--extern','cc='+str(host/'libcc.rlib')])
+if CASE=='builder_features':builder['features']=[]
+if CASE=='builder_package':builder['package_id']='TEST_CODE_OTHER'
+if CASE!='missing_builder':emit(builder)
+if CASE=='duplicate_builder':emit(builder)
+for name in ('cfg_if','getrandom','untrusted'):
+    source=session/'vendor'/name/'src/lib.rs'
+    event=compile(name,source,'TEST_CODE_'+name,deps,extra=['--target','x86_64-apple-darwin'])
+    # Actual request file spellings; aliases are observed Cargo artifacts, not rewritten argv.
+    real=next(v.split('=',1)[1] for v in TEMPLATE if v.startswith(name+'='))
+    alias=pathlib.Path(real.format(deps=deps));shutil.copyfile(deps/('lib'+name+'.rmeta'),alias)
+    event['filenames']=[str(alias)];emit(event)
+for i,name in enumerate(('libring_core_0_17_14_.a','libring_core_0_17_14__test.a')):(out/name).write_bytes(b'TEST_CODE_ARCHIVE_'+str(i).encode())
+event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'linked_libs':libs,'linked_paths':['native='+str(out)],'cfgs':[],'env':[]}
+if CASE=='origin_package':event['package_id']='TEST_CODE_OTHER'
+if CASE=='origin_outdir':
+    other=out.parent/'other';other.mkdir();event['out_dir']=str(other)
+if CASE=='linked_libs':event['linked_libs']=list(reversed(libs))
+if CASE=='linked_paths':event['linked_paths']=['native='+str(target)]
+if CASE=='event_cfg':event['cfgs']=['TEST_CODE']
+if CASE=='event_env':event['env']=[['TEST_CODE','1']]
+if CASE!='missing_origin':emit(event)
+if CASE=='duplicate_origin':emit(event)
+argv=[os.environ['RUSTC']]+[v.format(source=root/'src/lib.rs',deps=deps,host=host,out=out) for v in TEMPLATE]
+env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),CARGO_PKG_NAME='ring',CARGO_PKG_VERSION='0.17.14',CARGO_PKG_VERSION_MAJOR='0',CARGO_PKG_VERSION_MINOR='17',CARGO_PKG_VERSION_PATCH='14',CARGO_PKG_VERSION_PRE='',CARGO_CRATE_NAME='ring',OUT_DIR=str(out),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),RING9_CASE=CASE)
+cwd=root
+if CASE=='host_probe_control':
+    probe_env=dict(env,DYLD_FALLBACK_LIBRARY_PATH=os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+    probe_env.pop('OUT_DIR')
+    probe=subprocess.run([os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--print','sysroot'],env=probe_env,cwd=root,stdout=subprocess.PIPE)
+    if probe.returncode:raise RuntimeError('TEST_CODE genuine ring probe failed')
+if CASE=='reorder':argv[-3],argv[-1]=argv[-1],argv[-3]
+if CASE=='missing':argv=argv[:-2]
+if CASE=='missing_both_libraries':argv=argv[:-4]
+if CASE=='missing_all_native':argv=argv[:-6]
+if CASE=='attached':argv[-2:]=['-l'+argv[-1]]
+if CASE=='dynamic':argv[-1]='dylib=ring_core_0_17_14__test'
+if CASE=='extra_native':argv[-6:-6]=['-L','native='+str(out)]
+if CASE=='extra_lib':argv+=['-l','static=foreign']
+if CASE=='foreign_lib':argv[-1]='static=foreign'
+if CASE=='package':env['CARGO_PKG_NAME']='other'
+if CASE=='version':env['CARGO_PKG_VERSION']='0.17.15'
+if CASE=='cwd':cwd=app
+if CASE=='manifest':env['CARGO_MANIFEST_PATH']=str(app/'Cargo.toml')
+if CASE=='feature_missing':i=argv.index('--cfg');del argv[i:i+2]
+if CASE=='feature_extra':argv[-6:-6]=['--cfg','feature="other"']
+if CASE=='host':i=argv.index('--target');del argv[i:i+2]
+if CASE=='wrapper':env['RUSTC_WRAPPER']=str(session/'other-wrapper')
+if CASE=='loader':env['DYLD_FALLBACK_LIBRARY_PATH']=loader+':/other'
+if CASE=='environment':env['AR']='/TEST_CODE_FOREIGN_AR'
+if CASE=='outdir':env['OUT_DIR']=str(target)
+if CASE=='link_arg':argv[-6:-6]=['-C','link-arg=-lother']
+if CASE=='unknown_flag':argv[-6:-6]=['-Zunknown']
+if CASE=='source_arg':argv[4]=str(app/'src/lib.rs')
+original=(root/'src/lib.rs').read_bytes()
+if CASE=='source_hash':(root/'src/lib.rs').chmod(0o644);(root/'src/lib.rs').write_bytes(b'TEST_CODE_CHANGED')
+archive=out/'libring_core_0_17_14_.a'
+if CASE=='pre_missing':archive.unlink()
+if CASE=='pre_symlink':archive.unlink();archive.symlink_to(root/'src/lib.rs')
+if CASE=='pre_hardlink':other=out/'aliased.a';os.link(archive,other)
+(session/'ring9-attempt.json').write_text(json.dumps({'argv_hex':[os.fsencode(a).hex() for a in argv]}))
+result=subprocess.run([os.environ['RUSTC_WRAPPER'],*argv],env=env,cwd=cwd)
+if CASE=='source_hash':(root/'src/lib.rs').write_bytes(original)
+if CASE in ('pre_symlink','pre_hardlink'):
+    if CASE=='pre_symlink':archive.unlink();archive.write_bytes(b'TEST_CODE_ARCHIVE_0')
+    else:other.unlink()
+if result.returncode:
+    emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+consumer=artifact(package,root/'src/lib.rs','ring','lib',[deps/'libring-caa7295bfcdb1ff4.rmeta',deps/'libring-caa7295bfcdb1ff4.rlib'],features)
+if CASE=='consumer_features':consumer['features']=[]
+if CASE=='consumer_role':consumer['target']['kind']=['proc-macro']
+if CASE=='consumer_source':consumer['target']['src_path']=str(app/'src/lib.rs')
+if CASE!='missing_consumer':emit(consumer)
+if CASE=='duplicate_consumer':emit(consumer)
+app_event=compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,extra=['--target','x86_64-apple-darwin'])
+if CASE=='selected_archive':app_event['filenames']=[str(archive)]
+emit(app_event)
+paths=list((session/'invocations').glob('*/receipt.json'))
+rpath=next(p for p in paths if json.loads(p.read_text()).get('context',{}).get('ring_static_declarations'))
+r=json.loads(rpath.read_text())
+if CASE=='snapshot_missing':(rpath.parent/r['ring_archive_pre'][0]['snapshot']).unlink()
+if CASE=='snapshot_changed':(rpath.parent/r['ring_archive_pre'][0]['snapshot']).write_bytes(b'TEST_CODE_CHANGED')
+if CASE=='snapshot_swapped':
+    a,b=[rpath.parent/o['snapshot'] for o in r['ring_archive_pre']];old=a.read_bytes();a.write_bytes(b.read_bytes());b.write_bytes(old)
+if CASE=='final_archive':archive.write_bytes(b'TEST_CODE_FINAL_CHANGE')
+if CASE=='context_tamper':r['context']['out_dir']=str(target);rpath.write_text(json.dumps(r))
+if CASE in ('seal_missing_both_libraries','seal_missing_all_native','seal_unannotated_full'):
+    trim=4 if CASE=='seal_missing_both_libraries' else (6 if CASE=='seal_missing_all_native' else 0)
+    for leaf in ('request.json','invocation.json','receipt.json'):
+        p=rpath.parent/leaf;data=json.loads(p.read_text())
+        if trim:data['argv_hex']=data['argv_hex'][:-trim]
+        if leaf!='request.json':
+            data['context']={'kind':'DirectCargoCompile'}
+            for key in tuple(data):
+                if key.startswith('ring_archive_'):del data[key]
+            if trim:
+                data['parsed']['options'].pop('-l',None)
+                if trim==6:data['parsed']['options']['-L']=[v for v in data['parsed']['options']['-L'] if not v.startswith('native=')]
+        p.write_text(json.dumps(data))
+
+if CASE in ('cc_edge','extern_edge','archive_output'):
+    p=rpath if CASE!='cc_edge' else next(p for p in paths if json.loads(p.read_text()).get('source')==str(root/'build.rs'))
+    data=json.loads(p.read_text())
+    if CASE=='archive_output':data['declared_outputs'].append({'path':str(archive),'kind':'link'})
+    else:data['externs'][0]['path']=str(target/'absent.rlib')
+    p.write_text(json.dumps(data))
+emit({'reason':'build-finished','success':True})
+'''
+
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -2319,6 +2494,207 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertEqual(record["cargo_exit_code"], 0)
                 self.assertEqual(len(record["selected_library"]), 1)
                 self.assertEqual(len(list((session / "compiler-entry").iterdir())), 5)
+
+    def prepare_ring9(self, case="normal"):
+        inventory = self.prepare()
+        vendor = self.root / "vendor-origin"
+        specs = (("ring", "0.17.14"), ("cc", "1.2.59"), ("cfg_if", "0.0.0"),
+                 ("getrandom", "0.0.0"), ("untrusted", "0.0.0"))
+        for name, version in specs:
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE synthetic " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            if name == "ring":
+                write(vendor / name / "build.rs", "// TEST_CODE synthetic builder, no native execution\n")
+                write(vendor / name / "src/prefixed.rs", "// TEST_CODE prefix correspondence\n")
+            inventory["packages"].append({"id": ("registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version)
+                                           if name in ("ring", "cc") else "TEST_CODE_" + name,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        inventory["vendor"] = snapshot(vendor, ["dep", *[n for n, _ in specs]])
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + RING9_RUSTC)
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + RING9_CARGO.replace("__CASE__", repr(case)).replace("__TEMPLATE__", repr(RING9_ARGS)))
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inventory["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}
+        inventory["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly",
+                                           "profile": owner.PROFILE, "inventory": inventory}))
+        return inventory
+
+    def ring9_result(self, case="normal", status=0):
+        self.prepare_ring9(case)
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def ring9_before_entry_refusal(self, case, marker):
+        session, record, receipts = self.ring9_result(case, 2)
+        self.assertFalse((session / "compiler-entry/compile-ring").exists())
+        self.assertFalse(any(r.get("context", {}).get("ring_static_declarations") for _, r in receipts))
+        diagnostics = [json.loads(line) for line in (session / "cargo.stderr.raw").read_text().splitlines()]
+        self.assertTrue(any(d.get("reason") == "Refused" and d.get("detail") == marker for d in diagnostics), diagnostics)
+        self.assertEqual(record["native_link_declarations"], [])
+        requests = [p for p in (session / "invocations").glob("*/request.json") if not (p.parent / "receipt.json").exists()]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(json.loads(requests[0].read_text())["argv_hex"], json.loads((session / "ring9-attempt.json").read_text())["argv_hex"])
+        return session, record
+
+    def test_record9_ring_static_template_preserves_raw_argv(self):
+        session, record, receipts = self.ring9_result()
+        self.assertEqual(record["blockers"], [])
+        path, r = next((p, r) for p, r in receipts if r.get("context", {}).get("ring_static_declarations"))
+        expected = [str(self.root / "fake-rustc"), *[v.format(source=session / "vendor/ring/src/lib.rs",
+            deps=session / "target/x86_64-apple-darwin/debug/deps", host=session / "target/debug/deps",
+            out=session / "target/x86_64-apple-darwin/debug/build/ring-a2bdcca0b9c169e7/out") for v in RING9_ARGS]]
+        self.assertEqual(len(expected), 54)
+        for leaf in ("request.json", "invocation.json", "receipt.json"):
+            self.assertEqual(json.loads((path / leaf).read_text())["argv_hex"], [os.fsencode(v).hex() for v in expected])
+        self.assertEqual(json.loads((path / "stderr.raw").read_text())["fixture_argv"], expected[1:])
+        self.assertEqual(json.loads((session / "compiler-entry/compile-ring").read_text()), expected[1:])
+        self.assertEqual(r["parsed"]["options"]["-l"], list(owner.RING_LIBS))
+        self.assertEqual(r["parsed"]["options"]["--cfg"], ['feature="' + f + '"' for f in owner.RING_FEATURES])
+        self.assertEqual({e["name"] for e in r["externs"]}, {"cfg_if", "getrandom", "untrusted"})
+        for case, marker in (("reorder", "RingStaticTemplate"), ("missing", "RingStaticTemplate"),
+            ("missing_both_libraries", "RingStaticTemplate"), ("missing_all_native", "RingStaticTemplate"),
+            ("attached", "RingStaticTemplate"), ("dynamic", "RingStaticTemplate"),
+            ("extra_lib", "RingStaticTemplate"), ("extra_native", "RingCompileContext")):
+            with self.subTest(case=case):
+                refused_session, _ = self.ring9_before_entry_refusal(case, marker)
+                if case in ("missing_both_libraries", "missing_all_native"):
+                    attempt = json.loads((refused_session / "ring9-attempt.json").read_text())["argv_hex"]
+                    self.assertEqual(len(attempt), 50 if case == "missing_both_libraries" else 48)
+                    self.assertNotIn(b"-l".hex(), attempt)
+                    self.assertFalse(any(p.name == "compile-ring" for p in (refused_session / "compiler-entry").iterdir()))
+
+    def test_record9_ring_static_connected_declarations_bind_archives(self):
+        session, record, receipts = self.ring9_result()
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["native_link_declarations"]), 2)
+        by_id = {p.name: (p, r) for p, r in receipts}
+        for index, d in enumerate(record["native_link_declarations"]):
+            self.assertEqual(d["declaration"], owner.RING_LIBS[index])
+            self.assertEqual(d["raw_argument_indices"], [50 + 2 * index, 51 + 2 * index])
+            self.assertEqual(d["artifact_selection"], "not_observed")
+            self.assertEqual(d["native_child_provenance"], "not_observed")
+            self.assertEqual(d["native_producer_qualification"], "not_issued")
+            p, r = by_id[d["consumer_invocation"]]
+            self.assertEqual(r["exit_code"], 0)
+            self.assertEqual(by_id[d["producer_invocation"]][1]["role"], "Host")
+            cc = next(e for e in record["extern_edges"] if e["consumer"] == d["producer_invocation"] and e["name"] == "cc")
+            self.assertEqual(len(cc["producers"]), 1)
+            self.assertEqual(by_id[cc["producers"][0]][1]["package"]["id"], "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59")
+            for phase in ("pre", "post"):
+                o = d["archive_" + phase]
+                self.assertEqual((p / o["snapshot"]).read_bytes(), b"TEST_CODE_ARCHIVE_" + str(index).encode())
+                self.assertEqual(sha(p / o["snapshot"]), o["sha256"])
+                self.assertEqual(Path(o["path"]).stat().st_size, o["length"])
+                self.assertFalse(any(v["path"] == o["path"] for _, rr in receipts for v in rr["outputs"]))
+        session, record, receipts = self.ring9_result("compiler_fail", 2)
+        p, r = next((p, r) for p, r in receipts if r.get("context", {}).get("ring_static_declarations"))
+        self.assertEqual(r["exit_code"], 7)
+        self.assertEqual(r["blockers"], ["CompilerFailed"])
+        self.assertEqual(len(r["ring_archive_pre"]), 2);self.assertEqual(len(r["ring_archive_post"]), 2)
+        self.assertEqual(record["native_link_declarations"], [])
+        self.assertIn("RingGraph:RingConsumer", record["blockers"])
+        self.assertTrue((p / "stderr.raw").read_bytes())
+
+    def test_record9_ring_static_origin_environment_and_sources_refuse(self):
+        cases = (("package", "FixedPackageContext"), ("version", "FixedPackageContext"),
+            ("cwd", "FixedPackageContext"), ("manifest", "RingEnvironmentContext"),
+            ("source_hash", "FixedPackageSource"), ("source_arg", "RingCompileContext"),
+            ("feature_missing", "RingFeatureContext"), ("feature_extra", "RingFeatureContext"),
+            ("host", "RingCompileContext"), ("wrapper", "RingEnvironmentContext"),
+            ("loader", "CompilerEnvironmentInjection"), ("environment", "RingEnvironmentContext"),
+            ("outdir", "RingStaticTemplate"), ("link_arg", "RingCompileContext"),
+            ("unknown_flag", "UnsupportedRustcArgument:-Zunknown"))
+        for case, marker in cases:
+            with self.subTest(case=case):self.ring9_before_entry_refusal(case, marker)
+
+    def test_record9_ring_static_archive_snapshots_are_required(self):
+        for case in ("pre_missing", "pre_symlink", "pre_hardlink"):
+            with self.subTest(case=case):self.ring9_before_entry_refusal(case, "RingArchiveEvidence")
+        for case, marker in (("during_change", "RingArchiveChanged"), ("post_missing", "RingArchiveEvidence")):
+            with self.subTest(case=case):
+                session, record, receipts = self.ring9_result(case, 2)
+                p, r = next((p, r) for p, r in receipts if r.get("context", {}).get("ring_static_declarations"))
+                self.assertEqual(r["exit_code"], 0);self.assertIn(marker, r["blockers"])
+                self.assertTrue((session / "compiler-entry/compile-ring").exists())
+                self.assertTrue((p / r["ring_archive_pre"][0]["snapshot"]).is_file())
+                if case == "during_change":self.assertNotEqual(r["ring_archive_pre"][0]["sha256"], r["ring_archive_post"][0]["sha256"])
+                self.assertEqual(record["native_link_declarations"], [])
+        for case in ("snapshot_missing", "snapshot_changed", "snapshot_swapped", "final_archive"):
+            with self.subTest(case=case):
+                session, record, _ = self.ring9_result(case, 2)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertIn("RingGraph:RingArchiveBinding", record["blockers"])
+                self.assertEqual(record["native_link_declarations"], [])
+
+    def test_record9_ring_static_final_events_and_edges_are_unique(self):
+        for case, marker, length in (("seal_missing_both_libraries", "RingStaticTemplate", 50),
+                ("seal_missing_all_native", "RingStaticTemplate", 48),
+                ("seal_unannotated_full", "RingInvocationEvidence", 54)):
+            with self.subTest(case=case):
+                session, record, receipts = self.ring9_result(case, 2)
+                call, receipt = next((p, r) for p, r in receipts if r.get("source") == str(session / "vendor/ring/src/lib.rs"))
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(receipt["exit_code"], 0)
+                self.assertEqual(len(json.loads((session / "compiler-entry/compile-ring").read_text())), 53)
+                self.assertIn("RingGraph:" + marker, record["blockers"])
+                self.assertFalse(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+                self.assertEqual(record["native_link_declarations"], [])
+                for leaf in ("request.json", "invocation.json", "receipt.json"):
+                    data = json.loads((call / leaf).read_text())
+                    self.assertEqual(len(data["argv_hex"]), length)
+                    self.assertNotIn("ring_static_declarations", data.get("context", {}))
+                    self.assertFalse(any(k.startswith("ring_archive_") for k in data))
+                    self.assertEqual(data["environment_hex"][b"CARGO_PKG_NAME".hex()], b"ring".hex())
+        cases = {"missing_origin": "RingOrigin", "duplicate_origin": "RingOrigin", "origin_package": "RingOrigin",
+            "origin_outdir": "RingOrigin", "missing_builder": "RingOrigin", "duplicate_builder": "RingOrigin",
+            "builder_package": "RingOrigin", "builder_features": "RingBuilderFeatures", "cc_edge": "RingBuilderCc",
+            "linked_libs": "RingDeclaration", "linked_paths": "RingDeclaration", "event_cfg": "RingDeclaration",
+            "event_env": "RingDeclaration", "missing_consumer": "RingConsumer", "duplicate_consumer": "RingConsumer",
+            "consumer_features": "RingConsumer", "consumer_role": "RingConsumer", "consumer_source": "RingConsumer",
+            "extern_edge": "RingConsumer", "context_tamper": "RingInvocationEvidence"}
+        for case, marker in cases.items():
+            with self.subTest(case=case):
+                session, record, _ = self.ring9_result(case, 2)
+                self.assertTrue((session / "compiler-entry/compile-ring").exists())
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertIn("RingGraph:" + marker, record["blockers"])
+                self.assertEqual(record["native_link_declarations"], [])
+                if case in ("cc_edge", "extern_edge"):
+                    self.assertTrue(any(b.startswith("UnresolvedExternProducer:") for b in record["blockers"]))
+
+    def test_record9_ring_static_does_not_generalize_native_authority(self):
+        session, record, receipts = self.ring9_result("host_probe_control")
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["native_link_declarations"]), 2)
+        builder = next(r for _, r in receipts if r.get("source") == str(session / "vendor/ring/build.rs"))
+        probe = next(r for _, r in receipts if r["kind"] == "Probe")
+        for r in (builder, probe):
+            self.assertEqual(r["exit_code"], 0)
+            self.assertNotIn("ring_static_declarations", r["context"])
+            self.assertEqual(r["environment_hex"][b"CARGO_PKG_NAME".hex()], b"ring".hex())
+        self.assertEqual(builder["role"], "Host")
+        self.assertTrue((session / "compiler-entry/compile-build_script_build").exists())
+        self.assertEqual(json.loads((session / "compiler-entry/probe-ring").read_text()), ["--print", "sysroot"])
+        self.ring9_before_entry_refusal("package", "FixedPackageContext")
+        self.ring9_before_entry_refusal("foreign_lib", "RingStaticTemplate")
+        for case in ("archive_output", "selected_archive"):
+            with self.subTest(case=case):
+                session, record, _ = self.ring9_result(case, 2)
+                self.assertEqual(record["native_link_declarations"], [])
+                self.assertTrue(any(b in ("RingGraph:RingArchiveBinding", "UnresolvedSelectedLibrary") for b in record["blockers"]))
+                self.assertNotIn("qualified", record)
+        _, record, _ = self.fix5_result("framework")
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual([d["declaration"] for d in record["native_link_declarations"]], [owner.FRAMEWORK_LITERAL])
+        for args in (["-l", "static=other"], ["-lother"], ["--extern-native", "other"]):
+            with self.subTest(args=args), self.assertRaisesRegex(owner.Refusal, "UnsupportedRustcArgument"):
+                owner.parse_rustc(args)
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:

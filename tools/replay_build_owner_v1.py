@@ -577,6 +577,234 @@ def fixed_source_package(name, version, cwd, env, session, inv, sources):
     return package, root, out
 
 
+RING_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14"
+RING_LIBS = ("static=ring_core_0_17_14_", "static=ring_core_0_17_14__test")
+RING_ARCHIVES = ("libring_core_0_17_14_.a", "libring_core_0_17_14__test.a")
+RING_FEATURES = ("alloc", "default", "dev_urandom_fallback", "std")
+
+
+def ring_static_context(args, env, cwd, session, inv):
+    raw = args[1:]
+    native = any(a.startswith("-l") or a.startswith("--extern-native") for a in raw)
+    if not native:
+        if env.get("CARGO_PKG_NAME") != "ring":
+            return None
+        # Recognition cannot depend on the declarations whose absence we reject.
+        # Parse ordinary forms to preserve genuine Host builds and probe routes.
+        candidate = parse_rustc(raw)
+        options = candidate["options"]
+        if (candidate["probe"] or options.get("--target") != [TARGET]
+                or options.get("--crate-type") != ["lib"]):
+            return None
+    elif not (env.get("CARGO_PKG_NAME") == "ring"
+              or any("ring_core_0_17_14_" in a for a in raw)):
+        return None
+    out_raw = env.get("OUT_DIR", "")
+    require(raw[-6:] == ["-L", "native=" + out_raw, "-l", RING_LIBS[0], "-l", RING_LIBS[1]]
+            and sum(a.startswith("-l") or a.startswith("--extern-native") for a in raw) == 2,
+            "RingStaticTemplate")
+    package, root, out = fixed_source_package("ring", "0.17.14", cwd, env, session, inv,
+                                             ("src/lib.rs", "src/prefixed.rs"))
+    require(re.fullmatch(r"ring-[0-9a-f]{16}", out.parent.name), "FixedPackageOutDir")
+    parsed = parse_rustc(raw[:-6])
+    o = parsed["options"]
+    deps = session / "target" / TARGET / "debug/deps"
+    require(not parsed["probe"] and parsed["inputs"] == [str(root / "src/lib.rs")]
+            and o.get("--crate-name") == ["ring"] and o.get("--crate-type") == ["lib"]
+            and o.get("--edition") == ["2021"] and o.get("--target") == [TARGET]
+            and o.get("--out-dir") == [str(deps)] and o.get("--emit") == ["dep-info,metadata,link"]
+            and "--test" not in o and not any(k in parsed["codegen"] for k in ("link-arg", "linker"))
+            and o.get("-L") == ["dependency=" + str(deps), "dependency=" + str(session / "target/debug/deps")],
+            "RingCompileContext")
+    require(sorted(o.get("--cfg", [])) == sorted('feature="' + f + '"' for f in RING_FEATURES),
+            "RingFeatureContext")
+    externs = [v.partition("=") for v in o.get("--extern", [])]
+    require(len(externs) == 3 and {v[0] for v in externs} == {"cfg_if", "getrandom", "untrusted"}
+            and all(sep and Path(path).is_absolute() and Path(path).parent == deps
+                    and str(Path(path)) == path and Path(path).resolve() == Path(path)
+                    for _, sep, path in externs), "RingCompileContext")
+    require(env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and env.get("CARGO_CRATE_NAME") == "ring"
+            and all(env.get(k) == v for k, v in {"CARGO_PKG_VERSION_MAJOR": "0",
+                "CARGO_PKG_VERSION_MINOR": "17", "CARGO_PKG_VERSION_PATCH": "14", "CARGO_PKG_VERSION_PRE": ""}.items())
+            and env.get("RUSTC") == inv["rustc"]["path"]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not env.get("RUSTC_WORKSPACE_WRAPPER")
+            and all(env.get(k) == inv["environment"].get(k) for k in ("CC", "CXX", "AR", "SDKROOT")),
+            "RingEnvironmentContext")
+    o["-L"].append("native=" + str(out))
+    o["-l"] = list(RING_LIBS)
+    return parsed, {"kind": "DirectCargoCompile", "ring_static_declarations": list(RING_LIBS),
+                    "package_id": package["id"], "manifest": str(root), "out_dir": str(out)}
+
+
+def ring_archive_observation(call, context, phase):
+    require(phase in ("pre", "post"), "RingArchiveEvidence")
+    observations = []
+    try:
+        for index, name in enumerate(RING_ARCHIVES):
+            path = Path(context["out_dir"]) / name
+            regular(path)
+            require(path.resolve() == path and path.stat().st_nlink == 1, "RingArchiveEvidence")
+            snapshot = call / ("ring-archive-" + phase + "-" + str(index) + ".raw")
+            with open(path, "rb") as source, open(snapshot, "xb") as dest:
+                shutil.copyfileobj(source, dest, 65536)
+            sha = file_hash(snapshot)
+            require(file_hash(path) == sha and path.stat().st_size == snapshot.stat().st_size,
+                    "RingArchiveEvidence")
+            observations.append({"path": str(path), "snapshot": snapshot.name,
+                                 "length": snapshot.stat().st_size, "sha256": sha})
+    except (OSError, Refusal) as error:
+        raise Refusal("RingArchiveEvidence") from error
+    return observations
+
+
+def validate_ring_static_evidence(receipt, call, session, inv):
+    request = strict_json((call / "request.json").read_bytes())
+    initial = strict_json((call / "invocation.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v))
+           for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    special = ring_static_context(args, env, cwd, session, inv)
+    claimed = any("ring_static_declarations" in r.get("context", {})
+                  or any(k.startswith("ring_archive_") for k in r) for r in (initial, receipt))
+    if special is None:
+        # The same raw classifier above rejects known Target/lib consumers even
+        # when all native tokens and optional evidence annotations are absent.
+        require(not claimed, "RingInvocationEvidence")
+        return None
+    require(claimed, "RingInvocationEvidence")
+    parsed, context = special
+    require(args[0] == inv["rustc"]["path"] and file_hash(Path(args[0])) == inv["rustc"]["sha256"]
+            and receipt["compiler_sha256"] == inv["rustc"]["sha256"]
+            and request["argv_hex"] == receipt["argv_hex"]
+            and request["environment_hex"] == receipt["environment_hex"]
+            and all(initial[k] == receipt[k] for k in ("context", "argv_hex", "environment_hex", "parsed",
+                "source", "package", "role", "kind", "cwd", "compiler_sha256", "ring_archive_pre"))
+            and receipt["parsed"] == parsed and receipt["context"] == context
+            and receipt["cwd"] == str(cwd) and receipt["role"] == "Target" and receipt["kind"] == "Compile"
+            and receipt["source"] == str(Path(context["manifest"]) / "src/lib.rs")
+            and receipt["package"] == {"id": RING_PACKAGE, "tree": "vendor", "manifest": "ring/Cargo.toml"},
+            "RingInvocationEvidence")
+    compiler_environment(env, session, inv["sysroot"], probe=False, context=context)
+    try:
+        for phase in ("pre", "post"):
+            rows = receipt.get("ring_archive_" + phase)
+            require(isinstance(rows, list) and len(rows) == 2, "RingArchiveBinding")
+            for index, row in enumerate(rows):
+                require(set(row) == {"path", "snapshot", "length", "sha256"}
+                        and row["path"] == str(Path(context["out_dir"]) / RING_ARCHIVES[index])
+                        and row["snapshot"] == "ring-archive-" + phase + "-" + str(index) + ".raw",
+                        "RingArchiveBinding")
+                for path in (call / row["snapshot"], Path(row["path"])):
+                    regular(path)
+                    require(path.resolve() == path and path.stat().st_nlink == 1
+                            and path.stat().st_size == row["length"] and file_hash(path) == row["sha256"],
+                            "RingArchiveBinding")
+        require(all({k: a[k] for k in ("path", "length", "sha256")} ==
+                    {k: b[k] for k in ("path", "length", "sha256")}
+                    for a, b in zip(receipt["ring_archive_pre"], receipt["ring_archive_post"])), "RingArchiveBinding")
+    except (Refusal, OSError, KeyError, TypeError) as error:
+        raise Refusal("RingArchiveBinding") from error
+    return context
+
+
+def ring_static_graph(receipts, associations, artifacts, events, edges, session, inv):
+    blockers, declarations = [], []
+    by_id = {r["invocation_id"]: r for r in receipts}
+    for r in receipts:
+        call = session / "invocations" / r["invocation_id"]
+        # Do not reinterpret unrelated legacy receipts, including their negative fixtures.
+        request = strict_json((call / "request.json").read_bytes())
+        initial = strict_json((call / "invocation.json").read_bytes())
+        candidates = [r, initial]
+        claimed = any("ring_static_declarations" in item.get("context", {})
+                      or any(k.startswith("ring_archive_") for k in item) for item in candidates)
+        raw_candidates = request.get("argv_hex", [])
+        ring_literal = os.fsencode("ring_core_0_17_14_").hex()
+        if not (claimed or any(isinstance(a, str) and ring_literal in a for a in raw_candidates)
+                or request.get("environment_hex", {}).get(os.fsencode("CARGO_PKG_NAME").hex())
+                   == os.fsencode("ring").hex()):
+            continue
+        try:
+            context = validate_ring_static_evidence(r, call, session, inv)
+            if context is None:
+                continue
+            origins = [a for a in associations if a["package_id"] == RING_PACKAGE
+                       and a["out_dir"] == context["out_dir"]]
+            origin_events = [e for e in events if e["reason"] == "build-script-executed"
+                             and e.get("package_id") == RING_PACKAGE]
+            require(len(origins) == 1 and len(origin_events) == 1
+                    and origins[0]["cargo_event"] == origin_events[0], "RingOrigin")
+            association = origins[0]
+            builder = by_id.get(association["producer_invocation"])
+            require(builder is not None and builder["kind"] == "Compile" and builder["role"] == "Host"
+                    and builder["exit_code"] == 0 and not builder["blockers"]
+                    and builder["source"] == str(Path(context["manifest"]) / "build.rs")
+                    and builder["package"]["id"] == RING_PACKAGE, "RingBuilder")
+            ba = [a for a in artifacts if a["invocation_id"] == builder["invocation_id"] and "builder_alias" in a]
+            be = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == RING_PACKAGE
+                  and e.get("target", {}).get("kind") == ["custom-build"]]
+            require(len(ba) == len(be) == 1 and be[0]["target"].get("src_path") == builder["source"], "RingBuilder")
+            require(sorted(builder["parsed"]["options"].get("--cfg", [])) ==
+                    sorted('feature="' + f + '"' for f in RING_FEATURES)
+                    and sorted(be[0].get("features", [])) == sorted(RING_FEATURES), "RingBuilderFeatures")
+            cc = [e for e in edges if e["consumer"] == builder["invocation_id"] and e["name"] == "cc"]
+            require(len(cc) == 1 and len(cc[0]["producers"]) == 1, "RingBuilderCc")
+            helper = by_id[cc[0]["producers"][0]]
+            require(helper["kind"] == "Compile" and helper["role"] == "Host" and helper["exit_code"] == 0
+                    and not helper["blockers"] and helper["package"] == {
+                        "id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59",
+                        "tree": "vendor", "manifest": "cc/Cargo.toml"}
+                    and helper["source"] == str(session / "vendor/cc/src/lib.rs"), "RingBuilderCc")
+            event = association["cargo_event"]
+            require(event["linked_libs"] == list(RING_LIBS)
+                    and event["linked_paths"] == ["native=" + context["out_dir"]]
+                    and event["cfgs"] == [] and event["env"] == [], "RingDeclaration")
+            ca = [a for a in artifacts if a["invocation_id"] == r["invocation_id"]]
+            ce = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == RING_PACKAGE
+                  and e.get("target", {}).get("src_path") == r["source"]]
+            require(r["exit_code"] == 0 and not r["blockers"] and len(ca) == len(ce) == 1
+                    and ce[0]["target"].get("kind") == ["lib"] and ce[0]["target"].get("crate_types") == ["lib"]
+                    and ce[0]["target"].get("name") == "ring" and ce[0]["target"].get("edition") == "2021"
+                    and len([v for v in receipts if v["kind"] == "Compile" and v["role"] == "Target"
+                             and v.get("source") == r["source"]]) == 1 and sorted(ce[0].get("features", [])) == sorted(RING_FEATURES)
+                    and ca[0]["files"] == ce[0]["filenames"], "RingConsumer")
+            rust_edges = [e for e in edges if e["consumer"] == r["invocation_id"]]
+            require(len(rust_edges) == 3 and {e["name"] for e in rust_edges} == {"cfg_if", "getrandom", "untrusted"}
+                    and all(len(e["producers"]) == 1 and by_id[e["producers"][0]]["kind"] == "Compile"
+                            and by_id[e["producers"][0]]["role"] == "Target"
+                            and by_id[e["producers"][0]]["exit_code"] == 0
+                            and not by_id[e["producers"][0]]["blockers"] for e in rust_edges), "RingConsumer")
+            paths = {row["path"] for row in r["ring_archive_pre"]}
+            hashes = {row["sha256"] for row in r["ring_archive_pre"]}
+            require(all(association["generated_files"].get(name) == row["sha256"]
+                        for name, row in zip(RING_ARCHIVES, r["ring_archive_pre"]))
+                    and not any(o["path"] in paths or o.get("sha256") in hashes
+                                for other in receipts for o in other["declared_outputs"] + other["outputs"])
+                    and not any(e["path"] in paths for e in edges)
+                    and not any(str((Path(other["cwd"]) / v).resolve()) in paths
+                                for other in receipts for o in other["outputs"]
+                                for v in o.get("dep_info", {}).get("paths", []))
+                    and not any(f in paths or sha in hashes for a in artifacts for f, sha in a["file_sha256"].items())
+                    and not any(str(Path(f).resolve()) in paths for e in events
+                                if e["reason"] == "compiler-artifact" for f in e.get("filenames", [])),
+                    "RingArchiveBinding")
+            for index, literal in enumerate(RING_LIBS):
+                declarations.append({"state": "RecordingOnly", "declaration": literal,
+                    "raw_argument_indices": [len(r["argv_hex"]) - 4 + index * 2, len(r["argv_hex"]) - 3 + index * 2],
+                    "consumer_invocation": r["invocation_id"], "producer_invocation": builder["invocation_id"],
+                    "package_id": RING_PACKAGE, "out_dir": context["out_dir"],
+                    "archive_pre": r["ring_archive_pre"][index], "archive_post": r["ring_archive_post"][index],
+                    "artifact_selection": "not_observed", "native_child_provenance": "not_observed",
+                    "native_producer_qualification": "not_issued"})
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            # This check also handles unclaimed contexts rederived from raw argv.
+            blockers.append("RingGraph:" + (str(error) if isinstance(error, Refusal) else "RingInvocationEvidence"))
+    return blockers, declarations
+
+
 def framework_context(args, env, cwd, session, inv):
     raw = args[1:]
     if not any(a == "-l" or a.startswith("-l") or a.startswith("--extern-native") for a in raw):
@@ -1086,6 +1314,8 @@ def wrapper(session_id, args):
     require(inside(cwd, session), "CompilerCwd")
     special = rustix_context(args, os.environ, cwd, session, inv)
     if special is None:
+        special = ring_static_context(args, os.environ, cwd, session, inv)
+    if special is None:
         special = framework_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = autocfg_context(args, os.environ, cwd, session, inv)
@@ -1166,6 +1396,8 @@ def wrapper(session_id, args):
         record["stdin"] = stdin_evidence
     if rustix_stdin:
         record.update(metadata_pre=pre, predecessor_invocation=predecessor)
+    if "ring_static_declarations" in context:
+        record["ring_archive_pre"] = ring_archive_observation(call, context, "pre")
     atomic_json(call / "invocation.json", record)
     stdin_failures = []
     code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
@@ -1175,6 +1407,14 @@ def wrapper(session_id, args):
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
     record["outputs"], record["blockers"] = [], []
+    if "ring_static_declarations" in context:
+        try:
+            record["ring_archive_post"] = ring_archive_observation(call, context, "post")
+            if any(a["sha256"] != b["sha256"] or a["length"] != b["length"]
+                   for a, b in zip(record["ring_archive_pre"], record["ring_archive_post"])):
+                record["blockers"].append("RingArchiveChanged")
+        except Refusal as error:
+            record["blockers"].append(str(error))
     if transient:
         try:
             if rustix_stdin:
@@ -1481,6 +1721,10 @@ def seal_record(session, policy, cargo_exit):
     blockers.extend(autocfg_graph_blockers(receipts, associations, edges))
     new_blockers, declarations = new_role_graphs(receipts, associations)
     blockers.extend(new_blockers)
+    ring_blockers, ring_declarations = ring_static_graph(receipts, associations, artifacts, events, edges,
+                                                       session, policy["inventory"])
+    blockers.extend(ring_blockers)
+    declarations.extend(ring_declarations)
     consumed = []
     for receipt in receipts:
         if receipt["invocation_id"] in transient_collisions:
