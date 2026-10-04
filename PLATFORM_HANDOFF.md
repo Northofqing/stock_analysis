@@ -319,6 +319,7 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 | Original构造与A00清理生命周期 | 3项定向库测试通过（342.028秒），复用同一编译产物的原非空Catalog6财务备份回归1项通过（18.8秒）；独立源码/运行证据审查通过；`d0904d88` | 固定初始化顺序、首个错误、reset/finalize/单次close与未释放frame保留；修复跨port提前清理的屏障缺口，真实native/SQL/诊断付款与完整历史仍待 |
 | Original sidecar资源采集与未消费结果保留 | 3项定向库测试通过（308.270秒），同一编译产物A00回归3项（9.247秒）和非空Catalog6备份1项（8.839秒）通过；独立源码/运行证据复核通过；`c31bcb58` | 保留部分采集、未消费载体及失败close持有的真实File；正常首错和终止清理屏障保持；实际sidecar采集、native/provider与完整16MiB历史路径仍待 |
 | Original审计资源采集与清理生命周期 | 3项定向库测试通过（292.236秒），同一产物A00回归3项（9.129秒）、sidecar回归3项（1.492秒）及非空Catalog6备份1项（8.480秒）通过；独立源码/运行证据复核通过；`38cf70f0` | 文件最早进入同一frame，局部与完整保留状态、首错和终止清理屏障准确；借用不释放资源，未观察unlock时保留File/guard；真实审计/FS/raw unlock、BEGIN及完整16MiB路径仍待 |
+| Original BEGIN与提前退出的事务生命周期 | 修补后3项定向库测试通过（322.566秒），同一产物A00回归3项、sidecar回归3项、审计回归3项及非空Catalog6备份1项通过；独立源码/运行复核通过；`2d3bb923` | 完整BEGIN返回事实与VM清理分开，失败及提前退出保留首错和单次ROLLBACK，同一frame的审计/连接清理屏障保持；真实SQL适配、读取/capture/COMMIT与完整16MiB历史路径仍待 |
 | zstd、Anyhow及Serde构建证据录制 | 6项新增及10项相关旧检查的有限运行证据通过，独立源码/数据/运行证据审查通过；`8065395b` | 保留真实探测状态、归档隔离及明确的RecordingOnly生成源映射；完整922输入清单更新，实际录制及native/provider另验 |
 | ring/psm编译器家族探测 | 6项新增及4项相关旧检查的有限运行证据通过，独立源码/数据/运行证据审查通过；`ad6fb35e` | 固定E、help/version、同文件重试及真实状态记录；修复损坏回执崩溃，该片仅覆盖探测；后续Compile见下面新检查点，provider资格仍待 |
 | Anyhow消费者识别 | 2项受影响新运行通过，14项未变路径证据复用，源码/运行/组合及数据独立审查通过；`bc73cea9` | `--check-cfg`声明不再误认成子探测；与Native6精确合并，bundled RecordingOnly配方保留 |
@@ -344,7 +345,7 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 尚未完成的整体范围：
 
 1. 受控构建与原生SQLite：ring/psm归档、lz4/zstd原生编译与归档的严格分派，zstd/Anyhow/Serde修补后的真实消费者路径、选定编译来源/布局/规则、SQLite最终可执行文件及同进程provider资格。普通录制中的psm成功及30次对象编译成功不替代这些条件。
-2. 完整财务历史回放：Stage3A核心、Original初始化、sidecar及审计资源生命周期已实现并通过上述定向检查；真实SQL/审计/环境与品种身份接线、事务与Source-tail，以及全历史prepare→render累计16MiB路径仍待。阶段性fixture不能作为完整成功。
+2. 完整财务历史回放：Stage3A核心、Original初始化、sidecar、审计及BEGIN/提前退出事务生命周期已实现并通过上述定向检查；真实SQL/审计/环境与品种身份接线、读取/capture/COMMIT与Source-tail，以及全历史prepare→render累计16MiB路径仍待。阶段性fixture不能作为完整成功。
 3. 目标迁移与恢复：exact6→8增量目标、原全部非空财务历史保全、早期代际映射、整制品批准绑定、原子交换、启动/冷恢复及生产重新资格。
 4. 正式资金和正向F2：真实账户B/allocation/seed/cutover批准、唯一正向intent发行与持久版本、调度和实际Paper消费。只读提案和完整拒绝记录不能代替这些条件。
 5. 真实上游资格：实际SDK/source/provider合同、原生身份、整数价格/数量、时间与有效窗、tick/band/halt/liquidity/lifecycle和同版本RPC事实。
