@@ -2064,6 +2064,235 @@ if CASE.startswith('namespace_'):
 emit(app_event);emit({'reason':'build-finished','success':True})
 '''
 
+# Stage A fixture: fresh synthetic tools; no real Cargo, compiler or archive.
+E1_NATIVE = r'''
+import json,os,pathlib,signal,sys,threading,uuid
+args=sys.argv[1:];env=dict(os.environ);session=pathlib.Path(env['E1_SESSION']);case=env['E1_CASE']
+hits=session/'foreign-entry';hits.mkdir(exist_ok=True)
+pair=tuple(map(int,env['CARGO_MAKEFLAGS'].split('--jobserver-fds=')[1].split()[0].split(',')))
+entry={'argv':args,'environment':env,'cwd':str(pathlib.Path.cwd()),'stdin_eof':sys.stdin.buffer.read()==b'',
+       'fds':list(pair),'inodes':[os.fstat(fd).st_ino for fd in pair]}
+(hits/uuid.uuid4().hex).write_text(json.dumps(entry))
+if args[0]=='-E':
+    source=pathlib.Path(args[-1])
+    if case=='post_missing':source.unlink()
+    if case=='post_change':source.write_bytes(b'X'*206)
+    if case=='source_post':
+        manifest=pathlib.Path(env['CARGO_MANIFEST_PATH']);manifest.chmod(0o644);manifest.write_bytes(b'TEST_CODE_drift')
+    if case.startswith('warning_') and '--' not in args:
+        os.write(1 if case=='warning_stdout' else 2,b'-Wslash-u-filename\n');sys.exit(3)
+    if case=='streams':
+        threads=[threading.Thread(target=os.write,args=(fd,byte*120000)) for fd,byte in ((1,b'O'),(2,b'E'))]
+        for t in threads:t.start()
+        for t in threads:t.join()
+    else:os.write(1,b'"clang" "gcc"\n')
+    if case=='signal':os.kill(os.getpid(),signal.SIGTERM)
+    sys.exit(7 if case=='e_nonzero' else 0)
+if args==['-?']:
+    os.write(1,b'TEST_CODE_help_stdout\n');os.write(2,b'TEST_CODE_help_stderr\n')
+    sys.exit(0 if case=='help_zero' else 9)
+assert args==['--version']
+os.write(1,b'ziglang TEST_CODE\n' if case in ('version_zig','version_nonzero') else b'Apple clang TEST_CODE\n')
+os.write(2,b'TEST_CODE_version_stderr\n');sys.exit(4 if case=='version_nonzero' else 0)
+'''
+
+E1_CARGO = r'''
+import hashlib,json,os,pathlib,subprocess,sys,threading
+CASE=__CASE__;argv=sys.argv[1:];app=pathlib.Path(argv[argv.index('--manifest-path')+1]).parent;session=app.parent
+target=session/'target';host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+base=dict(os.environ,E1_SESSION=str(session),E1_CASE=CASE,D1_SESSION=str(session),D1_CASE='normal',CARGO_ENCODED_RUSTFLAGS='')
+def emit(e):print(json.dumps(e),flush=True)
+def compile(name,source,pkg,dest,extra=()):
+    root=source.parent.parent;env=dict(base,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),
+        CARGO_PKG_NAME=name,CARGO_PKG_VERSION='1.2.59' if name=='cc' else '0.0.0',
+        DYLD_FALLBACK_LIBRARY_PATH=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+    args=['--crate-name',name,'--edition=2021',str(source),'--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),*extra]
+    result=subprocess.run([env['RUSTC_WRAPPER'],env['RUSTC'],*args],cwd=root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    assert result.returncode==0,result.stderr
+    emit({'reason':'compiler-artifact','package_id':pkg,'target':{'src_path':str(source),'name':name,'kind':['lib'],'crate_types':['lib']},
+          'features':[],'filenames':[str(dest/('lib'+name+'.rlib')),str(dest/('lib'+name+'.rmeta'))],'executable':None,'fresh':False})
+compile('cc',session/'vendor/cc/src/lib.rs','registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59',host)
+read,write=os.pipe();other_read,other_write=os.pipe();opened=[read,write,other_read,other_write]
+original_stats=[os.fstat(fd).st_ino for fd in (read,write)]
+native_loader=':'.join(map(str,(target/'debug',host,pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']).parent/'lib/rustlib/x86_64-apple-darwin/lib',pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']))))
+results=[]
+def family(name,ordinal):
+    root=session/'vendor'/name;version='0.17.14' if name=='ring' else '0.1.30';major,minor,patch=version.split('.')
+    out=target/'x86_64-apple-darwin/debug/build'/(name+'-0123456789abcdef')/'out';out.mkdir(parents=True,exist_ok=True)
+    features=['alloc','default','dev_urandom_fallback','std'] if name=='ring' else []
+    env=dict(base,CARGO=argv[0] if False else os.environ.get('CARGO',sys.argv[0]),CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),
+        CARGO_PKG_NAME=name,CARGO_PKG_VERSION=version,CARGO_PKG_VERSION_MAJOR=major,CARGO_PKG_VERSION_MINOR=minor,CARGO_PKG_VERSION_PATCH=patch,CARGO_PKG_VERSION_PRE='',
+        HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',CARGO_CFG_TARGET_ARCH='x86_64',CARGO_CFG_TARGET_OS='macos',CARGO_CFG_TARGET_ENV='',
+        CARGO_CFG_TARGET_ENDIAN='little',CARGO_CFG_TARGET_VENDOR='apple',CARGO_CFG_TARGET_POINTER_WIDTH='64',CARGO_CFG_TARGET_FAMILY='unix',
+        CARGO_CFG_TARGET_ABI='',CARGO_CFG_UNIX='',CARGO_CFG_FEATURE=','.join(features),DEBUG='true',OPT_LEVEL='0',PROFILE='debug',
+        CARGO_CFG_TARGET_FEATURE='cmpxchg16b,fxsr,sse,sse2,sse3,sse4.1,ssse3',CARGO_CFG_TARGET_HAS_ATOMIC='128,16,32,64,8,ptr',
+        CARGO_CFG_DEBUG_ASSERTIONS='',CARGO_CFG_PANIC='unwind',
+        OUT_DIR=str(out),LC_CTYPE='C.UTF-8',DYLD_FALLBACK_LIBRARY_PATH=native_loader,
+        CARGO_MAKEFLAGS=f'-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}')
+    for k in ('LC_ALL','ZERO_AR_DATE'):env.pop(k,None)
+    env.update({'CARGO_FEATURE_'+f.upper().replace('-','_'):'1' for f in features})
+    if name=='ring':env['CARGO_MANIFEST_LINKS']='ring_core_0_17_14_'
+    source=out/(str(ordinal)+'detect_compiler_family.c');source.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())
+    args=['-E',str(source)];role='CC';saved={}
+    if CASE=='source_post':saved[root/'Cargo.toml']=(root/'Cargo.toml').read_bytes()
+    if CASE.startswith('reject_'):
+        choice=CASE[7:]
+        if choice=='name':env['CARGO_PKG_NAME']='unknown'
+        if choice=='version':env['CARGO_PKG_VERSION']='0.0.0'
+        if choice=='component':env['CARGO_PKG_VERSION_PATCH']='0'
+        if choice=='manifest':env['CARGO_MANIFEST_PATH']=str(app/'Cargo.toml')
+        if choice=='manifest_absent':env.pop('CARGO_MANIFEST_PATH')
+        if choice=='labels_absent':env.pop('CARGO_PKG_NAME')
+        if choice=='features':env['CARGO_FEATURE_UNKNOWN']='1'
+        if choice=='locale':env['LC_ALL']='C';env.pop('LC_CTYPE')
+        if choice=='out':env['OUT_DIR']=str(target)
+        if choice=='target':env['CARGO_CFG_TARGET_ARCH']='aarch64'
+        if choice=='branch':env['CARGO_CFG_MIRI']=''
+        if choice=='fd_missing':env.pop('CARGO_MAKEFLAGS')
+        if choice=='fd_reversed':env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={write},{read} --jobserver-auth={write},{read}'
+        if choice=='fd_foreign':env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={read},{other_write} --jobserver-auth={read},{other_write}'
+        if choice=='fd_closed':env['CARGO_MAKEFLAGS']='-j --jobserver-fds=500,501 --jobserver-auth=500,501'
+        if choice=='literal':source.write_bytes(b'X'*206)
+        if choice=='extent':source.write_bytes(source.read_bytes()+b'X')
+        if choice=='hardlink':copy=out/'literal-copy';copy.write_bytes(source.read_bytes());source.unlink();os.link(copy,source)
+        if choice=='symlink':source.unlink();source.symlink_to(session/'vendor/cc/src/detect_compiler_family.c')
+        if choice=='overflow':source=out/('18446744073709551616detect_compiler_family.c');source.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes());args=['-E',str(source)]
+        if choice=='source':path=root/'build.rs';saved[path]=path.read_bytes();path.chmod(0o644);path.write_bytes(b'TEST_CODE_drift')
+        if choice=='unknown':root=app;env['CARGO_MANIFEST_DIR']=str(app)
+        if choice=='compile':args=['-c',str(root/'build.rs'),'-o',str(out/'foreign.o')]
+        if choice=='archive':role='AR';args=['cqD',str(out/'foreign.a'),str(out/'foreign.o')]
+        if choice=='retry':args=['-E','--',str(source)]
+        if choice=='retry_reordered':args=['--','-E',str(source)]
+        if choice=='extra_help':args=['-?','--version']
+        if choice=='attached_help':args=['-?--version']
+        if choice=='extra_version':args=['--version','-?']
+        if choice=='wrong_role':role='AR';args=['-?']
+    def execute(raw):
+        result=subprocess.run([env[role],*raw],cwd=root,env=env,pass_fds=tuple(opened),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        results.append({'name':name,'args':raw,'status':result.returncode,'stdout_hex':result.stdout.hex(),'stderr_hex':result.stderr.hex()})
+        return result
+    result=execute(args)
+    if CASE=='duplicate_e':execute(args)
+    if CASE.startswith('warning_') and result.returncode==3:execute(['-E','--',str(source)])
+    if not CASE.startswith('reject_'):
+        execute(['-?']);execute(['--version'])
+    for path,body in saved.items():path.write_bytes(body);path.chmod(0o444)
+    if CASE not in ('post_missing','post_change','source_post','survive') and source.exists() and not source.is_symlink():source.unlink()
+if CASE=='concurrent':
+    threads=[threading.Thread(target=family,args=('ring',i)) for i in (10,11)]
+    for t in threads:t.start()
+    for t in threads:t.join()
+else:
+    family('ring',10);family('psm',11)
+assert [os.fstat(fd).st_ino for fd in (read,write)]==original_stats
+for fd in opened:os.close(fd)
+(session/'foreign-forwarded.json').write_text(json.dumps(results))
+paths=list((session/'foreign-native-invocations').glob('*/receipt.json'))
+if CASE=='request_only':paths[0].unlink()
+if CASE in ('snapshot_changed','snapshot_missing'):
+    p=next(p for p in paths if 'input_post' in json.loads(p.read_text()));r=json.loads(p.read_text());snapshot=p.parent/r['input_post']['snapshot']
+    snapshot.unlink() if CASE=='snapshot_missing' else snapshot.write_bytes(b'TEST_CODE_changed')
+cc_path=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(session/'vendor/cc/src/lib.rs'))
+if CASE in ('borrowed_request','borrowed_initial','borrowed_target','borrowed_context'):
+    leaf='request.json' if CASE=='borrowed_request' else 'invocation.json';p=cc_path.parent/leaf;r=json.loads(p.read_text())
+    if CASE=='borrowed_request':r['cwd_hex']=os.fsencode(str(app)).hex()
+    elif CASE=='borrowed_initial':r['argv_hex'][0]=b'/foreign'.hex()
+    elif CASE=='borrowed_target':r['role']='Target'
+    else:r['context']={'kind':'DirectCargoProbe'}
+    p.write_text(json.dumps(r))
+if CASE.startswith('ownership_'):
+    p=next(p for p in paths if 'input_post' in json.loads(p.read_text()));native=json.loads(p.read_text());snapshot=p.parent/native['input_post']['snapshot']
+    copied=target/'copied-native.bin';copied.write_bytes(snapshot.read_bytes());r=json.loads(cc_path.read_text());kind=CASE[10:]
+    value=str(snapshot if kind=='snapshot' else copied)
+    if kind in ('source','snapshot','relative'):
+        if kind=='relative':value=os.path.relpath(value,session/'vendor/cc')
+        for o in r['outputs']:
+            if o['kind']=='dep-info':o['dep_info']['paths'].append(value)
+    elif kind=='output':r['declared_outputs'].append({'path':value,'kind':'link'})
+    elif kind=='extern':r['externs'].append({'name':'foreign','path':value})
+    elif kind=='artifact':emit({'reason':'compiler-artifact','package_id':'TEST_CODE_app','target':{'src_path':str(app/'src/lib.rs'),'name':'stock_analysis','kind':['lib'],'crate_types':['lib']},'features':[],'filenames':[value],'executable':None,'fresh':False})
+    cc_path.write_text(json.dumps(r))
+stream_controls=[]
+if CASE.startswith('stream_') or CASE=='forward_fault':
+    # Real wrapper capture first, then ownership claims and independent mutations.
+    specifications=[tuple(CASE.split('_')[1:])] if CASE!='forward_fault' else [
+        ('stdout','output','deleted'),('stderr','extern','mutated')]
+    for stream,role,cut in specifications:
+        request_cut=None
+        invalid_state=cut=='deletedinvalidstate'
+        if invalid_state:cut='deleted'
+        if cut in ('mutatedmissingrequest','deletedcorruptrequest'):
+            request_cut='missing' if cut=='mutatedmissingrequest' else 'corrupt'
+            cut='mutated' if request_cut=='missing' else 'deleted'
+        input_copy=stream=='input'
+        actual='input_post' if input_copy else 'stderr' if stream=='empty' else stream
+        wanted='CompilerFamilyHelpProbe' if actual=='stderr' and stream!='empty' else 'CompilerFamilyFileProbe'
+        p=next(p for p in paths if p.is_file() and json.loads(p.read_text()).get('operation',{}).get('class')==wanted)
+        observed=json.loads(p.read_text());raw=p.parent/(observed[actual]['snapshot'] if input_copy else actual+'.raw');body=raw.read_bytes()
+        assert bool(body)==(stream!='empty')
+        retained=observed[actual]['sha256'] if input_copy else observed[actual+'_sha256'];assert retained==hashlib.sha256(body).hexdigest()
+        copied=target/('copied-stream-'+stream+'-'+role+'.bin');copied.write_bytes(body)
+        if role=='generated':
+            out=target/'x86_64-apple-darwin/debug/build/stock_analysis-2222222222222222/out';out.mkdir(parents=True)
+            copied=out/'copied-stream.bin';copied.write_bytes(body);(out/'ordinary.txt').write_bytes(b'TEST_CODE_ordinary_generated')
+            dest=target/'debug/build/stock_analysis-1111111111111111';source=app/'build.rs'
+            env=dict(base,CARGO_MANIFEST_DIR=str(app),CARGO_MANIFEST_PATH=str(app/'Cargo.toml'),CARGO_PKG_NAME='stock_analysis',
+                     CARGO_PKG_VERSION='0.0.0',DYLD_FALLBACK_LIBRARY_PATH=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+            args=['--crate-name','build_script_build','--edition=2021',str(source),'--crate-type','bin','--emit=dep-info,link','--out-dir',str(dest)]
+            result=subprocess.run([env['RUSTC_WRAPPER'],env['RUSTC'],*args],cwd=app,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            assert result.returncode==0,result.stderr
+            emit({'reason':'compiler-artifact','package_id':'TEST_CODE_app','target':{'src_path':str(source),'name':'build_script_build',
+                  'kind':['custom-build'],'crate_types':['bin']},'features':[],'filenames':[str(dest/'build_script_build')],'executable':None,'fresh':False})
+            emit({'reason':'build-script-executed','package_id':'TEST_CODE_app','out_dir':str(out),'linked_libs':[],'linked_paths':[],'cfgs':[],'env':[]})
+        r=json.loads(cc_path.read_text());value=str(copied)
+        if role=='source':
+            for output in r['outputs']:
+                if output['kind']=='dep-info':output['dep_info']['paths'].append(value)
+        elif role=='output':r['declared_outputs'].append({'path':value,'kind':'link'})
+        elif role=='extern':r['externs'].append({'name':'copied_stream','path':value})
+        cc_path.write_text(json.dumps(r))
+        control={'stream':stream,'role':role,'cut':cut,'path':value,'operation_id':p.parent.name,
+                 'raw_path':str(raw),'retained_sha256':retained,'body_hex':body.hex(),'original_protocol_state':observed['protocol_state']}
+        matching=[q for q in (session/'foreign-native-invocations').glob('*/*.raw') if q.read_bytes()==body]
+        control['matching_raw_paths']=list(map(str,matching))
+        annotations=[q for q in paths if q.is_file() and (json.loads(q.read_text()).get('input_post',{}).get('sha256')
+                     if input_copy else json.loads(q.read_text()).get(actual+'_sha256'))==retained]
+        control['matching_receipt_paths']=list(map(str,annotations))
+        if cut=='mutated':
+            for q in matching:q.write_bytes(b'TEST_CODE_stream_drift_'+actual.encode())
+        elif cut=='deleted':
+            for q in matching:q.unlink()
+        elif cut=='annotation':
+            for q in annotations:
+                data=json.loads(q.read_text());data.pop(actual+'_sha256');q.write_text(json.dumps(data))
+        elif cut=='requestonly':
+            for q in annotations:q.unlink()
+        if invalid_state:
+            control['invalid_snapshot_field']='input_pre'
+            for q in annotations:
+                data=json.loads(q.read_text());data['input_pre']='TEST_CODE_invalid_state';q.write_text(json.dumps(data))
+        if request_cut:
+            control['request_cut']=request_cut
+            control['matching_request_paths']=[str(q.parent/'request.json') for q in annotations]
+            for name in control['matching_request_paths']:
+                q=pathlib.Path(name)
+                if request_cut=='missing':q.unlink()
+                else:q.write_bytes(b'{TEST_CODE_invalid_request')
+        stream_controls.append(control)
+compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,['--target','x86_64-apple-darwin'])
+for control in stream_controls:
+    if control['role']=='artifact':
+        # Claim ordinary app products and their real Cargo artifact/selection edge.
+        p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(app/'src/lib.rs'))
+        r=json.loads(p.read_text());body=bytes.fromhex(control['body_hex']);changed=[]
+        for output in r['outputs']:
+            if output['kind'] in ('link','metadata'):
+                pathlib.Path(output['path']).write_bytes(body);output['sha256']=control['retained_sha256'];changed.append(output['path'])
+        p.write_text(json.dumps(r));control['artifact_paths']=changed
+(session/'stream-copy-controls.json').write_text(json.dumps(stream_controls))
+emit({'reason':'build-finished','success':True})
+'''
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -3839,6 +4068,311 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertNotIn("native_record_sha256", record)
         session = Path(json.loads(result.stdout)["record_path"]).parent
         self.assertFalse((session/"native-invocations").exists())
+
+    def prepare_native_e1(self, case="normal"):
+        shutil.copyfile(TOOL, self.tool)
+        inventory = self.prepare_d1()
+        vendor = self.root / "vendor-origin"
+        for name, version in (("ring", "0.17.14"), ("psm", "0.1.30")):
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+            write(vendor / name / "build.rs", "// TEST_CODE fixed foreign builder\n")
+            write(vendor / name / "src/lib.rs", "// TEST_CODE fixed foreign library\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        write(vendor / "ring/pregenerated/TEST_CODE.s", "// TEST_CODE packaged assembly directory\n")
+        write(vendor / "cc/src/command_helpers.rs", "// TEST_CODE fixed cc command closure\n")
+        inventory["vendor"] = snapshot(vendor, ["dep", "libsqlite3-sys", "cc", "diesel", "rusqlite", "ring", "psm"])
+        rustc_body = D1_RUSTC.replace("__BUILDER__", repr(D1_BUILDER)).replace(
+            "inputs=[str(source)]", "inputs=[str(source)]\nif name=='cc':inputs.append(str(source.parent/'detect_compiler_family.c'))")
+        for name, body in (("fake-rustc", rustc_body), ("fake-native-cc", E1_NATIVE),
+                           ("fake-cargo", E1_CARGO.replace("__CASE__", repr(case)))):
+            path = write(self.root / name, "#!" + PYTHON + " -I\n" + body); path.chmod(0o700)
+        for key, name in (("rustc", "fake-rustc"), ("cargo", "fake-cargo")):
+            inventory[key] = {"path": str(self.root / name), "sha256": sha(self.root / name)}
+        inventory["generators"]["CC"] = {"path": str(self.root / "fake-native-cc"), "sha256": sha(self.root / "fake-native-cc")}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        inventory["environment"]["PROTOC"] = inventory["rustc"]["path"]
+        if case in ("capture_fault", "forward_fault"):
+            body = self.tool.read_text()
+            if case == "capture_fault":
+                needle = 'try:dest=open(call/(name+".raw"),"xb")'
+                self.assertEqual(body.count(needle), 1)
+                body = body.replace(needle, 'try:\n                if env.get("E1_CASE")=="capture_fault" and name=="stderr":raise OSError("TEST_CODE capture")\n                dest=open(call/(name+".raw"),"xb")')
+            else:
+                needle = 'written = os.write(1 if stream == "stdout" else 2, view)'
+                self.assertEqual(body.count(needle), 1)
+                body = body.replace(needle, 'raise OSError("TEST_CODE forward")\n                            ' + needle)
+            self.tool.write_text(body)
+        inventory["owner_sha256"] = sha(self.tool)
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly",
+                                           "profile": owner.BUNDLED_PROFILE, "inventory": inventory}))
+        return inventory
+
+
+    def native_e1_result(self, case="normal"):
+        inventory = self.prepare_native_e1(case)
+        run = self.invoke("record")
+        self.assertEqual(run.returncode, 2, run.stdout.decode(errors="replace") + run.stderr.decode(errors="replace"))
+        record = self.record_result(run); session = Path(json.loads(run.stdout)["record_path"]).parent
+        foreign = json.loads((session / "foreign-native-record.json").read_text())
+        calls = [(p.parent, json.loads(p.read_text())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")]
+        self.assertEqual(record["foreign_native_record_sha256"], sha(session / "foreign-native-record.json"))
+        return inventory, session, record, foreign, calls
+
+
+    def test_native_e1_two_packages_capture_and_retirement(self):
+        for case, final in (("normal", "RetiredAfterCcReturn"), ("survive", "Present")):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls = self.native_e1_result(case)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertEqual(len(calls), 6)
+                self.assertTrue(all(r["protocol_state"] == "Completed" for _, r in calls))
+                probes = [(c, r) for c, r in calls if r["operation"]["class"] == "CompilerFamilyFileProbe"]
+                self.assertEqual({r["context"]["package_id"] for _, r in probes}, {owner.RING_PACKAGE, owner.PSM_PACKAGE})
+                for call, r in probes:
+                    self.assertEqual((call / "input-pre.raw").read_bytes(), D1_PROBE)
+                    self.assertEqual(owner.native_state_key(r["input_pre"]), owner.native_state_key(r["input_post"]))
+                    self.assertEqual(r["jobserver_identity"], r["jobserver_return"])
+                    retained = next(o for o in foreign["operations"] if o["operation_id"] == call.name)
+                    self.assertEqual(retained["input_final_state"], final)
+                hits = [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]
+                self.assertTrue(all(h["stdin_eof"] for h in hits))
+                for hit in hits:
+                    receipt = next(r for _, r in calls if [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]] == hit["argv"]
+                                   and r["context"]["manifest"] == hit["cwd"])
+                    self.assertEqual([e["fd"] for e in receipt["jobserver_identity"]["endpoints"]], hit["fds"])
+
+
+    def test_native_e1_fixed_context_literal_and_live_fd_rejections(self):
+        cases = ("name", "version", "component", "manifest", "manifest_absent", "labels_absent", "features",
+                 "locale", "out", "target", "branch", "source", "unknown", "literal", "extent", "hardlink",
+                 "symlink", "overflow", "fd_missing", "fd_reversed", "fd_foreign", "fd_closed", "compile", "archive")
+        for choice in cases:
+            with self.subTest(choice=choice):
+                _, session, _, foreign, calls = self.native_e1_result("reject_" + choice)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(all(r["protocol_state"] == "ProtocolRefused" and r["tool_result"] is None for _, r in calls))
+                self.assertFalse((session / "foreign-entry").exists())
+                self.assertTrue(any("ForeignProtocolSticky" in b for b in foreign["blockers"]))
+
+
+    def test_native_e1_warning_only_exact_same_file_retry(self):
+        for case in ("warning_stdout", "warning_stderr"):
+            with self.subTest(case=case):
+                _, _, _, foreign, calls = self.native_e1_result(case)
+                probes = [(c, r) for c, r in calls if r["operation"]["class"] == "CompilerFamilyFileProbe"]
+                self.assertEqual(len(probes), 4)
+                by_id = {c.name: r for c, r in probes}
+                for call, r in probes:
+                    self.assertEqual(r["protocol_state"], "Completed")
+                    if r["operation"]["retry"]:
+                        previous = by_id[r["operation"]["predecessor"]]
+                        self.assertEqual(previous["tool_result"], 3)
+                        self.assertEqual(previous["operation"]["source"], r["operation"]["source"])
+                        self.assertTrue(r["source_semantics"]["effective_stdout"])
+                self.assertFalse(any("ForeignOperation" in b for b in foreign["blockers"]))
+        for case, marker in (("reject_retry", "ForeignProbePredecessor"), ("reject_retry_reordered", "ForeignStageAArgv")):
+            with self.subTest(case=case):
+                _, session, _, _, calls = self.native_e1_result(case)
+                self.assertFalse((session / "foreign-entry").exists())
+                self.assertTrue(all(marker in r["failures"] for _, r in calls))
+        _, _, _, foreign, calls = self.native_e1_result("duplicate_e")
+        self.assertTrue(any("ForeignProtocolSticky" in b for b in foreign["blockers"]))
+        self.assertTrue(any(r["protocol_state"] == "ProtocolRefused" and "ForeignProbePredecessor" in r["failures"] for _, r in calls))
+
+
+    def test_native_e1_raw_status_streams_forward_and_post_faults(self):
+        for case, code in (("e_nonzero", 7), ("signal", -15), ("streams", 0)):
+            with self.subTest(case=case):
+                _, session, _, _, calls = self.native_e1_result(case)
+                forwarded = json.loads((session / "foreign-forwarded.json").read_text())
+                probes = [(c, r) for c, r in calls if r["operation"]["class"] == "CompilerFamilyFileProbe"]
+                for call, r in probes:
+                    self.assertEqual((r["protocol_state"], r["tool_result"]), ("Completed", code))
+                    observed = next(f for f in forwarded if f["args"] == [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]])
+                    self.assertEqual(observed["status"], code if code >= 0 else 128 - code)
+                    for s in ("stdout", "stderr"):
+                        self.assertEqual((call / (s + ".raw")).read_bytes().hex(), observed[s + "_hex"])
+                    if case == "streams":
+                        self.assertEqual((call / "stdout.raw").read_bytes(), b"O" * 120000)
+                        self.assertEqual((call / "stderr.raw").read_bytes(), b"E" * 120000)
+        for case in ("capture_fault", "forward_fault", "post_missing", "post_change", "source_post", "snapshot_changed", "snapshot_missing"):
+            with self.subTest(case=case):
+                _, _, record, foreign, calls = self.native_e1_result(case)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                self.assertTrue(any("ForeignOperation" in b for b in foreign["blockers"]))
+                if case in ("capture_fault", "forward_fault", "post_missing", "post_change"):
+                    self.assertTrue(any(r["protocol_state"] == "ProtocolRefused" and r["tool_result"] == 0 for _, r in calls))
+
+
+    def test_native_e1_help_version_source_semantics_and_ambiguous_concurrency(self):
+        for case in ("normal", "help_zero", "version_zig", "version_nonzero", "concurrent", "forward_fault"):
+            with self.subTest(case=case):
+                _, _, _, foreign, calls = self.native_e1_result(case)
+                helpers = [r for _, r in calls if r["operation"]["class"] != "CompilerFamilyFileProbe"]
+                self.assertTrue(all(r["operation"]["probe_predecessor"] == "not_observed" for r in helpers))
+                if case == "forward_fault":
+                    self.assertTrue(any("ForeignProtocolSticky" in b for b in foreign["blockers"]))
+                    continue
+                self.assertTrue(all(r["protocol_state"] == "Completed" for r in helpers))
+                for r in helpers:
+                    if r["operation"]["class"] == "CompilerFamilyHelpProbe":
+                        self.assertEqual(r["tool_result"], 0 if case == "help_zero" else 9)
+                        self.assertEqual(r["source_semantics"]["accepts_cl_style_flags"], case == "help_zero")
+                    else:
+                        self.assertEqual(r["source_semantics"]["zig_cc"], case == "version_zig")
+                        self.assertEqual(r["source_semantics"]["source_nonzero_default"], case == "version_nonzero")
+                self.assertTrue(all(g["family_pairing"] == "ambiguous_context_group" for g in foreign["context_groups"]))
+                if case == "concurrent":
+                    self.assertEqual(len(calls), 6); self.assertEqual(len(helpers), 4)
+                    self.assertEqual(len(foreign["context_groups"]), 1)
+                    self.assertEqual(len(foreign["context_groups"][0]["operations"]), 6)
+        for case in ("extra_help", "attached_help", "extra_version", "wrong_role"):
+            with self.subTest(case=case):
+                _, session, _, _, calls = self.native_e1_result("reject_" + case)
+                self.assertFalse((session / "foreign-entry").exists())
+                self.assertTrue(all(r["protocol_state"] == "ProtocolRefused" for _, r in calls))
+
+
+    def test_native_e1_seal_request_only_and_namespace_ownership(self):
+        _, session, record, foreign, calls = self.native_e1_result()
+        self.assertEqual(foreign["stage"], "StageAIncomplete")
+        self.assertEqual((foreign["native_producer_qualification"], foreign["artifact_selection"]), ("not_issued", "not_observed"))
+        self.assertEqual(set(foreign["unclosed"]), {"compiler-family-successors", "family-to-compile", "object", "archive", "builder-run", "consumer"})
+        self.assertFalse(any("NativeOutputRole" in b for b in record["blockers"]), record["blockers"])
+        literal = str(session / "vendor" / owner.PROBE_LITERAL)
+        self.assertTrue(any(c["path"] == literal and c["owner"] == {"tree": "vendor", "relative_path": owner.PROBE_LITERAL}
+                            for c in record["consumed_sources"]))
+        # Empty-stream ownership stays conservative; no generic 0B/vendor waiver.
+        self.assertIn(hashlib.sha256(b"").hexdigest(), foreign["quarantine"]["sha256"])
+        for case in ("request_only", "ownership_source", "ownership_snapshot", "ownership_relative", "ownership_output", "ownership_extern", "ownership_artifact",
+                     "borrowed_request", "borrowed_initial", "borrowed_target", "borrowed_context"):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls = self.native_e1_result(case)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                if case == "request_only":
+                    self.assertEqual(len(foreign["operations"]), 6); self.assertEqual(len(calls), 5)
+                    self.assertTrue(any("ForeignOperation" in b for b in foreign["blockers"]))
+                    requested = [json.loads(p.read_text()) for p in (session / "foreign-native-invocations").glob("*/request.json")]
+                    for r in requested:
+                        args = [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]]
+                        if args[:1] == ["-E"]:self.assertIn(args[-1], foreign["quarantine"]["paths"])
+                else:
+                    self.assertTrue(any("NativeOutputRole" in b for b in record["blockers"]), record["blockers"])
+                    denied = set(foreign["quarantine"]["paths"]) | {str(session / "target/copied-native.bin")}
+                    self.assertFalse(any(c["path"] in denied for c in record["consumed_sources"]))
+                    self.assertFalse(any(f in denied for a in record["selected_library"] for f in a["files"]))
+        stream_cases = ["stream_" + stream + "_" + role + "_current"
+                        for stream in ("stdout", "stderr") for role in ("source", "output", "extern", "artifact", "generated")]
+        stream_cases += ["stream_stdout_source_mutated", "stream_stderr_output_deleted",
+                         "stream_stdout_artifact_deleted", "stream_stderr_generated_mutated",
+                         "stream_stdout_source_annotation", "stream_stderr_extern_annotation",
+                         "stream_stdout_output_requestonly", "stream_stderr_source_requestonly",
+                         "stream_stdout_source_mutatedmissingrequest", "stream_stderr_extern_deletedcorruptrequest",
+                         "stream_input_source_mutatedmissingrequest", "stream_input_extern_deletedcorruptrequest",
+                         "stream_input_source_deletedinvalidstate",
+                         "forward_fault", "stream_empty_source_current"]
+        for case in stream_cases:
+            with self.subTest(case=case):
+                _, session, record, foreign, calls = self.native_e1_result(case)
+                self.assertEqual(record["cargo_exit_code"], 0)
+                controls = json.loads((session / "stream-copy-controls.json").read_text())
+                self.assertEqual(len(controls), 2 if case == "forward_fault" else 1)
+                for control in controls:
+                    path = control["path"]; retained = control["retained_sha256"]; cut = control["cut"]
+                    body = bytes.fromhex(control["body_hex"])
+                    self.assertEqual(hashlib.sha256(body).hexdigest(), retained)
+                    self.assertEqual(bool(body), control["stream"] != "empty")
+                    self.assertEqual(Path(path).read_bytes(), body)
+                    self.assertNotIn(path, foreign["quarantine"]["paths"])
+                    self.assertIn(retained, foreign["quarantine"]["sha256"])
+                    self.assertTrue(control["matching_raw_paths"])
+                    self.assertTrue(control["matching_receipt_paths"])
+                    current = {sha(p) for p in (session / "foreign-native-invocations").glob("*/*.raw")}
+                    if cut in ("mutated", "deleted"):
+                        # No surviving current raw file may supply the original digest.
+                        self.assertNotIn(retained, current)
+                        for name in control["matching_raw_paths"]:
+                            if cut == "deleted": self.assertFalse(Path(name).exists())
+                            else:
+                                self.assertNotEqual(sha(Path(name)), retained)
+                                self.assertIn(sha(Path(name)), foreign["quarantine"]["sha256"])
+                    elif cut == "annotation":
+                        for name in control["matching_receipt_paths"]:
+                            self.assertNotIn(control["stream"] + "_sha256", json.loads(Path(name).read_text()))
+                        self.assertIn(retained, current)
+                    elif cut == "requestonly":
+                        self.assertTrue(all(not Path(name).exists() for name in control["matching_receipt_paths"]))
+                        self.assertIn(retained, current)
+                        self.assertTrue(any("ForeignOperation" in b for b in foreign["blockers"]))
+                    if control.get("request_cut"):
+                        self.assertIn(cut, ("mutated", "deleted"))
+                        self.assertNotIn(retained, current)
+                        self.assertEqual(len(control["matching_request_paths"]), len(control["matching_receipt_paths"]))
+                        for name in control["matching_receipt_paths"]:
+                            receipt = json.loads(Path(name).read_text())
+                            value = receipt["input_post"]["sha256"] if control["stream"] == "input" else receipt[control["stream"] + "_sha256"]
+                            self.assertEqual(value, retained)
+                            self.assertTrue(any(b.startswith("ForeignNamespace:" + Path(name).parent.name + ":")
+                                                for b in foreign["blockers"]), foreign["blockers"])
+                        for name in control["matching_request_paths"]:
+                            if control["request_cut"] == "missing": self.assertFalse(Path(name).exists())
+                            else:
+                                with self.assertRaises(json.JSONDecodeError): json.loads(Path(name).read_bytes())
+                    if control["stream"] == "input":
+                        self.assertEqual((len(body), retained), (206, owner.PROBE_DIGEST))
+                        for name in control["matching_receipt_paths"]:
+                            receipt = json.loads(Path(name).read_text())
+                            self.assertEqual((receipt["input_post"]["length"], receipt["input_post"]["sha256"]), (206, retained))
+                            if control.get("invalid_snapshot_field"):
+                                self.assertEqual(receipt["input_pre"], "TEST_CODE_invalid_state")
+                                self.assertIn("ForeignNamespace:" + Path(name).parent.name + ":ForeignSnapshotFields", foreign["blockers"])
+                        literal = str(session / "vendor" / owner.PROBE_LITERAL)
+                        self.assertEqual(Path(literal).read_bytes(), body)
+                        self.assertTrue(any(c["path"] == literal and c["owner"] == {"tree": "vendor", "relative_path": owner.PROBE_LITERAL}
+                                            for c in record["consumed_sources"]), record["blockers"])
+                    if case == "forward_fault":
+                        self.assertEqual(control["original_protocol_state"], "ProtocolRefused")
+                        self.assertTrue(any("ForeignProtocolSticky" in b for b in foreign["blockers"]))
+                    denied = {path, *control.get("artifact_paths", [])}
+                    self.assertFalse(any(c["path"] in denied for c in record["consumed_sources"]))
+                    self.assertFalse(any(f in denied for a in record["selected_library"] for f in a["files"]))
+                    self.assertFalse(any(e["path"] in denied and e["producers"] for e in record["extern_edges"]))
+                    role = control["role"]
+                    if role == "output":
+                        cc_receipts = [(p, json.loads(p.read_text()))
+                                       for p in (session / "invocations").glob("*/receipt.json")]
+                        cc_receipts = [(p, r) for p, r in cc_receipts
+                                       if r.get("source") == str(session / "vendor/cc/src/lib.rs")]
+                        self.assertEqual(len(cc_receipts), 1)
+                        cc_path, cc = cc_receipts[0]
+                        cc_id = cc_path.parent.name
+                        sealed_cc = [r for r in record["invocations"] if r["invocation_id"] == cc_id]
+                        self.assertEqual(len(sealed_cc), 1)
+                        self.assertEqual(sealed_cc[0]["receipt_sha256"], sha(cc_path))
+                        self.assertIn("NativeOutputRole:" + cc_id, record["blockers"])
+                        self.assertTrue(any(o["path"] == path for o in cc["declared_outputs"]))
+                    elif role in ("source", "extern"):
+                        self.assertIn("NativeOutputRole:" + path, record["blockers"])
+                        if role == "extern":
+                            edge = [e for e in record["extern_edges"] if e["path"] == path]
+                            self.assertEqual(len(edge), 1); self.assertEqual(edge[0]["producers"], [])
+                    elif role == "artifact":
+                        self.assertEqual(len(control["artifact_paths"]), 2)
+                        self.assertTrue(all(sha(Path(f)) == retained for f in control["artifact_paths"]))
+                        self.assertIn("NativeOutputRole:CargoArtifact", record["blockers"])
+                        self.assertEqual(record["selected_library"], [])
+                    else:
+                        self.assertEqual(role, "generated")
+                        self.assertIn("NativeOutputRole:GeneratedFile:" + path, record["blockers"])
+                        associations = [a for a in record["build_script_associations"] if a["package_id"] == "TEST_CODE_app"]
+                        self.assertEqual(len(associations), 1)
+                        self.assertEqual(str(Path(path).parent), associations[0]["out_dir"])
+                        self.assertNotIn("copied-stream.bin", associations[0]["generated_files"])
+                        self.assertEqual(associations[0]["generated_files"]["ordinary.txt"], sha(Path(path).with_name("ordinary.txt")))
+                        self.assertNotIn("UnresolvedBuildScriptProducer", record["blockers"])
+
 
     def test_finite_argument_and_dep_info_parsers(self):
         for args in [["@response"], ["--sysroot", "/a", "--sysroot=/b"], ["-Zrandomize-layout"]]:

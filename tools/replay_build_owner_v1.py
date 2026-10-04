@@ -2655,12 +2655,478 @@ def native_operation(session, policy, owner, role, args, cwd, env, *, inspector=
     return call,receipt
 
 
+FOREIGN_LANE = "ForeignBuilderRecordingOnly"
+FOREIGN_PACKAGES = {"ring": ("0.17.14", RING_FEATURES, "ring_core_0_17_14_"),
+                    "psm": ("0.1.30", (), None)}
+FOREIGN_CC_MEMBERS = ("cc/Cargo.toml", "cc/src/lib.rs", "cc/src/tool.rs",
+                      "cc/src/tempfile.rs", "cc/src/command_helpers.rs", PROBE_LITERAL)
+
+
+def foreign_context(env, cwd, session, inv):
+    # Source recognition precedes labels, flags and OUT_DIR. No generic fallback.
+    require(cwd.is_absolute() and cwd.resolve() == cwd and not cwd.is_symlink(), "ForeignSourceAlias")
+    name = next((n for n in FOREIGN_PACKAGES if cwd == session / "vendor" / n), None)
+    require(name is not None, "ForeignSourceContext")
+    version, features, links = FOREIGN_PACKAGES[name]
+    package, root, out = fixed_source_package(name, version, cwd, env, session, inv, ())
+    require(env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and re.fullmatch(re.escape(name) + r"-[0-9a-f]{16}", out.parent.name), "ForeignManifestOutDir")
+    components = version.split(".")
+    require(all(env.get("CARGO_PKG_VERSION_" + k) == v for k, v in
+                zip(("MAJOR", "MINOR", "PATCH"), components))
+            and env.get("CARGO_PKG_VERSION_PRE") == "", "ForeignVersion")
+    require({k: v for k, v in env.items() if k.startswith("CARGO_FEATURE_")} ==
+            {"CARGO_FEATURE_" + f.upper().replace("-", "_"): "1" for f in features}
+            and env.get("CARGO_CFG_FEATURE") == ",".join(features)
+            and (env.get("CARGO_MANIFEST_LINKS") == links if links is not None
+                 else "CARGO_MANIFEST_LINKS" not in env), "ForeignFeaturesLinks")
+    expected = {"HOST": TARGET, "TARGET": TARGET, "CARGO_CFG_TARGET_ARCH": "x86_64",
+                "CARGO_CFG_TARGET_OS": "macos", "CARGO_CFG_TARGET_ENV": "",
+                "CARGO_CFG_TARGET_ENDIAN": "little", "CARGO_CFG_TARGET_VENDOR": "apple",
+                "CARGO_CFG_TARGET_POINTER_WIDTH": "64", "CARGO_CFG_TARGET_FAMILY": "unix",
+                "CARGO_CFG_TARGET_ABI": "", "CARGO_CFG_UNIX": "", "PROFILE": "debug",
+                "CARGO_CFG_TARGET_FEATURE": "cmpxchg16b,fxsr,sse,sse2,sse3,sse4.1,ssse3",
+                "CARGO_CFG_TARGET_HAS_ATOMIC": "128,16,32,64,8,ptr", "CARGO_CFG_DEBUG_ASSERTIONS": "",
+                "CARGO_CFG_PANIC": "unwind",
+                "DEBUG": "true", "OPT_LEVEL": "0"}
+    require(all(env.get(k) == v for k, v in expected.items()), "ForeignConfiguration")
+    require("CARGO_CFG_MIRI" not in env and "RING_PREGENERATE_ASM" not in env
+            and not (root / ".git").exists() and not (root / ".git").is_symlink(), "ForeignSourceBranch")
+    if name == "ring":
+        pregenerated = root / "pregenerated"
+        require(pregenerated.is_dir() and not pregenerated.is_symlink()
+                and pregenerated.resolve() == pregenerated, "ForeignSourceBranch")
+    cc_package = {"id": CC_PACKAGE, "tree": "vendor", "manifest": "cc/Cargo.toml"}
+    require(inv["packages"].count(cc_package) == 1, "ForeignCcPackage")
+    sources = {}
+    for member in (name + "/Cargo.toml", name + "/build.rs", *FOREIGN_CC_MEMBERS):
+        path = session / "vendor" / member
+        regular(path)
+        require(path.resolve() == path and path.stat().st_nlink == 1
+                and inv["vendor"]["files"].get(member) == file_hash(path), "ForeignSourcePin")
+        sources[member] = file_hash(path)
+    require(sources[PROBE_LITERAL] == PROBE_DIGEST
+            and (session / "vendor" / PROBE_LITERAL).stat().st_size == 206, "ForeignProbeLiteral")
+    return {"lane": FOREIGN_LANE, "package_id": package["id"], "manifest": str(root),
+            "out_dir": str(out), "source_sha256": sources}
+
+
+def foreign_environment(env, session, inv):
+    native_environment(env, session, inv)
+    require("LC_ALL" not in env and env.get("LC_CTYPE") == "C.UTF-8"
+            and "ZERO_AR_DATE" not in env, "ForeignProbeEnvironment")
+    require(env.get("CARGO") == inv["cargo"]["path"]
+            and env.get("HOME") == str(session / "home")
+            and env.get("TMPDIR") == str(session / "tmp")
+            and env.get("CARGO_HOME") == str(session / "cargo-home"), "ForeignSessionEnvironment")
+
+
+def foreign_controls(session, policy, owner, context):
+    inv = native_control(session, policy, owner)
+    return {"owner_source_sha256": file_hash(Path(__file__)), "policy_sha256": digest(POLICY.read_bytes()),
+            "session_owner_sha256": file_hash(session / "owner.json"),
+            "launchers": owner["native_launchers"], "tools": {r: inv["generators"][r] for r in ("CC", "AR")},
+            "source_sha256": context["source_sha256"]}
+
+
+def foreign_prior(session, context, current_call=None):
+    rows = []
+    root = session / "foreign-native-invocations"
+    if not root.exists(): return rows
+    for call in root.iterdir():
+        if call == current_call: continue
+        if (call / "receipt.json").is_file():
+            receipt = strict_json((call / "receipt.json").read_bytes())
+            if receipt.get("context") == context: rows.append((call, receipt))
+        else:
+            # A pending/request-only first E reserves its source identity too.
+            # Concurrent duplicate requests may both refuse; neither gains entry.
+            request = strict_json((call / "request.json").read_bytes())
+            cwd = os.fsdecode(bytes.fromhex(request["cwd_hex"]))
+            args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+            if cwd == context["manifest"] and args[:1] == ["-E"] and len(args) in (2, 3):
+                rows.append((call, {"context": context, "protocol_state": "ProtocolRefused",
+                    "failures": ["ForeignPendingRequest"], "operation": {"class": "CompilerFamilyFileProbe",
+                    "source": str((Path(cwd) / args[-1]).resolve()), "retry": len(args) == 3}}))
+    return rows
+
+
+def foreign_probe_classify(role, args, context, env, session, inv, *, history=None, current_call=None):
+    require(role == "cc", "ForeignRole")
+    # Fresh Command::new calls have no Tool.args or compile locale adjustment.
+    if args == ["-?"]:
+        return {"class": "CompilerFamilyHelpProbe", "context_group": context["out_dir"],
+                "probe_predecessor": "not_observed"}
+    if args == ["--version"]:
+        return {"class": "CompilerFamilyVersionProbe", "context_group": context["out_dir"],
+                "probe_predecessor": "not_observed"}
+    retry = len(args) == 3 and args[:2] == ["-E", "--"]
+    require((len(args) == 2 and args[:1] == ["-E"]) or retry, "ForeignStageAArgv")
+    path = Path(args[-1]); out = Path(context["out_dir"])
+    match = re.fullmatch(r"(0|[1-9][0-9]{0,19})detect_compiler_family\.c", path.name)
+    require(match and int(match[1]) <= 2**64 - 1 and path.parent == out
+            and path.is_absolute() and str(path) == args[-1] and path.resolve() == path, "ForeignProbePath")
+    rows = foreign_prior(session, context, current_call) if history is None else history
+    prior = [(c, r) for c, r in rows if r.get("operation", {}).get("source") == str(path)]
+    require((not retry and not prior) or (retry and len(prior) == 1), "ForeignProbePredecessor")
+    predecessor = None
+    if retry:
+        call, receipt = prior[0]
+        require(receipt["protocol_state"] == "Completed" and not receipt["failures"]
+                and receipt["operation"]["class"] == "CompilerFamilyFileProbe"
+                and not receipt["operation"]["retry"]
+                and any(b"-Wslash-u-filename" in (call / (s + ".raw")).read_bytes()
+                        for s in ("stdout", "stderr")), "ForeignProbePredecessor")
+        native_state_check(call, receipt["input_post"], live=history is None)
+        predecessor = call.name
+    return {"class": "CompilerFamilyFileProbe", "source": str(path), "retry": retry,
+            "predecessor": predecessor, "context_group": context["out_dir"]}
+
+
+def foreign_semantics(call, receipt):
+    code = receipt["tool_result"]
+    require(type(code) is int, "ForeignToolStatus")
+    kind = receipt["operation"]["class"]
+    stdout = (call / "stdout.raw").read_bytes().decode("utf-8", errors="replace")
+    stderr = (call / "stderr.raw").read_bytes().decode("utf-8", errors="replace")
+    if kind == "CompilerFamilyHelpProbe":
+        return {"accepts_cl_style_flags": code == 0,
+                "source_branch": "MsvcArmCandidate" if code == 0 else "ClStyleRejected"}
+    if kind == "CompilerFamilyVersionProbe":
+        return {"zig_cc": code == 0 and "ziglang" in stdout,
+                "source_nonzero_default": code != 0}
+    warning = "-Wslash-u-filename" in stdout or "-Wslash-u-filename" in stderr
+    effective = code == 0 and (receipt["operation"]["retry"] or not warning)
+    return {"warning_retry_requested": warning and not receipt["operation"]["retry"],
+            "effective_stdout": effective,
+            "markers": {m: ('"' + m + '"') in stdout for m in ("clang", "gcc", "emscripten", "VxWorks")}}
+
+
+def foreign_operation(session, policy, owner, role, args, cwd, env):
+    namespace = session / "foreign-native-invocations"
+    namespace.mkdir(mode=0o700, exist_ok=True)
+    require(namespace.resolve() == namespace and not namespace.is_symlink(), "ForeignNamespaceAlias")
+    call = namespace / uuid.uuid4().hex; call.mkdir(mode=0o700)
+    request = {"schema": NATIVE_SCHEMA, "state": "RecordingOnly", "lane": FOREIGN_LANE,
+               "role": role, "args_hex": [os.fsencode(a).hex() for a in args],
+               "cwd_hex": os.fsencode(str(cwd)).hex(),
+               "environment_hex": {os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in env.items()},
+               "owner_issued_inspector": False}
+    atomic_json(call / "request.json", request)
+    receipt = dict(request, operation_id=call.name, protocol_state="ProtocolRefused", tool_result=None, failures=[])
+    try:
+        inv = native_control(session, policy, owner)
+        context = foreign_context(env, cwd, session, inv); receipt["context"] = context
+        foreign_environment(env, session, inv)
+        controls = foreign_controls(session, policy, owner, context); receipt["controls_pre"] = controls
+        operation = foreign_probe_classify(role, args, context, env, session, inv, current_call=call); receipt["operation"] = operation
+        tool = pinned_file(inv["generators"]["CC"])
+        receipt["tool_sha256"] = inv["generators"]["CC"]["sha256"]
+        receipt["argv_hex"] = [os.fsencode(v).hex() for v in [tool, *args]]
+        if operation["class"] == "CompilerFamilyFileProbe":
+            receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw", bound=206)
+            require(receipt["input_pre"]["length"] == 206 and receipt["input_pre"]["sha256"] == PROBE_DIGEST,
+                    "ForeignProbeLiteral")
+        fds = inherited_jobserver_fds(env)
+        require(len(fds) == 2, "ForeignJobserverRequired")
+        receipt["jobserver_identity"] = native_jobserver_identity(fds)
+        code, faults = native_streamed([tool, *args], cwd, env, call, fds, {})
+        receipt["tool_result"] = code; receipt["failures"].extend(faults)
+        if "input_pre" in receipt:
+            receipt["input_post"] = native_snapshot(call, operation["source"], "input-post.raw", bound=206)
+            require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"]), "ForeignInputChanged")
+        post_context = foreign_context(env, cwd, session, inv)
+        receipt["controls_post"] = foreign_controls(session, policy, owner, post_context)
+        require(receipt["controls_post"] == controls, "ForeignControlChanged")
+        require(not receipt["failures"], "ForeignCaptureSticky")
+        receipt["source_semantics"] = foreign_semantics(call, receipt)
+        receipt["protocol_state"] = "Completed"
+    except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
+        receipt["failures"].append(str(error))
+    for stream in ("stdout", "stderr"):
+        path = call / (stream + ".raw")
+        try:
+            if path.is_file():
+                receipt[stream + "_sha256"] = file_hash(path)
+                with open(path, "rb") as source:
+                    for block in iter(lambda: source.read(65536), b""):
+                        view = memoryview(block)
+                        while view:
+                            written = os.write(1 if stream == "stdout" else 2, view)
+                            require(written > 0, "ForeignForwardZero:" + stream)
+                            view = view[written:]
+                require(file_hash(path) == receipt[stream + "_sha256"], "ForeignStreamChanged")
+        except (OSError, Refusal) as error:
+            receipt["protocol_state"] = "ProtocolRefused"
+            receipt["failures"].append("ForeignForward:" + stream + ":" + str(error))
+    # A fault swallowed by cc stays in this receipt and in the aggregate seal.
+    if receipt["protocol_state"] == "Completed":
+        try:
+            context = foreign_context(env, cwd, session, inv)
+            receipt["controls_return"] = foreign_controls(session, policy, owner, context)
+            require(receipt["controls_return"] == receipt["controls_pre"], "ForeignControlChanged")
+            receipt["jobserver_return"] = native_jobserver_identity(fds)
+            require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
+            if "input_post" in receipt: native_state_check(call, receipt["input_post"], live=True)
+        except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+            receipt["protocol_state"] = "ProtocolRefused"; receipt["failures"].append(str(error))
+    atomic_json(call / "receipt.json", receipt)
+    return call, receipt
+
+
+def foreign_evidence_namespace(session):
+    paths, probes, hashes, blockers = set(), set(), set(), []
+    namespace = session / "foreign-native-invocations"
+    if not namespace.exists() and not namespace.is_symlink(): return paths, probes, hashes, blockers
+    if not (namespace.is_dir() and namespace.resolve() == namespace and not namespace.is_symlink()):
+        return paths, probes, hashes, ["ForeignNamespaceAlias"]
+    for call in namespace.iterdir():
+        try:
+            require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call
+                    and not call.is_symlink(), "ForeignCallAlias")
+        except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
+            blockers.append("ForeignNamespace:" + call.name + ":" + str(error)); continue
+        try:
+            # Snapshot and stream bytes stay denied even if annotations vanish.
+            # Empty hashes conservatively deny every 0B ordinary-file copy too.
+            for snapshot in call.glob("*.raw"):
+                paths.add(str(snapshot.resolve()))
+                if snapshot.is_file() and not snapshot.is_symlink(): hashes.add(file_hash(snapshot))
+        except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
+            blockers.append("ForeignNamespace:" + call.name + ":" + str(error))
+        receipt = None
+        try:
+            receipt_path = call / "receipt.json"
+            if receipt_path.is_file() and not receipt_path.is_symlink():
+                receipt = strict_json(receipt_path.read_bytes())
+                require(isinstance(receipt, dict), "ForeignSnapshotFields")
+                # Retained stream ownership is independent of request validity.
+                for stream in ("stdout", "stderr"):
+                    sha = receipt.get(stream + "_sha256")
+                    if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+                # Harvest every valid digest; one bad state cannot hide another.
+                # Shape and cwd-dependent path checks remain in the request phase.
+                for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
+                    state = receipt.get(key)
+                    if isinstance(state, dict):
+                        sha = state.get("sha256")
+                        if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+        except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
+            receipt = None
+            blockers.append("ForeignNamespace:" + call.name + ":" + str(error))
+        try:
+            request = strict_json((call / "request.json").read_bytes())
+            cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            require(cwd.is_absolute(), "ForeignSourceAlias")
+            args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+            declared = []
+            if args[:1] == ["-E"] and len(args) >= 2:
+                declared.append(args[-1]); probes.add(str((cwd / args[-1]).resolve()))
+            for index, arg in enumerate(args[:-1]):
+                if arg in {"-o", "-c"}: declared.append(args[index + 1])
+            if request["role"] == "ar" and len(args) >= 2: declared.extend(args[1:])
+            paths.update(str((cwd / value).resolve()) for value in declared)
+            if receipt is not None:
+                for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
+                    state = receipt.get(key, {})
+                    require(isinstance(state, dict), "ForeignSnapshotFields")
+                    if "path" in state: paths.add(str((cwd / state["path"]).resolve()))
+                    if "snapshot" in state: paths.add(str((call / state["snapshot"]).resolve()))
+        except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
+            blockers.append("ForeignNamespace:" + call.name + ":" + str(error))
+    for value in paths:
+        path = Path(value)
+        if path.is_file() and not path.is_symlink(): hashes.add(file_hash(path))
+    return paths, probes, hashes, blockers
+
+
+def foreign_owned(value, cwd, paths, hashes):
+    path = (Path(cwd) / value).resolve()
+    return str(path) in paths or (bool(hashes) and path.is_file() and not path.is_symlink()
+                                  and file_hash(path) in hashes)
+
+
+def foreign_borrowed_cc_literal(value, receipt, session, inv, artifacts):
+    """Root's sole provenance exception: cc's pinned include_bytes dep-info edge."""
+    try:
+        literal = session / "vendor" / PROBE_LITERAL
+        require(os.path.join(receipt["cwd"], value) == str(literal), "ForeignBorrowedLiteralPath")
+        regular(literal)
+        require(literal.resolve() == literal and literal.stat().st_nlink == 1
+                and file_hash(literal) == PROBE_DIGEST == inv["vendor"]["files"][PROBE_LITERAL], "ForeignBorrowedLiteralPin")
+        call = session / "invocations" / receipt["invocation_id"]
+        request = strict_json((call / "request.json").read_bytes())
+        initial = strict_json((call / "invocation.json").read_bytes())
+        raw = [os.fsdecode(bytes.fromhex(v)) for v in request["argv_hex"]]
+        env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        root = session / "vendor/cc"; source = root / "src/lib.rs"
+        package = {"id": CC_PACKAGE, "tree": "vendor", "manifest": "cc/Cargo.toml"}
+        require(inv["packages"].count(package) == 1 and cwd == root and cwd.resolve() == cwd
+                and env.get("CARGO_MANIFEST_DIR") == str(root) and env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+                and env.get("CARGO_PKG_NAME") == "cc" and env.get("CARGO_PKG_VERSION") == "1.2.59"
+                and raw[0] == pinned_file(inv["rustc"]), "ForeignBorrowedCcOrigin")
+        parsed = parse_rustc(raw[1:]); context = invocation_context(raw, parsed, env, cwd, session, inv)
+        compiler_environment(env, session, inv["sysroot"], probe=parsed["probe"], context=context)
+        require(not parsed["probe"] and "--target" not in parsed["options"]
+                and parsed["inputs"] and len(parsed["inputs"]) == 1 and cwd / parsed["inputs"][0] == source
+                and parsed["options"].get("--crate-name") == ["cc"]
+                and parsed["options"].get("--crate-type") == ["lib"]
+                and context == {"kind": "DirectCargoCompile"}, "ForeignBorrowedCcCompile")
+        regular(source)
+        require(source.resolve() == source and source.stat().st_nlink == 1
+                and file_hash(source) == inv["vendor"]["files"]["cc/src/lib.rs"], "ForeignBorrowedCcSource")
+        fields = ("argv_hex", "environment_hex", "cwd", "parsed", "context", "package", "source",
+                  "role", "kind", "compiler_sha256", "declared_outputs")
+        require(all(initial[k] == receipt[k] for k in fields)
+                and receipt["argv_hex"] == request["argv_hex"]
+                and receipt["environment_hex"] == request["environment_hex"] and receipt["cwd"] == str(cwd)
+                and receipt["parsed"] == parsed and receipt["context"] == context
+                and receipt["package"] == package and receipt["source"] == str(source)
+                and receipt["role"] == "Host" and receipt["kind"] == "Compile"
+                and receipt["compiler_sha256"] == inv["rustc"]["sha256"]
+                and receipt["declared_outputs"] == selected_outputs(parsed, cwd, session / "target")
+                and receipt["exit_code"] == 0 and receipt["blockers"] == [], "ForeignBorrowedCcBinding")
+        matches = [a for a in artifacts if a["invocation_id"] == receipt["invocation_id"]
+                   and a["package_id"] == CC_PACKAGE and a["target"].get("kind") == ["lib"]
+                   and a["target"].get("crate_types") == ["lib"] and a["target"].get("name") == "cc"
+                   and a["target"].get("src_path") == str(source)]
+        require(len(matches) == 1, "ForeignBorrowedCcArtifact")
+        return True
+    except (Refusal, OSError, KeyError, TypeError, ValueError, IndexError):
+        return False
+
+
+def foreign_jobserver_binding(identity, env):
+    match = re.fullmatch(r"-j --jobserver-fds=([1-9][0-9]*),([1-9][0-9]*) --jobserver-auth=\1,\2",
+                         env.get("CARGO_MAKEFLAGS", ""))
+    require(match is not None and "MAKEFLAGS" not in env and "MFLAGS" not in env, "ForeignJobserverRequired")
+    require(identity["state"] == "RecordingOnly" and identity["platform"] == "darwin"
+            and identity["library"] == "/usr/lib/libproc.dylib" and identity["symbol"] == "proc_pidfdinfo"
+            and identity["flavor"] == 6 and identity["buffer_bytes"] == 184
+            and identity["pipe_info_offset"] == 24 and identity["handle_offset"] == 160
+            and identity["peer_offset"] == 168 and type(identity["pid"]) is int and identity["pid"] > 0,
+            "ForeignJobserverBinding")
+    ends = identity["endpoints"]; fds = [int(v) for v in match.groups()]
+    require(len(ends) == 2 and fds[0] != fds[1]
+            and all(3 <= fd <= 2**31 - 1 for fd in fds), "ForeignJobserverBinding")
+    for end, fd, access in zip(ends, fds, (os.O_RDONLY, os.O_WRONLY)):
+        require(end["fd"] == fd and end["access"] == access
+                and end["flags"] & os.O_ACCMODE == access and end["file_type"] == stat.S_IFIFO
+                and end["returned_bytes"] == 184 and end["handle"] == end["inode"]
+                and end["handle"] != 0 and end["peer"] != 0, "ForeignJobserverBinding")
+    require(ends[0]["handle"] == ends[1]["peer"] and ends[1]["handle"] == ends[0]["peer"]
+            and ends[0]["handle"] != ends[1]["handle"], "ForeignJobserverBinding")
+
+
+def foreign_seal(session, policy):
+    namespace = session / "foreign-native-invocations"
+    owner = strict_json((session / "owner.json").read_bytes()); inv = native_control(session, policy, owner)
+    result = {"schema": NATIVE_SCHEMA, "state": "RecordingOnly", "lane": FOREIGN_LANE,
+              "operations": [], "context_groups": [], "blockers": [],
+              "stage": "StageAIncomplete", "native_producer_qualification": "not_issued",
+              "artifact_selection": "not_observed",
+              "unclosed": ["compiler-family-successors", "family-to-compile", "object", "archive", "builder-run", "consumer"]}
+    paths, probes, hashes, failures = foreign_evidence_namespace(session)
+    calls = {}; groups = {}; outdirs = {}
+    if namespace.exists() and namespace.is_dir() and namespace.resolve() == namespace and not namespace.is_symlink():
+        for call in sorted(namespace.iterdir()):
+            item = {"operation_id": call.name}; result["operations"].append(item)
+            try:
+                item["retained_raw_sha256"] = {}
+                for raw in call.glob("*.raw"):
+                    regular(raw)
+                    require(raw.resolve() == raw and raw.stat().st_nlink == 1, "ForeignEvidenceAlias")
+                    item["retained_raw_sha256"][raw.name] = file_hash(raw)
+                for leaf in ("request", "receipt"):
+                    path = call / (leaf + ".json"); regular(path)
+                    require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignEvidenceAlias")
+                    item[leaf + "_sha256"] = file_hash(path)
+                request = strict_json((call / "request.json").read_bytes()); receipt = strict_json((call / "receipt.json").read_bytes())
+                keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
+                require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly"
+                        and request["lane"] == FOREIGN_LANE and request["owner_issued_inspector"] is False
+                        and receipt["operation_id"] == call.name and all(receipt[k] == v for k, v in request.items()), "ForeignReceiptBinding")
+                item["protocol_state"] = receipt["protocol_state"]; item["tool_result"] = receipt["tool_result"]
+                require(receipt["protocol_state"] == "Completed" and receipt["failures"] == [], "ForeignProtocolSticky")
+                env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+                cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"]))); args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+                context = foreign_context(env, cwd, session, inv); foreign_environment(env, session, inv)
+                group = context["out_dir"]; package = context["package_id"]
+                require(group not in outdirs or outdirs[group] == package, "ForeignOutDirCollision"); outdirs[group] = package
+                controls = foreign_controls(session, policy, owner, context)
+                require(receipt["context"] == context and all(receipt.get(k) == controls
+                        for k in ("controls_pre", "controls_post", "controls_return")), "ForeignControlChanged")
+                require(receipt["tool_sha256"] == inv["generators"]["CC"]["sha256"]
+                        and receipt["argv_hex"] == [os.fsencode(inv["generators"]["CC"]["path"]).hex(), *request["args_hex"]], "ForeignToolBinding")
+                foreign_jobserver_binding(receipt["jobserver_identity"], env)
+                require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
+                for stream in ("stdout", "stderr"):
+                    path = call / (stream + ".raw"); regular(path)
+                    require(path.resolve() == path and path.stat().st_nlink == 1
+                            and file_hash(path) == receipt[stream + "_sha256"], "ForeignStreamChanged")
+                require(foreign_semantics(call, receipt) == receipt["source_semantics"], "ForeignSourceSemantics")
+                calls[call.name] = (call, receipt, env, args)
+                groups.setdefault(group, []).append(call.name)
+            except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+                failures.append("ForeignOperation:" + call.name + ":" + str(error))
+        for ident, (call, receipt, env, args) in calls.items():
+            try:
+                operation = receipt["operation"]; predecessor = operation.get("predecessor")
+                history = []
+                if predecessor is not None:
+                    require(predecessor in calls, "ForeignProbePredecessor")
+                    history = [calls[predecessor][:2]]
+                computed = foreign_probe_classify(receipt["role"], args, receipt["context"], env, session, inv, history=history)
+                require(computed == operation, "ForeignRawClassification")
+                if operation["class"] == "CompilerFamilyFileProbe":
+                    require(isinstance(receipt.get("input_pre"), dict)
+                            and isinstance(receipt.get("input_post"), dict), "ForeignSnapshotFields")
+                    require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"])
+                            and receipt["input_pre"]["exists"] is True
+                            and receipt["input_pre"]["path"] == receipt["input_post"]["path"] == operation["source"]
+                            and receipt["input_pre"]["length"] == 206
+                            and receipt["input_pre"]["sha256"] == PROBE_DIGEST, "ForeignInputChanged")
+                    native_state_check(call, receipt["input_pre"])
+                    item = next(i for i in result["operations"] if i["operation_id"] == ident)
+                    item["input_final_state"] = native_state_check(call, receipt["input_post"], live=True, retire=True)
+                else:
+                    require(not any(k in receipt for k in ("input_pre", "input_post", "output_pre", "output_post",
+                                                           "archive_pre", "archive_post")), "ForeignOutputFreeClass")
+            except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+                failures.append("ForeignOperation:" + ident + ":" + str(error))
+        sources = {}
+        for ident, (_, receipt, _, _) in calls.items():
+            operation = receipt["operation"]
+            if operation["class"] == "CompilerFamilyFileProbe": sources.setdefault(operation["source"], []).append((ident, operation))
+        for source, rows in sources.items():
+            first = [i for i, op in rows if not op["retry"]]
+            if len(first) != 1 or len(rows) > 2 or any(op["retry"] and op["predecessor"] != first[0] for _, op in rows):
+                failures.append("ForeignProbeHistory:" + source)
+    for out, members in sorted(groups.items()):
+        observed = {calls[i][1]["operation"]["class"] for i in members}
+        missing = sorted({"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe"} - observed)
+        result["context_groups"].append({"out_dir": out, "package_id": outdirs[out],
+            "operations": sorted(members), "per_probe_family_predecessor": "not_observed",
+            "observed_classes": sorted(observed), "missing_observation_classes": missing,
+            "family_pairing": "ambiguous_context_group", "family_qualification": "not_issued"})
+    if result["operations"]:
+        failures.extend("ForeignSeal:StageAIncomplete:" + missing for missing in result["unclosed"])
+    result["quarantine"] = {"paths": sorted(paths), "probe_paths": sorted(probes), "sha256": sorted(hashes)}
+    result["blockers"] = sorted(set(failures)); native_control(session, policy, owner)
+    atomic_json(session / "foreign-native-record.json", result)
+    return result
+
+
 def native_wrapper(session_id, role, args):
     require(ID.fullmatch(session_id),"SessionId")
     session=SESSIONS/("pending-"+session_id)
     require(session.is_dir() and session.resolve()==session and not session.is_symlink(),"MissingSession")
     policy=strict_json(POLICY.read_bytes());owner=strict_json((session/"owner.json").read_bytes())
-    call,r=native_operation(session,policy,owner,role,args,Path.cwd(),dict(os.environ))
+    cwd = Path.cwd(); env = dict(os.environ)
+    # Only the actual canonical SQLite tree uses its unchanged native graph.
+    operation = native_operation if cwd == session / "vendor/libsqlite3-sys" else foreign_operation
+    call,r=operation(session,policy,owner,role,args,cwd,env)
     if r["protocol_state"]!="Completed":
         raise Refusal("NativeProtocolRefused:"+call.name+":"+r["failures"][0])
     code=r["tool_result"]
@@ -2725,6 +3191,8 @@ def native_evidence_paths(session):
                     if "snapshot" in state: paths.add(str((call / state["snapshot"]).resolve()))
         except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
             blockers.append("NativeNamespace:" + call.name + ":" + str(error))
+    foreign_paths, foreign_probes, _, foreign_blockers = foreign_evidence_namespace(session)
+    paths.update(foreign_paths); probes.update(foreign_probes); blockers.extend(foreign_blockers)
     return paths, probes, blockers
 
 
@@ -3336,10 +3804,12 @@ def seal_record(session, policy, cargo_exit):
     # An unsupported probe may have no output file; its declared namespace is still excluded.
     transient_paths = {str(Path(o["path"]).resolve()) for r in receipts if r["kind"] == "TransientProbe"
                        for o in r["declared_outputs"] + r["outputs"]} | record10_transient_paths | anyhow_paths
-    native_paths, native_probes = set(), set()
+    native_paths, native_probes, foreign_paths, native_hashes = set(), set(), set(), set()
     if policy["profile"] == BUNDLED_PROFILE:
         native_paths, native_probes, namespace_blockers = native_evidence_paths(session)
         blockers.extend(namespace_blockers)
+        foreign_paths, _, native_hashes, foreign_blockers = foreign_evidence_namespace(session)
+        blockers.extend(foreign_blockers)
     output_owners, transient_collisions = {}, set()
     for receipt in receipts:
         if receipt["invocation_id"] in record10_invalid_calls | psm_invalid_calls | tools12_invalid_calls:
@@ -3356,8 +3826,10 @@ def seal_record(session, policy, cargo_exit):
                    and file_hash(Path(o["path"])) in psm_hashes)
                for o in receipt["declared_outputs"] + receipt["outputs"]):
             blockers.append("PsmArchiveOwnership:Output"); transient_collisions.add(receipt["invocation_id"]); continue
-        if native_paths and ((isinstance(receipt.get("source"), str) and native_path_identity(receipt["source"], receipt) in native_paths)
-                or any(native_path_identity(o["path"], receipt) in native_paths
+        if (native_paths or native_hashes) and ((isinstance(receipt.get("source"), str)
+                and foreign_owned(receipt["source"], receipt["cwd"], native_paths, native_hashes))
+                or any(foreign_owned(o["path"], receipt["cwd"], native_paths, native_hashes)
+                       or o.get("sha256") in native_hashes
                        for o in receipt["declared_outputs"] + receipt["outputs"])):
             blockers.append("NativeOutputRole:" + receipt["invocation_id"])
             transient_collisions.add(receipt["invocation_id"])
@@ -3400,11 +3872,12 @@ def seal_record(session, policy, cargo_exit):
             continue
         # A relative Cargo filename has only the actual requesting receipt's cwd.
         # No candidate may claim a native namespace through an alternate spelling.
-        if native_paths:
+        if native_paths or native_hashes:
             native_candidates = [r for r in receipts if isinstance(r.get("source"), str)
                                  and native_path_identity(r["source"], r) == native_path_identity(root, r)
                                  and package_id(r["package"], session) == event.get("package_id")]
-            if any(native_path_identity(f, r) in native_paths for r in native_candidates for f in filename_list):
+            if (any(foreign_owned(f, r["cwd"], native_paths, native_hashes) for r in native_candidates for f in filename_list)
+                    or any(foreign_owned(f, session, native_paths, native_hashes) for f in filename_list)):
                 blockers.append("NativeOutputRole:CargoArtifact")
                 continue
         if any(str(Path(f).resolve()) in psm_paths or (Path(f).is_file() and not Path(f).is_symlink()
@@ -3476,6 +3949,9 @@ def seal_record(session, policy, cargo_exit):
         for path in Path(out_dir).rglob("*"):
             if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                 blockers.append("GeneratedNonregular:" + str(path)); continue
+            if path.is_file() and (str(path.resolve()) in foreign_paths
+                    or native_hashes and file_hash(path) in native_hashes):
+                blockers.append("NativeOutputRole:GeneratedFile:" + str(path)); continue
             if (path.is_file() and str(path.resolve()) not in transient_paths | native_probes
                     and not tools12_owned(str(path), None, anyhow_paths, anyhow_hashes)):
                 generated[path.relative_to(out_dir).as_posix()] = file_hash(path)
@@ -3507,7 +3983,7 @@ def seal_record(session, policy, cargo_exit):
             if str(Path(edge["path"]).resolve()) in psm_paths or (Path(edge["path"]).is_file()
                     and not Path(edge["path"]).is_symlink() and file_hash(Path(edge["path"])) in psm_hashes):
                 blockers.append("PsmArchiveOwnership:Extern"); edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[])); continue
-            if native_paths and native_path_identity(edge["path"], receipt) in native_paths:
+            if (native_paths or native_hashes) and foreign_owned(edge["path"], receipt["cwd"], native_paths, native_hashes):
                 blockers.append("NativeOutputRole:" + edge["path"])
                 edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[]))
                 continue
@@ -3545,7 +4021,8 @@ def seal_record(session, policy, cargo_exit):
                     blockers.append(denied); continue
                 if str(path) in psm_paths or (path.is_file() and not path.is_symlink() and file_hash(path) in psm_hashes):
                     blockers.append("PsmArchiveOwnership:ConsumedSource"); continue
-                if str(path) in native_paths:
+                if (native_paths or native_hashes) and foreign_owned(value, receipt["cwd"], native_paths, native_hashes) and not (
+                        str(path) not in native_paths and foreign_borrowed_cc_literal(value, receipt, session, policy["inventory"], artifacts)):
                     blockers.append("NativeOutputRole:" + str(path)); continue
                 if str(path) in transient_paths:
                     blockers.append("TransientConsumedSource:" + str(path)); continue
@@ -3602,6 +4079,10 @@ def seal_record(session, policy, cargo_exit):
         native = native_seal(session, policy, receipts, associations, artifacts, events, edges)
         seal["native_record_sha256"] = file_hash(session / "native-record.json")
         seal["blockers"] = sorted(set(seal["blockers"] + native["blockers"]))
+        if (session / "foreign-native-invocations").exists() or (session / "foreign-native-invocations").is_symlink():
+            foreign = foreign_seal(session, policy)
+            seal["foreign_native_record_sha256"] = file_hash(session / "foreign-native-record.json")
+            seal["blockers"] = sorted(set(seal["blockers"] + foreign["blockers"]))
     atomic_json(session / "record.json", seal)
     return seal
 
