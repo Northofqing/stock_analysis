@@ -1151,6 +1151,7 @@ if CASE=='dynamic':argv[-1]='dylib=ring_core_0_17_14__test'
 if CASE=='extra_native':argv[-6:-6]=['-L','native='+str(out)]
 if CASE=='extra_lib':argv+=['-l','static=foreign']
 if CASE=='foreign_lib':argv[-1]='static=foreign'
+if CASE=='manifest_alias':env['CARGO_MANIFEST_DIR']=str(root.parent)+'//'+name
 if CASE=='package':env['CARGO_PKG_NAME']='other'
 if CASE=='version':env['CARGO_PKG_VERSION']='0.17.15'
 if CASE=='cwd':cwd=app
@@ -1728,6 +1729,7 @@ if CASE=='test':argv[-12:-12]=['--test']
 if CASE=='host':i=argv.index('--target');del argv[i:i+2]
 if CASE=='platform':argv[argv.index('--target')+1]='aarch64-apple-darwin'
 if CASE=='source':argv[4]=str(app/'src/lib.rs')
+if CASE=='manifest_alias':env['CARGO_MANIFEST_DIR']=str(root.parent)+'//'+name
 if CASE=='package':env['CARGO_PKG_NAME']='other'
 if CASE=='version':env['CARGO_PKG_VERSION']='0.1.31'
 if CASE=='cwd':cwd=app
@@ -1798,6 +1800,268 @@ if CASE in ('archive_output','archive_extern','snapshot_output'):
     else:data['declared_outputs'].append({'path':str(rpath.parent/r['psm_archive_pre']['snapshot']) if CASE=='snapshot_output' else str(archive),'kind':'link'})
     p.write_text(json.dumps(data))
 emit({'reason':'build-finished','success':True})
+'''
+
+# Original ordered record12 words, with only session paths substituted.
+ZSTD12_ARGS = ['--crate-name', 'zstd_sys', '--edition=2018', '{source}', '--error-format=json', '--json=diagnostic-rendered-ansi,artifacts,future-incompat', '--crate-type', 'lib', '--emit=dep-info,metadata,link', '-C', 'embed-bitcode=no', '-C', 'debuginfo=1', '-C', 'split-debuginfo=unpacked', '--allow=non_upper_case_globals', '--cfg', 'feature="legacy"', '--cfg', 'feature="std"', '--cfg', 'feature="zdict_builder"', '--check-cfg', 'cfg(docsrs,test)', '--check-cfg', 'cfg(feature, values("bindgen", "debug", "default", "experimental", "fat-lto", "legacy", "no_asm", "no_wasm_shim", "non-cargo", "pkg-config", "seekable", "std", "thin", "thin-lto", "zdict_builder", "zstdmt"))', '-C', 'metadata=219fc208899e9805', '-C', 'extra-filename=-d231fa1e57295f5a', '--out-dir', '{deps}', '--target', 'x86_64-apple-darwin', '-L', 'dependency={deps}', '-L', 'dependency={host}', '--cap-lints', 'allow', '-L', 'native={out}', '-l', 'static=zstd']
+SERDE12_CHECK = 'cfg(feature, values("alloc", "default", "rc", "result", "std", "unstable"))'
+SERDE12_CHECKS = ['if_docsrs_then_no_serde_core', 'no_core_cstr', 'no_core_error', 'no_core_net', 'no_core_num_saturating', 'no_diagnostic_namespace', 'no_serde_derive', 'no_std_atomic', 'no_std_atomic64', 'no_target_has_atomic']
+TOOLS12_PRIVATE = b'#[doc(hidden)]\npub mod __private228 {\n    #[doc(hidden)]\n    pub use crate::private::*;\n}\n'
+
+TOOLS12_RUSTC = r'''
+import json,os,pathlib,sys
+args=sys.argv[1:]
+def value(k):
+    inline=[a.split('=',1)[1] for a in args if a.startswith(k+'=')]
+    return inline[0] if inline else args[args.index(k)+1]
+name=value('--crate-name');source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+source=source if source.is_absolute() else pathlib.Path.cwd()/source
+probe='--cfg=anyhow_build_probe' in args
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+(hits/(('probe-' if probe else 'compile-')+name)).write_text(json.dumps(args))
+case=os.environ.get('TOOLS12_CASE','normal');family=os.environ.get('TOOLS12_FAMILY','')
+if name=='zstd_sys':
+    archive=pathlib.Path(os.environ['OUT_DIR'])/'libzstd.a'
+    if case=='during_change':archive.write_bytes(b'TEST_CODE_CHANGED_DURING_CHILD')
+    if case=='post_missing':archive.unlink()
+    if case=='post_symlink':archive.unlink();archive.symlink_to(source)
+    if case=='post_hardlink':os.link(archive,archive.parent/'other.a')
+if (name=='zstd_sys' or probe) and case=='source_post':source.chmod(0o644);source.write_bytes(b'TEST_CODE_SOURCE_POST')
+out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+codegen=[args[i+1] for i,a in enumerate(args) if a=='-C'];suffix=next((v.split('=',1)[1] for v in codegen if v.startswith('extra-filename=')),'')
+base=name+suffix;types=value('--crate-type');emit=value('--emit').split(',')
+files=[]
+if 'metadata' in emit:files.append(out/('lib'+base+'.rmeta'))
+if 'link' in emit:files.append(out/(base if types=='bin' else 'lib'+base+'.rlib'))
+status=1 if probe and case in ('probe1-none','probe1-partial','probe1-both') else (7 if (probe and case=='probe7') or (name=='zstd_sys' and case=='compiler_fail') else 0)
+for path in files:
+    if not (probe and (case in ('probe1-none','probe1-partial') or case=='capture_missing')):
+        path.write_bytes(b'TEST_CODE_OUTPUT:'+name.encode()+b':'+json.dumps(args).encode())
+def esc(s):return s.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+consumed=[str(source)]
+if name=='serde_core':consumed.extend([str(source.parent/'crate_root.rs'),str(pathlib.Path(os.environ['OUT_DIR'])/'private.rs')])
+dep=out/(base+'.d')
+if not(probe and case=='probe1-none'):
+    dep.write_text(esc(str(files[0] if files else out/base))+': '+' '.join(esc(s) for s in consumed)+'\n'+('# env-dep:OUT_DIR='+os.environ['OUT_DIR']+'\n' if name=='serde_core' else ''))
+if probe and case=='capture_alias':
+    path=out/'libanyhow.rmeta';path.unlink();path.symlink_to(source)
+if probe and case=='capture_hardlink':os.link(out/'libanyhow.rmeta',out/'other.rmeta')
+if probe and case=='capture_dep':dep.write_text('# TEST_CODE invalid dep comment\n')
+sys.exit(status)
+'''
+
+TOOLS12_CARGO = r'''
+import json,os,pathlib,shutil,subprocess,sys
+CASE=__CASE__;FAMILY=__FAMILY__;ZSTD=__ZSTD__;SCHECK=__SCHECK__;CHECKS=__CHECKS__;PRIVATE=__PRIVATE__
+args=sys.argv[1:]
+def value(k):return args[args.index(k)+1]
+app=pathlib.Path(value('--manifest-path')).parent;session=app.parent;target=pathlib.Path(value('--target-dir'))
+name={'zstd':'zstd-sys','anyhow':'anyhow','serde':'serde_core'}[FAMILY]
+version={'zstd':'2.0.16+zstd.1.5.7','anyhow':'1.0.102','serde':'1.0.228'}[FAMILY]
+package='registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version;root=session/'vendor'/name
+host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+for p in (host,deps):p.mkdir(parents=True,exist_ok=True)
+loader=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'];features={'zstd':['legacy','std','zdict_builder'],'anyhow':['default','std'],'serde':['alloc','default','rc','result','std']}[FAMILY]
+out=(target/'debug/build/anyhow-d005d5c1d4426d3a/out' if FAMILY=='anyhow' else target/'x86_64-apple-darwin/debug/build'/({'zstd':'zstd-sys-21005f2c27aa00ab','serde':'serde_core-8c92ebf254a84c42'}[FAMILY])/'out');out.mkdir(parents=True)
+def emit(e):print(json.dumps(e),flush=True)
+def environment(pkgname,pkgversion,manifest,crate,*,nested=False):
+    parts=pkgversion.split('+')[0].split('.')
+    return dict(os.environ,CARGO_MANIFEST_DIR=str(manifest),CARGO_MANIFEST_PATH=str(manifest/'Cargo.toml'),CARGO_PKG_NAME=pkgname,CARGO_PKG_VERSION=pkgversion,
+        CARGO_PKG_VERSION_MAJOR=parts[0],CARGO_PKG_VERSION_MINOR=parts[1],CARGO_PKG_VERSION_PATCH=parts[2],CARGO_PKG_VERSION_PRE='',CARGO_CRATE_NAME=crate,
+        DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),TOOLS12_CASE=CASE,TOOLS12_FAMILY=FAMILY)
+def artifact(pkg,source,crate,kind,files,fs):
+    return {'reason':'compiler-artifact','package_id':pkg,'manifest_path':str((source.parent if source.name=='build.rs' else source.parent.parent)/'Cargo.toml'),
+        'target':{'src_path':str(source),'kind':[kind],'crate_types':['bin' if kind=='custom-build' else kind],'name':'build-script-build' if kind=='custom-build' else crate,'edition':'2018' if FAMILY=='zstd' and pkg!= 'TEST_CODE_app' else '2021'},
+        'features':fs,'filenames':[str(p) for p in files],'executable':None,'fresh':False}
+def compile_event(crate,source,pkg,dest,fs=(),kind='lib',extra=(),exact=None,env_extra=None):
+    manifest=source.parent if source.name=='build.rs' else source.parent.parent
+    pkgname,pkgversion=(name,version) if pkg==package else (manifest.name,{'cc':'1.2.59','pkg-config':'0.3.32'}.get(manifest.name,'0.0.0'))
+    argv=exact or [os.environ['RUSTC'],'--crate-name',crate,'--edition='+('2018' if FAMILY=='zstd' and pkg!='TEST_CODE_app' else '2021'),str(source),'--crate-type',kind,'--emit='+('dep-info,link' if kind=='bin' else 'dep-info,metadata,link'),'--out-dir',str(dest),*[v for f in fs for v in ('--cfg','feature="'+f+'"')],*extra]
+    env=environment(pkgname,pkgversion,manifest,crate);env.update(env_extra or {})
+    r=subprocess.run([os.environ['RUSTC_WRAPPER'],*argv],env=env,cwd=manifest)
+    if r.returncode:raise RuntimeError('TEST_CODE prerequisite compile failed '+crate)
+    c=[argv[i+1] for i,a in enumerate(argv) if a=='-C'];suffix=next((v.split('=',1)[1] for v in c if v.startswith('extra-filename=')),'')
+    base=crate+suffix;files=[dest/base] if kind=='bin' else [dest/('lib'+base+'.rmeta'),dest/('lib'+base+'.rlib')]
+    event=artifact(pkg,source,crate,'custom-build' if kind=='bin' else kind,files,list(fs))
+    if kind=='bin':
+        alias=dest/'build-script-build';shutil.copyfile(files[0],alias);event['filenames']=[str(alias)]
+    return event
+if FAMILY=='zstd':
+    for helper,hversion,crate,hfeatures in (('cc','1.2.59','cc',['parallel']),('pkg-config','0.3.32','pkg_config',[])):
+        hp='registry+https://github.com/rust-lang/crates.io-index#'+helper+'@'+hversion
+        event=compile_event(crate,session/'vendor'/helper/'src/lib.rs',hp,host,hfeatures,extra=['--target','x86_64-apple-darwin'] if CASE=='target_helper_'+crate else ())
+        if CASE!='missing_'+crate:emit(event)
+        if CASE=='duplicate_'+crate:emit(event)
+    extern=['--extern','cc='+str(host/'libcc.rlib'),'--extern','pkg_config='+str(host/'libpkg_config.rlib')]
+else:extern=[]
+def serde_args(fs,metadata,suffix,builder):
+    dest=target/'debug/build'/('serde_core'+suffix) if builder else deps
+    argv=[os.environ['RUSTC'],'--crate-name','build_script_build' if builder else 'serde_core','--edition=2021',str(root/('build.rs' if builder else 'src/lib.rs')),
+        '--error-format=json','--json=diagnostic-rendered-ansi,artifacts,future-incompat','--crate-type','bin' if builder else 'lib','--emit='+('dep-info,link' if builder else 'dep-info,metadata,link'),
+        '-C','embed-bitcode=no','-C','debuginfo=1','-C','split-debuginfo=unpacked',*[v for f in fs for v in ('--cfg','feature="'+f+'"')],
+        '--check-cfg','cfg(docsrs,test)','--check-cfg',SCHECK,'-C','metadata='+metadata,'-C','extra-filename='+suffix,'--out-dir',str(dest)]
+    if not builder:argv+=['--target','x86_64-apple-darwin','-L','dependency='+str(deps)]
+    argv+=['-L','dependency='+str(host),'--cap-lints','allow']
+    if not builder:argv += [v for f in CHECKS for v in ('--check-cfg','cfg('+f+')')]
+    return argv,dest
+if FAMILY=='serde':
+    for tag,fs,metadata,suffix in [('A',features if CASE!='no_compatible' else ['result','std'],'499268712182025e','-7695a1447424a441'),('B',['result','std'],'1f52e4bdee6a9d81','-44ac0d1892dbd87b')]+([('C',features,'aaaaaaaaaaaaaaaa','-aaaaaaaaaaaaaaaa')] if CASE in ('duplicate_features','private_hash_same') else []):
+        argv,dest=serde_args(fs,metadata,suffix,True)
+        e=compile_event('build_script_build',root/'build.rs',package,dest,fs,'bin',exact=argv)
+        if CASE=='builder_features' and tag=='A':e['features']=['result','std']
+        if not(CASE=='missing_builder' and tag=='A'):emit(e)
+    (out/'private.rs').write_bytes(PRIVATE if CASE!='private_bytes' else b'TEST_CODE_WRONG_PRIVATE')
+else:
+    builder=compile_event('build_script_build',root/'build.rs',package,target/'debug/build'/('zstd-sys-0c68b4e77f2808a6a' if FAMILY=='zstd' else 'anyhow-d005d5c1d4426d3a'),features,'bin',extern)
+    if CASE=='builder_features':builder['features']=['other']
+    if CASE!='missing_builder':emit(builder)
+    if CASE=='duplicate_builder':emit(builder)
+    if FAMILY=='zstd':(out/'libzstd.a').write_bytes(b'TEST_CODE_ZSTD_ARCHIVE')
+child=None;original=(root/('src/nightly.rs' if FAMILY=='anyhow' else 'src/lib.rs')).read_bytes()
+if FAMILY=='zstd':
+    argv=[os.environ['RUSTC']]+[v.format(source=root/'src/lib.rs',deps=deps,host=host,out=out) for v in ZSTD]
+    env=environment(name,version,root,'zstd_sys');env['OUT_DIR']=str(out);cwd=root
+    if CASE=='source':argv[4]=str(app/'src/lib.rs')
+    if CASE=='raw_space':
+        feature_checks=[word for word in argv if word.startswith('cfg(feature, values(')]
+        assert len(feature_checks)==1, 'TEST_CODE raw_space requires one feature check word'
+        original_check=feature_checks[0];mutated_check=original_check.replace(', ', ',')
+        assert mutated_check!=original_check, 'TEST_CODE raw_space must change feature check bytes'
+        argv[argv.index(original_check)]=mutated_check
+    if CASE=='raw_feature':argv[argv.index('feature="legacy"')]='feature="experimental"'
+    if CASE=='source_alias':argv[4]=str(root/'../zstd-sys/src/lib.rs')
+    if CASE=='inline':argv[-2:]=['-lstatic=zstd']
+    if CASE=='reorder':argv[-4:]=argv[-2:]+argv[-4:-2]
+    if CASE=='extra_native':argv[-4:-4]=['-L','native='+str(out)]
+    if CASE=='no_native':del argv[-4:]
+    if CASE=='extern':argv[-4:-4]=['--extern','cc='+str(host/'libcc.rlib')]
+    if CASE=='link_arg':argv[-4:-4]=['-C','link-arg=-lother']
+    if CASE=='host':i=argv.index('--target');del argv[i:i+2]
+    if CASE=='platform':argv[argv.index('--target')+1]='aarch64-apple-darwin'
+    archive=out/'libzstd.a'
+    if CASE=='pre_missing':archive.unlink()
+    if CASE=='pre_symlink':archive.unlink();archive.symlink_to(root/'src/lib.rs')
+    if CASE=='pre_hardlink':os.link(archive,out/'other.a')
+elif FAMILY=='anyhow':
+    argv=[os.environ['RUSTC'],'--cfg=anyhow_build_probe','--edition=2018','--crate-name=anyhow','--crate-type=lib','--cap-lints=allow','--emit=dep-info,metadata','--out-dir',str(out/'probe'),'src/nightly.rs','--target','x86_64-apple-darwin']
+    env=environment(name,version,root,'anyhow');env.update(OUT_DIR=str(out),HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',CARGO_FEATURE_DEFAULT='1',CARGO_FEATURE_STD='1',CARGO_ENCODED_RUSTFLAGS='',DYLD_FALLBACK_LIBRARY_PATH=str(target/'debug')+':'+str(host)+':'+str(pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH'])/'rustlib/x86_64-apple-darwin/lib')+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']);cwd=root
+    if CASE=='source':argv[9]='src/lib.rs'
+    if CASE=='inline':argv[1:2]=['--cfg','anyhow_build_probe']
+    if CASE=='raw_space':argv[6]='--emit=metadata,dep-info'
+    if CASE=='source_alias':argv[9]='./src/nightly.rs'
+    if CASE=='host_env':env['HOST']='aarch64-apple-darwin'
+    if CASE=='encoded_flags':env['CARGO_ENCODED_RUSTFLAGS']='-Cdebuginfo=2'
+    if CASE=='missing_feature':env.pop('CARGO_FEATURE_STD')
+    if CASE=='platform':argv[-1]='aarch64-apple-darwin'
+    if CASE=='host':del argv[-2:]
+    if CASE=='loader':env['DYLD_FALLBACK_LIBRARY_PATH']=loader
+    if CASE=='retry':argv.insert(1,'--cfg=anyhow_build_probe')
+else:
+    argv,_=serde_args(features,'accbf619672d37e1','-d3ba454884ccf462',False)
+    env=environment(name,version,root,'serde_core');env['OUT_DIR']=str(out);cwd=root
+    if CASE=='consumer_role':i=argv.index('--target');del argv[i:i+2]
+    if CASE=='consumer_metadata':argv[argv.index('metadata=accbf619672d37e1')]='metadata=other'
+if CASE=='manifest_alias':env['CARGO_MANIFEST_DIR']=str(root.parent)+'//'+name
+if CASE=='package':env['CARGO_PKG_NAME']='other'
+if CASE=='version':env['CARGO_PKG_VERSION']='9.9.9'
+if CASE=='cwd':cwd=app
+if CASE=='outdir':env['OUT_DIR']=str(target)
+if CASE=='feature':env['CARGO_FEATURE_OTHER']='1'
+if CASE=='bootstrap':env['RUSTC_BOOTSTRAP']='1'
+if CASE=='stage':env['RUSTC_STAGE']='1'
+if CASE=='wrapper':env['RUSTC_WRAPPER']=str(session/'other-wrapper')
+if CASE=='source_hash':
+    source=root/('src/nightly.rs' if FAMILY=='anyhow' else 'src/lib.rs');source.chmod(0o644);source.write_bytes(b'TEST_CODE_DRIFT')
+(session/'tools12-attempt.json').write_text(json.dumps({'argv_hex':[os.fsencode(a).hex() for a in argv]}))
+result=subprocess.run([os.environ['RUSTC_WRAPPER'],*argv],env=env,cwd=cwd)
+if CASE in ('source_hash','source_post'):(root/('src/nightly.rs' if FAMILY=='anyhow' else 'src/lib.rs')).write_bytes(original)
+# Simulate the observed build-script cleanup after the wrapper retained outputs.
+if FAMILY=='anyhow':shutil.rmtree(out/'probe',ignore_errors=True)
+if FAMILY=='zstd' and result.returncode:
+    emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+if FAMILY=='anyhow':
+    status=1 if CASE.startswith('probe1') else (7 if CASE=='probe7' else 0)
+    cfgs=['error_generic_member_access'] if status==0 else []
+    consumer=compile_event('anyhow',root/'src/lib.rs',package,host,features,extra=[v for c in cfgs for v in ('--cfg',c)],env_extra={'OUT_DIR':str(out)})
+else:
+    cfgs=[];crate='zstd_sys' if FAMILY=='zstd' else 'serde_core';suffix='-d231fa1e57295f5a' if FAMILY=='zstd' else '-d3ba454884ccf462'
+    consumer=artifact(package,root/'src/lib.rs',crate,'lib',[deps/('lib'+crate+suffix+'.rmeta'),deps/('lib'+crate+suffix+'.rlib')],features)
+if CASE=='consumer_features':consumer['features']=['other']
+if CASE!='missing_consumer':emit(consumer)
+if CASE=='duplicate_consumer':emit(consumer)
+event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'linked_libs':['static=zstd'] if FAMILY=='zstd' else [],'linked_paths':['native='+str(out)] if FAMILY=='zstd' else [],'cfgs':cfgs,'env':[]}
+if CASE=='event_cfg':event['cfgs']=['other']
+if CASE=='event_env':event['env']=[['OTHER','1']]
+if CASE=='event_outdir':event['out_dir']=str(target)
+if CASE!='missing_event':emit(event)
+if CASE=='duplicate_event':emit(event)
+app_event=compile_event('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,extra=['--target','x86_64-apple-darwin'])
+paths=list((session/'invocations').glob('*/receipt.json'))
+child_path=next((p for p in paths if json.loads(p.read_text()).get('context',{}).get('zstd_static_declaration') or json.loads(p.read_text()).get('context',{}).get('kind')=='AnyhowStaticFeatureProbe'),None)
+consumer_path=next((p for p in paths if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs')),None)
+bpaths=[p for p in paths if json.loads(p.read_text()).get('source')==str(root/'build.rs')]
+selected_path=next(p for p in paths if json.loads(p.read_text()).get('source')==str(app/'src/lib.rs'))
+if FAMILY=='serde' and CASE in ('raw_builder','builder_source','builder_cwd','builder_metadata','builder_role','builder_outdir','alias'):
+    consumer=json.loads(consumer_path.read_text());wide_cfg=consumer['parsed']['options'].get('--cfg',[])
+    assert wide_cfg==['feature="'+f+'"' for f in features], 'TEST_CODE builder control requires exact consumer features'
+    compatible=[p for p in bpaths if json.loads(p.read_text())['parsed']['options'].get('--cfg',[])==wide_cfg]
+    assert len(bpaths)==2 and len(compatible)==1, 'TEST_CODE builder control requires two builders and one feature-compatible target'
+    controlled_builder,=compatible;builder=json.loads(controlled_builder.read_text())
+    request=json.loads((controlled_builder.parent/'request.json').read_text());initial=json.loads((controlled_builder.parent/'invocation.json').read_text())
+    raw=[os.fsdecode(bytes.fromhex(a)) for a in request['argv_hex']]
+    raw_cfg=[raw[i+1] for i,word in enumerate(raw) if word=='--cfg']
+    raw_sources=[word for word in raw[1:] if not word.startswith('-') and word.endswith('.rs')]
+    assert request['argv_hex']==initial['argv_hex']==builder['argv_hex'] and raw_cfg==wide_cfg, 'TEST_CODE compatible target raw/receipt feature mismatch'
+    assert raw[0]==os.environ['RUSTC'] and raw_sources==[str(root/'build.rs')], 'TEST_CODE compatible target compiler/source mismatch'
+    assert builder['source']==str(root/'build.rs') and builder['package']['id']==package and builder['role']=='Host' and builder['kind']=='Compile', 'TEST_CODE compatible target identity mismatch'
+    assert builder['context']==initial['context']=={'kind':'DirectCargoCompile'} and builder['compiler_sha256']==initial['compiler_sha256']==consumer['compiler_sha256'], 'TEST_CODE compatible target compiler context mismatch'
+    assert request['cwd_hex']==os.fsencode(str(root)).hex() and builder['cwd']==initial['cwd']==str(root), 'TEST_CODE compatible target cwd mismatch'
+def update(path,change,leaves=('receipt.json',)):
+    for leaf in leaves:
+        p=path.parent/leaf;data=json.loads(p.read_text());change(data);p.write_text(json.dumps(data))
+if CASE=='request_only' and child_path:
+    for leaf in ('receipt.json','invocation.json'):(child_path.parent/leaf).unlink()
+if CASE=='missing_annotation' and child_path:
+    def erase(d):
+        d['context']={'kind':'DirectCargoCompile'}
+        for k in list(d):
+            if k.startswith('zstd_archive_'):del d[k]
+    update(child_path,erase,('receipt.json','invocation.json'))
+if CASE=='request_cwd' and child_path:update(child_path,lambda d:d.update(cwd_hex=os.fsencode(str(app)).hex()),('request.json',))
+if CASE=='raw_builder':update(controlled_builder if FAMILY=='serde' else bpaths[0],lambda d:d['argv_hex'].__setitem__(4,os.fsencode(str(app/'build.rs')).hex()),('request.json',))
+if CASE=='consumer_source':update(consumer_path,lambda d:d.update(source=str(app/'src/lib.rs')),('receipt.json','invocation.json'))
+if CASE=='builder_source':update(controlled_builder,lambda d:d.update(source=str(app/'build.rs')),('receipt.json','invocation.json'))
+if CASE=='consumer_outdir':update(consumer_path,lambda d:d['environment_hex'].update({os.fsencode('OUT_DIR').hex():os.fsencode(str(target)).hex()}),('request.json','receipt.json','invocation.json'))
+if CASE=='compiler_identity':update(consumer_path,lambda d:d.update(compiler_sha256='0'*64),('receipt.json','invocation.json'))
+if CASE=='builder_cwd':update(controlled_builder,lambda d:d.update(cwd=str(app)),('receipt.json','invocation.json'))
+if CASE=='builder_metadata':update(controlled_builder,lambda d:d['parsed']['codegen'].update(metadata=['other']),('receipt.json','invocation.json'))
+if CASE=='builder_role':update(controlled_builder,lambda d:d.update(role='Target'),('receipt.json','invocation.json'))
+if CASE=='builder_outdir':update(controlled_builder,lambda d:d['environment_hex'].update({os.fsencode('OUT_DIR').hex():os.fsencode(str(out)).hex()}),('request.json','receipt.json','invocation.json'))
+if CASE=='alias':
+    links=[o['path'] for o in json.loads(controlled_builder.read_text())['declared_outputs'] if o['kind']=='link']
+    assert len(links)==1, 'TEST_CODE compatible target requires one real compiler link output'
+    pathlib.Path(links[0]).write_bytes(b'TEST_CODE_ALIAS_DRIFT')
+if CASE=='snapshot_missing' and child_path:(child_path.parent/('zstd-archive-pre.raw' if FAMILY=='zstd' else 'probe-output-0.raw')).unlink()
+if CASE=='snapshot_changed' and child_path:(child_path.parent/('zstd-archive-post.raw' if FAMILY=='zstd' else 'probe-output-1.raw')).write_bytes(b'TEST_CODE_TAMPER')
+if CASE=='final_archive':(out/'libzstd.a').write_bytes(b'TEST_CODE_FINAL_CHANGE')
+if CASE.startswith('namespace_'):
+    _,epoch,reuse=CASE.split('_',2)
+    child=json.loads(child_path.read_text())
+    source=out/'libzstd.a' if FAMILY=='zstd' else child_path.parent/'probe-output-1.raw'
+    copied=deps/'libpromoted.rlib';shutil.copyfile(source,copied)
+    if epoch=='retained':
+        if FAMILY=='zstd':
+            (out/'libzstd.a').write_bytes(b'TEST_CODE_FINAL_CHANGE')
+            for phase in ('pre','post'):(child_path.parent/('zstd-archive-'+phase+'.raw')).unlink()
+        else:
+            for o in child['outputs']:(child_path.parent/o['snapshot']).unlink()
+    if reuse=='snapshot':update(selected_path,lambda d:d['declared_outputs'].append({'path':str(child_path.parent/('zstd-archive-pre.raw' if FAMILY=='zstd' else 'probe-output-0.raw')),'kind':'link'}))
+    if reuse in ('artifact','selected'):app_event['filenames']=[str(copied)]
+    if reuse=='output':
+        data=json.loads(selected_path.read_text());ordinary=next(o for o in data['outputs'] if o['kind']=='link');shutil.copyfile(copied,ordinary['path'])
+    if reuse=='extern':update(selected_path,lambda d:d['externs'].append({'name':'promoted','path':str(copied)}))
+    if reuse=='consumed':update(selected_path,lambda d:next(o for o in d['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copied)))
+emit(app_event);emit({'reason':'build-finished','success':True})
 '''
 
 class RecordingProtocolTests(unittest.TestCase):
@@ -3920,6 +4184,192 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertIn(marker, record["blockers"]); self.assertEqual(record["native_link_declarations"], [])
                 self.assertFalse(any(c["path"].endswith("libpsm_s.a") for c in record["consumed_sources"]))
 
+
+
+    def prepare_tools12(self, family, case="normal"):
+        inv = self.prepare(); vendor = self.root / "vendor-origin"
+        specs = {"zstd": (("zstd-sys", "2.0.16+zstd.1.5.7", ("Cargo.toml", "build.rs", "src/lib.rs", "src/bindings_zstd.rs", "src/bindings_zdict.rs")),
+                           ("cc", "1.2.59", ("Cargo.toml", "src/lib.rs")), ("pkg-config", "0.3.32", ("Cargo.toml", "src/lib.rs"))),
+                 "anyhow": (("anyhow", "1.0.102", ("Cargo.toml", "build.rs", "src/backtrace.rs", "src/chain.rs", "src/context.rs", "src/ensure.rs", "src/error.rs", "src/fmt.rs", "src/kind.rs", "src/lib.rs", "src/macros.rs", "src/nightly.rs", "src/ptr.rs", "src/wrapper.rs")),),
+                 "serde": (("serde_core", "1.0.228", ("Cargo.toml", "build.rs", "src/crate_root.rs", "src/de/ignored_any.rs", "src/de/impls.rs", "src/de/mod.rs", "src/de/value.rs", "src/format.rs", "src/lib.rs", "src/macros.rs", "src/private/content.rs", "src/private/doc.rs", "src/private/mod.rs", "src/private/seed.rs", "src/private/size_hint.rs", "src/private/string.rs", "src/ser/fmt.rs", "src/ser/impls.rs", "src/ser/impossible.rs", "src/ser/mod.rs", "src/std_error.rs")),)}[family]
+        for name, version, sources in specs:
+            for leaf in sources:
+                write(vendor / name / leaf, '[package]\nname="' + name + '"\nversion="' + version + '"\n' if leaf == "Cargo.toml" else "// TEST_CODE separately inventoried " + name + "/" + leaf + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inv["packages"].append({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                    "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        inv["vendor"] = snapshot(vendor, ["dep", *[n for n, _, _ in specs]])
+        write(self.root / "sysroot/lib/rustlib/x86_64-apple-darwin/lib/test.bin", "TEST_CODE_HOST_SYSROOT")
+        inv["sysroot"] = snapshot(self.root / "sysroot", ["lib"])
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + TOOLS12_RUSTC)
+        cargo_text = TOOLS12_CARGO.replace("__CASE__", repr(case)).replace("__FAMILY__", repr(family)).replace("__ZSTD__", repr(ZSTD12_ARGS)).replace("__SCHECK__", repr(SERDE12_CHECK)).replace("__CHECKS__", repr(SERDE12_CHECKS)).replace("__PRIVATE__", repr(TOOLS12_PRIVATE))
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + cargo_text)
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inv["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}; inv["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inv["generators"]["PROTOC"] = dict(inv["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inv}))
+        return inv
+
+    def tools12_result(self, family, case="normal", status=0):
+        self.prepare_tools12(family, case); result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result); session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def tools12_admission_refusal(self, family, case, marker):
+        session, record, receipts = self.tools12_result(family, case, 2)
+        name = "compile-zstd_sys" if family == "zstd" else "probe-anyhow"
+        self.assertFalse((session / "compiler-entry" / name).exists())
+        self.assertTrue(any(r["source"] == str(session / "vendor" / ("zstd-sys" if family == "zstd" else "anyhow") / "build.rs") for _, r in receipts))
+        diagnostics = [json.loads(line) for line in (session / "cargo.stderr.raw").read_text().splitlines()]
+        self.assertTrue(any(d.get("reason") == "Refused" and d.get("detail") == marker for d in diagnostics), diagnostics)
+        requests = [p for p in (session / "invocations").glob("*/request.json") if not (p.parent / "receipt.json").exists()]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(json.loads(requests[0].read_text())["argv_hex"], json.loads((session / "tools12-attempt.json").read_text())["argv_hex"])
+        self.assertIn("IncompleteInvocation:" + requests[0].parent.name, record["blockers"])
+        self.assertEqual(record["native_link_declarations"], [])
+
+    def test_record12_zstd_connected_native_declaration_and_archive_graph(self):
+        session, record, receipts = self.tools12_result("zstd")
+        self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+        path, r = next((p, r) for p, r in receipts if r["context"].get("zstd_static_declaration"))
+        declaration, = record["native_link_declarations"]
+        raw = [os.fsdecode(bytes.fromhex(a)) for a in r["argv_hex"]]
+        self.assertEqual(len(raw), 45)
+        self.assertEqual(raw[1:], [v.format(source=session / "vendor/zstd-sys/src/lib.rs", deps=session / "target" / owner.TARGET / "debug/deps", host=session / "target/debug/deps", out=r["context"]["out_dir"]) for v in ZSTD12_ARGS])
+        self.assertEqual(declaration["raw_argument_indices"], [41, 42, 43, 44])
+        self.assertEqual([raw[i] for i in declaration["raw_argument_indices"]], ["-L", "native=" + r["context"]["out_dir"], "-l", "static=zstd"])
+        self.assertEqual(declaration["state"], "RecordingOnly"); self.assertEqual(declaration["consumer_invocation"], path.name)
+        self.assertEqual(declaration["artifact_selection"], "not_observed"); self.assertEqual(declaration["native_child_provenance"], "not_observed")
+        self.assertEqual(declaration["native_producer_qualification"], "not_issued")
+        builder = declaration["producer_invocation"]
+        self.assertEqual({e["name"] for e in record["extern_edges"] if e["consumer"] == builder}, {"cc", "pkg_config"})
+        by_id = {p.name: row for p, row in receipts}
+        for edge in [e for e in record["extern_edges"] if e["consumer"] == builder]:
+            producer, = edge["producers"]; self.assertEqual(by_id[producer]["role"], "Host"); self.assertEqual(by_id[producer]["exit_code"], 0)
+        for phase in ("pre", "post"):
+            row = r["zstd_archive_" + phase]
+            self.assertEqual(sha(path / row["snapshot"]), row["sha256"]); self.assertEqual(sha(Path(row["path"])), row["sha256"])
+        self.assertFalse(any(c["path"].endswith("libzstd.a") for c in record["consumed_sources"]))
+        self.assertEqual(record["selected_library"][0]["package_id"], "TEST_CODE_app")
+
+    def test_record12_zstd_source_raw_status_snapshots_and_negative_namespace(self):
+        admission = {"source": "ZstdStaticTemplate", "package": "ZstdSourceContext", "version": "ZstdSourceContext", "cwd": "ZstdSourceContext", "outdir": "ZstdSourceContext", "source_hash": "ZstdSourceContext",
+            "feature": "ZstdEnvironmentContext", "bootstrap": "ZstdEnvironmentContext", "stage": "ZstdEnvironmentContext", "wrapper": "ZstdEnvironmentContext", "inline": "ZstdStaticTemplate", "raw_space": "ZstdStaticTemplate", "raw_feature": "ZstdStaticTemplate", "source_alias": "ZstdStaticTemplate", "manifest_alias": "ZstdSourceContext", "reorder": "ZstdStaticTemplate", "extra_native": "ZstdStaticTemplate", "no_native": "ZstdStaticTemplate", "extern": "ZstdStaticTemplate", "link_arg": "ZstdStaticTemplate", "host": "ZstdStaticTemplate", "platform": "ZstdStaticTemplate", "pre_missing": "ZstdArchiveEvidence", "pre_symlink": "ZstdArchiveEvidence", "pre_hardlink": "ZstdArchiveEvidence"}
+        for case, marker in admission.items():
+            with self.subTest(admission=case): self.tools12_admission_refusal("zstd", case, marker)
+        after = {"during_change": "ZstdArchiveChanged", "post_missing": "ZstdArchiveEvidence", "post_symlink": "ZstdArchiveEvidence", "post_hardlink": "ZstdArchiveEvidence", "source_post": "ZstdPostSource:ZstdSourceContext", "compiler_fail": "CompilerFailed",
+            "snapshot_missing": "ZstdGraph:ZstdArchiveBinding", "snapshot_changed": "ZstdGraph:ZstdArchiveBinding", "final_archive": "ZstdGraph:ZstdArchiveBinding", "request_only": "IncompleteInvocation:", "missing_annotation": "ZstdGraph:ZstdInvocationEvidence", "request_cwd": "ZstdGraph:ZstdSourceContext", "raw_builder": "ZstdGraph:ZstdSourceContext", "builder_features": "ZstdGraph:ZstdBuilder", "missing_builder": "ZstdGraph:ZstdOrigin", "duplicate_builder": "ZstdGraph:ZstdOrigin", "missing_event": "ZstdGraph:ZstdOrigin", "duplicate_event": "ZstdGraph:ZstdOrigin", "event_outdir": "ZstdGraph:ZstdOrigin", "event_cfg": "ZstdGraph:ZstdDeclaration", "event_env": "ZstdGraph:ZstdDeclaration", "missing_cc": "ZstdGraph:ZstdBuilderExtern", "duplicate_cc": "ZstdGraph:ZstdBuilderExtern", "missing_pkg_config": "ZstdGraph:ZstdBuilderExtern", "target_helper_cc": "ZstdGraph:ZstdBuilderExtern", "target_helper_pkg_config": "ZstdGraph:ZstdBuilderExtern", "missing_consumer": "ZstdGraph:ZstdConsumer", "duplicate_consumer": "ZstdGraph:ZstdConsumer", "consumer_features": "ZstdGraph:ZstdConsumer"}
+        for case, marker in after.items():
+            with self.subTest(after=case):
+                session, record, receipts = self.tools12_result("zstd", case, 2)
+                self.assertTrue((session / "compiler-entry/compile-zstd_sys").exists())
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                self.assertEqual(record["native_link_declarations"], [])
+                if case == "compiler_fail":
+                    _, r = next((p, r) for p, r in receipts if r["context"].get("zstd_static_declaration"))
+                    self.assertEqual(r["exit_code"], 7); self.assertIn("zstd_archive_post", r)
+        for epoch in ("current", "retained"):
+            for reuse, marker in (("output", "Output"), ("artifact", "CargoArtifact"), ("extern", "Extern"), ("consumed", "ConsumedSource"), ("selected", "CargoArtifact"), ("snapshot", "Output")):
+                with self.subTest(epoch=epoch, reuse=reuse):
+                    session, record, _ = self.tools12_result("zstd", "namespace_" + epoch + "_" + reuse, 2)
+                    self.assertTrue((session / "compiler-entry/compile-zstd_sys").exists())
+                    self.assertIn("ZstdArchiveOwnership:" + marker, record["blockers"]); self.assertEqual(record["native_link_declarations"], [])
+        from unittest.mock import patch
+        call = self.root / "TEST_CODE_zstd_partial"; call.mkdir(); (call / "libzstd.a").write_bytes(b"TEST_CODE_NONEMPTY_ARCHIVE")
+        with patch.object(owner.shutil, "copyfileobj", side_effect=lambda source, dest, size: dest.write(source.read(1))):
+            with self.assertRaisesRegex(owner.Refusal, "ZstdArchiveEvidence"):
+                owner.static_archive_observation(call, {"out_dir": str(call)}, "pre", "zstd", "libzstd.a", "ZstdArchiveEvidence")
+
+    def test_record12_anyhow_actual_compiler_status_and_cleanup_capture(self):
+        for case, code, outputs in (("normal", 0, 2), ("probe1-none", 1, 0), ("probe1-partial", 1, 1), ("probe1-both", 1, 2)):
+            with self.subTest(case=case):
+                session, record, receipts = self.tools12_result("anyhow", case)
+                self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+                path, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "AnyhowStaticFeatureProbe")
+                self.assertEqual(r["exit_code"], code); self.assertEqual(r["probe_outcome"], "Supported" if code == 0 else "Unsupported")
+                self.assertEqual(r["role"], "Target"); self.assertEqual(r["kind"], "TransientProbe"); self.assertEqual(len(r["outputs"]), outputs)
+                self.assertFalse((Path(r["context"]["out_dir"]) / "probe").exists())
+                raw = [os.fsdecode(bytes.fromhex(a)) for a in r["argv_hex"]]
+                self.assertEqual(raw[1:], ["--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow", "--emit=dep-info,metadata", "--out-dir", str(Path(r["context"]["out_dir"]) / "probe"), "src/nightly.rs", "--target", owner.TARGET])
+                for output in r["outputs"]:self.assertEqual(sha(path / output["snapshot"]), output["sha256"])
+                association, = [a for a in record["build_script_associations"] if a["package_id"].endswith("#anyhow@1.0.102")]
+                self.assertEqual(association["generated_files"], {}); self.assertEqual(association["cargo_event"]["cfgs"], ["error_generic_member_access"] if code == 0 else [])
+                origin, = [o for o in record["nested_origins"] if o["invocation_id"] == path.name]
+                self.assertEqual(origin["producer_invocation"], association["producer_invocation"])
+                self.assertFalse(any("/probe/" in c["path"] for c in record["consumed_sources"]))
+                self.assertEqual(record["native_link_declarations"], [])
+        session, record, receipts = self.tools12_result("anyhow", "probe7", 2)
+        _, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "AnyhowStaticFeatureProbe")
+        self.assertEqual(r["exit_code"], 7); self.assertEqual(r["probe_outcome"], "CompilerFailure"); self.assertIn("CompilerFailed", record["blockers"])
+        for case, marker in (("capture_missing", "MissingDeclaredOutput:"), ("capture_alias", "TransientEvidence:TransientOutputAlias"), ("capture_hardlink", "TransientEvidence:TransientOutputAlias"), ("capture_dep", "TransientEvidence:UnsupportedDepComment"), ("source_post", "AnyhowPostSource:AnyhowSourceContext")):
+            with self.subTest(evidence=case):
+                session, record, receipts = self.tools12_result("anyhow", case, 2)
+                _, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "AnyhowStaticFeatureProbe")
+                self.assertEqual(r["exit_code"], 0); self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+
+    def test_record12_anyhow_source_raw_origin_and_transient_namespace_refuse(self):
+        admission = {"source": "AnyhowTemplate", "package": "AnyhowSourceContext", "version": "AnyhowSourceContext", "cwd": "AnyhowSourceContext", "source_hash": "AnyhowSourceContext", "outdir": "AnyhowOutDir", "feature": "AnyhowFeatures", "bootstrap": "AnyhowEnvironment", "stage": "AnyhowEnvironment", "wrapper": "AnyhowEnvironment", "inline": "AnyhowTemplate", "raw_space": "AnyhowTemplate", "host": "AnyhowTemplate", "platform": "AnyhowTemplate", "retry": "AnyhowTemplate", "source_alias": "AnyhowTemplate", "manifest_alias": "AnyhowSourceContext", "host_env": "AnyhowEnvironment", "encoded_flags": "AnyhowEnvironment", "missing_feature": "AnyhowFeatures", "loader": "CompilerEnvironmentInjection"}
+        for case, marker in admission.items():
+            with self.subTest(admission=case):self.tools12_admission_refusal("anyhow", case, marker)
+        after = {"request_only": "IncompleteInvocation:", "missing_annotation": "AnyhowGraph:CompilerEnvironmentInjection", "request_cwd": "AnyhowGraph:AnyhowSourceContext", "raw_builder": "AnyhowGraph:AnyhowBuilderJoin", "builder_features": "AnyhowGraph:AnyhowBuilderJoin", "missing_builder": "AnyhowGraph:AnyhowOriginJoin", "duplicate_builder": "AnyhowGraph:AnyhowOriginJoin", "missing_event": "AnyhowGraph:AnyhowOriginJoin", "duplicate_event": "AnyhowGraph:AnyhowOriginJoin", "event_outdir": "AnyhowGraph:AnyhowOriginJoin", "event_cfg": "AnyhowGraph:AnyhowCfgJoin", "event_env": "AnyhowGraph:AnyhowCfgJoin", "missing_consumer": "AnyhowGraph:AnyhowConsumerJoin", "duplicate_consumer": "AnyhowGraph:AnyhowConsumerJoin", "consumer_features": "AnyhowGraph:AnyhowConsumerJoin", "snapshot_missing": "AnyhowGraph:AnyhowInvocationEvidence", "snapshot_changed": "AnyhowGraph:AnyhowSnapshot"}
+        for case, marker in after.items():
+            with self.subTest(after=case):
+                session, record, receipts = self.tools12_result("anyhow", case, 2)
+                self.assertTrue((session / "compiler-entry/probe-anyhow").exists())
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                if case == "missing_annotation":
+                    self.assertIn("Tools12Evidence:CompilerEnvironmentInjection", record["blockers"])
+                    self.assertEqual(record["nested_origins"], [])
+                    self.assertFalse(any("/probe/" in c["path"] for c in record["consumed_sources"]))
+                    self.assertEqual(record["native_link_declarations"], [])
+                if case in ("snapshot_missing", "snapshot_changed"):
+                    call, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "AnyhowStaticFeatureProbe")
+                    self.assertEqual(r["exit_code"], 0)
+                    if case == "snapshot_missing":
+                        missing = call / "probe-output-0.raw"
+                        self.assertFalse(missing.exists())
+                        self.assertIn("Tools12Evidence:" + str(FileNotFoundError(2, os.strerror(2), str(missing))), record["blockers"])
+                    else:
+                        self.assertIn("Tools12Evidence:AnyhowSnapshot", record["blockers"])
+                    self.assertFalse(any("/probe/" in c["path"] for c in record["consumed_sources"]))
+                    self.assertEqual(record["native_link_declarations"], [])
+        for epoch in ("current", "retained"):
+            for reuse, marker in (("output", "Output"), ("artifact", "CargoArtifact"), ("extern", "Extern"), ("consumed", "ConsumedSource"), ("selected", "CargoArtifact"), ("snapshot", "Output")):
+                with self.subTest(epoch=epoch, reuse=reuse):
+                    session, record, _ = self.tools12_result("anyhow", "namespace_" + epoch + "_" + reuse, 2)
+                    self.assertTrue((session / "compiler-entry/probe-anyhow").exists()); self.assertIn("AnyhowTransientOwnership:" + marker, record["blockers"])
+                    self.assertFalse(any(c["path"].endswith("libpromoted.rlib") for c in record["consumed_sources"]))
+                    self.assertEqual(record["native_link_declarations"], [])
+
+    def test_record12_serde_core_two_host_builders_map_one_target_consumer(self):
+        session, record, receipts = self.tools12_result("serde")
+        self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+        builders = [(p, r) for p, r in receipts if r["source"] == str(session / "vendor/serde_core/build.rs")]
+        self.assertEqual(len(builders), 2)
+        self.assertTrue(all(r["role"] == "Host" and r["exit_code"] == 0 and "--target" not in r["parsed"]["options"] for _, r in builders))
+        consumer_path, consumer = next((p, r) for p, r in receipts if r["source"] == str(session / "vendor/serde_core/src/lib.rs"))
+        self.assertEqual(consumer["role"], "Target"); self.assertEqual(consumer["parsed"]["options"]["--target"], [owner.TARGET])
+        association, = [a for a in record["build_script_associations"] if a["package_id"].endswith("#serde_core@1.0.228")]
+        wide_path, wide = next((p, r) for p, r in builders if 'feature="alloc"' in r["parsed"]["options"]["--cfg"])
+        self.assertEqual(association["producer_invocation"], wide_path.name)
+        mapping = association["recording_only_mapping"]
+        self.assertEqual(mapping, {"state": "RecordingOnly", "rule": "RecordingOnlySerdeCoreConsumerFeatureMappingV1", "execution_edge": "not_observed", "consumer_invocation": consumer_path.name, "features": ["alloc", "default", "rc", "result", "std"]})
+        private, = [c for c in record["consumed_sources"] if c["path"].endswith("/serde_core-8c92ebf254a84c42/out/private.rs")]
+        self.assertEqual(private["owner"]["generated_by"], wide_path.name); self.assertEqual(private["owner"]["recording_only_mapping"], mapping)
+        self.assertEqual(Path(private["path"]).read_bytes(), TOOLS12_PRIVATE); self.assertEqual(private["sha256"], hashlib.sha256(TOOLS12_PRIVATE).hexdigest())
+        self.assertEqual(record["native_link_declarations"], []); self.assertEqual(record["nested_origins"], [])
+
+    def test_record12_serde_core_feature_mapping_requires_all_finite_evidence(self):
+        for case in ("missing_builder", "duplicate_features", "no_compatible", "private_hash_same", "builder_features", "builder_metadata", "builder_role", "builder_outdir", "raw_builder", "alias", "consumer_role", "consumer_metadata", "consumer_features", "missing_consumer", "duplicate_consumer", "event_outdir", "event_cfg", "event_env", "private_bytes", "consumer_source", "builder_source", "consumer_outdir", "compiler_identity", "builder_cwd", "package", "version", "cwd", "outdir", "feature"):
+            with self.subTest(case=case):
+                session, record, receipts = self.tools12_result("serde", case, 2)
+                self.assertTrue((session / "compiler-entry/compile-serde_core").exists())
+                self.assertIn("SerdeCoreMapping:SerdeCoreMapping", record["blockers"])
+                self.assertTrue(any(r["source"] == str(session / "vendor/serde_core/build.rs") for _, r in receipts))
+                self.assertFalse(any(a["package_id"].endswith("#serde_core@1.0.228") for a in record["build_script_associations"]))
+                self.assertFalse(any(c["path"].endswith("private.rs") for c in record["consumed_sources"]))
 
 
 if __name__ == "__main__":

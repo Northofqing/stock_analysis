@@ -1170,16 +1170,20 @@ def psm_static_context(args, env, cwd, session, inv):
 
 
 def psm_archive_observation(call, context, phase):
-    require(phase in ("pre", "post"), "PsmArchiveEvidence")
+    return static_archive_observation(call, context, phase, "psm", PSM_ARCHIVE, "PsmArchiveEvidence")
+
+
+def static_archive_observation(call, context, phase, prefix, archive, reason):
+    require(phase in ("pre", "post"), reason)
     try:
-        path = Path(context["out_dir"]) / PSM_ARCHIVE; regular(path)
+        path = Path(context["out_dir"]) / archive; regular(path)
         before = path.stat()
-        require(path.resolve() == path and before.st_nlink == 1, "PsmArchiveEvidence")
-        snapshot = call / ("psm-archive-" + phase + ".raw")
+        require(path.resolve() == path and before.st_nlink == 1, reason)
+        snapshot = call / (prefix + "-archive-" + phase + ".raw")
         with open(path, "rb") as source, open(snapshot, "xb") as dest:
             opened = os.fstat(source.fileno())
             require((opened.st_dev, opened.st_ino, opened.st_size) == (before.st_dev, before.st_ino, before.st_size),
-                    "PsmArchiveEvidence")
+                    reason)
             shutil.copyfileobj(source, dest, 65536)
             after = os.fstat(source.fileno())
         current = path.stat(); sha = file_hash(snapshot)
@@ -1187,10 +1191,10 @@ def psm_archive_observation(call, context, phase):
                 and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
                     (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) ==
                     (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
-                and snapshot.stat().st_size == before.st_size and file_hash(path) == sha, "PsmArchiveEvidence")
+                and snapshot.stat().st_size == before.st_size and file_hash(path) == sha, reason)
         return {"path": str(path), "snapshot": snapshot.name, "length": before.st_size, "sha256": sha}
     except (OSError, Refusal) as error:
-        raise Refusal("PsmArchiveEvidence") from error
+        raise Refusal(reason) from error
 
 
 def psm_archive_namespace(args, env, cwd, call, session):
@@ -1346,6 +1350,426 @@ def psm_static_graph(receipts, associations, artifacts, events, edges, session, 
         except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
             blockers.append("PsmGraph:" + (str(error) if isinstance(error, Refusal) else "PsmInvocationEvidence"))
     return blockers, declarations
+
+
+ZSTD_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#zstd-sys@2.0.16+zstd.1.5.7"
+ZSTD_FEATURES = ("legacy", "std", "zdict_builder")
+ZSTD_SOURCES = ("Cargo.toml", "build.rs", "src/lib.rs", "src/bindings_zstd.rs", "src/bindings_zdict.rs")
+ZSTD_CHECK = 'cfg(feature, values("bindgen", "debug", "default", "experimental", "fat-lto", "legacy", "no_asm", "no_wasm_shim", "non-cargo", "pkg-config", "seekable", "std", "thin", "thin-lto", "zdict_builder", "zstdmt"))'
+ANYHOW_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#anyhow@1.0.102"
+ANYHOW_KIND = "AnyhowStaticFeatureProbe"
+ANYHOW_SOURCES = ("Cargo.toml", "build.rs", "src/backtrace.rs", "src/chain.rs", "src/context.rs", "src/ensure.rs",
+    "src/error.rs", "src/fmt.rs", "src/kind.rs", "src/lib.rs", "src/macros.rs", "src/nightly.rs", "src/ptr.rs", "src/wrapper.rs")
+SERDE_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.228"
+SERDE_SOURCES = ("Cargo.toml", "build.rs", "src/crate_root.rs", "src/de/ignored_any.rs", "src/de/impls.rs", "src/de/mod.rs",
+    "src/de/value.rs", "src/format.rs", "src/lib.rs", "src/macros.rs", "src/private/content.rs", "src/private/doc.rs",
+    "src/private/mod.rs", "src/private/seed.rs", "src/private/size_hint.rs", "src/private/string.rs", "src/ser/fmt.rs",
+    "src/ser/impls.rs", "src/ser/impossible.rs", "src/ser/mod.rs", "src/std_error.rs")
+SERDE_FEATURES = (("alloc", "default", "rc", "result", "std"), ("result", "std"))
+SERDE_CHECK = 'cfg(feature, values("alloc", "default", "rc", "result", "std", "unstable"))'
+SERDE_EXTRA_CHECKS = ("if_docsrs_then_no_serde_core", "no_core_cstr", "no_core_error", "no_core_net", "no_core_num_saturating",
+    "no_diagnostic_namespace", "no_serde_derive", "no_std_atomic", "no_std_atomic64", "no_target_has_atomic")
+SERDE_PRIVATE = b'#[doc(hidden)]\npub mod __private228 {\n    #[doc(hidden)]\n    pub use crate::private::*;\n}\n'
+SERDE_MAPPING = "RecordingOnlySerdeCoreConsumerFeatureMappingV1"
+
+
+def tools12_source(name, version, sources, env, cwd, session, inv, reason):
+    root = session / "vendor" / name
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    parts = version.split("+", 1)[0].split(".")
+    try:
+        require(inv["packages"].count(package) == 1 and cwd == root
+                and env.get("CARGO_MANIFEST_DIR") == str(root) and env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+                and env.get("CARGO_PKG_NAME") == name and env.get("CARGO_PKG_VERSION") == version
+                and all(env.get(k) == v for k, v in zip(("CARGO_PKG_VERSION_MAJOR", "CARGO_PKG_VERSION_MINOR",
+                    "CARGO_PKG_VERSION_PATCH"), parts)) and env.get("CARGO_PKG_VERSION_PRE") == "", reason)
+        for leaf in sources:
+            path = root / leaf; regular(path)
+            require(path.resolve() == path and path.stat().st_nlink == 1
+                    and inv["vendor"]["files"].get(name + "/" + leaf) == file_hash(path), reason)
+    except (Refusal, OSError) as error:
+        raise Refusal(reason) from error
+    return package, root
+
+
+def tools12_out(name, env, session, *, host=False, reason):
+    raw = env.get("OUT_DIR", ""); out = Path(raw)
+    parent = session / "target/debug/build" if host else session / "target" / TARGET / "debug/build"
+    require(out.is_absolute() and str(out) == raw and out.resolve() == out and out.is_dir() and not out.is_symlink()
+            and out.name == "out" and out.parent.parent == parent
+            and re.fullmatch(re.escape(name) + r"-[0-9a-f]{16}", out.parent.name), reason)
+    return out
+
+
+def tools12_candidate(name, source, args, env, cwd, session):
+    root = session / "vendor" / name
+    return (any(not a.startswith("-") and a.endswith(".rs") and (cwd / a).resolve() == root / source for a in args[1:])
+            or env.get("CARGO_PKG_NAME") == name or env.get("CARGO_CRATE_NAME") == name.replace("-", "_")
+            or bool(env.get("CARGO_MANIFEST_DIR")) and (cwd / env["CARGO_MANIFEST_DIR"]).resolve() == root)
+
+
+def zstd_static_context(args, env, cwd, session, inv):
+    if not (tools12_candidate("zstd-sys", "src/lib.rs", args, env, cwd, session)
+            or any(a in ("static=zstd", "-lstatic=zstd") for a in args[1:])):
+        return None
+    raw = args[1:]; root = session / "vendor/zstd-sys"
+    if not any(a.startswith(("-l", "--extern-native")) for a in raw):
+        ordinary = parse_rustc(raw)
+        if ordinary["inputs"] == [str(root / "build.rs")] and ordinary["options"].get("--crate-type") == ["bin"] and "--target" not in ordinary["options"]:
+            return None
+    package, root = tools12_source("zstd-sys", "2.0.16+zstd.1.5.7", ZSTD_SOURCES, env, cwd, session, inv, "ZstdSourceContext")
+    out = tools12_out("zstd-sys", env, session, reason="ZstdSourceContext")
+    suffix = ["-L", "native=" + str(out), "-l", "static=zstd"]
+    require(raw[-4:] == suffix, "ZstdStaticTemplate")
+    try:
+        parsed = parse_rustc(raw[:-4])
+    except Refusal as error:
+        raise Refusal("ZstdStaticTemplate") from error
+    c = parsed["codegen"]; metadata = c.get("metadata", [""])[0]; extra = c.get("extra-filename", [""])[0]
+    deps, host = session / "target" / TARGET / "debug/deps", session / "target/debug/deps"
+    exact = ["--crate-name", "zstd_sys", "--edition=2018", str(root / "src/lib.rs"), "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts,future-incompat", "--crate-type", "lib", "--emit=dep-info,metadata,link",
+        "-C", "embed-bitcode=no", "-C", "debuginfo=1", "-C", "split-debuginfo=unpacked", "--allow=non_upper_case_globals",
+        *[v for f in ZSTD_FEATURES for v in ("--cfg", 'feature="' + f + '"')], "--check-cfg", "cfg(docsrs,test)",
+        "--check-cfg", ZSTD_CHECK, "-C", "metadata=" + metadata, "-C", "extra-filename=" + extra,
+        "--out-dir", str(deps), "--target", TARGET, "-L", "dependency=" + str(deps), "-L", "dependency=" + str(host),
+        "--cap-lints", "allow", *suffix]
+    require(raw == exact and re.fullmatch(r"[0-9a-f]{16}", metadata) and re.fullmatch(r"-[0-9a-f]{16}", extra), "ZstdStaticTemplate")
+    require(env.get("CARGO_CRATE_NAME") == "zstd_sys" and not any(k.startswith("CARGO_FEATURE_") for k in env)
+            and args[0] == inv["rustc"]["path"] and env.get("RUSTC") == args[0]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not any(k in env for k in ("RUSTC_WORKSPACE_WRAPPER", "RUSTC_STAGE", "RUSTC_BOOTSTRAP"))
+            and all(env.get(k) == inv["environment"].get(k) for k in ("CC", "CXX", "AR", "SDKROOT")), "ZstdEnvironmentContext")
+    parsed["options"]["-L"].append("native=" + str(out)); parsed["options"]["-l"] = ["static=zstd"]
+    return parsed, {"kind": "DirectCargoCompile", "zstd_static_declaration": "static=zstd", "package_id": package["id"],
+                    "manifest": str(root), "out_dir": str(out), "native_argument_indices": list(range(len(args) - 4, len(args)))}
+
+
+def anyhow_candidate(args, env, cwd, session):
+    return (tools12_candidate("anyhow", "src/nightly.rs", args, env, cwd, session)
+            and (env.get("DYLD_FALLBACK_LIBRARY_PATH", "").startswith(str(session / "target/debug") + ":")
+                 or any("anyhow_build_probe" in a or a == "src/nightly.rs" or a.endswith("/src/nightly.rs") for a in args[1:])))
+
+
+def anyhow_context(args, env, cwd, session, inv):
+    if not anyhow_candidate(args, env, cwd, session): return None
+    package, root = tools12_source("anyhow", "1.0.102", ANYHOW_SOURCES, env, cwd, session, inv, "AnyhowSourceContext")
+    out = tools12_out("anyhow", env, session, host=True, reason="AnyhowOutDir")
+    require((out / "probe").resolve() == out / "probe", "AnyhowProbeDirectory")
+    require({k for k in env if k.startswith("CARGO_FEATURE_")} == {"CARGO_FEATURE_DEFAULT", "CARGO_FEATURE_STD"}
+            and env["CARGO_FEATURE_DEFAULT"] == env["CARGO_FEATURE_STD"] == "1", "AnyhowFeatures")
+    require(args[0] == inv["rustc"]["path"] and env.get("RUSTC") == args[0]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not any(k in env for k in ("RUSTC_WORKSPACE_WRAPPER", "RUSTC_STAGE", "RUSTC_BOOTSTRAP"))
+            and env.get("HOST") == env.get("TARGET") == TARGET and env.get("CARGO_ENCODED_RUSTFLAGS") == "", "AnyhowEnvironment")
+    exact = ["--cfg=anyhow_build_probe", "--edition=2018", "--crate-name=anyhow", "--crate-type=lib", "--cap-lints=allow",
+             "--emit=dep-info,metadata", "--out-dir", str(out / "probe"), "src/nightly.rs", "--target", TARGET]
+    require(args[1:] == exact, "AnyhowTemplate")
+    return parse_rustc(args[1:]), {"kind": ANYHOW_KIND, "package_id": package["id"], "manifest": str(root), "out_dir": str(out)}
+
+
+def tools12_request(receipt, session, inv, reason, *, parsed=None):
+    call = session / "invocations" / receipt["invocation_id"]
+    request = strict_json((call / "request.json").read_bytes()); initial = strict_json((call / "invocation.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    require(args[0] == inv["rustc"]["path"] and file_hash(Path(args[0])) == inv["rustc"]["sha256"]
+            and receipt["compiler_sha256"] == inv["rustc"]["sha256"]
+            and request["argv_hex"] == initial["argv_hex"] == receipt["argv_hex"]
+            and request["environment_hex"] == initial["environment_hex"] == receipt["environment_hex"]
+            and receipt["cwd"] == str(cwd) == os.fsdecode(bytes.fromhex(request["cwd_hex"]))
+            and all(initial[k] == receipt[k] for k in ("context", "source", "package", "role", "kind", "cwd", "parsed",
+                "compiler_sha256", "declared_outputs", "externs")), reason)
+    require(receipt["parsed"] == (parse_rustc(args[1:]) if parsed is None else parsed)
+            and env.get("RUSTC") == inv["rustc"]["path"] and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not any(k in env for k in ("RUSTC_BOOTSTRAP", "RUSTC_STAGE", "RUSTC_WORKSPACE_WRAPPER"))
+            and not env.get("CARGO_ENCODED_RUSTFLAGS"), reason)
+    compiler_environment(env, session, inv["sysroot"], probe=False, context=receipt["context"])
+    return call, args, env, cwd
+
+
+def tools12_artifact(receipt, artifacts, events, features, kind, reason):
+    aa = [a for a in artifacts if a["invocation_id"] == receipt["invocation_id"]]
+    ee = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == receipt["package"]["id"]
+          and e.get("target", {}).get("src_path") == receipt["source"]
+          and aa and e.get("filenames") == aa[0]["files"]]
+    require(len(aa) == len(ee) == 1 and ee[0]["target"].get("kind") == [kind]
+            and ee[0]["target"].get("crate_types") == ["bin" if kind == "custom-build" else kind]
+            and sorted(ee[0].get("features", [])) == sorted(features)
+            and len(features) == len(set(features))
+            and ee[0]["target"].get("name") == ("build-script-build" if kind == "custom-build" else receipt["parsed"]["options"]["--crate-name"][0])
+            and ee[0]["target"].get("edition") == receipt["parsed"]["options"]["--edition"][0]
+            and ee[0].get("manifest_path") == str(Path(receipt["cwd"]) / "Cargo.toml"), reason)
+    if kind == "custom-build":
+        require(aa[0].get("builder_alias") == custom_build_producer(ee[0], receipt, aa[0]["file_sha256"]), reason)
+        alias = aa[0]["builder_alias"]
+        require(all(Path(alias[k]).is_file() and not Path(alias[k]).is_symlink()
+                    and file_hash(Path(alias[k])) == alias["sha256"] for k in ("path", "link_path")), reason)
+    else:
+        require(set(aa[0]["files"]) == {o["path"] for o in receipt["declared_outputs"] if o["kind"] in ("metadata", "link")}, reason)
+    return aa[0], ee[0]
+
+
+def tools12_ordinary(receipt, name, version, source, role, features, session, inv, reason):
+    _, args, env, cwd = tools12_request(receipt, session, inv, reason)
+    root = session / "vendor" / name
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    require(receipt["kind"] == "Compile" and receipt["context"]["kind"] == "DirectCargoCompile"
+            and receipt["role"] == role and receipt["exit_code"] == 0 and not receipt["blockers"]
+            and receipt["source"] == str(root / source) and receipt["package"] == package and cwd == root
+            and receipt["parsed"]["inputs"] == [receipt["source"]]
+            and (receipt["parsed"]["options"].get("--target") == [TARGET] if role == "Target" else "--target" not in receipt["parsed"]["options"])
+            and sorted(receipt["parsed"]["options"].get("--cfg", [])) == sorted('feature="' + f + '"' for f in features)
+            and env.get("CARGO_MANIFEST_DIR") == str(root) and env.get("CARGO_PKG_NAME") == name
+            and env.get("CARGO_PKG_VERSION") == version and env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and env.get("CARGO_CRATE_NAME") == ("build_script_build" if source == "build.rs" else name.replace("-", "_"))
+            and receipt["parsed"]["options"].get("--crate-name") == [env["CARGO_CRATE_NAME"]]
+            and receipt["parsed"]["options"].get("--crate-type") == ["bin" if source == "build.rs" else "lib"]
+            and receipt["parsed"]["options"].get("--edition") == ["2018" if name in {"zstd-sys", "cc", "pkg-config"} else "2021"]
+            and env.get("RUSTC") == inv["rustc"]["path"]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not any(k in env for k in ("RUSTC_BOOTSTRAP", "RUSTC_STAGE", "RUSTC_WORKSPACE_WRAPPER"))
+            and not env.get("CARGO_ENCODED_RUSTFLAGS"), reason)
+    feature_keys = {k for k in env if k.startswith("CARGO_FEATURE_")}
+    require(not feature_keys or feature_keys == {"CARGO_FEATURE_" + f.upper() for f in features}
+            and all(env[k] == "1" for k in feature_keys), reason)
+    require(all(Path(o["path"]).is_file() and not Path(o["path"]).is_symlink()
+                and file_hash(Path(o["path"])) == o["sha256"] for o in receipt["outputs"]), reason)
+    return args, env, cwd
+
+
+def tools12_namespace(name, args, env, cwd, call, session):
+    # Negative-only current and retained bytes; no qualified annotations needed.
+    archive = name == "zstd-sys"
+    leaves = ("zstd-archive-pre.raw", "zstd-archive-post.raw") if archive else ("probe-output-0.raw", "probe-output-1.raw")
+    paths = {str(call / leaf) for leaf in leaves} if archive or anyhow_candidate(args, env, cwd, session) else set()
+    out = (cwd / env.get("OUT_DIR", "")).resolve()
+    parent = session / "target" / TARGET / "debug/build" if archive else session / "target/debug/build"
+    if out.name == "out" and out.parent.parent == parent and re.fullmatch(re.escape(name) + r"-[0-9a-f]{16}", out.parent.name):
+        paths.update({str(out / "libzstd.a")} if archive else {str(out / "probe" / leaf) for leaf in ("anyhow.d", "libanyhow.rmeta")})
+    hashes = {file_hash(Path(p)) for p in paths if Path(p).is_file() and not Path(p).is_symlink()}
+    for leaf in ("invocation.json", "receipt.json"):
+        path = call / leaf
+        if not path.is_file() or path.is_symlink(): continue
+        data = strict_json(path.read_bytes())
+        rows = [data.get("zstd_archive_" + phase, {}) for phase in ("pre", "post")] if archive else (
+            data.get("outputs", []) if anyhow_candidate(args, env, cwd, session) or data.get("context", {}).get("kind") == ANYHOW_KIND else [])
+        for row in rows:
+            sha = row.get("sha256") if isinstance(row, dict) else None
+            if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha): hashes.add(sha)
+    return paths, hashes
+
+
+def tools12_owned(path, sha, paths, hashes):
+    p = Path(path)
+    return str(p.resolve()) in paths or sha in hashes or p.is_file() and not p.is_symlink() and file_hash(p) in hashes
+
+
+def zstd_evidence(receipt, session, inv):
+    call = session / "invocations" / receipt["invocation_id"]
+    request = strict_json((call / "request.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    special = zstd_static_context(args, env, cwd, session, inv)
+    claimed = "zstd_static_declaration" in receipt.get("context", {}) or any(k.startswith("zstd_archive_") for k in receipt)
+    if special is None:
+        require(not claimed, "ZstdInvocationEvidence"); return None
+    parsed, context = special
+    tools12_request(receipt, session, inv, "ZstdInvocationEvidence", parsed=parsed)
+    initial = strict_json((call / "invocation.json").read_bytes())
+    require(receipt["context"] == context and receipt["role"] == "Target" and receipt["kind"] == "Compile"
+            and receipt["source"] == str(session / "vendor/zstd-sys/src/lib.rs") and receipt["externs"] == []
+            and receipt["package"] == {"id": ZSTD_PACKAGE, "tree": "vendor", "manifest": "zstd-sys/Cargo.toml"}
+            and receipt["declared_outputs"] == selected_outputs(parsed, cwd, session / "target")
+            and initial.get("zstd_archive_pre") == receipt.get("zstd_archive_pre"), "ZstdInvocationEvidence")
+    try:
+        for phase in ("pre", "post"):
+            row = receipt["zstd_archive_" + phase]
+            require(set(row) == {"path", "snapshot", "length", "sha256"} and type(row["length"]) is int and row["length"] >= 0
+                    and row["path"] == str(Path(context["out_dir"]) / "libzstd.a")
+                    and row["snapshot"] == "zstd-archive-" + phase + ".raw", "ZstdArchiveBinding")
+            for path in (call / row["snapshot"], Path(row["path"])):
+                regular(path)
+                require(path.resolve() == path and path.stat().st_nlink == 1 and path.stat().st_size == row["length"]
+                        and file_hash(path) == row["sha256"], "ZstdArchiveBinding")
+        require(all(receipt["zstd_archive_pre"][k] == receipt["zstd_archive_post"][k] for k in ("path", "length", "sha256")), "ZstdArchiveBinding")
+    except (Refusal, OSError, KeyError, TypeError) as error:
+        raise Refusal("ZstdArchiveBinding") from error
+    return context
+
+
+def zstd_graph(receipts, associations, artifacts, events, edges, session, inv, paths, hashes):
+    blockers, declarations = [], []; by_id = {r["invocation_id"]: r for r in receipts}
+    for r in receipts:
+        try:
+            context = zstd_evidence(r, session, inv)
+            if context is None: continue
+            origins = [a for a in associations if a["package_id"] == ZSTD_PACKAGE and a["out_dir"] == context["out_dir"]]
+            oe = [e for e in events if e["reason"] == "build-script-executed" and e.get("package_id") == ZSTD_PACKAGE]
+            require(len(origins) == len(oe) == 1 and origins[0]["cargo_event"] == oe[0], "ZstdOrigin")
+            association = origins[0]; builder = by_id[association["producer_invocation"]]
+            tools12_ordinary(builder, "zstd-sys", "2.0.16+zstd.1.5.7", "build.rs", "Host", ZSTD_FEATURES, session, inv, "ZstdBuilder")
+            require(builder["parsed"]["options"].get("--crate-type") == ["bin"], "ZstdBuilder")
+            tools12_artifact(builder, artifacts, events, ZSTD_FEATURES, "custom-build", "ZstdBuilder")
+            be = [e for e in edges if e["consumer"] == builder["invocation_id"]]
+            require(len(be) == 2 and {e["name"] for e in be} == {"cc", "pkg_config"}, "ZstdBuilderExtern")
+            for edge_name, name, version, features in (("cc", "cc", "1.2.59", ("parallel",)), ("pkg_config", "pkg-config", "0.3.32", ())):
+                ee = [e for e in be if e["name"] == edge_name]
+                require(len(ee) == 1 and len(ee[0]["producers"]) == 1, "ZstdBuilderExtern")
+                helper = by_id[ee[0]["producers"][0]]
+                tools12_ordinary(helper, name, version, "src/lib.rs", "Host", features, session, inv, "ZstdBuilderExtern")
+                tools12_artifact(helper, artifacts, events, features, "lib", "ZstdBuilderExtern")
+            event = association["cargo_event"]
+            require(event["linked_libs"] == ["static=zstd"] and event["linked_paths"] == ["native=" + context["out_dir"]]
+                    and event["cfgs"] == event["env"] == [], "ZstdDeclaration")
+            require(r["exit_code"] == 0 and not r["blockers"]
+                    and len([v for v in receipts if v["source"] == r["source"]]) == 1, "ZstdConsumer")
+            tools12_artifact(r, artifacts, events, ZSTD_FEATURES, "lib", "ZstdConsumer")
+            require(association["generated_files"].get("libzstd.a") == r["zstd_archive_pre"]["sha256"], "ZstdArchiveBinding")
+            require(not any(tools12_owned(o["path"], o.get("sha256"), paths, hashes)
+                            for v in receipts for o in v["declared_outputs"] + v["outputs"])
+                    and not any(tools12_owned(e["path"], None, paths, hashes) for e in edges)
+                    and not any(tools12_owned(str((Path(v["cwd"]) / q).resolve()), None, paths, hashes)
+                                for v in receipts for o in v["outputs"] for q in o.get("dep_info", {}).get("paths", []))
+                    and not any(tools12_owned(f, None, paths, hashes) for e in events if e["reason"] == "compiler-artifact" for f in e.get("filenames", [])),
+                    "ZstdArchiveOwnership")
+            declarations.append({"state": "RecordingOnly", "declaration": "static=zstd", "raw_argument_indices": context["native_argument_indices"],
+                "consumer_invocation": r["invocation_id"], "producer_invocation": builder["invocation_id"], "package_id": ZSTD_PACKAGE,
+                "out_dir": context["out_dir"], "archive_pre": r["zstd_archive_pre"], "archive_post": r["zstd_archive_post"],
+                "artifact_selection": "not_observed", "native_child_provenance": "not_observed", "native_producer_qualification": "not_issued"})
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("ZstdGraph:" + (str(error) if isinstance(error, Refusal) else "ZstdInvocationEvidence"))
+    return blockers, declarations
+
+
+def anyhow_evidence(receipt, session, inv):
+    call = session / "invocations" / receipt["invocation_id"]
+    request = strict_json((call / "request.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    special = anyhow_context(args, env, cwd, session, inv)
+    if special is None:
+        require(receipt.get("context", {}).get("kind") != ANYHOW_KIND, "AnyhowInvocationEvidence"); return None
+    parsed, context = special
+    tools12_request(receipt, session, inv, "AnyhowInvocationEvidence", parsed=parsed)
+    outputs = selected_outputs(parsed, cwd, session / "target")
+    require(receipt["context"] == context and receipt["kind"] == "TransientProbe" and receipt["role"] == "Target"
+            and receipt["source"] == str(cwd / "src/nightly.rs") and receipt["package"] == {"id": ANYHOW_PACKAGE, "tree": "vendor", "manifest": "anyhow/Cargo.toml"}
+            and receipt["declared_outputs"] == outputs and receipt["externs"] == []
+            and receipt["probe_outcome"] == {0: "Supported", 1: "Unsupported"}.get(receipt["exit_code"], "CompilerFailure"), "AnyhowInvocationEvidence")
+    declarations = {o["path"]: (i, o) for i, o in enumerate(outputs)}
+    require(len({o["path"] for o in receipt["outputs"]}) == len(receipt["outputs"])
+            and (receipt["exit_code"] != 0 or {o["path"] for o in receipt["outputs"]} == set(declarations)), "AnyhowProbeEvidence")
+    for output in receipt["outputs"]:
+        require(output["path"] in declarations, "AnyhowProbeEvidence")
+        index, declaration = declarations[output["path"]]; snapshot = call / ("probe-output-" + str(index) + ".raw")
+        require(output["kind"] == declaration["kind"] and output["snapshot"] == snapshot.name, "AnyhowProbeEvidence")
+        regular(snapshot)
+        require(snapshot.resolve() == snapshot and snapshot.stat().st_nlink == 1 and file_hash(snapshot) == output["sha256"], "AnyhowSnapshot")
+        current = Path(output["path"])
+        if current.exists() or current.is_symlink():
+            regular(current)
+            require(current.resolve() == current and current.stat().st_nlink == 1 and file_hash(current) == output["sha256"], "AnyhowSnapshot")
+        if output["kind"] == "dep-info": require(output.get("dep_info") == dep_info(snapshot.read_bytes()), "AnyhowDepInfo")
+    return context
+
+
+def anyhow_graph(receipts, associations, artifacts, events, session, inv):
+    if not any(isinstance(r.get("package"), dict) and r["package"]["id"] == ANYHOW_PACKAGE for r in receipts): return []
+    try:
+        children = [(r, anyhow_evidence(r, session, inv)) for r in receipts]
+        children = [(r, c) for r, c in children if c is not None]
+        require(len(children) == 1, "AnyhowChildJoin")
+        child, context = children[0]
+        require(child["exit_code"] in (0, 1) and not child["blockers"], "AnyhowChildJoin")
+        origins = [a for a in associations if a["package_id"] == ANYHOW_PACKAGE]
+        oe = [e for e in events if e["reason"] == "build-script-executed" and e.get("package_id") == ANYHOW_PACKAGE]
+        require(len(origins) == len(oe) == 1 and origins[0]["cargo_event"] == oe[0]
+                and origins[0]["out_dir"] == context["out_dir"], "AnyhowOriginJoin")
+        association = origins[0]; by_id = {r["invocation_id"]: r for r in receipts}; builder = by_id[association["producer_invocation"]]
+        tools12_ordinary(builder, "anyhow", "1.0.102", "build.rs", "Host", ("default", "std"), session, inv, "AnyhowBuilderJoin")
+        tools12_artifact(builder, artifacts, events, ("default", "std"), "custom-build", "AnyhowBuilderJoin")
+        consumers = [r for r in receipts if r["source"] == str(session / "vendor/anyhow/src/lib.rs")]
+        require(len(consumers) == 1, "AnyhowConsumerJoin"); consumer = consumers[0]
+        cfgs = ["error_generic_member_access"] if child["exit_code"] == 0 else []
+        event = association["cargo_event"]
+        require(event["cfgs"] == cfgs and all(event[k] == [] for k in ("linked_libs", "linked_paths", "env"))
+                and sorted(consumer["parsed"]["options"].get("--cfg", [])) == sorted(['feature="default"', 'feature="std"'] + cfgs), "AnyhowCfgJoin")
+        # Validate the ordinary Host consumer without treating generated cfg as a feature.
+        _, _, env, cwd = tools12_request(consumer, session, inv, "AnyhowConsumerJoin")
+        tools12_source("anyhow", "1.0.102", ANYHOW_SOURCES, env, cwd, session, inv, "AnyhowConsumerJoin")
+        require(consumer["kind"] == "Compile" and consumer["context"]["kind"] == "DirectCargoCompile"
+                and consumer["role"] == "Host" and "--target" not in consumer["parsed"]["options"]
+                and consumer["exit_code"] == 0 and not consumer["blockers"] and env.get("OUT_DIR") == context["out_dir"]
+                and env.get("CARGO_CRATE_NAME") == "anyhow"
+                and consumer["parsed"]["options"].get("--crate-name") == ["anyhow"]
+                and consumer["parsed"]["options"].get("--crate-type") == ["lib"], "AnyhowConsumerJoin")
+        tools12_artifact(consumer, artifacts, events, ("default", "std"), "lib", "AnyhowConsumerJoin")
+        require(association["generated_files"] == {}, "AnyhowGeneratedJoin")
+        return []
+    except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+        return ["AnyhowGraph:" + (str(error) if isinstance(error, Refusal) else "AnyhowInvocationEvidence")]
+
+
+def serde_core_mapping(event, producers, receipts, artifacts, events, session, inv):
+    """Finite RecordingOnly mapping rule; Cargo did not observe alias execution."""
+    reason = "SerdeCoreMapping"
+    require(event["cfgs"] == event["env"] == event["linked_libs"] == event["linked_paths"] == [], reason)
+    consumers = [r for r in receipts if r["source"] == str(session / "vendor/serde_core/src/lib.rs")]
+    require(len(consumers) == 1, reason); consumer = consumers[0]
+    _, args, env, cwd = tools12_request(consumer, session, inv, reason)
+    tools12_source("serde_core", "1.0.228", SERDE_SOURCES, env, cwd, session, inv, reason)
+    out = tools12_out("serde_core", env, session, reason=reason)
+    require(str(out) == event["out_dir"] and consumer["role"] == "Target" and consumer["package"]["id"] == SERDE_PACKAGE
+            and consumer["kind"] == "Compile" and consumer["context"]["kind"] == "DirectCargoCompile"
+            and consumer["exit_code"] == 0 and not consumer["blockers"] and consumer["externs"] == [], reason)
+    features = tuple(v[len('feature="'):-1] for v in consumer["parsed"]["options"].get("--cfg", []) if v.startswith('feature="') and v.endswith('"'))
+    feature_keys = {k for k in env if k.startswith("CARGO_FEATURE_")}
+    require(features in SERDE_FEATURES and env.get("CARGO_CRATE_NAME") == "serde_core"
+            and (not feature_keys or feature_keys == {"CARGO_FEATURE_" + f.upper() for f in features}
+                 and all(env[k] == "1" for k in feature_keys)), reason)
+    tools12_artifact(consumer, artifacts, events, features, "lib", reason)
+    serde_core_template(args, features, cwd, session, builder=False)
+    compatible = []
+    for artifact in producers:
+        builder = next(r for r in receipts if r["invocation_id"] == artifact["invocation_id"])
+        _, bargs, benv, bcwd = tools12_request(builder, session, inv, reason)
+        tools12_source("serde_core", "1.0.228", SERDE_SOURCES, benv, bcwd, session, inv, reason)
+        bf = tuple(v[len('feature="'):-1] for v in builder["parsed"]["options"].get("--cfg", []) if v.startswith('feature="') and v.endswith('"'))
+        require(bf in SERDE_FEATURES and not any(k in benv for k in ("OUT_DIR", "HOST", "TARGET")), reason)
+        tools12_ordinary(builder, "serde_core", "1.0.228", "build.rs", "Host", bf, session, inv, reason)
+        tools12_artifact(builder, artifacts, events, bf, "custom-build", reason)
+        serde_core_template(bargs, bf, bcwd, session, builder=True)
+        if bf == features: compatible.append(artifact)
+    require(len(compatible) == 1, reason)
+    private = out / "private.rs"; regular(private)
+    require(private.resolve() == private and private.stat().st_nlink == 1 and private.read_bytes() == SERDE_PRIVATE, reason)
+    di = [o["dep_info"] for o in consumer["outputs"] if o["kind"] == "dep-info"]
+    require(len(di) == 1 and str(private) in {str((cwd / p).resolve()) for p in di[0]["paths"]}
+            and os.fsencode("OUT_DIR=" + str(out)).hex() in di[0]["environment_comment_hex"], reason)
+    return compatible, {"state": "RecordingOnly", "rule": SERDE_MAPPING, "execution_edge": "not_observed",
+                        "consumer_invocation": consumer["invocation_id"], "features": list(features)}
+
+
+def serde_core_template(args, features, root, session, *, builder):
+    parsed = parse_rustc(args[1:]); c = parsed["codegen"]
+    metadata = c.get("metadata", [""])[0]; extra = c.get("extra-filename", [""])[0]
+    require(re.fullmatch(r"[0-9a-f]{16}", metadata) and re.fullmatch(r"-[0-9a-f]{16}", extra), "SerdeCoreMapping")
+    dest = session / "target/debug/build" / ("serde_core" + extra) if builder else session / "target" / TARGET / "debug/deps"
+    exact = ["--crate-name", "build_script_build" if builder else "serde_core", "--edition=2021", str(root / ("build.rs" if builder else "src/lib.rs")),
+        "--error-format=json", "--json=diagnostic-rendered-ansi,artifacts,future-incompat", "--crate-type", "bin" if builder else "lib",
+        "--emit=" + ("dep-info,link" if builder else "dep-info,metadata,link"), "-C", "embed-bitcode=no", "-C", "debuginfo=1", "-C", "split-debuginfo=unpacked",
+        *[v for f in features for v in ("--cfg", 'feature="' + f + '"')], "--check-cfg", "cfg(docsrs,test)", "--check-cfg", SERDE_CHECK,
+        "-C", "metadata=" + metadata, "-C", "extra-filename=" + extra, "--out-dir", str(dest)]
+    if not builder: exact += ["--target", TARGET, "-L", "dependency=" + str(dest)]
+    exact += ["-L", "dependency=" + str(session / "target/debug/deps"), "--cap-lints", "allow"]
+    if not builder: exact += [v for f in SERDE_EXTRA_CHECKS for v in ("--check-cfg", "cfg(" + f + ")")]
+    require(args[1:] == exact, "SerdeCoreMapping")
 
 
 def framework_context(args, env, cwd, session, inv):
@@ -1560,7 +1984,7 @@ def compiler_environment(env, session, sysroot, *, probe, context=None):
     require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     expected = sysroot_loader_path(sysroot)
     kind = (context or {}).get("kind")
-    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
+    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND, ANYHOW_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
         relative = "lib/rustlib/" + TARGET + "/lib"
         host_lib = Path(sysroot["root"]) / relative
         require(host_lib.is_dir() and host_lib.resolve() == host_lib
@@ -2496,7 +2920,9 @@ def wrapper(session_id, args):
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
     cwd = Path.cwd().resolve()
     require(inside(cwd, session), "CompilerCwd")
-    special = record10_context(args, os.environ, cwd, session, inv)
+    special = anyhow_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        special = record10_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = rustix_context(args, os.environ, cwd, session, inv)
     if special is None and policy["profile"] == BUNDLED_PROFILE:
@@ -2506,6 +2932,8 @@ def wrapper(session_id, args):
         special = ring_static_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = psm_static_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        special = zstd_static_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = framework_context(args, os.environ, cwd, session, inv)
     if special is None:
@@ -2573,7 +3001,7 @@ def wrapper(session_id, args):
         for value in codegen.get("linker", []):
             require(value in {v["path"] for v in inv["generators"].values()}, "UnpinnedLinker")
         outputs = selected_outputs(parsed, cwd, target)
-    transient = context["kind"] in {"ProcMacro2FeatureProbe", "ThiserrorStaticFeatureProbe"} or autocfg_stdin or rustix_stdin
+    transient = context["kind"] in {"ProcMacro2FeatureProbe", "ThiserrorStaticFeatureProbe", ANYHOW_KIND} or autocfg_stdin or rustix_stdin
     record = {"state": "RecordingOnly", "kind": "TransientProbe" if transient else (
                   "Probe" if parsed["probe"] else "Compile"), "context": context,
               "argv_hex": [os.fsencode(value).hex() for value in args], "parsed": parsed,
@@ -2591,6 +3019,8 @@ def wrapper(session_id, args):
         record["ring_archive_pre"] = ring_archive_observation(call, context, "pre")
     if "psm_static_declaration" in context:
         record["psm_archive_pre"] = psm_archive_observation(call, context, "pre")
+    if "zstd_static_declaration" in context:
+        record["zstd_archive_pre"] = static_archive_observation(call, context, "pre", "zstd", "libzstd.a", "ZstdArchiveEvidence")
     atomic_json(call / "invocation.json", record)
     stdin_failures = []
     code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
@@ -2607,6 +3037,17 @@ def wrapper(session_id, args):
             require(psm_static_context(args, os.environ, cwd, session, inv) == (parsed, context), "PsmPostSource")
         except (Refusal, OSError) as error:
             psm_post_blockers.append("PsmPostSource:" + str(error))
+    zstd_post, zstd_post_blockers = None, []
+    if "zstd_static_declaration" in context:
+        try:
+            zstd_post = static_archive_observation(call, context, "post", "zstd", "libzstd.a", "ZstdArchiveEvidence")
+            require(all(record["zstd_archive_pre"][k] == zstd_post[k] for k in ("path", "length", "sha256")), "ZstdArchiveChanged")
+        except (Refusal, OSError) as error:
+            zstd_post_blockers.append(str(error))
+        try:
+            require(zstd_static_context(args, os.environ, cwd, session, inv) == (parsed, context), "ZstdPostSource")
+        except (Refusal, OSError) as error:
+            zstd_post_blockers.append("ZstdPostSource:" + str(error))
     record["exit_code"] = code
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
@@ -2622,6 +3063,9 @@ def wrapper(session_id, args):
     if psm_post is not None:
         record["psm_archive_post"] = psm_post
     record["blockers"].extend(psm_post_blockers)
+    if zstd_post is not None:
+        record["zstd_archive_post"] = zstd_post
+    record["blockers"].extend(zstd_post_blockers)
     if transient:
         try:
             if rustix_stdin:
@@ -2631,7 +3075,7 @@ def wrapper(session_id, args):
                     record["outputs"] = [dict(outputs[0], sha256=post["sha256"], snapshot=post["snapshot"], observation_only=True)]
                 elif code == 0:
                     record["blockers"].append("MissingDeclaredOutput:" + outputs[0]["path"])
-            elif context["kind"] == "ThiserrorStaticFeatureProbe":
+            elif context["kind"] in {"ThiserrorStaticFeatureProbe", ANYHOW_KIND}:
                 record["outputs"], record["blockers"] = record10_capture_outputs(call, outputs, code)
             else:
                 record["outputs"], record["blockers"] = capture_transient_outputs(call, outputs, code)
@@ -2660,6 +3104,11 @@ def wrapper(session_id, args):
             require(record10_context(args, os.environ, cwd, session, inv) == (parsed, context), "Record10PostSource")
         except (Refusal, OSError) as error:
             record["blockers"].append("Record10PostSource:" + str(error))
+    if context["kind"] == ANYHOW_KIND:
+        try:
+            require(anyhow_context(args, os.environ, cwd, session, inv) == (parsed, context), "AnyhowPostSource")
+        except (Refusal, OSError) as error:
+            record["blockers"].append("AnyhowPostSource:" + str(error))
     record["blockers"].extend(stdin_failures)
     atomic_json(call / "receipt.json", record)
     return code if code != 0 else (0 if not record["blockers"] else 2)
@@ -2758,6 +3207,12 @@ def seal_record(session, policy, cargo_exit):
     record10_transient_paths = set()
     record10_invalid_calls = set()
     psm_paths, psm_hashes, psm_invalid_calls = set(), set(), set()
+    zstd_paths, zstd_hashes, anyhow_paths, anyhow_hashes, tools12_invalid_calls = set(), set(), set(), set(), set()
+    for event in events:
+        if (event["reason"] == "build-script-executed" and event.get("package_id") == ZSTD_PACKAGE
+                and isinstance(event.get("out_dir"), str)):
+            paths, hashes = tools12_namespace("zstd-sys", [], {"OUT_DIR": event["out_dir"]}, session, session, session)
+            zstd_paths.update(paths); zstd_hashes.update(hashes)
     # Fixed event names only strengthen exclusion if mutable consumer annotations vanish.
     for event in events:
         if (event["reason"] != "build-script-executed" or event.get("package_id") != PSM_PACKAGE
@@ -2776,6 +3231,14 @@ def seal_record(session, policy, cargo_exit):
             raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
             env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
             cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            for name, paths, hashes in (("zstd-sys", zstd_paths, zstd_hashes), ("anyhow", anyhow_paths, anyhow_hashes)):
+                names, values = tools12_namespace(name, raw, env, cwd, directory, session)
+                paths.update(names); hashes.update(values)
+            try:
+                zstd_static_context(raw, env, cwd, session, policy["inventory"])
+                anyhow_context(raw, env, cwd, session, policy["inventory"])
+            except (Refusal, OSError) as error:
+                blockers.append("Tools12Evidence:" + str(error)); tools12_invalid_calls.add(directory.name)
             record10_transient_paths.update(record10_transient_namespace(raw, env, cwd, session))
             paths, hashes = psm_archive_namespace(raw, env, cwd, directory, session)
             psm_paths.update(paths); psm_hashes.update(hashes)
@@ -2822,6 +3285,11 @@ def seal_record(session, policy, cargo_exit):
             blockers.append("ChangedSysrootExternDeclaration:" + directory.name)
         initial = strict_json((directory / "invocation.json").read_bytes())
         try:
+            zstd_evidence(receipt, session, policy["inventory"])
+            anyhow_evidence(receipt, session, policy["inventory"])
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("Tools12Evidence:" + str(error)); tools12_invalid_calls.add(directory.name)
+        try:
             request = strict_json((directory / "request.json").read_bytes())
             raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
             env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
@@ -2867,16 +3335,22 @@ def seal_record(session, policy, cargo_exit):
     # Collect all declared transient paths before registering any ordinary output.
     # An unsupported probe may have no output file; its declared namespace is still excluded.
     transient_paths = {str(Path(o["path"]).resolve()) for r in receipts if r["kind"] == "TransientProbe"
-                       for o in r["declared_outputs"] + r["outputs"]} | record10_transient_paths
+                       for o in r["declared_outputs"] + r["outputs"]} | record10_transient_paths | anyhow_paths
     native_paths, native_probes = set(), set()
     if policy["profile"] == BUNDLED_PROFILE:
         native_paths, native_probes, namespace_blockers = native_evidence_paths(session)
         blockers.extend(namespace_blockers)
     output_owners, transient_collisions = {}, set()
     for receipt in receipts:
-        if receipt["invocation_id"] in record10_invalid_calls | psm_invalid_calls:
+        if receipt["invocation_id"] in record10_invalid_calls | psm_invalid_calls | tools12_invalid_calls:
             transient_collisions.add(receipt["invocation_id"])
             continue
+        denied = next((reason for paths, hashes, reason in ((zstd_paths, zstd_hashes, "ZstdArchiveOwnership:Output"),
+                      (anyhow_paths, anyhow_hashes, "AnyhowTransientOwnership:Output"))
+                       if receipt["kind"] != "TransientProbe" and any(tools12_owned(o["path"], o.get("sha256"), paths, hashes)
+                         for o in receipt["declared_outputs"] + receipt["outputs"])), None)
+        if denied:
+            blockers.append(denied); transient_collisions.add(receipt["invocation_id"]); continue
         if any(str(Path(o["path"]).resolve()) in psm_paths or o.get("sha256") in psm_hashes
                or (Path(o["path"]).is_file() and not Path(o["path"]).is_symlink()
                    and file_hash(Path(o["path"])) in psm_hashes)
@@ -2915,6 +3389,11 @@ def seal_record(session, policy, cargo_exit):
         filename_list = event.get("filenames")
         if not isinstance(root, str) or not isinstance(filename_list, list) or not all(isinstance(f, str) for f in filename_list):
             blockers.append("IncompleteArtifactEvent"); continue
+        denied = next((reason for paths, hashes, reason in ((zstd_paths, zstd_hashes, "ZstdArchiveOwnership:CargoArtifact"),
+                      (anyhow_paths, anyhow_hashes, "AnyhowTransientOwnership:CargoArtifact"))
+                       if any(tools12_owned(f, None, paths, hashes) for f in filename_list)), None)
+        if denied:
+            blockers.append(denied); continue
         forbidden = [f for f in filename_list if str(Path(f).resolve()) in transient_paths]
         if forbidden:
             blockers.extend("TransientCargoArtifact:" + f for f in forbidden)
@@ -2981,6 +3460,12 @@ def seal_record(session, policy, cargo_exit):
         out_dir = event.get("out_dir")
         producers = [a for a in artifacts if a["package_id"] == event.get("package_id")
                      and "builder_alias" in a]
+        mapping = None
+        if event.get("package_id") == SERDE_PACKAGE:
+            try:
+                producers, mapping = serde_core_mapping(event, producers, receipts, artifacts, events, session, policy["inventory"])
+            except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError, StopIteration) as error:
+                blockers.append("SerdeCoreMapping:" + (str(error) if isinstance(error, Refusal) else "SerdeCoreEvidence")); continue
         if (not isinstance(out_dir, str) or not inside(Path(out_dir), session / "target")
                 or str(Path(out_dir)) != out_dir or Path(out_dir).resolve() != Path(out_dir)
                 or not Path(out_dir).is_dir() or len(producers) != 1):
@@ -2991,15 +3476,18 @@ def seal_record(session, policy, cargo_exit):
         for path in Path(out_dir).rglob("*"):
             if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                 blockers.append("GeneratedNonregular:" + str(path)); continue
-            if path.is_file() and str(path.resolve()) not in transient_paths | native_probes:
+            if (path.is_file() and str(path.resolve()) not in transient_paths | native_probes
+                    and not tools12_owned(str(path), None, anyhow_paths, anyhow_hashes)):
                 generated[path.relative_to(out_dir).as_posix()] = file_hash(path)
         associations.append({"out_dir": str(Path(out_dir).resolve()), "package_id": event["package_id"],
                              "producer_invocation": producers[0]["invocation_id"],
                              "generated_files": generated, "cargo_event": event})
+        if mapping is not None:
+            associations[-1]["recording_only_mapping"] = mapping
     nested_origins = []
     for receipt in receipts:
         context = receipt.get("context", {})
-        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
+        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND, ANYHOW_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
             matches = [a for a in associations if a["package_id"] == context["package_id"]
                        and a["out_dir"] == context["out_dir"]]
             if len(matches) != 1:
@@ -3011,6 +3499,11 @@ def seal_record(session, policy, cargo_exit):
     edges = []
     for receipt in receipts:
         for edge in receipt["externs"]:
+            denied = next((reason for paths, hashes, reason in ((zstd_paths, zstd_hashes, "ZstdArchiveOwnership:Extern"),
+                          (anyhow_paths, anyhow_hashes, "AnyhowTransientOwnership:Extern"))
+                           if tools12_owned(edge["path"], None, paths, hashes)), None)
+            if denied:
+                blockers.append(denied); edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[])); continue
             if str(Path(edge["path"]).resolve()) in psm_paths or (Path(edge["path"]).is_file()
                     and not Path(edge["path"]).is_symlink() and file_hash(Path(edge["path"])) in psm_hashes):
                 blockers.append("PsmArchiveOwnership:Extern"); edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[])); continue
@@ -3035,6 +3528,9 @@ def seal_record(session, policy, cargo_exit):
     declarations.extend(ring_declarations)
     psm_blockers, psm_declarations = psm_static_graph(receipts, associations, artifacts, events, edges, session, policy["inventory"])
     blockers.extend(psm_blockers); declarations.extend(psm_declarations)
+    zstd_blockers, zstd_declarations = zstd_graph(receipts, associations, artifacts, events, edges, session, policy["inventory"], zstd_paths, zstd_hashes)
+    blockers.extend(zstd_blockers); declarations.extend(zstd_declarations)
+    blockers.extend(anyhow_graph(receipts, associations, artifacts, events, session, policy["inventory"]))
     consumed = []
     for receipt in receipts:
         if receipt["invocation_id"] in transient_collisions:
@@ -3042,6 +3538,11 @@ def seal_record(session, policy, cargo_exit):
         for output in receipt["outputs"]:
             for value in output.get("dep_info", {}).get("paths", []):
                 path = (Path(receipt["cwd"]) / value).resolve()
+                denied = next((reason for paths, hashes, reason in ((zstd_paths, zstd_hashes, "ZstdArchiveOwnership:ConsumedSource"),
+                              (anyhow_paths, anyhow_hashes, "AnyhowTransientOwnership:ConsumedSource"))
+                               if tools12_owned(str(path), None, paths, hashes)), None)
+                if denied:
+                    blockers.append(denied); continue
                 if str(path) in psm_paths or (path.is_file() and not path.is_symlink() and file_hash(path) in psm_hashes):
                     blockers.append("PsmArchiveOwnership:ConsumedSource"); continue
                 if str(path) in native_paths:
@@ -3062,6 +3563,8 @@ def seal_record(session, policy, cargo_exit):
                         expected = association["generated_files"].get(name)
                         if path.is_file() and expected == file_hash(path):
                             owner = {"generated_by": association["producer_invocation"], "out_dir": association["out_dir"]}
+                            if "recording_only_mapping" in association:
+                                owner["recording_only_mapping"] = association["recording_only_mapping"]
                 if owner is None or not path.is_file() or path.is_symlink():
                     blockers.append("UnresolvedConsumedSource:" + str(path)); continue
                 consumed.append({"path": str(path), "sha256": file_hash(path), "owner": owner})
