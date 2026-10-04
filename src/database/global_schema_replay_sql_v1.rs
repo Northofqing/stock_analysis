@@ -851,6 +851,7 @@ pub(super) mod original_native {
         tx: TxRecord,
         initial_read: InitialReadRecord,
         integrity_read: IntegrityReadRecord,
+        capture_prefix: CapturePrefixRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -881,6 +882,7 @@ pub(super) mod original_native {
                 },
                 initial_read: InitialReadRecord::empty(),
                 integrity_read: IntegrityReadRecord::empty(),
+                capture_prefix: CapturePrefixRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -944,6 +946,14 @@ pub(super) mod original_native {
         WrapIntegrityDetail, DiscardIntegrityOwnedDetail, FinalizeIntegrityRead,
         RetainIntegrityOwnedCleanup, DiscardIntegrityOwnedCleanup, DiscardIntegrityRaw,
         AwaitIntegrityPartialReturn, DiscardIntegrityOwnedVector, DiscardIntegrityPartial, StopIntegrityRead, IntegrityPrefixReached, AwaitIntegrityCaptureReturn,
+        BeginCapturePragmaScope, PrepareCaptureRead, CheckCaptureNoTail, BindCaptureEmpty, StepCaptureRead,
+        CaptureColumnType, CaptureInteger, CaptureText, AwaitCaptureString, RetainCaptureRaw,
+        ResetCaptureRead, FinalizeCaptureRead, RetainCaptureCleanup, DiscardCaptureCleanup,
+        AwaitCaptureQueryReturn, AwaitCapturePragmaScopeEnd, AwaitCapturePragmaReturn,
+        FormatCaptureDetail, AwaitCaptureDetail, BuildCaptureCatalogError,
+        AwaitCaptureRuntimeErrorReturn, AwaitCaptureCatalogReturn, WrapCaptureCatalogError,
+        DiscardCaptureRaw, DiscardCaptureDetail, DiscardCaptureCatalogError, DiscardCaptureString,
+        AdvanceCaptureQuery, CapturePrefixReached, StopCapturePrefix,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1777,6 +1787,7 @@ pub(super) mod original_native {
         fn transaction_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
             let terminal = work.terminal().is_some();
             if let Some(action) = self.batch_action(BatchKind::Begin, terminal) { return Some(action); }
+            if let Some(action) = self.capture_prefix_action(work, physical) { return Some(action); }
             if let Some(action) = self.integrity_read_action(work, physical) { return Some(action); }
             if self.initial_read.context != InitialContext::Unbound
                 && (matches!(self.tx.phase, TxPhase::Active) || matches!(self.initial_read.context, InitialContext::Unknown | InitialContext::Refused)) {
@@ -1799,7 +1810,7 @@ pub(super) mod original_native {
                 && matches!(self.tx.phase, TxPhase::NotCreated | TxPhase::Finished)
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
-                && self.integrity_read.stopped_clear()
+                && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1970,7 +1981,8 @@ pub(super) mod original_native {
                 || !matches!(self.fields.native.tx.phase, TxPhase::Active)
                 || self.fields.native.initial_read.ignored.is_some() || self.fields.native.statements[0].live().is_some()
                 || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some()
-                || self.fields.native.integrity_read.blocks_early_primary() { return Err(error); }
+                || self.fields.native.integrity_read.blocks_early_primary()
+                || self.fields.native.capture_prefix.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -3173,6 +3185,9 @@ pub(super) mod original_native {
     impl NativeOriginalOwner {
         fn integrity_semantic_failure_cut_absent(&self) -> bool { !self.integrity_read.semantic_detail_closed }
         fn integrity_read_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            if !matches!(self.capture_prefix.stage, CaptureStage::Dormant | CaptureStage::Stopped) {
+                return self.capture_prefix_action(work, physical);
+            }
             let r = &self.integrity_read;
             if matches!(r.stage, IntegrityStage::Dormant | IntegrityStage::Stopped) { return None; }
             if r.ignored.is_some() { return Some(LifecycleAction::DiscardIntegrityOwnedCleanup); }
@@ -3900,4 +3915,680 @@ pub(super) mod original_native {
             assert_eq!(self.fields.work.test_code_observation(), before);
         }
     }
+    // C2082/C3136 fixed three-query prefix, before compile_options.
+    // The private rusqlite pragma::Sql stays in its real callee scope. These
+    // named lease obligations neither own that Sql nor prove its payment.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureQuery { ApplicationId, UserVersion, SourceId }
+    impl CaptureQuery {
+        fn index(self) -> usize { match self { Self::ApplicationId => 0, Self::UserVersion => 1, Self::SourceId => 2 } }
+        fn action(self) -> FixedAction { if self == Self::SourceId { FixedAction::SourceId } else { FixedAction::Pragmas } }
+        fn stage(self) -> &'static str { match self { Self::ApplicationId => "capture-application-id", Self::UserVersion => "capture-user-version", Self::SourceId => "capture-source-id" } }
+        fn pragma(self) -> bool { self != Self::SourceId }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureStage { Dormant, Reading, Ready, Stopped }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CapturePhase { Scope, Prepare, Tail, Bind, Step, Type, Integer, Text, ValueReturn, NeedRaw, Reset, Drain }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureReturn { Unknown, Ok, Error, Interrupted }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureOutcome { Unknown, Row, Value, Error, NoRows }
+    #[derive(Clone, Copy)]
+    struct CaptureCall {
+        prepare: CodeSlot, rows_started: bool, outcome: CaptureOutcome,
+        query_return: CaptureReturn, pragma_started: bool, pragma_scope_ended: bool,
+        pragma_return: CaptureReturn, consumed: Option<StmtState>,
+    }
+    impl CaptureCall {
+        fn empty() -> Self { Self { prepare: CodeSlot::NotCalled, rows_started: false, outcome: CaptureOutcome::Unknown,
+            query_return: CaptureReturn::Unknown, pragma_started: false, pragma_scope_ended: false,
+            pragma_return: CaptureReturn::Unknown, consumed: None } }
+        fn scopes_complete(&self, query: CaptureQuery) -> bool {
+            self.query_return != CaptureReturn::Unknown
+                && (!query.pragma() || (self.pragma_scope_ended && self.pragma_return != CaptureReturn::Unknown))
+        }
+    }
+    struct CapturePrefixRecord {
+        stage: CaptureStage, phase: CapturePhase, query: CaptureQuery, calls: [CaptureCall; 3],
+        raw: Option<rusqlite::Error>, ignored: Option<rusqlite::Error>, need_cleanup: bool,
+        value_started: bool, value_returned: bool, value_live: bool, value_matches: bool,
+        detail_started: bool, detail_returned: bool, catalog_live: bool,
+        runtime_error_return: CaptureReturn, catalog_return: CaptureReturn, capture_started: bool,
+    }
+    impl CapturePrefixRecord {
+        fn empty() -> Self { Self { stage: CaptureStage::Dormant, phase: CapturePhase::Scope,
+            query: CaptureQuery::ApplicationId, calls: [CaptureCall::empty(); 3], raw: None, ignored: None,
+            need_cleanup: false, value_started: false, value_returned: false, value_live: false, value_matches: false,
+            detail_started: false, detail_returned: false, catalog_live: false,
+            runtime_error_return: CaptureReturn::Unknown, catalog_return: CaptureReturn::Unknown, capture_started: false } }
+        fn blocks_early_primary(&self) -> bool {
+            self.raw.is_some() || self.ignored.is_some() || self.need_cleanup || self.detail_started
+                || self.catalog_live || self.phase == CapturePhase::NeedRaw
+                || (self.value_started && !self.value_returned)
+        }
+        fn stopped_clear(&self) -> bool {
+            matches!(self.stage, CaptureStage::Dormant | CaptureStage::Stopped)
+                && self.raw.is_none() && self.ignored.is_none() && !self.need_cleanup
+                && !self.detail_started && !self.catalog_live && !self.value_live
+                && (!self.value_started || self.value_returned)
+        }
+    }
+    impl NativeOriginalOwner {
+        fn capture_prefix_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            let r = &self.capture_prefix;
+            if matches!(r.stage, CaptureStage::Dormant | CaptureStage::Stopped) { return None; }
+            if r.ignored.is_some() { return Some(LifecycleAction::DiscardCaptureCleanup); }
+            if r.need_cleanup { return Some(LifecycleAction::RetainCaptureCleanup); }
+            if r.phase == CapturePhase::NeedRaw { return Some(LifecycleAction::RetainCaptureRaw); }
+            if r.value_started && !r.value_returned { return Some(LifecycleAction::AwaitCaptureString); }
+            if r.detail_started && !r.detail_returned { return Some(LifecycleAction::AwaitCaptureDetail); }
+            let interrupted = work.terminal().is_some() || physical.primary.is_some();
+            let call = &r.calls[r.query.index()];
+            let draining = interrupted || r.phase == CapturePhase::Reset || r.phase == CapturePhase::Drain || r.raw.is_some();
+            if draining {
+                if let Some(state) = self.statements[0].live() {
+                    return Some(if state.cursor != CursorPhase::NoCursor && matches!(state.reset, CodeSlot::NotCalled) {
+                        LifecycleAction::ResetCaptureRead
+                    } else { LifecycleAction::FinalizeCaptureRead });
+                }
+                if !matches!(call.prepare, CodeSlot::NotCalled) && call.query_return == CaptureReturn::Unknown {
+                    return Some(LifecycleAction::AwaitCaptureQueryReturn);
+                }
+            }
+            if call.pragma_started && (call.query_return != CaptureReturn::Unknown || (interrupted && matches!(call.prepare, CodeSlot::NotCalled))) {
+                if !call.pragma_scope_ended { return Some(LifecycleAction::AwaitCapturePragmaScopeEnd); }
+                if call.pragma_return == CaptureReturn::Unknown { return Some(LifecycleAction::AwaitCapturePragmaReturn); }
+            }
+            if r.detail_started && r.detail_returned {
+                return Some(if interrupted { LifecycleAction::DiscardCaptureDetail } else { LifecycleAction::BuildCaptureCatalogError });
+            }
+            if r.catalog_live {
+                if r.query == CaptureQuery::SourceId && r.runtime_error_return == CaptureReturn::Unknown { return Some(LifecycleAction::AwaitCaptureRuntimeErrorReturn); }
+                if r.catalog_return == CaptureReturn::Unknown { return Some(LifecycleAction::AwaitCaptureCatalogReturn); }
+                return Some(if interrupted { LifecycleAction::DiscardCaptureCatalogError } else { LifecycleAction::WrapCaptureCatalogError });
+            }
+            if r.raw.is_some() { return Some(if interrupted { LifecycleAction::DiscardCaptureRaw } else { LifecycleAction::FormatCaptureDetail }); }
+            if interrupted {
+                if r.value_live { return Some(LifecycleAction::DiscardCaptureString); }
+                if r.capture_started && r.catalog_return == CaptureReturn::Unknown { return Some(LifecycleAction::AwaitCaptureCatalogReturn); }
+                return Some(LifecycleAction::StopCapturePrefix);
+            }
+            if r.stage == CaptureStage::Ready { return Some(LifecycleAction::CapturePrefixReached); }
+            if call.scopes_complete(r.query) { return Some(LifecycleAction::AdvanceCaptureQuery); }
+            Some(match r.phase {
+                CapturePhase::Scope => LifecycleAction::BeginCapturePragmaScope,
+                CapturePhase::Prepare => LifecycleAction::PrepareCaptureRead,
+                CapturePhase::Tail => LifecycleAction::CheckCaptureNoTail,
+                CapturePhase::Bind => LifecycleAction::BindCaptureEmpty,
+                CapturePhase::Step => LifecycleAction::StepCaptureRead,
+                CapturePhase::Type => LifecycleAction::CaptureColumnType,
+                CapturePhase::Integer => LifecycleAction::CaptureInteger,
+                CapturePhase::Text => LifecycleAction::CaptureText,
+                CapturePhase::ValueReturn => LifecycleAction::AwaitCaptureString,
+                CapturePhase::NeedRaw => LifecycleAction::RetainCaptureRaw,
+                CapturePhase::Reset => LifecycleAction::ResetCaptureRead,
+                CapturePhase::Drain => LifecycleAction::AwaitCaptureQueryReturn,
+            })
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalCapturePrefixLoan<'a> {
+        fields: OriginalOwnerFields<'a>, prefix: &'a mut super::super::super::FinancialCapturePrefixState,
+    }
+    struct OriginalCapturePort<'short, 'a, 'rules> {
+        loan: &'short mut OriginalCapturePrefixLoan<'a>, query: CaptureQuery, _rules: &'rules SelectedOriginalNativeRules,
+    }
+    struct OriginalCaptureStringReturnPort<'bytes, 'short, 'a> {
+        loan: &'short mut OriginalCapturePrefixLoan<'a>, text: &'bytes str,
+    }
+    struct OriginalCaptureDetailReturnPort<'short, 'a> { loan: &'short mut OriginalCapturePrefixLoan<'a> }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_catalog_prefix(&mut self) -> bool {
+            let n = &mut self.native;
+            let r = &n.integrity_read;
+            if self.work.terminal().is_some() || self.physical.primary.is_some()
+                || !matches!(n.tx.phase, TxPhase::Active) || n.capture_prefix.stage != CaptureStage::Dormant
+                || r.stage != IntegrityStage::Ready || r.returned != [IntegrityReturn::Ok; 2]
+                || r.capture_returned != IntegrityReturn::Ok || r.failed || r.raw.is_some()
+                || r.ignored.is_some() || r.need_cleanup.is_some() || r.partial_live || r.detail_started
+                || r.consumed.iter().any(Option::is_none) || n.statements.iter().any(|s| s.live().is_some()) { return false; }
+            n.capture_prefix.stage = CaptureStage::Reading;
+            // Both A03 consumed ledgers and its owning Vec stay retained.
+            // One existing slot is reused only after their scopes are complete.
+            n.statements[0] = StmtSlot::Vacant;
+            true
+        }
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn capture_prefix(self, prefix: &'a mut super::super::super::FinancialCapturePrefixState) -> OriginalCapturePrefixLoan<'a> {
+            OriginalCapturePrefixLoan { fields: self, prefix }
+        }
+    }
+    impl<'a> OriginalCapturePrefixLoan<'a> {
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.capture_prefix_action(&self.fields.work, self.fields.physical) }
+        fn fixed_port<'short, 'rules>(&'short mut self, query: CaptureQuery, rules: &'rules SelectedOriginalNativeRules) -> Result<OriginalCapturePort<'short, 'a, 'rules>, ProtocolFault> {
+            if self.fields.native.capture_prefix.query != query || self.fields.native.capture_prefix.stage != CaptureStage::Reading { return Err(ProtocolFault::UnexpectedObservation); }
+            Ok(OriginalCapturePort { loan: self, query, _rules: rules })
+        }
+        fn application_id<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> Result<OriginalCapturePort<'short, 'a, 'rules>, ProtocolFault> { self.fixed_port(CaptureQuery::ApplicationId, rules) }
+        fn user_version<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> Result<OriginalCapturePort<'short, 'a, 'rules>, ProtocolFault> { self.fixed_port(CaptureQuery::UserVersion, rules) }
+        fn source_id<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> Result<OriginalCapturePort<'short, 'a, 'rules>, ProtocolFault> { self.fixed_port(CaptureQuery::SourceId, rules) }
+        fn begin_pragma_scope(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BeginCapturePragmaScope) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix; let call = &mut r.calls[r.query.index()];
+            if !r.query.pragma() || call.pragma_started { return Err(ProtocolFault::RepeatedObservation); }
+            call.pragma_started = true; r.capture_started = true; r.phase = CapturePhase::Prepare; Ok(())
+        }
+        fn prepare_slot(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareCaptureRead) || self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.statements[0] = StmtSlot::Vacant; Ok(())
+        }
+        fn adverse(&mut self, code: i32) {
+            if code == rusqlite::ffi::SQLITE_OK || code == rusqlite::ffi::SQLITE_ROW || code == rusqlite::ffi::SQLITE_DONE { return; }
+            let query = self.fields.native.capture_prefix.query;
+            let make = || FixedAdverse { role: Role::Original, action: query.action(), ordinal: query.index(), code };
+            if self.fields.native.secondary.is_none() { self.fields.native.secondary = Some(make()); }
+            if self.fields.release.first_secondary.is_none() { self.fields.release.first_secondary = Some(make()); }
+        }
+        fn observe_prepare(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareCaptureRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let query = self.fields.native.capture_prefix.query;
+            if code == rusqlite::ffi::SQLITE_OK {
+                let state = self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                if state.role != Role::Original || state.action != query.action() || state.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            } else if self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix; record_once(&mut r.calls[query.index()].prepare, code)?;
+            r.capture_started = true;
+            r.phase = if code == rusqlite::ffi::SQLITE_OK { CapturePhase::Tail } else { r.calls[query.index()].outcome = CaptureOutcome::Error; CapturePhase::NeedRaw };
+            self.adverse(code); Ok(())
+        }
+        fn observe_tail(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CheckCaptureNoTail) || !matches!(fact, CaptureReturn::Ok | CaptureReturn::Error) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix;
+            r.phase = if fact == CaptureReturn::Ok { CapturePhase::Bind } else { r.calls[r.query.index()].outcome = CaptureOutcome::Error; CapturePhase::NeedRaw }; Ok(())
+        }
+        fn observe_bind(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BindCaptureEmpty) || !matches!(fact, CaptureReturn::Ok | CaptureReturn::Error) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix;
+            if fact == CaptureReturn::Ok { r.calls[r.query.index()].rows_started = true; r.phase = CapturePhase::Step;
+                self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?.cursor = CursorPhase::Active;
+            } else { r.calls[r.query.index()].outcome = CaptureOutcome::Error; r.phase = CapturePhase::NeedRaw; } Ok(())
+        }
+        fn observe_step(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StepCaptureRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let state = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.step, code)?;
+            let r = &mut self.fields.native.capture_prefix;
+            if code == rusqlite::ffi::SQLITE_ROW { r.calls[r.query.index()].outcome = CaptureOutcome::Row; r.phase = CapturePhase::Type; }
+            else if code == rusqlite::ffi::SQLITE_DONE { r.calls[r.query.index()].outcome = CaptureOutcome::NoRows; r.phase = CapturePhase::Reset; }
+            else { r.calls[r.query.index()].outcome = CaptureOutcome::Error; r.phase = CapturePhase::NeedRaw; } self.adverse(code); Ok(())
+        }
+        fn observe_type(&mut self, kind: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CaptureColumnType) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix;
+            let expected = if r.query == CaptureQuery::SourceId { rusqlite::ffi::SQLITE_TEXT } else { rusqlite::ffi::SQLITE_INTEGER };
+            r.phase = if kind != expected { r.calls[r.query.index()].outcome = CaptureOutcome::Error; CapturePhase::NeedRaw }
+                else if r.query == CaptureQuery::SourceId { CapturePhase::Text } else { CapturePhase::Integer }; Ok(())
+        }
+        fn observe_integer(&mut self, value: i64) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CaptureInteger) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix;
+            if r.query == CaptureQuery::SourceId || self.prefix.identity[r.query.index()].is_some() { return Err(ProtocolFault::RepeatedObservation); }
+            self.prefix.identity[r.query.index()] = Some(value); r.calls[r.query.index()].outcome = CaptureOutcome::Value; r.phase = CapturePhase::Reset; Ok(())
+        }
+        fn text_return_port<'bytes, 'short>(&'short mut self, bytes: &'bytes [u8]) -> Result<OriginalCaptureStringReturnPort<'bytes, 'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CaptureText) { return Err(ProtocolFault::UnexpectedObservation); }
+            let text = match std::str::from_utf8(bytes) { Ok(text) => text, Err(_) => {
+                let r = &mut self.fields.native.capture_prefix; r.calls[r.query.index()].outcome = CaptureOutcome::Error; r.phase = CapturePhase::NeedRaw;
+                return Err(ProtocolFault::UnexpectedObservation);
+            } };
+            let r = &mut self.fields.native.capture_prefix; r.value_started = true; r.phase = CapturePhase::ValueReturn;
+            Ok(OriginalCaptureStringReturnPort { loan: self, text })
+        }
+        fn retain_raw(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.next() != Some(LifecycleAction::RetainCaptureRaw) || self.fields.native.capture_prefix.raw.is_some() { return Err(error); }
+            self.fields.native.capture_prefix.raw = Some(error); self.fields.native.capture_prefix.phase = CapturePhase::Drain; Ok(())
+        }
+        fn observe_reset(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ResetCaptureRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let terminal = self.fields.work.terminal().is_some();
+            let state = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.reset, code)?; state.cursor = CursorPhase::NoCursor;
+            let r = &mut self.fields.native.capture_prefix; let i = r.query.index();
+            if r.calls[i].outcome == CaptureOutcome::NoRows && r.raw.is_none() {
+                // The reached DONE/reset callee result still needs owned custody
+                // after T: actual reset Err or actual QueryReturnedNoRows.
+                // This does not observe a whole return or construct that error.
+                if code != rusqlite::ffi::SQLITE_OK { r.calls[i].outcome = CaptureOutcome::Error; }
+                r.phase = CapturePhase::NeedRaw;
+            } else { r.phase = CapturePhase::Drain;
+                if !terminal && code != rusqlite::ffi::SQLITE_OK { r.need_cleanup = true; }
+            } self.adverse(code); Ok(())
+        }
+        fn observe_finalize(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FinalizeCaptureRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let mut state = *self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            if state.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            record_once(&mut state.finalize, code)?;
+            self.fields.native.statements[0] = StmtSlot::Finalized(state);
+            let r = &mut self.fields.native.capture_prefix; r.calls[r.query.index()].consumed = Some(state); r.phase = CapturePhase::Drain;
+            if self.fields.work.terminal().is_none() && code != rusqlite::ffi::SQLITE_OK { r.need_cleanup = true; } self.adverse(code); Ok(())
+        }
+        fn retain_cleanup(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.next() != Some(LifecycleAction::RetainCaptureCleanup) || self.fields.native.capture_prefix.ignored.is_some() { return Err(error); }
+            self.fields.native.capture_prefix.ignored = Some(error); Ok(())
+        }
+        fn discard_cleanup(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardCaptureCleanup) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix; drop(r.ignored.take()); r.need_cleanup = false;
+            r.phase = CapturePhase::Drain; Ok(())
+        }
+        fn query_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCaptureQueryReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.capture_prefix; let call = &mut r.calls[r.query.index()];
+            if call.query_return != CaptureReturn::Unknown { return Err(ProtocolFault::RepeatedObservation); }
+            match fact {
+                CaptureReturn::Ok if call.outcome == CaptureOutcome::Value && r.raw.is_none()
+                    && (r.query != CaptureQuery::SourceId || (r.value_returned && r.value_matches && self.prefix.source_id.is_some())) => {},
+                CaptureReturn::Error if matches!(call.outcome, CaptureOutcome::Error | CaptureOutcome::NoRows) && r.raw.is_some() => {},
+                CaptureReturn::Interrupted if interrupted && !matches!(call.outcome, CaptureOutcome::Value | CaptureOutcome::Error | CaptureOutcome::NoRows) => {},
+                _ => return Err(ProtocolFault::UnexpectedObservation),
+            }
+            call.query_return = fact; Ok(())
+        }
+        fn pragma_scope_end(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCapturePragmaScopeEnd) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Independent real callee lexical return only, not scalar proof of
+            // Sql.buf ownership, allocation, payment or a selectable adapter.
+            let r = &mut self.fields.native.capture_prefix; r.calls[r.query.index()].pragma_scope_ended = true; Ok(())
+        }
+        fn pragma_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCapturePragmaReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.capture_prefix; let call = &mut r.calls[r.query.index()];
+            if fact == CaptureReturn::Unknown || (fact != call.query_return
+                && !(interrupted && matches!(call.prepare, CodeSlot::NotCalled) && fact == CaptureReturn::Interrupted)) { return Err(ProtocolFault::UnexpectedObservation); }
+            call.pragma_return = fact; Ok(())
+        }
+        fn detail_return_port<'short>(&'short mut self) -> Result<OriginalCaptureDetailReturnPort<'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FormatCaptureDetail) || self.prefix.detail.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.capture_prefix.detail_started = true;
+            Ok(OriginalCaptureDetailReturnPort { loan: self })
+        }
+        fn build_catalog_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BuildCaptureCatalogError) { return Err(ProtocolFault::UnexpectedObservation); }
+            let detail = self.prefix.detail.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let r = &mut self.fields.native.capture_prefix;
+            self.prefix.catalog_error = Some(super::super::super::GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage: r.query.stage(), ddl_id: None, detail });
+            // C's Display argument is consumed after formatting and before
+            // its owned enum result returns. No raw child is cloned/wrapped early.
+            drop(r.raw.take()); r.detail_started = false; r.catalog_live = true; Ok(())
+        }
+        fn runtime_error_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCaptureRuntimeErrorReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.capture_prefix.runtime_error_return = CaptureReturn::Error; Ok(())
+        }
+        fn catalog_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCaptureCatalogReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.capture_prefix;
+            if (r.catalog_live && fact != CaptureReturn::Error) || (!r.catalog_live && (!interrupted || fact != CaptureReturn::Interrupted)) { return Err(ProtocolFault::UnexpectedObservation); }
+            r.catalog_return = fact; Ok(())
+        }
+        fn wrap_catalog_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::WrapCaptureCatalogError) { return Err(ProtocolFault::UnexpectedObservation); }
+            let error = self.prefix.catalog_error.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            self.fields.physical.primary = Some(super::super::super::retain_capture_catalog_error(error));
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            self.fields.native.capture_prefix.catalog_live = false; Ok(())
+        }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> {
+            match self.fields.native.capture_prefix_action(&self.fields.work, self.fields.physical) {
+                Some(LifecycleAction::DiscardCaptureRaw) => { drop(self.fields.native.capture_prefix.raw.take()); },
+                Some(LifecycleAction::DiscardCaptureDetail) => { drop(self.prefix.detail.take()); self.fields.native.capture_prefix.detail_started = false; },
+                Some(LifecycleAction::DiscardCaptureCatalogError) => { drop(self.prefix.catalog_error.take()); self.fields.native.capture_prefix.catalog_live = false; },
+                Some(LifecycleAction::DiscardCaptureString) => { drop(self.prefix.source_id.take()); self.fields.native.capture_prefix.value_live = false; },
+                _ => return Err(ProtocolFault::UnexpectedObservation),
+            } Ok(())
+        }
+        fn advance(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AdvanceCaptureQuery) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.capture_prefix;
+            if r.calls[r.query.index()].query_return != CaptureReturn::Ok { return Err(ProtocolFault::UnexpectedObservation); }
+            match r.query {
+                CaptureQuery::ApplicationId => r.query = CaptureQuery::UserVersion,
+                CaptureQuery::UserVersion => r.query = CaptureQuery::SourceId,
+                CaptureQuery::SourceId => { r.stage = CaptureStage::Ready; return Ok(()); },
+            }
+            r.phase = if r.query.pragma() { CapturePhase::Scope } else { CapturePhase::Prepare }; Ok(())
+        }
+        fn stop(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StopCapturePrefix) || self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.capture_prefix.stage = CaptureStage::Stopped; Ok(())
+        }
+    }
+    impl OriginalCaptureStringReturnPort<'_, '_, '_> {
+        fn retain(self, text: String) {
+            let matches = text.as_str() == self.text;
+            // Exclusive preflight: actual acquired String moves into the same
+            // owning frame before any later primary/terminal observation gate.
+            self.loan.prefix.source_id = Some(text);
+            let r = &mut self.loan.fields.native.capture_prefix;
+            r.value_returned = true; r.value_live = true; r.value_matches = matches;
+            r.calls[r.query.index()].outcome = CaptureOutcome::Value; r.phase = CapturePhase::Reset;
+        }
+    }
+    impl OriginalCaptureDetailReturnPort<'_, '_> {
+        fn retain(self, detail: String) {
+            self.loan.prefix.detail = Some(detail); self.loan.fields.native.capture_prefix.detail_returned = true;
+        }
+    }
+    impl<'a> OriginalCapturePort<'_, 'a, '_> {
+        fn begin_pragma_scope(&mut self) -> Result<(), ProtocolFault> { self.loan.begin_pragma_scope() }
+        fn prepare_slot(&mut self) -> Result<(), ProtocolFault> { self.loan.prepare_slot() }
+        fn prepare(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_prepare(code) }
+        fn no_tail(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> { self.loan.observe_tail(fact) }
+        fn empty_query(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> { self.loan.observe_bind(fact) }
+        fn step(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_step(code) }
+        fn column_type(&mut self, kind: i32) -> Result<(), ProtocolFault> { self.loan.observe_type(kind) }
+        fn integer(&mut self, value: i64) -> Result<(), ProtocolFault> { self.loan.observe_integer(value) }
+        fn text<'bytes, 'short>(&'short mut self, bytes: &'bytes [u8]) -> Result<OriginalCaptureStringReturnPort<'bytes, 'short, 'a>, ProtocolFault> { self.loan.text_return_port(bytes) }
+        fn owned_raw(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_raw(error) }
+        fn reset(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_reset(code) }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_finalize(code) }
+        fn owned_cleanup(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_cleanup(error) }
+        fn query_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> { self.loan.query_return(fact) }
+        fn pragma_scope_end(&mut self) -> Result<(), ProtocolFault> { self.loan.pragma_scope_end() }
+        fn pragma_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> { self.loan.pragma_return(fact) }
+        fn detail_return_port<'short>(&'short mut self) -> Result<OriginalCaptureDetailReturnPort<'short, 'a>, ProtocolFault> { self.loan.detail_return_port() }
+        fn build_catalog_error(&mut self) -> Result<(), ProtocolFault> { self.loan.build_catalog_error() }
+        fn runtime_error_return(&mut self) -> Result<(), ProtocolFault> { self.loan.runtime_error_return() }
+        fn catalog_return(&mut self, fact: CaptureReturn) -> Result<(), ProtocolFault> { self.loan.catalog_return(fact) }
+        fn wrap_catalog_error(&mut self) -> Result<(), ProtocolFault> { self.loan.wrap_catalog_error() }
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug)]
+    pub(in crate::database::global_schema_v1) enum CaptureErrorCase { Prepare, Tail, Bind, Step, NoRows, DoneReset, Type, Utf8 }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug)]
+    pub(in crate::database::global_schema_v1) enum CaptureTerminalCut { BeforeQuery, Prepared, Row, OwnedString, StringPending, WholePending, PragmaScopePending, OwnedRaw, CleanupOwed, DetailPending, CatalogPending }
+    #[cfg(test)]
+    fn capture_test_allocation(error: &rusqlite::Error) -> usize {
+        match error {
+            rusqlite::Error::SqliteFailure(_, Some(text)) | rusqlite::Error::InvalidColumnName(text)
+                | rusqlite::Error::InvalidColumnType(_, text, _) => text.as_ptr() as usize,
+            rusqlite::Error::FromSqlConversionFailure(_, _, child) => child.as_ref() as *const _ as *const () as usize,
+            rusqlite::Error::QueryReturnedNoRows => 0,
+            _ => panic!("fixed supplied capture driver child"),
+        }
+    }
+    #[cfg(test)]
+    impl OriginalCapturePrefixLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_barrier(&mut self) {
+            let before = self.fields.work.test_code_observation();
+            let expected = self.next().expect("fixed capture scope pending");
+            assert_eq!(self.fields.native.transaction_action(&self.fields.work, self.fields.physical), Some(expected));
+            assert_eq!(self.fields.native.integrity_read_action(&self.fields.work, self.fields.physical), Some(expected));
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
+            let mut acquire = self.fields.reborrow().original_acquisition();
+            assert_eq!(acquire.constructor().next(), expected); assert_eq!(acquire.a00_epilogue().next(), expected);
+            assert_eq!(acquire.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert!(matches!(acquire.settle(), AcquisitionSettlement::Held(_)));
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        fn test_code_prepare(&mut self) {
+            if self.next() == Some(LifecycleAction::BeginCapturePragmaScope) {
+                self.begin_pragma_scope().unwrap(); assert!(self.begin_pragma_scope().is_err());
+            }
+            self.prepare_slot().unwrap();
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::ResourceNotInstalled));
+            let action = self.fields.native.capture_prefix.query.action();
+            self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action, ..protocol_stmt_state() });
+            self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap(); assert!(self.observe_prepare(rusqlite::ffi::SQLITE_OK).is_err());
+        }
+        fn test_code_row(&mut self) {
+            self.test_code_prepare(); self.observe_tail(CaptureReturn::Ok).unwrap(); self.observe_bind(CaptureReturn::Ok).unwrap();
+            self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+            assert!(self.observe_step(rusqlite::ffi::SQLITE_DONE).is_err());
+            let kind = if self.fields.native.capture_prefix.query == CaptureQuery::SourceId { rusqlite::ffi::SQLITE_TEXT } else { rusqlite::ffi::SQLITE_INTEGER };
+            self.observe_type(kind).unwrap();
+        }
+        fn test_code_ok_scope(&mut self) {
+            assert!(self.query_return(CaptureReturn::Ok).is_err());
+            self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); self.test_code_barrier();
+            self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap(); assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            self.test_code_barrier(); assert!(self.query_return(CaptureReturn::Error).is_err());
+            self.query_return(CaptureReturn::Ok).unwrap(); assert!(self.query_return(CaptureReturn::Ok).is_err());
+            if self.fields.native.capture_prefix.query.pragma() {
+                self.test_code_barrier(); assert!(self.pragma_return(CaptureReturn::Ok).is_err());
+                self.pragma_scope_end().unwrap(); self.test_code_barrier();
+                assert!(self.pragma_return(CaptureReturn::Error).is_err()); self.pragma_return(CaptureReturn::Ok).unwrap();
+                assert!(self.pragma_return(CaptureReturn::Ok).is_err());
+            }
+            self.advance().unwrap(); assert!(self.advance().is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_integer_query(&mut self, value: i64) {
+            assert!(self.fields.native.capture_prefix.query.pragma());
+            self.test_code_row(); self.observe_integer(value).unwrap(); assert!(self.observe_integer(value).is_err());
+            self.test_code_ok_scope();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_success_with_ignored_children(&mut self, reset: rusqlite::Error, finalize: rusqlite::Error) {
+            self.test_code_row(); self.observe_integer(i64::MIN).unwrap();
+            self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.test_code_barrier();
+            self.retain_cleanup(reset).unwrap_or_else(|_| panic!("successful mapper's actual ignored reset Err"));
+            self.discard_cleanup().unwrap(); assert!(self.discard_cleanup().is_err());
+            self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.test_code_barrier();
+            assert!(self.fields.native.statements[0].live().is_none());
+            self.retain_cleanup(finalize).unwrap_or_else(|_| panic!("successful query's consumed VM finalize Err"));
+            self.discard_cleanup().unwrap(); assert!(self.discard_cleanup().is_err());
+            assert!(self.fields.physical.primary.is_none()); self.query_return(CaptureReturn::Ok).unwrap();
+            self.pragma_scope_end().unwrap(); self.pragma_return(CaptureReturn::Ok).unwrap(); self.advance().unwrap();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_source_query(&mut self, value: String) {
+            assert_eq!(self.fields.native.capture_prefix.query, CaptureQuery::SourceId);
+            self.test_code_row(); let pointer = value.as_ptr(); let bytes = value.as_bytes().to_vec();
+            let port = self.text_return_port(&bytes).unwrap(); port.retain(value);
+            assert_eq!(self.prefix.source_id.as_ref().unwrap().as_ptr(), pointer);
+            self.test_code_ok_scope(); assert_eq!(self.next(), Some(LifecycleAction::CapturePrefixReached));
+            assert!(self.fields.native.capture_prefix.calls.iter().all(|call| call.consumed.is_some() && call.query_return == CaptureReturn::Ok));
+            assert_eq!(self.fields.native.capture_prefix.catalog_return, CaptureReturn::Unknown);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_error(&mut self, case: CaptureErrorCase, raw: rusqlite::Error, reset: rusqlite::Error, finalize: rusqlite::Error) -> usize {
+            let raw_pointer = capture_test_allocation(&raw);
+            let query = self.fields.native.capture_prefix.query;
+            if matches!(case, CaptureErrorCase::Prepare) {
+                if query.pragma() { self.begin_pragma_scope().unwrap(); }
+                self.prepare_slot().unwrap(); self.observe_prepare(rusqlite::ffi::SQLITE_ERROR).unwrap();
+            } else {
+                self.test_code_prepare();
+                if matches!(case, CaptureErrorCase::Tail) { self.observe_tail(CaptureReturn::Error).unwrap(); }
+                else {
+                    self.observe_tail(CaptureReturn::Ok).unwrap();
+                    if matches!(case, CaptureErrorCase::Bind) { self.observe_bind(CaptureReturn::Error).unwrap(); }
+                    else {
+                        self.observe_bind(CaptureReturn::Ok).unwrap();
+                        match case {
+                            CaptureErrorCase::Step => self.observe_step(rusqlite::ffi::SQLITE_ERROR).unwrap(),
+                            CaptureErrorCase::NoRows | CaptureErrorCase::DoneReset => {
+                                self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); assert!(self.retain_raw(rusqlite::Error::QueryReturnedNoRows).is_err());
+                                self.observe_reset(if matches!(case, CaptureErrorCase::DoneReset) { rusqlite::ffi::SQLITE_ERROR } else { rusqlite::ffi::SQLITE_OK }).unwrap();
+                            },
+                            CaptureErrorCase::Type | CaptureErrorCase::Utf8 => {
+                                self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+                                if matches!(case, CaptureErrorCase::Type) { self.observe_type(rusqlite::ffi::SQLITE_BLOB).unwrap(); }
+                                else { self.observe_type(rusqlite::ffi::SQLITE_TEXT).unwrap(); assert!(self.text_return_port(&[0xff]).is_err()); }
+                            },
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            self.retain_raw(raw).unwrap_or_else(|_| panic!("already owned driver error before Rows/Stmt scopes"));
+            assert_eq!(capture_test_allocation(self.fields.native.capture_prefix.raw.as_ref().unwrap()), raw_pointer);
+            assert!(self.build_catalog_error().is_err()); self.test_code_barrier();
+            let mut reset = Some(reset); let mut finalize = Some(finalize);
+            if self.next() == Some(LifecycleAction::ResetCaptureRead) {
+                self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.test_code_barrier();
+                let child = reset.take().unwrap(); let pointer = capture_test_allocation(&child);
+                self.retain_cleanup(child).unwrap_or_else(|_| panic!("actual ignored reset child"));
+                assert_eq!(capture_test_allocation(self.fields.native.capture_prefix.ignored.as_ref().unwrap()), pointer);
+                self.test_code_barrier(); self.discard_cleanup().unwrap(); assert!(self.discard_cleanup().is_err());
+            }
+            if self.next() == Some(LifecycleAction::FinalizeCaptureRead) {
+                self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.test_code_barrier();
+                assert!(self.fields.native.statements[0].live().is_none()); assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+                self.retain_cleanup(finalize.take().unwrap()).unwrap_or_else(|_| panic!("consumed VM's actual ignored finalize child"));
+                self.discard_cleanup().unwrap(); assert!(self.discard_cleanup().is_err());
+            }
+            drop(reset); drop(finalize);
+            assert_eq!(capture_test_allocation(self.fields.native.capture_prefix.raw.as_ref().unwrap()), raw_pointer);
+            assert!(self.build_catalog_error().is_err()); self.test_code_barrier();
+            assert!(self.query_return(CaptureReturn::Ok).is_err()); self.query_return(CaptureReturn::Error).unwrap();
+            if query.pragma() { self.test_code_barrier(); assert!(self.detail_return_port().is_err());
+                self.pragma_scope_end().unwrap(); self.test_code_barrier(); self.pragma_return(CaptureReturn::Error).unwrap(); }
+            // Actual test Display return is an owned String; these supplied
+            // test resources do not prove producer/formatter payment authority.
+            let detail = self.fields.native.capture_prefix.raw.as_ref().unwrap().to_string(); let pointer = detail.as_ptr() as usize;
+            self.detail_return_port().unwrap().retain(detail); self.test_code_barrier();
+            self.build_catalog_error().unwrap(); assert!(self.fields.native.capture_prefix.raw.is_none());
+            if query == CaptureQuery::SourceId { self.test_code_barrier(); assert!(self.catalog_return(CaptureReturn::Error).is_err()); self.runtime_error_return().unwrap(); }
+            self.test_code_barrier(); assert!(self.wrap_catalog_error().is_err());
+            self.catalog_return(CaptureReturn::Error).unwrap(); assert!(self.catalog_return(CaptureReturn::Error).is_err());
+            self.wrap_catalog_error().unwrap(); assert!(self.wrap_catalog_error().is_err());
+            self.test_code_barrier(); self.stop().unwrap(); assert!(self.stop().is_err()); pointer
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_interruption_cut(&mut self, cut: CaptureTerminalCut, raw: rusqlite::Error, cleanup: rusqlite::Error) -> Option<String> {
+            let mut raw = Some(raw); let mut cleanup = Some(cleanup); let mut pending = None;
+            match cut {
+                CaptureTerminalCut::BeforeQuery => {},
+                CaptureTerminalCut::Prepared => self.test_code_prepare(),
+                CaptureTerminalCut::Row => self.test_code_row(),
+                CaptureTerminalCut::OwnedString | CaptureTerminalCut::StringPending => {
+                    self.test_code_row(); assert_eq!(self.fields.native.capture_prefix.query, CaptureQuery::SourceId);
+                    let text = String::from("TEST_CODE source-id");
+                    if matches!(cut, CaptureTerminalCut::OwnedString) { self.text_return_port(b"TEST_CODE source-id").unwrap().retain(text); }
+                    else { { let _short = self.text_return_port(b"TEST_CODE source-id").unwrap(); } pending = Some(text); }
+                },
+                CaptureTerminalCut::WholePending | CaptureTerminalCut::PragmaScopePending => {
+                    self.test_code_row();
+                    if self.fields.native.capture_prefix.query == CaptureQuery::SourceId { self.text_return_port(b"TEST_CODE source-id").unwrap().retain(String::from("TEST_CODE source-id")); }
+                    else { self.observe_integer(i64::MIN).unwrap(); }
+                    self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+                    if matches!(cut, CaptureTerminalCut::PragmaScopePending) { assert!(self.fields.native.capture_prefix.query.pragma()); self.query_return(CaptureReturn::Ok).unwrap(); }
+                },
+                CaptureTerminalCut::OwnedRaw | CaptureTerminalCut::CleanupOwed | CaptureTerminalCut::DetailPending | CaptureTerminalCut::CatalogPending => {
+                    self.test_code_prepare(); self.observe_tail(CaptureReturn::Error).unwrap();
+                    self.retain_raw(raw.take().unwrap()).unwrap_or_else(|_| panic!("same already-owned raw cut"));
+                    if !matches!(cut, CaptureTerminalCut::OwnedRaw) {
+                        self.observe_finalize(if matches!(cut, CaptureTerminalCut::CleanupOwed) { rusqlite::ffi::SQLITE_ERROR } else { rusqlite::ffi::SQLITE_OK }).unwrap();
+                        if matches!(cut, CaptureTerminalCut::CleanupOwed) { self.retain_cleanup(cleanup.take().unwrap()).unwrap_or_else(|_| panic!("pre-existing cleanup owner")); }
+                        else {
+                            self.query_return(CaptureReturn::Error).unwrap();
+                            if self.fields.native.capture_prefix.query.pragma() { self.pragma_scope_end().unwrap(); self.pragma_return(CaptureReturn::Error).unwrap(); }
+                            let detail = self.fields.native.capture_prefix.raw.as_ref().unwrap().to_string();
+                            if matches!(cut, CaptureTerminalCut::DetailPending) { { let _port = self.detail_return_port().unwrap(); } pending = Some(detail); }
+                            else { self.detail_return_port().unwrap().retain(detail); self.build_catalog_error().unwrap(); }
+                        }
+                    }
+                },
+            }
+            drop(raw); drop(cleanup); self.test_code_barrier(); pending
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_reached_done(&mut self) {
+            self.test_code_prepare(); self.observe_tail(CaptureReturn::Ok).unwrap(); self.observe_bind(CaptureReturn::Ok).unwrap();
+            self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_done_result_after_terminal(&mut self, case: CaptureErrorCase, raw: rusqlite::Error, duplicate: rusqlite::Error) {
+            assert!(self.fields.work.terminal().is_some());
+            let before = self.fields.work.test_code_observation();
+            let code = match case { CaptureErrorCase::NoRows => rusqlite::ffi::SQLITE_OK,
+                CaptureErrorCase::DoneReset => rusqlite::ffi::SQLITE_ERROR, _ => unreachable!() };
+            let pointer = capture_test_allocation(&raw); let duplicate_pointer = capture_test_allocation(&duplicate);
+            self.observe_reset(code).unwrap(); assert!(self.observe_reset(code).is_err());
+            let r = &self.fields.native.capture_prefix; let call = r.calls[r.query.index()];
+            assert_eq!(call.outcome, if code == rusqlite::ffi::SQLITE_OK { CaptureOutcome::NoRows } else { CaptureOutcome::Error });
+            assert_eq!(call.query_return, CaptureReturn::Unknown); assert!(!r.need_cleanup && r.raw.is_none());
+            assert_eq!(self.next(), Some(LifecycleAction::RetainCaptureRaw)); self.test_code_barrier();
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.query_return(CaptureReturn::Error).is_err()); assert!(self.query_return(CaptureReturn::Interrupted).is_err());
+            assert!(self.stop().is_err()); assert!(self.pragma_scope_end().is_err()); assert!(self.catalog_return(CaptureReturn::Interrupted).is_err());
+            self.retain_raw(raw).unwrap_or_else(|_| panic!("already returned DONE/reset child retained after T"));
+            assert_eq!(capture_test_allocation(self.fields.native.capture_prefix.raw.as_ref().unwrap()), pointer);
+            let rejected = self.retain_raw(duplicate).unwrap_err(); assert_eq!(capture_test_allocation(&rejected), duplicate_pointer); drop(rejected);
+            self.test_code_barrier(); self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err()); self.test_code_barrier();
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCaptureQueryReturn));
+            assert!(self.query_return(CaptureReturn::Unknown).is_err()); assert!(self.query_return(CaptureReturn::Ok).is_err());
+            assert!(self.query_return(CaptureReturn::Interrupted).is_err()); assert!(self.stop().is_err());
+            assert_eq!(self.fields.native.capture_prefix.calls[self.fields.native.capture_prefix.query.index()].query_return, CaptureReturn::Unknown);
+            self.query_return(CaptureReturn::Error).unwrap(); assert!(self.query_return(CaptureReturn::Error).is_err());
+            if self.fields.native.capture_prefix.query.pragma() {
+                self.test_code_barrier(); assert!(self.pragma_return(CaptureReturn::Error).is_err()); self.pragma_scope_end().unwrap();
+                self.test_code_barrier(); assert!(self.pragma_return(CaptureReturn::Unknown).is_err());
+                assert!(self.pragma_return(CaptureReturn::Interrupted).is_err()); assert!(self.pragma_return(CaptureReturn::Ok).is_err());
+                assert_eq!(self.fields.native.capture_prefix.calls[self.fields.native.capture_prefix.query.index()].pragma_return, CaptureReturn::Unknown);
+                self.pragma_return(CaptureReturn::Error).unwrap(); assert!(self.pragma_return(CaptureReturn::Error).is_err());
+            }
+            assert_eq!(capture_test_allocation(self.fields.native.capture_prefix.raw.as_ref().unwrap()), pointer);
+            assert!(self.detail_return_port().is_err()); self.discard_owned().unwrap(); assert!(self.discard_owned().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCaptureCatalogReturn)); self.test_code_barrier();
+            assert!(self.catalog_return(CaptureReturn::Unknown).is_err()); assert!(self.catalog_return(CaptureReturn::Error).is_err());
+            assert_eq!(self.fields.native.capture_prefix.catalog_return, CaptureReturn::Unknown); assert!(self.stop().is_err());
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_drain_interrupted(&mut self, pending: Option<String>, reset_child: rusqlite::Error) {
+            assert!(self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some());
+            let before = self.fields.work.test_code_observation();
+            assert!(self.observe_prepare(rusqlite::ffi::SQLITE_OK).is_err()); assert!(self.observe_bind(CaptureReturn::Ok).is_err());
+            assert!(self.observe_step(rusqlite::ffi::SQLITE_ROW).is_err()); assert!(self.detail_return_port().is_err());
+            let pending_pointer = pending.as_ref().map(|s| s.as_ptr());
+            let r = &self.fields.native.capture_prefix;
+            if r.value_started && !r.value_returned {
+                self.test_code_barrier(); assert!(self.query_return(CaptureReturn::Ok).is_err());
+                OriginalCaptureStringReturnPort { loan: self, text: "TEST_CODE source-id" }.retain(pending.unwrap());
+                assert_eq!(self.prefix.source_id.as_ref().map(|s| s.as_ptr()), pending_pointer);
+            } else if r.detail_started && !r.detail_returned {
+                self.test_code_barrier(); assert!(self.stop().is_err()); OriginalCaptureDetailReturnPort { loan: self }.retain(pending.unwrap());
+                assert_eq!(self.prefix.detail.as_ref().map(|s| s.as_ptr()), pending_pointer);
+            } else { assert!(pending.is_none()); }
+            let mut reset_child = Some(reset_child);
+            // Bounded fixed cleanup script. It supplies independent return
+            // facts only after asserting their separate pending boundaries.
+            for _ in 0..16 {
+                self.test_code_barrier();
+                match self.next().unwrap() {
+                    LifecycleAction::DiscardCaptureCleanup => self.discard_cleanup().unwrap(),
+                    LifecycleAction::RetainCaptureCleanup => self.retain_cleanup(reset_child.take().unwrap()).unwrap_or_else(|_| panic!("normal primary's actual ignored child")),
+                    LifecycleAction::ResetCaptureRead => self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(),
+                    LifecycleAction::FinalizeCaptureRead => self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap(),
+                    LifecycleAction::AwaitCaptureQueryReturn => {
+                        assert!(self.stop().is_err());
+                        let r = &self.fields.native.capture_prefix; let call = r.calls[r.query.index()];
+                        let fact = if r.raw.is_some() { CaptureReturn::Error } else if call.outcome == CaptureOutcome::Value { CaptureReturn::Ok } else { CaptureReturn::Interrupted };
+                        let contrary = if fact == CaptureReturn::Ok { CaptureReturn::Error } else { CaptureReturn::Ok };
+                        assert!(self.query_return(contrary).is_err()); self.query_return(fact).unwrap();
+                    },
+                    LifecycleAction::AwaitCapturePragmaScopeEnd => { assert!(self.stop().is_err()); self.pragma_scope_end().unwrap(); },
+                    LifecycleAction::AwaitCapturePragmaReturn => {
+                        let call = self.fields.native.capture_prefix.calls[self.fields.native.capture_prefix.query.index()];
+                        self.pragma_return(if call.query_return == CaptureReturn::Unknown { CaptureReturn::Interrupted } else { call.query_return }).unwrap();
+                    },
+                    LifecycleAction::AwaitCaptureRuntimeErrorReturn => { assert!(self.stop().is_err()); self.runtime_error_return().unwrap(); },
+                    LifecycleAction::AwaitCaptureCatalogReturn => {
+                        assert!(self.stop().is_err()); self.catalog_return(if self.fields.native.capture_prefix.catalog_live { CaptureReturn::Error } else { CaptureReturn::Interrupted }).unwrap();
+                    },
+                    LifecycleAction::DiscardCaptureRaw | LifecycleAction::DiscardCaptureDetail | LifecycleAction::DiscardCaptureCatalogError | LifecycleAction::DiscardCaptureString => self.discard_owned().unwrap(),
+                    LifecycleAction::StopCapturePrefix => { self.stop().unwrap(); break; },
+                    action => panic!("new read work after interruption: {action:?}"),
+                }
+            }
+            drop(reset_child);
+            assert!(self.fields.native.capture_prefix.stopped_clear());
+            assert!(self.prefix.source_id.is_none() && self.prefix.detail.is_none() && self.prefix.catalog_error.is_none());
+            assert_eq!(self.fields.work.test_code_observation(), before); assert!(self.discard_owned().is_err());
+        }
+    }
+
 }

@@ -315,10 +315,10 @@ mod sql_rows;
 // Only G's fixed owning carriers may use the unqualified sibling-field port.
 pub(super) use sql_rows::original_native::{
     FixedDrainLedger, NativeOriginalOwner, OriginalOwnerFields, OriginalInitialReadLoan,
-    OriginalIntegrityReadLoan,
+    OriginalIntegrityReadLoan, OriginalCapturePrefixLoan,
 };
 #[cfg(test)]
-pub(super) use sql_rows::original_native::{LifecycleA00Case, LifecycleConstructorCase};
+pub(super) use sql_rows::original_native::{CaptureErrorCase, CaptureTerminalCut, LifecycleA00Case, LifecycleConstructorCase};
 
 #[path = "global_schema_replay_calendar_v1.rs"]
 mod paid_calendar;

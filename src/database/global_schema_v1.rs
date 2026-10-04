@@ -1117,6 +1117,40 @@ impl FinancialIntegrityReadFrame<'_, '_> {
         self.prefix.source.fields().integrity_read(&mut self.integrity)
     }
 }
+// Fixed C capture prefix; it preserves the complete successful A03 frame.
+// No runtime identity, CatalogSnapshot, SQL/native issuer or payment is built.
+struct FinancialCapturePrefixState {
+    identity: [Option<i64>; 2],
+    source_id: Option<String>,
+    detail: Option<String>,
+    catalog_error: Option<GlobalSchemaCatalogError>,
+}
+impl FinancialCapturePrefixState {
+    fn empty() -> Self { Self { identity: [None; 2], source_id: None, detail: None, catalog_error: None } }
+}
+struct FinancialCapturePrefixFrame<'purpose, 'writer> {
+    integrity: FinancialIntegrityReadFrame<'purpose, 'writer>,
+    capture: FinancialCapturePrefixState,
+}
+impl<'purpose, 'writer> FinancialIntegrityReadFrame<'purpose, 'writer> {
+    fn begin_catalog_prefix(mut self) -> Result<FinancialCapturePrefixFrame<'purpose, 'writer>, Self> {
+        if self.integrity.integrity_rows.as_ref().is_none_or(|rows| rows.as_slice() != ["ok"])
+            || self.integrity.foreign_key_violations != 0
+            || !self.prefix.source.fields().begin_catalog_prefix() { return Err(self); }
+        Ok(FinancialCapturePrefixFrame { integrity: self, capture: FinancialCapturePrefixState::empty() })
+    }
+}
+impl FinancialCapturePrefixFrame<'_, '_> {
+    fn capture_loan(&mut self) -> replay_work::OriginalCapturePrefixLoan<'_> {
+        self.integrity.prefix.source.fields().capture_prefix(&mut self.capture)
+    }
+}
+// Pure move from the actual already-returned C error. The fixed formatting
+// port must first retain its actual String; this function does no formatting.
+fn retain_capture_catalog_error(error: GlobalSchemaCatalogError) -> rows::original_source::SourceOperationError {
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: error })
+}
+
 fn retain_integrity_driver_error(query: FinancialIntegrityQuery, cut: FinancialIntegrityErrorCut,
     source: rusqlite::Error) -> rows::original_source::SourceOperationError {
     let operation = match (query, cut) {
@@ -2454,6 +2488,195 @@ mod financial_original_audit_acquisition_tests {
             assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
             assert_ne!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
         }
+        // Fixed protocol scripts only: supplied Sqlite/String/Vec carriers and
+        // /dev/null resources do not establish real SQL, FS, capacity or payment.
+        fn fixed_capture_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialCapturePrefixFrame<'purpose, 'writer> {
+            let mut integrity = fixed_integrity_frame(purpose, writer, trace);
+            let Err(mut integrity) = integrity.begin_catalog_prefix() else { panic!("unreached A03 refuses capture"); };
+            assert!(integrity.integrity_loan().test_code_whole_check(vec![String::from("ok")]));
+            integrity.integrity_loan().test_code_foreign_rows(0, false); integrity.integrity_loan().test_code_finish_success();
+            integrity.begin_catalog_prefix().unwrap_or_else(|_| panic!("actual two whole results/VM scopes and capture Ok"))
+        }
+        fn fixed_capture_raw(case: replay_work::CaptureErrorCase) -> rusqlite::Error {
+            use replay_work::CaptureErrorCase as Case;
+            match case {
+                Case::NoRows => rusqlite::Error::QueryReturnedNoRows,
+                Case::Type => rusqlite::Error::InvalidColumnType(0, String::from("TEST_CODE actual column0"), rusqlite::types::Type::Blob),
+                Case::Utf8 => {
+                    let invalid = [0xff]; let child = std::str::from_utf8(&invalid).unwrap_err();
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(child))
+                },
+                _ => rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR), Some(String::from("TEST_CODE owned raw driver detail"))),
+            }
+        }
+        fn capture_advance_to(frame: &mut FinancialCapturePrefixFrame<'_, '_>, query: usize) {
+            if query >= 1 { frame.capture_loan().test_code_integer_query(i64::MIN); }
+            if query == 2 { frame.capture_loan().test_code_integer_query(i64::MAX); }
+        }
+        fn assert_capture_primary(frame: &FinancialCapturePrefixFrame<'_, '_>, query: usize, allocation: usize) {
+            let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+                source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage, ddl_id, detail },
+            })) = &frame.integrity.prefix.source.physical.primary else { panic!("same fixed C error through G enum move"); };
+            assert_eq!(*stage, ["capture-application-id", "capture-user-version", "capture-source-id"][query]);
+            assert!(ddl_id.is_none()); assert_eq!(detail.as_ptr() as usize, allocation); assert!(!detail.is_empty());
+        }
+        #[test]
+        fn history_original_capture_prefix_fixed_order_full_i64_and_actual_owned_source() {
+            for text in ["TEST_CODE unvalidated source-id", ""] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
+                let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                let row = frame.integrity.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr();
+                let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
+                frame.capture_loan().test_code_barrier(); frame.capture_loan().test_code_integer_query(i64::MIN);
+                assert_eq!(frame.capture.identity, [Some(i64::MIN), None]);
+                frame.capture_loan().test_code_integer_query(i64::MAX);
+                let source = String::from(text); let pointer = source.as_ptr(); frame.capture_loan().test_code_source_query(source);
+                { let _short = frame.capture_loan(); } let mut moved = frame;
+                assert_eq!(moved.capture.identity, [Some(i64::MIN), Some(i64::MAX)]);
+                assert_eq!(moved.capture.source_id.as_ref().unwrap().as_ptr(), pointer);
+                assert_eq!(moved.capture.source_id.as_deref(), Some(text));
+                assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(), row);
+                assert!(std::ptr::eq(moved.integrity.prefix.initial.purpose, &purpose));
+                assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                moved.capture_loan().test_code_barrier(); assert_eq!(trace.snapshot(), [None; 8]);
+                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                // The prefix is retained before compile_options, never a
+                // CatalogSnapshot/COMMIT/settled FinancialPending success.
+                let spare = fixed_capture_raw(replay_work::CaptureErrorCase::Step);
+                let first = moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                let terminal = moved.integrity.prefix.source.fields().source_work().test_code_observation();
+                moved.capture_loan().test_code_drain_interrupted(None, spare);
+                moved.integrity.integrity_loan().test_code_drain_interrupted();
+                moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
+                moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                assert!(moved.integrity.prefix.source.physical.parent_sidecars_retained());
+                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), terminal);
+            }
+        }
+        #[test]
+        fn history_original_capture_prefix_errors_finish_driver_scopes_before_c_then_g() {
+            use replay_work::CaptureErrorCase as Case;
+            // Mapper/query success remains Ok despite independently owned
+            // ignored cleanup Errors; those children cannot become a primary.
+            {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
+                frame.capture_loan().test_code_success_with_ignored_children(fixed_capture_raw(Case::Step), fixed_capture_raw(Case::Step));
+                frame.capture_loan().test_code_integer_query(i64::MAX);
+                frame.capture_loan().test_code_source_query(String::from("TEST_CODE successful ignored children"));
+                assert!(frame.integrity.prefix.source.physical.primary.is_none());
+                let spare = fixed_capture_raw(Case::Step);
+                frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                frame.capture_loan().test_code_drain_interrupted(None, spare);
+                frame.integrity.integrity_loan().test_code_drain_interrupted();
+                frame.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                drain_integrity_source_audit(&mut frame.integrity.prefix.source, &trace);
+                frame.integrity.prefix.source.fields().test_code_sidecar_close_busy();
+                assert!(frame.integrity.prefix.source.physical.primary.is_none());
+            }
+            for query in 0..3 {
+                for case in [Case::Prepare, Case::Tail, Case::Bind, Case::Step, Case::NoRows, Case::DoneReset, Case::Type, Case::Utf8] {
+                    if matches!(case, Case::Utf8) && query != 2 { continue; }
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
+                    let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                    let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
+                    let allocation = frame.capture_loan().test_code_error(case, fixed_capture_raw(case), fixed_capture_raw(Case::Step), fixed_capture_raw(Case::Step));
+                    { let _short = frame.capture_loan(); } let mut moved = frame;
+                    assert_capture_primary(&moved, query, allocation);
+                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                    assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                    moved.integrity.integrity_loan().test_code_drain_interrupted();
+                    let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
+                    moved.integrity.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup);
+                    drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
+                    moved.integrity.prefix.source.fields().test_code_sidecar_close_busy();
+                    assert_capture_primary(&moved, query, allocation); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    assert!(moved.integrity.prefix.source.physical.parent_sidecars_retained());
+                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                }
+            }
+        }
+        #[test]
+        fn history_original_capture_prefix_first_primary_terminal_and_unknown_returns_hold() {
+            use replay_work::{CaptureErrorCase as ErrorCase, CaptureTerminalCut as Cut};
+            for query in 0..3 {
+                for case in [ErrorCase::NoRows, ErrorCase::DoneReset] {
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
+                    let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                    let raw = fixed_capture_raw(case); let duplicate = fixed_capture_raw(case); let spare = fixed_capture_raw(ErrorCase::Step);
+                    frame.capture_loan().test_code_reached_done();
+                    let first = frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                    let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
+                    { let _short = frame.capture_loan(); } let mut moved = frame;
+                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                    assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                    assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    moved.capture_loan().test_code_done_result_after_terminal(case, raw, duplicate);
+                    moved.capture_loan().test_code_drain_interrupted(None, spare);
+                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                    moved.integrity.integrity_loan().test_code_drain_interrupted();
+                    moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                    drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
+                    moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    assert!(moved.integrity.prefix.source.physical.primary.is_none());
+                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                }
+            }
+            for query in 0..3 {
+                for cut in [Cut::BeforeQuery, Cut::Prepared, Cut::Row, Cut::OwnedString, Cut::StringPending,
+                    Cut::WholePending, Cut::PragmaScopePending, Cut::OwnedRaw, Cut::CleanupOwed, Cut::DetailPending, Cut::CatalogPending] {
+                    if matches!(cut, Cut::OwnedString | Cut::StringPending) && query != 2 { continue; }
+                    if matches!(cut, Cut::PragmaScopePending) && query == 2 { continue; }
+                    for terminal in [false, true] {
+                        let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                        let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                        let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
+                        let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                        let pending = frame.capture_loan().test_code_interruption_cut(cut, fixed_capture_raw(ErrorCase::Step), fixed_capture_raw(ErrorCase::Step));
+                        let source = frame.capture.source_id.as_ref().map(|s| s.as_ptr());
+                        let pending_pointer = pending.as_ref().map(|s| s.as_ptr());
+                        let (primary, allocation) = fixed_primary();
+                        let reset_child = fixed_capture_raw(ErrorCase::Step);
+                        let first = if terminal { drop(primary); Some(frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
+                            else { frame.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
+                                frame.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first actual supplied primary")); None };
+                        let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
+                        { let _short = frame.capture_loan(); } let mut moved = frame;
+                        assert_eq!(moved.capture.source_id.as_ref().map(|s| s.as_ptr()), source);
+                        assert_eq!(pending.as_ref().map(|s| s.as_ptr()), pending_pointer);
+                        assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                        assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                        assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                        moved.capture_loan().test_code_drain_interrupted(pending, reset_child);
+                        assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+                        moved.integrity.integrity_loan().test_code_drain_interrupted();
+                        if terminal { moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit(); }
+                        else { assert_primary(&moved.integrity.prefix.source.physical, allocation);
+                            let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
+                            moved.integrity.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup); }
+                        drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
+                        moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                        if let Some(first) = first { assert!(moved.integrity.prefix.source.physical.primary.is_none());
+                            assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
+                        else { assert_primary(&moved.integrity.prefix.source.physical, allocation); }
+                        assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                    }
+                }
+            }
+        }
+
         fn integrity_raw_allocation(raw: &rusqlite::Error) -> usize {
             match raw {
                 rusqlite::Error::InvalidColumnName(name) | rusqlite::Error::InvalidColumnType(_, name, _) => name.as_ptr() as usize,
