@@ -2664,6 +2664,42 @@ FOREIGN_CC_MEMBERS = ("cc/Cargo.toml", "cc/src/lib.rs", "cc/src/tool.rs",
                       "cc/src/tempfile.rs", "cc/src/command_helpers.rs", PROBE_LITERAL)
 
 
+# Finite source-derived CompileOnly map: bundled2 raw30, cc1.2.59 and Rust1.95.
+# This is not a general DefaultHasher model or a compiler/provider fallback.
+FOREIGN_MAP_RUSTC_SHA256 = "fcf2ce6f5b55d90d29867767262ad179ed761a8b54d24b5c181c535fa05ced19"
+FOREIGN_MAP_CC_SHA256 = "7fe2e79744d09922c1c8eef63e90473880c9e33a6375e54ebee8fe246555b09e"
+FOREIGN_OBJECT_PREFIXES = {
+    ("/crypto", "c"): "a4019cc0736b0423", ("/crypto/curve25519", "c"): "25ac62e5b3c53843",
+    ("/crypto/fipsmodule/aes", "c"): "0bbbd18bda93c05b", ("/crypto/fipsmodule/bn", "c"): "00c879ee3285a50d",
+    ("/crypto/fipsmodule/ec", "c"): "a0330e891e733f4e", ("/crypto/limbs", "c"): "aaa1ba3e455ee2e1",
+    ("/crypto/poly1305", "c"): "d5a9841f3dc6e253", ("/pregenerated", "S"): "c322a0bcc369f531",
+    ("/third_party/fiat/asm", "S"): "e165cd818145c705", ("src/arch", "s"): "4f9a91766097c4c5"}
+FOREIGN_COMPILE_SOURCES = {
+    "ring": ("crypto/cpu_intel.c", "crypto/crypto.c", "crypto/curve25519/curve25519.c",
+        "crypto/curve25519/curve25519_64_adx.c", "crypto/fipsmodule/aes/aes_nohw.c",
+        "crypto/fipsmodule/bn/montgomery.c", "crypto/fipsmodule/bn/montgomery_inv.c",
+        "crypto/fipsmodule/ec/ecp_nistz.c", "crypto/fipsmodule/ec/gfp_p256.c", "crypto/fipsmodule/ec/gfp_p384.c",
+        "crypto/fipsmodule/ec/p256-nistz.c", "crypto/fipsmodule/ec/p256.c", "crypto/limbs/limbs.c", "crypto/mem.c",
+        "crypto/poly1305/poly1305.c", "pregenerated/aes-gcm-avx2-x86_64-macosx.S",
+        "pregenerated/aesni-gcm-x86_64-macosx.S", "pregenerated/aesni-x86_64-macosx.S",
+        "pregenerated/chacha-x86_64-macosx.S", "pregenerated/chacha20_poly1305_x86_64-macosx.S",
+        "pregenerated/ghash-x86_64-macosx.S", "pregenerated/p256-x86_64-asm-macosx.S",
+        "pregenerated/sha256-x86_64-macosx.S", "pregenerated/sha512-x86_64-macosx.S",
+        "pregenerated/vpaes-x86_64-macosx.S", "pregenerated/x86_64-mont-macosx.S",
+        "pregenerated/x86_64-mont5-macosx.S", "third_party/fiat/asm/fiat_curve25519_adx_mul.S",
+        "third_party/fiat/asm/fiat_curve25519_adx_square.S"),
+    "psm": ("src/arch/x86_64.s",)}
+FOREIGN_COMPILE_CC_MEMBERS = tuple("cc/src/target/" + n + ".rs" for n in ("apple", "llvm", "parser", "generated"))
+FOREIGN_COMPILE_COMMON = ("-O0", "-ffunction-sections", "-fdata-sections", "-fPIC", "-g", "-gdwarf-2",
+    "-fno-omit-frame-pointer", "-m64", "--target=x86_64-apple-macosx", "-mmacosx-version-min=26.5")
+FOREIGN_COMPILE_RING = ("-Wall", "-Wextra", "-fvisibility=hidden", "-std=c1x", "-Wall", "-Wbad-function-cast",
+    "-Wcast-align", "-Wcast-qual", "-Wconversion", "-Wmissing-field-initializers", "-Wmissing-include-dirs",
+    "-Wnested-externs", "-Wredundant-decls", "-Wshadow", "-Wsign-compare", "-Wsign-conversion",
+    "-Wstrict-prototypes", "-Wundef", "-Wuninitialized", "-gfull", "-DNDEBUG")
+FOREIGN_COMPILE_PSM = ("-Wall", "-Wextra", "-xassembler-with-cpp", "-DCFG_TARGET_OS_macos",
+    "-DCFG_TARGET_ARCH_x86_64", "-DCFG_TARGET_ENV_")
+
+
 def foreign_context(env, cwd, session, inv):
     # Source recognition precedes labels, flags and OUT_DIR. No generic fallback.
     require(cwd.is_absolute() and cwd.resolve() == cwd and not cwd.is_symlink(), "ForeignSourceAlias")
@@ -2797,11 +2833,204 @@ def foreign_semantics(call, receipt):
     if kind == "CompilerFamilyVersionProbe":
         return {"zig_cc": code == 0 and "ziglang" in stdout,
                 "source_nonzero_default": code != 0}
+    if kind == "CompilerObjectCompile":
+        return {"compiler_success": code == 0, "object_observed": receipt["output_post"]["exists"]}
     warning = "-Wslash-u-filename" in stdout or "-Wslash-u-filename" in stderr
     effective = code == 0 and (receipt["operation"]["retry"] or not warning)
     return {"warning_retry_requested": warning and not receipt["operation"]["retry"],
             "effective_stdout": effective,
             "markers": {m: ('"' + m + '"') in stdout for m in ("clang", "gcc", "emscripten", "VxWorks")}}
+
+
+def foreign_compile_environment(env, session, inv):
+    native_environment(env, session, inv)
+    require(env.get("LC_ALL") == "C" and "LC_CTYPE" not in env and "ZERO_AR_DATE" not in env,
+            "ForeignCompileEnvironment")
+    require(env.get("CARGO") == inv["cargo"]["path"] and env.get("HOME") == str(session / "home")
+            and env.get("TMPDIR") == str(session / "tmp") and env.get("CARGO_HOME") == str(session / "cargo-home"),
+            "ForeignSessionEnvironment")
+
+
+def foreign_compile_inputs(inv, name):
+    """Negative-only declaration for the closed ring/psm input set; no observation."""
+    require(name in FOREIGN_COMPILE_SOURCES, "ForeignCompileSource")
+    sources = {name + "/" + member for member in FOREIGN_COMPILE_SOURCES[name]}
+    if name == "ring":
+        include = {m for m in inv["vendor"]["files"] if m.startswith("ring/include/")}
+        sources.update(include)
+        sources.update(m for m in inv["vendor"]["files"] if m.startswith("ring/pregenerated/"))
+        # Closed private header leaves from the existing ring0.17.14 policy.
+        # They are native inputs, with the same pins/quarantine as public includes.
+        sources.update(('ring/crypto/curve25519/curve25519_tables.h', 'ring/crypto/curve25519/internal.h', 'ring/crypto/fipsmodule/bn/internal.h', 'ring/crypto/fipsmodule/ec/ecp_nistz.h', 'ring/crypto/fipsmodule/ec/ecp_nistz384.h', 'ring/crypto/fipsmodule/ec/ecp_nistz384.inl', 'ring/crypto/fipsmodule/ec/p256-nistz-table.h', 'ring/crypto/fipsmodule/ec/p256-nistz.h', 'ring/crypto/fipsmodule/ec/p256_shared.h', 'ring/crypto/fipsmodule/ec/p256_table.h', 'ring/crypto/fipsmodule/ec/util.h', 'ring/crypto/internal.h', 'ring/crypto/limbs/limbs.h', 'ring/crypto/limbs/limbs.inl', 'ring/third_party/fiat/curve25519_32.h', 'ring/third_party/fiat/curve25519_64.h', 'ring/third_party/fiat/curve25519_64_adx.h', 'ring/third_party/fiat/curve25519_64_msvc.h', 'ring/third_party/fiat/p256_32.h', 'ring/third_party/fiat/p256_64.h', 'ring/third_party/fiat/p256_64_msvc.h'))
+    return {"state": "DeclaredOnly", "source_sha256":
+            {member: inv["vendor"]["files"].get(member) for member in sorted(sources)}}
+
+
+def foreign_compile_pins(session, inv, context):
+    name = Path(context["manifest"]).name
+    if name == "ring":
+        require(any(m.startswith("ring/include/") for m in inv["vendor"]["files"]), "ForeignCompileInclude")
+    sources = foreign_compile_inputs(inv, name)["source_sha256"]
+    helpers = set(FOREIGN_COMPILE_CC_MEMBERS)
+    source_pins, helper_pins = {}, {}
+    for members, pins in ((sources, source_pins), (helpers, helper_pins)):
+        for member in sorted(members):
+            path = session / "vendor" / member; regular(path)
+            require(path.resolve() == path and path.stat().st_nlink == 1
+                    and inv["vendor"]["files"].get(member) == file_hash(path), "ForeignCompileSourcePin")
+            pins[member] = file_hash(path)
+    require(inv["rustc"]["sha256"] == FOREIGN_MAP_RUSTC_SHA256
+            and context["source_sha256"]["cc/src/command_helpers.rs"] == FOREIGN_MAP_CC_SHA256,
+            "ForeignObjectMapBinding")
+    return {"source_sha256": source_pins, "helper_sha256": helper_pins, "rustc": inv["rustc"],
+            "object_map_cc_sha256": FOREIGN_MAP_CC_SHA256}
+
+
+def foreign_compile_classify(role, args, context, session, *, current_call=None):
+    require(role == "cc", "ForeignRole")
+    root = Path(context["manifest"]); name = root.name
+    require(len(args) >= 5 and args[-4] == "-o" and args[-2] == "-c", "ForeignCompileArgv")
+    raw_source = args[-1]
+    member = next((m for m in FOREIGN_COMPILE_SOURCES[name]
+                   if raw_source == (str(root / m) if name == "ring" else m)), None)
+    require(member is not None, "ForeignCompileSource")
+    # Match cc's literal dirname strip_prefix and extension writes; no Path.hash.
+    dirname = str(Path(raw_source).parent)
+    if dirname.startswith(str(root)): dirname = dirname[len(str(root)):]
+    extension = Path(raw_source).suffix[1:]
+    prefix = FOREIGN_OBJECT_PREFIXES.get((dirname, extension)); require(prefix is not None, "ForeignObjectMap")
+    output = Path(context["out_dir"]) / (prefix + "-" + Path(raw_source).with_suffix(".o").name)
+    flags = list(FOREIGN_COMPILE_COMMON)
+    flags += ["-I", str(root / "include"), "-I", str(root / "pregenerated"), *FOREIGN_COMPILE_RING] if name == "ring" else list(FOREIGN_COMPILE_PSM)
+    require(args == [*flags, "-o", str(output), "-c", raw_source], "ForeignCompileArgv")
+    require(output.resolve() == output and output.is_absolute(), "ForeignCompileOutputAlias")
+    # An immutable request reserves its output even if execution/receipt failed.
+    namespace = session / "foreign-native-invocations"
+    for other in namespace.iterdir():
+        if other == current_call: continue
+        if not (other / "request.json").exists() and not (other / "receipt.json").exists(): continue
+        request = strict_json((other / "request.json").read_bytes())
+        other_cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        values = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        for index, value in enumerate(values[:-1]):
+            if value == "-o":
+                require((other_cwd / values[index + 1]).resolve() != output, "ForeignCompileOwnership")
+    return {"class": "CompilerObjectCompile", "source": str(root / member), "raw_source": raw_source,
+            "output": str(output), "object_derivation": {"dirname": dirname, "extension": extension, "prefix": prefix},
+            "context_group": context["out_dir"]}
+
+
+def foreign_compile_family(session, policy, owner, context, *, current_call=None):
+    inv = native_control(session, policy, owner); controls = foreign_controls(session, policy, owner, context)
+    rows = []; prior_compiles = []; kinds = {"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe"}
+    namespace = session / "foreign-native-invocations"
+    for call in namespace.iterdir():
+        if call == current_call: continue
+        require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call and not call.is_symlink(), "ForeignFamilyEvidenceAlias")
+        request_path = call / "request.json"
+        # A not-yet-published concurrent call has no evidence/ownership authority.
+        # A retained receipt with a missing request is a fault, never skipped.
+        if not request_path.exists() and not (call / "receipt.json").exists(): continue
+        regular(request_path)
+        require(request_path.resolve() == request_path and request_path.stat().st_nlink == 1, "ForeignFamilyEvidenceAlias")
+        request = strict_json(request_path.read_bytes())
+        env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        if str(cwd) != context["manifest"] or env.get("OUT_DIR") != context["out_dir"]: continue
+        keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
+        require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly" and request["lane"] == FOREIGN_LANE
+                and request["owner_issued_inspector"] is False, "ForeignFamilyReceiptBinding")
+        args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        receipt_path = call / "receipt.json"
+        if not receipt_path.exists():
+            # Concurrent fixed object requests are not probe predecessors or successes.
+            # Their eventual faults remain sticky in the aggregate, including request-only cuts.
+            require("-c" in args, "ForeignFamilyPending")
+            foreign_compile_environment(env, session, inv)
+            require(foreign_context(env, cwd, session, inv) == context, "ForeignFamilyControl")
+            foreign_compile_classify(request["role"], args, context, session, current_call=call)
+            continue
+        regular(receipt_path)
+        require(receipt_path.resolve() == receipt_path and receipt_path.stat().st_nlink == 1, "ForeignFamilyEvidenceAlias")
+        receipt = strict_json(receipt_path.read_bytes())
+        require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly" and request["lane"] == FOREIGN_LANE
+                and request["owner_issued_inspector"] is False and receipt["operation_id"] == call.name
+                and all(receipt[k] == v for k, v in request.items()), "ForeignFamilyReceiptBinding")
+        require(receipt["protocol_state"] == "Completed" and receipt["failures"] == [], "ForeignFamilySticky")
+        computed_context = foreign_context(env, cwd, session, inv)
+        require(computed_context == context and receipt["context"] == context
+                and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignFamilyControl")
+        args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        require(receipt["tool_sha256"] == inv["generators"]["CC"]["sha256"]
+                and receipt["argv_hex"] == [os.fsencode(inv["generators"]["CC"]["path"]).hex(), *request["args_hex"]], "ForeignFamilyTool")
+        foreign_jobserver_binding(receipt["jobserver_identity"], env)
+        require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
+        for stream in ("stdout", "stderr"):
+            path = call / (stream + ".raw"); regular(path)
+            require(path.resolve() == path and path.stat().st_nlink == 1
+                    and file_hash(path) == receipt[stream + "_sha256"], "ForeignFamilyStream")
+        semantics = foreign_semantics(call, receipt)
+        require(semantics == receipt["source_semantics"], "ForeignFamilySemantics")
+        kind = receipt["operation"]["class"]
+        if kind == "CompilerObjectCompile":
+            foreign_compile_environment(env, session, inv)
+            require(semantics["compiler_success"], "ForeignFamilySticky")
+            operation = foreign_compile_classify(receipt["role"], args, context, session, current_call=call)
+            require(operation == receipt["operation"], "ForeignFamilyClassification")
+            pins = foreign_compile_pins(session, inv, context)
+            require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
+            require(all(isinstance(receipt.get(k), dict) for k in ("input_pre", "input_post", "output_pre", "output_post")), "ForeignSnapshotFields")
+            require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"])
+                    and receipt["input_pre"]["exists"] is True
+                    and receipt["input_pre"]["path"] == receipt["input_post"]["path"] == operation["source"]
+                    and receipt["input_pre"]["sha256"] == pins["source_sha256"][str(Path(operation["source"]).relative_to(session / "vendor"))]
+                    and receipt["output_pre"] == {"exists": False, "path": operation["output"]}
+                    and receipt["output_post"]["path"] == operation["output"]
+                    and receipt["output_post"]["exists"] is True and receipt["output_post"]["length"] > 0, "ForeignCompileSnapshot")
+            native_state_check(call, receipt["input_pre"]); native_state_check(call, receipt["input_post"], live=True)
+            native_state_check(call, receipt["output_post"], live=True)
+            prior_compiles.append(receipt)
+            continue
+        require(kind in kinds, "ForeignFamilyClass"); foreign_environment(env, session, inv)
+        rows.append((call, receipt, args))
+    files = [(c, r) for c, r, _ in rows if r["operation"]["class"] == "CompilerFamilyFileProbe"]
+    effective = []; references = {}
+    for call, receipt, args in rows:
+        predecessor = receipt["operation"].get("predecessor")
+        history = [(c, r) for c, r in files if c.name == predecessor] if predecessor else []
+        operation = foreign_probe_classify(receipt["role"], args, context, {}, session, inv, history=history)
+        require(operation == receipt["operation"], "ForeignFamilyClassification")
+        kind = operation["class"]
+        if kind == "CompilerFamilyFileProbe":
+            pre, post = receipt.get("input_pre"), receipt.get("input_post")
+            require(isinstance(pre, dict) and isinstance(post, dict), "ForeignSnapshotFields")
+            require(native_state_key(pre) == native_state_key(post) and pre["exists"] is True
+                    and pre["path"] == post["path"] == operation["source"] and pre["length"] == 206
+                    and pre["sha256"] == PROBE_DIGEST, "ForeignFamilyLiteral")
+            native_state_check(call, pre); native_state_check(call, post, live=True, retire=True)
+            if receipt["source_semantics"]["effective_stdout"]: effective.append((call, receipt))
+        else:
+            require(not any(k in receipt for k in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post")), "ForeignOutputFreeClass")
+        reference = {"operation_id": call.name, "request_sha256": file_hash(call / "request.json"),
+                     "receipt_sha256": file_hash(call / "receipt.json"),
+                     "stdout_sha256": receipt["stdout_sha256"], "stderr_sha256": receipt["stderr_sha256"]}
+        references.setdefault(kind, []).append(reference)
+    require(len(files) in (1, 2) and len(effective) == 1, "ForeignFamilyUnique")
+    first = [(c, r) for c, r in files if not r["operation"]["retry"]]
+    require(len(first) == 1 and all(not r["operation"]["retry"] or r["operation"]["predecessor"] == first[0][0].name for _, r in files), "ForeignFamilyUnique")
+    for kind in ("CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe"):
+        require(len(references.get(kind, [])) == 1, "ForeignFamilyUnique")
+    _, e = effective[0]
+    help_row = next(r for _, r, _ in rows if r["operation"]["class"] == "CompilerFamilyHelpProbe")
+    version = next(r for _, r, _ in rows if r["operation"]["class"] == "CompilerFamilyVersionProbe")
+    require(e["tool_result"] == 0 and e["source_semantics"]["markers"]["clang"]
+            and not e["source_semantics"]["warning_retry_requested"] and help_row["tool_result"] == 1
+            and help_row["source_semantics"] == {"accepts_cl_style_flags": False, "source_branch": "ClStyleRejected"}
+            and version["tool_result"] == 0 and version["source_semantics"] == {"zig_cc": False, "source_nonzero_default": False}, "ForeignFamilyClang")
+    evidence = {"family": "Clang", "effective_e_operation_id": effective[0][0].name,
+                "context_group": context["out_dir"], "evidence": {k: sorted(v, key=lambda r: r["operation_id"]) for k, v in references.items()}}
+    require(all(r["family_pre"] == r["family_return"] == evidence for r in prior_compiles), "ForeignFamilyChanged")
+    return evidence
 
 
 def foreign_operation(session, policy, owner, role, args, cwd, env):
@@ -2819,9 +3048,17 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
     try:
         inv = native_control(session, policy, owner)
         context = foreign_context(env, cwd, session, inv); receipt["context"] = context
-        foreign_environment(env, session, inv)
+        compiling = "-c" in args
+        (foreign_compile_environment if compiling else foreign_environment)(env, session, inv)
         controls = foreign_controls(session, policy, owner, context); receipt["controls_pre"] = controls
-        operation = foreign_probe_classify(role, args, context, env, session, inv, current_call=call); receipt["operation"] = operation
+        operation = (foreign_compile_classify(role, args, context, session, current_call=call) if compiling
+                     else foreign_probe_classify(role, args, context, env, session, inv, current_call=call))
+        receipt["operation"] = operation
+        if compiling:
+            # Retain expected input ownership before any pin validation may refuse.
+            receipt["compile_input_declaration"] = foreign_compile_inputs(inv, Path(context["manifest"]).name)
+            receipt["compile_pins_pre"] = foreign_compile_pins(session, inv, context)
+            receipt["family_pre"] = foreign_compile_family(session, policy, owner, context, current_call=call)
         tool = pinned_file(inv["generators"]["CC"])
         receipt["tool_sha256"] = inv["generators"]["CC"]["sha256"]
         receipt["argv_hex"] = [os.fsencode(v).hex() for v in [tool, *args]]
@@ -2829,17 +3066,29 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
             receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw", bound=206)
             require(receipt["input_pre"]["length"] == 206 and receipt["input_pre"]["sha256"] == PROBE_DIGEST,
                     "ForeignProbeLiteral")
+        if compiling:
+            receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw")
+            receipt["output_pre"] = native_snapshot(call, operation["output"], "output-pre.raw", absent=True)
+            require(not receipt["output_pre"]["exists"], "ForeignCompileOwnership")
         fds = inherited_jobserver_fds(env)
         require(len(fds) == 2, "ForeignJobserverRequired")
         receipt["jobserver_identity"] = native_jobserver_identity(fds)
         code, faults = native_streamed([tool, *args], cwd, env, call, fds, {})
         receipt["tool_result"] = code; receipt["failures"].extend(faults)
+        if compiling:
+            # Capture even a failed compiler's partial output before input/control checks.
+            receipt["output_post"] = native_snapshot(call, operation["output"], "output-post.raw", absent=True)
         if "input_pre" in receipt:
-            receipt["input_post"] = native_snapshot(call, operation["source"], "input-post.raw", bound=206)
+            receipt["input_post"] = native_snapshot(call, operation["source"], "input-post.raw", bound=receipt["input_pre"]["length"] if compiling else 206)
             require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"]), "ForeignInputChanged")
+        if compiling:
+            require(code != 0 or (receipt["output_post"]["exists"] and receipt["output_post"]["length"] > 0), "ForeignCompileObjectMissing")
         post_context = foreign_context(env, cwd, session, inv)
         receipt["controls_post"] = foreign_controls(session, policy, owner, post_context)
         require(receipt["controls_post"] == controls, "ForeignControlChanged")
+        if compiling:
+            receipt["compile_pins_post"] = foreign_compile_pins(session, inv, post_context)
+            require(receipt["compile_pins_post"] == receipt["compile_pins_pre"], "ForeignCompilePinChanged")
         require(not receipt["failures"], "ForeignCaptureSticky")
         receipt["source_semantics"] = foreign_semantics(call, receipt)
         receipt["protocol_state"] = "Completed"
@@ -2870,6 +3119,12 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
             receipt["jobserver_return"] = native_jobserver_identity(fds)
             require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
             if "input_post" in receipt: native_state_check(call, receipt["input_post"], live=True)
+            if compiling:
+                native_state_check(call, receipt["output_post"], live=True)
+                receipt["compile_pins_return"] = foreign_compile_pins(session, inv, context)
+                require(receipt["compile_pins_return"] == receipt["compile_pins_pre"], "ForeignCompilePinChanged")
+                receipt["family_return"] = foreign_compile_family(session, policy, owner, context, current_call=call)
+                require(receipt["family_return"] == receipt["family_pre"], "ForeignFamilyChanged")
         except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
             receipt["protocol_state"] = "ProtocolRefused"; receipt["failures"].append(str(error))
     atomic_json(call / "receipt.json", receipt)
@@ -2906,6 +3161,13 @@ def foreign_evidence_namespace(session):
                 for stream in ("stdout", "stderr"):
                     sha = receipt.get(stream + "_sha256")
                     if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+                # Native compile inputs/includes keep retained ownership before request parsing.
+                for key in ("compile_input_declaration", "compile_pins_pre", "compile_pins_post", "compile_pins_return"):
+                    pins = receipt.get(key)
+                    if isinstance(pins, dict) and isinstance(pins.get("source_sha256"), dict):
+                        for member, sha in pins["source_sha256"].items():
+                            if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+                            if isinstance(member, str): paths.add(str((session / "vendor" / member).resolve()))
                 # Harvest every valid digest; one bad state cannot hide another.
                 # Shape and cwd-dependent path checks remain in the request phase.
                 for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
@@ -2928,6 +3190,25 @@ def foreign_evidence_namespace(session):
                 if arg in {"-o", "-c"}: declared.append(args[index + 1])
             if request["role"] == "ar" and len(args) >= 2: declared.extend(args[1:])
             paths.update(str((cwd / value).resolve()) for value in declared)
+            # A receiptless fixed Compile request owns its closed inputs negatively.
+            # Raw cwd/source and pinned package identity suffice for declaration only;
+            # labels, environment, flags and receipts cannot grant execution authority.
+            if args.count("-c") == 1:
+                name = next((n for n in FOREIGN_COMPILE_SOURCES
+                             if cwd == session / "vendor" / n and cwd.resolve() == cwd
+                             and not cwd.is_symlink()), None)
+                index = args.index("-c")
+                if name is not None and index + 1 < len(args) and any(
+                        args[index + 1] == (str(cwd / m) if name == "ring" else m)
+                        for m in FOREIGN_COMPILE_SOURCES[name]):
+                    inv = strict_json(POLICY.read_bytes())["inventory"]
+                    package = {"id": RING_PACKAGE if name == "ring" else PSM_PACKAGE,
+                               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                    require(inv["packages"].count(package) == 1, "ForeignCompileDeclarationPackage")
+                    inputs = foreign_compile_inputs(inv, name)["source_sha256"]
+                    for member, sha in inputs.items():
+                        paths.add(str((session / "vendor" / member).resolve()))
+                        if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
             if receipt is not None:
                 for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
                     state = receipt.get(key, {})
@@ -3030,7 +3311,7 @@ def foreign_seal(session, policy):
               "artifact_selection": "not_observed",
               "unclosed": ["compiler-family-successors", "family-to-compile", "object", "archive", "builder-run", "consumer"]}
     paths, probes, hashes, failures = foreign_evidence_namespace(session)
-    calls = {}; groups = {}; outdirs = {}
+    calls = {}; groups = {}; outdirs = {}; compile_requested = False
     if namespace.exists() and namespace.is_dir() and namespace.resolve() == namespace and not namespace.is_symlink():
         for call in sorted(namespace.iterdir()):
             item = {"operation_id": call.name}; result["operations"].append(item)
@@ -3040,6 +3321,8 @@ def foreign_seal(session, policy):
                     regular(raw)
                     require(raw.resolve() == raw and raw.stat().st_nlink == 1, "ForeignEvidenceAlias")
                     item["retained_raw_sha256"][raw.name] = file_hash(raw)
+                early_request = strict_json((call / "request.json").read_bytes())
+                compile_requested = compile_requested or any(os.fsdecode(bytes.fromhex(v)) == "-c" for v in early_request["args_hex"])
                 for leaf in ("request", "receipt"):
                     path = call / (leaf + ".json"); regular(path)
                     require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignEvidenceAlias")
@@ -3050,10 +3333,13 @@ def foreign_seal(session, policy):
                         and request["lane"] == FOREIGN_LANE and request["owner_issued_inspector"] is False
                         and receipt["operation_id"] == call.name and all(receipt[k] == v for k, v in request.items()), "ForeignReceiptBinding")
                 item["protocol_state"] = receipt["protocol_state"]; item["tool_result"] = receipt["tool_result"]
+                compile_requested = compile_requested or any(os.fsdecode(bytes.fromhex(v)) == "-c" for v in request["args_hex"])
                 require(receipt["protocol_state"] == "Completed" and receipt["failures"] == [], "ForeignProtocolSticky")
                 env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
                 cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"]))); args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
-                context = foreign_context(env, cwd, session, inv); foreign_environment(env, session, inv)
+                compiling = "-c" in args; compile_requested = compile_requested or compiling
+                context = foreign_context(env, cwd, session, inv)
+                (foreign_compile_environment if compiling else foreign_environment)(env, session, inv)
                 group = context["out_dir"]; package = context["package_id"]
                 require(group not in outdirs or outdirs[group] == package, "ForeignOutDirCollision"); outdirs[group] = package
                 controls = foreign_controls(session, policy, owner, context)
@@ -3079,7 +3365,9 @@ def foreign_seal(session, policy):
                 if predecessor is not None:
                     require(predecessor in calls, "ForeignProbePredecessor")
                     history = [calls[predecessor][:2]]
-                computed = foreign_probe_classify(receipt["role"], args, receipt["context"], env, session, inv, history=history)
+                compiling = operation["class"] == "CompilerObjectCompile"
+                computed = (foreign_compile_classify(receipt["role"], args, receipt["context"], session, current_call=call) if compiling
+                            else foreign_probe_classify(receipt["role"], args, receipt["context"], env, session, inv, history=history))
                 require(computed == operation, "ForeignRawClassification")
                 if operation["class"] == "CompilerFamilyFileProbe":
                     require(isinstance(receipt.get("input_pre"), dict)
@@ -3092,6 +3380,22 @@ def foreign_seal(session, policy):
                     native_state_check(call, receipt["input_pre"])
                     item = next(i for i in result["operations"] if i["operation_id"] == ident)
                     item["input_final_state"] = native_state_check(call, receipt["input_post"], live=True, retire=True)
+                elif compiling:
+                    pins = foreign_compile_pins(session, inv, receipt["context"])
+                    require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
+                    family = foreign_compile_family(session, policy, owner, receipt["context"], current_call=call)
+                    require(receipt["family_pre"] == receipt["family_return"] == family, "ForeignFamilyChanged")
+                    require(all(isinstance(receipt.get(k), dict) for k in ("input_pre", "input_post", "output_pre", "output_post")), "ForeignSnapshotFields")
+                    require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"])
+                            and receipt["input_pre"]["exists"] is True
+                            and receipt["input_pre"]["path"] == receipt["input_post"]["path"] == operation["source"]
+                            and receipt["input_pre"]["sha256"] == pins["source_sha256"][str(Path(operation["source"]).relative_to(session / "vendor"))]
+                            and receipt["output_pre"] == {"exists": False, "path": operation["output"]}
+                            and receipt["output_post"]["path"] == operation["output"], "ForeignCompileSnapshot")
+                    native_state_check(call, receipt["input_pre"]); native_state_check(call, receipt["input_post"], live=True)
+                    native_state_check(call, receipt["output_post"], live=True)
+                    require(receipt["tool_result"] == 0 and receipt["output_post"]["exists"] is True
+                            and receipt["output_post"]["length"] > 0, "ForeignCompileNonzeroOrMissing")
                 else:
                     require(not any(k in receipt for k in ("input_pre", "input_post", "output_pre", "output_post",
                                                            "archive_pre", "archive_post")), "ForeignOutputFreeClass")
@@ -3112,8 +3416,11 @@ def foreign_seal(session, policy):
             "operations": sorted(members), "per_probe_family_predecessor": "not_observed",
             "observed_classes": sorted(observed), "missing_observation_classes": missing,
             "family_pairing": "ambiguous_context_group", "family_qualification": "not_issued"})
+    if compile_requested:
+        result["stage"] = "StageBIncomplete"
+        result["unclosed"] = ["archive", "builder-run", "consumer"]
     if result["operations"]:
-        failures.extend("ForeignSeal:StageAIncomplete:" + missing for missing in result["unclosed"])
+        failures.extend("ForeignSeal:" + result["stage"] + ":" + missing for missing in result["unclosed"])
     result["quarantine"] = {"paths": sorted(paths), "probe_paths": sorted(probes), "sha256": sorted(hashes)}
     result["blockers"] = sorted(set(failures)); native_control(session, policy, owner)
     atomic_json(session / "foreign-native-record.json", result)

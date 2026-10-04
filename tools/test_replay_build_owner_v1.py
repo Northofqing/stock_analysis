@@ -2296,6 +2296,138 @@ for control in stream_controls:
 emit({'reason':'build-finished','success':True})
 '''
 
+# Stage B fixtures use bound bundled2 raw data, not production classifier output.
+E2_SOURCE_DATA = {'ring': [('crypto/cpu_intel.c', 'a4019cc0736b0423-cpu_intel.o'), ('crypto/crypto.c', 'a4019cc0736b0423-crypto.o'), ('crypto/curve25519/curve25519.c', '25ac62e5b3c53843-curve25519.o'), ('crypto/curve25519/curve25519_64_adx.c', '25ac62e5b3c53843-curve25519_64_adx.o'), ('crypto/fipsmodule/aes/aes_nohw.c', '0bbbd18bda93c05b-aes_nohw.o'), ('crypto/fipsmodule/bn/montgomery.c', '00c879ee3285a50d-montgomery.o'), ('crypto/fipsmodule/bn/montgomery_inv.c', '00c879ee3285a50d-montgomery_inv.o'), ('crypto/fipsmodule/ec/ecp_nistz.c', 'a0330e891e733f4e-ecp_nistz.o'), ('crypto/fipsmodule/ec/gfp_p256.c', 'a0330e891e733f4e-gfp_p256.o'), ('crypto/fipsmodule/ec/gfp_p384.c', 'a0330e891e733f4e-gfp_p384.o'), ('crypto/fipsmodule/ec/p256-nistz.c', 'a0330e891e733f4e-p256-nistz.o'), ('crypto/fipsmodule/ec/p256.c', 'a0330e891e733f4e-p256.o'), ('crypto/limbs/limbs.c', 'aaa1ba3e455ee2e1-limbs.o'), ('crypto/mem.c', 'a4019cc0736b0423-mem.o'), ('crypto/poly1305/poly1305.c', 'd5a9841f3dc6e253-poly1305.o'), ('pregenerated/aes-gcm-avx2-x86_64-macosx.S', 'c322a0bcc369f531-aes-gcm-avx2-x86_64-macosx.o'), ('pregenerated/aesni-gcm-x86_64-macosx.S', 'c322a0bcc369f531-aesni-gcm-x86_64-macosx.o'), ('pregenerated/aesni-x86_64-macosx.S', 'c322a0bcc369f531-aesni-x86_64-macosx.o'), ('pregenerated/chacha-x86_64-macosx.S', 'c322a0bcc369f531-chacha-x86_64-macosx.o'), ('pregenerated/chacha20_poly1305_x86_64-macosx.S', 'c322a0bcc369f531-chacha20_poly1305_x86_64-macosx.o'), ('pregenerated/ghash-x86_64-macosx.S', 'c322a0bcc369f531-ghash-x86_64-macosx.o'), ('pregenerated/p256-x86_64-asm-macosx.S', 'c322a0bcc369f531-p256-x86_64-asm-macosx.o'), ('pregenerated/sha256-x86_64-macosx.S', 'c322a0bcc369f531-sha256-x86_64-macosx.o'), ('pregenerated/sha512-x86_64-macosx.S', 'c322a0bcc369f531-sha512-x86_64-macosx.o'), ('pregenerated/vpaes-x86_64-macosx.S', 'c322a0bcc369f531-vpaes-x86_64-macosx.o'), ('pregenerated/x86_64-mont-macosx.S', 'c322a0bcc369f531-x86_64-mont-macosx.o'), ('pregenerated/x86_64-mont5-macosx.S', 'c322a0bcc369f531-x86_64-mont5-macosx.o'), ('third_party/fiat/asm/fiat_curve25519_adx_mul.S', 'e165cd818145c705-fiat_curve25519_adx_mul.o'), ('third_party/fiat/asm/fiat_curve25519_adx_square.S', 'e165cd818145c705-fiat_curve25519_adx_square.o')], 'psm': [('src/arch/x86_64.s', '4f9a91766097c4c5-x86_64.o')]}
+E2_PREFIX_DATA = {'ring': ['-O0', '-ffunction-sections', '-fdata-sections', '-fPIC', '-g', '-gdwarf-2', '-fno-omit-frame-pointer', '-m64', '--target=x86_64-apple-macosx', '-mmacosx-version-min=26.5', '-I', '$ROOT/include', '-I', '$ROOT/pregenerated', '-Wall', '-Wextra', '-fvisibility=hidden', '-std=c1x', '-Wall', '-Wbad-function-cast', '-Wcast-align', '-Wcast-qual', '-Wconversion', '-Wmissing-field-initializers', '-Wmissing-include-dirs', '-Wnested-externs', '-Wredundant-decls', '-Wshadow', '-Wsign-compare', '-Wsign-conversion', '-Wstrict-prototypes', '-Wundef', '-Wuninitialized', '-gfull', '-DNDEBUG'], 'psm': ['-O0', '-ffunction-sections', '-fdata-sections', '-fPIC', '-g', '-gdwarf-2', '-fno-omit-frame-pointer', '-m64', '--target=x86_64-apple-macosx', '-mmacosx-version-min=26.5', '-Wall', '-Wextra', '-xassembler-with-cpp', '-DCFG_TARGET_OS_macos', '-DCFG_TARGET_ARCH_x86_64', '-DCFG_TARGET_ENV_']}
+E2_PRIVATE_HEADER_MEMBERS = ('ring/crypto/curve25519/curve25519_tables.h', 'ring/crypto/curve25519/internal.h', 'ring/crypto/fipsmodule/bn/internal.h', 'ring/crypto/fipsmodule/ec/ecp_nistz.h', 'ring/crypto/fipsmodule/ec/ecp_nistz384.h', 'ring/crypto/fipsmodule/ec/ecp_nistz384.inl', 'ring/crypto/fipsmodule/ec/p256-nistz-table.h', 'ring/crypto/fipsmodule/ec/p256-nistz.h', 'ring/crypto/fipsmodule/ec/p256_shared.h', 'ring/crypto/fipsmodule/ec/p256_table.h', 'ring/crypto/fipsmodule/ec/util.h', 'ring/crypto/internal.h', 'ring/crypto/limbs/limbs.h', 'ring/crypto/limbs/limbs.inl', 'ring/third_party/fiat/curve25519_32.h', 'ring/third_party/fiat/curve25519_64.h', 'ring/third_party/fiat/curve25519_64_adx.h', 'ring/third_party/fiat/curve25519_64_msvc.h', 'ring/third_party/fiat/p256_32.h', 'ring/third_party/fiat/p256_64.h', 'ring/third_party/fiat/p256_64_msvc.h')
+E2_NATIVE = E1_NATIVE.replace("if args[0]=='-E':", r"""if '-c' in args:
+    output=pathlib.Path(args[args.index('-o')+1]);source=pathlib.Path(args[-1])
+    os.write(1,b'TEST_CODE_compile_stdout\n');os.write(2,b'TEST_CODE_compile_stderr\n')
+    if case!='object_missing':output.write_bytes(b'TEST_CODE_object:'+source.name.encode())
+    if case=='source_post':source.chmod(0o644);source.write_bytes(b'X')
+    if case=='include_post':
+        header=pathlib.Path(env['CARGO_MANIFEST_DIR'])/'include/TEST_CODE.h'
+        if header.exists():header.chmod(0o644);header.write_bytes(b'X')
+    if case=='private_header_post':
+        header=pathlib.Path(env['CARGO_MANIFEST_DIR'])/'crypto/internal.h'
+        if header.exists():header.chmod(0o644);header.write_bytes(b'TEST_CODE_private_header_post')
+    if case=='signal':os.kill(os.getpid(),signal.SIGTERM)
+    sys.exit(7 if case in ('nonzero','sticky') else 0)
+if args[0]=='-E':
+    if case in ('source_post','signal'):case='normal'""").replace("sys.exit(0 if case=='help_zero' else 9)", "sys.exit(0 if case=='family_msvc' else 1)")
+E2_NATIVE = E2_NATIVE.replace("case in ('version_zig','version_nonzero')", "case=='family_zig'").replace("else:os.write(1,b'\"clang\" \"gcc\"\\n')", "else:os.write(1,b'\"gcc\"\\n' if case=='family_label' else b'\"clang\" \"gcc\"\\n')")
+E2_COMPILE_CARGO = r'''
+    if source.exists():source.unlink()
+    if CASE=='family_resurrect':source.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())
+    if CASE=='family_duplicate':execute(['-?'])
+    family_paths=[p for p in (session/'foreign-native-invocations').glob('*/receipt.json')
+                  if json.loads(p.read_text()).get('context',{}).get('manifest')==str(root)]
+    if CASE=='family_pending':
+        p=next(p for p in family_paths if json.loads(p.read_text())['operation']['class']=='CompilerFamilyHelpProbe');p.unlink()
+    if CASE in ('family_stream','family_label','family_control','family_fd'):
+        p=next(p for p in family_paths if json.loads(p.read_text())['operation']['class']=='CompilerFamilyFileProbe')
+        receipt=json.loads(p.read_text())
+        if CASE=='family_stream':(p.parent/'stdout.raw').write_bytes(b'TEST_CODE_tampered_family_stream')
+        if CASE=='family_label':receipt['source_semantics']['markers']['clang']=True
+        if CASE=='family_control':receipt['controls_pre']['owner_source_sha256']='0'*64
+        if CASE=='family_fd':receipt['jobserver_return']={}
+        if CASE!='family_stream':p.write_text(json.dumps(receipt))
+    env['LC_ALL']='C';env.pop('LC_CTYPE',None)
+    selected=E2_SOURCE_DATA[name] if CASE in ('normal','parallel') else E2_SOURCE_DATA[name][:2 if CASE=='sticky' else 1]
+    def object_call(specification):
+        member,basename=specification;raw=str(root/member) if name=='ring' else member
+        output=out/basename;args=[v.replace('$ROOT',str(root)) for v in E2_PREFIX_DATA[name]]+['-o',str(output),'-c',raw]
+        saved={}
+        if CASE=='template_source':args[-1]=str(root/'build.rs')
+        if CASE=='template_flag':args[0]='-O2'
+        if CASE=='template_order':args[0],args[1]=args[1],args[0]
+        if CASE=='template_prefix':args[-3]=str(out/('0000000000000000-'+basename.split('-',1)[1]))
+        if CASE=='template_suffix':args[-3]=str(output.with_suffix('.a'))
+        if CASE=='template_escape':args[-3]=str(target/basename)
+        if CASE=='template_locale':env['LC_CTYPE']='C.UTF-8'
+        if CASE=='template_fd':env['CARGO_MAKEFLAGS']=f'-j --jobserver-fds={write},{read} --jobserver-auth={write},{read}'
+        if CASE=='template_existing':output.write_bytes(b'TEST_CODE_existing_object')
+        if CASE in ('private_header_pre','private_header_copy_pre'):
+            path=root/'crypto/internal.h'
+            if path.exists():
+                if CASE=='private_header_pre':saved[path]=path.read_bytes()
+                path.chmod(0o644);path.write_bytes(b'TEST_CODE_private_header_pre')
+        if CASE in ('template_hash','template_include','template_helper'):
+            path=(root/member if CASE=='template_hash' else root/'include/TEST_CODE.h' if CASE=='template_include' else session/'vendor/cc/src/target/apple.rs')
+            if path.exists():saved[path]=path.read_bytes();path.chmod(0o644);path.write_bytes(b'TEST_CODE_changed')
+        execute(args)
+        if CASE=='template_duplicate':execute(args)
+        for path,body in saved.items():path.write_bytes(body);path.chmod(0o444)
+    if CASE=='parallel':
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(object_call,selected))
+    else:
+        for specification in selected:object_call(specification)
+    if CASE=='archive':
+        role='AR';execute(['cqD',str(out/'unqualified.a'),str(out/selected[0][1])]);role='CC'
+'''
+E2_CARGO = E1_CARGO.replace("base=dict(os.environ,", "E2_SOURCE_DATA="+repr(E2_SOURCE_DATA)+"\nE2_PREFIX_DATA="+repr(E2_PREFIX_DATA)+"\nbase=dict(os.environ,")
+E2_CARGO = E2_CARGO.replace("execute(['-?']);execute(['--version'])", "execute(['-?'])\n        if CASE!='family_missing':execute(['--version'])")
+E2_CARGO = E2_CARGO.replace("    for path,body in saved.items():path.write_bytes(body);path.chmod(0o444)", E2_COMPILE_CARGO+"\n    for path,body in saved.items():path.write_bytes(body);path.chmod(0o444)")
+E2_CARGO = E2_CARGO.replace("paths=list((session/'foreign-native-invocations').glob('*/receipt.json'))", r'''
+paths=list((session/'foreign-native-invocations').glob('*/receipt.json'))
+object_paths=[p for p in paths if json.loads(p.read_text()).get('operation',{}).get('class')=='CompilerObjectCompile'
+              and json.loads(p.read_text()).get('output_post',{}).get('exists')]
+if CASE in ('object_mutated','object_snapshot_missing','object_request_only'):
+    p=object_paths[0];receipt=json.loads(p.read_text())
+    if CASE=='object_mutated':pathlib.Path(receipt['output_post']['path']).write_bytes(b'TEST_CODE_object_drift')
+    if CASE=='object_snapshot_missing':(p.parent/receipt['output_post']['snapshot']).unlink()
+    if CASE=='object_request_only':p.unlink()
+if CASE in ('private_header_copy_current','private_header_copy_retained','private_header_copy_pre','private_header_copy_request_only'):
+    header=session/'vendor/ring/crypto/internal.h';body=header.read_bytes();retained=hashlib.sha256(body).hexdigest()
+    copy=target/'copied-private-header.bin';copy.write_bytes(body)
+    cc_path=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(session/'vendor/cc/src/lib.rs'))
+    cc=json.loads(cc_path.read_text());ring_paths=[p for p in paths if json.loads(p.read_text()).get('operation',{}).get('class')=='CompilerObjectCompile'
+                                               and json.loads(p.read_text())['context']['package_id'].endswith('#ring@0.17.14')]
+    assert len(ring_paths)==1
+    p=ring_paths[0];receipt=json.loads(p.read_text());member='ring/crypto/internal.h';expected=receipt['compile_input_declaration']['source_sha256'][member]
+    assert receipt['compile_input_declaration']['state']=='DeclaredOnly'
+    if CASE=='private_header_copy_pre':
+        assert receipt['protocol_state']=='ProtocolRefused' and receipt['tool_result'] is None and receipt['failures']==['ForeignCompileSourcePin']
+        assert 'compile_pins_pre' not in receipt and expected!=retained
+        (p.parent/'request.json').write_bytes(b'{TEST_CODE_invalid_pre_private_request')
+    else:
+        assert all(receipt[k]['source_sha256'][member]==retained for k in ('compile_pins_pre','compile_pins_post','compile_pins_return'))
+    if CASE in ('private_header_copy_retained','private_header_copy_request_only'):
+        header.chmod(0o644);header.write_bytes(b'TEST_CODE_private_header_new_current')
+        if CASE=='private_header_copy_retained':(p.parent/'request.json').write_bytes(b'{TEST_CODE_invalid_private_request')
+        else:p.unlink()
+        cc['externs'].append({'name':'private_header_copy','path':str(copy)})
+    else:
+        for o in cc['outputs']:
+            if o['kind']=='dep-info':o['dep_info']['paths'].append(str(copy))
+    cc_path.write_text(json.dumps(cc))
+    (session/'private-header-copy-control.json').write_text(json.dumps({'member':member,'source':str(header),'copy':str(copy),
+        'retained_sha256':retained,'expected_sha256':expected,'body_hex':body.hex(),'operation_id':p.parent.name,
+        'role':'extern' if CASE in ('private_header_copy_retained','private_header_copy_request_only') else 'source'}))
+if CASE.startswith('ownership_object_'):
+    p=object_paths[0];receipt=json.loads(p.read_text());body=(p.parent/receipt['output_post']['snapshot']).read_bytes()
+    copy=target/'copied-object.bin';copy.write_bytes(body)
+    cc_path=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(session/'vendor/cc/src/lib.rs'))
+    cc=json.loads(cc_path.read_text());kind=CASE[len('ownership_object_'):]
+    if kind=='source':
+        for o in cc['outputs']:
+            if o['kind']=='dep-info':o['dep_info']['paths'].append(str(copy))
+    elif kind=='extern':cc['externs'].append({'name':'foreign_object','path':str(copy)})
+    elif kind=='output':cc['declared_outputs'].append({'path':str(copy),'kind':'link'})
+    cc_path.write_text(json.dumps(cc))
+    if kind=='retained':
+        retained=receipt['output_post']['sha256']
+        for q in (session/'foreign-native-invocations').glob('*/*.raw'):
+            if hashlib.sha256(q.read_bytes()).hexdigest()==retained:q.unlink()
+        pathlib.Path(receipt['output_post']['path']).unlink()
+        (p.parent/'request.json').write_bytes(b'{TEST_CODE_bad_request')
+        for o in cc['outputs']:
+            if o['kind']=='dep-info':o['dep_info']['paths'].append(str(copy))
+        cc_path.write_text(json.dumps(cc))
+''')
+
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -4375,6 +4507,391 @@ class RecordingProtocolTests(unittest.TestCase):
                         self.assertNotIn("copied-stream.bin", associations[0]["generated_files"])
                         self.assertEqual(associations[0]["generated_files"]["ordinary.txt"], sha(Path(path).with_name("ordinary.txt")))
                         self.assertNotIn("UnresolvedBuildScriptProducer", record["blockers"])
+
+
+    def prepare_native_e2(self, case="normal"):
+        inventory = self.prepare_native_e1()
+        vendor = self.root / "vendor-origin"
+        for name, rows in E2_SOURCE_DATA.items():
+            for member, _ in rows:write(vendor / name / member, "// TEST_CODE compile input " + member + "\n")
+        write(vendor / "ring/include/TEST_CODE.h", "// TEST_CODE pinned include\n")
+        for member in E2_PRIVATE_HEADER_MEMBERS:write(vendor / member, "// TEST_CODE private header " + member + "\n")
+        for name in ("apple", "llvm", "parser", "generated"):
+            write(vendor / ("cc/src/target/" + name + ".rs"), "// TEST_CODE fixed target helper " + name + "\n")
+        inventory["vendor"] = snapshot(vendor, ["dep", "libsqlite3-sys", "cc", "diesel", "rusqlite", "ring", "psm"])
+        cargo_body = E2_CARGO
+        app_compile = "compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,['--target','x86_64-apple-darwin'])"
+        self.assertEqual(cargo_body.count(app_compile), 1)
+        cargo_body = cargo_body.replace(app_compile, "# TEST_CODE Stage B CompileOnly ends before any application library compile/artifact.")
+        if case == "source_post":
+            legacy_save = "    if CASE=='source_post':saved[root/'Cargo.toml']=(root/'Cargo.toml').read_bytes()"
+            self.assertEqual(cargo_body.count(legacy_save), 1)
+            cargo_body = cargo_body.replace(legacy_save, "    # E2 source_post changes only C inputs; no inherited manifest restoration.")
+        for name, body in (("fake-native-cc", E2_NATIVE), ("fake-cargo", cargo_body.replace("__CASE__", repr(case)))):
+            path = write(self.root / name, "#!" + PYTHON + " -I\n" + body); path.chmod(0o700)
+        inventory["cargo"] = {"path": str(self.root / "fake-cargo"), "sha256": sha(self.root / "fake-cargo")}
+        inventory["generators"]["CC"] = {"path": str(self.root / "fake-native-cc"), "sha256": sha(self.root / "fake-native-cc")}
+        body = self.tool.read_text()
+        # Isolated fake source/tool pins replace only the two fixed map witnesses.
+        for key, value in (("FOREIGN_MAP_RUSTC_SHA256", inventory["rustc"]["sha256"]),
+                           ("FOREIGN_MAP_CC_SHA256", sha(vendor / "cc/src/command_helpers.rs"))):
+            original = key + " = " + json.dumps(getattr(owner, key))
+            self.assertEqual(body.count(original), 1)
+            body = body.replace(original, key + " = " + json.dumps("0" * 64 if case == "template_map" else value))
+        if case == "capture_fault":
+            needle = 'try:dest=open(call/(name+".raw"),"xb")';self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, 'try:\n                if env.get("E1_CASE")=="capture_fault" and "-c" in argv and name=="stderr":raise OSError("TEST_CODE capture")\n                dest=open(call/(name+".raw"),"xb")')
+        if case == "forward_fault":
+            needle = 'written = os.write(1 if stream == "stdout" else 2, view)';self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, 'if compiling:raise OSError("TEST_CODE forward")\n                            ' + needle)
+        if case == "fd_return":
+            needle = 'receipt["tool_result"] = code; receipt["failures"].extend(faults)';self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, needle + '\n        if compiling:os.close(fds[0])')
+        self.tool.write_text(body); inventory["owner_sha256"] = sha(self.tool)
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.BUNDLED_PROFILE, "inventory": inventory}))
+        return inventory
+
+
+    def native_e2_result(self, case="normal"):
+        inventory = self.prepare_native_e2(case)
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(run.returncode, 2, run.stdout.decode(errors="replace") + run.stderr.decode(errors="replace"))
+        record = self.record_result(run); session = Path(json.loads(run.stdout)["record_path"]).parent
+        foreign = json.loads((session / "foreign-native-record.json").read_text())
+        calls = [(p.parent, json.loads(p.read_text())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")]
+        self.assertEqual(record["foreign_native_record_sha256"], sha(session / "foreign-native-record.json"))
+        return inventory, session, record, foreign, calls
+
+
+    def native_e2_private_negative_result(self, case):
+        # This fixed cut observes real negative ownership after the CLI inventory abort.
+        self.assertIn(case, ("source_post", "include_post", "private_header_post",
+                             "private_header_copy_retained", "private_header_copy_pre", "private_header_copy_request_only"))
+        from unittest import mock
+        inventory = self.prepare_native_e2(case)
+        pending_root = self.root / ".replay-build-records"
+        before = set(pending_root.glob("pending-*"))
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(run.returncode, 2, run.stderr.decode(errors="replace"))
+        self.assertEqual(run.stdout, b"")
+        self.assertEqual(json.loads(run.stderr), {"schema": owner.SCHEMA, "state": "RecordingOnly",
+                                                 "reason": "Refused", "detail": "InventoryMismatch"})
+        pending = set(pending_root.glob("pending-*")) - before
+        self.assertEqual(len(pending), 1);session = pending.pop()
+        self.assertFalse((session / "record.json").exists())
+        self.assertFalse((session / "foreign-native-record.json").exists())
+        forwarded = session / "foreign-forwarded.json"
+        self.assertTrue(forwarded.is_file(), (session / "cargo.stderr.raw").read_text(errors="replace"))
+        self.assertEqual({row["name"] for row in json.loads(forwarded.read_bytes())}, {"ring", "psm"})
+        calls = [(p.parent, json.loads(p.read_text())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")]
+        self.assertTrue(calls)
+        with mock.patch.object(owner, "POLICY", self.policy):
+            privateNegativeObservation = owner.foreign_evidence_namespace(session)
+        # The real tuple is never presented as a persisted foreign record or qualification.
+        return inventory, session, calls, privateNegativeObservation
+
+
+    def test_native_e2_fixed_thirty_sources_and_parallel_capture(self):
+        for case in ("normal", "parallel"):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls = self.native_e2_result(case)
+                compiles = [(c, r) for c, r in calls if r.get("operation", {}).get("class") == "CompilerObjectCompile"]
+                self.assertEqual(len(compiles), 30);self.assertEqual(len(calls), 36)
+                self.assertTrue(all(r["protocol_state"] == "Completed" and r["tool_result"] == 0 for _, r in compiles), foreign["blockers"])
+                self.assertEqual({Path(r["context"]["manifest"]).name for _, r in compiles}, {"ring", "psm"})
+                forwarded = json.loads((session / "foreign-forwarded.json").read_text())
+                for call, receipt in compiles:
+                    name = Path(receipt["context"]["manifest"]).name;raw = receipt["operation"]["raw_source"]
+                    member = str(Path(raw).relative_to(session / "vendor/ring")) if name == "ring" else raw
+                    expected = dict(E2_SOURCE_DATA[name])[member]
+                    self.assertEqual(Path(receipt["operation"]["output"]).name, expected)
+                    self.assertEqual(receipt["input_pre"]["sha256"], receipt["input_post"]["sha256"])
+                    self.assertFalse(receipt["output_pre"]["exists"]);self.assertTrue(receipt["output_post"]["exists"])
+                    self.assertEqual((call / "output-post.raw").read_bytes(), Path(receipt["operation"]["output"]).read_bytes())
+                    self.assertEqual(receipt["jobserver_identity"], receipt["jobserver_return"])
+                    self.assertEqual(receipt["family_pre"], receipt["family_return"])
+                    e_id = receipt["family_pre"]["effective_e_operation_id"]
+                    e_call, e_receipt = next((c, r) for c, r in calls if c.name == e_id)
+                    self.assertFalse(Path(e_receipt["operation"]["source"]).exists())
+                    self.assertEqual(next(o for o in foreign["operations"] if o["operation_id"] == e_id)["input_final_state"], "RetiredAfterCcReturn")
+                    evidence = receipt["family_pre"]["evidence"]
+                    self.assertEqual({k: len(v) for k, v in evidence.items()}, {"CompilerFamilyFileProbe": 1, "CompilerFamilyHelpProbe": 1, "CompilerFamilyVersionProbe": 1})
+                    for references in evidence.values():
+                        for reference in references:
+                            directory = session / "foreign-native-invocations" / reference["operation_id"]
+                            for leaf in ("request", "receipt", "stdout", "stderr"):
+                                self.assertEqual(reference[leaf + "_sha256"], sha(directory / (leaf + (".json" if leaf in ("request", "receipt") else ".raw"))))
+                    observed = next(v for v in forwarded if v["args"] == [os.fsdecode(bytes.fromhex(a)) for a in receipt["args_hex"]])
+                    self.assertEqual(observed["stdout_hex"], (call / "stdout.raw").read_bytes().hex())
+                    self.assertEqual(observed["stderr_hex"], (call / "stderr.raw").read_bytes().hex())
+                    self.assertIn(receipt["output_post"]["sha256"], foreign["quarantine"]["sha256"])
+                    if name == "ring":
+                        for member in E2_PRIVATE_HEADER_MEMBERS:
+                            path = session / "vendor" / member;digest = sha(path)
+                            self.assertTrue(all(receipt[k]["source_sha256"][member] == digest for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")))
+                            self.assertIn(str(path), foreign["quarantine"]["paths"])
+                            self.assertIn(digest, foreign["quarantine"]["sha256"])
+                self.assertEqual(foreign["stage"], "StageBIncomplete")
+                self.assertEqual(foreign["unclosed"], ["archive", "builder-run", "consumer"])
+                self.assertFalse(any("ForeignOperation:" in v for v in foreign["blockers"]), foreign["blockers"])
+                self.assertEqual((foreign["native_producer_qualification"], foreign["artifact_selection"]), ("not_issued", "not_observed"))
+                self.assertEqual(record["selected_library"], [])
+
+
+    def test_native_e2_template_locale_pins_and_genuine_family_rejections(self):
+        cases = {"template_source": "ForeignCompileSource", "template_flag": "ForeignCompileArgv",
+                 "template_order": "ForeignCompileArgv", "template_prefix": "ForeignCompileArgv",
+                 "template_suffix": "ForeignCompileArgv", "template_escape": "ForeignCompileArgv",
+                 "template_locale": "ForeignCompileEnvironment", "template_hash": "ForeignCompileSourcePin",
+                 "template_helper": "ForeignCompileSourcePin", "template_map": "ForeignObjectMapBinding",
+                 "template_fd": "Jobserver", "template_existing": "ForeignCompileOwnership",
+                 "family_missing": "ForeignFamilyUnique", "family_duplicate": "ForeignFamilyUnique",
+                 "family_msvc": "ForeignFamilyClang", "family_zig": "ForeignFamilyClang",
+                 "family_stream": "ForeignFamilyStream", "family_label": "ForeignFamilySemantics",
+                 "family_control": "ForeignFamilyControl", "family_fd": "ForeignJobserverChanged",
+                 "family_resurrect": "NativeVersionChanged", "family_pending": "ForeignFamilyPending"}
+        for case, reason in cases.items():
+            with self.subTest(case=case):
+                _, session, _, foreign, calls = self.native_e2_result(case)
+                compiles = [(c, r) for c, r in calls if "-c" in [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]]]
+                self.assertEqual(len(compiles), 2)
+                self.assertTrue(all(r["protocol_state"] == "ProtocolRefused" and r["tool_result"] is None for _, r in compiles))
+                self.assertTrue(all(any(reason in f for f in r["failures"]) for _, r in compiles), [r["failures"] for _, r in compiles])
+                hits = [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]
+                self.assertFalse(any("-c" in h["argv"] for h in hits))
+                self.assertTrue(any("ForeignProtocolSticky" in b for b in foreign["blockers"]))
+
+
+        _, _, _, _, calls = self.native_e2_result("template_include")
+        ring = [r for _, r in calls if "-c" in [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]] and r["context"]["package_id"] == owner.RING_PACKAGE]
+        self.assertEqual(len(ring), 1);self.assertEqual(ring[0]["tool_result"], None)
+        self.assertIn("ForeignCompileSourcePin", ring[0]["failures"])
+
+
+        _, session, _, _, calls = self.native_e2_result("private_header_pre")
+        ring = [(c, r) for c, r in calls if "-c" in [os.fsdecode(bytes.fromhex(a)) for a in r["args_hex"]] and r["context"]["package_id"] == owner.RING_PACKAGE]
+        self.assertEqual(len(ring), 1)
+        self.assertEqual((ring[0][1]["protocol_state"], ring[0][1]["tool_result"], ring[0][1]["failures"]), ("ProtocolRefused", None, ["ForeignCompileSourcePin"]))
+        hits = [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]
+        self.assertFalse(any("-c" in h["argv"] and h["cwd"] == str(session / "vendor/ring") for h in hits))
+
+
+    def test_native_e2_signed_status_partial_objects_and_sticky_faults(self):
+        cases = {"nonzero": (7, "ForeignCompileNonzeroOrMissing"), "signal": (-15, "ForeignCompileNonzeroOrMissing"),
+                 "object_missing": (0, "ForeignCompileObjectMissing"), "source_post": (0, "ForeignInputChanged"),
+                 "capture_fault": (0, "ForeignCaptureSticky"), "forward_fault": (0, "ForeignForward"), "fd_return": (0, "InvalidJobserverDescriptors")}
+        for case, (status, reason) in cases.items():
+            with self.subTest(case=case):
+                if case == "source_post":
+                    _, session, calls, privateNegativeObservation = self.native_e2_private_negative_result(case)
+                    paths, _, hashes, _ = privateNegativeObservation
+                    compiles = [(c, r) for c, r in calls if r.get("operation", {}).get("class") == "CompilerObjectCompile"]
+                    self.assertEqual(len(compiles), 2)
+                    for call, receipt in compiles:
+                        self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]),
+                                         ("ProtocolRefused", 0, ["ForeignInputChanged"]))
+                        request = json.loads((call / "request.json").read_bytes())
+                        self.assertEqual(request["args_hex"], receipt["args_hex"])
+                        for stream in ("stdout", "stderr"):
+                            self.assertEqual((call / (stream + ".raw")).read_bytes(), ("TEST_CODE_compile_" + stream + "\n").encode())
+                            self.assertEqual(sha(call / (stream + ".raw")), receipt[stream + "_sha256"])
+                        for key in ("input_pre", "input_post", "output_post"):
+                            state = receipt[key];snapshot_path = call / state["snapshot"]
+                            self.assertTrue(state["exists"]);self.assertEqual(sha(snapshot_path), state["sha256"])
+                            self.assertIn(state["sha256"], hashes)
+                            copy = session / ("target/source-post-" + call.name + "-" + key + ".bin");copy.write_bytes(snapshot_path.read_bytes())
+                            self.assertNotIn(str(copy), paths)
+                            self.assertTrue(owner.foreign_owned(str(copy), session, paths, hashes))
+                        source = Path(receipt["operation"]["source"])
+                        self.assertEqual(source.read_bytes(), b"X")
+                        self.assertEqual(sha(source), receipt["input_post"]["sha256"])
+                        self.assertNotEqual(receipt["input_pre"]["sha256"], receipt["input_post"]["sha256"])
+                        self.assertIn(str(source), paths)
+                        self.assertEqual(sha(Path(receipt["operation"]["output"])), receipt["output_post"]["sha256"])
+                        self.assertNotIn("compile_pins_post", receipt)
+                    continue
+                _, session, _, foreign, calls = self.native_e2_result(case)
+                compiles = [(c, r) for c, r in calls if r.get("operation", {}).get("class") == "CompilerObjectCompile"]
+                self.assertEqual(len(compiles), 2)
+                for call, receipt in compiles:
+                    self.assertEqual(receipt["tool_result"], status)
+                    self.assertIn(b"TEST_CODE_compile_stdout", (call / "stdout.raw").read_bytes())
+                    if case != "capture_fault":self.assertIn(b"TEST_CODE_compile_stderr", (call / "stderr.raw").read_bytes())
+                    self.assertTrue(any(reason in b for b in [*foreign["blockers"], *receipt["failures"]]), [foreign["blockers"], receipt["failures"]])
+                    if case != "object_missing":
+                        self.assertTrue(receipt["output_post"]["exists"])
+                        self.assertIn(receipt["output_post"]["sha256"], foreign["quarantine"]["sha256"])
+                if status == 0:self.assertTrue(all(r["protocol_state"] == "ProtocolRefused" and r["failures"] for _, r in compiles))
+        _, _, _, foreign, calls = self.native_e2_result("sticky")
+        ring = [r for _, r in calls if r.get("operation", {}).get("class") == "CompilerObjectCompile" and r["context"]["package_id"] == owner.RING_PACKAGE]
+        self.assertEqual(len(ring), 2)
+        self.assertEqual(sum(r["tool_result"] == 7 for r in ring), 1)
+        self.assertEqual(sum(r["tool_result"] is None for r in ring), 1)
+        self.assertTrue(any("ForeignFamilySticky" in f for r in ring for f in r["failures"]))
+
+
+        for case, member in (("include_post", "ring/include/TEST_CODE.h"),
+                             ("private_header_post", "ring/crypto/internal.h")):
+            with self.subTest(case=case):
+                inventory, session, calls, privateNegativeObservation = self.native_e2_private_negative_result(case)
+                paths, _, hashes, _ = privateNegativeObservation
+                ring = [(c, r) for c, r in calls if r.get("operation", {}).get("class") == "CompilerObjectCompile" and r["context"]["package_id"] == owner.RING_PACKAGE]
+                self.assertEqual(len(ring), 1);call, receipt = ring[0]
+                self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]), ("ProtocolRefused", 0, ["ForeignCompileSourcePin"]))
+                request = json.loads((call / "request.json").read_bytes())
+                self.assertEqual(request["args_hex"], receipt["args_hex"])
+                for stream in ("stdout", "stderr"):
+                    self.assertEqual((call / (stream + ".raw")).read_bytes(), ("TEST_CODE_compile_" + stream + "\n").encode())
+                    self.assertEqual(sha(call / (stream + ".raw")), receipt[stream + "_sha256"])
+                for key in ("input_pre", "input_post", "output_post"):
+                    state = receipt[key];self.assertTrue(state["exists"])
+                    self.assertEqual(sha(call / state["snapshot"]), state["sha256"])
+                    self.assertIn(state["sha256"], hashes)
+                self.assertEqual(receipt["input_pre"]["sha256"], receipt["input_post"]["sha256"])
+                self.assertEqual(sha(Path(receipt["operation"]["output"])), receipt["output_post"]["sha256"])
+                self.assertNotIn("compile_pins_post", receipt)
+                self.assertNotIn("compile_pins_return", receipt)
+                header = session / "vendor" / member;expected = inventory["vendor"]["files"][member]
+                self.assertEqual(receipt["compile_pins_pre"]["source_sha256"][member], expected)
+                self.assertEqual(receipt["compile_input_declaration"]["source_sha256"][member], expected)
+                self.assertNotEqual(sha(header), expected)
+                self.assertEqual(header.read_bytes(), b"X" if case == "include_post" else b"TEST_CODE_private_header_post")
+                self.assertIn(str(header), paths)
+                self.assertIn(sha(header), hashes);self.assertIn(expected, hashes)
+                original = self.root / "vendor-origin" / member;self.assertEqual(sha(original), expected)
+                for kind, body in (("current", header.read_bytes()), ("retained", original.read_bytes()),
+                                   ("object", (call / receipt["output_post"]["snapshot"]).read_bytes())):
+                    copy = session / ("target/" + case + "-" + kind + ".bin");copy.write_bytes(body)
+                    self.assertNotIn(str(copy), paths)
+                    self.assertTrue(owner.foreign_owned(str(copy), session, paths, hashes))
+                hits = [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]
+                self.assertEqual(sum("-c" in h["argv"] and h["cwd"] == str(session / "vendor/ring") for h in hits), 1)
+
+
+    def test_native_e2_quarantine_retained_objects_seal_and_archive_refusal(self):
+        for case in ("object_mutated", "object_snapshot_missing", "object_request_only", "template_duplicate", "archive",
+                     "ownership_object_source", "ownership_object_extern", "ownership_object_output", "ownership_object_retained"):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls = self.native_e2_result(case)
+                self.assertEqual(record["selected_library"], [])
+                self.assertEqual((foreign["native_producer_qualification"], foreign["artifact_selection"]), ("not_issued", "not_observed"))
+                if case.startswith("ownership_object_"):
+                    copy = session / "target/copied-object.bin";self.assertTrue(copy.is_file())
+                    self.assertIn(sha(copy), foreign["quarantine"]["sha256"])
+                    self.assertTrue(any("NativeOutputRole" in b for b in record["blockers"]), record["blockers"])
+                    self.assertFalse(any(c["path"] == str(copy) for c in record["consumed_sources"]))
+                    self.assertFalse(any(e["path"] == str(copy) and e["producers"] for e in record["extern_edges"]))
+                    if case.endswith("retained"):
+                        self.assertNotIn(sha(copy), {sha(p) for p in (session / "foreign-native-invocations").glob("*/*.raw")})
+                        self.assertTrue(any("ForeignNamespace" in b for b in foreign["blockers"]))
+                elif case == "archive":
+                    ar = [r for _, r in calls if r["role"] == "ar"]
+                    self.assertEqual(len(ar), 2);self.assertTrue(all(r["protocol_state"] == "ProtocolRefused" and r["tool_result"] is None for r in ar))
+                    self.assertFalse(any(h["argv"][:1] == ["cqD"] for h in [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]))
+                else:self.assertTrue(any("ForeignOperation:" in b for b in foreign["blockers"]))
+                literal = str(session / "vendor" / owner.PROBE_LITERAL)
+                if case == "ownership_object_output":
+                    # A denied declared output rejects the whole cc call before its literal edge.
+                    cc_source = str(session / "vendor/cc/src/lib.rs")
+                    cc_paths = [p for p in (session / "invocations").glob("*/receipt.json") if json.loads(p.read_text()).get("source") == cc_source]
+                    self.assertEqual(len(cc_paths), 1);cc_path = cc_paths[0]
+                    cc = json.loads(cc_path.read_bytes());call_id = cc_path.parent.name
+                    bound = [r for r in record["invocations"] if r["invocation_id"] == call_id]
+                    self.assertEqual(len(bound), 1);self.assertEqual(bound[0]["receipt_sha256"], sha(cc_path))
+                    self.assertIn({"path": str(copy), "kind": "link"}, cc["declared_outputs"])
+                    dep = [o for o in cc["outputs"] if o["kind"] == "dep-info"]
+                    self.assertEqual(len(dep), 1);self.assertIn(literal, dep[0]["dep_info"]["paths"])
+                    dep_path = Path(dep[0]["path"]);self.assertEqual(sha(dep_path), dep[0]["sha256"])
+                    self.assertIn(os.fsencode(literal), dep_path.read_bytes())
+                    self.assertEqual(Path(literal).stat().st_size, 206);self.assertEqual(sha(Path(literal)), owner.PROBE_DIGEST)
+                    self.assertIn("NativeOutputRole:" + call_id, record["blockers"])
+                    self.assertIn("UnresolvedCargoArtifact:" + cc_source, record["blockers"])
+                    self.assertFalse(any(c["path"] == literal for c in record["consumed_sources"]))
+                    self.assertFalse(any(call_id in e["producers"] for e in record["extern_edges"]))
+                    self.assertFalse(any(a["producer_invocation"] == call_id for a in record["build_script_associations"]))
+                    self.assertFalse(any(a["invocation_id"] == call_id for a in record["selected_library"]))
+                else:
+                    self.assertTrue(any(c["path"] == literal for c in record["consumed_sources"]))
+
+
+        for case in ("private_header_copy_current", "private_header_copy_retained", "private_header_copy_pre", "private_header_copy_request_only"):
+            with self.subTest(case=case):
+                if case != "private_header_copy_current":
+                    inventory, session, calls, privateNegativeObservation = self.native_e2_private_negative_result(case)
+                    paths, _, hashes, blockers = privateNegativeObservation
+                    control = json.loads((session / "private-header-copy-control.json").read_text())
+                    copy = Path(control["copy"]);source = Path(control["source"]);retained = control["retained_sha256"]
+                    self.assertEqual(copy.read_bytes().hex(), control["body_hex"]);self.assertEqual(sha(copy), retained)
+                    self.assertNotIn(str(copy), paths);self.assertIn(str(source), paths)
+                    self.assertIn(retained, hashes);self.assertIn(sha(source), hashes)
+                    self.assertTrue(owner.foreign_owned(str(copy), session, paths, hashes))
+                    self.assertEqual(control["expected_sha256"], inventory["vendor"]["files"][control["member"]])
+                    cc_paths = [p for p in (session / "invocations").glob("*/receipt.json") if json.loads(p.read_text()).get("source") == str(session / "vendor/cc/src/lib.rs")]
+                    self.assertEqual(len(cc_paths), 1);cc = json.loads(cc_paths[0].read_text())
+                    if case in ("private_header_copy_retained", "private_header_copy_request_only"):
+                        self.assertEqual(control["role"], "extern")
+                        self.assertEqual([e["path"] for e in cc["externs"] if e["name"] == "private_header_copy"], [str(copy)])
+                        self.assertNotEqual(sha(source), retained)
+                        self.assertNotIn(retained, {sha(p) for p in (session / "foreign-native-invocations").glob("*/*.raw")})
+                        self.assertNotIn(retained, {sha(session / "vendor" / member) for member in E2_PRIVATE_HEADER_MEMBERS})
+                    else:
+                        self.assertEqual(control["role"], "source")
+                        self.assertTrue(any(str(copy) in o["dep_info"]["paths"] for o in cc["outputs"] if o["kind"] == "dep-info"))
+                    call = session / "foreign-native-invocations" / control["operation_id"]
+                    if case == "private_header_copy_request_only":
+                        self.assertFalse((call / "receipt.json").exists())
+                        self.assertFalse(any(r.get("context", {}).get("package_id") == owner.RING_PACKAGE and r.get("operation", {}).get("class") == "CompilerObjectCompile" for _, r in calls))
+                        request = json.loads((call / "request.json").read_bytes())
+                        self.assertEqual((request["schema"], request["state"], request["lane"], request["role"]), (owner.NATIVE_SCHEMA, "RecordingOnly", owner.FOREIGN_LANE, "cc"))
+                        raw = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+                        self.assertEqual(os.fsdecode(bytes.fromhex(request["cwd_hex"])), str(session / "vendor/ring"))
+                        self.assertEqual(raw[-2:], ["-c", str(session / "vendor/ring" / E2_SOURCE_DATA["ring"][0][0])])
+                        output = Path(raw[raw.index("-o") + 1])
+                        self.assertTrue(output.is_file());self.assertIn(str(output), paths);self.assertIn(sha(output), hashes)
+                        # Receipt deletion removes status authority; remaining raw bytes still own copies negatively.
+                        for stream in ("stdout", "stderr"):
+                            raw_path = call / (stream + ".raw")
+                            self.assertEqual(raw_path.read_bytes(), ("TEST_CODE_compile_" + stream + "\n").encode())
+                            self.assertIn(sha(raw_path), hashes)
+                    else:
+                        receipt = next(r for c, r in calls if c == call)
+                        self.assertEqual(receipt["compile_input_declaration"]["state"], "DeclaredOnly")
+                        self.assertEqual(receipt["compile_input_declaration"]["source_sha256"][control["member"]], control["expected_sha256"])
+                        with self.assertRaises(json.JSONDecodeError):json.loads((call / "request.json").read_bytes())
+                        self.assertTrue(any(b.startswith("ForeignNamespace:" + call.name + ":") for b in blockers), blockers)
+                        if case == "private_header_copy_pre":
+                            self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]), ("ProtocolRefused", None, ["ForeignCompileSourcePin"]))
+                            self.assertNotIn("compile_pins_pre", receipt);self.assertNotIn("output_post", receipt)
+                            self.assertNotEqual(control["expected_sha256"], retained)
+                            self.assertIn(control["expected_sha256"], hashes)
+                            hits = [json.loads(p.read_text()) for p in (session / "foreign-entry").iterdir()]
+                            self.assertFalse(any("-c" in h["argv"] and h["cwd"] == str(session / "vendor/ring") for h in hits))
+                        else:
+                            self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]), ("Completed", 0, []))
+                            self.assertTrue(all(receipt[k]["source_sha256"][control["member"]] == retained for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")))
+                            for stream in ("stdout", "stderr"):
+                                raw_path = call / (stream + ".raw")
+                                self.assertEqual(raw_path.read_bytes(), ("TEST_CODE_compile_" + stream + "\n").encode())
+                                self.assertEqual(sha(raw_path), receipt[stream + "_sha256"])
+                            self.assertTrue(receipt["output_post"]["exists"])
+                            self.assertEqual(sha(call / receipt["output_post"]["snapshot"]), receipt["output_post"]["sha256"])
+                            self.assertIn(receipt["output_post"]["sha256"], hashes)
+                    continue
+                _, session, record, foreign, calls = self.native_e2_result(case)
+                control = json.loads((session / "private-header-copy-control.json").read_text())
+                copy = Path(control["copy"]);source = Path(control["source"]);retained = control["retained_sha256"]
+                self.assertEqual(copy.read_bytes().hex(), control["body_hex"]);self.assertEqual(sha(copy), retained)
+                self.assertNotIn(str(copy), foreign["quarantine"]["paths"])
+                self.assertIn(str(source), foreign["quarantine"]["paths"])
+                self.assertIn(retained, foreign["quarantine"]["sha256"])
+                self.assertIn("NativeOutputRole:" + str(copy), record["blockers"])
+                self.assertFalse(any(c["path"] == str(copy) for c in record["consumed_sources"]))
+                self.assertFalse(any(e["path"] == str(copy) and e["producers"] for e in record["extern_edges"]))
+                self.assertEqual(record["selected_library"], [])
+                literal = str(session / "vendor" / owner.PROBE_LITERAL)
+                self.assertTrue(any(c["path"] == literal for c in record["consumed_sources"]))
 
 
     def test_finite_argument_and_dep_info_parsers(self):
