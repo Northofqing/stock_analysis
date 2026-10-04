@@ -812,7 +812,25 @@ pub(super) mod original_native {
     enum AutocommitObservation { NotObserved, Observed(i32) }
     #[repr(u8)]
     enum RollbackObservation { NotReached, Reached }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BatchPhase { Dormant, Prepare, Step, Primary, Finalize, PaidFinalize, AwaitReturn, Finished }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BatchReturn { Unobserved, ReturnedOk, ReturnedError }
+    struct FixedBatchRecord {
+        phase: BatchPhase,
+        prepare: CodeSlot,
+        returned: BatchReturn,
+    }
+    impl FixedBatchRecord {
+        fn empty() -> Self { Self { phase: BatchPhase::Dormant, prepare: CodeSlot::NotCalled, returned: BatchReturn::Unobserved } }
+    }
     struct TxRecord {
+        // Saved consumed scalar ledgers, never additional live VM slots.
+        a00_consumed: Option<StmtState>,
+        begin_consumed: Option<StmtState>,
+        begin: FixedBatchRecord,
+        rollback_batch: FixedBatchRecord,
+        ignored_rollback: Option<SourceOperationError>,
         phase: TxPhase,
         exit: TxExit,
         autocommit: AutocommitObservation,
@@ -851,6 +869,9 @@ pub(super) mod original_native {
                 statement_phase: StatementPhase::Empty,
                 a00: A00Record::empty(),
                 tx: TxRecord {
+                    a00_consumed: None, begin_consumed: None,
+                    begin: FixedBatchRecord::empty(), rollback_batch: FixedBatchRecord::empty(),
+                    ignored_rollback: None,
                     phase: TxPhase::NotCreated,
                     exit: TxExit::NotSelected,
                     autocommit: AutocommitObservation::NotObserved,
@@ -905,6 +926,10 @@ pub(super) mod original_native {
         RetainPaidPrimary, DiscardPaidReset, DiscardPaidFinalize,
         ResetA00, FinalizeA00, A00Complete, ConstructorClose, OriginalClose,
         Quiescent, FatalBorrow, FinishSidecarAcquisition, DrainSidecarLocals, FinishAuditAcquisition, DrainAuditResources,
+        PrepareBegin, StepBegin, FinalizeBegin, RetainTransactionPrimary,
+        DiscardBatchFinalize, AwaitBatchReturn, CancelUnissuedBegin, ConsumeKnownBatchReturn,
+        ConsumeEarlyTransaction, ObserveAutocommit, PrepareRollback, StepRollback,
+        FinalizeRollback, RetainIgnoredRollback, DiscardIgnoredRollback,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1019,6 +1044,7 @@ pub(super) mod original_native {
         // Both ports and settlement consult this same barrier. Terminal drain
         // deliberately bypasses it and never requests an owned error.
         fn pending_normal_action(&self) -> Option<LifecycleAction> {
+            if let Some(action) = self.fields.native.transaction_action(&self.fields.work) { return Some(action); }
             if self.fields.physical.audit_pending() {
                 return Some(if self.fields.physical.primary.is_some() { LifecycleAction::DrainAuditResources }
                     else { LifecycleAction::FinishAuditAcquisition });
@@ -1058,6 +1084,7 @@ pub(super) mod original_native {
             }
         }
         fn drain_action(&self) -> LifecycleAction {
+            if let Some(action) = self.fields.native.transaction_action(&self.fields.work) { return action; }
             if self.fields.physical.audit_pending() { return LifecycleAction::DrainAuditResources; }
             if self.fields.physical.sidecar_locals_pending() { return LifecycleAction::DrainSidecarLocals; }
             if let Some(state) = self.fields.native.statements[0].live() {
@@ -1144,7 +1171,8 @@ pub(super) mod original_native {
             Ok(())
         }
         fn settle(self) -> AcquisitionSettlement<'a> {
-            if (self.terminal().is_none() && self.pending_normal_action().is_some())
+            if self.fields.native.transaction_action(&self.fields.work).is_some()
+                || (self.terminal().is_none() && self.pending_normal_action().is_some())
                 || self.fields.physical.blocks_original_close()
                 || self.fields.native.original.phase().is_some()
                 || !matches!(&self.fields.native.aux, AuxPlace::Empty)
@@ -1659,6 +1687,476 @@ pub(super) mod original_native {
             assert!(loan.primary.is_none());
             assert_eq!(loan.fields.work.test_code_observation(), before);
             assert!(matches!(loan.fields.native.original.status().unwrap().close_second, CodeSlot::NotCalled));
+        }
+    }
+
+    // Fixed batch lifecycle only. execute_batch has no reset call: its VM
+    // goes directly to Statement::Drop/finalize, whose owned Result is ignored.
+    // Neither DONE nor finalize/cleanup can construct a Transaction. Only the
+    // independent whole-batch return observation can do that.
+    const BEGIN_SQL: &str = "BEGIN IMMEDIATE";
+    const ROLLBACK_SQL: &str = "ROLLBACK";
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BatchKind { Begin, Rollback }
+    enum BatchObservation { Prepare(i32), Step(i32), Finalize(i32) }
+    // Private status, not a caller Result, native-effect flag or qualification.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BatchReturnedFact { Ok, Error }
+    pub(in crate::database::global_schema_v1) struct OriginalTransactionLoan<'a> {
+        fields: OriginalOwnerFields<'a>,
+    }
+    struct OriginalBeginPort<'s, 'a> { loan: &'s mut OriginalTransactionLoan<'a> }
+    struct OriginalEarlyTransactionExitPort<'s, 'a> { loan: &'s mut OriginalTransactionLoan<'a> }
+    // Future genuine adapters alone possess this unissued rules borrow. Fixed
+    // cfg scripts call the shared core explicitly as protocol observations.
+    struct OriginalBatchReturnPort<'s, 'a, 'r> {
+        loan: &'s mut OriginalTransactionLoan<'a>,
+        kind: BatchKind,
+        _rules: &'r SelectedOriginalNativeRules,
+    }
+    impl OriginalBatchReturnPort<'_, '_, '_> {
+        fn retain_return(&mut self, fact: BatchReturnedFact) -> Result<(), ProtocolFault> {
+            self.loan.retain_batch_return(self.kind, fact)
+        }
+    }
+    impl NativeOriginalOwner {
+        fn batch(&self, kind: BatchKind) -> &FixedBatchRecord {
+            match kind { BatchKind::Begin => &self.tx.begin, BatchKind::Rollback => &self.tx.rollback_batch }
+        }
+        fn batch_mut(&mut self, kind: BatchKind) -> &mut FixedBatchRecord {
+            match kind { BatchKind::Begin => &mut self.tx.begin, BatchKind::Rollback => &mut self.tx.rollback_batch }
+        }
+        fn batch_action(&self, kind: BatchKind, terminal: bool) -> Option<LifecycleAction> {
+            let batch = self.batch(kind);
+            if matches!(batch.phase, BatchPhase::Dormant | BatchPhase::Finished) { return None; }
+            if terminal {
+                // A returned rollback VM is installed before its prepare
+                // observation; that fact must precede the live-VM drain cut.
+                if kind == BatchKind::Rollback && batch.phase == BatchPhase::Prepare { return Some(LifecycleAction::PrepareRollback); }
+                if kind == BatchKind::Rollback && batch.phase == BatchPhase::Step { return Some(LifecycleAction::StepRollback); }
+                if self.statements[0].live().is_some() { return Some(match kind {
+                    BatchKind::Begin => LifecycleAction::FinalizeBegin, BatchKind::Rollback => LifecycleAction::FinalizeRollback,
+                }); }
+                if kind == BatchKind::Begin && batch.phase == BatchPhase::Prepare
+                    && matches!(batch.prepare, CodeSlot::NotCalled) { return Some(LifecycleAction::CancelUnissuedBegin); }
+                if batch.returned == BatchReturn::ReturnedError && batch.phase == BatchPhase::Primary {
+                    return Some(LifecycleAction::ConsumeKnownBatchReturn);
+                }
+                // Rollback is cleanup of an already-created transaction. It is
+                // permitted after terminal; a fresh BEGIN/step never is.
+                return Some(LifecycleAction::AwaitBatchReturn);
+            }
+            Some(match (kind, batch.phase) {
+                (BatchKind::Begin, BatchPhase::Prepare) => LifecycleAction::PrepareBegin,
+                (BatchKind::Rollback, BatchPhase::Prepare) => LifecycleAction::PrepareRollback,
+                (BatchKind::Begin, BatchPhase::Step) => LifecycleAction::StepBegin,
+                (BatchKind::Rollback, BatchPhase::Step) => LifecycleAction::StepRollback,
+                (BatchKind::Begin, BatchPhase::Primary) => LifecycleAction::RetainTransactionPrimary,
+                (BatchKind::Rollback, BatchPhase::Primary) => LifecycleAction::RetainIgnoredRollback,
+                (BatchKind::Begin, BatchPhase::Finalize) => LifecycleAction::FinalizeBegin,
+                (BatchKind::Rollback, BatchPhase::Finalize) => LifecycleAction::FinalizeRollback,
+                (_, BatchPhase::PaidFinalize) => LifecycleAction::DiscardBatchFinalize,
+                (_, BatchPhase::AwaitReturn) => LifecycleAction::AwaitBatchReturn,
+                (_, BatchPhase::Dormant | BatchPhase::Finished) => return None,
+            })
+        }
+        fn transaction_action(&self, work: &OriginalSourceWork<'_>) -> Option<LifecycleAction> {
+            let terminal = work.terminal().is_some();
+            if let Some(action) = self.batch_action(BatchKind::Begin, terminal) { return Some(action); }
+            match self.tx.phase {
+                TxPhase::NotCreated | TxPhase::Finished => None,
+                TxPhase::Active => Some(LifecycleAction::ConsumeEarlyTransaction),
+                TxPhase::Consuming => {
+                    if matches!(self.tx.autocommit, AutocommitObservation::NotObserved) { return Some(LifecycleAction::ObserveAutocommit); }
+                    if let Some(action) = self.batch_action(BatchKind::Rollback, terminal) { return Some(action); }
+                    if self.tx.ignored_rollback.is_some() { Some(LifecycleAction::DiscardIgnoredRollback) }
+                    else { None }
+                }
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn transaction_release_ready(&self, work: &OriginalSourceWork<'_>) -> bool {
+            self.transaction_action(work).is_none()
+                && matches!(self.tx.phase, TxPhase::NotCreated | TxPhase::Finished)
+                && self.statements.iter().all(|slot| slot.live().is_none())
+        }
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn original_transaction(self) -> OriginalTransactionLoan<'a> {
+            OriginalTransactionLoan { fields: self }
+        }
+    }
+    impl<'a> OriginalTransactionLoan<'a> {
+        pub(in crate::database::global_schema_v1) fn begin(&mut self) -> bool {
+            let n = &mut self.fields.native;
+            if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
+                || !self.fields.physical.parent_sidecars_retained()
+                || self.fields.physical.audit_phase != super::super::super::FinancialAuditPhase::Ready
+                || !n.audit_acquisition_ready() || n.tx.begin.phase != BatchPhase::Dormant { return false; }
+            let StmtSlot::Finalized(state) = &n.statements[0] else { return false; };
+            if state.action != FixedAction::MaterializeCount || state.cursor != CursorPhase::NoCursor
+                || !matches!(state.finalize, CodeSlot::Called(_)) { return false; }
+            n.tx.a00_consumed = Some(*state);
+            n.statements[0] = StmtSlot::Vacant;
+            n.tx.begin.phase = BatchPhase::Prepare;
+            true
+        }
+        fn begin_port(&mut self) -> OriginalBeginPort<'_, 'a> { OriginalBeginPort { loan: self } }
+        fn early_exit_port(&mut self) -> OriginalEarlyTransactionExitPort<'_, 'a> { OriginalEarlyTransactionExitPort { loan: self } }
+        fn batch_return_port<'s, 'r>(&'s mut self, kind: BatchKind, rules: &'r SelectedOriginalNativeRules)
+            -> OriginalBatchReturnPort<'s, 'a, 'r> {
+            OriginalBatchReturnPort { loan: self, kind, _rules: rules }
+        }
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.transaction_action(&self.fields.work) }
+        fn adverse(&mut self, action: FixedAction, code: i32) {
+            if code == rusqlite::ffi::SQLITE_OK { return; }
+            if self.fields.native.secondary.is_none() {
+                self.fields.native.secondary = Some(FixedAdverse { role: Role::Original, action, ordinal: 0, code });
+            }
+            if self.fields.release.first_secondary.is_none() {
+                self.fields.release.first_secondary = Some(FixedAdverse { role: Role::Original, action, ordinal: 0, code });
+            }
+        }
+        fn observe_batch(&mut self, kind: BatchKind, event: BatchObservation) -> Result<(), ProtocolFault> {
+            let action = match kind { BatchKind::Begin => FixedAction::Begin, BatchKind::Rollback => FixedAction::Rollback };
+            let expected = match (&event, kind) {
+                (BatchObservation::Prepare(_), BatchKind::Begin) => LifecycleAction::PrepareBegin,
+                (BatchObservation::Prepare(_), BatchKind::Rollback) => LifecycleAction::PrepareRollback,
+                (BatchObservation::Step(_), BatchKind::Begin) => LifecycleAction::StepBegin,
+                (BatchObservation::Step(_), BatchKind::Rollback) => LifecycleAction::StepRollback,
+                (BatchObservation::Finalize(_), BatchKind::Begin) => LifecycleAction::FinalizeBegin,
+                (BatchObservation::Finalize(_), BatchKind::Rollback) => LifecycleAction::FinalizeRollback,
+            };
+            if self.next() != Some(expected) { return Err(ProtocolFault::UnexpectedObservation); }
+            let terminal = self.fields.work.terminal().is_some();
+            match event {
+                BatchObservation::Prepare(code) => {
+                    let state = self.fields.native.statements[0].live();
+                    if code == rusqlite::ffi::SQLITE_OK {
+                        let state = state.ok_or(ProtocolFault::ResourceNotInstalled)?;
+                        if state.action != action || state.role != Role::Original || state.cursor != CursorPhase::NoCursor {
+                            return Err(ProtocolFault::UnexpectedObservation);
+                        }
+                    } else if state.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+                    record_once(&mut self.fields.native.batch_mut(kind).prepare, code)?;
+                    if kind == BatchKind::Rollback { self.fields.native.tx.rollback = RollbackObservation::Reached; }
+                    if code == rusqlite::ffi::SQLITE_OK { self.fields.native.statement_phase = StatementPhase::Single; }
+                    self.fields.native.batch_mut(kind).phase = if code == rusqlite::ffi::SQLITE_OK { BatchPhase::Step }
+                        else if terminal { BatchPhase::AwaitReturn } else { BatchPhase::Primary };
+                    if code != rusqlite::ffi::SQLITE_OK { self.adverse(action, code); }
+                }
+                BatchObservation::Step(code) => {
+                    let state = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                    if state.action != action { return Err(ProtocolFault::UnexpectedObservation); }
+                    record_once(&mut state.step, code)?;
+                    state.cursor = if code == rusqlite::ffi::SQLITE_DONE { CursorPhase::Ended } else { CursorPhase::Active };
+                    let failed = code != rusqlite::ffi::SQLITE_DONE && code != rusqlite::ffi::SQLITE_ROW;
+                    self.fields.native.batch_mut(kind).phase = if failed && !terminal { BatchPhase::Primary } else { BatchPhase::Finalize };
+                    if failed { self.adverse(action, code); }
+                }
+                BatchObservation::Finalize(code) => {
+                    let mut state = *self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                    if state.action != action { return Err(ProtocolFault::UnexpectedObservation); }
+                    record_once(&mut state.finalize, code)?;
+                    state.cursor = CursorPhase::NoCursor;
+                    self.fields.native.statements[0] = StmtSlot::Finalized(state);
+                    if kind == BatchKind::Begin { self.fields.native.tx.begin_consumed = Some(state); }
+                    self.fields.native.statement_phase = StatementPhase::Empty;
+                    self.fields.native.batch_mut(kind).phase = if code != rusqlite::ffi::SQLITE_OK && !terminal { BatchPhase::PaidFinalize }
+                        else { BatchPhase::AwaitReturn };
+                    self.adverse(action, code);
+                }
+            }
+            Ok(())
+        }
+        fn retain_paid_primary(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
+            if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
+                || self.next() != Some(LifecycleAction::RetainTransactionPrimary) { return Err(error); }
+            self.fields.physical.primary = Some(error);
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            self.after_paid_primary(BatchKind::Begin);
+            Ok(())
+        }
+        fn retain_ignored_rollback(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
+            if self.fields.work.terminal().is_some() || self.fields.native.tx.ignored_rollback.is_some()
+                || self.next() != Some(LifecycleAction::RetainIgnoredRollback) { return Err(error); }
+            self.fields.native.tx.ignored_rollback = Some(error);
+            self.after_paid_primary(BatchKind::Rollback);
+            Ok(())
+        }
+        fn after_paid_primary(&mut self, kind: BatchKind) {
+            let phase = if self.fields.native.statements[0].live().is_some() { BatchPhase::Finalize }
+                else if self.fields.native.batch(kind).returned == BatchReturn::Unobserved { BatchPhase::AwaitReturn }
+                else { BatchPhase::Finished };
+            self.fields.native.batch_mut(kind).phase = phase;
+        }
+        fn discard_paid_finalize(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
+            if self.fields.work.terminal().is_some() || self.next() != Some(LifecycleAction::DiscardBatchFinalize) { return Err(error); }
+            let kind = if self.fields.native.tx.begin.phase == BatchPhase::PaidFinalize { BatchKind::Begin } else { BatchKind::Rollback };
+            drop(error); self.fields.native.batch_mut(kind).phase = BatchPhase::AwaitReturn; Ok(())
+        }
+        fn retain_batch_return(&mut self, kind: BatchKind, fact: BatchReturnedFact) -> Result<(), ProtocolFault> {
+            // This observes the already-completed driver call. No tail query,
+            // step, error factory or native action is performed by this cut.
+            if self.next() != Some(LifecycleAction::AwaitBatchReturn) || self.fields.native.statements[0].live().is_some()
+                || self.fields.native.batch(kind).returned != BatchReturn::Unobserved { return Err(ProtocolFault::UnexpectedObservation); }
+            let terminal = self.fields.work.terminal().is_some();
+            let n = &mut self.fields.native;
+            if (kind == BatchKind::Begin && n.tx.begin.phase == BatchPhase::Finished)
+                || (kind == BatchKind::Rollback && !matches!(n.tx.phase, TxPhase::Consuming)) { return Err(ProtocolFault::UnexpectedObservation); }
+            if fact == BatchReturnedFact::Ok {
+                if !matches!(n.batch(kind).prepare, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)) { return Err(ProtocolFault::UnexpectedObservation); }
+                let state = match &n.statements[0] { StmtSlot::Finalized(state) => state, _ => return Err(ProtocolFault::ResourceNotInstalled) };
+                let action = if kind == BatchKind::Begin { FixedAction::Begin } else { FixedAction::Rollback };
+                if state.action != action || !matches!(state.step, CodeSlot::Called(rusqlite::ffi::SQLITE_DONE | rusqlite::ffi::SQLITE_ROW)) {
+                    return Err(ProtocolFault::UnexpectedObservation);
+                }
+            }
+            n.batch_mut(kind).returned = if fact == BatchReturnedFact::Ok { BatchReturn::ReturnedOk } else { BatchReturn::ReturnedError };
+            let unpaid = fact == BatchReturnedFact::Error && !terminal && match kind {
+                BatchKind::Begin => self.fields.physical.primary.is_none(), BatchKind::Rollback => n.tx.ignored_rollback.is_none(),
+            };
+            n.batch_mut(kind).phase = if unpaid { BatchPhase::Primary } else { BatchPhase::Finished };
+            match kind {
+                BatchKind::Begin => n.tx.phase = if fact == BatchReturnedFact::Ok { TxPhase::Active } else { TxPhase::NotCreated },
+                BatchKind::Rollback => if n.tx.ignored_rollback.is_none() && !unpaid { n.tx.phase = TxPhase::Finished; },
+            }
+            Ok(())
+        }
+        fn consume_known_return(&mut self) -> Result<(), ProtocolFault> {
+            // First terminal consumes only an already-retained return fact.
+            // No observation is repeated and no unpaid error is constructed.
+            if self.next() != Some(LifecycleAction::ConsumeKnownBatchReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let kind = if self.fields.native.tx.begin.phase == BatchPhase::Primary { BatchKind::Begin } else { BatchKind::Rollback };
+            self.fields.native.batch_mut(kind).phase = BatchPhase::Finished;
+            if kind == BatchKind::Begin { self.fields.native.tx.phase = TxPhase::NotCreated; }
+            else if self.fields.native.tx.ignored_rollback.is_none() { self.fields.native.tx.phase = TxPhase::Finished; }
+            Ok(())
+        }
+        fn cancel_unissued_begin(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CancelUnissuedBegin) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.tx.begin.phase = BatchPhase::Finished;
+            self.fields.native.tx.phase = TxPhase::NotCreated; Ok(())
+        }
+        fn start_early_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ConsumeEarlyTransaction)
+                || (self.fields.work.terminal().is_none() && self.fields.physical.primary.is_none()) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.tx.phase = TxPhase::Consuming; self.fields.native.tx.exit = TxExit::EarlyError; Ok(())
+        }
+        fn retain_early_primary(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
+            if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
+                || self.next() != Some(LifecycleAction::ConsumeEarlyTransaction) { return Err(error); }
+            self.fields.physical.primary = Some(error);
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            Ok(())
+        }
+        fn observe_autocommit(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ObserveAutocommit) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.tx.autocommit = AutocommitObservation::Observed(code);
+            if code != 0 { self.fields.native.tx.phase = TxPhase::Finished; }
+            else {
+                // The old VM is consumed; preserve its scalar BEGIN ledger.
+                self.fields.native.statements[0] = StmtSlot::Vacant;
+                self.fields.native.tx.rollback_batch.phase = BatchPhase::Prepare;
+            }
+            Ok(())
+        }
+        fn discard_ignored_rollback(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIgnoredRollback) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.fields.native.tx.ignored_rollback.take());
+            self.fields.native.tx.phase = TxPhase::Finished; Ok(())
+        }
+    }
+    impl OriginalBeginPort<'_, '_> {
+        fn sql(&self) -> &'static str { BEGIN_SQL }
+        fn observe(&mut self, event: BatchObservation) -> Result<(), ProtocolFault> { self.loan.observe_batch(BatchKind::Begin, event) }
+    }
+    impl OriginalEarlyTransactionExitPort<'_, '_> {
+        fn sql(&self) -> &'static str { ROLLBACK_SQL }
+        fn observe(&mut self, event: BatchObservation) -> Result<(), ProtocolFault> { self.loan.observe_batch(BatchKind::Rollback, event) }
+    }
+
+    // Fixed protocol scripts only: no pointer, FFI, tail execution or issuer.
+    // A returned-Ok script is an independent observation of a completed call,
+    // never a DONE/finalize-to-Active inference or provider success assertion.
+    #[cfg(test)]
+    impl OriginalTransactionLoan<'_> {
+        fn fixed_install_batch(&mut self, kind: BatchKind) {
+            assert!(matches!(&self.fields.native.statements[0], StmtSlot::Vacant));
+            self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState {
+                action: if kind == BatchKind::Begin { FixedAction::Begin } else { FixedAction::Rollback },
+                ..protocol_stmt_state()
+            });
+            self.observe_batch(kind, BatchObservation::Prepare(rusqlite::ffi::SQLITE_OK)).unwrap();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_assert_transaction_barrier(&mut self) {
+            assert!(self.next().is_some());
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work));
+            let before = self.fields.work.test_code_observation();
+            let expected = self.next().unwrap();
+            let mut old = self.fields.reborrow().original_acquisition();
+            assert_eq!(old.constructor().next(), expected); assert_eq!(old.a00_epilogue().next(), expected);
+            assert_eq!(old.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(old.a00_epilogue().observe(A00Observation::Finalize(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            let AcquisitionSettlement::Held(old) = old.settle() else { panic!("transaction/VM/payment must hold whole frame"); };
+            assert!(old.primary.is_none()); assert_eq!(old.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_failure_cut(&mut self, case: super::super::super::FinancialBeginFailureCase) {
+            use super::super::super::FinancialBeginFailureCase as Case;
+            assert_eq!(self.begin_port().sql(), "BEGIN IMMEDIATE");
+            match case {
+                Case::Prepare => self.begin_port().observe(BatchObservation::Prepare(rusqlite::ffi::SQLITE_ERROR)).unwrap(),
+                Case::Step | Case::Tail => {
+                    self.fixed_install_batch(BatchKind::Begin);
+                    self.begin_port().observe(BatchObservation::Step(if matches!(case, Case::Step) { rusqlite::ffi::SQLITE_ERROR } else { rusqlite::ffi::SQLITE_DONE })).unwrap();
+                    if matches!(case, Case::Tail) {
+                        self.begin_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_OK)).unwrap();
+                        self.retain_batch_return(BatchKind::Begin, BatchReturnedFact::Error).unwrap();
+                    }
+                }
+            }
+            assert_eq!(self.next(), Some(LifecycleAction::RetainTransactionPrimary));
+            self.test_code_assert_transaction_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_failure_primary(&mut self, primary: SourceOperationError, spare: SourceOperationError) {
+            let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &spare else { panic!("fixed spare"); };
+            let spare_allocation = detail.as_ptr() as usize;
+            self.retain_paid_primary(primary).unwrap_or_else(|_| panic!("first G primary"));
+            let Err(spare) = self.retain_paid_primary(spare) else { panic!("second G primary must be returned unchanged"); };
+            let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &spare else { panic!("same spare"); };
+            assert_eq!(detail.as_ptr() as usize, spare_allocation); drop(spare);
+            { let _short = self.begin_port(); }
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_failed_begin(&mut self, cleanup: SourceOperationError) {
+            if self.fields.native.statements[0].live().is_some() {
+                self.begin_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+                assert!(matches!(&self.fields.native.statements[0], StmtSlot::Finalized(_)));
+                self.test_code_assert_transaction_barrier();
+                assert_eq!(self.begin_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+                self.discard_paid_finalize(cleanup).unwrap_or_else(|_| panic!("paid ignored finalize"));
+            } else { drop(cleanup); }
+            if self.fields.native.tx.begin.returned == BatchReturn::Unobserved {
+                self.test_code_assert_transaction_barrier();
+                self.retain_batch_return(BatchKind::Begin, BatchReturnedFact::Error).unwrap();
+            }
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::NotCreated));
+            assert!(matches!(self.fields.native.tx.autocommit, AutocommitObservation::NotObserved));
+            assert!(matches!(self.fields.native.tx.rollback, RollbackObservation::NotReached));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            self.assert_a00_saved();
+        }
+        fn assert_a00_saved(&self) {
+            let saved = self.fields.native.tx.a00_consumed.as_ref().unwrap();
+            assert_eq!(saved.action, FixedAction::MaterializeCount);
+            assert!(matches!(saved.step, CodeSlot::Called(rusqlite::ffi::SQLITE_ROW)));
+            assert!(matches!(saved.reset, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)));
+            assert!(matches!(saved.finalize, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_done_batch(&mut self) {
+            self.fixed_install_batch(BatchKind::Begin);
+            self.begin_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_DONE)).unwrap();
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::NotCreated));
+            self.begin_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            assert!(matches!(&self.fields.native.statements[0], StmtSlot::Finalized(_)));
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::NotCreated));
+            self.test_code_assert_transaction_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_paid_finalize_then_wait(&mut self, cleanup: SourceOperationError) {
+            self.discard_paid_finalize(cleanup).unwrap_or_else(|_| panic!("paid before batch return"));
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitBatchReturn));
+            self.test_code_assert_transaction_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_observe_fixed_return_ok(&mut self) {
+            self.retain_batch_return(BatchKind::Begin, BatchReturnedFact::Ok).unwrap();
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::Active)); self.assert_a00_saved();
+            assert!(self.fields.native.tx.begin_consumed.is_some());
+            assert_eq!(self.retain_batch_return(BatchKind::Begin, BatchReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+            self.test_code_assert_transaction_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_normal_early_primary(&mut self, primary: SourceOperationError, spare: SourceOperationError) {
+            let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &spare else { panic!("fixed spare"); };
+            let spare_allocation = detail.as_ptr() as usize;
+            self.retain_early_primary(primary).unwrap_or_else(|_| panic!("single early G primary"));
+            let Err(spare) = self.retain_early_primary(spare) else { panic!("second G primary must be returned unchanged"); };
+            let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &spare else { panic!("same spare"); };
+            assert_eq!(detail.as_ptr() as usize, spare_allocation); drop(spare);
+            self.start_early_error().unwrap();
+            assert_eq!(self.start_early_error(), Err(ProtocolFault::UnexpectedObservation));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_autocommit_one(&mut self) {
+            self.observe_autocommit(1).unwrap();
+            assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::Finished));
+            assert!(matches!(self.fields.native.tx.rollback, RollbackObservation::NotReached));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_normal_rollback_error(&mut self, ignored: SourceOperationError, cleanup: SourceOperationError) {
+            let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &ignored else { panic!("fixed owned ignored result"); };
+            let allocation = detail.as_ptr() as usize;
+            self.observe_autocommit(0).unwrap(); assert_eq!(self.early_exit_port().sql(), "ROLLBACK");
+            self.fixed_install_batch(BatchKind::Rollback);
+            self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            self.test_code_assert_transaction_barrier();
+            self.retain_ignored_rollback(ignored).unwrap_or_else(|_| panic!("owned ignored result held in same frame"));
+            { let _short = self.early_exit_port(); }
+            let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &self.fields.native.tx.ignored_rollback else { panic!("retained ignored result"); };
+            assert_eq!(detail.as_ptr() as usize, allocation);
+            self.early_exit_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            self.test_code_assert_transaction_barrier();
+            self.discard_paid_finalize(cleanup).unwrap_or_else(|_| panic!("ignored finalize paid once"));
+            self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error).unwrap();
+            self.test_code_assert_transaction_barrier();
+            self.discard_ignored_rollback().unwrap();
+            assert_eq!(self.discard_ignored_rollback(), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_rollback_tail_error(&mut self) {
+            self.observe_autocommit(0).unwrap(); self.fixed_install_batch(BatchKind::Rollback);
+            self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_DONE)).unwrap();
+            self.early_exit_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_OK)).unwrap();
+            self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::RetainIgnoredRollback));
+            assert!(self.fields.native.tx.ignored_rollback.is_none()); self.test_code_assert_transaction_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_consume_known_error_at_terminal(&mut self) {
+            let before = self.fields.work.test_code_observation();
+            assert!(before.terminal.is_some()); assert_eq!(self.next(), Some(LifecycleAction::ConsumeKnownBatchReturn));
+            self.test_code_assert_transaction_barrier();
+            assert_eq!(self.retain_batch_return(BatchKind::Begin, BatchReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+            self.consume_known_return().unwrap();
+            assert_eq!(self.consume_known_return(), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.tx.ignored_rollback.is_none());
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_terminal_exit(&mut self) {
+            assert!(self.fields.work.terminal().is_some()); assert!(self.fields.physical.primary.is_none());
+            let before = self.fields.work.test_code_observation();
+            self.start_early_error().unwrap(); self.observe_autocommit(0).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::PrepareRollback)); self.test_code_assert_transaction_barrier();
+            self.fixed_install_batch(BatchKind::Rollback);
+            assert_eq!(self.next(), Some(LifecycleAction::StepRollback)); self.test_code_assert_transaction_barrier();
+            assert_eq!(self.early_exit_port().observe(BatchObservation::Prepare(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            { let _short = self.early_exit_port(); }
+            self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::FinalizeRollback)); self.test_code_assert_transaction_barrier();
+            assert_eq!(self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_DONE)), Err(ProtocolFault::UnexpectedObservation));
+            self.early_exit_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            assert_eq!(self.early_exit_port().observe(BatchObservation::Finalize(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            self.test_code_assert_transaction_barrier();
+            self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error).unwrap();
+            assert_eq!(self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.tx.ignored_rollback.is_none());
+            assert!(matches!(self.fields.native.tx.phase, TxPhase::Finished));
+            assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_DONE)), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            let adverse = self.fields.native.secondary.as_ref().unwrap();
+            // First adverse is BEGIN's consumed finalize; rollback cannot
+            // overwrite it or the first terminal.
+            assert_eq!(adverse.action, FixedAction::Begin); assert_eq!(adverse.code, rusqlite::ffi::SQLITE_ERROR);
+            assert_eq!(self.fields.work.test_code_observation(), before);
         }
     }
 
