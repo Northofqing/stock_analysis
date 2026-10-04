@@ -637,6 +637,72 @@ mod financial_source_start_tests {
     }
 }
 
+#[cfg(test)]
+mod financial_original_sql_lifecycle_tests {
+    use super::*;
+    use replay_work::{LifecycleA00Case, LifecycleConstructorCase};
+    use rows::original_source::{OwnerStartProbe, SourceResourceCause, SourceSite, SourceTerminal};
+
+    // Fixed protocol carriers use the real owner fields and work loans. They
+    // create no SQLite pointer, source qualification, rules or paid request.
+    #[test]
+    fn history_original_sql_lifecycle_constructor_failure_keeps_primary_and_single_close() {
+        for case in [LifecycleConstructorCase::NoHandle,
+            LifecycleConstructorCase::OpenErrorWithResource,
+            LifecycleConstructorCase::BusyTimeoutError] {
+            let owner = GlobalSchemaVersionOwner::for_test_code();
+            let mut start = owner.start_fixed_financial_source_work();
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            start.fields().test_code_constructor_cut(case);
+            let after = start.fields().source_work().test_code_observation();
+            assert_eq!((after.limit, after.used, after.rows, after.bytes, after.streams, after.terminal),
+                (16 * 1024 * 1024, 3, 2, 11, 1, None));
+        }
+    }
+
+    #[test]
+    fn history_original_sql_lifecycle_a00_first_row_no_row_and_paid_cleanup_order() {
+        for case in [LifecycleA00Case::FirstRow, LifecycleA00Case::NoRow, LifecycleA00Case::StepError] {
+            let owner = GlobalSchemaVersionOwner::for_test_code();
+            let mut start = owner.start_fixed_financial_source_work();
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            start.fields().test_code_a00_cut(case);
+            let after = start.fields().source_work().test_code_observation();
+            assert_eq!((after.used, after.rows, after.bytes, after.streams, after.terminal), (3, 2, 11, 1, None));
+        }
+    }
+
+    #[test]
+    fn history_original_sql_lifecycle_terminal_move_and_unreleased_borrow_keep_fields() {
+        let owner = GlobalSchemaVersionOwner::for_test_code();
+        let mut start = owner.start_fixed_financial_source_work();
+        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start.fields().test_code_seed_live_a00();
+        let terminal = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        assert_eq!(terminal, SourceTerminal::Resource {
+            site: SourceSite::RawCatalog, cause: SourceResourceCause::Exceeded,
+            attempted_used: 16 * 1024 * 1024 + 3,
+        });
+        // This consumes the whole existing frame exactly once, including its
+        // retained protocol resource slots and the already-terminal RowsWork.
+        let mut construction = start.enter_rows();
+        {
+            let mut fields = construction.fields();
+            fields.reborrow().test_code_terminal_drain();
+            assert!(fields.test_code_unreleased_a00());
+            let mut work = fields.source_work();
+            assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(terminal));
+            let retained = work.test_code_observation();
+            assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
+                (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal)));
+        }
+        // Ending the failed-close loan does not release a slot or refund work.
+        let mut fields = construction.fields();
+        assert!(fields.test_code_unreleased_a00());
+        assert_eq!(fields.source_work().test_code_observation().terminal, Some(terminal));
+    }
+}
+
 pub(super) fn run_selection_v2_migration_command<I, S>(args: I) -> Result<String, String>
 where
     I: IntoIterator<Item = S>,
