@@ -1449,7 +1449,9 @@ def zstd_static_context(args, env, cwd, session, inv):
 def anyhow_candidate(args, env, cwd, session):
     return (tools12_candidate("anyhow", "src/nightly.rs", args, env, cwd, session)
             and (env.get("DYLD_FALLBACK_LIBRARY_PATH", "").startswith(str(session / "target/debug") + ":")
-                 or any("anyhow_build_probe" in a or a == "src/nightly.rs" or a.endswith("/src/nightly.rs") for a in args[1:])))
+                 or "--cfg=anyhow_build_probe" in args[1:]
+                 or any(a == "--cfg" and b == "anyhow_build_probe" for a, b in zip(args[1:], args[2:]))
+                 or any(not a.startswith("-") and (a == "src/nightly.rs" or a.endswith("/src/nightly.rs")) for a in args[1:])))
 
 
 def anyhow_context(args, env, cwd, session, inv):

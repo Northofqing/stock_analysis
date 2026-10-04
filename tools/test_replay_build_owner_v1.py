@@ -1946,6 +1946,8 @@ elif FAMILY=='anyhow':
     argv=[os.environ['RUSTC'],'--cfg=anyhow_build_probe','--edition=2018','--crate-name=anyhow','--crate-type=lib','--cap-lints=allow','--emit=dep-info,metadata','--out-dir',str(out/'probe'),'src/nightly.rs','--target','x86_64-apple-darwin']
     env=environment(name,version,root,'anyhow');env.update(OUT_DIR=str(out),HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',CARGO_FEATURE_DEFAULT='1',CARGO_FEATURE_STD='1',CARGO_ENCODED_RUSTFLAGS='',DYLD_FALLBACK_LIBRARY_PATH=str(target/'debug')+':'+str(host)+':'+str(pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH'])/'rustlib/x86_64-apple-darwin/lib')+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']);cwd=root
     if CASE=='source':argv[9]='src/lib.rs'
+    if CASE in ('probe_check_cfg','probe_check_cfg_source'):argv[1:2]=['--check-cfg','cfg(anyhow_build_probe)']
+    if CASE=='probe_check_cfg_source':argv[argv.index('src/nightly.rs')]='src/lib.rs'
     if CASE=='inline':argv[1:2]=['--cfg','anyhow_build_probe']
     if CASE=='raw_space':argv[6]='--emit=metadata,dep-info'
     if CASE=='source_alias':argv[9]='./src/nightly.rs'
@@ -1982,7 +1984,8 @@ if FAMILY=='zstd' and result.returncode:
 if FAMILY=='anyhow':
     status=1 if CASE.startswith('probe1') else (7 if CASE=='probe7' else 0)
     cfgs=['error_generic_member_access'] if status==0 else []
-    consumer=compile_event('anyhow',root/'src/lib.rs',package,host,features,extra=[v for c in cfgs for v in ('--cfg',c)],env_extra={'OUT_DIR':str(out)})
+    checks=('anyhow_build_probe','anyhow_nightly_testing','anyhow_no_clippy_format_args','anyhow_no_core_error','error_generic_member_access')
+    consumer=compile_event('anyhow',root/'src/lib.rs',package,host,features,extra=[v for c in cfgs for v in ('--cfg',c)]+[v for c in checks for v in ('--check-cfg','cfg('+c+')')],env_extra={'OUT_DIR':str(out)})
 else:
     cfgs=[];crate='zstd_sys' if FAMILY=='zstd' else 'serde_core';suffix='-d231fa1e57295f5a' if FAMILY=='zstd' else '-d3ba454884ccf462'
     consumer=artifact(package,root/'src/lib.rs',crate,'lib',[deps/('lib'+crate+suffix+'.rmeta'),deps/('lib'+crate+suffix+'.rlib')],features)
@@ -4821,6 +4824,15 @@ class RecordingProtocolTests(unittest.TestCase):
             with self.subTest(case=case):
                 session, record, receipts = self.tools12_result("anyhow", case)
                 self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+                self.assertTrue((session / "compiler-entry/compile-anyhow").exists())
+                _, consumer = next((p, r) for p, r in receipts if r["source"] == str(session / "vendor/anyhow/src/lib.rs"))
+                self.assertEqual((consumer["kind"], consumer["role"], consumer["context"], consumer["exit_code"]), ("Compile", "Host", {"kind": "DirectCargoCompile"}, 0))
+                self.assertEqual(consumer["parsed"]["options"]["--check-cfg"], ["cfg(" + c + ")" for c in ("anyhow_build_probe", "anyhow_nightly_testing", "anyhow_no_clippy_format_args", "anyhow_no_core_error", "error_generic_member_access")])
+                self.assertNotIn("anyhow_build_probe", consumer["parsed"]["options"].get("--cfg", []))
+                consumer_env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in consumer["environment_hex"].items()}
+                self.assertFalse(any(k.startswith("CARGO_FEATURE_") for k in consumer_env))
+                self.assertEqual(consumer_env["DYLD_FALLBACK_LIBRARY_PATH"].split(":")[0], str(session / "target/debug/deps"))
+                self.assertEqual(len(consumer_env["DYLD_FALLBACK_LIBRARY_PATH"].split(":")), 2)
                 path, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "AnyhowStaticFeatureProbe")
                 self.assertEqual(r["exit_code"], code); self.assertEqual(r["probe_outcome"], "Supported" if code == 0 else "Unsupported")
                 self.assertEqual(r["role"], "Target"); self.assertEqual(r["kind"], "TransientProbe"); self.assertEqual(len(r["outputs"]), outputs)
@@ -4844,7 +4856,7 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertEqual(r["exit_code"], 0); self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
 
     def test_record12_anyhow_source_raw_origin_and_transient_namespace_refuse(self):
-        admission = {"source": "AnyhowTemplate", "package": "AnyhowSourceContext", "version": "AnyhowSourceContext", "cwd": "AnyhowSourceContext", "source_hash": "AnyhowSourceContext", "outdir": "AnyhowOutDir", "feature": "AnyhowFeatures", "bootstrap": "AnyhowEnvironment", "stage": "AnyhowEnvironment", "wrapper": "AnyhowEnvironment", "inline": "AnyhowTemplate", "raw_space": "AnyhowTemplate", "host": "AnyhowTemplate", "platform": "AnyhowTemplate", "retry": "AnyhowTemplate", "source_alias": "AnyhowTemplate", "manifest_alias": "AnyhowSourceContext", "host_env": "AnyhowEnvironment", "encoded_flags": "AnyhowEnvironment", "missing_feature": "AnyhowFeatures", "loader": "CompilerEnvironmentInjection"}
+        admission = {"source": "AnyhowTemplate", "package": "AnyhowSourceContext", "version": "AnyhowSourceContext", "cwd": "AnyhowSourceContext", "source_hash": "AnyhowSourceContext", "outdir": "AnyhowOutDir", "feature": "AnyhowFeatures", "bootstrap": "AnyhowEnvironment", "stage": "AnyhowEnvironment", "wrapper": "AnyhowEnvironment", "inline": "AnyhowTemplate", "raw_space": "AnyhowTemplate", "host": "AnyhowTemplate", "platform": "AnyhowTemplate", "retry": "AnyhowTemplate", "source_alias": "AnyhowTemplate", "manifest_alias": "AnyhowSourceContext", "host_env": "AnyhowEnvironment", "encoded_flags": "AnyhowEnvironment", "missing_feature": "AnyhowFeatures", "loader": "CompilerEnvironmentInjection", "probe_check_cfg": "AnyhowTemplate", "probe_check_cfg_source": "AnyhowTemplate"}
         for case, marker in admission.items():
             with self.subTest(admission=case):self.tools12_admission_refusal("anyhow", case, marker)
         after = {"request_only": "IncompleteInvocation:", "missing_annotation": "AnyhowGraph:CompilerEnvironmentInjection", "request_cwd": "AnyhowGraph:AnyhowSourceContext", "raw_builder": "AnyhowGraph:AnyhowBuilderJoin", "builder_features": "AnyhowGraph:AnyhowBuilderJoin", "missing_builder": "AnyhowGraph:AnyhowOriginJoin", "duplicate_builder": "AnyhowGraph:AnyhowOriginJoin", "missing_event": "AnyhowGraph:AnyhowOriginJoin", "duplicate_event": "AnyhowGraph:AnyhowOriginJoin", "event_outdir": "AnyhowGraph:AnyhowOriginJoin", "event_cfg": "AnyhowGraph:AnyhowCfgJoin", "event_env": "AnyhowGraph:AnyhowCfgJoin", "missing_consumer": "AnyhowGraph:AnyhowConsumerJoin", "duplicate_consumer": "AnyhowGraph:AnyhowConsumerJoin", "consumer_features": "AnyhowGraph:AnyhowConsumerJoin", "snapshot_missing": "AnyhowGraph:AnyhowInvocationEvidence", "snapshot_changed": "AnyhowGraph:AnyhowSnapshot"}
