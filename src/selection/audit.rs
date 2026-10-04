@@ -2850,3 +2850,252 @@ mod tests {
         }
     }
 }
+
+// Financial-only resource mechanics. Ordinary session/writer code is unchanged.
+// The native/FS producer and raw-unlock adapter have no rules issuer here.
+#[allow(dead_code)]
+pub(crate) mod financial_original {
+    use super::*;
+    struct SelectedAuditRules { _issuance: std::convert::Infallible }
+    struct LockedFile { file: File, identity: FileIdentity }
+    enum LockPlace { Opened(File), Locked(LockedFile), #[cfg(test)] ProtocolHeld(File) }
+    enum ContainerPlace { Opened(File), Pinned(PinnedNamespaceContainer) }
+    enum DataPlace { Opened(File), Pinned(PinnedAuditData) }
+    // Preserve container -> parent File order, including the prelock locals.
+    struct Parent { container: Option<ContainerPlace>, file: File,
+        identity: Option<FileIdentity>, marker: Option<DirectoryMutationMarker> }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Action { Unlock, LockFile, Parent, Guard, Data, Finished }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Fault { WrongPhase, AlreadyObserved }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Stage { Empty, Bound, Guard, Parent, ParentPinned, Opened, Locked, DataOpened, Data, Ready, Draining, Released }
+    // All resource fields live in G's owning frame. No owning result escapes
+    // a callee; its short loan always contains references only.
+    pub(crate) struct Resources<'writer> {
+        writer: Option<&'writer SelectionAuditWriter>,
+        guard: Option<MutexGuard<'static, ()>>,
+        parent: Option<Parent>,
+        lock: Option<LockPlace>,
+        data: Option<DataPlace>,
+        release_file: Option<File>,
+        release_needs_unlock: bool,
+        unlock: Option<i32>,
+        stage: Stage,
+        post_lock: bool,
+        #[cfg(test)] trace: Option<Trace>,
+    }
+    impl<'writer> Resources<'writer> {
+        pub(crate) fn empty() -> Self {
+            Self { writer: None, guard: None, parent: None, lock: None, data: None,
+                release_file: None, release_needs_unlock: false, unlock: None,
+                stage: Stage::Empty, post_lock: false, #[cfg(test)] trace: None }
+        }
+        pub(crate) fn bind(&mut self, writer: &'writer SelectionAuditWriter) -> Result<(), Fault> {
+            if self.stage != Stage::Empty { return Err(Fault::WrongPhase); }
+            self.writer = Some(writer); self.stage = Stage::Bound; Ok(())
+        }
+        pub(crate) fn loan(&mut self) -> Loan<'_, 'writer> { Loan { resources: self } }
+        pub(crate) fn ready(&self) -> bool { self.stage == Stage::Ready }
+        pub(crate) fn released(&self) -> bool { self.stage == Stage::Released }
+    }
+    pub(crate) struct Loan<'a, 'writer> { resources: &'a mut Resources<'writer> }
+    impl<'writer> Loan<'_, 'writer> {
+        // Fixed private preflight borrows are obtained BEFORE driver/resource
+        // acquisition. Their consume stores directly into G's owning fields;
+        // there is no owning return carrier or second-slot overwrite path.
+        fn guard_port(&mut self) -> Result<GuardPort<'_, 'writer>, Fault> {
+            if self.resources.stage != Stage::Bound { return Err(Fault::WrongPhase); }
+            Ok(GuardPort(self.resources))
+        }
+        fn parent_port(&mut self) -> Result<ParentPort<'_, 'writer>, Fault> {
+            if self.resources.stage != Stage::Guard { return Err(Fault::WrongPhase); }
+            Ok(ParentPort(self.resources))
+        }
+        fn container_port(&mut self) -> Result<ContainerPort<'_>, Fault> {
+            if self.resources.stage != Stage::Parent { return Err(Fault::WrongPhase); }
+            let parent = self.resources.parent.as_mut().ok_or(Fault::WrongPhase)?;
+            if parent.container.is_some() { return Err(Fault::WrongPhase); }
+            Ok(ContainerPort(&mut parent.container))
+        }
+        fn finish_container_pin(&mut self, marker: DirectoryMutationMarker, namespace_identity: FileIdentity,
+            namespace_leaf: OsString, _rules: &SelectedAuditRules) -> Result<(), Fault> {
+            if self.resources.stage != Stage::Parent { return Err(Fault::WrongPhase); }
+            let parent = self.resources.parent.as_mut().ok_or(Fault::WrongPhase)?;
+            if !matches!(parent.container, Some(ContainerPlace::Opened(_))) { return Err(Fault::WrongPhase); }
+            let Some(ContainerPlace::Opened(file)) = parent.container.take() else { return Err(Fault::WrongPhase); };
+            parent.container = Some(ContainerPlace::Pinned(PinnedNamespaceContainer {
+                file, marker, enforce_initial_marker: true, namespace_identity, namespace_leaf,
+            })); Ok(())
+        }
+        fn finish_parent_pin(&mut self, identity: FileIdentity, marker: DirectoryMutationMarker,
+            _rules: &SelectedAuditRules) -> Result<(), Fault> {
+            if self.resources.stage != Stage::Parent { return Err(Fault::WrongPhase); }
+            let parent = self.resources.parent.as_mut().ok_or(Fault::WrongPhase)?;
+            if !matches!(parent.container, Some(ContainerPlace::Pinned(_))) { return Err(Fault::WrongPhase); }
+            parent.identity = Some(identity); parent.marker = Some(marker); self.resources.stage = Stage::ParentPinned; Ok(())
+        }
+        fn opened_port(&mut self) -> Result<OpenedPort<'_, 'writer>, Fault> {
+            if self.resources.stage != Stage::ParentPinned { return Err(Fault::WrongPhase); }
+            Ok(OpenedPort(self.resources))
+        }
+        fn observe_locked(&mut self, identity: FileIdentity, _rules: &SelectedAuditRules) -> Result<(), Fault> {
+            if self.resources.stage != Stage::Opened { return Err(Fault::WrongPhase); }
+            let Some(LockPlace::Opened(file)) = self.resources.lock.take() else { return Err(Fault::WrongPhase); };
+            self.resources.lock = Some(LockPlace::Locked(LockedFile { file, identity }));
+            self.resources.post_lock = true; self.resources.stage = Stage::Locked; Ok(())
+        }
+        fn data_port(&mut self, _rules: &SelectedAuditRules) -> Result<DataPort<'_, 'writer>, Fault> {
+            if self.resources.stage != Stage::Locked { return Err(Fault::WrongPhase); }
+            Ok(DataPort(self.resources))
+        }
+        fn finish_data_pin(&mut self, identity: FileIdentity, _rules: &SelectedAuditRules) -> Result<(), Fault> {
+            if self.resources.stage != Stage::DataOpened { return Err(Fault::WrongPhase); }
+            let Some(DataPlace::Opened(file)) = self.resources.data.take() else { return Err(Fault::WrongPhase); };
+            self.resources.data = Some(DataPlace::Pinned(PinnedAuditData::Present { file, identity }));
+            self.resources.stage = Stage::Data; Ok(())
+        }
+        fn finish_audit_acquisition(&mut self, _rules: &SelectedAuditRules) -> Result<(), Fault> {
+            if self.resources.stage != Stage::Data { return Err(Fault::WrongPhase); }
+            self.resources.stage = Stage::Ready; Ok(())
+        }
+        pub(crate) fn begin_release(&mut self) -> Result<(), Fault> {
+            if matches!(self.resources.stage, Stage::Empty | Stage::Draining | Stage::Released) { return Err(Fault::WrongPhase); }
+            if let Some(lock) = self.resources.lock.take() {
+                let (file, held) = match lock {
+                    LockPlace::Opened(file) => (file, false),
+                    LockPlace::Locked(LockedFile { file, .. }) => (file, true),
+                    #[cfg(test)] LockPlace::ProtocolHeld(file) => (file, true),
+                };
+                self.resources.release_file = Some(file);
+                self.resources.release_needs_unlock = held;
+            }
+            self.resources.stage = Stage::Draining; Ok(())
+        }
+        pub(crate) fn next_release(&self) -> Result<Action, Fault> {
+            if self.resources.stage != Stage::Draining { return Err(Fault::WrongPhase); }
+            let resources = &self.resources;
+            if resources.release_file.is_some() {
+                return Ok(if resources.release_needs_unlock && resources.unlock.is_none() { Action::Unlock } else { Action::LockFile });
+            }
+            // Before a successful lock the locally acquired parent drops
+            // before the earlier process guard. Post-lock release first
+            // follows unlock -> lock File -> process guard.
+            if !resources.post_lock && resources.parent.is_some() { return Ok(Action::Parent); }
+            if resources.guard.is_some() { return Ok(Action::Guard); }
+            if resources.parent.is_some() { return Ok(Action::Parent); }
+            if resources.data.is_some() { return Ok(Action::Data); }
+            Ok(Action::Finished)
+        }
+        fn observe_unlock_code(&mut self, code: i32) -> Result<(), Fault> {
+            if self.resources.unlock.is_some() { return Err(Fault::AlreadyObserved); }
+            if self.next_release()? != Action::Unlock { return Err(Fault::WrongPhase); }
+            self.resources.unlock = Some(code); Ok(())
+        }
+        // No call/FD getter implements the original unlock adapter. A future
+        // selected adapter alone can supply its actual observed primitive code.
+        fn observe_original_unlock(&mut self, _rules: &SelectedAuditRules, code: i32) -> Result<(), Fault> {
+            self.observe_unlock_code(code)
+        }
+        pub(crate) fn release_one(&mut self) -> Result<Action, Fault> {
+            let action = self.next_release()?;
+            match action {
+                Action::Unlock => return Ok(action), // File/guard remain owned awaiting the genuine adapter.
+                Action::LockFile => { drop(self.resources.release_file.take()); }
+                Action::Parent => { drop(self.resources.parent.take()); }
+                Action::Guard => { drop(self.resources.guard.take()); }
+                Action::Data => { drop(self.resources.data.take()); }
+                Action::Finished => { self.resources.stage = Stage::Released; }
+            }
+            #[cfg(test)] if let Some(trace) = &self.resources.trace { trace.record(action); }
+            Ok(action)
+        }
+    }
+    struct GuardPort<'a, 'writer>(&'a mut Resources<'writer>);
+    impl GuardPort<'_, '_> {
+        fn retain(self, guard: MutexGuard<'static, ()>) { self.0.guard = Some(guard); self.0.stage = Stage::Guard; }
+    }
+    struct ParentPort<'a, 'writer>(&'a mut Resources<'writer>);
+    impl ParentPort<'_, '_> {
+        fn retain(self, file: File) { self.0.parent = Some(Parent { container: None, file, identity: None, marker: None }); self.0.stage = Stage::Parent; }
+    }
+    struct ContainerPort<'a>(&'a mut Option<ContainerPlace>);
+    impl ContainerPort<'_> { fn retain(self, file: File) { *self.0 = Some(ContainerPlace::Opened(file)); } }
+    struct OpenedPort<'a, 'writer>(&'a mut Resources<'writer>);
+    impl OpenedPort<'_, '_> {
+        fn retain(self, file: File) { self.0.lock = Some(LockPlace::Opened(file)); self.0.stage = Stage::Opened; }
+    }
+    struct DataPort<'a, 'writer>(&'a mut Resources<'writer>);
+    impl DataPort<'_, '_> {
+        fn retain_opened(self, file: File) { self.0.data = Some(DataPlace::Opened(file)); self.0.stage = Stage::DataOpened; }
+        fn retain_missing(self) { self.0.data = Some(DataPlace::Pinned(PinnedAuditData::Absent)); self.0.stage = Stage::Data; }
+    }
+    // Fixed cfg protocols own real descriptors/mutex guards but make no OS
+    // lock, namespace, scan, chain-validation, provider or payment claim.
+    #[cfg(test)]
+    #[derive(Clone)]
+    pub(crate) struct Trace(std::rc::Rc<std::cell::RefCell<[Option<Action>; 8]>>);
+    #[cfg(test)]
+    impl Trace {
+        pub(crate) fn new() -> Self { Self(std::rc::Rc::new(std::cell::RefCell::new([None; 8]))) }
+        fn record(&self, action: Action) {
+            let mut events = self.0.borrow_mut();
+            let index = events.iter().position(Option::is_none).expect("fixed trace capacity"); events[index] = Some(action);
+        }
+        pub(crate) fn snapshot(&self) -> [Option<Action>; 8] { *self.0.borrow() }
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    pub(crate) enum Case { GuardOnly, ParentOpened, OpenedLock, LockedDataOpened, Ready }
+    #[cfg(test)]
+    static FIXED_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    #[cfg(test)]
+    pub(crate) fn fixed_writer() -> SelectionAuditWriter {
+        SelectionAuditWriter { namespace_root: PathBuf::from("/TEST_CODE/audit"),
+            path: PathBuf::from("/TEST_CODE/audit/selection-audit.jsonl"),
+            lock_path: PathBuf::from("/TEST_CODE/audit/selection-audit.lock"), pinned_test_namespace: None }
+    }
+    #[cfg(test)]
+    pub(crate) fn fixed_snapshot() -> ValidatedAuditChainSnapshot {
+        ValidatedAuditChainSnapshot { validation: AuditValidationReceipt { record_count: 0, tail_hash: Some(String::from("TEST_CODE unvalidated owned tail")) }, records: Vec::new() }
+    }
+    #[cfg(test)]
+    impl Loan<'_, '_> {
+        pub(crate) fn seed_fixed_case(&mut self, case: Case, trace: &Trace) {
+            assert!(self.resources.stage == Stage::Bound);
+            self.resources.trace = Some(trace.clone());
+            self.guard_port().unwrap().retain(FIXED_TEST_MUTEX.lock().unwrap());
+            if matches!(case, Case::GuardOnly) { return; }
+            let file = File::open("/dev/null").unwrap(); let metadata = file.metadata().unwrap();
+            self.parent_port().unwrap().retain(file);
+            if matches!(case, Case::ParentOpened) { return; }
+            self.container_port().unwrap().retain(File::open("/dev/null").unwrap());
+            // cfg-only pin/status script; no SelectedAuditRules is constructed.
+            self.resources.stage = Stage::ParentPinned;
+            self.opened_port().unwrap().retain(File::open("/dev/null").unwrap());
+            if matches!(case, Case::OpenedLock) { return; }
+            let Some(LockPlace::Opened(file)) = self.resources.lock.take() else { panic!("fixed opened field"); };
+            self.resources.lock = Some(LockPlace::ProtocolHeld(file)); self.resources.post_lock = true;
+            if matches!(case, Case::LockedDataOpened) {
+                self.resources.data = Some(DataPlace::Opened(File::open("/dev/null").unwrap()));
+                self.resources.stage = Stage::DataOpened; return;
+            }
+            self.resources.data = Some(DataPlace::Pinned(PinnedAuditData::Present { file: File::open("/dev/null").unwrap(),
+                identity: FileIdentity::from_metadata(&metadata) }));
+            self.resources.stage = Stage::Ready;
+        }
+        pub(crate) fn assert_fixed_owned(&self) {
+            assert!(self.resources.guard.is_some()); assert!(FIXED_TEST_MUTEX.try_lock().is_err());
+            if let Some(parent) = &self.resources.parent { parent.file.metadata().unwrap(); }
+            if let Some(lock) = &self.resources.lock {
+                match lock { LockPlace::Opened(file) | LockPlace::ProtocolHeld(file) => { file.metadata().unwrap(); }
+                    LockPlace::Locked(locked) => { locked.file.metadata().unwrap(); } }
+            }
+            if let Some(file) = &self.resources.release_file { file.metadata().unwrap(); }
+        }
+        pub(crate) fn observe_fixed_unlock_ok(&mut self) { self.observe_unlock_code(0).unwrap(); }
+        pub(crate) fn observe_fixed_unlock_error(&mut self) { self.observe_unlock_code(5).unwrap(); }
+        pub(crate) fn assert_fixed_guard_released(&self) { assert!(self.resources.guard.is_none()); assert!(self.resources.stage == Stage::Released); }
+        pub(crate) fn assert_fixed_unlock_error_retained(&self) { assert_eq!(self.resources.unlock, Some(5)); }
+    }
+}

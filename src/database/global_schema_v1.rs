@@ -10,6 +10,7 @@
 //! identity field or substitutes an unattested path.
 
 use fs2::FileExt;
+use crate::selection::audit::financial_original as financial_audit;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
@@ -486,9 +487,35 @@ enum FinancialSidecarFault { UnexpectedCut, Terminal, ResourceMissing }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum FinancialSidecarDrop { CurrentPin, Shm, Wal, BuiltPair, NoLocalPayload }
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialAuditPhase { NotStarted, Acquiring, Records, Ready, Failed, Draining, Released }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialAuditFault { UnexpectedCut, Terminal }
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialAuditPinPhase { None, LocalParent, LocalComplete, CompleteRetained }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialAuditRelease { Session(financial_audit::Action), LocalFile, LocalParent, LocalRecords, Finished }
+#[allow(dead_code)]
+struct FinancialAuditState<'writer> {
+    resources: financial_audit::Resources<'writer>,
+    records: Option<ValidatedAuditChainSnapshot>,
+    pin_phase: FinancialAuditPinPhase,
+    parent: Option<PinnedDirectory>,
+    leaf: Option<OsString>,
+    file: Option<PinnedSelectionAuditFile>,
+}
+#[allow(dead_code)]
+impl FinancialAuditState<'_> {
+    fn empty() -> Self { Self { resources: financial_audit::Resources::empty(), records: None, pin_phase: FinancialAuditPinPhase::None, parent: None, leaf: None, file: None } }
+}
 #[allow(dead_code)]
 struct FinancialPhysical {
     phase: FinancialSidecarPhase,
+    audit_phase: FinancialAuditPhase,
     opened: Option<FinancialOpenedSidecar>,
     wal: Option<FinancialPinnedSidecar>,
     shm: Option<FinancialPinnedSidecar>,
@@ -504,12 +531,14 @@ struct FinancialPhysical {
 #[allow(dead_code)]
 impl FinancialPhysical {
     fn empty() -> Self {
-        Self { phase: FinancialSidecarPhase::BeforeA00, opened: None,
+        Self { phase: FinancialSidecarPhase::BeforeA00, audit_phase: FinancialAuditPhase::NotStarted, opened: None,
             wal: None, shm: None, complete: None, returned: None, abandoned: None, failed_cut: None,
             primary: None, context: None }
     }
     fn post_a00_started(&self) -> bool { self.phase != FinancialSidecarPhase::BeforeA00 }
-    fn blocks_original_close(&self) -> bool {
+    fn audit_pending(&self) -> bool { !matches!(self.audit_phase, FinancialAuditPhase::NotStarted | FinancialAuditPhase::Released) }
+    fn blocks_original_close(&self) -> bool { self.audit_pending() || self.sidecar_locals_pending() }
+    fn sidecar_locals_pending(&self) -> bool {
         !matches!(self.phase, FinancialSidecarPhase::BeforeA00
             | FinancialSidecarPhase::Returned | FinancialSidecarPhase::LocalDrained)
     }
@@ -639,7 +668,7 @@ impl<'a> FinancialSidecarLoan<'a> {
         let required = self.physical.failed_cut.is_some()
             || self.physical.phase == FinancialSidecarPhase::AbandonedResult;
         if self.work.terminal().is_some() || !required
-            || self.physical.primary.is_some() || !self.physical.blocks_original_close() { return Err(error); }
+            || self.physical.primary.is_some() || !self.physical.sidecar_locals_pending() { return Err(error); }
         self.physical.primary = Some(error);
         Ok(())
     }
@@ -649,7 +678,7 @@ impl<'a> FinancialSidecarLoan<'a> {
         // An unresolved callee result is not known drained, even with empty
         // physical slots (for example after a safe forget of its carrier).
         if self.physical.phase == FinancialSidecarPhase::ValidatedLocal
-            || !self.physical.blocks_original_close()
+            || !self.physical.sidecar_locals_pending()
             || (self.work.terminal().is_none() && self.physical.primary.is_none()) {
             return Err(FinancialSidecarFault::UnexpectedCut);
         }
@@ -736,32 +765,153 @@ impl FinancialCompleteSidecars {
     }
 }
 
+// Writer remains in the genuine G call's stable outer scope. No self
+// reference is formed: the frame owns resources and only borrows that writer.
 #[allow(dead_code)]
-struct FinancialSourceStart {
+struct FinancialAuditFields<'a, 'writer> {
+    native: &'a replay_work::NativeOriginalOwner,
+    audit: &'a mut FinancialAuditState<'writer>,
+    physical: &'a mut FinancialPhysical,
+    work: rows::original_source::OriginalSourceWork<'a>,
+}
+#[allow(dead_code)]
+impl<'writer> FinancialAuditFields<'_, 'writer> {
+    fn begin(&mut self, writer: &'writer SelectionAuditWriter) -> Result<(), FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if !self.native.audit_acquisition_ready() || !self.physical.parent_sidecars_retained() || self.physical.primary.is_some()
+            || self.physical.audit_phase != FinancialAuditPhase::NotStarted { return Err(FinancialAuditFault::UnexpectedCut); }
+        self.audit.resources.bind(writer).map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+        self.physical.audit_phase = FinancialAuditPhase::Acquiring; Ok(())
+    }
+    // Preflight precedes each producer operation. The resulting short port
+    // has no work access or owning result: its single consume always retains
+    // acquired payload directly, with no second post-acquisition refusal.
+    fn records_port(&mut self) -> Result<FinancialAuditRecordsPort<'_, 'writer>, FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.physical.audit_phase != FinancialAuditPhase::Acquiring
+            || !self.audit.resources.ready() || self.audit.records.is_some() { return Err(FinancialAuditFault::UnexpectedCut); }
+        Ok(FinancialAuditRecordsPort { audit: self.audit, physical: self.physical })
+    }
+    fn parent_port(&mut self) -> Result<FinancialAuditParentPort<'_, 'writer>, FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.physical.audit_phase != FinancialAuditPhase::Records
+            || self.audit.pin_phase != FinancialAuditPinPhase::None { return Err(FinancialAuditFault::UnexpectedCut); }
+        Ok(FinancialAuditParentPort { audit: self.audit })
+    }
+    fn file_port(&mut self) -> Result<FinancialAuditFilePort<'_, 'writer>, FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.physical.audit_phase != FinancialAuditPhase::Records
+            || self.audit.pin_phase != FinancialAuditPinPhase::LocalParent { return Err(FinancialAuditFault::UnexpectedCut); }
+        Ok(FinancialAuditFilePort { audit: self.audit })
+    }
+    fn finish_pins(&mut self) -> Result<(), FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.physical.audit_phase != FinancialAuditPhase::Records
+            || self.audit.pin_phase != FinancialAuditPinPhase::LocalComplete { return Err(FinancialAuditFault::UnexpectedCut); }
+        // Logical parent retention only; no validation/FS permission is issued.
+        self.audit.pin_phase = FinancialAuditPinPhase::CompleteRetained;
+        self.physical.audit_phase = FinancialAuditPhase::Ready; Ok(())
+    }
+    fn note_normal_failure(&mut self) -> Result<(), FinancialAuditFault> {
+        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if !matches!(self.physical.audit_phase, FinancialAuditPhase::Acquiring | FinancialAuditPhase::Records | FinancialAuditPhase::Ready) {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
+        self.physical.audit_phase = FinancialAuditPhase::Failed; Ok(())
+    }
+    fn retain_paid_primary(&mut self, error: rows::original_source::SourceOperationError)
+        -> Result<(), rows::original_source::SourceOperationError> {
+        if self.work.terminal().is_some() || self.physical.audit_phase != FinancialAuditPhase::Failed
+            || self.physical.primary.is_some() { return Err(error); }
+        self.physical.primary = Some(error); Ok(())
+    }
+    fn begin_release(&mut self) -> Result<(), FinancialAuditFault> {
+        if !self.physical.audit_pending() || self.physical.audit_phase == FinancialAuditPhase::Draining
+            || (self.work.terminal().is_none() && (self.physical.audit_phase != FinancialAuditPhase::Failed
+                || self.physical.primary.is_none())) { return Err(FinancialAuditFault::UnexpectedCut); }
+        self.audit.resources.loan().begin_release().map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+        self.physical.audit_phase = FinancialAuditPhase::Draining; Ok(())
+    }
+    fn release_one(&mut self) -> Result<FinancialAuditRelease, FinancialAuditFault> {
+        if self.physical.audit_phase != FinancialAuditPhase::Draining { return Err(FinancialAuditFault::UnexpectedCut); }
+        if !self.audit.resources.released() {
+            let action = self.audit.resources.loan().release_one().map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+            // Session Finished cannot discharge G's still-local pin payload.
+            return Ok(FinancialAuditRelease::Session(action));
+        }
+        if self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained {
+            if self.audit.file.is_some() {
+                drop(self.audit.file.take()); self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
+                return Ok(FinancialAuditRelease::LocalFile);
+            }
+            if self.audit.parent.is_some() {
+                drop(self.audit.parent.take()); drop(self.audit.leaf.take());
+                self.audit.pin_phase = FinancialAuditPinPhase::None;
+                return Ok(FinancialAuditRelease::LocalParent);
+            }
+            if self.audit.records.is_some() {
+                drop(self.audit.records.take()); return Ok(FinancialAuditRelease::LocalRecords);
+            }
+        }
+        self.physical.audit_phase = FinancialAuditPhase::Released;
+        Ok(FinancialAuditRelease::Finished)
+    }
+}
+// No public constructors/raw access/closure factory. Each producer port is a
+// non-owning short borrow, issued only after terminal/phase preflight.
+#[allow(dead_code)]
+struct FinancialAuditRecordsPort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer>, physical: &'a mut FinancialPhysical }
+#[allow(dead_code)]
+impl FinancialAuditRecordsPort<'_, '_> {
+    fn retain(self, records: ValidatedAuditChainSnapshot) {
+        self.audit.records = Some(records); self.physical.audit_phase = FinancialAuditPhase::Records;
+    }
+}
+#[allow(dead_code)]
+struct FinancialAuditParentPort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer> }
+#[allow(dead_code)]
+impl FinancialAuditParentPort<'_, '_> {
+    fn retain(self, parent: PinnedDirectory, leaf: OsString) {
+        self.audit.parent = Some(parent); self.audit.leaf = Some(leaf); self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
+    }
+}
+#[allow(dead_code)]
+struct FinancialAuditFilePort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer> }
+#[allow(dead_code)]
+impl FinancialAuditFilePort<'_, '_> {
+    fn retain(self, file: PinnedSelectionAuditFile) {
+        self.audit.file = Some(file); self.audit.pin_phase = FinancialAuditPinPhase::LocalComplete;
+    }
+}
+
+#[allow(dead_code)]
+struct FinancialSourceStart<'writer> {
     decision: FinancialRetainedStartDecision,
     native: replay_work::NativeOriginalOwner,
     staged: rows::original_source::StagedOriginalWork,
     release: replay_work::FixedDrainLedger,
     physical: FinancialPhysical,
+    audit: FinancialAuditState<'writer>,
 }
 
 #[allow(dead_code)]
-struct FinancialRowsConstruction {
+struct FinancialRowsConstruction<'writer> {
     decision: FinancialRetainedStartDecision,
     native: replay_work::NativeOriginalOwner,
     construction: rows::original_source::PendingConstruction,
     release: replay_work::FixedDrainLedger,
     physical: FinancialPhysical,
+    audit: FinancialAuditState<'writer>,
 }
 
 #[allow(dead_code)]
-struct FinancialRejectedConstruction {
-    construction: FinancialRowsConstruction,
+struct FinancialRejectedConstruction<'writer> {
+    construction: FinancialRowsConstruction<'writer>,
     failure: rows::original_source::SourceFailure,
 }
 
 #[allow(dead_code)]
-impl FinancialSourceStart {
+impl<'writer> FinancialSourceStart<'writer> {
     fn fields(&mut self) -> replay_work::OriginalOwnerFields<'_> {
         replay_work::OriginalOwnerFields::lend(
             &mut self.native,
@@ -771,20 +921,25 @@ impl FinancialSourceStart {
         )
     }
 
-    fn enter_rows(self) -> FinancialRowsConstruction {
-        let Self { decision, native, staged, release, physical } = self;
+    fn audit_fields(&mut self) -> FinancialAuditFields<'_, 'writer> {
+        FinancialAuditFields { native: &self.native, audit: &mut self.audit, physical: &mut self.physical, work: self.staged.source_loan() }
+    }
+
+    fn enter_rows(self) -> FinancialRowsConstruction<'writer> {
+        let Self { decision, native, staged, release, physical, audit } = self;
         FinancialRowsConstruction {
             decision,
             native,
             construction: staged.enter_rows(),
             release,
             physical,
+            audit,
         }
     }
 }
 
 #[allow(dead_code)]
-impl FinancialRowsConstruction {
+impl<'writer> FinancialRowsConstruction<'writer> {
     fn fields(&mut self) -> replay_work::OriginalOwnerFields<'_> {
         replay_work::OriginalOwnerFields::lend(
             &mut self.native,
@@ -794,7 +949,11 @@ impl FinancialRowsConstruction {
         )
     }
 
-    fn reject(self, failure: rows::original_source::SourceFailure) -> FinancialRejectedConstruction {
+    fn audit_fields(&mut self) -> FinancialAuditFields<'_, 'writer> {
+        FinancialAuditFields { native: &self.native, audit: &mut self.audit, physical: &mut self.physical, work: self.construction.source_loan() }
+    }
+
+    fn reject(self, failure: rows::original_source::SourceFailure) -> FinancialRejectedConstruction<'writer> {
         FinancialRejectedConstruction { construction: self, failure }
     }
 }
@@ -1750,6 +1909,205 @@ impl Drop for TestCodeSelectionRehearsal {
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
+mod financial_original_audit_acquisition_tests {
+    use super::*;
+    use rows::original_source::{OwnerStartProbe, SourceOperationError};
+    use financial_audit::{Action, Case, Trace};
+    // Fixed protocols own descriptors/guards. /dev/null, an unvalidated owned
+    // tail and ProtocolHeld confer no FS lock, validated audit, native/SQL,
+    // paid request or Source success qualification.
+    fn fixed_returned_sidecars(start: &mut FinancialSourceStart<'_>) {
+        start.fields().test_code_enter_sidecars();
+        let trace = FinancialSidecarTrace::new();
+        for (index, name) in ["TEST_CODE-wal", "TEST_CODE-shm"].into_iter().enumerate() {
+            let file = File::open("/dev/null").unwrap();
+            let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+            let opened = FinancialOpenedSidecar { file, leaf: OsString::from(name),
+                path: PathBuf::from(name), pin_nul: CString::new(name).unwrap(), trace: trace.clone() };
+            let mut fields = start.fields(); let mut loan = fields.sidecar_loan();
+            if index == 0 {
+                loan.retain_opened_wal(opened).unwrap_or_else(|_| panic!("fixed wal"));
+                loan.finish_wal_pin(identity).unwrap(); loan.begin_shm_pin().unwrap();
+            } else {
+                loan.retain_opened_shm(opened).unwrap_or_else(|_| panic!("fixed shm"));
+                loan.finish_shm_pin(identity).unwrap(); loan.finish_journal_absence().unwrap();
+                loan.finish_pair_validation().unwrap_or_else(|_| panic!("fixed pair"))
+                    .finish_sidecar_acquisition().unwrap_or_else(|_| panic!("fixed return"));
+            }
+        }
+    }
+    fn fixed_primary() -> (SourceOperationError, usize) {
+        let detail = String::from("TEST_CODE supplied E05 primary"); let allocation = detail.as_ptr() as usize;
+        (SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }), allocation)
+    }
+    fn assert_primary(physical: &FinancialPhysical, allocation: usize) {
+        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &physical.primary else { panic!("same primary"); };
+        assert_eq!(detail.as_ptr() as usize, allocation); assert_eq!(detail, "TEST_CODE supplied E05 primary");
+    }
+    fn fixed_parent() -> PinnedDirectory {
+        let file = File::open("/dev/null").unwrap(); let identity = DirectoryIdentity::from_metadata(&file.metadata().unwrap());
+        PinnedDirectory { path: PathBuf::from("/TEST_CODE/audit"), root: File::open("/dev/null").unwrap(),
+            relative_components: Vec::new(), file, identity }
+    }
+    fn fixed_file() -> PinnedSelectionAuditFile {
+        let file = File::open("/dev/null").unwrap(); let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+        PinnedSelectionAuditFile::Present { file, identity }
+    }
+    fn assert_owned_pin(audit: &FinancialAuditState<'_>) {
+        if let Some(parent) = &audit.parent { parent.file.metadata().unwrap(); parent.root.metadata().unwrap(); }
+        if let Some(PinnedSelectionAuditFile::Present { file, .. }) = &audit.file { file.metadata().unwrap(); }
+    }
+    #[test]
+    fn history_original_audit_acquisition_partial_cuts_require_primary_and_ordered_drain() {
+        for case in [Case::GuardOnly, Case::ParentOpened, Case::OpenedLock, Case::LockedDataOpened, Case::Ready] {
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let (primary, allocation) = fixed_primary(); let (spare, spare_allocation) = fixed_primary();
+            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            fixed_returned_sidecars(&mut start);
+            let before = start.fields().source_work().test_code_observation();
+            start.audit_fields().begin(&writer).unwrap();
+            start.audit.resources.loan().seed_fixed_case(case, &trace);
+            { let _short = start.audit_fields(); }
+            start.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
+            start.fields().test_code_audit_blocks_close();
+            start.audit_fields().note_normal_failure().unwrap();
+            assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            start.fields().test_code_audit_blocks_close();
+            start.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first paid primary"));
+            let Err(spare) = start.audit_fields().retain_paid_primary(spare) else { panic!("second primary refused"); };
+            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = spare else { panic!("same spare category"); };
+            assert_eq!(detail.as_ptr() as usize, spare_allocation); assert_primary(&start.physical, allocation);
+            start.audit_fields().begin_release().unwrap();
+            if matches!(case, Case::LockedDataOpened | Case::Ready) {
+                assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
+                assert_eq!(trace.snapshot(), [None; 8]); start.audit.resources.loan().assert_fixed_owned();
+                start.fields().test_code_audit_blocks_close();
+                start.audit.resources.loan().observe_fixed_unlock_ok();
+            }
+            let expected: &[Action] = match case {
+                Case::GuardOnly => &[Action::Guard, Action::Finished],
+                Case::ParentOpened => &[Action::Parent, Action::Guard, Action::Finished],
+                Case::OpenedLock => &[Action::LockFile, Action::Parent, Action::Guard, Action::Finished],
+                Case::LockedDataOpened | Case::Ready => &[Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished],
+            };
+            for &action in expected {
+                assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+                start.fields().test_code_audit_blocks_close(); // Even session Finished does not settle G.
+            }
+            for (index, &action) in expected.iter().enumerate() { assert_eq!(trace.snapshot()[index], Some(action)); }
+            start.audit.resources.loan().assert_fixed_guard_released();
+            assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
+            assert_eq!(start.audit_fields().release_one(), Err(FinancialAuditFault::UnexpectedCut));
+            start.fields().test_code_sidecar_close_ok();
+            assert_primary(&start.physical, allocation); assert!(start.physical.parent_sidecars_retained());
+            assert_eq!(start.fields().source_work().test_code_observation(), before);
+        }
+    }
+    #[test]
+    fn history_original_audit_acquisition_local_pins_and_retained_frame_survive_short_ports() {
+        // Even an otherwise returned sidecar frame cannot start E05 after
+        // an already attempted close. The absence of slots is not authority.
+        let writer = financial_audit::fixed_writer();
+        let mut closed = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        fixed_returned_sidecars(&mut closed); closed.fields().test_code_sidecar_close_busy();
+        assert_eq!(closed.audit_fields().begin(&writer), Err(FinancialAuditFault::UnexpectedCut));
+        assert!(closed.physical.audit_phase == FinancialAuditPhase::NotStarted);
+        for cut in [FinancialAuditPinPhase::LocalParent, FinancialAuditPinPhase::LocalComplete, FinancialAuditPinPhase::CompleteRetained] {
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let (primary, allocation) = fixed_primary();
+            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_returned_sidecars(&mut start);
+            start.audit_fields().begin(&writer).unwrap();
+            assert!(start.audit_fields().records_port().is_err()); // A ready cut is mandatory.
+            start.audit.resources.loan().seed_fixed_case(Case::Ready, &trace);
+            let records = financial_audit::fixed_snapshot(); let tail_allocation = records.validation().tail_hash.as_ref().unwrap().as_ptr() as usize;
+            start.audit_fields().records_port().unwrap().retain(records);
+            { let mut fields = start.audit_fields(); let _unused = fields.parent_port().unwrap(); }
+            assert!(start.audit.parent.is_none()); assert_eq!(trace.snapshot(), [None; 8]);
+            start.audit_fields().parent_port().unwrap().retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
+            assert!(start.audit_fields().parent_port().is_err());
+            if cut != FinancialAuditPinPhase::LocalParent { start.audit_fields().file_port().unwrap().retain(fixed_file()); }
+            if cut == FinancialAuditPinPhase::CompleteRetained { start.audit_fields().finish_pins().unwrap(); }
+            assert_owned_pin(&start.audit); let before = start.fields().source_work().test_code_observation();
+            let mut frame = start.enter_rows(); // No new pool or second owned-work take.
+            { let _short = frame.audit_fields(); }
+            assert_owned_pin(&frame.audit); frame.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
+            assert_eq!(frame.audit.records.as_ref().unwrap().validation().tail_hash.as_ref().unwrap().as_ptr() as usize, tail_allocation);
+            frame.audit_fields().note_normal_failure().unwrap(); frame.fields().test_code_audit_blocks_close();
+            frame.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("same G primary"));
+            frame.audit_fields().begin_release().unwrap(); frame.audit.resources.loan().observe_fixed_unlock_ok();
+            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
+                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+                frame.fields().test_code_audit_blocks_close();
+            }
+            if cut != FinancialAuditPinPhase::CompleteRetained {
+                if cut == FinancialAuditPinPhase::LocalComplete {
+                    assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalFile)); frame.fields().test_code_audit_blocks_close();
+                }
+                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalParent)); frame.fields().test_code_audit_blocks_close();
+                assert!(frame.audit.parent.is_none() && frame.audit.leaf.is_none() && frame.audit.file.is_none());
+                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalRecords)); frame.fields().test_code_audit_blocks_close();
+                assert!(frame.audit.records.is_none());
+            }
+            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
+            frame.fields().test_code_sidecar_close_busy(); // Failed close holds retained audit/sidecar payload and first primary.
+            assert_primary(&frame.physical, allocation); assert!(frame.physical.parent_sidecars_retained());
+            if cut == FinancialAuditPinPhase::CompleteRetained {
+                assert_owned_pin(&frame.audit); assert!(frame.audit.file.is_some() && frame.audit.parent.is_some());
+                assert_eq!(frame.audit.records.as_ref().unwrap().validation().tail_hash.as_ref().unwrap().as_ptr() as usize, tail_allocation);
+            }
+            assert_eq!(frame.fields().source_work().test_code_observation(), before);
+        }
+    }
+    #[test]
+    fn history_original_audit_acquisition_terminal_keeps_unlock_errno_and_blocks_new_ports() {
+        for complete in [false, true] {
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_returned_sidecars(&mut start);
+            start.audit_fields().begin(&writer).unwrap(); start.audit.resources.loan().seed_fixed_case(Case::Ready, &trace);
+            start.audit_fields().records_port().unwrap().retain(financial_audit::fixed_snapshot());
+            start.audit_fields().parent_port().unwrap().retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
+            start.audit_fields().file_port().unwrap().retain(fixed_file());
+            if complete { start.audit_fields().finish_pins().unwrap(); }
+            let first = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            let before = start.fields().source_work().test_code_observation();
+            { let mut fields = start.audit_fields();
+                assert!(matches!(fields.records_port(), Err(FinancialAuditFault::Terminal)));
+                assert!(matches!(fields.parent_port(), Err(FinancialAuditFault::Terminal)));
+                assert!(matches!(fields.file_port(), Err(FinancialAuditFault::Terminal)));
+                assert_eq!(fields.finish_pins(), Err(FinancialAuditFault::Terminal));
+                assert_eq!(fields.note_normal_failure(), Err(FinancialAuditFault::Terminal));
+            }
+            assert_owned_pin(&start.audit); start.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
+            let mut frame = start.enter_rows(); frame.fields().test_code_audit_blocks_close();
+            frame.audit_fields().begin_release().unwrap();
+            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
+            { let _short = frame.audit_fields(); }
+            frame.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
+            frame.fields().test_code_audit_blocks_close(); frame.audit.resources.loan().observe_fixed_unlock_error();
+            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
+                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+                frame.fields().test_code_audit_blocks_close();
+            }
+            if !complete {
+                for action in [FinancialAuditRelease::LocalFile, FinancialAuditRelease::LocalParent, FinancialAuditRelease::LocalRecords] {
+                    assert_eq!(frame.audit_fields().release_one(), Ok(action)); frame.fields().test_code_audit_blocks_close();
+                }
+                assert!(frame.audit.file.is_none() && frame.audit.parent.is_none() && frame.audit.records.is_none());
+            }
+            frame.audit.resources.loan().assert_fixed_guard_released(); frame.audit.resources.loan().assert_fixed_unlock_error_retained();
+            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
+            assert_eq!(frame.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            frame.fields().test_code_sidecar_close_busy(); assert!(frame.physical.primary.is_none());
+            if complete { assert_owned_pin(&frame.audit); assert!(frame.audit.records.is_some()); }
+            assert_eq!(frame.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            assert_eq!(frame.fields().source_work().test_code_observation(), before);
+        }
+    }
+}
+
 impl GlobalSchemaVersionOwner {
     fn new() -> Self {
         new_global_schema_version_owner()
@@ -1763,13 +2121,13 @@ impl GlobalSchemaVersionOwner {
     // Callable by this genuine owner before any attributable source operation.
     // It initializes only one production meter and empty native/ledger places.
     // No current safe-driver purpose calls this incomplete financial route.
-    fn start_fixed_financial_source_work(&self) -> FinancialSourceStart {
+    fn start_fixed_financial_source_work<'writer>(&self) -> FinancialSourceStart<'writer> {
         let decision = FinancialStartDecision::fixed_production();
         let (decision, staged) =
             rows::original_source::StagedOriginalWork::stage_from_decision(decision);
         let native = replay_work::NativeOriginalOwner::from_start_decision(&decision);
         let release = replay_work::FixedDrainLedger::from_start_decision(&decision);
-        FinancialSourceStart { decision, native, staged, release, physical: FinancialPhysical::empty() }
+        FinancialSourceStart { decision, native, staged, release, physical: FinancialPhysical::empty(), audit: FinancialAuditState::empty() }
     }
 
     pub(crate) fn inspect_fixed_production(

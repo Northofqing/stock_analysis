@@ -862,6 +862,19 @@ pub(super) mod original_native {
         }
     }
 
+    impl NativeOriginalOwner {
+        // Fixed same-frame cut only; it carries no native/FS rules. In
+        // particular a first failed close cannot permit fresh acquisition.
+        pub(in crate::database::global_schema_v1) fn audit_acquisition_ready(&self) -> bool {
+            self.original.phase() == Some(ConnectionPhase::Configured)
+                && self.original.status().is_some_and(|status| matches!(status.close_first, CodeSlot::NotCalled))
+                && self.a00.phase == A00Phase::Complete
+                && !self.statements.iter().any(|slot| slot.live().is_some())
+                && matches!(&self.aux, AuxPlace::Empty)
+                && matches!(&self.tx.phase, TxPhase::NotCreated)
+        }
+    }
+
     // Opaque declaration only: the absent issuer cannot create a rule value.
     // No operation here interprets this as a qualified provider or a gate.
     struct SelectedOriginalNativeRules { _issuance: std::convert::Infallible }
@@ -891,7 +904,7 @@ pub(super) mod original_native {
         ConstructorComplete, PrepareA00, BeginA00Query, StepA00, ReadA00Integer,
         RetainPaidPrimary, DiscardPaidReset, DiscardPaidFinalize,
         ResetA00, FinalizeA00, A00Complete, ConstructorClose, OriginalClose,
-        Quiescent, FatalBorrow, FinishSidecarAcquisition, DrainSidecarLocals,
+        Quiescent, FatalBorrow, FinishSidecarAcquisition, DrainSidecarLocals, FinishAuditAcquisition, DrainAuditResources,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1006,7 +1019,11 @@ pub(super) mod original_native {
         // Both ports and settlement consult this same barrier. Terminal drain
         // deliberately bypasses it and never requests an owned error.
         fn pending_normal_action(&self) -> Option<LifecycleAction> {
-            if self.fields.physical.blocks_original_close() {
+            if self.fields.physical.audit_pending() {
+                return Some(if self.fields.physical.primary.is_some() { LifecycleAction::DrainAuditResources }
+                    else { LifecycleAction::FinishAuditAcquisition });
+            }
+            if self.fields.physical.sidecar_locals_pending() {
                 return Some(if self.fields.physical.primary.is_some() { LifecycleAction::DrainSidecarLocals }
                     else { LifecycleAction::FinishSidecarAcquisition });
             }
@@ -1041,7 +1058,8 @@ pub(super) mod original_native {
             }
         }
         fn drain_action(&self) -> LifecycleAction {
-            if self.fields.physical.blocks_original_close() { return LifecycleAction::DrainSidecarLocals; }
+            if self.fields.physical.audit_pending() { return LifecycleAction::DrainAuditResources; }
+            if self.fields.physical.sidecar_locals_pending() { return LifecycleAction::DrainSidecarLocals; }
             if let Some(state) = self.fields.native.statements[0].live() {
                 return if state.cursor != CursorPhase::NoCursor && matches!(state.reset, CodeSlot::NotCalled) {
                     LifecycleAction::ResetA00
@@ -1604,6 +1622,18 @@ pub(super) mod original_native {
             assert!(loan.primary.is_none()); // E04's primary remains in G, never duplicated in Q.
             assert_eq!(loan.fields.work.test_code_observation(), before);
             assert!(loan.fields.native.original.phase().is_some());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_audit_blocks_close(self) {
+            let before = self.work.test_code_observation();
+            let mut loan = self.original_acquisition();
+            let expected = if loan.terminal().is_some() || loan.fields.physical.primary.is_some() { LifecycleAction::DrainAuditResources }
+                else { LifecycleAction::FinishAuditAcquisition };
+            assert_eq!(loan.constructor().next(), expected);
+            assert_eq!(loan.a00_epilogue().next(), expected);
+            assert_eq!(loan.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            let AcquisitionSettlement::Held(loan) = loan.settle() else { panic!("audit resources/primary obligation must hold the same loan"); };
+            assert!(loan.primary.is_none());
+            assert_eq!(loan.fields.work.test_code_observation(), before);
         }
         pub(in crate::database::global_schema_v1) fn test_code_sidecar_close_ok(self) {
             let before = self.work.test_code_observation();
