@@ -366,6 +366,8 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 
 接续仍由 root 独占实际源码应用、共享 Cargo 和构建录制；作者只封存源码，非作者独立复核。全部失败原件保留。上列7类整体余项继续有效，没有新部署、生产重启或消息重发。
 
-第五次真实 bundled 录制已结束：EXIT2/605.392秒，Cargo101，308个Rust调用均有request/receipt，没有request-only；922项应用输入与Tools/清单在录制前后保持不变。112个原生请求中，30次ring/psm对象编译实际EXIT0；ring两批共29个成员的`cq`追加实际EXIT0，psm的`cq`追加和`s`索引实际EXIT0，原始归档前后快照保留。ring随后的`s`索引在工具执行前被ForeignArchiveTemplate拒绝。lz4/zstd的5次E预处理实际EXIT0，后续H/V、41次普通编译及3次zstd flag探测仍被拒绝；真实Clang请求已观察，不能把包装拒绝当底层工具不支持。新的blake3来源上下文还有6次E和4次C请求拒绝，需要单独补齐。SQLite实际调用仍为零，selected library为空，构建失败原件保留，不发行原生provider或可用pin资格。本轮数据摘要已提取2096项原始绑定，独立数据复核正在进行。
+第五次真实 bundled 录制已结束：EXIT2/605.392秒，Cargo101，308个Rust调用均有request/receipt，没有request-only；922项应用输入与Tools/清单在录制前后保持不变。112个原生请求中，30次ring/psm对象编译实际EXIT0；ring两批共29个成员的`cq`追加实际EXIT0，psm的`cq`追加和`s`索引实际EXIT0，原始归档前后快照保留。ring随后的`s`索引在工具执行前被ForeignArchiveTemplate拒绝。lz4/zstd的5次E预处理实际EXIT0，后续H/V、41次普通编译及3次zstd flag探测仍被拒绝；真实Clang请求已观察，不能把包装拒绝当底层工具不支持。新的blake3来源上下文还有6次E和4次C请求拒绝，需要单独补齐。SQLite实际调用仍为零，selected library为空，构建失败原件保留，不发行原生provider或可用pin资格。本轮2096项原始绑定、完整目录和全部调用投影已通过独立数据复核；ring归档成员台账0→16→29，psm0→1→1，psm索引后的字节相同但文件身份改变。复核确认记录准确，构建失败结论不变。
 
-财务采集首包在源码阶段发现DONE之后、reset之前发生终止时的owned-result保留义务缺口，已停止应用；原首包保持NOT_RUN。最小修补包已封存，仅修改该保留分支并补充三个查询各两种reset结果的延迟交付控制；独立源码审查和新增3项、相关6项库测试尚待，不能记作已完成实现。
+财务采集首包在源码阶段发现DONE之后、reset之前发生终止时的owned-result保留义务缺口，已停止应用；原首包保持NOT_RUN。最小修补包已通过独立源码审查并应用，仅修改该保留分支并补充三个查询各两种reset结果的延迟交付控制。新增3项定向库测试实际通过（300.357秒），同一封存library harness的相关6项也全部通过，共9项；独立源码和运行复核均通过，已本地提交 `5ec9c7fc`。该片仍仅覆盖私有固定三查询机制，真实SQL、callee私有缓冲所有权、formatter付款、native/provider与完整历史16MiB路径继续未交付。
+
+ring 固定29成员归档的后续 `s` 索引源码包已封存，保留旧108项完整测试，新增两项行为测试，非作者源码审查正在进行，尚未应用或运行。lz4/zstd H/V及三个zstd编译选项探测的源码仍在并行开发；41次普通编译需在真实选项结果观察后重新绑定。下一段财务SQLite编译选项采集正在梳理Statement、行迭代器和返回集合的所有权与清理时机，尚未授予源码实施或运行通过。
