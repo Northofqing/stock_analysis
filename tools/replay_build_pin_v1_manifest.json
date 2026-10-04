@@ -39324,6 +39324,6 @@
     }
   },
   "mode": "RecordingOnly",
-  "profile": "normaldev-library",
+  "profile": "normaldev-library-bundledsqlite-v1",
   "schema": "stock-analysis-replay-build-record-v1"
 }
