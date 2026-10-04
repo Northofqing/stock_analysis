@@ -3053,9 +3053,14 @@ def foreign_e_only_prior(session, context, current_call):
     return rows
 
 
-def foreign_context(env, cwd, session, inv):
+def foreign_context(env, cwd, session, inv, *, args=None):
     # Source recognition precedes labels, flags and OUT_DIR. No generic fallback.
     require(cwd.is_absolute() and cwd.resolve() == cwd and not cwd.is_symlink(), "ForeignSourceAlias")
+    if args is not None and foreign_flag_argv(args, cwd) is not None:
+        out = Path(env.get("OUT_DIR", ""))
+        require(cwd == out and out.name == "out" and out.parent.parent == session / "target" / TARGET / "debug/build"
+                and re.fullmatch(r"zstd-sys-[0-9a-f]{16}", out.parent.name), "ForeignSourceContext")
+        return foreign_e_only_context(env, session / "vendor/zstd-sys", session, inv, "zstd-sys")
     selected = next((n for n in FOREIGN_E_ONLY_PACKAGES if cwd == session / "vendor" / n), None)
     if selected is not None: return foreign_e_only_context(env, cwd, session, inv, selected)
     name = next((n for n in FOREIGN_PACKAGES if cwd == session / "vendor" / n), None)
@@ -3149,8 +3154,12 @@ def foreign_prior(session, context, current_call=None):
 def foreign_probe_classify(role, args, context, env, session, inv, *, history=None, current_call=None):
     require(role == "cc", "ForeignRole")
     if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
+        if args in (["-?"], ["--version"]):
+            return foreign_e_stage(args, context, session, inv, current_call=current_call)
         require((len(args) == 2 and args[:1] == ["-E"])
                 or (len(args) == 3 and args[:2] == ["-E", "--"]), "ForeignEOnlyArgv")
+        if history is None and current_call is not None:
+            foreign_e_before_file(args, context, session, inv, current_call)
     # Fresh Command::new calls have no Tool.args or compile locale adjustment.
     if args == ["-?"]:
         return {"class": "CompilerFamilyHelpProbe", "context_group": context["out_dir"],
@@ -3193,6 +3202,9 @@ def foreign_semantics(call, receipt):
     if kind == "CompilerFamilyVersionProbe":
         return {"zig_cc": code == 0 and "ziglang" in stdout,
                 "source_nonzero_default": code != 0}
+    if kind == "CompilerFlagProbe":
+        return {"supported": code == 0 and (call / "stderr.raw").stat().st_size == 0,
+                "source_branch": "StatusSuccessAndEmptyStderr", "execution_edge": "not_observed"}
     if kind == "CompilerObjectCompile":
         return {"compiler_success": code == 0, "object_observed": receipt["output_post"]["exists"]}
     if kind in {"ArchiverFirstAppend", "ArchiverRemainingAppend"}:
@@ -3446,6 +3458,12 @@ def foreign_archive_classify(role, args, context):
         foreign_archive_partition(context)
         members = [str(out / n) for n in FOREIGN_ARCHIVE_REMAINING_MEMBERS]
         kind = "ArchiverRemainingAppend"
+    elif name == "ring" and args == ["s", str(archive)]:
+        # Index has no member argv. Its semantic input is the complete fixed
+        # two-batch operand ledger, not an observed binary archive inventory.
+        foreign_archive_partition(context)
+        members += [str(out / n) for n in FOREIGN_ARCHIVE_REMAINING_MEMBERS]
+        kind = "ArchiverIndex"
     elif name == "psm" and args == ["s", str(archive)]:
         # The original one-member ledger is semantic input, not members argv.
         kind = "ArchiverIndex"
@@ -3473,6 +3491,8 @@ def foreign_archive_partition(context):
 
 
 def foreign_archive_stage(operation):
+    if (operation["class"], operation["mode"]) == ("ArchiverIndex", "s") and Path(operation["archive"]).name == RING_ARCHIVES[0]:
+        return "RingIndexS"
     stages = {("ArchiverFirstAppend", "cqD"): "FirstD", ("ArchiverFirstAppend", "cq"): "FirstFallbackCQ",
               ("ArchiverRemainingAppend", "cq"): "RingRemainingCQ", ("ArchiverIndex", "s"): "PSMIndexS"}
     stage = stages.get((operation["class"], operation["mode"]))
@@ -3517,15 +3537,36 @@ def foreign_archive_predecessor(operation, chain):
     elif stage == "FirstFallbackCQ":
         require(len(chain) == 1 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
                 and chain[0][1]["tool_result"] != 0, "ForeignArchivePredecessor")
+    elif stage == "RingIndexS":
+        # Both callers obtained this chain from the strict raw/control/member
+        # history gate. Preserve the old no-child diagnostic only for its
+        # genuine empty-D -> successful ordered-first16 prefix, before CQ13.
+        if (len(chain) == 2 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
+                and chain[0][1]["tool_result"] != 0
+                and chain[0][1]["archive_post"]["exists"] is False
+                and foreign_archive_stage(chain[1][1]["operation"]) == "FirstFallbackCQ"
+                and chain[1][1]["tool_result"] == 0
+                and all(r["operation"]["archive"] == operation["archive"] for _, r in chain)
+                and [p["path"] for p in foreign_archive_ledger(chain)["producers"]]
+                    == [str(Path(operation["archive"]).parent / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS["ring"]]):
+            require(False, "ForeignArchiveTemplate")
+        require(len(chain) == 3 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
+                and chain[0][1]["tool_result"] != 0
+                and foreign_archive_stage(chain[1][1]["operation"]) == "FirstFallbackCQ"
+                and chain[1][1]["tool_result"] == 0
+                and foreign_archive_stage(chain[2][1]["operation"]) == "RingRemainingCQ"
+                and chain[2][1]["tool_result"] == 0, "ForeignArchivePredecessor")
     else:
         require(len(chain) == 2 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
                 and chain[0][1]["tool_result"] != 0
                 and foreign_archive_stage(chain[1][1]["operation"]) == "FirstFallbackCQ"
                 and chain[1][1]["tool_result"] == 0, "ForeignArchivePredecessor")
     require(not chain or all(r["operation"]["archive"] == operation["archive"] for _, r in chain), "ForeignArchivePredecessor")
-    if stage in ("RingRemainingCQ", "PSMIndexS"):
-        name = "ring" if stage == "RingRemainingCQ" else "psm"
-        expected = [str(Path(operation["archive"]).parent / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS[name]]
+    if stage in ("RingRemainingCQ", "PSMIndexS", "RingIndexS"):
+        name = "ring" if stage in ("RingRemainingCQ", "RingIndexS") else "psm"
+        names = FOREIGN_ARCHIVE_FIRST_MEMBERS[name]
+        if stage == "RingIndexS": names = (*names, *FOREIGN_ARCHIVE_REMAINING_MEMBERS)
+        expected = [str(Path(operation["archive"]).parent / n) for n in names]
         require([p["path"] for p in foreign_archive_ledger(chain)["producers"]] == expected,
                 "ForeignArchiveLedger")
 
@@ -3642,7 +3683,8 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
         stage = foreign_archive_stage(operation)
         require(stage not in rows, "ForeignArchiveOnce"); rows[stage] = (call, receipt)
     chain = []
-    stages = ("FirstD", "FirstFallbackCQ", "RingRemainingCQ" if Path(context["manifest"]).name == "ring" else "PSMIndexS")
+    stages = (("FirstD", "FirstFallbackCQ", "RingRemainingCQ", "RingIndexS")
+              if Path(context["manifest"]).name == "ring" else ("FirstD", "FirstFallbackCQ", "PSMIndexS"))
     for stage in stages:
         if stage not in rows: continue
         call, receipt = rows[stage]; operation = receipt["operation"]
@@ -3661,6 +3703,232 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
     return chain
 
 
+FOREIGN_FLAG_ORDER = ("-ffunction-sections", "-fdata-sections", "-fmerge-all-constants")
+FOREIGN_FLAG_COMMON = ("-O0", "-ffunction-sections", "-fdata-sections", "-fPIC", "-m64",
+    "--target=x86_64-apple-macosx", "-mmacosx-version-min=26.5", "-Wall", "-Wextra")
+
+
+def foreign_flag_argv(args, out):
+    return next((flag for flag in FOREIGN_FLAG_ORDER if args == [*FOREIGN_FLAG_COMMON, flag,
+        "-Wno-unused-command-line-argument", "-o", str(out / "flag_check"), "-c", str(out / "flag_check.c")]), None)
+
+
+def foreign_e_reference(call, receipt):
+    return {"operation_id": call.name, "request_sha256": file_hash(call / "request.json"),
+            "receipt_sha256": file_hash(call / "receipt.json"), "stdout_sha256": receipt["stdout_sha256"],
+            "stderr_sha256": receipt["stderr_sha256"]}
+
+
+def foreign_e_history(session, inv, context, *, current_call=None, live_output=True, pending_retry_source=None):
+    """Strict same-group capture history. Retained context selects negatives only."""
+    policy = strict_json(POLICY.read_bytes()); owner = strict_json((session / "owner.json").read_bytes())
+    require(policy["inventory"] == inv, "ForeignFamilyControl")
+    controls = foreign_controls(session, policy, owner, context)
+    rows = {}; namespace = session / "foreign-native-invocations"
+    for call in namespace.iterdir():
+        if call == current_call: continue
+        require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call and not call.is_symlink(), "ForeignFamilyEvidenceAlias")
+        request_path = call / "request.json"; receipt_path = call / "receipt.json"
+        if not request_path.exists() and not receipt_path.exists(): continue
+        request = strict_json(request_path.read_bytes()) if request_path.exists() else None
+        receipt = strict_json(receipt_path.read_bytes()) if receipt_path.exists() else None
+        if isinstance(request, dict): require(isinstance(request.get("environment_hex"), dict), "ForeignFamilyReceiptBinding")
+        env = ({os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+               if isinstance(request, dict) else {})
+        retained = receipt.get("context") if isinstance(receipt, dict) else None
+        relevant = env.get("OUT_DIR") == context["out_dir"] or (isinstance(retained, dict) and retained.get("out_dir") == context["out_dir"])
+        if not relevant: continue
+        require(isinstance(request, dict) and isinstance(receipt, dict), "ForeignFamilyPending")
+        for path in (request_path, receipt_path):
+            regular(path); require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignFamilyEvidenceAlias")
+        keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
+        require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly" and request["lane"] == FOREIGN_LANE
+                and request["role"] == "cc" and request["owner_issued_inspector"] is False
+                and receipt["operation_id"] == call.name and all(receipt.get(k) == v for k, v in request.items()), "ForeignFamilyReceiptBinding")
+        require(receipt["protocol_state"] == "Completed" and receipt["failures"] == [], "ForeignFamilySticky")
+        args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        require(foreign_context(env, cwd, session, inv, args=args) == context and receipt["context"] == context
+                and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignFamilyControl")
+        operation = receipt.get("operation"); require(isinstance(operation, dict), "ForeignFamilyClassification")
+        kind = operation.get("class"); flagging = kind == "CompilerFlagProbe"
+        (foreign_compile_environment if flagging else foreign_environment)(env, session, inv)
+        require(receipt["tool_sha256"] == inv["generators"]["CC"]["sha256"]
+                and receipt["argv_hex"] == [os.fsencode(inv["generators"]["CC"]["path"]).hex(), *request["args_hex"]], "ForeignFamilyTool")
+        foreign_jobserver_binding(receipt["jobserver_identity"], env)
+        require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
+        for stream in ("stdout", "stderr"):
+            path = call / (stream + ".raw"); regular(path)
+            require(path.resolve() == path and path.stat().st_nlink == 1 and file_hash(path) == receipt[stream + "_sha256"], "ForeignFamilyStream")
+        require(foreign_semantics(call, receipt) == receipt["source_semantics"], "ForeignFamilySemantics")
+        require(kind in {"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"}, "ForeignFamilyClass")
+        rows[call.name] = (call, receipt, args)
+    files = {i: row for i, row in rows.items() if row[1]["operation"]["class"] == "CompilerFamilyFileProbe"}
+    helps = {i: row for i, row in rows.items() if row[1]["operation"]["class"] == "CompilerFamilyHelpProbe"}
+    versions = {i: row for i, row in rows.items() if row[1]["operation"]["class"] == "CompilerFamilyVersionProbe"}
+    flags = {i: row for i, row in rows.items() if row[1]["operation"]["class"] == "CompilerFlagProbe"}
+    for i, (call, receipt, args) in files.items():
+        op = receipt["operation"]; predecessor = op.get("predecessor")
+        history = [(files[predecessor][0], files[predecessor][1])] if predecessor in files else []
+        require(foreign_probe_classify("cc", args, context, {}, session, inv, history=history) == op, "ForeignFamilyClassification")
+        pre, post = receipt.get("input_pre"), receipt.get("input_post")
+        require(isinstance(pre, dict) and isinstance(post, dict) and native_state_key(pre) == native_state_key(post)
+                and pre["exists"] is True and pre["path"] == op["source"] and pre["length"] == 206 and pre["sha256"] == PROBE_DIGEST, "ForeignFamilyLiteral")
+        native_state_check(call, pre); native_state_check(call, post, live=True, retire=True)
+    require(len({r[1]["operation"]["source"] for r in files.values() if not r[1]["operation"]["retry"]})
+            == len([r for r in files.values() if not r[1]["operation"]["retry"]]), "ForeignFamilyRepeated")
+    require(len({r[1]["operation"]["predecessor"] for r in files.values() if r[1]["operation"]["retry"]})
+            == len([r for r in files.values() if r[1]["operation"]["retry"]]), "ForeignFamilyRepeated")
+    effective = {i for i, (_, r, _) in files.items() if r["source_semantics"]["effective_stdout"]}
+    for i, (_, receipt, _) in files.items():
+        if i not in effective:
+            require(receipt["source_semantics"]["warning_retry_requested"] and (
+                receipt["operation"]["source"] == pending_retry_source or any(
+                    row[1]["operation"].get("predecessor") == i and rid in effective for rid, row in files.items())), "ForeignFamilyPending")
+    require(len({r[1]["operation"].get("predecessor") for r in helps.values()}) == len(helps), "ForeignFamilyRepeated")
+    require(len({r[1]["operation"].get("predecessor") for r in versions.values()}) == len(versions), "ForeignFamilyRepeated")
+    for kind, mapping, predecessor_map, argv in (("CompilerFamilyHelpProbe", helps, files, ["-?"]),
+                                                ("CompilerFamilyVersionProbe", versions, helps, ["--version"])):
+        for i, (call, receipt, args) in mapping.items():
+            op = receipt["operation"]; predecessor = op.get("predecessor")
+            require(args == argv and predecessor in predecessor_map and op == {"class": kind,
+                "context_group": context["out_dir"], "predecessor": predecessor, "previous_version": op.get("previous_version")}, "ForeignFamilyClassification")
+            if kind == "CompilerFamilyHelpProbe":
+                require(predecessor in effective and predecessor_map[predecessor][1]["source_semantics"]["markers"]["clang"]
+                        and not predecessor_map[predecessor][1]["source_semantics"]["markers"]["VxWorks"], "ForeignFamilyClang")
+                previous = op["previous_version"]
+                require(previous is None or previous in versions, "ForeignFamilyOrder")
+            else:
+                h = predecessor_map[predecessor][1]
+                require(op["previous_version"] == h["operation"]["previous_version"], "ForeignFamilyOrder")
+                require(h["tool_result"] == 1 and h["source_semantics"] == {"accepts_cl_style_flags": False, "source_branch": "ClStyleRejected"}, "ForeignFamilyClang")
+            require(not any(k in receipt for k in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return", "archive_pre", "archive_post")), "ForeignOutputFreeClass")
+    # Explicit predecessor links establish order; directory names/timestamps do not.
+    ordered = []; previous = None
+    while True:
+        following = [row for row in versions.values() if row[1]["operation"]["previous_version"] == previous]
+        if not following: break
+        require(len(following) == 1 and following[0][0].name not in {row[0].name for row in ordered}, "ForeignFamilyOrder")
+        ordered.append(following[0]); previous = following[0][0].name
+    require(len(ordered) == len(versions), "ForeignFamilyOrder")
+    require(len({row[1]["operation"]["previous_version"] for row in helps.values()}) == len(helps), "ForeignFamilyOrder")
+    ordered_flags = []; previous_flag = None
+    for index in range(len(flags)):
+        following = [row for row in flags.values() if row[1]["operation"].get("predecessor") == previous_flag]
+        require(len(following) == 1 and index < len(FOREIGN_FLAG_ORDER), "ForeignFlagOrder")
+        call, receipt, args = following[0]; op = receipt["operation"]
+        require(op == foreign_flag_operation(args, context, index, previous_flag), "ForeignFlagArgv")
+        require(len(ordered) >= index + 2 and receipt["family_pre"] == receipt["family_return"]
+                == foreign_e_family_evidence(ordered[0], ordered[index + 1], rows, context), "ForeignFamilyChanged")
+        for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return"):
+            require(isinstance(receipt.get(key), dict), "ForeignSnapshotFields"); native_state_check(call, receipt[key])
+        pre, post = receipt["input_pre"], receipt["input_post"]
+        require(native_state_key(pre) == native_state_key(post) == native_state_key(receipt["input_return"])
+                and pre["exists"] is True and pre["path"] == op["source"] and pre["length"] == 28
+                and pre["sha256"] == FOREIGN_FLAG_LITERAL_DIGEST, "ForeignFlagLiteral")
+        require(receipt["output_pre"]["path"] == receipt["output_post"]["path"] == op["output"]
+                and native_state_key(receipt["output_post"]) == native_state_key(receipt["output_return"]), "ForeignFlagOutput")
+        expected = ordered_flags[-1][1]["output_return"] if ordered_flags else {"exists": False, "path": op["output"]}
+        require(native_state_key(receipt["output_pre"]) == native_state_key(expected), "ForeignFlagPredecessor")
+        ordered_flags.append(following[0]); previous_flag = call.name
+    if ordered_flags:
+        call, receipt, _ = ordered_flags[-1]
+        native_state_check(call, receipt["input_return"], live=True)
+        if live_output: native_state_check(call, receipt["output_return"], live=True)
+    return rows, effective, helps, ordered, ordered_flags
+
+
+def foreign_e_family_evidence(base, probe, rows, context):
+    def group(version):
+        vcall, v, _ = version; hcall, h, _ = rows[v["operation"]["predecessor"]]
+        ecall, e, _ = rows[h["operation"]["predecessor"]]
+        require(e["tool_result"] == 0 and e["source_semantics"]["effective_stdout"]
+                and e["source_semantics"]["markers"]["clang"] and v["tool_result"] == 0
+                and v["source_semantics"] == {"zig_cc": False, "source_nonzero_default": False}, "ForeignFamilyClang")
+        evidence = [foreign_e_reference(ecall, e), foreign_e_reference(hcall, h), foreign_e_reference(vcall, v)]
+        if e["operation"]["retry"]:
+            pcall, p, _ = rows[e["operation"]["predecessor"]]; evidence.insert(0, foreign_e_reference(pcall, p))
+        return evidence
+    return {"family": "Clang", "context_group": context["out_dir"], "base": group(base), "probe": group(probe),
+            "mapping_rule": "RecordingOnlySourceOrderedCapture", "execution_edge": "not_observed"}
+
+
+def foreign_e_before_file(args, context, session, inv, current_call):
+    # Preserve the original pure-E path. Once raw/retained extended evidence is
+    # published, a fresh E cannot reset that group's sticky history.
+    extended = False
+    for call in (session / "foreign-native-invocations").iterdir():
+        if call == current_call: continue
+        receipt_path = call / "receipt.json"
+        receipt = strict_json(receipt_path.read_bytes()) if receipt_path.exists() else {}
+        retained = receipt.get("context", {}) if isinstance(receipt, dict) else {}
+        request_path = call / "request.json"
+        try: request = strict_json(request_path.read_bytes()) if request_path.exists() else {}
+        except ValueError:
+            require(not (isinstance(retained, dict) and retained.get("out_dir") == context["out_dir"]), "ForeignFamilyReceiptBinding")
+            continue
+        require(isinstance(request, dict) and isinstance(receipt, dict)
+                and isinstance(request.get("environment_hex", {}), dict), "ForeignFamilyReceiptBinding")
+        raw_env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request.get("environment_hex", {}).items()}
+        raw_args = [os.fsdecode(bytes.fromhex(v)) for v in request.get("args_hex", [])]
+        raw_group = raw_env.get("OUT_DIR") == context["out_dir"]
+        retained_group = isinstance(retained, dict) and retained.get("out_dir") == context["out_dir"]
+        kind = receipt.get("operation", {}).get("class") if isinstance(receipt.get("operation"), dict) else None
+        retained_args = [os.fsdecode(bytes.fromhex(v)) for v in receipt.get("args_hex", [])]
+        if (raw_group and (raw_args in (["-?"], ["--version"]) or "-c" in raw_args)) or (retained_group and (
+                retained_args in (["-?"], ["--version"]) or "-c" in retained_args or kind in {
+                    "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"})): extended = True
+    if not extended: return
+    pending = args[-1] if args[:2] == ["-E", "--"] else None
+    rows, effective, helps, versions, flags = foreign_e_history(session, inv, context, current_call=current_call, pending_retry_source=pending)
+    require(Path(context["manifest"]).name == "zstd-sys" and len(helps) < 4, "ForeignFamilyRepeated")
+    require(len(helps) == len(versions) and {row[1]["operation"]["predecessor"] for row in helps.values()} == effective
+            and len(versions) == len(flags) + 1, "ForeignFlagFamilyOrder")
+    foreign_e_family_evidence(versions[0], versions[-1], rows, context)
+
+
+def foreign_e_stage(args, context, session, inv, *, current_call=None):
+    rows, effective, helps, ordered, flags = foreign_e_history(session, inv, context, current_call=current_call)
+    if args == ["-?"]:
+        consumed = {row[1]["operation"]["predecessor"] for row in helps.values()}
+        available = effective - consumed
+        require(len(available) == 1, "ForeignEOnlyArgv" if not effective else "ForeignFamilyUnique")
+        require(len(helps) == len(ordered), "ForeignFamilyPending")
+        name = Path(context["manifest"]).name
+        require(len(helps) < (1 if name == "lz4-sys" else 4), "ForeignFamilyRepeated")
+        if name == "zstd-sys" and ordered:
+            require(len(ordered) == len(flags) + 1, "ForeignFlagFamilyOrder")
+        if ordered: foreign_e_family_evidence(ordered[0], ordered[-1], rows, context)
+        predecessor = next(iter(available)); require(rows[predecessor][1]["source_semantics"]["markers"]["clang"]
+                and not rows[predecessor][1]["source_semantics"]["markers"]["VxWorks"], "ForeignFamilyClang")
+        return {"class": "CompilerFamilyHelpProbe", "context_group": context["out_dir"], "predecessor": predecessor,
+                "previous_version": ordered[-1][0].name if ordered else None}
+    require(args == ["--version"], "ForeignEOnlyArgv")
+    consumed = {row[1]["operation"]["predecessor"] for row in ordered}
+    available = set(helps) - consumed
+    require(len(available) == 1, "ForeignEOnlyArgv" if not helps else "ForeignFamilyUnique")
+    predecessor = next(iter(available)); h = helps[predecessor][1]
+    require(h["tool_result"] == 1 and h["source_semantics"] == {"accepts_cl_style_flags": False, "source_branch": "ClStyleRejected"}, "ForeignFamilyClang")
+    return {"class": "CompilerFamilyVersionProbe", "context_group": context["out_dir"], "predecessor": predecessor,
+            "previous_version": h["operation"]["previous_version"]}
+
+
+def foreign_flag_operation(args, context, index, predecessor):
+    out = Path(context["out_dir"]); flag = foreign_flag_argv(args, out)
+    require(index < len(FOREIGN_FLAG_ORDER) and flag == FOREIGN_FLAG_ORDER[index], "ForeignFlagArgv")
+    return {"class": "CompilerFlagProbe", "flag": flag, "index": index, "source": str(out / "flag_check.c"),
+            "output": str(out / "flag_check"), "context_group": str(out), "predecessor": predecessor}
+
+
+def foreign_flag_stage(args, context, session, inv, *, current_call=None, live_output=True):
+    rows, effective, helps, ordered, flags = foreign_e_history(session, inv, context, current_call=current_call, live_output=live_output)
+    require("zig" not in Path(inv["generators"]["CC"]["path"]).name, "ForeignFamilyClang")
+    require(len(helps) == len(ordered) and {row[1]["operation"]["predecessor"] for row in helps.values()} == effective
+            and len(ordered) == len(flags) + 2, "ForeignFlagFamilyOrder")
+    operation = foreign_flag_operation(args, context, len(flags), flags[-1][0].name if flags else None)
+    return operation, foreign_e_family_evidence(ordered[0], ordered[-1], rows, context), flags
+
+
 def foreign_operation(session, policy, owner, role, args, cwd, env):
     namespace = session / "foreign-native-invocations"
     namespace.mkdir(mode=0o700, exist_ok=True)
@@ -3677,19 +3945,23 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
         inv = native_control(session, policy, owner)
         declaration = foreign_e_only_declaration(inv, cwd, args, env, session)
         if declaration is not None: receipt["e_only_input_declaration"] = declaration
-        context = foreign_context(env, cwd, session, inv); receipt["context"] = context
+        context = foreign_context(env, cwd, session, inv, args=args); receipt["context"] = context
+        flagging = foreign_flag_argv(args, Path(context["out_dir"])) is not None and cwd == Path(context["out_dir"])
         if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
-            require(role == "cc" and ((len(args) == 2 and args[:1] == ["-E"])
+            require(role == "cc" and (flagging or args in (["-?"], ["--version"]) or (len(args) == 2 and args[:1] == ["-E"])
                     or (len(args) == 3 and args[:2] == ["-E", "--"])), "ForeignEOnlyArgv")
-        archiving = role == "ar"; compiling = "-c" in args and not archiving
+        archiving = role == "ar"; compiling = "-c" in args and not archiving and not flagging
         if archiving:
             # Declarations are negative-only, retained before environment/pin refusal.
             receipt["compile_input_declaration"] = foreign_compile_inputs(inv, Path(context["manifest"]).name)
             names = RING_ARCHIVES if Path(context["manifest"]).name == "ring" else (PSM_ARCHIVE,)
             receipt["archive_output_declaration"] = [str(Path(context["out_dir"]) / n) for n in names]
-        (foreign_archive_environment if archiving else foreign_compile_environment if compiling else foreign_environment)(env, session, inv)
+        (foreign_archive_environment if archiving else foreign_compile_environment if compiling or flagging else foreign_environment)(env, session, inv)
         controls = foreign_controls(session, policy, owner, context); receipt["controls_pre"] = controls
-        operation = (foreign_archive_classify(role, args, context) if archiving
+        if flagging:
+            operation, family, flag_history = foreign_flag_stage(args, context, session, inv, current_call=call)
+            receipt["family_pre"] = family
+        operation = (operation if flagging else foreign_archive_classify(role, args, context) if archiving
                      else foreign_compile_classify(role, args, context, session, current_call=call) if compiling
                      else foreign_probe_classify(role, args, context, env, session, inv, current_call=call))
         receipt["operation"] = operation
@@ -3716,6 +3988,12 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
             receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw", bound=206)
             require(receipt["input_pre"]["length"] == 206 and receipt["input_pre"]["sha256"] == PROBE_DIGEST,
                     "ForeignProbeLiteral")
+        if flagging:
+            receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw", bound=28)
+            require(receipt["input_pre"]["length"] == 28 and receipt["input_pre"]["sha256"] == FOREIGN_FLAG_LITERAL_DIGEST, "ForeignFlagLiteral")
+            receipt["output_pre"] = native_snapshot(call, operation["output"], "output-pre.raw", absent=True)
+            expected = flag_history[-1][1]["output_return"] if flag_history else {"exists": False, "path": operation["output"]}
+            require(native_state_key(receipt["output_pre"]) == native_state_key(expected), "ForeignFlagPredecessor")
         if compiling:
             receipt["input_pre"] = native_snapshot(call, operation["source"], "input-pre.raw")
             receipt["output_pre"] = native_snapshot(call, operation["output"], "output-pre.raw", absent=True)
@@ -3735,7 +4013,7 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
         receipt["jobserver_identity"] = native_jobserver_identity(fds)
         code, faults = native_streamed([tool, *args], cwd, env, call, fds, {})
         receipt["tool_result"] = code; receipt["failures"].extend(faults)
-        if compiling:
+        if compiling or flagging:
             # Capture even a failed compiler's partial output before input/control checks.
             receipt["output_post"] = native_snapshot(call, operation["output"], "output-post.raw", absent=True)
         if archiving:
@@ -3746,11 +4024,11 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
                 receipt["archive_members_post"].append(native_snapshot(call, path, "archive-member-post-" + str(index) + ".raw"))
             foreign_archive_states(call, receipt, operation, live_archive=True)
         if "input_pre" in receipt:
-            receipt["input_post"] = native_snapshot(call, operation["source"], "input-post.raw", bound=receipt["input_pre"]["length"] if compiling else 206)
+            receipt["input_post"] = native_snapshot(call, operation["source"], "input-post.raw", bound=receipt["input_pre"]["length"] if compiling or flagging else 206)
             require(native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"]), "ForeignInputChanged")
         if compiling:
             require(code != 0 or (receipt["output_post"]["exists"] and receipt["output_post"]["length"] > 0), "ForeignCompileObjectMissing")
-        post_context = foreign_context(env, cwd, session, inv)
+        post_context = foreign_context(env, cwd, session, inv, args=args)
         receipt["controls_post"] = foreign_controls(session, policy, owner, post_context)
         require(receipt["controls_post"] == controls, "ForeignControlChanged")
         if compiling or archiving:
@@ -3780,12 +4058,19 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
     # A fault swallowed by cc stays in this receipt and in the aggregate seal.
     if receipt["protocol_state"] == "Completed":
         try:
-            context = foreign_context(env, cwd, session, inv)
+            context = foreign_context(env, cwd, session, inv, args=args)
             receipt["controls_return"] = foreign_controls(session, policy, owner, context)
             require(receipt["controls_return"] == receipt["controls_pre"], "ForeignControlChanged")
             receipt["jobserver_return"] = native_jobserver_identity(fds)
             require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
             if "input_post" in receipt: native_state_check(call, receipt["input_post"], live=True)
+            if flagging:
+                native_state_check(call, receipt["output_post"], live=True)
+                receipt["input_return"] = dict(receipt["input_post"])
+                receipt["output_return"] = dict(receipt["output_post"])
+                returned, family, _ = foreign_flag_stage(args, context, session, inv, current_call=call, live_output=False)
+                receipt["family_return"] = family
+                require(returned == operation and family == receipt["family_pre"], "ForeignFamilyChanged")
             if compiling:
                 native_state_check(call, receipt["output_post"], live=True)
                 receipt["compile_pins_return"] = foreign_compile_pins(session, inv, context)
@@ -3873,11 +4158,13 @@ def foreign_evidence_namespace(session):
                                  if isinstance(value, str) and Path(value).is_absolute())
                 # Harvest every valid digest; one bad state cannot hide another.
                 # Shape and cwd-dependent path checks remain in the request phase.
-                for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
+                for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return", "archive_pre", "archive_post"):
                     state = receipt.get(key)
                     if isinstance(state, dict):
                         sha = state.get("sha256")
                         if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+                        value = state.get("path")
+                        if isinstance(value, str) and Path(value).is_absolute(): paths.add(str(Path(value).resolve()))
         except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
             receipt = None
             blockers.append("ForeignNamespace:" + call.name + ":" + str(error))
@@ -3941,7 +4228,7 @@ def foreign_evidence_namespace(session):
                     paths.update(str(out / n) for n in (*names, *FOREIGN_ARCHIVE_FIRST_MEMBERS[name],
                                  *(FOREIGN_ARCHIVE_REMAINING_MEMBERS if name == "ring" else ())))
             if receipt is not None:
-                for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
+                for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return", "archive_pre", "archive_post"):
                     state = receipt.get(key, {})
                     require(isinstance(state, dict), "ForeignSnapshotFields")
                     if "path" in state: paths.add(str((cwd / state["path"]).resolve()))
@@ -4070,9 +4357,12 @@ def foreign_seal(session, policy):
                 env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
                 cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"]))); args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
                 archiving = request["role"] == "ar"; archive_requested = archive_requested or archiving
-                compiling = "-c" in args and not archiving; compile_requested = compile_requested or compiling
-                context = foreign_context(env, cwd, session, inv)
-                (foreign_archive_environment if archiving else foreign_compile_environment if compiling else foreign_environment)(env, session, inv)
+                operation = receipt.get("operation")
+                require(isinstance(operation, dict), "ForeignOperationFields")
+                flagging = operation.get("class") == "CompilerFlagProbe"
+                compiling = "-c" in args and not archiving and not flagging; compile_requested = compile_requested or compiling
+                context = foreign_context(env, cwd, session, inv, args=args)
+                (foreign_archive_environment if archiving else foreign_compile_environment if compiling or flagging else foreign_environment)(env, session, inv)
                 group = context["out_dir"]; package = context["package_id"]
                 require(group not in outdirs or outdirs[group] == package, "ForeignOutDirCollision"); outdirs[group] = package
                 controls = foreign_controls(session, policy, owner, context)
@@ -4101,7 +4391,13 @@ def foreign_seal(session, policy):
                     history = [calls[predecessor][:2]]
                 compiling = operation["class"] == "CompilerObjectCompile"
                 archiving = operation["class"] in {"ArchiverFirstAppend", "ArchiverRemainingAppend", "ArchiverIndex"}
-                computed = (foreign_archive_classify(receipt["role"], args, receipt["context"]) if archiving
+                extended = Path(receipt["context"]["manifest"]).name in FOREIGN_E_ONLY_PACKAGES and operation["class"] in {"CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"}
+                if extended:
+                    _, effective, helps, versions, flags = foreign_e_history(session, inv, receipt["context"])
+                    if operation["class"] == "CompilerFlagProbe":
+                        require(len(flags) == 3 and len(versions) == 4 and len(helps) == 4
+                                and len(effective) == 4, "ForeignFlagIncomplete")
+                computed = (operation if extended else foreign_archive_classify(receipt["role"], args, receipt["context"]) if archiving
                             else foreign_compile_classify(receipt["role"], args, receipt["context"], session, current_call=call) if compiling
                             else foreign_probe_classify(receipt["role"], args, receipt["context"], env, session, inv, history=history))
                 require(computed == operation, "ForeignRawClassification")
@@ -4116,6 +4412,9 @@ def foreign_seal(session, policy):
                     native_state_check(call, receipt["input_pre"])
                     item = next(i for i in result["operations"] if i["operation_id"] == ident)
                     item["input_final_state"] = native_state_check(call, receipt["input_post"], live=True, retire=True)
+                elif operation["class"] == "CompilerFlagProbe":
+                    # Full retained overwrite lineage was validated above.
+                    pass
                 elif compiling:
                     pins = foreign_compile_pins(session, inv, receipt["context"])
                     require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
