@@ -852,6 +852,7 @@ pub(super) mod original_native {
         initial_read: InitialReadRecord,
         integrity_read: IntegrityReadRecord,
         capture_prefix: CapturePrefixRecord,
+        compile_options: CompileOptionsRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -883,6 +884,7 @@ pub(super) mod original_native {
                 initial_read: InitialReadRecord::empty(),
                 integrity_read: IntegrityReadRecord::empty(),
                 capture_prefix: CapturePrefixRecord::empty(),
+                compile_options: CompileOptionsRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -954,6 +956,14 @@ pub(super) mod original_native {
         AwaitCaptureRuntimeErrorReturn, AwaitCaptureCatalogReturn, WrapCaptureCatalogError,
         DiscardCaptureRaw, DiscardCaptureDetail, DiscardCaptureCatalogError, DiscardCaptureString,
         AdvanceCaptureQuery, CapturePrefixReached, StopCapturePrefix,
+        PrepareCompileStatement, AwaitCompilePrepareObservation, AwaitCompilePrepareReturn,
+        QueryCompileEmpty, AwaitCompileQueryObservation, AwaitCompileQueryReturn, AwaitCompileStepObservation,
+        StepCompileRead, CompileColumnType, CompileText, AwaitCompileMapperReturn, RetainCompileRaw,
+        ResetCompileRows, AwaitCompileRowsDrop, AwaitCompileCalleeScope, AwaitCompileCollectReturn,
+        AwaitCompileVector, FormatCompileDetail, AwaitCompileDetail, BuildCompileCatalogError,
+        FinalizeCompileStatement, AwaitCompileStatementDrop, AwaitCompileRuntimeReturn, AwaitCompileCatalogReturn,
+        WrapCompileCatalogError, DiscardCompileRaw, DiscardCompileDetail, DiscardCompileVector,
+        DiscardCompileCatalogError, DiscardCompileSourceId, StopCompileOptions, CompileOptionsBeforeSort,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1810,7 +1820,7 @@ pub(super) mod original_native {
                 && matches!(self.tx.phase, TxPhase::NotCreated | TxPhase::Finished)
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
-                && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear()
+                && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear() && self.compile_options.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1982,7 +1992,8 @@ pub(super) mod original_native {
                 || self.fields.native.initial_read.ignored.is_some() || self.fields.native.statements[0].live().is_some()
                 || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some()
                 || self.fields.native.integrity_read.blocks_early_primary()
-                || self.fields.native.capture_prefix.blocks_early_primary() { return Err(error); }
+                || self.fields.native.capture_prefix.blocks_early_primary()
+                || self.fields.native.compile_options.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -3976,6 +3987,9 @@ pub(super) mod original_native {
     }
     impl NativeOriginalOwner {
         fn capture_prefix_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            if self.compile_options.stage != CompileStage::Dormant {
+                return self.compile_options_action(work, physical);
+            }
             let r = &self.capture_prefix;
             if matches!(r.stage, CaptureStage::Dormant | CaptureStage::Stopped) { return None; }
             if r.ignored.is_some() { return Some(LifecycleAction::DiscardCaptureCleanup); }
@@ -4588,6 +4602,583 @@ pub(super) mod original_native {
             assert!(self.fields.native.capture_prefix.stopped_clear());
             assert!(self.prefix.source_id.is_none() && self.prefix.detail.is_none() && self.prefix.catalog_error.is_none());
             assert_eq!(self.fields.work.test_code_observation(), before); assert!(self.discard_owned().is_err());
+        }
+    }
+
+    // Fixed compile_options callee protocol, before sort. These records do not
+    // own the private MappedRows/partial Vec/mapper String or ignored Drop
+    // Results. A real controlled adapter must end those lexical obligations;
+    // the uninhabited Rules port cannot issue their allocation/payment facts.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileStage { Dormant, Running, Ready, Stopped }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompilePhase { Prepare, Query, Step, Type, Mapper, NeedRaw, Reset, Exit }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileReturn { Unknown, Ok, Error, Interrupted }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileOutcome { Unknown, Eof, Error }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileErrorStage { Prepare, Query, Read }
+    impl CompileErrorStage {
+        fn label(self) -> &'static str { match self {
+            Self::Prepare => "prepare-compile-options", Self::Query => "query-compile-options",
+            Self::Read => "read-compile-options",
+        } }
+    }
+    struct CompileOptionsRecord {
+        stage: CompileStage, phase: CompilePhase, error_stage: CompileErrorStage,
+        prepare_started: bool, prepare: CodeSlot, prepare_return: CompileReturn,
+        query_started: bool, query_observed: bool, query_return: CompileReturn, step_pending: bool,
+        collect_started: bool, rows_live: bool, callee_scope_ended: bool,
+        mapper_pending: bool, outcome: CompileOutcome, collect_return: CompileReturn,
+        raw: Option<rusqlite::Error>, vector_pending: bool, vector_live: bool,
+        detail_started: bool, detail_returned: bool, catalog_live: bool,
+        statement_drop_owed: bool, statement_drop_ended: bool, consumed: Option<StmtState>,
+        runtime_return: CompileReturn, catalog_return: CompileReturn,
+    }
+    impl CompileOptionsRecord {
+        fn empty() -> Self { Self {
+            stage: CompileStage::Dormant, phase: CompilePhase::Prepare, error_stage: CompileErrorStage::Prepare,
+            prepare_started: false, prepare: CodeSlot::NotCalled, prepare_return: CompileReturn::Unknown,
+            query_started: false, query_observed: false, query_return: CompileReturn::Unknown, step_pending: false,
+            collect_started: false, rows_live: false, callee_scope_ended: false,
+            mapper_pending: false, outcome: CompileOutcome::Unknown, collect_return: CompileReturn::Unknown,
+            raw: None, vector_pending: false, vector_live: false, detail_started: false,
+            detail_returned: false, catalog_live: false, statement_drop_owed: false,
+            statement_drop_ended: false, consumed: None,
+            runtime_return: CompileReturn::Unknown, catalog_return: CompileReturn::Unknown,
+        } }
+        fn blocks_early_primary(&self) -> bool {
+            self.raw.is_some() || self.mapper_pending || self.vector_pending || self.detail_started
+                || (self.prepare_started && self.prepare_return == CompileReturn::Unknown)
+                || (self.query_started && self.query_return == CompileReturn::Unknown) || self.step_pending
+                || self.catalog_live || self.statement_drop_owed || self.phase == CompilePhase::NeedRaw
+                || (self.collect_started && self.collect_return == CompileReturn::Unknown)
+        }
+        fn stopped_clear(&self) -> bool {
+            matches!(self.stage, CompileStage::Dormant | CompileStage::Stopped)
+                && !self.blocks_early_primary() && !self.vector_live && !self.rows_live
+        }
+    }
+    impl NativeOriginalOwner {
+        fn compile_options_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            let r = &self.compile_options;
+            if matches!(r.stage, CompileStage::Dormant | CompileStage::Stopped) { return None; }
+            if r.prepare_started && matches!(r.prepare, CodeSlot::NotCalled) { return Some(LifecycleAction::AwaitCompilePrepareObservation); }
+            if r.query_started && !r.query_observed { return Some(LifecycleAction::AwaitCompileQueryObservation); }
+            if r.step_pending { return Some(LifecycleAction::AwaitCompileStepObservation); }
+            if r.phase == CompilePhase::NeedRaw { return Some(LifecycleAction::RetainCompileRaw); }
+            if r.mapper_pending { return Some(LifecycleAction::AwaitCompileMapperReturn); }
+            if r.vector_pending { return Some(LifecycleAction::AwaitCompileVector); }
+            if r.detail_started && !r.detail_returned { return Some(LifecycleAction::AwaitCompileDetail); }
+            if !matches!(r.prepare, CodeSlot::NotCalled) && r.prepare_return == CompileReturn::Unknown {
+                return Some(LifecycleAction::AwaitCompilePrepareReturn);
+            }
+            if r.query_started && r.query_return == CompileReturn::Unknown { return Some(LifecycleAction::AwaitCompileQueryReturn); }
+            let interrupted = work.terminal().is_some() || physical.primary.is_some();
+            let ending = interrupted || r.outcome != CompileOutcome::Unknown;
+            if r.collect_started && r.collect_return == CompileReturn::Unknown {
+                if !ending { return Some(match r.phase {
+                    CompilePhase::Step => LifecycleAction::StepCompileRead,
+                    CompilePhase::Type => LifecycleAction::CompileColumnType,
+                    CompilePhase::Mapper => LifecycleAction::CompileText,
+                    _ => LifecycleAction::AwaitCompileCollectReturn,
+                }); }
+                if r.rows_live {
+                    if self.statements[0].live().is_some_and(|s| s.cursor != CursorPhase::NoCursor) {
+                        return Some(LifecycleAction::ResetCompileRows);
+                    }
+                    return Some(LifecycleAction::AwaitCompileRowsDrop);
+                }
+                if !r.callee_scope_ended { return Some(LifecycleAction::AwaitCompileCalleeScope); }
+                return Some(LifecycleAction::AwaitCompileCollectReturn);
+            }
+            if r.detail_started && r.detail_returned { return Some(if interrupted { LifecycleAction::DiscardCompileDetail } else { LifecycleAction::BuildCompileCatalogError }); }
+            if r.raw.is_some() { return Some(if interrupted { LifecycleAction::DiscardCompileRaw } else { LifecycleAction::FormatCompileDetail }); }
+            if r.vector_live && interrupted { return Some(LifecycleAction::DiscardCompileVector); }
+            if r.statement_drop_owed { return Some(LifecycleAction::AwaitCompileStatementDrop); }
+            if interrupted || r.catalog_live {
+                if self.statements[0].live().is_some() { return Some(LifecycleAction::FinalizeCompileStatement); }
+                if !r.statement_drop_ended && matches!(r.prepare, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)) {
+                    return Some(LifecycleAction::AwaitCompileStatementDrop);
+                }
+                if self.capture_prefix.value_live { return Some(LifecycleAction::DiscardCompileSourceId); }
+                if r.runtime_return == CompileReturn::Unknown { return Some(LifecycleAction::AwaitCompileRuntimeReturn); }
+                if r.catalog_return == CompileReturn::Unknown { return Some(LifecycleAction::AwaitCompileCatalogReturn); }
+                if r.catalog_live { return Some(if interrupted { LifecycleAction::DiscardCompileCatalogError } else { LifecycleAction::WrapCompileCatalogError }); }
+                return Some(LifecycleAction::StopCompileOptions);
+            }
+            if r.stage == CompileStage::Ready { return Some(LifecycleAction::CompileOptionsBeforeSort); }
+            Some(match r.phase {
+                CompilePhase::Prepare => LifecycleAction::PrepareCompileStatement,
+                CompilePhase::Query => LifecycleAction::QueryCompileEmpty,
+                _ => LifecycleAction::AwaitCompileCollectReturn,
+            })
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalCompileOptionsLoan<'a> {
+        fields: OriginalOwnerFields<'a>, options: &'a mut super::super::super::FinancialCompileOptionsState,
+        source_id: &'a mut Option<String>,
+    }
+    struct OriginalCompileOptionsPort<'short, 'a, 'rules> {
+        loan: &'short mut OriginalCompileOptionsLoan<'a>, _rules: &'rules SelectedOriginalNativeRules,
+    }
+    struct OriginalCompileVectorReturnPort<'short, 'a> { loan: &'short mut OriginalCompileOptionsLoan<'a> }
+    struct OriginalCompileDetailReturnPort<'short, 'a> { loan: &'short mut OriginalCompileOptionsLoan<'a> }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_compile_options(&mut self) -> bool {
+            let n = &mut self.native; let p = &n.capture_prefix;
+            if self.work.terminal().is_some() || self.physical.primary.is_some() || !matches!(n.tx.phase, TxPhase::Active)
+                || n.compile_options.stage != CompileStage::Dormant || p.stage != CaptureStage::Ready
+                || p.calls.iter().any(|c| c.query_return != CaptureReturn::Ok || c.consumed.is_none())
+                || p.calls[..2].iter().any(|c| c.pragma_return != CaptureReturn::Ok || !c.pragma_scope_ended)
+                || !p.value_live || !p.value_matches || p.blocks_early_primary()
+                || n.statements.iter().any(|s| s.live().is_some()) { return false; }
+            // Parent ledgers stay in p. Only its completed vacant VM place is
+            // reused; no second Work take, request, meter or limit is created.
+            n.statements[0] = StmtSlot::Vacant; n.compile_options.stage = CompileStage::Running; true
+        }
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn compile_options(self, options: &'a mut super::super::super::FinancialCompileOptionsState,
+            source_id: &'a mut Option<String>) -> OriginalCompileOptionsLoan<'a> {
+            OriginalCompileOptionsLoan { fields: self, options, source_id }
+        }
+    }
+    impl<'a> OriginalCompileOptionsLoan<'a> {
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.compile_options_action(&self.fields.work, self.fields.physical) }
+        fn fixed_port<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> OriginalCompileOptionsPort<'short, 'a, 'rules> {
+            OriginalCompileOptionsPort { loan: self, _rules: rules }
+        }
+        fn begin_prepare(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareCompileStatement) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.prepare_started = true; Ok(())
+        }
+        fn adverse(&mut self, code: i32) {
+            if code == rusqlite::ffi::SQLITE_OK || code == rusqlite::ffi::SQLITE_ROW || code == rusqlite::ffi::SQLITE_DONE { return; }
+            let make = || FixedAdverse { role: Role::Original, action: FixedAction::CompileOptions, ordinal: 0, code };
+            if self.fields.native.secondary.is_none() { self.fields.native.secondary = Some(make()); }
+            if self.fields.release.first_secondary.is_none() { self.fields.release.first_secondary = Some(make()); }
+        }
+        fn observe_prepare(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompilePrepareObservation) { return Err(ProtocolFault::UnexpectedObservation); }
+            if code == rusqlite::ffi::SQLITE_OK {
+                let s = self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                if s.role != Role::Original || s.action != FixedAction::CompileOptions || s.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            } else if self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options; record_once(&mut r.prepare, code)?;
+            if code != rusqlite::ffi::SQLITE_OK { r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw; }
+            self.adverse(code); Ok(())
+        }
+        fn prepare_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompilePrepareReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options;
+            let expected = if matches!(r.prepare, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)) { CompileReturn::Ok } else { CompileReturn::Error };
+            if fact != expected { return Err(ProtocolFault::UnexpectedObservation); }
+            r.prepare_return = fact; r.phase = if fact == CompileReturn::Ok { CompilePhase::Query } else { CompilePhase::Exit }; Ok(())
+        }
+        fn begin_query(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::QueryCompileEmpty) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.query_started = true; Ok(())
+        }
+        fn observe_query(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileQueryObservation) || !matches!(fact, CompileReturn::Ok | CompileReturn::Error) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options; r.query_observed = true;
+            if fact == CompileReturn::Ok {
+                r.collect_started = true; r.rows_live = true; r.phase = CompilePhase::Step;
+                self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?.cursor = CursorPhase::Active;
+            } else { r.error_stage = CompileErrorStage::Query; r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw; }
+            Ok(())
+        }
+        fn query_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileQueryReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options;
+            if fact != if r.collect_started { CompileReturn::Ok } else { CompileReturn::Error } { return Err(ProtocolFault::UnexpectedObservation); }
+            r.query_return = fact; Ok(())
+        }
+        fn begin_step(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StepCompileRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.step_pending = true; Ok(())
+        }
+        fn observe_step(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileStepObservation) { return Err(ProtocolFault::UnexpectedObservation); }
+            let s = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            s.step = CodeSlot::Called(code);
+            let r = &mut self.fields.native.compile_options; r.step_pending = false; r.error_stage = CompileErrorStage::Read;
+            if code == rusqlite::ffi::SQLITE_ROW { r.phase = CompilePhase::Type; }
+            else if code == rusqlite::ffi::SQLITE_DONE { r.outcome = CompileOutcome::Eof; r.phase = CompilePhase::Reset; }
+            else { r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw; }
+            self.adverse(code); Ok(())
+        }
+        fn observe_type(&mut self, kind: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CompileColumnType) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options;
+            if kind == rusqlite::ffi::SQLITE_TEXT { r.phase = CompilePhase::Mapper; }
+            else { r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw; } Ok(())
+        }
+        fn text(&mut self, bytes: &[u8]) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CompileText) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options;
+            if std::str::from_utf8(bytes).is_err() { r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw; return Err(ProtocolFault::UnexpectedObservation); }
+            // This is only a borrowed type/UTF8 preflight, not the actual
+            // allocated mapper String or its insertion in the private Vec.
+            r.mapper_pending = true; Ok(())
+        }
+        fn mapper_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileMapperReturn) || fact != CompileReturn::Ok { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options; r.mapper_pending = false; r.phase = CompilePhase::Step; Ok(())
+        }
+        fn retain_raw(&mut self, raw: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.next() != Some(LifecycleAction::RetainCompileRaw) || self.fields.native.compile_options.raw.is_some() { return Err(raw); }
+            let r = &mut self.fields.native.compile_options; r.raw = Some(raw); r.phase = CompilePhase::Exit; Ok(())
+        }
+        fn observe_reset(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ResetCompileRows) { return Err(ProtocolFault::UnexpectedObservation); }
+            let s = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut s.reset, code)?; s.cursor = CursorPhase::NoCursor;
+            let r = &mut self.fields.native.compile_options;
+            if r.outcome == CompileOutcome::Eof && code != rusqlite::ffi::SQLITE_OK {
+                // DONE's nonignored reset Err is an actual reached raw result,
+                // including after T. Never infer it from collect-return labels.
+                r.outcome = CompileOutcome::Error; r.phase = CompilePhase::NeedRaw;
+            }
+            self.adverse(code); Ok(())
+        }
+        fn rows_drop_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileRowsDrop) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Independently ended real Rows lexical scope; its internally
+            // ignored reset Result has no G transport/payment issuer here.
+            self.fields.native.compile_options.rows_live = false; Ok(())
+        }
+        fn callee_scope_end(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileCalleeScope) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.callee_scope_ended = true; Ok(())
+        }
+        fn vector_return_port<'short>(&'short mut self) -> Result<OriginalCompileVectorReturnPort<'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileCollectReturn)
+                || self.fields.native.compile_options.outcome != CompileOutcome::Eof || self.options.rows.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.vector_pending = true; Ok(OriginalCompileVectorReturnPort { loan: self })
+        }
+        fn collect_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileCollectReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.compile_options;
+            if !((fact == CompileReturn::Error && r.outcome == CompileOutcome::Error && r.raw.is_some())
+                || (fact == CompileReturn::Interrupted && interrupted && r.outcome == CompileOutcome::Unknown)) { return Err(ProtocolFault::UnexpectedObservation); }
+            r.collect_return = fact; r.phase = CompilePhase::Exit; Ok(())
+        }
+        fn detail_return_port<'short>(&'short mut self) -> Result<OriginalCompileDetailReturnPort<'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FormatCompileDetail) || self.options.detail.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.detail_started = true; Ok(OriginalCompileDetailReturnPort { loan: self })
+        }
+        fn build_catalog_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BuildCompileCatalogError) { return Err(ProtocolFault::UnexpectedObservation); }
+            let detail = self.options.detail.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let r = &mut self.fields.native.compile_options;
+            self.options.catalog_error = Some(super::super::super::GlobalSchemaCatalogError::SqliteReferenceBuildFailure {
+                stage: r.error_stage.label(), ddl_id: None, detail,
+            });
+            drop(r.raw.take()); r.detail_started = false; r.catalog_live = true; Ok(())
+        }
+        fn observe_finalize(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FinalizeCompileStatement) { return Err(ProtocolFault::UnexpectedObservation); }
+            let mut s = *self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            if s.action != FixedAction::CompileOptions || s.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            record_once(&mut s.finalize, code)?;
+            self.fields.native.statements[0] = StmtSlot::Finalized(s);
+            let r = &mut self.fields.native.compile_options; r.consumed = Some(s); r.statement_drop_owed = true; self.adverse(code); Ok(())
+        }
+        fn statement_drop_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileStatementDrop) || self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            // VM consumed before the callee decodes/drops its ignored owned
+            // finalize Result. Only independent lexical completion ends debt.
+            let r = &mut self.fields.native.compile_options; r.statement_drop_owed = false; r.statement_drop_ended = true; Ok(())
+        }
+        fn runtime_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileRuntimeReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.compile_options;
+            let expected = if r.catalog_live { CompileReturn::Error } else { CompileReturn::Interrupted };
+            if fact != expected { return Err(ProtocolFault::UnexpectedObservation); }
+            r.runtime_return = fact; Ok(())
+        }
+        fn catalog_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileCatalogReturn) || fact != self.fields.native.compile_options.runtime_return { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.catalog_return = fact; Ok(())
+        }
+        fn wrap_catalog_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::WrapCompileCatalogError) { return Err(ProtocolFault::UnexpectedObservation); }
+            let error = self.options.catalog_error.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            self.fields.physical.primary = Some(super::super::super::retain_capture_catalog_error(error));
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            self.fields.native.compile_options.catalog_live = false; Ok(())
+        }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> {
+            match self.next() {
+                Some(LifecycleAction::DiscardCompileRaw) => drop(self.fields.native.compile_options.raw.take()),
+                Some(LifecycleAction::DiscardCompileDetail) => { drop(self.options.detail.take()); self.fields.native.compile_options.detail_started = false; },
+                Some(LifecycleAction::DiscardCompileVector) => { drop(self.options.rows.take()); self.fields.native.compile_options.vector_live = false; },
+                Some(LifecycleAction::DiscardCompileCatalogError) => { drop(self.options.catalog_error.take()); self.fields.native.compile_options.catalog_live = false; },
+                Some(LifecycleAction::DiscardCompileSourceId) => { drop(self.source_id.take()); self.fields.native.capture_prefix.value_live = false; },
+                _ => return Err(ProtocolFault::UnexpectedObservation),
+            } Ok(())
+        }
+        fn stop(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StopCompileOptions) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.compile_options.stage = CompileStage::Stopped;
+            self.fields.native.capture_prefix.stage = CaptureStage::Stopped; Ok(())
+        }
+    }
+    impl OriginalCompileVectorReturnPort<'_, '_> {
+        fn retain(self, rows: Vec<String>) {
+            // Exclusive preflight owns the only empty destination. Actual
+            // returned Vec moves first, without a post-acquisition refusal.
+            self.loan.options.rows = Some(rows);
+            let r = &mut self.loan.fields.native.compile_options;
+            r.vector_pending = false; r.vector_live = true; r.collect_return = CompileReturn::Ok; r.stage = CompileStage::Ready;
+        }
+    }
+    impl OriginalCompileDetailReturnPort<'_, '_> {
+        fn retain(self, detail: String) {
+            self.loan.options.detail = Some(detail); self.loan.fields.native.compile_options.detail_returned = true;
+        }
+    }
+    impl<'a> OriginalCompileOptionsPort<'_, 'a, '_> {
+        fn sql(&self) -> &'static str { "PRAGMA compile_options" }
+        fn begin_prepare(&mut self) -> Result<(), ProtocolFault> { self.loan.begin_prepare() }
+        fn prepare(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_prepare(code) }
+        fn prepare_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.prepare_return(fact) }
+        fn begin_query(&mut self) -> Result<(), ProtocolFault> { self.loan.begin_query() }
+        fn query_empty(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.observe_query(fact) }
+        fn query_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.query_return(fact) }
+        fn begin_step(&mut self) -> Result<(), ProtocolFault> { self.loan.begin_step() }
+        fn step(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_step(code) }
+        fn column_type(&mut self, kind: i32) -> Result<(), ProtocolFault> { self.loan.observe_type(kind) }
+        fn text(&mut self, bytes: &[u8]) -> Result<(), ProtocolFault> { self.loan.text(bytes) }
+        fn mapper_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.mapper_return(fact) }
+        fn owned_raw(&mut self, raw: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_raw(raw) }
+        fn reset(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_reset(code) }
+        fn rows_drop_return(&mut self) -> Result<(), ProtocolFault> { self.loan.rows_drop_return() }
+        fn callee_scope_end(&mut self) -> Result<(), ProtocolFault> { self.loan.callee_scope_end() }
+        fn vector_return<'short>(&'short mut self) -> Result<OriginalCompileVectorReturnPort<'short, 'a>, ProtocolFault> { self.loan.vector_return_port() }
+        fn collect_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.collect_return(fact) }
+        fn detail_return<'short>(&'short mut self) -> Result<OriginalCompileDetailReturnPort<'short, 'a>, ProtocolFault> { self.loan.detail_return_port() }
+        fn build_catalog_error(&mut self) -> Result<(), ProtocolFault> { self.loan.build_catalog_error() }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_finalize(code) }
+        fn statement_drop_return(&mut self) -> Result<(), ProtocolFault> { self.loan.statement_drop_return() }
+        fn runtime_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.runtime_return(fact) }
+        fn catalog_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.catalog_return(fact) }
+        fn wrap_catalog_error(&mut self) -> Result<(), ProtocolFault> { self.loan.wrap_catalog_error() }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_owned() }
+        fn stop(&mut self) -> Result<(), ProtocolFault> { self.loan.stop() }
+    }
+
+    #[cfg(test)]
+    impl OriginalCompileOptionsLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_barrier(&mut self) {
+            let before = self.fields.work.test_code_observation();
+            let expected = self.next().expect("fixed compile_options obligation");
+            assert_eq!(self.fields.native.transaction_action(&self.fields.work, self.fields.physical), Some(expected));
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
+            let mut acquire = self.fields.reborrow().original_acquisition();
+            assert_eq!(acquire.constructor().next(), expected); assert_eq!(acquire.a00_epilogue().next(), expected);
+            assert!(acquire.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)).is_err());
+            assert!(matches!(acquire.settle(), AcquisitionSettlement::Held(_)));
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        fn test_code_prepare(&mut self) {
+            assert!(self.prepare_return(CompileReturn::Ok).is_err()); self.begin_prepare().unwrap(); assert!(self.begin_prepare().is_err());
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::ResourceNotInstalled));
+            self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action: FixedAction::CompileOptions, ..protocol_stmt_state() });
+            self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap(); assert!(self.observe_prepare(rusqlite::ffi::SQLITE_OK).is_err());
+            self.test_code_barrier(); assert!(self.observe_query(CompileReturn::Ok).is_err());
+            assert!(self.prepare_return(CompileReturn::Error).is_err()); self.prepare_return(CompileReturn::Ok).unwrap();
+            assert!(self.prepare_return(CompileReturn::Ok).is_err());
+        }
+        fn test_code_query(&mut self) {
+            self.test_code_prepare(); self.begin_query().unwrap(); self.observe_query(CompileReturn::Ok).unwrap(); self.test_code_barrier();
+            assert!(self.test_code_step(rusqlite::ffi::SQLITE_ROW).is_err());
+            assert!(self.query_return(CompileReturn::Error).is_err()); self.query_return(CompileReturn::Ok).unwrap();
+            assert!(self.query_return(CompileReturn::Ok).is_err());
+        }
+        fn test_code_step(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            self.begin_step()?; self.observe_step(code)
+        }
+        fn test_code_eof(&mut self) {
+            self.test_code_step(rusqlite::ffi::SQLITE_DONE).unwrap();
+            assert!(self.vector_return_port().is_err()); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert!(self.observe_reset(rusqlite::ffi::SQLITE_OK).is_err()); self.test_code_scope_end();
+        }
+        fn test_code_scope_end(&mut self) {
+            self.test_code_barrier(); assert!(self.collect_return(CompileReturn::Interrupted).is_err());
+            self.rows_drop_return().unwrap(); assert!(self.rows_drop_return().is_err());
+            self.test_code_barrier(); assert!(self.vector_return_port().is_err());
+            self.callee_scope_end().unwrap(); assert!(self.callee_scope_end().is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_collect_success(&mut self, rows: Vec<String>) {
+            let vector = rows.as_ptr(); let capacity = rows.capacity();
+            self.test_code_query();
+            for text in &rows {
+                self.test_code_step(rusqlite::ffi::SQLITE_ROW).unwrap(); self.observe_type(rusqlite::ffi::SQLITE_TEXT).unwrap();
+                self.text(text.as_bytes()).unwrap(); self.test_code_barrier();
+                assert!(self.test_code_step(rusqlite::ffi::SQLITE_ROW).is_err()); self.mapper_return(CompileReturn::Ok).unwrap();
+                assert!(self.mapper_return(CompileReturn::Ok).is_err());
+            }
+            self.test_code_eof(); self.vector_return_port().unwrap().retain(rows);
+            assert_eq!(self.options.rows.as_ref().unwrap().as_ptr(), vector); assert_eq!(self.options.rows.as_ref().unwrap().capacity(), capacity);
+            assert!(self.vector_return_port().is_err()); assert!(self.collect_return(CompileReturn::Error).is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::CompileOptionsBeforeSort));
+            assert!(self.fields.native.statements[0].live().is_some()); assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.fields.native.compile_options.consumed.is_none());
+            assert!(self.fields.native.compile_options.runtime_return == CompileReturn::Unknown);
+            assert!(self.fields.native.compile_options.catalog_return == CompileReturn::Unknown); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_error(&mut self, case: super::super::super::FinancialCompileErrorCase, raw: rusqlite::Error) {
+            use super::super::super::FinancialCompileErrorCase as Case;
+            let pointer = compile_test_allocation(&raw);
+            match case {
+                Case::Prepare => { self.begin_prepare().unwrap(); self.observe_prepare(rusqlite::ffi::SQLITE_ERROR).unwrap(); },
+                Case::Query => { self.test_code_prepare(); self.begin_query().unwrap(); self.observe_query(CompileReturn::Error).unwrap(); },
+                Case::Step => { self.test_code_query(); self.test_code_step(rusqlite::ffi::SQLITE_ERROR).unwrap(); },
+                Case::Type | Case::Utf8 => {
+                    self.test_code_query(); self.test_code_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+                    self.observe_type(if case == Case::Type { rusqlite::ffi::SQLITE_BLOB } else { rusqlite::ffi::SQLITE_TEXT }).unwrap();
+                    if case == Case::Utf8 { assert!(self.text(&[0xff]).is_err()); }
+                },
+                Case::DoneReset => { self.test_code_query(); self.test_code_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); },
+            }
+            assert_eq!(self.next(), Some(LifecycleAction::RetainCompileRaw)); self.test_code_barrier();
+            self.retain_raw(raw).unwrap_or_else(|_| panic!("actual reached raw enters same frame"));
+            assert_eq!(compile_test_allocation(self.fields.native.compile_options.raw.as_ref().unwrap()), pointer);
+            if case == Case::Prepare { self.prepare_return(CompileReturn::Error).unwrap(); }
+            else if case == Case::Query { self.query_return(CompileReturn::Error).unwrap(); }
+            else {
+                if self.next() == Some(LifecycleAction::ResetCompileRows) { self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+                self.test_code_scope_end(); assert!(self.collect_return(CompileReturn::Ok).is_err());
+                self.collect_return(CompileReturn::Error).unwrap(); assert!(self.collect_return(CompileReturn::Error).is_err());
+            }
+            assert_eq!(self.next(), Some(LifecycleAction::FormatCompileDetail));
+            if case != Case::Prepare { assert!(self.fields.native.statements[0].live().is_some()); }
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err()); assert!(self.runtime_return(CompileReturn::Error).is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_wrap_before_statement_exit(&mut self) -> usize {
+            let detail = self.fields.native.compile_options.raw.as_ref().unwrap().to_string(); let pointer = detail.as_ptr() as usize;
+            self.detail_return_port().unwrap().retain(detail); self.test_code_barrier();
+            self.build_catalog_error().unwrap(); assert!(self.build_catalog_error().is_err());
+            assert!(self.fields.native.compile_options.raw.is_none()); assert!(self.options.catalog_error.is_some());
+            assert!(self.runtime_return(CompileReturn::Error).is_err());
+            if self.next() == Some(LifecycleAction::FinalizeCompileStatement) {
+                self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                assert!(self.fields.native.statements[0].live().is_none()); self.test_code_barrier();
+                assert!(self.runtime_return(CompileReturn::Error).is_err()); assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+                self.statement_drop_return().unwrap(); assert!(self.statement_drop_return().is_err());
+            }
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardCompileSourceId)); self.discard_owned().unwrap();
+            assert!(self.source_id.is_none()); self.test_code_barrier(); assert!(self.catalog_return(CompileReturn::Error).is_err());
+            self.runtime_return(CompileReturn::Error).unwrap(); assert!(self.runtime_return(CompileReturn::Error).is_err());
+            assert!(self.catalog_return(CompileReturn::Ok).is_err()); self.catalog_return(CompileReturn::Error).unwrap();
+            assert!(self.catalog_return(CompileReturn::Error).is_err()); self.wrap_catalog_error().unwrap();
+            assert!(self.wrap_catalog_error().is_err()); self.stop().unwrap(); assert!(self.stop().is_err()); pointer
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_interruption_cut(&mut self, cut: super::super::super::FinancialCompileTerminalCut,
+            raw: rusqlite::Error) -> (Option<Vec<String>>, Option<String>, Option<rusqlite::Error>) {
+            use super::super::super::FinancialCompileTerminalCut as Cut;
+            let mut raw = Some(raw);
+            if cut == Cut::BeforePrepare { return (None, None, raw); }
+            if cut == Cut::PreparePending {
+                self.begin_prepare().unwrap();
+                self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action: FixedAction::CompileOptions, ..protocol_stmt_state() });
+                return (None, None, raw);
+            }
+            if cut == Cut::QueryPending { self.test_code_prepare(); self.begin_query().unwrap(); return (None, None, raw); }
+            self.test_code_query();
+            if cut == Cut::StepPending { self.begin_step().unwrap(); return (None, None, raw); }
+            if cut == Cut::DoneBeforeReset { self.test_code_step(rusqlite::ffi::SQLITE_DONE).unwrap(); return (None, None, raw); }
+            if cut == Cut::MapperPending {
+                self.test_code_step(rusqlite::ffi::SQLITE_ROW).unwrap(); self.observe_type(rusqlite::ffi::SQLITE_TEXT).unwrap();
+                self.text(b"TEST_CODE private mapper obligation").unwrap(); return (None, None, raw);
+            }
+            if cut == Cut::RawPending { self.test_code_step(rusqlite::ffi::SQLITE_ERROR).unwrap(); return (None, None, raw); }
+            if matches!(cut, Cut::DetailPending | Cut::CatalogOwned | Cut::StatementDropPending) {
+                self.test_code_step(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.retain_raw(raw.take().unwrap()).unwrap_or_else(|_| panic!("fixed raw"));
+                self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); self.test_code_scope_end(); self.collect_return(CompileReturn::Error).unwrap();
+                let detail = self.fields.native.compile_options.raw.as_ref().unwrap().to_string();
+                let port = self.detail_return_port().unwrap();
+                if cut == Cut::DetailPending { drop(port); return (None, Some(detail), None); }
+                port.retain(detail); self.build_catalog_error().unwrap();
+                if cut == Cut::StatementDropPending { self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+                return (None, None, None);
+            }
+            self.test_code_eof();
+            if cut == Cut::CollectPending { return (Some(Vec::new()), None, raw); }
+            let rows = Vec::new(); let port = self.vector_return_port().unwrap();
+            if cut == Cut::VectorPending { drop(port); return (Some(rows), None, raw); }
+            assert_eq!(cut, Cut::VectorOwned); port.retain(rows); (None, None, raw)
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_drain_interrupted(&mut self, pending_vector: Option<Vec<String>>,
+            pending_detail: Option<String>, raw: Option<rusqlite::Error>) {
+            let before = self.fields.work.test_code_observation();
+            assert!(self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some());
+            assert!(self.begin_query().is_err()); assert!(self.begin_step().is_err());
+            let mut raw = raw; let mut pending_vector = pending_vector; let mut pending_detail = pending_detail;
+            for _ in 0..24 {
+                self.test_code_barrier();
+                match self.next().unwrap() {
+                    LifecycleAction::AwaitCompilePrepareObservation => self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap(),
+                    LifecycleAction::AwaitCompilePrepareReturn => self.prepare_return(CompileReturn::Ok).unwrap(),
+                    LifecycleAction::AwaitCompileQueryObservation => self.observe_query(CompileReturn::Error).unwrap(),
+                    LifecycleAction::AwaitCompileQueryReturn => self.query_return(CompileReturn::Error).unwrap(),
+                    LifecycleAction::AwaitCompileStepObservation => self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(),
+                    LifecycleAction::RetainCompileRaw => { self.retain_raw(raw.take().unwrap()).unwrap_or_else(|_| panic!("late actual raw custody")); },
+                    LifecycleAction::AwaitCompileMapperReturn => { assert!(self.mapper_return(CompileReturn::Interrupted).is_err()); self.mapper_return(CompileReturn::Ok).unwrap(); },
+                    LifecycleAction::AwaitCompileVector => {
+                        let rows = pending_vector.take().unwrap(); let pointer = rows.as_ptr();
+                        OriginalCompileVectorReturnPort { loan: self }.retain(rows);
+                        assert_eq!(self.options.rows.as_ref().unwrap().as_ptr(), pointer);
+                    },
+                    LifecycleAction::AwaitCompileDetail => {
+                        let detail = pending_detail.take().unwrap(); let pointer = detail.as_ptr();
+                        OriginalCompileDetailReturnPort { loan: self }.retain(detail);
+                        assert_eq!(self.options.detail.as_ref().unwrap().as_ptr(), pointer);
+                    },
+                    LifecycleAction::ResetCompileRows => self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(),
+                    LifecycleAction::AwaitCompileRowsDrop => { assert!(self.callee_scope_end().is_err()); self.rows_drop_return().unwrap(); },
+                    LifecycleAction::AwaitCompileCalleeScope => { assert!(self.collect_return(CompileReturn::Interrupted).is_err()); self.callee_scope_end().unwrap(); },
+                    LifecycleAction::AwaitCompileCollectReturn => {
+                        let outcome = self.fields.native.compile_options.outcome; assert!(self.stop().is_err());
+                        if outcome == CompileOutcome::Eof {
+                            let rows = pending_vector.take().unwrap(); self.vector_return_port().unwrap().retain(rows);
+                        } else {
+                            let fact = if outcome == CompileOutcome::Error { CompileReturn::Error } else { CompileReturn::Interrupted };
+                            assert!(self.collect_return(CompileReturn::Ok).is_err()); self.collect_return(fact).unwrap();
+                            assert!(self.collect_return(fact).is_err());
+                        }
+                    },
+                    LifecycleAction::DiscardCompileRaw | LifecycleAction::DiscardCompileDetail | LifecycleAction::DiscardCompileVector
+                        | LifecycleAction::DiscardCompileCatalogError | LifecycleAction::DiscardCompileSourceId => self.discard_owned().unwrap(),
+                    LifecycleAction::FinalizeCompileStatement => { self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap(); assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err()); },
+                    LifecycleAction::AwaitCompileStatementDrop => { assert!(self.runtime_return(CompileReturn::Interrupted).is_err()); self.statement_drop_return().unwrap(); },
+                    LifecycleAction::AwaitCompileRuntimeReturn => {
+                        let fact = if self.fields.native.compile_options.catalog_live { CompileReturn::Error } else { CompileReturn::Interrupted };
+                        assert!(self.runtime_return(CompileReturn::Ok).is_err()); self.runtime_return(fact).unwrap();
+                    },
+                    LifecycleAction::AwaitCompileCatalogReturn => { let fact = self.fields.native.compile_options.runtime_return; self.catalog_return(fact).unwrap(); },
+                    LifecycleAction::StopCompileOptions => { self.stop().unwrap(); break; },
+                    action => panic!("new compile read/format after first stop: {action:?}"),
+                }
+            }
+            assert!(self.fields.native.compile_options.stopped_clear()); assert!(self.fields.native.capture_prefix.stopped_clear());
+            assert!(self.options.rows.is_none() && self.options.detail.is_none() && self.options.catalog_error.is_none() && self.source_id.is_none());
+            assert!(pending_vector.is_none() && pending_detail.is_none()); drop(raw);
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+    }
+    #[cfg(test)]
+    fn compile_test_allocation(raw: &rusqlite::Error) -> usize {
+        match raw {
+            rusqlite::Error::SqliteFailure(_, Some(detail)) | rusqlite::Error::InvalidColumnType(_, detail, _) => detail.as_ptr() as usize,
+            rusqlite::Error::FromSqlConversionFailure(_, _, child) => child.as_ref() as *const _ as *const () as usize,
+            rusqlite::Error::InvalidParameterCount(_, _) => 0,
+            _ => panic!("fixed supplied compile-options raw child"),
         }
     }
 
