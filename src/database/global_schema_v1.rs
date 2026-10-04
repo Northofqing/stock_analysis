@@ -1176,6 +1176,24 @@ impl FinancialCompileOptionsFrame<'_, '_> {
         self.prefix.integrity.prefix.source.fields().compile_options(&mut self.options, &mut self.prefix.capture.source_id)
     }
 }
+// This carrier moves the entire completed collector frame once. Its Vec,
+// live Statement, source-id and earlier ledgers remain in their original slots.
+struct FinancialCompileSortFrame<'purpose, 'writer> {
+    compile: FinancialCompileOptionsFrame<'purpose, 'writer>,
+}
+impl<'purpose, 'writer> FinancialCompileOptionsFrame<'purpose, 'writer> {
+    fn begin_sort_duplicate(mut self) -> Result<FinancialCompileSortFrame<'purpose, 'writer>, Self> {
+        if self.options.rows.is_none() || self.prefix.capture.source_id.is_none()
+            || !self.prefix.integrity.prefix.source.fields().begin_compile_sort_duplicate() { return Err(self); }
+        Ok(FinancialCompileSortFrame { compile: self })
+    }
+}
+impl FinancialCompileSortFrame<'_, '_> {
+    fn sort_duplicate_loan(&mut self) -> replay_work::OriginalCompileSortLoan<'_> {
+        self.compile.prefix.integrity.prefix.source.fields().compile_sort_duplicate(
+            &mut self.compile.options, &mut self.compile.prefix.capture.source_id)
+    }
+}
 fn retain_capture_catalog_error(error: GlobalSchemaCatalogError) -> rows::original_source::SourceOperationError {
     rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: error })
 }
@@ -2823,6 +2841,138 @@ mod financial_original_audit_acquisition_tests {
                     assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
                 }
             }
+        }
+
+        fn fixed_compile_sort_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileSortFrame<'purpose, 'writer> {
+            let compile = fixed_compile_options_frame(purpose, writer, trace);
+            let Err(mut compile) = compile.begin_sort_duplicate() else { panic!("no returned Vec refuses sort entry"); };
+            compile.compile_options_loan().test_code_collect_success(values);
+            compile.begin_sort_duplicate().unwrap_or_else(|_| panic!("actual returned Vec moves whole collector frame once"))
+        }
+        fn actual_duplicate_error() -> GlobalSchemaCatalogError {
+            GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail: String::from("SQLite reports duplicate compile options") }
+        }
+        fn duplicate_detail_pointer(error: &GlobalSchemaCatalogError) -> *const u8 {
+            let GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail } = error else { panic!("fixed actual duplicate C error"); };
+            detail.as_ptr()
+        }
+        #[test]
+        fn history_original_compile_sort_duplicate_unique_vec_and_held_digest() {
+            // cfg-only actual Vec.sort() checks mechanics, not private scratch,
+            // allocation fit, formatter payment or SQL/provider qualification.
+            for values in [Vec::new(), vec![String::from("A")], vec![String::from("Z"), String::from("A"), String::from("M")]] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let vector = values.as_ptr(); let capacity = values.capacity();
+                let children: Vec<_> = values.iter().map(|s| s.as_ptr()).collect();
+                let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace, values);
+                let source = frame.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
+                let integrity = frame.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                frame.sort_duplicate_loan().test_code_sort_body();
+                { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
+                assert_eq!(moved.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
+                assert_eq!(moved.compile.options.rows.as_ref().unwrap().capacity(), capacity);
+                for pointer in children { assert!(moved.compile.options.rows.as_ref().unwrap().iter().any(|s| s.as_ptr() == pointer)); }
+                moved.sort_duplicate_loan().test_code_sort_return(); moved.sort_duplicate_loan().test_code_check_unique();
+                assert!(moved.compile.options.rows.as_ref().unwrap().windows(2).all(|pair| pair[0] < pair[1]));
+                assert_eq!(moved.compile.prefix.capture.identity, [Some(i64::MIN), Some(i64::MAX)]);
+                assert_eq!(moved.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
+                assert_eq!(moved.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+                assert!(std::ptr::eq(moved.compile.prefix.integrity.prefix.initial.purpose, &purpose));
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                let first = moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                let stopped = moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                moved.sort_duplicate_loan().test_code_vector_before_statement(); moved.sort_duplicate_loan().test_code_statement_before_source_id();
+                moved.sort_duplicate_loan().test_code_finish_error_returns(); finish_compile_options_failure(&mut moved.compile, &trace, true);
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), stopped);
+            }
+        }
+        #[test]
+        fn history_original_compile_sort_duplicate_error_before_lexical_cleanup() {
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace,
+                vec![String::from("Z"), String::from("A"), String::from("Z")]);
+            let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            frame.sort_duplicate_loan().test_code_check_duplicate();
+            let error = actual_duplicate_error(); let detail = duplicate_detail_pointer(&error);
+            frame.sort_duplicate_loan().test_code_retain_duplicate(error);
+            assert_eq!(duplicate_detail_pointer(frame.compile.options.catalog_error.as_ref().unwrap()), detail);
+            { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
+            assert!(moved.compile.options.rows.is_some()); assert!(moved.compile.prefix.capture.source_id.is_some());
+            assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            moved.sort_duplicate_loan().test_code_duplicate_return(); moved.sort_duplicate_loan().test_code_vector_before_statement();
+            assert_eq!(duplicate_detail_pointer(moved.compile.options.catalog_error.as_ref().unwrap()), detail);
+            moved.sort_duplicate_loan().test_code_statement_before_source_id();
+            assert!(moved.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+            moved.sort_duplicate_loan().test_code_finish_error_returns();
+            let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source })) = &moved.compile.prefix.integrity.prefix.source.physical.primary
+                else { panic!("same actual duplicate C error reaches G only after scope returns"); };
+            assert_eq!(duplicate_detail_pointer(source), detail);
+            finish_compile_options_failure(&mut moved.compile, &trace, false);
+            assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+        }
+        #[test]
+        fn history_original_compile_sort_duplicate_primary_terminal_keep_owed_returns() {
+            // Fixed connected cuts: before sort, started/unknown body, actual
+            // body returned/lexical pending, duplicate owner pending/owned,
+            // and unique digest not started. No cfg allocation is payment.
+            for cut in 0..6 { for terminal in [false, true] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let values = if cut == 5 { vec![String::from("B"), String::from("A")] }
+                    else { vec![String::from("B"), String::from("A"), String::from("B")] };
+                let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace, values);
+                let mut pending = None;
+                match cut {
+                    1 => frame.sort_duplicate_loan().test_code_drop_body_unknown(),
+                    2 => frame.sort_duplicate_loan().test_code_sort_body(),
+                    3 | 4 | 5 => {
+                        frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+                        if cut == 5 { frame.sort_duplicate_loan().test_code_check_unique(); }
+                        else {
+                            frame.sort_duplicate_loan().test_code_check_duplicate();
+                            let error = actual_duplicate_error();
+                            if cut == 3 { frame.sort_duplicate_loan().test_code_begin_duplicate_unknown(); pending = Some(error); }
+                            else { frame.sort_duplicate_loan().test_code_retain_duplicate(error); }
+                        }
+                    },
+                    _ => {},
+                }
+                let (primary, allocation) = fixed_primary();
+                let first = if terminal { drop(primary); Some(frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
+                    else { frame.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
+                        frame.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("actual first supplied primary")); None };
+                let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
+                moved.sort_duplicate_loan().test_code_barrier();
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.compile.prefix.integrity.prefix.source.audit);
+                if cut == 1 {
+                    // No actual body return exists. T/primary cannot infer it
+                    // or start a sort to make cleanup possible: remains Held.
+                    moved.sort_duplicate_loan().test_code_no_successor_after_stop();
+                } else {
+                    if cut == 2 { moved.sort_duplicate_loan().test_code_sort_return(); }
+                    if cut == 3 { let error = pending.take().unwrap(); let pointer = duplicate_detail_pointer(&error);
+                        moved.sort_duplicate_loan().test_code_late_duplicate(error);
+                        assert_eq!(duplicate_detail_pointer(moved.compile.options.catalog_error.as_ref().unwrap()), pointer); }
+                    if cut == 3 || cut == 4 { moved.sort_duplicate_loan().test_code_duplicate_return(); }
+                    moved.sort_duplicate_loan().test_code_vector_before_statement(); moved.sort_duplicate_loan().test_code_statement_before_source_id();
+                    moved.sort_duplicate_loan().test_code_finish_error_returns(); finish_compile_options_failure(&mut moved.compile, &trace, terminal);
+                }
+                assert!(pending.is_none());
+                if let Some(first) = first { assert!(moved.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+                    assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
+                else { assert_primary(&moved.compile.prefix.integrity.prefix.source.physical, allocation); }
+                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            } }
         }
 
         fn integrity_raw_allocation(raw: &rusqlite::Error) -> usize {

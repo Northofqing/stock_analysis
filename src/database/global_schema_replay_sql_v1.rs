@@ -853,6 +853,7 @@ pub(super) mod original_native {
         integrity_read: IntegrityReadRecord,
         capture_prefix: CapturePrefixRecord,
         compile_options: CompileOptionsRecord,
+        compile_sort: CompileSortRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -885,6 +886,7 @@ pub(super) mod original_native {
                 integrity_read: IntegrityReadRecord::empty(),
                 capture_prefix: CapturePrefixRecord::empty(),
                 compile_options: CompileOptionsRecord::empty(),
+                compile_sort: CompileSortRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -964,6 +966,8 @@ pub(super) mod original_native {
         FinalizeCompileStatement, AwaitCompileStatementDrop, AwaitCompileRuntimeReturn, AwaitCompileCatalogReturn,
         WrapCompileCatalogError, DiscardCompileRaw, DiscardCompileDetail, DiscardCompileVector,
         DiscardCompileCatalogError, DiscardCompileSourceId, StopCompileOptions, CompileOptionsBeforeSort,
+        SortCompileOptions, AwaitCompileSortReturn, AwaitCompileSortLexicalReturn, CheckCompileDuplicates,
+        AcquireCompileDuplicateError, AwaitCompileDuplicateOwner, AwaitCompileDuplicateReturn, AwaitCompileDigestSuccessor,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1821,6 +1825,7 @@ pub(super) mod original_native {
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
                 && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear() && self.compile_options.stopped_clear()
+                && self.compile_sort.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1993,7 +1998,8 @@ pub(super) mod original_native {
                 || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some()
                 || self.fields.native.integrity_read.blocks_early_primary()
                 || self.fields.native.capture_prefix.blocks_early_primary()
-                || self.fields.native.compile_options.blocks_early_primary() { return Err(error); }
+                || self.fields.native.compile_options.blocks_early_primary()
+                || self.fields.native.compile_sort.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -4662,6 +4668,7 @@ pub(super) mod original_native {
     }
     impl NativeOriginalOwner {
         fn compile_options_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            if let Some(action) = self.compile_sort_action(work, physical) { return Some(action); }
             let r = &self.compile_options;
             if matches!(r.stage, CompileStage::Dormant | CompileStage::Stopped) { return None; }
             if r.prepare_started && matches!(r.prepare, CodeSlot::NotCalled) { return Some(LifecycleAction::AwaitCompilePrepareObservation); }
@@ -4916,7 +4923,12 @@ pub(super) mod original_native {
             match self.next() {
                 Some(LifecycleAction::DiscardCompileRaw) => drop(self.fields.native.compile_options.raw.take()),
                 Some(LifecycleAction::DiscardCompileDetail) => { drop(self.options.detail.take()); self.fields.native.compile_options.detail_started = false; },
-                Some(LifecycleAction::DiscardCompileVector) => { drop(self.options.rows.take()); self.fields.native.compile_options.vector_live = false; },
+                Some(LifecycleAction::DiscardCompileVector) => {
+                    drop(self.options.rows.take()); self.fields.native.compile_options.vector_live = false;
+                    if !matches!(self.fields.native.compile_sort.phase, CompileSortPhase::Dormant | CompileSortPhase::Stopped) {
+                        self.fields.native.compile_sort.phase = CompileSortPhase::Draining;
+                    }
+                },
                 Some(LifecycleAction::DiscardCompileCatalogError) => { drop(self.options.catalog_error.take()); self.fields.native.compile_options.catalog_live = false; },
                 Some(LifecycleAction::DiscardCompileSourceId) => { drop(self.source_id.take()); self.fields.native.capture_prefix.value_live = false; },
                 _ => return Err(ProtocolFault::UnexpectedObservation),
@@ -4925,7 +4937,11 @@ pub(super) mod original_native {
         fn stop(&mut self) -> Result<(), ProtocolFault> {
             if self.next() != Some(LifecycleAction::StopCompileOptions) { return Err(ProtocolFault::UnexpectedObservation); }
             self.fields.native.compile_options.stage = CompileStage::Stopped;
-            self.fields.native.capture_prefix.stage = CaptureStage::Stopped; Ok(())
+            self.fields.native.capture_prefix.stage = CaptureStage::Stopped;
+            if self.fields.native.compile_sort.phase == CompileSortPhase::Draining {
+                self.fields.native.compile_sort.phase = CompileSortPhase::Stopped;
+            }
+            Ok(())
         }
     }
     impl OriginalCompileVectorReturnPort<'_, '_> {
@@ -5179,6 +5195,255 @@ pub(super) mod original_native {
             rusqlite::Error::FromSqlConversionFailure(_, _, child) => child.as_ref() as *const _ as *const () as usize,
             rusqlite::Error::InvalidParameterCount(_, _) => 0,
             _ => panic!("fixed supplied compile-options raw child"),
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileSortPhase { Dormant, BeforeSort, SortReturn, LexicalReturn, Check, NeedError, ErrorOwner, ErrorReturn, DigestHeld, Draining, Stopped }
+    struct CompileSortRecord {
+        phase: CompileSortPhase, body_returned: bool,
+    }
+    impl CompileSortRecord {
+        fn empty() -> Self { Self { phase: CompileSortPhase::Dormant, body_returned: false } }
+        fn blocks_early_primary(&self) -> bool {
+            matches!(self.phase, CompileSortPhase::SortReturn | CompileSortPhase::LexicalReturn
+                | CompileSortPhase::ErrorOwner | CompileSortPhase::ErrorReturn)
+        }
+        fn stopped_clear(&self) -> bool { matches!(self.phase, CompileSortPhase::Dormant | CompileSortPhase::Stopped) }
+    }
+    impl NativeOriginalOwner {
+        fn compile_sort_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            use CompileSortPhase as Phase;
+            let stopped = work.terminal().is_some() || physical.primary.is_some();
+            Some(match self.compile_sort.phase {
+                Phase::Dormant | Phase::Stopped => return None,
+                // Reached call/lexical/owned-return obligations precede both
+                // first-primary and terminal cleanup. Neither supplies a fact.
+                Phase::SortReturn => LifecycleAction::AwaitCompileSortReturn,
+                Phase::LexicalReturn => LifecycleAction::AwaitCompileSortLexicalReturn,
+                Phase::ErrorOwner => LifecycleAction::AwaitCompileDuplicateOwner,
+                Phase::ErrorReturn => LifecycleAction::AwaitCompileDuplicateReturn,
+                Phase::BeforeSort | Phase::Check | Phase::NeedError | Phase::DigestHeld if stopped => LifecycleAction::DiscardCompileVector,
+                Phase::BeforeSort => LifecycleAction::SortCompileOptions,
+                Phase::Check => LifecycleAction::CheckCompileDuplicates,
+                Phase::NeedError => LifecycleAction::AcquireCompileDuplicateError,
+                Phase::DigestHeld => LifecycleAction::AwaitCompileDigestSuccessor,
+                Phase::Draining => {
+                    if self.compile_options.vector_live { LifecycleAction::DiscardCompileVector }
+                    else { return None; } // parent's fixed Stmt -> source-id -> C/G cleanup
+                },
+            })
+        }
+    }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_compile_sort_duplicate(&mut self) -> bool {
+            let n = &mut self.native; let r = &n.compile_options;
+            if self.work.terminal().is_some() || self.physical.primary.is_some() || !matches!(n.tx.phase, TxPhase::Active)
+                || n.compile_sort.phase != CompileSortPhase::Dormant || r.stage != CompileStage::Ready
+                || r.collect_return != CompileReturn::Ok || !r.vector_live || r.blocks_early_primary()
+                || r.runtime_return != CompileReturn::Unknown || r.catalog_return != CompileReturn::Unknown
+                || !n.statements[0].live().is_some_and(|s| s.action == FixedAction::CompileOptions && s.cursor == CursorPhase::NoCursor)
+                || !n.capture_prefix.value_live { return false; }
+            n.compile_sort.phase = CompileSortPhase::BeforeSort; true
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalCompileSortLoan<'a> {
+        fields: OriginalOwnerFields<'a>, options: &'a mut super::super::super::FinancialCompileOptionsState,
+        source_id: &'a mut Option<String>,
+    }
+    struct OriginalCompileSortPort<'short, 'a, 'rules> {
+        loan: &'short mut OriginalCompileSortLoan<'a>, _rules: &'rules SelectedOriginalNativeRules,
+    }
+    struct OriginalCompileSortBodyPort<'short> { rows: &'short mut Vec<String>, record: &'short mut CompileSortRecord }
+    struct OriginalCompileDuplicateReturnPort<'short, 'a> { loan: &'short mut OriginalCompileSortLoan<'a> }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn compile_sort_duplicate(self,
+            options: &'a mut super::super::super::FinancialCompileOptionsState, source_id: &'a mut Option<String>) -> OriginalCompileSortLoan<'a> {
+            OriginalCompileSortLoan { fields: self, options, source_id }
+        }
+    }
+    impl<'a> OriginalCompileSortLoan<'a> {
+        fn fixed_port<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> OriginalCompileSortPort<'short, 'a, 'rules> {
+            OriginalCompileSortPort { loan: self, _rules: rules }
+        }
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.compile_options_action(&self.fields.work, self.fields.physical) }
+        fn parent_loan(&mut self) -> OriginalCompileOptionsLoan<'_> {
+            OriginalCompileOptionsLoan { fields: self.fields.reborrow(), options: &mut *self.options, source_id: &mut *self.source_id }
+        }
+        fn body_port(&mut self) -> Result<OriginalCompileSortBodyPort<'_>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::SortCompileOptions) { return Err(ProtocolFault::UnexpectedObservation); }
+            let rows = self.options.rows.as_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            self.fields.native.compile_sort.phase = CompileSortPhase::SortReturn;
+            Ok(OriginalCompileSortBodyPort { rows, record: &mut self.fields.native.compile_sort })
+        }
+        fn sort_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileSortReturn) || !self.fields.native.compile_sort.body_returned {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.fields.native.compile_sort.phase = CompileSortPhase::LexicalReturn; Ok(())
+        }
+        fn sort_lexical_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileSortLexicalReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Independent opaque callee/drop obligation, not scratch ownership,
+            // allocation accounting, allocator authority or a payment receipt.
+            self.fields.native.compile_sort.phase = CompileSortPhase::Check; Ok(())
+        }
+        fn check_duplicates(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CheckCompileDuplicates) { return Err(ProtocolFault::UnexpectedObservation); }
+            let rows = self.options.rows.as_ref().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let duplicate = rows.windows(2).any(|pair| pair[0] == pair[1]);
+            self.fields.native.compile_sort.phase = if duplicate { CompileSortPhase::NeedError } else { CompileSortPhase::DigestHeld }; Ok(())
+        }
+        fn duplicate_return_port(&mut self) -> Result<OriginalCompileDuplicateReturnPort<'_, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AcquireCompileDuplicateError) || self.options.catalog_error.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.fields.native.compile_sort.phase = CompileSortPhase::ErrorOwner;
+            Ok(OriginalCompileDuplicateReturnPort { loan: self })
+        }
+        fn duplicate_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitCompileDuplicateReturn) || !self.fields.native.compile_options.catalog_live {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.fields.native.compile_sort.phase = CompileSortPhase::Draining; Ok(())
+        }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() == Some(LifecycleAction::DiscardCompileVector) {
+                self.parent_loan().discard_owned()?;
+                self.fields.native.compile_sort.phase = CompileSortPhase::Draining; return Ok(());
+            }
+            self.parent_loan().discard_owned()
+        }
+        fn stop(&mut self) -> Result<(), ProtocolFault> {
+            self.parent_loan().stop()?; self.fields.native.compile_sort.phase = CompileSortPhase::Stopped; Ok(())
+        }
+    }
+    impl OriginalCompileSortBodyPort<'_> {
+        fn run(self) {
+            // Only the unissued fixed Rules port reaches this production body.
+            // Stable sort's actual private scratch remains a qualification gap.
+            self.rows.sort(); self.record.body_returned = true;
+        }
+    }
+    impl OriginalCompileDuplicateReturnPort<'_, '_> {
+        fn retain(self, error: super::super::super::GlobalSchemaCatalogError) {
+            // Exclusive preflight has the sole empty destination. A genuine
+            // already-owned C error moves before any later refusal; no format,
+            // clone, owned detail factory, new Work or payment issuer is added.
+            self.loan.options.catalog_error = Some(error);
+            self.loan.fields.native.compile_options.catalog_live = true;
+            self.loan.fields.native.compile_sort.phase = CompileSortPhase::ErrorReturn;
+        }
+    }
+    impl<'a> OriginalCompileSortPort<'_, 'a, '_> {
+        fn sort_body(&mut self) -> Result<OriginalCompileSortBodyPort<'_>, ProtocolFault> { self.loan.body_port() }
+        fn sort_return(&mut self) -> Result<(), ProtocolFault> { self.loan.sort_return() }
+        fn lexical_return(&mut self) -> Result<(), ProtocolFault> { self.loan.sort_lexical_return() }
+        fn check_duplicates(&mut self) -> Result<(), ProtocolFault> { self.loan.check_duplicates() }
+        fn duplicate_owner<'short>(&'short mut self) -> Result<OriginalCompileDuplicateReturnPort<'short, 'a>, ProtocolFault> { self.loan.duplicate_return_port() }
+        fn duplicate_return(&mut self) -> Result<(), ProtocolFault> { self.loan.duplicate_return() }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.parent_loan().observe_finalize(code) }
+        fn statement_drop_return(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().statement_drop_return() }
+        fn runtime_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.parent_loan().runtime_return(fact) }
+        fn catalog_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.parent_loan().catalog_return(fact) }
+        fn wrap_catalog_error(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().wrap_catalog_error() }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_owned() }
+        fn stop(&mut self) -> Result<(), ProtocolFault> { self.loan.stop() }
+    }
+
+    #[cfg(test)]
+    impl OriginalCompileSortLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_barrier(&mut self) {
+            self.parent_loan().test_code_barrier();
+            assert!(!self.fields.native.compile_sort.stopped_clear());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_sort_body(&mut self) {
+            assert!(self.sort_return().is_err()); assert!(self.sort_lexical_return().is_err());
+            self.body_port().unwrap().run();
+            assert!(self.body_port().is_err()); assert!(self.check_duplicates().is_err());
+            self.test_code_barrier();
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_sort_return(&mut self) {
+            self.sort_return().unwrap(); assert!(self.sort_return().is_err());
+            self.test_code_barrier(); assert!(self.check_duplicates().is_err());
+            self.sort_lexical_return().unwrap(); assert!(self.sort_lexical_return().is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_check_unique(&mut self) {
+            self.check_duplicates().unwrap(); assert!(self.check_duplicates().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDigestSuccessor));
+            assert!(self.duplicate_return_port().is_err()); assert!(self.stop().is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err());
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_check_duplicate(&mut self) {
+            self.check_duplicates().unwrap(); assert!(self.check_duplicates().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::AcquireCompileDuplicateError));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_duplicate(&mut self, error: super::super::super::GlobalSchemaCatalogError) {
+            self.duplicate_return_port().unwrap().retain(error);
+            assert!(self.duplicate_return_port().is_err()); self.test_code_barrier();
+            assert!(self.discard_owned().is_err()); assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Error).is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_duplicate_return(&mut self) {
+            self.duplicate_return().unwrap(); assert!(self.duplicate_return().is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_vector_before_statement(&mut self) {
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardCompileVector));
+            assert!(self.fields.native.statements[0].live().is_some());
+            assert!(self.source_id.is_some()); assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            self.discard_owned().unwrap(); assert!(self.options.rows.is_none());
+            assert!(!self.fields.native.compile_options.vector_live); assert!(self.fields.native.statements[0].live().is_some());
+            assert_eq!(self.next(), Some(LifecycleAction::FinalizeCompileStatement)); assert!(self.discard_owned().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_statement_before_source_id(&mut self) {
+            self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap();
+            assert!(self.fields.native.statements[0].live().is_none()); assert!(self.source_id.is_some());
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Error).is_err()); self.test_code_barrier();
+            // The driver's internally ignored owned finalize Result has no
+            // public transport. This fixed lexical return proves no payment.
+            self.parent_loan().statement_drop_return().unwrap();
+            assert!(self.parent_loan().statement_drop_return().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardCompileSourceId)); self.discard_owned().unwrap();
+            assert!(self.source_id.is_none()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_error_returns(&mut self) {
+            let expected = if self.fields.native.compile_options.catalog_live { CompileReturn::Error } else { CompileReturn::Interrupted };
+            assert!(self.parent_loan().catalog_return(expected).is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err()); self.test_code_barrier();
+            self.parent_loan().runtime_return(expected).unwrap(); assert!(self.parent_loan().runtime_return(expected).is_err());
+            assert!(self.stop().is_err()); self.parent_loan().catalog_return(expected).unwrap();
+            assert!(self.parent_loan().catalog_return(expected).is_err());
+            if self.fields.native.compile_options.catalog_live {
+                if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some() { self.discard_owned().unwrap(); }
+                else { self.parent_loan().wrap_catalog_error().unwrap(); assert!(self.parent_loan().wrap_catalog_error().is_err()); }
+            }
+            self.stop().unwrap(); assert!(self.stop().is_err());
+            assert!(self.fields.native.compile_sort.stopped_clear()); assert!(self.fields.native.compile_options.stopped_clear());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_drop_body_unknown(&mut self) {
+            drop(self.body_port().unwrap());
+            assert!(!self.fields.native.compile_sort.body_returned); assert!(self.sort_return().is_err());
+            assert!(self.sort_lexical_return().is_err()); assert!(self.body_port().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_begin_duplicate_unknown(&mut self) {
+            drop(self.duplicate_return_port().unwrap());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDuplicateOwner));
+            assert!(self.duplicate_return().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_late_duplicate(&mut self, error: super::super::super::GlobalSchemaCatalogError) {
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDuplicateOwner));
+            OriginalCompileDuplicateReturnPort { loan: self }.retain(error);
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDuplicateReturn)); self.test_code_barrier();
+            assert!(self.discard_owned().is_err()); assert!(self.parent_loan().runtime_return(CompileReturn::Error).is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_no_successor_after_stop(&mut self) {
+            assert!(self.body_port().is_err()); assert!(self.check_duplicates().is_err()); assert!(self.duplicate_return_port().is_err());
+            assert!(self.options.rows.is_some()); assert!(self.source_id.is_some()); self.test_code_barrier();
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err());
         }
     }
 
