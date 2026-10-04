@@ -981,7 +981,7 @@
         "sha256": "91d60b39e4207cb8d7c16c340f20979b5cf34f7220443aa6271244dd3a399366"
       }
     },
-    "owner_sha256": "954e2efb542cdaf20c300c613db8b9b5713a6c8c6fc580c4bb7620b777ecc4f2",
+    "owner_sha256": "1d9c2d8453b6efcfd11c23fdcc950fecbeb85cf304216a8c536506f461011338",
     "packages": [
       {
         "id": "registry+https://github.com/rust-lang/crates.io-index#adler2@2.0.1",
@@ -39324,6 +39324,6 @@
     }
   },
   "mode": "RecordingOnly",
-  "profile": "normaldev-library-bundledsqlite-v1",
+  "profile": "normaldev-library",
   "schema": "stock-analysis-replay-build-record-v1"
 }

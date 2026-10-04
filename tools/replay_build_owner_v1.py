@@ -1105,6 +1105,249 @@ def ring_static_graph(receipts, associations, artifacts, events, edges, session,
     return blockers, declarations
 
 
+
+PSM_PACKAGE = "registry+https://github.com/rust-lang/crates.io-index#psm@0.1.30"
+PSM_ARCHIVE = "libpsm_s.a"
+PSM_CFGS = ("asm", "link_asm", "switchable_stack")
+PSM_SOURCES = ("src/lib.rs", "src/arch/x86_64.s", "src/arch/psm.h", "src/arch/gnu_stack_note.s")
+
+
+def psm_candidate(args, env, cwd, session):
+    source = session / "vendor/psm/src/lib.rs"
+    return (any(not a.startswith("-") and a.endswith(".rs") and (cwd / a).resolve() == source for a in args[1:])
+            or env.get("CARGO_PKG_NAME") == "psm" or env.get("CARGO_CRATE_NAME") == "psm"
+            or (env.get("CARGO_MANIFEST_DIR") and (cwd / env["CARGO_MANIFEST_DIR"]).resolve() == source.parent.parent)
+            or any(a in ("static=psm_s", "-lstatic=psm_s") for a in args[1:]))
+
+
+def psm_static_context(args, env, cwd, session, inv):
+    if not psm_candidate(args, env, cwd, session):
+        return None
+    raw = args[1:]
+    root = session / "vendor/psm"
+    # The observed Host builder remains ordinary; no Host-library/probe exception.
+    if not any(a.startswith(("-l", "--extern-native")) for a in raw):
+        ordinary = parse_rustc(raw)
+        if (ordinary["inputs"] == [str(root / "build.rs")] and not ordinary["probe"]
+                and ordinary["options"].get("--crate-type") == ["bin"]
+                and "--target" not in ordinary["options"]):
+            return None
+    try:
+        package, root, out = fixed_source_package("psm", "0.1.30", cwd, env, session, inv, PSM_SOURCES)
+        require(re.fullmatch(r"psm-[0-9a-f]{16}", out.parent.name), "PsmSourceContext")
+    except (OSError, Refusal) as error:
+        raise Refusal("PsmSourceContext") from error
+    suffix = ["-L", "native=" + str(out), "-l", "static=psm_s", "--cfg", "asm", "--cfg", "link_asm",
+              "--cfg", "switchable_stack", "--check-cfg", "cfg(switchable_stack,asm,link_asm)"]
+    require(raw[-12:] == suffix, "PsmStaticTemplate")
+    try:
+        parsed = parse_rustc(raw[:-12] + raw[-8:])  # Only the validated balanced native pair is removed.
+    except Refusal as error:
+        raise Refusal("PsmStaticTemplate") from error
+    o, c = parsed["options"], parsed["codegen"]
+    metadata = c.get("metadata", [""])[0]; extra = c.get("extra-filename", [""])[0]
+    deps, host = session / "target" / TARGET / "debug/deps", session / "target/debug/deps"
+    exact = ["--crate-name", "psm", "--edition=2021", str(root / "src/lib.rs"), "--error-format=json",
+             "--json=diagnostic-rendered-ansi,artifacts,future-incompat", "--crate-type", "lib",
+             "--emit=dep-info,metadata,link", "-C", "embed-bitcode=no", "-C", "debuginfo=1",
+             "-C", "split-debuginfo=unpacked", "--check-cfg", "cfg(docsrs,test)", "--check-cfg",
+             "cfg(feature, values())", "-C", "metadata=" + metadata, "-C", "extra-filename=" + extra,
+             "--out-dir", str(deps), "--target", TARGET, "-L", "dependency=" + str(deps),
+             "-L", "dependency=" + str(host), "--cap-lints", "allow", *suffix]
+    require(raw == exact and re.fullmatch(r"[0-9a-f]{16}", metadata)
+            and re.fullmatch(r"-[0-9a-f]{16}", extra), "PsmStaticTemplate")
+    require(env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml") and env.get("CARGO_CRATE_NAME") == "psm"
+            and all(env.get(k) == v for k, v in {"CARGO_PKG_VERSION_MAJOR": "0", "CARGO_PKG_VERSION_MINOR": "1",
+                "CARGO_PKG_VERSION_PATCH": "30", "CARGO_PKG_VERSION_PRE": ""}.items())
+            and not any(k.startswith("CARGO_FEATURE_") for k in env)
+            and env.get("RUSTC") == inv["rustc"]["path"] and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and not env.get("RUSTC_WORKSPACE_WRAPPER")
+            and all(env.get(k) == inv["environment"].get(k) for k in ("CC", "CXX", "AR", "SDKROOT")),
+            "PsmEnvironmentContext")
+    o["-L"].append("native=" + str(out)); o["-l"] = ["static=psm_s"]
+    return parsed, {"kind": "DirectCargoCompile", "psm_static_declaration": "static=psm_s", "package_id": package["id"],
+                    "manifest": str(root), "out_dir": str(out), "native_argument_indices": list(range(len(args) - 12, len(args) - 8))}
+
+
+def psm_archive_observation(call, context, phase):
+    require(phase in ("pre", "post"), "PsmArchiveEvidence")
+    try:
+        path = Path(context["out_dir"]) / PSM_ARCHIVE; regular(path)
+        before = path.stat()
+        require(path.resolve() == path and before.st_nlink == 1, "PsmArchiveEvidence")
+        snapshot = call / ("psm-archive-" + phase + ".raw")
+        with open(path, "rb") as source, open(snapshot, "xb") as dest:
+            opened = os.fstat(source.fileno())
+            require((opened.st_dev, opened.st_ino, opened.st_size) == (before.st_dev, before.st_ino, before.st_size),
+                    "PsmArchiveEvidence")
+            shutil.copyfileobj(source, dest, 65536)
+            after = os.fstat(source.fileno())
+        current = path.stat(); sha = file_hash(snapshot)
+        require(path.resolve() == path and not path.is_symlink() and current.st_nlink == 1
+                and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) ==
+                    (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+                and snapshot.stat().st_size == before.st_size and file_hash(path) == sha, "PsmArchiveEvidence")
+        return {"path": str(path), "snapshot": snapshot.name, "length": before.st_size, "sha256": sha}
+    except (OSError, Refusal) as error:
+        raise Refusal("PsmArchiveEvidence") from error
+
+
+def psm_archive_namespace(args, env, cwd, call, session):
+    # Negative-only exclusion: these names never establish production or acquisition authority.
+    paths = {str(call / ("psm-archive-" + phase + ".raw")) for phase in ("pre", "post")}
+    out = (cwd / env.get("OUT_DIR", "")).resolve()
+    if (out.name == "out" and out.parent.parent == session / "target" / TARGET / "debug/build"
+            and re.fullmatch(r"psm-[0-9a-f]{16}", out.parent.name)):
+        paths.add(str(out / PSM_ARCHIVE))
+    hashes = {file_hash(Path(p)) for p in paths if Path(p).is_file() and not Path(p).is_symlink()}
+    return paths, hashes
+
+
+def validate_psm_static_evidence(receipt, call, session, inv):
+    request = strict_json((call / "request.json").read_bytes()); initial = strict_json((call / "invocation.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    special = psm_static_context(args, env, cwd, session, inv)
+    claimed = any("psm_static_declaration" in r.get("context", {}) or any(k.startswith("psm_archive_") for k in r)
+                  for r in (initial, receipt))
+    if special is None:
+        require(not claimed, "PsmInvocationEvidence"); return None
+    parsed, context = special
+    require(claimed and args[0] == inv["rustc"]["path"] and file_hash(Path(args[0])) == inv["rustc"]["sha256"]
+            and receipt["compiler_sha256"] == inv["rustc"]["sha256"]
+            and request["argv_hex"] == initial["argv_hex"] == receipt["argv_hex"]
+            and request["environment_hex"] == initial["environment_hex"] == receipt["environment_hex"]
+            and all(initial[k] == receipt[k] for k in ("context", "parsed", "source", "package", "role", "kind", "cwd",
+                                                       "compiler_sha256", "psm_archive_pre"))
+            and receipt["parsed"] == parsed and receipt["context"] == context and receipt["cwd"] == str(cwd)
+            and receipt["role"] == "Target" and receipt["kind"] == "Compile" and receipt["externs"] == []
+            and receipt["source"] == str(session / "vendor/psm/src/lib.rs")
+            and receipt["package"] == {"id": PSM_PACKAGE, "tree": "vendor", "manifest": "psm/Cargo.toml"},
+            "PsmInvocationEvidence")
+    compiler_environment(env, session, inv["sysroot"], probe=False, context=context)
+    try:
+        for phase in ("pre", "post"):
+            row = receipt["psm_archive_" + phase]
+            require(set(row) == {"path", "snapshot", "length", "sha256"}
+                    and type(row["length"]) is int and row["length"] >= 0
+                    and row["path"] == str(Path(context["out_dir"]) / PSM_ARCHIVE)
+                    and row["snapshot"] == "psm-archive-" + phase + ".raw", "PsmArchiveBinding")
+            for path in (call / row["snapshot"], Path(row["path"])):
+                regular(path)
+                require(path.resolve() == path and path.stat().st_nlink == 1 and path.stat().st_size == row["length"]
+                        and file_hash(path) == row["sha256"], "PsmArchiveBinding")
+        require(all(receipt["psm_archive_pre"][k] == receipt["psm_archive_post"][k]
+                    for k in ("path", "length", "sha256")), "PsmArchiveBinding")
+    except (Refusal, OSError, KeyError, TypeError) as error:
+        raise Refusal("PsmArchiveBinding") from error
+    return context
+
+
+def psm_static_graph(receipts, associations, artifacts, events, edges, session, inv):
+    blockers, declarations = [], []; by_id = {r["invocation_id"]: r for r in receipts}
+    for r in receipts:
+        call = session / "invocations" / r["invocation_id"]
+        request = strict_json((call / "request.json").read_bytes())
+        args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+        env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        if not (psm_candidate(args, env, cwd, session) or "psm_static_declaration" in r.get("context", {})
+                or any(k.startswith("psm_archive_") for k in r)):
+            continue
+        try:
+            context = validate_psm_static_evidence(r, call, session, inv)
+            if context is None: continue
+            origins = [a for a in associations if a["package_id"] == PSM_PACKAGE and a["out_dir"] == context["out_dir"]]
+            oe = [e for e in events if e["reason"] == "build-script-executed" and e.get("package_id") == PSM_PACKAGE]
+            require(len(origins) == len(oe) == 1 and origins[0]["cargo_event"] == oe[0], "PsmOrigin")
+            association = origins[0]; builder = by_id.get(association["producer_invocation"])
+            require(builder is not None and builder["kind"] == "Compile" and builder["role"] == "Host"
+                    and builder["exit_code"] == 0 and not builder["blockers"] and builder["source"] == str(session / "vendor/psm/build.rs")
+                    and builder["package"] == {"id": PSM_PACKAGE, "tree": "vendor", "manifest": "psm/Cargo.toml"}, "PsmBuilder")
+            bcall = session / "invocations" / builder["invocation_id"]
+            br = strict_json((bcall / "request.json").read_bytes()); bi = strict_json((bcall / "invocation.json").read_bytes())
+            barg = [os.fsdecode(bytes.fromhex(a)) for a in br["argv_hex"]]
+            benv = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in br["environment_hex"].items()}
+            bcwd = Path(os.fsdecode(bytes.fromhex(br["cwd_hex"])))
+            require(bcwd == session / "vendor/psm" and barg[0] == inv["rustc"]["path"]
+                    and br["argv_hex"] == bi["argv_hex"] == builder["argv_hex"]
+                    and br["environment_hex"] == bi["environment_hex"] == builder["environment_hex"]
+                    and all(bi[k] == builder[k] for k in ("source", "package", "role", "kind", "cwd", "parsed", "compiler_sha256"))
+                    and builder["parsed"] == parse_rustc(barg[1:]) and builder["cwd"] == str(bcwd)
+                    and builder["parsed"]["inputs"] == [builder["source"]]
+                    and builder["parsed"]["options"].get("--crate-type") == ["bin"]
+                    and not builder["parsed"]["options"].get("--target") and builder["compiler_sha256"] == inv["rustc"]["sha256"]
+                    and benv.get("CARGO_MANIFEST_DIR") == str(bcwd) and benv.get("CARGO_PKG_NAME") == "psm"
+                    and benv.get("CARGO_PKG_VERSION") == "0.1.30", "PsmBuilder")
+            compiler_environment(benv, session, inv["sysroot"], probe=False, context=builder["context"])
+            ba = [a for a in artifacts if a["invocation_id"] == builder["invocation_id"] and "builder_alias" in a]
+            be = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == PSM_PACKAGE
+                  and e.get("target", {}).get("kind") == ["custom-build"]]
+            require(len(ba) == len(be) == 1 and be[0]["target"].get("src_path") == builder["source"]
+                    and not be[0].get("features") and not builder["parsed"]["options"].get("--cfg")
+                    and not any(k.startswith("CARGO_FEATURE_") for k in benv), "PsmBuilder")
+            bedges = [e for e in edges if e["consumer"] == builder["invocation_id"]]
+            require(len(bedges) == 2 and {e["name"] for e in bedges} == {"cc", "ar_archive_writer"}, "PsmBuilderExtern")
+            for name, version in (("cc", "1.2.59"), ("ar_archive_writer", "0.5.1")):
+                ee = [e for e in bedges if e["name"] == name]
+                require(len(ee) == 1 and len(ee[0]["producers"]) == 1, "PsmBuilderExtern")
+                helper = by_id[ee[0]["producers"][0]]
+                require(helper["kind"] == "Compile" and helper["role"] == "Host" and helper["exit_code"] == 0
+                        and not helper["blockers"] and helper["package"] == {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                            "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                        and helper["source"] == str(session / "vendor" / name / "src/lib.rs"), "PsmBuilderExtern")
+                hcall = session / "invocations" / helper["invocation_id"]
+                hr = strict_json((hcall / "request.json").read_bytes()); hi = strict_json((hcall / "invocation.json").read_bytes())
+                hargs = [os.fsdecode(bytes.fromhex(a)) for a in hr["argv_hex"]]
+                require(hr["argv_hex"] == hi["argv_hex"] == helper["argv_hex"]
+                        and hr["environment_hex"] == hi["environment_hex"] == helper["environment_hex"]
+                        and Path(os.fsdecode(bytes.fromhex(hr["cwd_hex"]))) == session / "vendor" / name
+                        and helper["cwd"] == str(session / "vendor" / name)
+                        and all(hi[k] == helper[k] for k in ("source", "package", "role", "kind", "cwd", "parsed", "compiler_sha256"))
+                        and hargs[0] == inv["rustc"]["path"] and helper["compiler_sha256"] == inv["rustc"]["sha256"]
+                        and parse_rustc(hargs[1:]) == helper["parsed"] and not helper["parsed"]["probe"]
+                        and "--target" not in helper["parsed"]["options"]
+                        and helper["parsed"]["options"].get("--crate-type") == ["lib"]
+                        and helper["context"] == hi["context"] == {"kind": "DirectCargoCompile"}
+                        and helper["parsed"]["inputs"] == [helper["source"]]
+                        and len([a for a in artifacts if a["invocation_id"] == helper["invocation_id"]]) == 1,
+                        "PsmBuilderExtern")
+            event = association["cargo_event"]
+            require(event["linked_libs"] == ["static=psm_s"] and event["linked_paths"] == ["native=" + context["out_dir"]]
+                    and event["cfgs"] == list(PSM_CFGS) and event["env"] == [], "PsmDeclaration")
+            ca = [a for a in artifacts if a["invocation_id"] == r["invocation_id"]]
+            ce = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == PSM_PACKAGE
+                  and e.get("target", {}).get("src_path") == r["source"]]
+            require(r["exit_code"] == 0 and not r["blockers"] and len(ca) == len(ce) == 1 and ce[0].get("features") == []
+                    and ce[0]["target"].get("kind") == ["lib"] and ce[0]["target"].get("crate_types") == ["lib"]
+                    and ce[0]["target"].get("name") == "psm" and ce[0]["target"].get("edition") == "2021"
+                    and len([v for v in receipts if v.get("source") == r["source"]]) == 1 and ca[0]["files"] == ce[0]["filenames"]
+                    and set(ce[0]["filenames"]) == {o["path"] for o in r["declared_outputs"] if o["kind"] in ("metadata", "link")}
+                    and not any(e["consumer"] == r["invocation_id"] for e in edges), "PsmConsumer")
+            require(association["generated_files"].get(PSM_ARCHIVE) == r["psm_archive_pre"]["sha256"], "PsmArchiveBinding")
+            paths, hashes = psm_archive_namespace(args, env, cwd, call, session)
+            require(not any(o["path"] in paths or o.get("sha256") in hashes or (Path(o["path"]).is_file()
+                                and not Path(o["path"]).is_symlink() and file_hash(Path(o["path"])) in hashes)
+                            for v in receipts for o in v["declared_outputs"] + v["outputs"])
+                    and not any(e["path"] in paths for e in edges)
+                    and not any(str((Path(v["cwd"]) / q).resolve()) in paths or ((Path(v["cwd"]) / q).is_file()
+                                and not (Path(v["cwd"]) / q).is_symlink() and file_hash(Path(v["cwd"]) / q) in hashes)
+                                for v in receipts for o in v["outputs"] for q in o.get("dep_info", {}).get("paths", []))
+                    and not any(f in paths or sha in hashes for a in artifacts for f, sha in a["file_sha256"].items())
+                    and not any(str(Path(f).resolve()) in paths or (Path(f).is_file() and not Path(f).is_symlink()
+                                and file_hash(Path(f)) in hashes) for e in events if e["reason"] == "compiler-artifact"
+                                for f in e.get("filenames", [])), "PsmArchiveOwnership")
+            declarations.append({"state": "RecordingOnly", "declaration": "static=psm_s", "raw_argument_indices": context["native_argument_indices"],
+                "consumer_invocation": r["invocation_id"], "producer_invocation": builder["invocation_id"], "package_id": PSM_PACKAGE,
+                "out_dir": context["out_dir"], "archive_pre": r["psm_archive_pre"], "archive_post": r["psm_archive_post"],
+                "artifact_selection": "not_observed", "native_child_provenance": "not_observed", "native_producer_qualification": "not_issued"})
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("PsmGraph:" + (str(error) if isinstance(error, Refusal) else "PsmInvocationEvidence"))
+    return blockers, declarations
+
+
 def framework_context(args, env, cwd, session, inv):
     raw = args[1:]
     if not any(a == "-l" or a.startswith("-l") or a.startswith("--extern-native") for a in raw):
@@ -2262,6 +2505,8 @@ def wrapper(session_id, args):
     if special is None:
         special = ring_static_context(args, os.environ, cwd, session, inv)
     if special is None:
+        special = psm_static_context(args, os.environ, cwd, session, inv)
+    if special is None:
         special = framework_context(args, os.environ, cwd, session, inv)
     if special is None:
         special = autocfg_context(args, os.environ, cwd, session, inv)
@@ -2344,11 +2589,24 @@ def wrapper(session_id, args):
         record.update(metadata_pre=pre, predecessor_invocation=predecessor)
     if "ring_static_declarations" in context:
         record["ring_archive_pre"] = ring_archive_observation(call, context, "pre")
+    if "psm_static_declaration" in context:
+        record["psm_archive_pre"] = psm_archive_observation(call, context, "pre")
     atomic_json(call / "invocation.json", record)
     stdin_failures = []
     code = run_streamed(args, cwd, dict(os.environ), call / "stdout.raw", call / "stderr.raw",
                         echo=True, pass_fds=jobserver_fds, stdin_bytes=stdin_bytes,
                         stdin_failures=stdin_failures)
+    psm_post, psm_post_blockers = None, []
+    if "psm_static_declaration" in context:
+        try:
+            psm_post = psm_archive_observation(call, context, "post")
+            require(all(record["psm_archive_pre"][k] == psm_post[k] for k in ("path", "length", "sha256")), "PsmArchiveChanged")
+        except (Refusal, OSError) as error:
+            psm_post_blockers.append(str(error))
+        try:
+            require(psm_static_context(args, os.environ, cwd, session, inv) == (parsed, context), "PsmPostSource")
+        except (Refusal, OSError) as error:
+            psm_post_blockers.append("PsmPostSource:" + str(error))
     record["exit_code"] = code
     record["stdout_sha256"] = file_hash(call / "stdout.raw")
     record["stderr_sha256"] = file_hash(call / "stderr.raw")
@@ -2361,6 +2619,9 @@ def wrapper(session_id, args):
                 record["blockers"].append("RingArchiveChanged")
         except Refusal as error:
             record["blockers"].append(str(error))
+    if psm_post is not None:
+        record["psm_archive_post"] = psm_post
+    record["blockers"].extend(psm_post_blockers)
     if transient:
         try:
             if rustix_stdin:
@@ -2496,6 +2757,17 @@ def seal_record(session, policy, cargo_exit):
     sysroot_declarations = {}
     record10_transient_paths = set()
     record10_invalid_calls = set()
+    psm_paths, psm_hashes, psm_invalid_calls = set(), set(), set()
+    # Fixed event names only strengthen exclusion if mutable consumer annotations vanish.
+    for event in events:
+        if (event["reason"] != "build-script-executed" or event.get("package_id") != PSM_PACKAGE
+                or not isinstance(event.get("out_dir"), str)): continue
+        out = Path(event["out_dir"]).resolve()
+        if (out.name == "out"
+                and out.parent.parent == session / "target" / TARGET / "debug/build"
+                and re.fullmatch(r"psm-[0-9a-f]{16}", out.parent.name)):
+            archive = out / PSM_ARCHIVE; psm_paths.add(str(archive))
+            if archive.is_file() and not archive.is_symlink(): psm_hashes.add(file_hash(archive))
     for directory in sorted((session / "invocations").iterdir()):
         # Reconstruct closed names even for request-only failures, before any
         # full qualification or mutable receipt annotation can be consulted.
@@ -2505,12 +2777,34 @@ def seal_record(session, policy, cargo_exit):
             env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
             cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
             record10_transient_paths.update(record10_transient_namespace(raw, env, cwd, session))
+            paths, hashes = psm_archive_namespace(raw, env, cwd, directory, session)
+            psm_paths.update(paths); psm_hashes.update(hashes)
+            try:
+                psm_static_context(raw, env, cwd, session, policy["inventory"])
+            except (Refusal, OSError) as error:
+                blockers.append("PsmEvidence:" + str(error)); psm_invalid_calls.add(directory.name)
         except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
             blockers.append("Record10Namespace:" + str(error))
             record10_invalid_calls.add(directory.name)
+        # Retained observations strengthen exclusion even if files or annotations disappear.
+        for leaf in ("invocation.json", "receipt.json"):
+            path = directory / leaf
+            if not path.is_file() or path.is_symlink(): continue
+            try:
+                observation = strict_json(path.read_bytes())
+                for phase in ("pre", "post"):
+                    row = observation.get("psm_archive_" + phase, {})
+                    sha = row.get("sha256") if isinstance(row, dict) else None
+                    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha): psm_hashes.add(sha)
+            except (Refusal, OSError, TypeError, ValueError, AttributeError) as error:
+                blockers.append("PsmArchiveNamespace:" + str(error)); psm_invalid_calls.add(directory.name)
         if not (directory / "receipt.json").is_file():
             blockers.append("IncompleteInvocation:" + directory.name); continue
         receipt = strict_json((directory / "receipt.json").read_bytes())
+        if "psm_static_declaration" in receipt.get("context", {}) or any(k.startswith("psm_archive_") for k in receipt):
+            for phase in ("pre", "post"):
+                snapshot = directory / ("psm-archive-" + phase + ".raw"); psm_paths.add(str(snapshot))
+                if snapshot.is_file() and not snapshot.is_symlink(): psm_hashes.add(file_hash(snapshot))
         receipt["invocation_id"] = directory.name
         receipt["receipt_sha256"] = file_hash(directory / "receipt.json")
         receipt["request_sha256"] = file_hash(directory / "request.json")
@@ -2580,9 +2874,14 @@ def seal_record(session, policy, cargo_exit):
         blockers.extend(namespace_blockers)
     output_owners, transient_collisions = {}, set()
     for receipt in receipts:
-        if receipt["invocation_id"] in record10_invalid_calls:
+        if receipt["invocation_id"] in record10_invalid_calls | psm_invalid_calls:
             transient_collisions.add(receipt["invocation_id"])
             continue
+        if any(str(Path(o["path"]).resolve()) in psm_paths or o.get("sha256") in psm_hashes
+               or (Path(o["path"]).is_file() and not Path(o["path"]).is_symlink()
+                   and file_hash(Path(o["path"])) in psm_hashes)
+               for o in receipt["declared_outputs"] + receipt["outputs"]):
+            blockers.append("PsmArchiveOwnership:Output"); transient_collisions.add(receipt["invocation_id"]); continue
         if native_paths and ((isinstance(receipt.get("source"), str) and native_path_identity(receipt["source"], receipt) in native_paths)
                 or any(native_path_identity(o["path"], receipt) in native_paths
                        for o in receipt["declared_outputs"] + receipt["outputs"])):
@@ -2629,6 +2928,9 @@ def seal_record(session, policy, cargo_exit):
             if any(native_path_identity(f, r) in native_paths for r in native_candidates for f in filename_list):
                 blockers.append("NativeOutputRole:CargoArtifact")
                 continue
+        if any(str(Path(f).resolve()) in psm_paths or (Path(f).is_file() and not Path(f).is_symlink()
+               and file_hash(Path(f)) in psm_hashes) for f in filename_list):
+            blockers.append("PsmArchiveOwnership:CargoArtifact"); continue
         hashes = {}
         for filename in filename_list:
             path = Path(filename)
@@ -2709,6 +3011,9 @@ def seal_record(session, policy, cargo_exit):
     edges = []
     for receipt in receipts:
         for edge in receipt["externs"]:
+            if str(Path(edge["path"]).resolve()) in psm_paths or (Path(edge["path"]).is_file()
+                    and not Path(edge["path"]).is_symlink() and file_hash(Path(edge["path"])) in psm_hashes):
+                blockers.append("PsmArchiveOwnership:Extern"); edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[])); continue
             if native_paths and native_path_identity(edge["path"], receipt) in native_paths:
                 blockers.append("NativeOutputRole:" + edge["path"])
                 edges.append(dict(edge, consumer=receipt["invocation_id"], producers=[]))
@@ -2728,6 +3033,8 @@ def seal_record(session, policy, cargo_exit):
                                                        session, policy["inventory"])
     blockers.extend(ring_blockers)
     declarations.extend(ring_declarations)
+    psm_blockers, psm_declarations = psm_static_graph(receipts, associations, artifacts, events, edges, session, policy["inventory"])
+    blockers.extend(psm_blockers); declarations.extend(psm_declarations)
     consumed = []
     for receipt in receipts:
         if receipt["invocation_id"] in transient_collisions:
@@ -2735,6 +3042,8 @@ def seal_record(session, policy, cargo_exit):
         for output in receipt["outputs"]:
             for value in output.get("dep_info", {}).get("paths", []):
                 path = (Path(receipt["cwd"]) / value).resolve()
+                if str(path) in psm_paths or (path.is_file() and not path.is_symlink() and file_hash(path) in psm_hashes):
+                    blockers.append("PsmArchiveOwnership:ConsumedSource"); continue
                 if str(path) in native_paths:
                     blockers.append("NativeOutputRole:" + str(path)); continue
                 if str(path) in transient_paths:

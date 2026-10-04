@@ -1633,6 +1633,173 @@ emit({'reason':'build-finished','success':CASE!='cargo-failure'})
 '''
 
 
+PSM11_ARGS = ['--crate-name', 'psm', '--edition=2021', '{source}', '--error-format=json', '--json=diagnostic-rendered-ansi,artifacts,future-incompat', '--crate-type', 'lib', '--emit=dep-info,metadata,link', '-C', 'embed-bitcode=no', '-C', 'debuginfo=1', '-C', 'split-debuginfo=unpacked', '--check-cfg', 'cfg(docsrs,test)', '--check-cfg', 'cfg(feature, values())', '-C', 'metadata=85deb609eb7b9709', '-C', 'extra-filename=-749f77748b047fe7', '--out-dir', '{deps}', '--target', 'x86_64-apple-darwin', '-L', 'dependency={deps}', '-L', 'dependency={host}', '--cap-lints', 'allow', '-L', 'native={out}', '-l', 'static=psm_s', '--cfg', 'asm', '--cfg', 'link_asm', '--cfg', 'switchable_stack', '--check-cfg', 'cfg(switchable_stack,asm,link_asm)']
+
+PSM11_RUSTC = r'''
+import json,os,pathlib,sys
+args=sys.argv[1:]
+def value(k):
+    inline=[a.split('=',1)[1] for a in args if a.startswith(k+'=')]
+    return inline[0] if inline else args[args.index(k)+1]
+name=value('--crate-name');source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+(hits/('compile-'+name)).write_text(json.dumps(args));case=os.environ.get('PSM11_CASE','normal')
+if name=='psm':
+    archive=pathlib.Path(os.environ['OUT_DIR'])/'libpsm_s.a'
+    if case=='during_change':archive.write_bytes(b'TEST_CODE_CHANGED_DURING_CHILD')
+    if case=='post_missing':archive.unlink()
+    if case=='post_symlink':archive.unlink();archive.symlink_to(source)
+    if case=='post_hardlink':os.link(archive,archive.parent/'other.a')
+    if case=='source_post':source.chmod(0o644);source.write_bytes(b'TEST_CODE_SOURCE_POST')
+out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+codegen=[args[i+1] for i,a in enumerate(args) if a=='-C'];suffix=next((a.split('=',1)[1] for a in codegen if a.startswith('extra-filename=')),'')
+base=name+suffix;files=[out/base] if value('--crate-type')=='bin' else [out/('lib'+base+'.rmeta'),out/('lib'+base+'.rlib')]
+for path in files:path.write_bytes(b'TEST_CODE_OUTPUT:'+name.encode()+b':'+source.read_bytes())
+def esc(s):return s.replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+consumed=str(pathlib.Path(os.environ['OUT_DIR'])/'libpsm_s.a') if name=='psm' and case=='archive_consumed' else str(source)
+(out/(base+'.d')).write_text(esc(str(files[0]))+': '+esc(consumed)+'\n')
+if name=='psm' and case=='compiler_fail':sys.exit(7)
+'''
+
+PSM11_CARGO = r'''
+import json,os,pathlib,shutil,subprocess,sys
+CASE=__CASE__;TEMPLATE=__TEMPLATE__
+args=sys.argv[1:]
+def value(k):return args[args.index(k)+1]
+app=pathlib.Path(value('--manifest-path')).parent;session=app.parent;target=pathlib.Path(value('--target-dir'))
+root=session/'vendor/psm';host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+for p in (host,deps):p.mkdir(parents=True,exist_ok=True)
+package='registry+https://github.com/rust-lang/crates.io-index#psm@0.1.30'
+out=target/'x86_64-apple-darwin/debug/build/psm-b26dbedb25ce9602/out';out.mkdir(parents=True)
+loader=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']
+def emit(e):print(json.dumps(e),flush=True)
+def artifact(pkg,source,name,kind,files):
+    return {'reason':'compiler-artifact','package_id':pkg,'manifest_path':str(root/'Cargo.toml') if pkg==package else str(source.parent.parent/'Cargo.toml'),
+        'target':{'src_path':str(source),'kind':[kind],'crate_types':['bin' if kind=='custom-build' else kind],'name':name,'edition':'2021'},
+        'features':[],'filenames':[str(p) for p in files],'executable':None,'fresh':False}
+def compile(name,source,pkg,dest,kind='lib',extra=()):
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition=2021',str(source),'--crate-type',kind,'--emit='+('dep-info,link' if kind=='bin' else 'dep-info,metadata,link'),'--out-dir',str(dest),*extra]
+    env=dict(os.environ,CARGO_MANIFEST_DIR=str(source.parent if source.name=='build.rs' else source.parent.parent),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+    if pkg==package:env.update(CARGO_PKG_NAME='psm',CARGO_PKG_VERSION='0.1.30')
+    result=subprocess.run(command,env=env,cwd=pathlib.Path(env['CARGO_MANIFEST_DIR']))
+    if result.returncode:raise RuntimeError('TEST_CODE prerequisite compile failed')
+    files=[dest/name] if kind=='bin' else [dest/('lib'+name+'.rmeta'),dest/('lib'+name+'.rlib')]
+    event=artifact(pkg,source,name,'custom-build' if kind=='bin' else kind,files)
+    if kind=='bin':
+        alias=dest/'build-script-build';shutil.copyfile(files[0],alias);event['filenames']=[str(alias)]
+    return event
+for name,version in (('cc','1.2.59'),('ar_archive_writer','0.5.1')):
+    pkg='registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version
+    if CASE!='missing_'+name:
+        extra=['--target','x86_64-apple-darwin'] if CASE=='target_helper_'+name else ()
+        emit(compile(name,session/'vendor'/name/'src/lib.rs',pkg,host,extra=extra))
+    if CASE=='duplicate_'+name:emit(compile(name,session/'vendor'/name/'src/lib.rs',pkg,host))
+externs=['--extern','cc='+str(host/'libcc.rlib'),'--extern','ar_archive_writer='+str(host/'libar_archive_writer.rlib')]
+builder=compile('build_script_build',root/'build.rs',package,target/'debug/build/psm-89fcb6af8728a6c7','bin',externs)
+if CASE=='builder_features':builder['features']=['other']
+if CASE!='missing_builder':emit(builder)
+if CASE=='duplicate_builder':emit(builder)
+archive=out/'libpsm_s.a';archive.write_bytes(b'TEST_CODE_PSM_ARCHIVE')
+event={'reason':'build-script-executed','package_id':package,'out_dir':str(out),'linked_libs':['static=psm_s'],'linked_paths':['native='+str(out)],'cfgs':['asm','link_asm','switchable_stack'],'env':[]}
+if CASE=='event_cfg':event['cfgs'].reverse()
+if CASE=='event_env':event['env']=[['OTHER','1']]
+if CASE=='event_outdir':event['out_dir']=str(target)
+if CASE!='missing_event':emit(event)
+if CASE=='duplicate_event':emit(event)
+argv=[os.environ['RUSTC']]+[v.format(source=root/'src/lib.rs',deps=deps,host=host,out=out) for v in TEMPLATE]
+env=dict(os.environ,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),CARGO_PKG_NAME='psm',CARGO_PKG_VERSION='0.1.30',CARGO_PKG_VERSION_MAJOR='0',CARGO_PKG_VERSION_MINOR='1',CARGO_PKG_VERSION_PATCH='30',CARGO_PKG_VERSION_PRE='',CARGO_CRATE_NAME='psm',OUT_DIR=str(out),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'),PSM11_CASE=CASE)
+cwd=root
+if CASE=='no_native':del argv[-12:-8]
+if CASE=='no_suffix':del argv[-12:]
+if CASE in ('source_alias_no_native','manifest_alias_no_native'):
+    del argv[-12:]
+    for key in ('CARGO_PKG_NAME','CARGO_CRATE_NAME'):env.pop(key,None)
+    argv[4]=str(root/'../psm/src/lib.rs') if CASE=='source_alias_no_native' else '../psm/src/lib.rs'
+    env['CARGO_MANIFEST_DIR']=str(root.parent)+'//psm'
+if CASE=='inline':argv[-10:-8]=['-lstatic=psm_s']
+if CASE=='reorder':argv[-7],argv[-5]=argv[-5],argv[-7]
+if CASE=='extra_native':argv[-12:-12]=['-L','native='+str(out)]
+if CASE=='extra_cfg':argv[-12:-12]=['--cfg','other']
+if CASE=='check_cfg':argv[19]='cfg(feature,values())'
+if CASE=='link_arg':argv[-12:-12]=['-C','link-arg=-lother']
+if CASE=='extern':argv[-12:-12]=['--extern','cc='+str(host/'libcc.rlib')]
+if CASE=='extern_native':argv[-12:-12]=['--extern-native','foreign']
+if CASE=='test':argv[-12:-12]=['--test']
+if CASE=='host':i=argv.index('--target');del argv[i:i+2]
+if CASE=='platform':argv[argv.index('--target')+1]='aarch64-apple-darwin'
+if CASE=='source':argv[4]=str(app/'src/lib.rs')
+if CASE=='package':env['CARGO_PKG_NAME']='other'
+if CASE=='version':env['CARGO_PKG_VERSION']='0.1.31'
+if CASE=='cwd':cwd=app
+if CASE=='outdir':env['OUT_DIR']=str(target)
+if CASE=='feature':env['CARGO_FEATURE_OTHER']='1'
+if CASE=='environment':env['AR']='/TEST_CODE_FOREIGN_AR'
+if CASE=='wrapper':env['RUSTC_WRAPPER']=str(session/'other-wrapper')
+original=(root/'src/lib.rs').read_bytes()
+if CASE=='source_hash':(root/'src/lib.rs').chmod(0o644);(root/'src/lib.rs').write_bytes(b'TEST_CODE_DRIFT')
+if CASE=='pre_missing':archive.unlink()
+if CASE=='pre_symlink':archive.unlink();archive.symlink_to(root/'src/lib.rs')
+if CASE=='pre_hardlink':os.link(archive,out/'other.a')
+(session/'psm11-attempt.json').write_text(json.dumps({'argv_hex':[os.fsencode(a).hex() for a in argv]}))
+result=subprocess.run([os.environ['RUSTC_WRAPPER'],*argv],env=env,cwd=cwd)
+if CASE in ('source_hash','source_post'):(root/'src/lib.rs').write_bytes(original)
+if result.returncode:emit({'reason':'build-finished','success':False});sys.exit(result.returncode)
+consumer=artifact(package,root/'src/lib.rs','psm','lib',[deps/'libpsm-749f77748b047fe7.rmeta',deps/'libpsm-749f77748b047fe7.rlib'])
+if CASE=='consumer_features':consumer['features']=['other']
+if CASE=='consumer_role':consumer['target']['kind']=['proc-macro']
+if CASE!='missing_consumer':emit(consumer)
+if CASE=='duplicate_consumer':emit(consumer)
+app_event=compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,extra=['--target','x86_64-apple-darwin'])
+if CASE=='archive_selected':app_event['filenames']=[str(archive)]
+if CASE in ('archive_copy','archive_retained_copy','archive_current_output','archive_retained_extern','archive_retained_consumed'):
+    copied=deps/'libpromoted.rlib';shutil.copyfile(archive,copied)
+    if CASE in ('archive_copy','archive_retained_copy'):app_event['filenames']=[str(copied)]
+emit(app_event)
+paths=list((session/'invocations').glob('*/receipt.json'));rpath=next(p for p in paths if json.loads(p.read_text()).get('context',{}).get('psm_static_declaration'))
+r=json.loads(rpath.read_text());bpath=next(p for p in paths if json.loads(p.read_text()).get('source')==str(root/'build.rs'))
+if CASE=='helper_cwd_metadata':
+    p=next(p for p in paths if json.loads(p.read_text()).get('source')==str(session/'vendor/cc/src/lib.rs'))
+    for leaf in ('invocation.json','receipt.json'):
+        target=p.parent/leaf;data=json.loads(target.read_text());data['cwd']=str(app);target.write_text(json.dumps(data))
+if CASE.startswith('target_helper_'):
+    name=CASE.removeprefix('target_helper_')
+    p=next(p for p in paths if json.loads(p.read_text()).get('source')==str(session/'vendor'/name/'src/lib.rs'))
+    for leaf in ('invocation.json','receipt.json'):
+        target=p.parent/leaf;data=json.loads(target.read_text());data['role']='Host';target.write_text(json.dumps(data))
+if CASE in ('archive_retained_copy','archive_retained_extern','archive_retained_consumed'):
+    archive.write_bytes(b'TEST_CODE_FINAL_CHANGE')
+    for phase in ('pre','post'):(rpath.parent/r['psm_archive_'+phase]['snapshot']).unlink()
+if CASE in ('archive_current_output','archive_retained_extern','archive_retained_consumed'):
+    p=next(p for p in paths if json.loads(p.read_text()).get('source')==str(app/'src/lib.rs'));data=json.loads(p.read_text())
+    if CASE=='archive_current_output':
+        ordinary=next(o for o in data['outputs'] if o['kind']=='link');path=pathlib.Path(ordinary['path']);shutil.copyfile(copied,path)
+    if CASE=='archive_retained_extern':data['externs'].append({'name':'psm','path':str(copied)})
+    if CASE=='archive_retained_consumed':
+        next(o for o in data['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copied))
+    p.write_text(json.dumps(data))
+if CASE=='request_only':
+    for leaf in ('invocation.json','receipt.json'):(rpath.parent/leaf).unlink()
+if CASE=='missing_annotation':
+    for leaf in ('invocation.json','receipt.json'):
+        p=rpath.parent/leaf;data=json.loads(p.read_text());data['context']={'kind':'DirectCargoCompile'}
+        for key in tuple(data):
+            if key.startswith('psm_archive_'):del data[key]
+        p.write_text(json.dumps(data))
+if CASE=='raw_builder':
+    p=bpath.parent/'request.json';data=json.loads(p.read_text());data['argv_hex'][4]=os.fsencode(str(app/'build.rs')).hex();p.write_text(json.dumps(data))
+if CASE=='request_cwd':
+    p=rpath.parent/'request.json';data=json.loads(p.read_text());data['cwd_hex']=os.fsencode(str(app)).hex();p.write_text(json.dumps(data))
+if CASE=='snapshot_missing':(rpath.parent/r['psm_archive_pre']['snapshot']).unlink()
+if CASE=='snapshot_changed':(rpath.parent/r['psm_archive_post']['snapshot']).write_bytes(b'TEST_CODE_TAMPER')
+if CASE=='final_archive':archive.write_bytes(b'TEST_CODE_FINAL_CHANGE')
+if CASE in ('archive_output','archive_extern','snapshot_output'):
+    p=next(p for p in paths if json.loads(p.read_text()).get('source')==str(app/'src/lib.rs'));data=json.loads(p.read_text())
+    if CASE=='archive_extern':data['externs'].append({'name':'psm','path':str(archive)})
+    else:data['declared_outputs'].append({'path':str(rpath.parent/r['psm_archive_pre']['snapshot']) if CASE=='snapshot_output' else str(archive),'kind':'link'})
+    p.write_text(json.dumps(data))
+emit({'reason':'build-finished','success':True})
+'''
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -3629,6 +3796,130 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertTrue(all(not any(c["path"] == p for c in record["consumed_sources"]) for p in paths))
         self.assertEqual(record["state"], "RecordingOnly")
         self.assertEqual(record["review_gate"], "IndependentPolicyReviewRequired")
+
+    def prepare_psm11(self, case="normal"):
+        inv = self.prepare(); vendor = self.root / "vendor-origin"
+        specs = (("psm", "0.1.30"), ("cc", "1.2.59"), ("ar_archive_writer", "0.5.1"))
+        for name, version in specs:
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+            write(vendor / name / "src/lib.rs", "// TEST_CODE synthetic " + name + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inv["packages"].append({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                    "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        for source in ("build.rs", "src/arch/x86_64.s", "src/arch/psm.h", "src/arch/gnu_stack_note.s"):
+            write(vendor / "psm" / source, "// TEST_CODE separately inventoried " + source + "\n")
+        inv["vendor"] = snapshot(vendor, ["dep", *[n for n, _ in specs]])
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + PSM11_RUSTC)
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + PSM11_CARGO.replace("__CASE__", repr(case)).replace("__TEMPLATE__", repr(PSM11_ARGS)))
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inv["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}; inv["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inv["generators"]["PROTOC"] = dict(inv["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inv}))
+        return inv
+
+    def psm11_result(self, case="normal", status=0):
+        self.prepare_psm11(case); result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result); session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def psm11_before_entry_refusal(self, case, marker):
+        session, record, receipts = self.psm11_result(case, 2)
+        self.assertFalse((session / "compiler-entry/compile-psm").exists())
+        self.assertEqual(record["native_link_declarations"], [])
+        diagnostics = [json.loads(line) for line in (session / "cargo.stderr.raw").read_text().splitlines()]
+        self.assertTrue(any(d.get("reason") == "Refused" and d.get("detail") == marker for d in diagnostics), diagnostics)
+        requests = [p for p in (session / "invocations").glob("*/request.json") if not (p.parent / "receipt.json").exists()]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(json.loads(requests[0].read_text())["argv_hex"], json.loads((session / "psm11-attempt.json").read_text())["argv_hex"])
+        self.assertIn("IncompleteInvocation:" + requests[0].parent.name, record["blockers"])
+        return session, record
+
+    def test_record11_psm_connected_graph_and_raw_indices(self):
+        session, record, receipts = self.psm11_result()
+        self.assertEqual(record["blockers"], []); self.assertEqual(len(record["selected_library"]), 1)
+        path, r = next((p, r) for p, r in receipts if r.get("context", {}).get("psm_static_declaration"))
+        declaration, = record["native_link_declarations"]
+        raw = [os.fsdecode(bytes.fromhex(a)) for a in r["argv_hex"]]
+        self.assertEqual(raw, [raw[0]] + [v.format(source=session / "vendor/psm/src/lib.rs", deps=session / "target" / owner.TARGET / "debug/deps", host=session / "target/debug/deps", out=r["context"]["out_dir"]) for v in PSM11_ARGS])
+        self.assertEqual([raw[i] for i in declaration["raw_argument_indices"]], ["-L", "native=" + r["context"]["out_dir"], "-l", "static=psm_s"])
+        self.assertEqual(declaration["consumer_invocation"], r["invocation_id"] if "invocation_id" in r else path.name)
+        self.assertEqual(declaration["artifact_selection"], "not_observed"); self.assertEqual(declaration["native_child_provenance"], "not_observed")
+        self.assertEqual(declaration["native_producer_qualification"], "not_issued")
+        builder = declaration["producer_invocation"]
+        self.assertEqual({e["name"] for e in record["extern_edges"] if e["consumer"] == builder}, {"cc", "ar_archive_writer"})
+        for phase in ("pre", "post"):
+            row = r["psm_archive_" + phase]; self.assertEqual(sha(path / row["snapshot"]), row["sha256"])
+        unrelated = [str(self.root / "fake-rustc"), "--crate-name", "other", "--edition=2021", str(session / "application/src/lib.rs"), "--crate-type", "lib", "--emit=dep-info,metadata,link", "--out-dir", str(session / "target" / owner.TARGET / "debug/deps")]
+        self.assertIsNone(owner.psm_static_context(unrelated, {}, session / "vendor/psm", session, {}))
+
+    def test_record11_psm_identity_and_missing_native_fail_before_entry(self):
+        cases = {"source": "PsmStaticTemplate", "package": "PsmSourceContext", "version": "PsmSourceContext",
+                 "cwd": "PsmSourceContext", "outdir": "PsmSourceContext", "source_hash": "PsmSourceContext",
+                 "feature": "PsmEnvironmentContext", "environment": "PsmEnvironmentContext", "wrapper": "PsmEnvironmentContext",
+                 "no_native": "PsmStaticTemplate", "no_suffix": "PsmStaticTemplate", "host": "PsmStaticTemplate", "platform": "PsmStaticTemplate",
+                 "source_alias_no_native": "PsmSourceContext", "manifest_alias_no_native": "PsmSourceContext"}
+        for case, marker in cases.items():
+            with self.subTest(case=case): self.psm11_before_entry_refusal(case, marker)
+
+    def test_record11_psm_closed_native_cfg_and_check_cfg_tokens(self):
+        for case in ("inline", "reorder", "extra_native", "extra_cfg", "check_cfg", "link_arg", "extern", "extern_native", "test"):
+            with self.subTest(case=case): self.psm11_before_entry_refusal(case, "PsmStaticTemplate")
+
+    def test_record11_psm_request_evidence_and_exact_graph_joins(self):
+        cases = {"request_only": "IncompleteInvocation:", "missing_annotation": "PsmGraph:PsmInvocationEvidence",
+                 "request_cwd": "PsmEvidence:PsmSourceContext", "raw_builder": "PsmEvidence:PsmSourceContext",
+                 "missing_builder": "PsmGraph:PsmOrigin", "duplicate_builder": "PsmGraph:PsmOrigin",
+                 "missing_event": "PsmGraph:PsmOrigin", "duplicate_event": "PsmGraph:PsmOrigin", "event_outdir": "PsmGraph:PsmOrigin",
+                 "event_cfg": "PsmGraph:PsmDeclaration", "event_env": "PsmGraph:PsmDeclaration", "builder_features": "PsmGraph:PsmBuilder",
+                 "missing_cc": "PsmGraph:PsmBuilderExtern", "duplicate_cc": "PsmGraph:PsmBuilderExtern",
+                 "missing_ar_archive_writer": "PsmGraph:PsmBuilderExtern", "duplicate_ar_archive_writer": "PsmGraph:PsmBuilderExtern",
+                 "missing_consumer": "PsmGraph:PsmConsumer", "duplicate_consumer": "PsmGraph:PsmConsumer",
+                 "consumer_features": "PsmGraph:PsmConsumer", "consumer_role": "PsmGraph:PsmConsumer",
+                 "target_helper_cc": "PsmGraph:PsmBuilderExtern", "target_helper_ar_archive_writer": "PsmGraph:PsmBuilderExtern",
+                 "helper_cwd_metadata": "PsmGraph:PsmBuilderExtern"}
+        for case, marker in cases.items():
+            with self.subTest(case=case):
+                session, record, _ = self.psm11_result(case, 2)
+                self.assertTrue((session / "compiler-entry/compile-psm").exists())
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                self.assertEqual(record["native_link_declarations"], [])
+
+    def test_record11_psm_archive_observations_and_failed_status(self):
+        for case in ("pre_missing", "pre_symlink", "pre_hardlink"):
+            with self.subTest(case=case): self.psm11_before_entry_refusal(case, "PsmArchiveEvidence")
+        cases = {"during_change": "PsmArchiveChanged", "post_missing": "PsmArchiveEvidence", "post_symlink": "PsmArchiveEvidence",
+                 "post_hardlink": "PsmArchiveEvidence", "snapshot_missing": "PsmGraph:PsmArchiveBinding",
+                 "snapshot_changed": "PsmGraph:PsmArchiveBinding", "final_archive": "PsmGraph:PsmArchiveBinding",
+                 "source_post": "PsmPostSource:PsmSourceContext", "compiler_fail": "CompilerFailed"}
+        for case, marker in cases.items():
+            with self.subTest(case=case):
+                session, record, receipts = self.psm11_result(case, 2)
+                self.assertTrue((session / "compiler-entry/compile-psm").exists())
+                self.assertIn(marker, record["blockers"]); self.assertEqual(record["native_link_declarations"], [])
+                if case == "compiler_fail":
+                    _, r = next((p, r) for p, r in receipts if r.get("context", {}).get("psm_static_declaration"))
+                    self.assertEqual(r["exit_code"], 7); self.assertIn("psm_archive_post", r)
+        from unittest.mock import patch
+        call = self.root / "TEST_CODE_partial_read"; call.mkdir(); out = call / "out"; out.mkdir()
+        (out / "libpsm_s.a").write_bytes(b"TEST_CODE_NONEMPTY_ARCHIVE")
+        with patch.object(owner.shutil, "copyfileobj", side_effect=lambda source, dest, size: dest.write(source.read(1))):
+            with self.assertRaisesRegex(owner.Refusal, "PsmArchiveEvidence"):
+                owner.psm_archive_observation(call, {"out_dir": str(out)}, "pre")
+
+    def test_record11_psm_archive_cannot_become_ordinary_ownership(self):
+        cases = {"archive_output": "PsmArchiveOwnership:Output", "snapshot_output": "PsmArchiveOwnership:Output",
+                 "archive_extern": "PsmArchiveOwnership:Extern", "archive_consumed": "PsmArchiveOwnership:ConsumedSource",
+                 "archive_selected": "PsmArchiveOwnership:CargoArtifact", "archive_copy": "PsmArchiveOwnership:CargoArtifact",
+                 "archive_retained_copy": "PsmArchiveOwnership:CargoArtifact", "archive_current_output": "PsmArchiveOwnership:Output",
+                 "archive_retained_extern": "PsmArchiveOwnership:Extern", "archive_retained_consumed": "PsmArchiveOwnership:ConsumedSource"}
+        for case, marker in cases.items():
+            with self.subTest(case=case):
+                _, record, _ = self.psm11_result(case, 2)
+                self.assertIn(marker, record["blockers"]); self.assertEqual(record["native_link_declarations"], [])
+                self.assertFalse(any(c["path"].endswith("libpsm_s.a") for c in record["consumed_sources"]))
+
 
 
 if __name__ == "__main__":
