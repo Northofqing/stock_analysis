@@ -438,12 +438,311 @@ impl FinancialStartDecision {
     }
 }
 
+// E04 owned payload mechanics. These fields grant no FS/native/payment rules.
+// Only G's genuine producers may supply their already-owned physical values.
+#[allow(dead_code)]
+struct FinancialPhysicalContext {
+    database_file: File,
+    database_identity: FileIdentity,
+    database_path: PathBuf,
+    cleanup_names: [std::ffi::CString; 3],
+    maintenance: ExclusiveGlobalSchemaMaintenanceLease,
+}
+#[allow(dead_code)]
+struct FinancialOpenedSidecar {
+    file: File,
+    leaf: OsString,
+    path: PathBuf,
+    pin_nul: std::ffi::CString,
+    #[cfg(test)]
+    trace: FinancialSidecarTrace,
+}
+#[allow(dead_code)]
+struct FinancialPinnedSidecar {
+    pin: PinnedOwnerSqliteSidecar,
+    pin_nul: std::ffi::CString,
+    #[cfg(test)]
+    trace: FinancialSidecarTrace,
+}
+#[allow(dead_code)]
+struct FinancialCompleteSidecars {
+    sidecars: OwnerCreatedSqliteSidecars,
+    pin_names: [std::ffi::CString; 2],
+    #[cfg(test)]
+    traces: [FinancialSidecarTrace; 2],
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialSidecarPhase {
+    BeforeA00, WalOpening, WalOpened, WalPinned, ShmOpening, ShmOpened,
+    PairLocal, BuiltLocal, ValidatedLocal, AbandonedResult, Returned, LocalDrained,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialSidecarCut { WalPin, ShmPin, Journal, PairValidation }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialSidecarFault { UnexpectedCut, Terminal, ResourceMissing }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum FinancialSidecarDrop { CurrentPin, Shm, Wal, BuiltPair, NoLocalPayload }
+#[allow(dead_code)]
+struct FinancialPhysical {
+    phase: FinancialSidecarPhase,
+    opened: Option<FinancialOpenedSidecar>,
+    wal: Option<FinancialPinnedSidecar>,
+    shm: Option<FinancialPinnedSidecar>,
+    complete: Option<FinancialCompleteSidecars>,
+    returned: Option<FinancialCompleteSidecars>,
+    abandoned: Option<FinancialCompleteSidecars>,
+    failed_cut: Option<FinancialSidecarCut>,
+    primary: Option<rows::original_source::SourceOperationError>,
+    // Context survives all local payload drainage and the native close cut.
+    // Its real database/maintenance fields are never extracted by a loan.
+    context: Option<FinancialPhysicalContext>,
+}
+#[allow(dead_code)]
+impl FinancialPhysical {
+    fn empty() -> Self {
+        Self { phase: FinancialSidecarPhase::BeforeA00, opened: None,
+            wal: None, shm: None, complete: None, returned: None, abandoned: None, failed_cut: None,
+            primary: None, context: None }
+    }
+    fn post_a00_started(&self) -> bool { self.phase != FinancialSidecarPhase::BeforeA00 }
+    fn blocks_original_close(&self) -> bool {
+        !matches!(self.phase, FinancialSidecarPhase::BeforeA00
+            | FinancialSidecarPhase::Returned | FinancialSidecarPhase::LocalDrained)
+    }
+    fn begin_after_a00(&mut self) -> Result<(), FinancialSidecarFault> {
+        if self.post_a00_started() { return Err(FinancialSidecarFault::UnexpectedCut); }
+        self.phase = FinancialSidecarPhase::WalOpening;
+        Ok(())
+    }
+    fn parent_sidecars_retained(&self) -> bool {
+        self.phase == FinancialSidecarPhase::Returned && self.returned.is_some()
+    }
+}
+// Actual short split from Q's same native/work/release/physical field loan.
+// No Drop action, callback, caller path, amount or provider value is supplied.
+#[allow(dead_code)]
+struct FinancialSidecarLoan<'a> {
+    physical: &'a mut FinancialPhysical,
+    work: rows::original_source::OriginalSourceWork<'a>,
+}
+#[allow(dead_code)]
+impl<'a> FinancialSidecarLoan<'a> {
+    fn require_normal_cut(&self, phase: FinancialSidecarPhase) -> Result<(), FinancialSidecarFault> {
+        if self.work.terminal().is_some() { return Err(FinancialSidecarFault::Terminal); }
+        if self.physical.phase != phase || self.physical.failed_cut.is_some() {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
+        Ok(())
+    }
+    fn retain_context(&mut self, context: FinancialPhysicalContext) -> Result<(), FinancialPhysicalContext> {
+        if self.work.terminal().is_some() || self.physical.post_a00_started()
+            || self.physical.context.is_some() { return Err(context); }
+        self.physical.context = Some(context);
+        Ok(())
+    }
+    fn retain_opened_wal(&mut self, opened: FinancialOpenedSidecar) -> Result<(), FinancialOpenedSidecar> {
+        if self.require_normal_cut(FinancialSidecarPhase::WalOpening).is_err() { return Err(opened); }
+        self.physical.opened = Some(opened);
+        self.physical.phase = FinancialSidecarPhase::WalOpened;
+        Ok(())
+    }
+    fn finish_wal_pin(&mut self, identity: FileIdentity) -> Result<(), FinancialSidecarFault> {
+        self.require_normal_cut(FinancialSidecarPhase::WalOpened)?;
+        let opened = self.physical.opened.take().ok_or(FinancialSidecarFault::ResourceMissing)?;
+        self.physical.wal = Some(opened.into_pin(identity));
+        self.physical.phase = FinancialSidecarPhase::WalPinned;
+        Ok(())
+    }
+    fn begin_shm_pin(&mut self) -> Result<(), FinancialSidecarFault> {
+        self.require_normal_cut(FinancialSidecarPhase::WalPinned)?;
+        self.physical.phase = FinancialSidecarPhase::ShmOpening;
+        Ok(())
+    }
+    fn retain_opened_shm(&mut self, opened: FinancialOpenedSidecar) -> Result<(), FinancialOpenedSidecar> {
+        if self.require_normal_cut(FinancialSidecarPhase::ShmOpening).is_err() { return Err(opened); }
+        self.physical.opened = Some(opened);
+        self.physical.phase = FinancialSidecarPhase::ShmOpened;
+        Ok(())
+    }
+    fn finish_shm_pin(&mut self, identity: FileIdentity) -> Result<(), FinancialSidecarFault> {
+        self.require_normal_cut(FinancialSidecarPhase::ShmOpened)?;
+        let opened = self.physical.opened.take().ok_or(FinancialSidecarFault::ResourceMissing)?;
+        self.physical.shm = Some(opened.into_pin(identity));
+        self.physical.phase = FinancialSidecarPhase::PairLocal;
+        Ok(())
+    }
+    // Named internal continuation after the real journal-absence operation.
+    // This does not perform that operation or issue its FS/provider facts.
+    fn finish_journal_absence(&mut self) -> Result<(), FinancialSidecarFault> {
+        self.require_normal_cut(FinancialSidecarPhase::PairLocal)?;
+        if self.physical.wal.is_none() || self.physical.shm.is_none() { return Err(FinancialSidecarFault::ResourceMissing); }
+        let wal = self.physical.wal.take().expect("PairLocal owns wal");
+        let shm = self.physical.shm.take().expect("PairLocal owns shm");
+        let FinancialPinnedSidecar { pin: wal, pin_nul: wal_name, #[cfg(test)] trace: wal_trace } = wal;
+        let FinancialPinnedSidecar { pin: shm, pin_nul: shm_name, #[cfg(test)] trace: shm_trace } = shm;
+        self.physical.complete = Some(FinancialCompleteSidecars {
+            sidecars: OwnerCreatedSqliteSidecars { wal, shm },
+            pin_names: [wal_name, shm_name],
+            #[cfg(test)] traces: [wal_trace, shm_trace],
+        });
+        self.physical.phase = FinancialSidecarPhase::BuiltLocal;
+        Ok(())
+    }
+    // The validated callee result owns the actual pair. Its return alone has
+    // not yet placed that result in the parent's distinct retained slot.
+    fn finish_pair_validation(self) -> Result<FinancialSidecarReturn<'a>, (Self, FinancialSidecarFault)> {
+        if let Err(fault) = self.require_normal_cut(FinancialSidecarPhase::BuiltLocal) { return Err((self, fault)); }
+        // The exclusive physical borrow then keeps both destination slots
+        // empty until this one carrier is consumed or forwarded by its Drop.
+        if self.physical.returned.is_some() || self.physical.abandoned.is_some() {
+            return Err((self, FinancialSidecarFault::UnexpectedCut));
+        }
+        let Some(sidecars) = self.physical.complete.take() else { return Err((self, FinancialSidecarFault::ResourceMissing)); };
+        self.physical.phase = FinancialSidecarPhase::ValidatedLocal;
+        let Self { physical, work } = self;
+        Ok(FinancialSidecarReturn { physical, work, sidecars: Some(sidecars) })
+    }
+    fn failed_wal_pin(&mut self) -> Result<(), FinancialSidecarFault> {
+        if !matches!(self.physical.phase, FinancialSidecarPhase::WalOpening | FinancialSidecarPhase::WalOpened) {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
+        self.retain_failure_cut(FinancialSidecarCut::WalPin)
+    }
+    fn failed_shm_pin(&mut self) -> Result<(), FinancialSidecarFault> {
+        if !matches!(self.physical.phase, FinancialSidecarPhase::ShmOpening | FinancialSidecarPhase::ShmOpened) {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
+        self.retain_failure_cut(FinancialSidecarCut::ShmPin)
+    }
+    fn failed_journal_absence(&mut self) -> Result<(), FinancialSidecarFault> {
+        if self.physical.phase != FinancialSidecarPhase::PairLocal { return Err(FinancialSidecarFault::UnexpectedCut); }
+        self.retain_failure_cut(FinancialSidecarCut::Journal)
+    }
+    fn failed_pair_validation(&mut self) -> Result<(), FinancialSidecarFault> {
+        if self.physical.phase != FinancialSidecarPhase::BuiltLocal { return Err(FinancialSidecarFault::UnexpectedCut); }
+        self.retain_failure_cut(FinancialSidecarCut::PairValidation)
+    }
+    fn retain_failure_cut(&mut self, cut: FinancialSidecarCut) -> Result<(), FinancialSidecarFault> {
+        if self.work.terminal().is_some() { return Err(FinancialSidecarFault::Terminal); }
+        if self.physical.failed_cut.is_some() || self.physical.primary.is_some() { return Err(FinancialSidecarFault::UnexpectedCut); }
+        self.physical.failed_cut = Some(cut);
+        Ok(())
+    }
+    fn retain_paid_primary(&mut self, error: rows::original_source::SourceOperationError)
+        -> Result<(), rows::original_source::SourceOperationError> {
+        // Abandonment is a mechanism obligation, not an invented FS failure
+        // or proof of diagnostic payment. Only an already-owned error moves.
+        let required = self.physical.failed_cut.is_some()
+            || self.physical.phase == FinancialSidecarPhase::AbandonedResult;
+        if self.work.terminal().is_some() || !required
+            || self.physical.primary.is_some() || !self.physical.blocks_original_close() { return Err(error); }
+        self.physical.primary = Some(error);
+        Ok(())
+    }
+    // Only actual local payloads are consumed. Returned owns a different parent
+    // scope and must keep its files through close/E19; this is not full cleanup.
+    fn drain_one_local(&mut self) -> Result<FinancialSidecarDrop, FinancialSidecarFault> {
+        // An unresolved callee result is not known drained, even with empty
+        // physical slots (for example after a safe forget of its carrier).
+        if self.physical.phase == FinancialSidecarPhase::ValidatedLocal
+            || !self.physical.blocks_original_close()
+            || (self.work.terminal().is_none() && self.physical.primary.is_none()) {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
+        let action = if let Some(opened) = self.physical.opened.take() {
+            opened.drop_owned(); FinancialSidecarDrop::CurrentPin
+        } else if let Some(complete) = self.physical.complete.take() {
+            complete.drop_built_local(); FinancialSidecarDrop::BuiltPair
+        } else if let Some(abandoned) = self.physical.abandoned.take() {
+            abandoned.drop_built_local(); FinancialSidecarDrop::BuiltPair
+        } else if let Some(shm) = self.physical.shm.take() {
+            shm.drop_owned(FinancialSidecarDrop::Shm); FinancialSidecarDrop::Shm
+        } else if let Some(wal) = self.physical.wal.take() {
+            wal.drop_owned(FinancialSidecarDrop::Wal); FinancialSidecarDrop::Wal
+        } else { FinancialSidecarDrop::NoLocalPayload };
+        if self.physical.opened.is_none() && self.physical.complete.is_none()
+            && self.physical.abandoned.is_none()
+            && self.physical.shm.is_none() && self.physical.wal.is_none() {
+            self.physical.phase = FinancialSidecarPhase::LocalDrained;
+        }
+        Ok(action)
+    }
+}
+// Owned callee result, not a short loan or a provider/FS credential. The
+// caller consumes it at the fixed parent-return cut; nothing is restored to
+// the former BuiltLocal slot and the Work remains in its original owner.
+#[allow(dead_code)]
+struct FinancialSidecarReturn<'a> {
+    physical: &'a mut FinancialPhysical,
+    work: rows::original_source::OriginalSourceWork<'a>,
+    sidecars: Option<FinancialCompleteSidecars>,
+}
+#[allow(dead_code)]
+impl FinancialSidecarReturn<'_> {
+    fn finish_sidecar_acquisition(mut self) -> Result<(), Self> {
+        if self.work.terminal().is_some() || self.physical.phase != FinancialSidecarPhase::ValidatedLocal
+            || self.sidecars.is_none() || self.physical.returned.is_some() || self.physical.abandoned.is_some() { return Err(self); }
+        self.physical.returned = self.sidecars.take();
+        self.physical.phase = FinancialSidecarPhase::Returned;
+        Ok(()) // Drop sees an empty carrier and ends only the same borrow.
+    }
+}
+impl Drop for FinancialSidecarReturn<'_> {
+    fn drop(&mut self) {
+        if let Some(sidecars) = self.sidecars.take() {
+            // Issue checked the destination empty; the exclusive borrow has
+            // prevented another issuer/write. Forward, never restore/qualify.
+            self.physical.abandoned = Some(sidecars);
+            self.physical.phase = FinancialSidecarPhase::AbandonedResult;
+        }
+    }
+}
+#[allow(dead_code)]
+impl FinancialOpenedSidecar {
+    fn into_pin(self, identity: FileIdentity) -> FinancialPinnedSidecar {
+        let Self { file, leaf, path, pin_nul, #[cfg(test)] trace } = self;
+        FinancialPinnedSidecar { pin: PinnedOwnerSqliteSidecar { file, identity, leaf, path }, pin_nul,
+            #[cfg(test)] trace }
+    }
+    fn drop_owned(self) {
+        let Self { file, leaf, path, pin_nul, #[cfg(test)] trace } = self;
+        drop(file); drop(leaf); drop(path); drop(pin_nul);
+        #[cfg(test)] trace.record(FinancialSidecarDrop::CurrentPin);
+    }
+}
+#[allow(dead_code)]
+impl FinancialPinnedSidecar {
+    fn drop_owned(self, action: FinancialSidecarDrop) {
+        let Self { pin, pin_nul, #[cfg(test)] trace } = self;
+        drop(pin); drop(pin_nul);
+        #[cfg(test)] trace.record(action);
+        #[cfg(not(test))] let _ = action;
+    }
+}
+#[allow(dead_code)]
+impl FinancialCompleteSidecars {
+    fn drop_built_local(self) {
+        let Self { sidecars, pin_names, #[cfg(test)] traces } = self;
+        let OwnerCreatedSqliteSidecars { wal, shm } = sidecars;
+        drop(wal);
+        #[cfg(test)] traces[0].record(FinancialSidecarDrop::Wal);
+        drop(shm);
+        #[cfg(test)] traces[1].record(FinancialSidecarDrop::Shm);
+        drop(pin_names);
+    }
+}
+
 #[allow(dead_code)]
 struct FinancialSourceStart {
     decision: FinancialRetainedStartDecision,
     native: replay_work::NativeOriginalOwner,
     staged: rows::original_source::StagedOriginalWork,
     release: replay_work::FixedDrainLedger,
+    physical: FinancialPhysical,
 }
 
 #[allow(dead_code)]
@@ -452,6 +751,7 @@ struct FinancialRowsConstruction {
     native: replay_work::NativeOriginalOwner,
     construction: rows::original_source::PendingConstruction,
     release: replay_work::FixedDrainLedger,
+    physical: FinancialPhysical,
 }
 
 #[allow(dead_code)]
@@ -467,16 +767,18 @@ impl FinancialSourceStart {
             &mut self.native,
             self.staged.source_loan(),
             &mut self.release,
+            &mut self.physical,
         )
     }
 
     fn enter_rows(self) -> FinancialRowsConstruction {
-        let Self { decision, native, staged, release } = self;
+        let Self { decision, native, staged, release, physical } = self;
         FinancialRowsConstruction {
             decision,
             native,
             construction: staged.enter_rows(),
             release,
+            physical,
         }
     }
 }
@@ -488,6 +790,7 @@ impl FinancialRowsConstruction {
             &mut self.native,
             self.construction.source_loan(),
             &mut self.release,
+            &mut self.physical,
         )
     }
 
@@ -700,6 +1003,343 @@ mod financial_original_sql_lifecycle_tests {
         let mut fields = construction.fields();
         assert!(fields.test_code_unreleased_a00());
         assert_eq!(fields.source_work().test_code_observation().terminal, Some(terminal));
+    }
+}
+
+// Fixed-capacity trace is cfg-only; releasing a payload never grows a log.
+#[cfg(test)]
+#[derive(Clone)]
+struct FinancialSidecarTrace(std::rc::Rc<std::cell::RefCell<FinancialSidecarTraceState>>);
+#[cfg(test)]
+struct FinancialSidecarTraceState { events: [Option<FinancialSidecarDrop>; 4], used: usize }
+#[cfg(test)]
+impl FinancialSidecarTrace {
+    fn new() -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(FinancialSidecarTraceState { events: [None; 4], used: 0 })))
+    }
+    fn record(&self, action: FinancialSidecarDrop) {
+        let mut trace = self.0.borrow_mut();
+        let index = trace.used;
+        assert!(index < trace.events.len());
+        trace.events[index] = Some(action);
+        trace.used += 1;
+    }
+    fn snapshot(&self) -> [Option<FinancialSidecarDrop>; 4] { self.0.borrow().events }
+}
+
+#[cfg(test)]
+mod financial_original_sidecar_acquisition_tests {
+    use super::*;
+    use rows::original_source::{OwnerStartProbe, SourceOperationError};
+
+    // /dev/null provides real owned descriptors only. These fixed payloads do
+    // not claim regular WAL/SHM identity, journal absence, paid requests or FS
+    // qualification. The scripts test the connected ownership protocol.
+    fn fixed_opened_wal(trace: &FinancialSidecarTrace) -> (FinancialOpenedSidecar, FileIdentity) {
+        let file = File::open("/dev/null").unwrap();
+        let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+        (FinancialOpenedSidecar { file, leaf: OsString::from("TEST_CODE-wal"),
+            path: PathBuf::from("/TEST_CODE/wal"), pin_nul: CString::new("TEST_CODE-wal").unwrap(), trace: trace.clone() }, identity)
+    }
+    fn fixed_opened_shm(trace: &FinancialSidecarTrace) -> (FinancialOpenedSidecar, FileIdentity) {
+        let file = File::open("/dev/null").unwrap();
+        let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+        (FinancialOpenedSidecar { file, leaf: OsString::from("TEST_CODE-shm"),
+            path: PathBuf::from("/TEST_CODE/shm"), pin_nul: CString::new("TEST_CODE-shm").unwrap(), trace: trace.clone() }, identity)
+    }
+    fn fixed_supplied_primary() -> (SourceOperationError, usize) {
+        let detail = String::from("TEST_CODE supplied E04 primary");
+        let allocation = detail.as_ptr() as usize;
+        (SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }), allocation)
+    }
+    fn assert_primary_retained(physical: &FinancialPhysical, allocation: usize) {
+        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &physical.primary else {
+            panic!("the once-moved primary category must survive");
+        };
+        assert_eq!(detail.as_ptr() as usize, allocation);
+        assert_eq!(detail, "TEST_CODE supplied E04 primary");
+    }
+    fn fixed_pair_local(start: &mut FinancialSourceStart, trace: &FinancialSidecarTrace) {
+        let (wal, wal_identity) = fixed_opened_wal(trace);
+        let (shm, shm_identity) = fixed_opened_shm(trace);
+        let mut fields = start.fields();
+        let mut sidecars = fields.sidecar_loan();
+        sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+        sidecars.finish_wal_pin(wal_identity).unwrap();
+        sidecars.begin_shm_pin().unwrap();
+        sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+        sidecars.finish_shm_pin(shm_identity).unwrap();
+    }
+
+    #[test]
+    fn history_original_sidecar_acquisition_partial_cuts_drain_before_close_keep_primary() {
+        for cut in [FinancialSidecarCut::WalPin, FinancialSidecarCut::ShmPin,
+            FinancialSidecarCut::Journal, FinancialSidecarCut::PairValidation] {
+            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let trace = FinancialSidecarTrace::new();
+            let (error, allocation) = fixed_supplied_primary();
+            let (spare, spare_allocation) = fixed_supplied_primary(); // Pre-existing fixture value, for overwrite refusal only.
+            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            let before = start.fields().source_work().test_code_observation();
+            start.fields().test_code_enter_sidecars();
+            match cut {
+                FinancialSidecarCut::WalPin => {
+                    let (wal, _) = fixed_opened_wal(&trace);
+                    let mut fields = start.fields();
+                    let mut sidecars = fields.sidecar_loan();
+                    sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+                    sidecars.failed_wal_pin().unwrap();
+                }
+                FinancialSidecarCut::ShmPin => {
+                    let (wal, wal_identity) = fixed_opened_wal(&trace);
+                    let (shm, _) = fixed_opened_shm(&trace);
+                    let mut fields = start.fields();
+                    let mut sidecars = fields.sidecar_loan();
+                    sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+                    sidecars.finish_wal_pin(wal_identity).unwrap();
+                    sidecars.begin_shm_pin().unwrap();
+                    sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+                    sidecars.failed_shm_pin().unwrap();
+                }
+                FinancialSidecarCut::Journal => {
+                    fixed_pair_local(&mut start, &trace);
+                    start.fields().sidecar_loan().failed_journal_absence().unwrap();
+                }
+                FinancialSidecarCut::PairValidation => {
+                    fixed_pair_local(&mut start, &trace);
+                    let mut fields = start.fields();
+                    let mut sidecars = fields.sidecar_loan();
+                    sidecars.finish_journal_absence().unwrap();
+                    sidecars.failed_pair_validation().unwrap();
+                }
+            }
+            assert!(!start.physical.parent_sidecars_retained());
+            assert_eq!(start.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+            start.fields().test_code_sidecar_blocks_close(); // Missing paid primary cannot be bypassed.
+            assert_eq!(trace.snapshot(), [None; 4]);
+            start.fields().sidecar_loan().retain_paid_primary(error).unwrap_or_else(|_| panic!("supplied primary must move once"));
+            assert_primary_retained(&start.physical, allocation);
+            let Err(spare) = start.fields().sidecar_loan().retain_paid_primary(spare) else { panic!("a second primary must be returned untouched"); };
+            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = spare else { panic!("same rejected category"); };
+            assert_eq!(detail.as_ptr() as usize, spare_allocation);
+            assert_primary_retained(&start.physical, allocation);
+            start.fields().test_code_sidecar_blocks_close(); // Paid primary alone cannot bypass local files.
+            let expected_actions = match cut {
+                FinancialSidecarCut::WalPin => [Some(FinancialSidecarDrop::CurrentPin), None],
+                FinancialSidecarCut::ShmPin => [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal)],
+                FinancialSidecarCut::Journal => [Some(FinancialSidecarDrop::Shm), Some(FinancialSidecarDrop::Wal)],
+                FinancialSidecarCut::PairValidation => [Some(FinancialSidecarDrop::BuiltPair), None],
+            };
+            for action in expected_actions.into_iter().flatten() {
+                assert_eq!(start.fields().sidecar_loan().drain_one_local(), Ok(action));
+                if start.physical.blocks_original_close() { start.fields().test_code_sidecar_blocks_close(); }
+            }
+            let expected_drops = match cut {
+                FinancialSidecarCut::WalPin => [Some(FinancialSidecarDrop::CurrentPin), None, None, None],
+                FinancialSidecarCut::ShmPin => [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal), None, None],
+                FinancialSidecarCut::Journal => [Some(FinancialSidecarDrop::Shm), Some(FinancialSidecarDrop::Wal), None, None],
+                FinancialSidecarCut::PairValidation => [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None],
+            };
+            assert_eq!(trace.snapshot(), expected_drops); // PairLocal and BuiltLocal have different real drop order.
+            assert_primary_retained(&start.physical, allocation);
+            assert_eq!(start.fields().source_work().test_code_observation(), before);
+            if cut == FinancialSidecarCut::PairValidation {
+                let mut frame = start.enter_rows();
+                frame.fields().test_code_sidecar_close_busy();
+                assert!(frame.fields().test_code_unreleased_a00());
+                assert_primary_retained(&frame.physical, allocation);
+                { let mut fields = frame.fields(); let _short = fields.sidecar_loan(); }
+                assert_eq!(trace.snapshot(), expected_drops);
+                assert_primary_retained(&frame.physical, allocation);
+                assert_eq!(frame.fields().source_work().test_code_observation(), before);
+            } else {
+                start.fields().test_code_sidecar_close_ok();
+                assert_primary_retained(&start.physical, allocation);
+                assert_eq!(start.fields().source_work().test_code_observation(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn history_original_sidecar_acquisition_returned_boundary_and_failed_close_hold_files() {
+        let mut failed_a00 = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        failed_a00.fields().test_code_a00_primary_refuses_sidecars();
+        assert!(!failed_a00.physical.post_a00_started());
+        let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let trace = FinancialSidecarTrace::new();
+        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        let before = start.fields().source_work().test_code_observation();
+        start.fields().test_code_enter_sidecars();
+        fixed_pair_local(&mut start, &trace);
+        start.fields().sidecar_loan().finish_journal_absence().unwrap();
+        assert!(!start.physical.parent_sidecars_retained());
+        start.fields().test_code_sidecar_blocks_close(); // BuiltLocal is not the parent's returned object.
+        {
+            let mut fields = start.fields();
+            let sidecars = fields.sidecar_loan();
+            let returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed validated callee result"));
+            assert!(!returned.physical.parent_sidecars_retained());
+            assert!(returned.physical.complete.is_none());
+            returned.finish_sidecar_acquisition().unwrap_or_else(|_| panic!("fixed normal parent return")); // Consume into the parent's different slot.
+        }
+        assert!(start.physical.parent_sidecars_retained());
+        assert_eq!(start.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+        { let mut fields = start.fields(); let _short = fields.sidecar_loan(); }
+        assert_eq!(trace.snapshot(), [None; 4]);
+        let mut frame = start.enter_rows(); // The same Work and both real Files move once.
+        frame.fields().test_code_sidecar_close_busy();
+        assert!(frame.fields().test_code_unreleased_a00());
+        assert!(frame.physical.parent_sidecars_retained());
+        let retained = &frame.physical.returned.as_ref().unwrap().sidecars;
+        retained.wal.file.metadata().unwrap();
+        retained.shm.file.metadata().unwrap();
+        assert_eq!(trace.snapshot(), [None; 4]);
+        assert!(frame.physical.primary.is_none());
+        assert_eq!(frame.fields().source_work().test_code_observation(), before);
+
+        // An unconsumed normal callee result stays in the same owning frame.
+        let mut abandoned = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let abandoned_trace = FinancialSidecarTrace::new();
+        let (error, allocation) = fixed_supplied_primary();
+        abandoned.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        let before_abandonment = abandoned.fields().source_work().test_code_observation();
+        abandoned.fields().test_code_enter_sidecars();
+        fixed_pair_local(&mut abandoned, &abandoned_trace);
+        abandoned.fields().sidecar_loan().finish_journal_absence().unwrap();
+        {
+            let mut fields = abandoned.fields();
+            let sidecars = fields.sidecar_loan();
+            let returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed callee result"));
+            drop(returned); // Only forward the actual pair, never implicitly release it.
+        }
+        let retained = &abandoned.physical.abandoned.as_ref().unwrap().sidecars;
+        retained.wal.file.metadata().unwrap();
+        retained.shm.file.metadata().unwrap();
+        assert_eq!(abandoned_trace.snapshot(), [None; 4]);
+        assert!(abandoned.physical.failed_cut.is_none()); // Abandonment is not a fabricated FS failure.
+        assert!(!abandoned.physical.parent_sidecars_retained());
+        assert!(abandoned.physical.complete.is_none() && abandoned.physical.returned.is_none());
+        abandoned.fields().test_code_sidecar_blocks_close();
+        assert_eq!(abandoned.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+        abandoned.fields().sidecar_loan().retain_paid_primary(error).unwrap_or_else(|_| panic!("once-owned supplied primary"));
+        assert_primary_retained(&abandoned.physical, allocation);
+        abandoned.fields().test_code_sidecar_blocks_close();
+        { let mut fields = abandoned.fields(); let _short = fields.sidecar_loan(); }
+        assert_primary_retained(&abandoned.physical, allocation);
+        assert_eq!(abandoned_trace.snapshot(), [None; 4]);
+        let mut frame = abandoned.enter_rows();
+        assert_primary_retained(&frame.physical, allocation);
+        assert_eq!(frame.fields().source_work().test_code_observation(), before_abandonment);
+        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::BuiltPair));
+        assert_eq!(abandoned_trace.snapshot(), [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None]);
+        assert!(!frame.physical.parent_sidecars_retained());
+        frame.fields().test_code_sidecar_close_busy();
+        assert!(frame.fields().test_code_unreleased_a00());
+        assert_primary_retained(&frame.physical, allocation);
+        { let mut fields = frame.fields(); let _short = fields.sidecar_loan(); }
+        assert_eq!(frame.fields().source_work().test_code_observation(), before_abandonment);
+        assert_primary_retained(&frame.physical, allocation);
+    }
+
+    #[test]
+    fn history_original_sidecar_acquisition_terminal_short_loan_move_and_local_drain_keep_work() {
+        let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let trace = FinancialSidecarTrace::new();
+        let (wal, wal_identity) = fixed_opened_wal(&trace);
+        let (shm, shm_identity) = fixed_opened_shm(&trace);
+        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start.fields().test_code_enter_sidecars();
+        {
+            let mut fields = start.fields();
+            let mut sidecars = fields.sidecar_loan();
+            sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+            sidecars.finish_wal_pin(wal_identity).unwrap();
+            sidecars.begin_shm_pin().unwrap();
+            sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+        }
+        let terminal = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        start.fields().test_code_sidecar_blocks_close();
+        { let mut fields = start.fields(); let _short = fields.sidecar_loan(); }
+        assert_eq!(trace.snapshot(), [None; 4]); // Loan drop releases no acquired File.
+        start.physical.opened.as_ref().unwrap().file.metadata().unwrap();
+        start.physical.wal.as_ref().unwrap().pin.file.metadata().unwrap();
+        let mut frame = start.enter_rows();
+        {
+            let mut fields = frame.fields();
+            let mut sidecars = fields.sidecar_loan();
+            assert_eq!(sidecars.finish_shm_pin(shm_identity), Err(FinancialSidecarFault::Terminal));
+            assert_eq!(sidecars.finish_journal_absence(), Err(FinancialSidecarFault::Terminal));
+            assert_eq!(sidecars.failed_shm_pin(), Err(FinancialSidecarFault::Terminal));
+            assert_eq!(sidecars.drain_one_local(), Ok(FinancialSidecarDrop::CurrentPin));
+        }
+        frame.fields().test_code_sidecar_blocks_close(); // Wal is still owned, so even terminal cannot close early.
+        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::Wal));
+        assert_eq!(trace.snapshot(), [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal), None, None]);
+        assert!(frame.physical.primary.is_none()); // Terminal never requests a new diagnostic error.
+        frame.fields().test_code_sidecar_close_busy();
+        assert!(frame.fields().test_code_unreleased_a00());
+        let mut fields = frame.fields();
+        let mut work = fields.source_work();
+        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(terminal));
+        let retained = work.test_code_observation();
+        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal)));
+
+        let mut abandoned = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let abandoned_trace = FinancialSidecarTrace::new();
+        abandoned.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        abandoned.fields().test_code_enter_sidecars();
+        fixed_pair_local(&mut abandoned, &abandoned_trace);
+        abandoned.fields().sidecar_loan().finish_journal_absence().unwrap();
+        let first;
+        {
+            let mut fields = abandoned.fields();
+            let sidecars = fields.sidecar_loan();
+            let mut returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed callee result"));
+            first = returned.work.test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            let Err(returned) = returned.finish_sidecar_acquisition() else { panic!("terminal must refuse parent return and retain the same carrier"); };
+            let still_owned = &returned.sidecars.as_ref().unwrap().sidecars;
+            still_owned.wal.file.metadata().unwrap();
+            still_owned.shm.file.metadata().unwrap();
+            assert_eq!(returned.work.test_code_observation().terminal, Some(first));
+            assert_eq!(abandoned_trace.snapshot(), [None; 4]);
+            drop(returned); // Terminal Drop also only forwards already-owned payload.
+        }
+        let retained = &abandoned.physical.abandoned.as_ref().unwrap().sidecars;
+        retained.wal.file.metadata().unwrap();
+        retained.shm.file.metadata().unwrap();
+        assert_eq!(abandoned_trace.snapshot(), [None; 4]);
+        assert!(!abandoned.physical.parent_sidecars_retained());
+        assert!(abandoned.physical.primary.is_none() && abandoned.physical.failed_cut.is_none());
+        abandoned.fields().test_code_sidecar_blocks_close();
+        { let mut fields = abandoned.fields(); let _short = fields.sidecar_loan(); }
+        assert_eq!(abandoned_trace.snapshot(), [None; 4]);
+        let mut frame = abandoned.enter_rows();
+        frame.fields().test_code_sidecar_blocks_close();
+        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::BuiltPair));
+        assert_eq!(abandoned_trace.snapshot(), [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None]);
+        assert!(frame.physical.primary.is_none());
+        frame.fields().test_code_sidecar_close_busy();
+        assert!(frame.fields().test_code_unreleased_a00());
+        let mut fields = frame.fields();
+        let mut work = fields.source_work();
+        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        let retained = work.test_code_observation();
+        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first)));
+
+        // A fixed state-only probe models unresolved/forgotten result residue;
+        // no File is created or leaked and no owned result is asserted drained.
+        let mut unresolved = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        unresolved.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        unresolved.fields().test_code_enter_sidecars();
+        unresolved.physical.phase = FinancialSidecarPhase::ValidatedLocal;
+        assert_eq!(unresolved.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+        let first = unresolved.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        unresolved.fields().test_code_sidecar_blocks_close();
+        assert_eq!(unresolved.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+        assert!(unresolved.physical.blocks_original_close());
+        assert_eq!(unresolved.fields().source_work().test_code_observation().terminal, Some(first));
     }
 }
 
@@ -1129,7 +1769,7 @@ impl GlobalSchemaVersionOwner {
             rows::original_source::StagedOriginalWork::stage_from_decision(decision);
         let native = replay_work::NativeOriginalOwner::from_start_decision(&decision);
         let release = replay_work::FixedDrainLedger::from_start_decision(&decision);
-        FinancialSourceStart { decision, native, staged, release }
+        FinancialSourceStart { decision, native, staged, release, physical: FinancialPhysical::empty() }
     }
 
     pub(crate) fn inspect_fixed_production(

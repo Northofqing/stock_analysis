@@ -891,7 +891,7 @@ pub(super) mod original_native {
         ConstructorComplete, PrepareA00, BeginA00Query, StepA00, ReadA00Integer,
         RetainPaidPrimary, DiscardPaidReset, DiscardPaidFinalize,
         ResetA00, FinalizeA00, A00Complete, ConstructorClose, OriginalClose,
-        Quiescent, FatalBorrow,
+        Quiescent, FatalBorrow, FinishSidecarAcquisition, DrainSidecarLocals,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1006,6 +1006,10 @@ pub(super) mod original_native {
         // Both ports and settlement consult this same barrier. Terminal drain
         // deliberately bypasses it and never requests an owned error.
         fn pending_normal_action(&self) -> Option<LifecycleAction> {
+            if self.fields.physical.blocks_original_close() {
+                return Some(if self.fields.physical.primary.is_some() { LifecycleAction::DrainSidecarLocals }
+                    else { LifecycleAction::FinishSidecarAcquisition });
+            }
             let action = match self.fields.native.a00.phase {
                 A00Phase::Prepare => LifecycleAction::PrepareA00,
                 A00Phase::Query => LifecycleAction::BeginA00Query,
@@ -1037,6 +1041,7 @@ pub(super) mod original_native {
             }
         }
         fn drain_action(&self) -> LifecycleAction {
+            if self.fields.physical.blocks_original_close() { return LifecycleAction::DrainSidecarLocals; }
             if let Some(state) = self.fields.native.statements[0].live() {
                 return if state.cursor != CursorPhase::NoCursor && matches!(state.reset, CodeSlot::NotCalled) {
                     LifecycleAction::ResetA00
@@ -1058,7 +1063,7 @@ pub(super) mod original_native {
         }
         fn constructor(&mut self) -> OriginalConstructorPort<'_, 'a> { OriginalConstructorPort { loan: self } }
         fn begin_a00(&mut self) -> Result<A00Port<'_, 'a>, ProtocolFault> {
-            if self.terminal().is_some() || self.primary.is_some()
+            if self.terminal().is_some() || self.primary.is_some() || self.fields.physical.post_a00_started()
                 || self.fields.native.original.phase() != Some(ConnectionPhase::Configured)
                 || self.fields.native.a00.phase != A00Phase::NotStarted
                 || self.fields.native.statements.iter().any(|slot| !matches!(slot, StmtSlot::Vacant))
@@ -1070,8 +1075,24 @@ pub(super) mod original_native {
             Ok(A00Port { loan: self })
         }
         fn a00_epilogue(&mut self) -> A00Port<'_, 'a> { A00Port { loan: self } }
+        // A00's once-owned error stays in this loan on every refused handoff.
+        // The successful mechanics handoff moves only the same field borrow;
+        // it neither closes Original nor grants FS/SQL/provider qualification.
+        fn into_sidecar_scope(mut self) -> Result<OriginalOwnerFields<'a>, Self> {
+            if self.terminal().is_some() || self.primary.is_some() || self.draining
+                || self.fields.native.original.phase() != Some(ConnectionPhase::Configured)
+                || self.fields.native.a00.phase != A00Phase::Complete
+                || self.fields.native.statements.iter().any(|slot| slot.live().is_some())
+                || !matches!(&self.fields.native.aux, AuxPlace::Empty)
+                || !matches!(&self.fields.native.tx.phase, TxPhase::NotCreated) {
+                return Err(self);
+            }
+            if self.fields.physical.begin_after_a00().is_err() { return Err(self); }
+            let Self { fields, .. } = self;
+            Ok(fields)
+        }
         fn retain_paid_primary(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
-            if self.terminal().is_some() || self.primary.is_some() { return Err(error); }
+            if self.terminal().is_some() || self.primary.is_some() || self.fields.physical.post_a00_started() { return Err(error); }
             let phase = self.fields.native.a00.phase;
             let required = matches!(phase, A00Phase::PrimaryPrepare | A00Phase::PrimaryStep | A00Phase::PrimaryNoRows | A00Phase::PrimaryReset)
                 || self.constructor().next() == LifecycleAction::RetainPaidPrimary;
@@ -1106,6 +1127,7 @@ pub(super) mod original_native {
         }
         fn settle(self) -> AcquisitionSettlement<'a> {
             if (self.terminal().is_none() && self.pending_normal_action().is_some())
+                || self.fields.physical.blocks_original_close()
                 || self.fields.native.original.phase().is_some()
                 || !matches!(&self.fields.native.aux, AuxPlace::Empty)
                 || self.fields.native.statements.iter().any(|slot| slot.live().is_some()) {
@@ -1272,7 +1294,8 @@ pub(super) mod original_native {
             Ok(())
         }
         fn retain_paid_read_error(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
-            if self.next() != LifecycleAction::ReadA00Integer || self.loan.primary.is_some() { return Err(error); }
+            if self.next() != LifecycleAction::ReadA00Integer || self.loan.primary.is_some()
+                || self.loan.fields.physical.post_a00_started() { return Err(error); }
             self.loan.primary = Some(error);
             self.loan.fields.native.a00.outcome = A00Outcome::ReadError;
             self.loan.fields.native.a00.phase = A00Phase::Reset;
@@ -1532,6 +1555,83 @@ pub(super) mod original_native {
         }
     }
 
+    // Fixed post-A00 protocol scripts only. No native/FS adapter is invoked.
+    #[cfg(test)]
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn test_code_enter_sidecars(self) {
+            let before = self.work.test_code_observation();
+            let mut loan = self.original_acquisition();
+            loan.fixed_configured_carrier();
+            loan.fixed_prepared_a00();
+            loan.a00_epilogue().observe(A00Observation::Step(rusqlite::ffi::SQLITE_ROW)).unwrap();
+            loan.a00_epilogue().observe(A00Observation::Integer(7)).unwrap();
+            loan.a00_epilogue().observe(A00Observation::Reset(rusqlite::ffi::SQLITE_OK)).unwrap();
+            loan.a00_epilogue().observe(A00Observation::Finalize(rusqlite::ffi::SQLITE_OK)).unwrap();
+            let Ok(fields) = loan.into_sidecar_scope() else { panic!("completed A00 must hand off the same loan"); };
+            assert!(fields.physical.blocks_original_close());
+            assert_eq!(fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_a00_primary_refuses_sidecars(self) {
+            let before = self.work.test_code_observation();
+            let (error, allocation) = fixed_supplied_error();
+            let mut loan = self.original_acquisition();
+            loan.fixed_configured_carrier();
+            loan.fixed_prepared_a00();
+            loan.a00_epilogue().observe(A00Observation::Step(rusqlite::ffi::SQLITE_ERROR)).unwrap();
+            loan.retain_paid_primary(error).unwrap_or_else(|_| panic!("supplied primary must move once"));
+            loan.a00_epilogue().observe(A00Observation::Reset(rusqlite::ffi::SQLITE_OK)).unwrap();
+            loan.a00_epilogue().observe(A00Observation::Finalize(rusqlite::ffi::SQLITE_OK)).unwrap();
+            let Err(loan) = loan.into_sidecar_scope() else { panic!("failed A00 must not enter E04"); };
+            assert!(!loan.fields.physical.post_a00_started());
+            let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &loan.primary else {
+                panic!("blocked handoff must retain the original primary");
+            };
+            assert_eq!(detail.as_ptr() as usize, allocation);
+            assert_eq!(loan.fields.work.test_code_observation(), before);
+            assert!(loan.fields.native.original.phase().is_some());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_sidecar_blocks_close(self) {
+            let before = self.work.test_code_observation();
+            let mut loan = self.original_acquisition();
+            let expected = if loan.terminal().is_some() || loan.fields.physical.primary.is_some() { LifecycleAction::DrainSidecarLocals }
+                else { LifecycleAction::FinishSidecarAcquisition };
+            assert_eq!(loan.constructor().next(), expected);
+            assert_eq!(loan.a00_epilogue().next(), expected);
+            assert_eq!(loan.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(loan.a00_epilogue().observe(A00Observation::Finalize(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert!(loan.begin_a00().is_err());
+            let AcquisitionSettlement::Held(loan) = loan.settle() else { panic!("local ownership/payment barrier must hold the whole loan"); };
+            assert!(loan.primary.is_none()); // E04's primary remains in G, never duplicated in Q.
+            assert_eq!(loan.fields.work.test_code_observation(), before);
+            assert!(loan.fields.native.original.phase().is_some());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_sidecar_close_ok(self) {
+            let before = self.work.test_code_observation();
+            let mut loan = self.original_acquisition();
+            loan.start_original_drain().unwrap();
+            assert_eq!(loan.constructor().next(), LifecycleAction::OriginalClose);
+            loan.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)).unwrap();
+            let AcquisitionSettlement::Released { fields, primary, terminal } = loan.settle() else { panic!("legal OK close must release only the native slot"); };
+            assert!(primary.is_none());
+            assert_eq!(terminal, before.terminal);
+            assert_eq!(fields.work.test_code_observation(), before);
+            assert!(fields.physical.post_a00_started());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_sidecar_close_busy(self) {
+            let before = self.work.test_code_observation();
+            let mut loan = self.original_acquisition();
+            loan.start_original_drain().unwrap();
+            assert_eq!(loan.constructor().next(), LifecycleAction::OriginalClose);
+            loan.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_BUSY)).unwrap();
+            assert_eq!(loan.constructor().next(), LifecycleAction::FatalBorrow);
+            assert_eq!(loan.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            let AcquisitionSettlement::Held(loan) = loan.settle() else { panic!("failed close must hold all siblings"); };
+            assert!(loan.primary.is_none());
+            assert_eq!(loan.fields.work.test_code_observation(), before);
+            assert!(matches!(loan.fields.native.original.status().unwrap().close_second, CodeSlot::NotCalled));
+        }
+    }
+
     #[repr(C, u8)]
     enum BorrowedCell<'v> {
         Null, Integer(i64), RealBits(u64), Text(&'v [u8]), Blob(&'v [u8]),
@@ -1589,20 +1689,29 @@ pub(super) mod original_native {
         native: &'a mut NativeOriginalOwner,
         work: OriginalSourceWork<'a>,
         release: &'a mut FixedDrainLedger,
+        physical: &'a mut super::super::super::FinancialPhysical,
     }
     impl<'a> OriginalOwnerFields<'a> {
         pub(in crate::database::global_schema_v1) fn lend(
             native: &'a mut NativeOriginalOwner,
             work: OriginalSourceWork<'a>,
             release: &'a mut FixedDrainLedger,
+            physical: &'a mut super::super::super::FinancialPhysical,
         ) -> Self {
-            Self { native, work, release }
+            Self { native, work, release, physical }
         }
         pub(in crate::database::global_schema_v1) fn reborrow(&mut self) -> OriginalOwnerFields<'_> {
             OriginalOwnerFields {
                 native: &mut *self.native,
                 work: self.work.reborrow(),
                 release: &mut *self.release,
+                physical: &mut *self.physical,
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn sidecar_loan(&mut self) -> super::super::super::FinancialSidecarLoan<'_> {
+            super::super::super::FinancialSidecarLoan {
+                physical: &mut *self.physical,
+                work: self.work.reborrow(),
             }
         }
         pub(in crate::database::global_schema_v1) fn source_work(&mut self) -> OriginalSourceWork<'_> {
