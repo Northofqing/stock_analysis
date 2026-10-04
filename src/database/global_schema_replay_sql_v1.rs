@@ -700,7 +700,7 @@ mod tests {
 // The new financial-source route has no native entry/issuer in this slice.
 // These fixed places/loans make no selected-provider or release-success claim.
 #[allow(dead_code)]
-mod original_native {
+pub(super) mod original_native {
     use super::super::super::rows::original_source::{OriginalSourceWork, SourceTerminal};
     use rusqlite::ffi::{sqlite3, sqlite3_stmt};
     use std::ffi::CString;
@@ -814,7 +814,7 @@ mod original_native {
         ordinal: usize,
         code: i32,
     }
-    struct NativeOriginalOwner {
+    pub(in crate::database::global_schema_v1) struct NativeOriginalOwner {
         original: OriginalPlace,
         aux: AuxPlace,
         statements: [StmtSlot; 3],
@@ -827,6 +827,11 @@ mod original_native {
     // live-handle constructor or default Drop is introduced. Real acquisition
     // and explicit qualified release remain the next behavior slice.
     impl NativeOriginalOwner {
+        pub(in crate::database::global_schema_v1) fn from_start_decision(
+            _decision: &super::super::super::FinancialRetainedStartDecision,
+        ) -> Self {
+            Self::empty()
+        }
         fn empty() -> Self {
             Self {
                 original: OriginalPlace::Empty,
@@ -888,11 +893,75 @@ mod original_native {
         file: FileRelease,
         guard: GuardRelease,
     }
-    struct FixedDrainLedger {
+    pub(in crate::database::global_schema_v1) struct FixedDrainLedger {
         first_secondary: Option<FixedAdverse>,
         filesystem: FsObservation,
         audit: AuditReleaseStatus,
     }
+    impl FixedDrainLedger {
+        pub(in crate::database::global_schema_v1) fn from_start_decision(
+            _decision: &super::super::super::FinancialRetainedStartDecision,
+        ) -> Self {
+            Self {
+                first_secondary: None,
+                filesystem: FsObservation {
+                    action: FsAction::NamespaceIdentity,
+                    ordinal: 0,
+                    result: FsResult::NotCalled,
+                },
+                audit: AuditReleaseStatus {
+                    unlock: CodeSlot::NotCalled,
+                    file: FileRelease::NotTaken,
+                    guard: GuardRelease::NotTaken,
+                },
+            }
+        }
+    }
+
+    // Short sibling-field borrow, deliberately separate from OriginalSqlLoan.
+    // Creating or dropping it supplies no selected native rules or cleanup.
+    pub(in crate::database::global_schema_v1) struct OriginalOwnerFields<'a> {
+        native: &'a mut NativeOriginalOwner,
+        work: OriginalSourceWork<'a>,
+        release: &'a mut FixedDrainLedger,
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn lend(
+            native: &'a mut NativeOriginalOwner,
+            work: OriginalSourceWork<'a>,
+            release: &'a mut FixedDrainLedger,
+        ) -> Self {
+            Self { native, work, release }
+        }
+        pub(in crate::database::global_schema_v1) fn reborrow(&mut self) -> OriginalOwnerFields<'_> {
+            OriginalOwnerFields {
+                native: &mut *self.native,
+                work: self.work.reborrow(),
+                release: &mut *self.release,
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn source_work(&mut self) -> OriginalSourceWork<'_> {
+            self.work.reborrow()
+        }
+        #[cfg(test)]
+        pub(in crate::database::global_schema_v1) fn test_code_unreached(&self) -> bool {
+            matches!(&self.native.original, OriginalPlace::Empty)
+                && matches!(&self.native.aux, AuxPlace::Empty)
+                && self.native.statements.iter().all(|slot| matches!(slot, StmtSlot::Vacant))
+                && matches!(&self.native.statement_phase, StatementPhase::Empty)
+                && matches!(&self.native.tx.phase, TxPhase::NotCreated)
+                && matches!(&self.native.tx.exit, TxExit::NotSelected)
+                && matches!(&self.native.tx.autocommit, AutocommitObservation::NotObserved)
+                && matches!(&self.native.tx.rollback, RollbackObservation::NotReached)
+                && self.native.secondary.is_none()
+                && self.release.first_secondary.is_none()
+                && matches!(&self.release.filesystem.result, FsResult::NotCalled)
+                && matches!(&self.release.audit.unlock, CodeSlot::NotCalled)
+                && matches!(&self.release.audit.file, FileRelease::NotTaken)
+                && matches!(&self.release.audit.guard, GuardRelease::NotTaken)
+        }
+    }
+
     #[repr(u8)]
     enum CloseAction { Constructor, Original, Reference, CopiedFirst, CopiedSecond }
     struct FixedCloseViolation {

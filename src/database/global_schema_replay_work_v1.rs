@@ -312,6 +312,11 @@ impl<'a> V1RowsLoan<'a> {
 #[path = "global_schema_replay_sql_v1.rs"]
 mod sql_rows;
 
+// Only G's fixed owning carriers may use the unqualified sibling-field port.
+pub(super) use sql_rows::original_native::{
+    FixedDrainLedger, NativeOriginalOwner, OriginalOwnerFields,
+};
+
 #[path = "global_schema_replay_calendar_v1.rs"]
 mod paid_calendar;
 pub(crate) use paid_calendar::{

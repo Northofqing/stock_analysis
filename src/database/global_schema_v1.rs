@@ -364,6 +364,138 @@ pub(crate) struct GlobalSchemaVersionOwner {
     _private: (),
 }
 
+// Fixed mechanics origin for the later financial source route. This decision
+// carries no path, pin, provider, layout or source-success authority.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialStartPurpose {
+    FinancialTargetRowsBackup,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialModeDecision {
+    Production,
+    #[cfg(test)]
+    Test,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialStartRefusal {
+    IncompatibleModes,
+}
+
+#[allow(dead_code)]
+fn decide_financial_mode_pair(
+    bound: BoundMode,
+    catalog: GlobalSchemaCatalogMode,
+) -> Result<FinancialModeDecision, FinancialStartRefusal> {
+    match (bound, catalog) {
+        (BoundMode::Production, GlobalSchemaCatalogMode::Production) => {
+            Ok(FinancialModeDecision::Production)
+        }
+        #[cfg(test)]
+        (BoundMode::Test, GlobalSchemaCatalogMode::Test) => Ok(FinancialModeDecision::Test),
+        _ => Err(FinancialStartRefusal::IncompatibleModes),
+    }
+}
+
+// Move-only token. Only the fixed production owner origin creates it; a
+// successful Test mode decision above does not produce this production token.
+#[allow(dead_code)]
+struct FinancialStartDecision {
+    purpose: FinancialStartPurpose,
+    bound: BoundMode,
+    catalog: GlobalSchemaCatalogMode,
+}
+
+// The retained decision has no meter-construction port. Consuming the origin
+// token must not return a token that can stage a second pool.
+#[allow(dead_code)]
+struct FinancialRetainedStartDecision {
+    purpose: FinancialStartPurpose,
+    bound: BoundMode,
+    catalog: GlobalSchemaCatalogMode,
+}
+
+#[allow(dead_code)]
+impl FinancialStartDecision {
+    fn fixed_production() -> Self {
+        match decide_financial_mode_pair(BoundMode::Production, GlobalSchemaCatalogMode::Production) {
+            Ok(FinancialModeDecision::Production) => Self {
+                purpose: FinancialStartPurpose::FinancialTargetRowsBackup,
+                bound: BoundMode::Production,
+                catalog: GlobalSchemaCatalogMode::Production,
+            },
+            _ => unreachable!("fixed financial production pair must be compatible"),
+        }
+    }
+
+    fn into_retained(self) -> FinancialRetainedStartDecision {
+        let Self { purpose, bound, catalog } = self;
+        FinancialRetainedStartDecision { purpose, bound, catalog }
+    }
+}
+
+#[allow(dead_code)]
+struct FinancialSourceStart {
+    decision: FinancialRetainedStartDecision,
+    native: replay_work::NativeOriginalOwner,
+    staged: rows::original_source::StagedOriginalWork,
+    release: replay_work::FixedDrainLedger,
+}
+
+#[allow(dead_code)]
+struct FinancialRowsConstruction {
+    decision: FinancialRetainedStartDecision,
+    native: replay_work::NativeOriginalOwner,
+    construction: rows::original_source::PendingConstruction,
+    release: replay_work::FixedDrainLedger,
+}
+
+#[allow(dead_code)]
+struct FinancialRejectedConstruction {
+    construction: FinancialRowsConstruction,
+    failure: rows::original_source::SourceFailure,
+}
+
+#[allow(dead_code)]
+impl FinancialSourceStart {
+    fn fields(&mut self) -> replay_work::OriginalOwnerFields<'_> {
+        replay_work::OriginalOwnerFields::lend(
+            &mut self.native,
+            self.staged.source_loan(),
+            &mut self.release,
+        )
+    }
+
+    fn enter_rows(self) -> FinancialRowsConstruction {
+        let Self { decision, native, staged, release } = self;
+        FinancialRowsConstruction {
+            decision,
+            native,
+            construction: staged.enter_rows(),
+            release,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl FinancialRowsConstruction {
+    fn fields(&mut self) -> replay_work::OriginalOwnerFields<'_> {
+        replay_work::OriginalOwnerFields::lend(
+            &mut self.native,
+            self.construction.source_loan(),
+            &mut self.release,
+        )
+    }
+
+    fn reject(self, failure: rows::original_source::SourceFailure) -> FinancialRejectedConstruction {
+        FinancialRejectedConstruction { construction: self, failure }
+    }
+}
+
 /// Non-forgeable permission to capture the selection catalog from the
 /// database connection retained by the global owner.
 ///
@@ -387,6 +519,122 @@ impl SelectionCatalogCaptureAuthority {
 
 fn new_global_schema_version_owner() -> GlobalSchemaVersionOwner {
     GlobalSchemaVersionOwner { _private: () }
+}
+
+#[cfg(test)]
+mod financial_source_start_tests {
+    use super::*;
+    use rows::original_source::{
+        OwnerStartProbe, SourceFailure, SourceOperationError, SourceResourceCause,
+        SourceSite, SourceTerminal,
+    };
+
+    // Pure connected representation tests: no files, SQLite, source spec/tail,
+    // provider rules, real paid request or capability qualification is created.
+    #[test]
+    fn history_original_owner_start_fixed_origin_move_and_nested_loan_keep_terminal() {
+        let owner = GlobalSchemaVersionOwner::for_test_code();
+        let mut start = owner.start_fixed_financial_source_work();
+        assert_eq!(start.decision.purpose, FinancialStartPurpose::FinancialTargetRowsBackup);
+        assert_eq!(start.decision.bound, BoundMode::Production);
+        assert_eq!(start.decision.catalog, GlobalSchemaCatalogMode::Production);
+        {
+            let mut fields = start.fields();
+            assert!(fields.test_code_unreached());
+            let mut work = fields.source_work();
+            let initial = work.test_code_observation();
+            assert_eq!((initial.limit, initial.used, initial.terminal), (16 * 1024 * 1024, 0, None));
+            work.test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        }
+        let mut construction = start.enter_rows();
+        assert_eq!(construction.decision.bound, BoundMode::Production);
+        {
+            let mut fields = construction.fields();
+            let mut nested = fields.reborrow();
+            let mut work = nested.source_work();
+            work.test_code_probe(OwnerStartProbe::FundRows).unwrap();
+            let funded = work.test_code_observation();
+            assert_eq!((funded.used, funded.rows, funded.bytes, funded.streams), (8, 2, 11, 1));
+        }
+        let first = {
+            let mut fields = construction.fields();
+            let mut work = fields.source_work();
+            work.test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()
+        };
+        assert_eq!(first, SourceTerminal::Resource {
+            site: SourceSite::RawCatalog,
+            cause: SourceResourceCause::Exceeded,
+            attempted_used: 16 * 1024 * 1024 + 8,
+        });
+        let mut fields = construction.fields();
+        assert!(fields.test_code_unreached());
+        let mut nested = fields.reborrow();
+        let mut work = nested.source_work();
+        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        let retained = work.test_code_observation();
+        assert_eq!((retained.used, retained.terminal), (16 * 1024 * 1024 + 8, Some(first)));
+    }
+
+    #[test]
+    fn history_original_owner_start_mode_pair_rejects_before_origin() {
+        // These scalar decisions allocate no work and confer no production
+        // token, even when a cfg-test pair is compatible.
+        assert_eq!(
+            decide_financial_mode_pair(BoundMode::Test, GlobalSchemaCatalogMode::Production),
+            Err(FinancialStartRefusal::IncompatibleModes),
+        );
+        assert_eq!(
+            decide_financial_mode_pair(BoundMode::Production, GlobalSchemaCatalogMode::Test),
+            Err(FinancialStartRefusal::IncompatibleModes),
+        );
+        assert_eq!(
+            decide_financial_mode_pair(BoundMode::Production, GlobalSchemaCatalogMode::Production),
+            Ok(FinancialModeDecision::Production),
+        );
+        assert_eq!(
+            decide_financial_mode_pair(BoundMode::Test, GlobalSchemaCatalogMode::Test),
+            Ok(FinancialModeDecision::Test),
+        );
+    }
+
+    #[test]
+    fn history_original_owner_start_rejection_keeps_whole_carrier_and_failure_category() {
+        let owner = GlobalSchemaVersionOwner::for_test_code();
+        let mut start = owner.start_fixed_financial_source_work();
+        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        let construction = start.enter_rows();
+        let mut paid = construction.reject(SourceFailure::Paid(SourceOperationError::Global(
+            GlobalSchemaV1Error::ExclusiveProcessMaintenanceLeaseUnavailable,
+        )));
+        let SourceFailure::Paid(SourceOperationError::Global(error)) = &paid.failure else {
+            panic!("fixed paid owner error must retain its category");
+        };
+        assert_eq!(error.code(), "global_schema_exclusive_process_lease_busy");
+        assert_eq!(paid.construction.decision.catalog, GlobalSchemaCatalogMode::Production);
+        {
+            let mut fields = paid.construction.fields();
+            assert!(fields.test_code_unreached());
+            let retained = fields.source_work().test_code_observation();
+            assert_eq!((retained.used, retained.terminal), (3, None));
+        }
+
+        // A separate fixed fixture covers terminal rejection; it never creates
+        // a replacement pool inside either source capture.
+        let mut terminal_start = owner.start_fixed_financial_source_work();
+        terminal_start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        let mut terminal_construction = terminal_start.enter_rows();
+        let first = terminal_construction.fields().source_work()
+            .test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        let mut rejected = terminal_construction.reject(SourceFailure::Terminal(first));
+        assert!(matches!(&rejected.failure, SourceFailure::Terminal(terminal) if *terminal == first));
+        let mut fields = rejected.construction.fields();
+        assert!(fields.test_code_unreached());
+        let mut work = fields.source_work();
+        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        let retained = work.test_code_observation();
+        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first)));
+    }
 }
 
 pub(super) fn run_selection_v2_migration_command<I, S>(args: I) -> Result<String, String>
@@ -804,6 +1052,18 @@ impl GlobalSchemaVersionOwner {
     #[cfg(test)]
     fn for_test_code() -> Self {
         Self::new()
+    }
+
+    // Callable by this genuine owner before any attributable source operation.
+    // It initializes only one production meter and empty native/ledger places.
+    // No current safe-driver purpose calls this incomplete financial route.
+    fn start_fixed_financial_source_work(&self) -> FinancialSourceStart {
+        let decision = FinancialStartDecision::fixed_production();
+        let (decision, staged) =
+            rows::original_source::StagedOriginalWork::stage_from_decision(decision);
+        let native = replay_work::NativeOriginalOwner::from_start_decision(&decision);
+        let release = replay_work::FixedDrainLedger::from_start_decision(&decision);
+        FinancialSourceStart { decision, native, staged, release }
     }
 
     pub(crate) fn inspect_fixed_production(

@@ -1590,8 +1590,16 @@ pub(in crate::database) mod original_source {
         Rejected { construction: PendingConstruction, failure: SourceFailure },
     }
     impl StagedOriginalWork {
-        // Private, unwired origin. The future genuine G purpose owns the only
-        // call before O01; this is not an admission/provider constructor.
+        // Consume G's one origin token; return only its retained decision with
+        // the meter. No caller chooses a limit or can restage the retained token.
+        pub(in crate::database::global_schema_v1) fn stage_from_decision(
+            decision: super::super::FinancialStartDecision,
+        ) -> (super::super::FinancialRetainedStartDecision, Self) {
+            let staged = Self { work: RowsWork::new(Limits::production()) };
+            (decision.into_retained(), staged)
+        }
+        // Reduced representation fixtures never become a production origin.
+        #[cfg(test)]
         fn begin(limits: Limits) -> Self {
             Self { work: RowsWork::new(limits) }
         }
@@ -1635,6 +1643,57 @@ pub(in crate::database) mod original_source {
     impl FinancialPending {
         pub(in crate::database) fn source_loan(&mut self) -> OriginalSourceWork<'_> {
             OriginalSourceWork::from_work(&mut self.work)
+        }
+    }
+
+    // Closed cross-module mechanics probes. These do not stand in for a real
+    // source request, SQL read, layout qualification or provider invocation.
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    pub(in crate::database::global_schema_v1) enum OwnerStartProbe {
+        FundEarly,
+        FundRows,
+        ExceedProduction,
+        TryAfterTerminal,
+    }
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in crate::database::global_schema_v1) struct OwnerStartObservation {
+        pub(in crate::database::global_schema_v1) used: u64,
+        pub(in crate::database::global_schema_v1) limit: u64,
+        pub(in crate::database::global_schema_v1) rows: u64,
+        pub(in crate::database::global_schema_v1) bytes: u64,
+        pub(in crate::database::global_schema_v1) streams: u64,
+        pub(in crate::database::global_schema_v1) terminal: Option<SourceTerminal>,
+    }
+    #[cfg(test)]
+    impl OriginalSourceWork<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_probe(
+            &mut self,
+            probe: OwnerStartProbe,
+        ) -> Result<(), SourceTerminal> {
+            match probe {
+                OwnerStartProbe::FundEarly => {
+                    self.debit(SourceSite::PhysicalPaths, 3)?;
+                    *self.rows = 2;
+                    *self.bytes = 11;
+                    *self.streams = 1;
+                    Ok(())
+                }
+                OwnerStartProbe::FundRows => self.debit(SourceSite::RawCatalog, 5),
+                OwnerStartProbe::ExceedProduction => self.debit(SourceSite::RawCatalog, 16 * MIB),
+                OwnerStartProbe::TryAfterTerminal => self.debit(SourceSite::ReviewAndBinding, 1),
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_observation(&self) -> OwnerStartObservation {
+            OwnerStartObservation {
+                used: self.metadata.used(),
+                limit: self.limits.metadata_bytes,
+                rows: *self.rows,
+                bytes: *self.bytes,
+                streams: *self.streams,
+                terminal: *self.terminal,
+            }
         }
     }
 
