@@ -1,6 +1,6 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-04（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-05（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 ## 1. 接手目标与授权
 
@@ -21,9 +21,10 @@
 | 分支 | `codex/platform-roadmap-implementation-20261002` |
 | remote / upstream | `stock_analysis` / `stock_analysis/codex/platform-roadmap-implementation-20261002` |
 | remote 地址 | `github.com:Northofqing/stock_analysis.git` |
-| 最后源码提交 | `b005457e94138147f11af4def4240a2aa9d3996d` |
+| 最后本地源码提交 | `5ec9c7fcd0a7e980317718a8d481c1435e340002`（采集修复） |
+| 原交接远端源码检查点 | `b005457e94138147f11af4def4240a2aa9d3996d`（历史） |
 
-交接编写前实际 `git status` clean、upstream +0/-0；实际 `git ls-remote` 与上述完整 OID 一致。此文档随后单独提交，接手时以实际 Git HEAD 为准；文档提交不改变已验证源码。没有 `origin` remote。历史提交数不能当完成任务数。
+原交接编写前实际 `git status` clean、upstream +0/-0；当时的 `git ls-remote` 与原交接远端检查点的完整 OID 一致。此文档随后单独提交，接手时以实际 Git HEAD 为准；文档提交不改变已验证源码。没有 `origin` remote。历史提交数不能当完成任务数。2026-10-05接续源码为本地分批提交，本轮未重新验证或更新远端；具体有限测试和整体余项见末尾接续段。
 
 先读取 [AGENTS.md](AGENTS.md)、[CLAUDE.md](CLAUDE.md)、[整体路线图](docs/superpowers/plans/2026-09-28-platform-complete-roadmap.md) 和本交接，再检查实际工作树。
 
