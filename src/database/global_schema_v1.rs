@@ -1080,6 +1080,57 @@ impl<'purpose> FinancialInitialReadConstruction<'purpose, '_> {
 }
 
 
+// A03/A04 retained owning frame. This introduces no collect implementation,
+// allocator, native executor or Original selected-rules issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialIntegrityQuery { Check, Foreign }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialIntegrityErrorCut { Prepare, Query, Read }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialIntegrityFault { IntegrityRows, ForeignNonzero, ForeignOverflow }
+struct FinancialIntegrityReadState {
+    integrity_rows: Option<Vec<String>>,
+    partial_row: Option<String>,
+    partial_rows: Option<Vec<String>>,
+    paid_detail: Option<String>,
+    foreign_key_violations: i64,
+    fault: Option<FinancialIntegrityFault>,
+}
+impl FinancialIntegrityReadState {
+    fn empty() -> Self { Self { integrity_rows: None, partial_row: None, partial_rows: None, paid_detail: None,
+        foreign_key_violations: 0, fault: None } }
+}
+struct FinancialIntegrityReadFrame<'purpose, 'writer> {
+    prefix: FinancialInitialReadFrame<'purpose, 'writer>,
+    integrity: FinancialIntegrityReadState,
+}
+impl<'purpose, 'writer> FinancialInitialReadFrame<'purpose, 'writer> {
+    fn begin_integrity(mut self) -> Result<FinancialIntegrityReadFrame<'purpose, 'writer>, Self> {
+        // Same borrowed purpose/modes and the complete retained A01/A02
+        // prefix, never a new configured context or meter from scalar labels.
+        if !self.source.fields().begin_integrity_read() { return Err(self); }
+        Ok(FinancialIntegrityReadFrame { prefix: self, integrity: FinancialIntegrityReadState::empty() })
+    }
+}
+impl FinancialIntegrityReadFrame<'_, '_> {
+    fn integrity_loan(&mut self) -> replay_work::OriginalIntegrityReadLoan<'_> {
+        self.prefix.source.fields().integrity_read(&mut self.integrity)
+    }
+}
+fn retain_integrity_driver_error(query: FinancialIntegrityQuery, cut: FinancialIntegrityErrorCut,
+    source: rusqlite::Error) -> rows::original_source::SourceOperationError {
+    let operation = match (query, cut) {
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Prepare) => "prepare PRAGMA integrity_check",
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Query) => "query PRAGMA integrity_check",
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Read) => "read PRAGMA integrity_check",
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Prepare) => "prepare PRAGMA foreign_key_check",
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Query) => "query PRAGMA foreign_key_check",
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Read) => "read PRAGMA foreign_key_check",
+    };
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })
+}
+
+
 /// Non-forgeable permission to capture the selection catalog from the
 /// database connection retained by the global owner.
 ///
@@ -2034,6 +2085,13 @@ impl Drop for TestCodeSelectionRehearsal {
 #[derive(Clone, Copy)]
 enum FinancialBeginFailureCase { Prepare, Step, Tail }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinancialIntegrityErrorCase { Prepare, Query, Step, DoneReset, WrongType, WrongNull, WrongReal, WrongBlob, InvalidUtf8, ForeignPrepare, ForeignQuery, ForeignStep }
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinancialIntegrityTerminalCut { BeforePrepare, CompletedBeforeWhole, ForeignEofPending, SemanticDetail, PaidDetailPending, OwnedPaidDetail, AfterVector, ForeignRow, RowWithPartialOwner, OwnedRaw, OwnedIgnoredReset }
+
 #[allow(dead_code)]
 #[cfg(test)]
 mod financial_original_audit_acquisition_tests {
@@ -2374,6 +2432,234 @@ mod financial_original_audit_acquisition_tests {
                 assert!(moved.source.physical.primary.is_none()); assert_owned_pin(&moved.source.audit);
                 assert_eq!(moved.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
                 assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+            }
+        }
+        fn fixed_integrity_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialIntegrityReadFrame<'purpose, 'writer> {
+            let prefix = fixed_initial_frame(purpose, writer, trace);
+            // Seven independent A01/A02 whole returns, not a scalar label,
+            // must precede selecting the two fixed integrity queries.
+            let Err(mut prefix) = prefix.begin_integrity() else { panic!("unreached prefix refuses A03"); };
+            prefix.read_loan().test_code_exact_prefix(String::from("wal"));
+            prefix.begin_integrity().unwrap_or_else(|_| panic!("complete same-frame prefix"))
+        }
+        fn drain_integrity_source_audit(frame: &mut FinancialSourceStart<'_>, trace: &Trace) {
+            frame.audit_fields().begin_release().unwrap();
+            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
+            frame.audit.resources.loan().observe_fixed_unlock_ok();
+            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
+                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+                frame.fields().test_code_audit_blocks_close();
+            }
+            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
+            assert_ne!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
+        }
+        fn integrity_raw_allocation(raw: &rusqlite::Error) -> usize {
+            match raw {
+                rusqlite::Error::InvalidColumnName(name) | rusqlite::Error::InvalidColumnType(_, name, _) => name.as_ptr() as usize,
+                rusqlite::Error::FromSqlConversionFailure(_, _, child) => child.as_ref() as *const _ as *const () as usize,
+                _ => panic!("fixed actual owned driver error"),
+            }
+        }
+        fn fixed_integrity_raw(case: FinancialIntegrityErrorCase) -> (rusqlite::Error, usize) {
+            let raw = match case {
+                FinancialIntegrityErrorCase::WrongType | FinancialIntegrityErrorCase::WrongNull
+                    | FinancialIntegrityErrorCase::WrongReal | FinancialIntegrityErrorCase::WrongBlob => {
+                    let kind = match case { FinancialIntegrityErrorCase::WrongNull => rusqlite::types::Type::Null,
+                        FinancialIntegrityErrorCase::WrongReal => rusqlite::types::Type::Real,
+                        FinancialIntegrityErrorCase::WrongBlob => rusqlite::types::Type::Blob, _ => rusqlite::types::Type::Integer };
+                    rusqlite::Error::InvalidColumnType(0, String::from("TEST_CODE column zero"), kind)
+                }
+                FinancialIntegrityErrorCase::InvalidUtf8 => {
+                    let bytes = [0xff]; let child = std::str::from_utf8(&bytes).unwrap_err();
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(child))
+                }
+                _ => rusqlite::Error::InvalidColumnName(String::from("TEST_CODE actual retained driver child")),
+            };
+            let pointer = integrity_raw_allocation(&raw); (raw, pointer)
+        }
+        #[test]
+        fn history_original_integrity_fixed_whole_results_keep_two_vm_and_prefix() {
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
+            let journal = frame.prefix.initial.journal_mode.as_ref().unwrap().as_ptr();
+            let before = frame.prefix.source.fields().source_work().test_code_observation();
+            let rows = vec![String::from("ok")]; let vector = rows.as_ptr(); let child = rows[0].as_ptr();
+            assert!(frame.integrity_loan().test_code_whole_check(rows));
+            assert_eq!(frame.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            { let _short = frame.integrity_loan(); }
+            let mut moved = frame;
+            assert!(std::ptr::eq(moved.prefix.initial.purpose, &purpose));
+            assert_eq!(moved.prefix.initial.journal_mode.as_ref().unwrap().as_ptr(), journal);
+            moved.integrity_loan().test_code_foreign_rows(0, false);
+            assert_eq!(moved.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(), child);
+            // Both VM finalizations precede the independent capture return;
+            // the successful Vec is moved through that return, not discarded.
+            moved.integrity_loan().test_code_finish_success();
+            assert_eq!(moved.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert_eq!(moved.integrity.foreign_key_violations, 0);
+            assert_eq!(moved.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.prefix.source.audit);
+            assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+            // A03/A04 success is not COMMIT or a publishable capture. Existing
+            // terminal cleanup is still required for this unissued protocol.
+            let first = moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            let terminal = moved.prefix.source.fields().source_work().test_code_observation();
+            moved.integrity_loan().test_code_drain_interrupted();
+            moved.prefix.source.fields().original_transaction().test_code_terminal_exit();
+            drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
+            assert!(moved.prefix.source.physical.primary.is_none()); assert_owned_pin(&moved.prefix.source.audit);
+            assert!(moved.prefix.source.physical.parent_sidecars_retained());
+            assert_eq!(moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), terminal);
+        }
+        #[test]
+        fn history_original_integrity_errors_preserve_owned_results_and_scope_order() {
+            for case in [FinancialIntegrityErrorCase::Prepare, FinancialIntegrityErrorCase::Query,
+                FinancialIntegrityErrorCase::Step, FinancialIntegrityErrorCase::DoneReset,
+                FinancialIntegrityErrorCase::WrongType, FinancialIntegrityErrorCase::WrongNull,
+                FinancialIntegrityErrorCase::WrongReal, FinancialIntegrityErrorCase::WrongBlob, FinancialIntegrityErrorCase::InvalidUtf8,
+                FinancialIntegrityErrorCase::ForeignPrepare, FinancialIntegrityErrorCase::ForeignQuery,
+                FinancialIntegrityErrorCase::ForeignStep] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
+                let before = frame.prefix.source.fields().source_work().test_code_observation();
+                let (raw, allocation) = fixed_integrity_raw(case); let (cleanup, _) = fixed_initial_raw_error();
+                frame.integrity_loan().test_code_driver_error(case, raw, cleanup);
+                let expected = match case {
+                    FinancialIntegrityErrorCase::Prepare => "prepare PRAGMA integrity_check",
+                    FinancialIntegrityErrorCase::Query => "query PRAGMA integrity_check",
+                    FinancialIntegrityErrorCase::ForeignPrepare => "prepare PRAGMA foreign_key_check",
+                    FinancialIntegrityErrorCase::ForeignQuery => "query PRAGMA foreign_key_check",
+                    FinancialIntegrityErrorCase::ForeignStep => "read PRAGMA foreign_key_check",
+                    _ => "read PRAGMA integrity_check",
+                };
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })) = &frame.prefix.source.physical.primary else { panic!("Source-correct driver wrapper before remaining Statements"); };
+                assert_eq!(*operation, expected); assert_eq!(integrity_raw_allocation(source), allocation);
+                { let _short = frame.integrity_loan(); }
+                let mut moved = frame; let (cleanup, _) = fixed_initial_raw_error();
+                // FK scopes first; first successful Vec then first Statement.
+                // This asserts outer local order, never Vec children layout.
+                moved.integrity_loan().test_code_finish_failed_scope(cleanup);
+                assert!(moved.integrity.integrity_rows.is_none());
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })) = &moved.prefix.source.physical.primary else { panic!("same wrapped child"); };
+                assert_eq!(*operation, expected); assert_eq!(integrity_raw_allocation(source), allocation);
+                let (ignored, _) = fixed_primary(); let (finalize, _) = fixed_primary();
+                moved.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, finalize);
+                drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { source, .. })) = &moved.prefix.source.physical.primary else { panic!("first child survives failed Original close"); };
+                assert_eq!(integrity_raw_allocation(source), allocation); assert_owned_pin(&moved.prefix.source.audit);
+                assert!(moved.prefix.source.physical.parent_sidecars_retained());
+                assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+            }
+            for (rows, foreign_rows, overflow) in [(Vec::<String>::new(), 0, false),
+                (vec![String::from("bad")], 0, false), (vec![String::from("ok"), String::from("ok")], 0, false),
+                (vec![String::from("ok")], 2, false), (vec![String::from("ok")], 1, true)] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
+                let reached_fk = frame.integrity_loan().test_code_whole_check(rows);
+                if reached_fk { frame.integrity_loan().test_code_foreign_rows(foreign_rows, overflow); }
+                let detail = match frame.integrity.fault.unwrap() {
+                    FinancialIntegrityFault::IntegrityRows => format!("PRAGMA integrity_check failed: {:?}", frame.integrity.integrity_rows.as_ref().unwrap()),
+                    FinancialIntegrityFault::ForeignNonzero => format!("PRAGMA foreign_key_check found {} violation(s)", frame.integrity.foreign_key_violations),
+                    FinancialIntegrityFault::ForeignOverflow => String::from("PRAGMA foreign_key_check violation count overflowed i64"),
+                };
+                let allocation = detail.as_ptr(); let before = frame.prefix.source.fields().source_work().test_code_observation();
+                frame.integrity_loan().test_code_paid_semantic_error(detail);
+                let (cleanup, _) = fixed_initial_raw_error(); frame.integrity_loan().test_code_finish_failed_scope(cleanup);
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &frame.prefix.source.physical.primary else { panic!("fixed semantic category retained once"); };
+                assert_eq!(detail.as_ptr(), allocation);
+                frame.prefix.source.fields().original_transaction().test_code_existing_read_primary_exit();
+                drain_integrity_source_audit(&mut frame.prefix.source, &trace); frame.prefix.source.fields().test_code_sidecar_close_busy();
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &frame.prefix.source.physical.primary else { panic!("same semantic primary after close BUSY"); };
+                assert_eq!(detail.as_ptr(), allocation); assert_owned_pin(&frame.prefix.source.audit);
+                assert_eq!(frame.prefix.source.fields().source_work().test_code_observation(), before);
+            }
+        }
+        #[test]
+        fn history_original_integrity_terminal_and_first_primary_hold_same_frame() {
+            for terminal in [false, true] {
+                for cut in [FinancialIntegrityTerminalCut::BeforePrepare, FinancialIntegrityTerminalCut::CompletedBeforeWhole,
+                    FinancialIntegrityTerminalCut::ForeignEofPending, FinancialIntegrityTerminalCut::SemanticDetail,
+                    FinancialIntegrityTerminalCut::PaidDetailPending, FinancialIntegrityTerminalCut::OwnedPaidDetail,
+                    FinancialIntegrityTerminalCut::AfterVector, FinancialIntegrityTerminalCut::ForeignRow,
+                    FinancialIntegrityTerminalCut::RowWithPartialOwner, FinancialIntegrityTerminalCut::OwnedRaw,
+                    FinancialIntegrityTerminalCut::OwnedIgnoredReset] {
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                    let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
+                    let (raw, _) = fixed_initial_raw_error(); let (cleanup, _) = fixed_initial_raw_error();
+                    frame.integrity_loan().test_code_interruption_cut(cut, raw, cleanup);
+                    let mut paid_detail = if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending | FinancialIntegrityTerminalCut::OwnedPaidDetail) {
+                        Some(String::from("PRAGMA integrity_check failed: [\"bad\"]"))
+                    } else { None };
+                    let detail_pointer = paid_detail.as_ref().map(|s| s.as_ptr());
+                    if matches!(cut, FinancialIntegrityTerminalCut::OwnedPaidDetail) {
+                        frame.integrity_loan().test_code_retain_detail_before_interruption(paid_detail.take().unwrap());
+                    }
+                    let normal_reset_cleanup = if !terminal && matches!(cut, FinancialIntegrityTerminalCut::ForeignRow
+                        | FinancialIntegrityTerminalCut::RowWithPartialOwner | FinancialIntegrityTerminalCut::OwnedRaw) {
+                        Some(fixed_initial_raw_error().0)
+                    } else { None };
+                    let (primary, allocation) = fixed_primary();
+                    let first = if terminal {
+                        drop(primary); Some(frame.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
+                    } else {
+                        // The genuine G audit producer can retain its first
+                        // owned error while Q still owns ROW/VM/raw state.
+                        frame.prefix.source.audit_fields().note_normal_failure().unwrap();
+                        frame.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first owned G primary")); None
+                    };
+                    let before = frame.prefix.source.fields().source_work().test_code_observation();
+                    if matches!(cut, FinancialIntegrityTerminalCut::CompletedBeforeWhole) {
+                        frame.integrity_loan().test_code_completed_whole_at_interruption(vec![String::from("ok")]);
+                    }
+                    if matches!(cut, FinancialIntegrityTerminalCut::ForeignEofPending) {
+                        frame.integrity_loan().test_code_foreign_eof_at_interruption();
+                    }
+                    if matches!(cut, FinancialIntegrityTerminalCut::RowWithPartialOwner) {
+                        frame.integrity_loan().test_code_partial_owner(String::from("TEST_CODE actual returned row"), vec![String::from("TEST_CODE actual returned partial owner")]);
+                    }
+                    { let _short = frame.integrity_loan(); }
+                    let mut moved = frame;
+                    if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending) {
+                        moved.integrity_loan().test_code_detail_at_interruption(paid_detail.take().unwrap());
+                    }
+                    if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending | FinancialIntegrityTerminalCut::OwnedPaidDetail) {
+                        assert_eq!(moved.integrity.paid_detail.as_ref().map(|s| s.as_ptr()), detail_pointer);
+                    }
+                    assert!(std::ptr::eq(moved.prefix.initial.purpose, &purpose));
+                    assert!(moved.prefix.initial.journal_mode.as_ref().is_some_and(|s| s == "wal"));
+                    assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.prefix.source.audit);
+                    assert_eq!(moved.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                    let reset_allocation = normal_reset_cleanup.map(|cleanup| moved.integrity_loan().test_code_primary_reset_cleanup(cleanup));
+                    { let _short = moved.integrity_loan(); }
+                    let mut moved = moved;
+                    if let Some(reset_allocation) = reset_allocation {
+                        assert_primary(&moved.prefix.source.physical, allocation);
+                        moved.integrity_loan().test_code_primary_cleanup_once(reset_allocation);
+                        assert_primary(&moved.prefix.source.physical, allocation);
+                    }
+                    moved.integrity_loan().test_code_drain_interrupted();
+                    if terminal {
+                        assert!(moved.prefix.source.physical.primary.is_none());
+                        moved.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                    } else {
+                        assert_primary(&moved.prefix.source.physical, allocation);
+                        let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
+                        moved.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup);
+                    }
+                    drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
+                    assert_owned_pin(&moved.prefix.source.audit); assert!(moved.prefix.source.physical.parent_sidecars_retained());
+                    if let Some(first) = first {
+                        assert!(moved.prefix.source.physical.primary.is_none());
+                        assert_eq!(moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                    } else { assert_primary(&moved.prefix.source.physical, allocation); }
+                    assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+                }
             }
         }
     }

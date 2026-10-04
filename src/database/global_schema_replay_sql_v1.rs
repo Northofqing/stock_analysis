@@ -850,6 +850,7 @@ pub(super) mod original_native {
         a00: A00Record,
         tx: TxRecord,
         initial_read: InitialReadRecord,
+        integrity_read: IntegrityReadRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -879,6 +880,7 @@ pub(super) mod original_native {
                     rollback: RollbackObservation::NotReached,
                 },
                 initial_read: InitialReadRecord::empty(),
+                integrity_read: IntegrityReadRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -936,6 +938,12 @@ pub(super) mod original_native {
         PrepareInitialRead, CheckInitialNoTail, BindInitialEmpty, StepInitialRead, InitialColumnType, InitialInteger, InitialJournalText,
         ResetInitialRead, FinalizeInitialRead, RetainInitialResetError, RetainInitialFinalizeError,
         DiscardInitialOwnedCleanup, AwaitInitialQueryReturn, InitialPrefixReached, StopInitialRead,
+        PrepareIntegrityRead, BindIntegrityEmpty, StepIntegrityRead, IntegrityColumnType, IntegrityText,
+        AwaitIntegrityRowReturn, RetainIntegrityRaw, ResetIntegrityRead, AwaitIntegrityWholeReturn,
+        WrapIntegrityRaw, CheckIntegritySemantic, RetainIntegrityDetail, AwaitIntegrityDetailReturn,
+        WrapIntegrityDetail, DiscardIntegrityOwnedDetail, FinalizeIntegrityRead,
+        RetainIntegrityOwnedCleanup, DiscardIntegrityOwnedCleanup, DiscardIntegrityRaw,
+        AwaitIntegrityPartialReturn, DiscardIntegrityOwnedVector, DiscardIntegrityPartial, StopIntegrityRead, IntegrityPrefixReached, AwaitIntegrityCaptureReturn,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1769,6 +1777,7 @@ pub(super) mod original_native {
         fn transaction_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
             let terminal = work.terminal().is_some();
             if let Some(action) = self.batch_action(BatchKind::Begin, terminal) { return Some(action); }
+            if let Some(action) = self.integrity_read_action(work, physical) { return Some(action); }
             if self.initial_read.context != InitialContext::Unbound
                 && (matches!(self.tx.phase, TxPhase::Active) || matches!(self.initial_read.context, InitialContext::Unknown | InitialContext::Refused)) {
                 if let Some(action) = self.initial_read_action(work, physical) { return Some(action); }
@@ -1790,6 +1799,7 @@ pub(super) mod original_native {
                 && matches!(self.tx.phase, TxPhase::NotCreated | TxPhase::Finished)
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
+                && self.integrity_read.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1959,7 +1969,8 @@ pub(super) mod original_native {
             if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
                 || !matches!(self.fields.native.tx.phase, TxPhase::Active)
                 || self.fields.native.initial_read.ignored.is_some() || self.fields.native.statements[0].live().is_some()
-                || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some() { return Err(error); }
+                || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some()
+                || self.fields.native.integrity_read.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -3096,4 +3107,797 @@ pub(super) mod original_native {
     // Loans have no Drop action. Native/work/ledger remain in their owning
     // fields during the short exclusive borrow; actual abort qualification,
     // cleanup/native status and all selected layout/full-fit gates stay open.
+    // Fixed A03/A04 mechanics only. No collect, growth, formatting, native call
+    // or selected rule issuer is implemented here. Whole Vec ownership comes
+    // from the actual future collect return; row facts do not construct it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityQuery { Check, Foreign }
+    impl IntegrityQuery {
+        fn index(self) -> usize { match self { Self::Check => 0, Self::Foreign => 1 } }
+        fn action(self) -> FixedAction { match self { Self::Check => FixedAction::Integrity, Self::Foreign => FixedAction::ForeignKeyCheck } }
+        fn sql(self) -> &'static str { match self { Self::Check => "PRAGMA integrity_check", Self::Foreign => "PRAGMA foreign_key_check" } }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityStage { Dormant, Check, Foreign, Drain, Ready, Stopped }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityPhase { Prepare, Bind, Step, Type, Text, RowReturn, NeedRaw, Reset, AwaitWhole, Wrap, Compare, NeedDetail, Drain }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityReturn { Unknown, Ok, Error, Interrupted }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityCleanup { Reset, Finalize }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntegrityErrorCut { Prepare, Query, Read }
+    struct IntegrityReadRecord {
+        stage: IntegrityStage,
+        query: IntegrityQuery,
+        phase: IntegrityPhase,
+        prepare: [CodeSlot; 2],
+        rows_started: [bool; 2],
+        eof: [bool; 2],
+        rows: [usize; 2],
+        first_all_ok: bool,
+        pending_text_ok: bool,
+        returned: [IntegrityReturn; 2],
+        raw_cut: IntegrityErrorCut,
+        raw: Option<rusqlite::Error>,
+        need_cleanup: Option<(IntegrityQuery, IntegrityCleanup)>,
+        ignored: Option<rusqlite::Error>,
+        vector_live: bool,
+        partial_live: bool,
+        partial_returned: bool,
+        failed: bool,
+        consumed: [Option<StmtState>; 2],
+        semantic_detail_closed: bool,
+        detail_started: bool,
+        detail_returned: bool,
+        capture_started: bool,
+        capture_returned: IntegrityReturn,
+    }
+    impl IntegrityReadRecord {
+        fn empty() -> Self { Self { stage: IntegrityStage::Dormant, query: IntegrityQuery::Check,
+            phase: IntegrityPhase::Prepare, prepare: [CodeSlot::NotCalled; 2], rows_started: [false; 2],
+            eof: [false; 2], rows: [0; 2], first_all_ok: true, pending_text_ok: false,
+            returned: [IntegrityReturn::Unknown; 2], raw_cut: IntegrityErrorCut::Prepare, raw: None,
+            need_cleanup: None, ignored: None, vector_live: false, partial_live: false,
+            partial_returned: false, failed: false, consumed: [None; 2], semantic_detail_closed: false, detail_started: false, detail_returned: false, capture_started: false, capture_returned: IntegrityReturn::Unknown } }
+        fn blocks_early_primary(&self) -> bool {
+            self.raw.is_some() || self.ignored.is_some() || self.need_cleanup.is_some() || self.detail_started
+                || (self.stage != IntegrityStage::Dormant && self.phase == IntegrityPhase::NeedRaw)
+        }
+        fn stopped_clear(&self) -> bool {
+            matches!(self.stage, IntegrityStage::Dormant | IntegrityStage::Stopped)
+                && self.raw.is_none() && self.ignored.is_none() && self.need_cleanup.is_none()
+                && !self.vector_live && !self.partial_live && !self.detail_started
+        }
+    }
+    impl NativeOriginalOwner {
+        fn integrity_semantic_failure_cut_absent(&self) -> bool { !self.integrity_read.semantic_detail_closed }
+        fn integrity_read_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            let r = &self.integrity_read;
+            if matches!(r.stage, IntegrityStage::Dormant | IntegrityStage::Stopped) { return None; }
+            if r.ignored.is_some() { return Some(LifecycleAction::DiscardIntegrityOwnedCleanup); }
+            // A real already-returned owned Result may still be outside this
+            // loan. Terminal cannot infer its absence from the raw status.
+            if r.need_cleanup.is_some() { return Some(LifecycleAction::RetainIntegrityOwnedCleanup); }
+            if r.phase == IntegrityPhase::NeedRaw { return Some(LifecycleAction::RetainIntegrityRaw); }
+            if r.detail_started && !r.detail_returned { return Some(LifecycleAction::AwaitIntegrityDetailReturn); }
+            if r.partial_live && !r.partial_returned { return Some(LifecycleAction::AwaitIntegrityPartialReturn); }
+            let interrupted = work.terminal().is_some() || physical.primary.is_some();
+            if r.detail_started && r.detail_returned {
+                return Some(if interrupted { LifecycleAction::DiscardIntegrityOwnedDetail } else { LifecycleAction::WrapIntegrityDetail });
+            }
+            if r.stage == IntegrityStage::Ready && !interrupted { return Some(LifecycleAction::IntegrityPrefixReached); }
+            if r.phase == IntegrityPhase::AwaitWhole { return Some(LifecycleAction::AwaitIntegrityWholeReturn); }
+            if r.raw.is_some() && r.returned[r.query.index()] != IntegrityReturn::Unknown {
+                return Some(if interrupted { LifecycleAction::DiscardIntegrityRaw } else { LifecycleAction::WrapIntegrityRaw });
+            }
+            if interrupted || r.stage == IntegrityStage::Drain {
+                if let Some(state) = self.statements[1].live() {
+                    return Some(if state.cursor != CursorPhase::NoCursor && matches!(state.reset, CodeSlot::NotCalled) {
+                        LifecycleAction::ResetIntegrityRead
+                    } else { LifecycleAction::FinalizeIntegrityRead });
+                }
+                // The first completed Vec was declared after the first
+                // Statement: failed outer scope drops it before that VM.
+                if r.vector_live && (interrupted || r.failed) { return Some(LifecycleAction::DiscardIntegrityOwnedVector); }
+                if let Some(state) = self.statements[0].live() {
+                    return Some(if state.cursor != CursorPhase::NoCursor && matches!(state.reset, CodeSlot::NotCalled) {
+                        LifecycleAction::ResetIntegrityRead
+                    } else { LifecycleAction::FinalizeIntegrityRead });
+                }
+                if r.partial_live { return Some(LifecycleAction::DiscardIntegrityPartial); }
+                if !matches!(r.prepare[r.query.index()], CodeSlot::NotCalled)
+                    && r.returned[r.query.index()] == IntegrityReturn::Unknown
+                    && self.integrity_semantic_failure_cut_absent() {
+                    return Some(LifecycleAction::AwaitIntegrityWholeReturn);
+                }
+                if r.capture_started && r.capture_returned == IntegrityReturn::Unknown { return Some(LifecycleAction::AwaitIntegrityCaptureReturn); }
+                return Some(LifecycleAction::StopIntegrityRead);
+            }
+            Some(match r.phase {
+                IntegrityPhase::Prepare => LifecycleAction::PrepareIntegrityRead,
+                IntegrityPhase::Bind => LifecycleAction::BindIntegrityEmpty,
+                IntegrityPhase::Step => LifecycleAction::StepIntegrityRead,
+                IntegrityPhase::Type => LifecycleAction::IntegrityColumnType,
+                IntegrityPhase::Text => LifecycleAction::IntegrityText,
+                IntegrityPhase::RowReturn => LifecycleAction::AwaitIntegrityRowReturn,
+                IntegrityPhase::Reset => LifecycleAction::ResetIntegrityRead,
+                IntegrityPhase::AwaitWhole => LifecycleAction::AwaitIntegrityWholeReturn,
+                IntegrityPhase::Compare => LifecycleAction::CheckIntegritySemantic,
+                IntegrityPhase::NeedDetail => LifecycleAction::RetainIntegrityDetail,
+                IntegrityPhase::NeedRaw => LifecycleAction::RetainIntegrityRaw,
+                IntegrityPhase::Wrap => LifecycleAction::WrapIntegrityRaw,
+                IntegrityPhase::Drain => LifecycleAction::StopIntegrityRead,
+            })
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalIntegrityReadLoan<'a> {
+        fields: OriginalOwnerFields<'a>,
+        prefix: &'a mut super::super::super::FinancialIntegrityReadState,
+    }
+    struct OriginalIntegrityPort<'s, 'a, 'r> {
+        loan: &'s mut OriginalIntegrityReadLoan<'a>,
+        query: IntegrityQuery,
+        _rules: &'r SelectedOriginalNativeRules,
+    }
+    struct OriginalIntegrityDetailPort<'short, 'a> { loan: &'short mut OriginalIntegrityReadLoan<'a> }
+    struct OriginalIntegrityTextLoan<'bytes, 'short, 'a> {
+        loan: &'short mut OriginalIntegrityReadLoan<'a>,
+        text: &'bytes str,
+    }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_integrity_read(&mut self) -> bool {
+            let n = &mut self.native;
+            if self.work.terminal().is_some() || self.physical.primary.is_some()
+                || !matches!(n.tx.phase, TxPhase::Active) || !n.physical_initial_prefix_ready()
+                || n.integrity_read.stage != IntegrityStage::Dormant { return false; }
+            // Preserve all seven consumed A01/A02 ledgers and their real G
+            // fields, but only the newly selected fixed unit owns continuation.
+            n.initial_read.stage = InitialStage::Stopped;
+            n.integrity_read.stage = IntegrityStage::Check;
+            n.statements[0] = StmtSlot::Vacant;
+            n.statements[1] = StmtSlot::Vacant;
+            true
+        }
+    }
+    impl NativeOriginalOwner {
+        fn physical_initial_prefix_ready(&self) -> bool {
+            self.initial_read.context == InitialContext::Valid && self.initial_read.stage == InitialStage::Reached
+                && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
+                && self.initial_read.consumed.iter().all(Option::is_some)
+                && self.statements.iter().all(|s| s.live().is_none())
+                && self.original.phase() == Some(ConnectionPhase::Configured)
+        }
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn integrity_read(self, prefix: &'a mut super::super::super::FinancialIntegrityReadState) -> OriginalIntegrityReadLoan<'a> {
+            OriginalIntegrityReadLoan { fields: self, prefix }
+        }
+    }
+    impl<'a> OriginalIntegrityReadLoan<'a> {
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.integrity_read_action(&self.fields.work, self.fields.physical) }
+        fn port<'s, 'r>(&'s mut self, query: IntegrityQuery, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalIntegrityPort<'s, 'a, 'r>, ProtocolFault> {
+            if self.fields.native.integrity_read.query != query { return Err(ProtocolFault::UnexpectedObservation); }
+            Ok(OriginalIntegrityPort { loan: self, query, _rules: rules })
+        }
+        fn drain_index(&self) -> Result<usize, ProtocolFault> {
+            for i in [1, 0] { if self.fields.native.statements[i].live().is_some() { return Ok(i); } }
+            Err(ProtocolFault::ResourceNotInstalled)
+        }
+        fn adverse(&mut self, query: IntegrityQuery, code: i32) {
+            if code == rusqlite::ffi::SQLITE_OK { return; }
+            let make = || FixedAdverse { role: Role::Original, action: query.action(), ordinal: query.index(), code };
+            if self.fields.native.secondary.is_none() { self.fields.native.secondary = Some(make()); }
+            if self.fields.release.first_secondary.is_none() { self.fields.release.first_secondary = Some(make()); }
+        }
+        fn observe_prepare(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareIntegrityRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let query = self.fields.native.integrity_read.query;
+            let slot = &self.fields.native.statements[query.index()];
+            if code == rusqlite::ffi::SQLITE_OK {
+                let state = slot.live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                if state.role != Role::Original || state.action != query.action() || state.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            } else if slot.live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            record_once(&mut r.prepare[query.index()], code)?; r.capture_started = true;
+            r.phase = if code == rusqlite::ffi::SQLITE_OK { IntegrityPhase::Bind } else { IntegrityPhase::NeedRaw };
+            r.raw_cut = IntegrityErrorCut::Prepare;
+            if code != rusqlite::ffi::SQLITE_OK { r.failed = true; self.adverse(query, code); }
+            Ok(())
+        }
+        fn observe_empty_query(&mut self, fact: IntegrityReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BindIntegrityEmpty) || !matches!(fact, IntegrityReturn::Ok | IntegrityReturn::Error) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            if fact == IntegrityReturn::Ok {
+                r.rows_started[r.query.index()] = true; r.phase = IntegrityPhase::Step;
+                self.fields.native.statements[r.query.index()].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?.cursor = CursorPhase::Active;
+            } else { r.failed = true; r.raw_cut = IntegrityErrorCut::Query; r.phase = IntegrityPhase::NeedRaw; }
+            Ok(())
+        }
+        fn observe_step(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StepIntegrityRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            let state = self.fields.native.statements[r.query.index()].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            // Multiple next calls are phase-bound, not a repeated observation
+            // of one call; only the latest raw status remains in StmtState.
+            state.step = CodeSlot::Called(code);
+            state.cursor = if code == rusqlite::ffi::SQLITE_DONE { CursorPhase::Ended } else { CursorPhase::Active };
+            match code {
+                rusqlite::ffi::SQLITE_ROW => r.phase = if r.query == IntegrityQuery::Check { IntegrityPhase::Type } else { IntegrityPhase::RowReturn },
+                rusqlite::ffi::SQLITE_DONE => { r.eof[r.query.index()] = true; r.phase = IntegrityPhase::Reset; }
+                _ => { r.failed = true; r.raw_cut = IntegrityErrorCut::Read; r.phase = IntegrityPhase::NeedRaw; }
+            }
+            let query = r.query;
+            if code != rusqlite::ffi::SQLITE_ROW && code != rusqlite::ffi::SQLITE_DONE { self.adverse(query, code); }
+            Ok(())
+        }
+        fn observe_column_type(&mut self, native_type: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::IntegrityColumnType) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            if native_type == rusqlite::ffi::SQLITE_TEXT { r.phase = IntegrityPhase::Text; }
+            else { r.failed = true; r.raw_cut = IntegrityErrorCut::Read; r.phase = IntegrityPhase::NeedRaw; }
+            Ok(())
+        }
+        fn text<'bytes, 'short>(&'short mut self, bytes: &'bytes [u8]) -> Result<OriginalIntegrityTextLoan<'bytes, 'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::IntegrityText) { return Err(ProtocolFault::UnexpectedObservation); }
+            let text = match std::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => { let r = &mut self.fields.native.integrity_read; r.failed = true; r.raw_cut = IntegrityErrorCut::Read; r.phase = IntegrityPhase::NeedRaw; return Err(ProtocolFault::UnexpectedObservation); }
+            };
+            Ok(OriginalIntegrityTextLoan { loan: self, text })
+        }
+        fn observe_row_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityRowReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            let i = r.query.index();
+            r.rows[i] = r.rows[i].checked_add(1).ok_or(ProtocolFault::UnexpectedObservation)?;
+            if r.query == IntegrityQuery::Check { r.first_all_ok &= r.pending_text_ok; r.phase = IntegrityPhase::Step; }
+            else if let Some(count) = self.prefix.foreign_key_violations.checked_add(1) {
+                self.prefix.foreign_key_violations = count; r.phase = IntegrityPhase::Step;
+            } else { self.prefix.fault = Some(super::super::super::FinancialIntegrityFault::ForeignOverflow); r.phase = IntegrityPhase::NeedDetail; r.failed = true; }
+            Ok(())
+        }
+        fn retain_existing_raw(&mut self, raw: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.next() != Some(LifecycleAction::RetainIntegrityRaw) || self.fields.native.integrity_read.raw.is_some() { return Err(raw); }
+            let r = &mut self.fields.native.integrity_read;
+            r.raw = Some(raw);
+            r.phase = if r.rows_started[r.query.index()] && self.fields.native.statements[r.query.index()].live().is_some_and(|s| matches!(s.reset, CodeSlot::NotCalled)) {
+                IntegrityPhase::Reset
+            } else { IntegrityPhase::AwaitWhole };
+            Ok(())
+        }
+        fn observe_reset(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ResetIntegrityRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let i = self.drain_index()?;
+            let query = if i == 0 { IntegrityQuery::Check } else { IntegrityQuery::Foreign };
+            let state = self.fields.native.statements[i].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.reset, code)?; state.cursor = CursorPhase::NoCursor;
+            let r = &mut self.fields.native.integrity_read;
+            if interrupted {
+                r.failed = true; r.phase = IntegrityPhase::Drain; r.stage = IntegrityStage::Drain;
+                // A normal primary stops work, but does not consume the
+                // independent owned ignored Result returned by Rows::reset.
+                if code != rusqlite::ffi::SQLITE_OK && self.fields.work.terminal().is_none() {
+                    r.need_cleanup = Some((query, IntegrityCleanup::Reset));
+                }
+            } else if code != rusqlite::ffi::SQLITE_OK && r.eof[i] && r.raw.is_none() {
+                r.failed = true; r.raw_cut = IntegrityErrorCut::Read; r.phase = IntegrityPhase::NeedRaw;
+            } else {
+                r.phase = IntegrityPhase::AwaitWhole;
+                if code != rusqlite::ffi::SQLITE_OK { r.need_cleanup = Some((query, IntegrityCleanup::Reset)); }
+            }
+            self.adverse(query, code); Ok(())
+        }
+        fn retain_whole_error_return(&mut self, fact: IntegrityReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityWholeReturn) || !matches!(fact, IntegrityReturn::Error | IntegrityReturn::Interrupted) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.integrity_read;
+            if r.returned[r.query.index()] != IntegrityReturn::Unknown { return Err(ProtocolFault::RepeatedObservation); }
+            if fact == IntegrityReturn::Error && r.raw.is_none() { return Err(ProtocolFault::UnexpectedObservation); }
+            if fact == IntegrityReturn::Interrupted && (!interrupted || (r.eof[r.query.index()] && r.raw.is_none())) { return Err(ProtocolFault::UnexpectedObservation); }
+            r.returned[r.query.index()] = fact; r.failed = true;
+            r.phase = if r.raw.is_some() { IntegrityPhase::Wrap } else { IntegrityPhase::Drain };
+            if r.phase == IntegrityPhase::Drain { r.stage = IntegrityStage::Drain; }
+            Ok(())
+        }
+        fn retain_owned_whole_collection(&mut self, rows: Vec<String>) -> Result<(), Vec<String>> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityWholeReturn) { return Err(rows); }
+            let r = &mut self.fields.native.integrity_read;
+            if r.query != IntegrityQuery::Check || r.returned[0] != IntegrityReturn::Unknown || !r.eof[0]
+                || r.raw.is_some() || self.prefix.integrity_rows.is_some()
+                || rows.len() != r.rows[0] || rows.iter().all(|s| s == "ok") != r.first_all_ok { return Err(rows); }
+            // This moves the real whole collection; it neither reconstructs
+            // collect nor infers capacity/payment from scalar ROW facts.
+            self.prefix.integrity_rows = Some(rows); r.vector_live = true;
+            r.returned[0] = IntegrityReturn::Ok; r.phase = IntegrityPhase::Compare; Ok(())
+        }
+        fn retain_foreign_eof_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityWholeReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            if r.query != IntegrityQuery::Foreign || r.returned[1] != IntegrityReturn::Unknown || !r.eof[1] || r.raw.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            r.returned[1] = IntegrityReturn::Ok; r.phase = IntegrityPhase::Compare; Ok(())
+        }
+        fn check_semantic(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::CheckIntegritySemantic) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            if r.query == IntegrityQuery::Check {
+                let rows = self.prefix.integrity_rows.as_ref().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                if rows.as_slice() != ["ok"] { self.prefix.fault = Some(super::super::super::FinancialIntegrityFault::IntegrityRows); r.failed = true; r.phase = IntegrityPhase::NeedDetail; }
+                else { r.query = IntegrityQuery::Foreign; r.stage = IntegrityStage::Foreign; r.phase = IntegrityPhase::Prepare; }
+            } else if self.prefix.foreign_key_violations != 0 {
+                self.prefix.fault = Some(super::super::super::FinancialIntegrityFault::ForeignNonzero); r.failed = true; r.phase = IntegrityPhase::NeedDetail;
+            } else { r.stage = IntegrityStage::Drain; r.phase = IntegrityPhase::Drain; }
+            Ok(())
+        }
+        fn wrap_existing_raw(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::WrapIntegrityRaw) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            let raw = r.raw.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let query = if r.query == IntegrityQuery::Check { super::super::super::FinancialIntegrityQuery::Check } else { super::super::super::FinancialIntegrityQuery::Foreign };
+            let cut = match r.raw_cut { IntegrityErrorCut::Prepare => super::super::super::FinancialIntegrityErrorCut::Prepare,
+                IntegrityErrorCut::Query => super::super::super::FinancialIntegrityErrorCut::Query, IntegrityErrorCut::Read => super::super::super::FinancialIntegrityErrorCut::Read };
+            self.fields.physical.primary = Some(super::super::super::retain_integrity_driver_error(query, cut, raw));
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            r.stage = IntegrityStage::Drain; r.phase = IntegrityPhase::Drain; Ok(())
+        }
+        fn detail_port<'short>(&'short mut self) -> Result<OriginalIntegrityDetailPort<'short, 'a>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::RetainIntegrityDetail) || self.prefix.fault.is_none() { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read; r.detail_started = true; r.detail_returned = false;
+            Ok(OriginalIntegrityDetailPort { loan: self })
+        }
+        fn retain_existing_detail(&mut self, detail: String) -> Result<(), String> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityDetailReturn) || self.prefix.paid_detail.is_some() { return Err(detail); }
+            self.prefix.paid_detail = Some(detail); self.fields.native.integrity_read.detail_returned = true; Ok(())
+        }
+        fn wrap_paid_detail(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::WrapIntegrityDetail) { return Err(ProtocolFault::UnexpectedObservation); }
+            let detail = self.prefix.paid_detail.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            self.fields.physical.primary = Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }));
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            let r = &mut self.fields.native.integrity_read; r.failed = true; r.detail_started = false;
+            r.semantic_detail_closed = true; r.stage = IntegrityStage::Drain; r.phase = IntegrityPhase::Drain; Ok(())
+        }
+        fn discard_paid_detail(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIntegrityOwnedDetail) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.prefix.paid_detail.take()); let r = &mut self.fields.native.integrity_read;
+            r.detail_started = false; r.semantic_detail_closed = true; r.failed = true;
+            r.stage = IntegrityStage::Drain; r.phase = IntegrityPhase::Drain; Ok(())
+        }
+        fn observe_finalize(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FinalizeIntegrityRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let i = self.drain_index()?;
+            let query = if i == 0 { IntegrityQuery::Check } else { IntegrityQuery::Foreign };
+            let mut state = *self.fields.native.statements[i].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            if state.cursor != CursorPhase::NoCursor { return Err(ProtocolFault::UnexpectedObservation); }
+            record_once(&mut state.finalize, code)?;
+            self.fields.native.statements[i] = StmtSlot::Finalized(state);
+            let r = &mut self.fields.native.integrity_read; r.consumed[i] = Some(state);
+            if code != rusqlite::ffi::SQLITE_OK && self.fields.work.terminal().is_none() { r.need_cleanup = Some((query, IntegrityCleanup::Finalize)); }
+            r.phase = IntegrityPhase::Drain;
+            self.adverse(query, code); Ok(())
+        }
+        fn retain_existing_cleanup(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.next() != Some(LifecycleAction::RetainIntegrityOwnedCleanup) || self.fields.native.integrity_read.ignored.is_some() { return Err(error); }
+            self.fields.native.integrity_read.ignored = Some(error); Ok(())
+        }
+        fn discard_owned_cleanup(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIntegrityOwnedCleanup) { return Err(ProtocolFault::UnexpectedObservation); }
+            let primary_drain = self.fields.work.terminal().is_none() && self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.integrity_read;
+            drop(r.ignored.take());
+            let (_, kind) = r.need_cleanup.take().ok_or(ProtocolFault::UnexpectedObservation)?;
+            r.phase = if kind == IntegrityCleanup::Reset && !primary_drain { IntegrityPhase::AwaitWhole } else { IntegrityPhase::Drain }; Ok(())
+        }
+        fn discard_raw(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIntegrityRaw) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            drop(r.raw.take()); r.stage = IntegrityStage::Drain; r.phase = IntegrityPhase::Drain; Ok(())
+        }
+        fn retain_partial_owned(&mut self, row: Option<String>, rows: Option<Vec<String>>) -> Result<(), (Option<String>, Option<Vec<String>>)> {
+            let r = &mut self.fields.native.integrity_read;
+            if matches!(r.stage, IntegrityStage::Dormant | IntegrityStage::Ready | IntegrityStage::Stopped)
+                || r.capture_returned != IntegrityReturn::Unknown || r.partial_live || (row.is_none() && rows.is_none())
+                || (!r.failed && self.fields.work.terminal().is_none() && self.fields.physical.primary.is_none()) { return Err((row, rows)); }
+            self.prefix.partial_row = row; self.prefix.partial_rows = rows; r.partial_live = true; r.partial_returned = false; Ok(())
+        }
+        fn observe_partial_owner_return(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityPartialReturn) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Independent Source ownership return, never derived from ROW,
+            // reset/finalize, capacity or the outer collect Error marker.
+            self.fields.native.integrity_read.partial_returned = true; Ok(())
+        }
+        fn discard_vector(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIntegrityOwnedVector) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.prefix.integrity_rows.take()); self.fields.native.integrity_read.vector_live = false; Ok(())
+        }
+        fn discard_partial(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardIntegrityPartial) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.prefix.partial_row.take()); drop(self.prefix.partial_rows.take());
+            self.fields.native.integrity_read.partial_live = false; Ok(())
+        }
+        fn retain_capture_return(&mut self, fact: IntegrityReturn) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitIntegrityCaptureReturn)
+                || !matches!(fact, IntegrityReturn::Ok | IntegrityReturn::Error | IntegrityReturn::Interrupted) { return Err(ProtocolFault::UnexpectedObservation); }
+            let interrupted = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.integrity_read;
+            if r.capture_returned != IntegrityReturn::Unknown { return Err(ProtocolFault::RepeatedObservation); }
+            if fact == IntegrityReturn::Ok {
+                if r.failed || r.returned != [IntegrityReturn::Ok; 2] || !self.prefix.integrity_rows.as_ref().is_some_and(|rows| rows.as_slice() == ["ok"]) {
+                    return Err(ProtocolFault::UnexpectedObservation);
+                }
+                if self.prefix.foreign_key_violations != 0 { return Err(ProtocolFault::UnexpectedObservation); }
+            } else if !r.failed && !interrupted { return Err(ProtocolFault::UnexpectedObservation); }
+            r.capture_returned = fact; Ok(())
+        }
+        fn stop_or_reach(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StopIntegrityRead) || self.fields.native.statements.iter().any(|s| s.live().is_some()) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.integrity_read;
+            r.stage = if r.failed || self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some() { IntegrityStage::Stopped } else { IntegrityStage::Ready };
+            Ok(())
+        }
+    }
+    impl OriginalIntegrityDetailPort<'_, '_> {
+        fn retain(self, detail: String) {
+            // Preflight holds the exclusive Work/physical/frame loan. The
+            // acquired owned return moves before any further gate or Drop.
+            self.loan.prefix.paid_detail = Some(detail);
+            self.loan.fields.native.integrity_read.detail_returned = true;
+        }
+        // Dropping an unconsumed short port leaves its independent return
+        // Unknown; terminal cannot erase this owed owned-result cut.
+    }
+    impl OriginalIntegrityTextLoan<'_, '_, '_> {
+        fn observe_owned_string_return(self) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::IntegrityText) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Actual typed String return fact only. The String remains with
+            // its actual collect owner until the whole Result returns it.
+            let r = &mut self.loan.fields.native.integrity_read;
+            r.pending_text_ok = self.text == "ok"; r.phase = IntegrityPhase::RowReturn; Ok(())
+        }
+    }
+    impl<'a> OriginalIntegrityPort<'_, 'a, '_> {
+        fn sql(&self) -> &'static str { self.query.sql() }
+        fn prepare(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_prepare(code) }
+        fn empty_query(&mut self, fact: IntegrityReturn) -> Result<(), ProtocolFault> { self.loan.observe_empty_query(fact) }
+        fn step(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_step(code) }
+        fn column_type(&mut self, kind: i32) -> Result<(), ProtocolFault> { self.loan.observe_column_type(kind) }
+        fn text<'bytes, 'short>(&'short mut self, bytes: &'bytes [u8]) -> Result<OriginalIntegrityTextLoan<'bytes, 'short, 'a>, ProtocolFault> { self.loan.text(bytes) }
+        fn row_return(&mut self) -> Result<(), ProtocolFault> { self.loan.observe_row_return() }
+        fn owned_raw(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_existing_raw(error) }
+        fn reset(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_reset(code) }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_finalize(code) }
+        fn owned_cleanup(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_existing_cleanup(error) }
+        fn whole_collection(&mut self, rows: Vec<String>) -> Result<(), Vec<String>> { self.loan.retain_owned_whole_collection(rows) }
+        fn whole_error(&mut self, fact: IntegrityReturn) -> Result<(), ProtocolFault> { self.loan.retain_whole_error_return(fact) }
+        fn foreign_eof(&mut self) -> Result<(), ProtocolFault> { self.loan.retain_foreign_eof_return() }
+        fn partial_owner_return(&mut self) -> Result<(), ProtocolFault> { self.loan.observe_partial_owner_return() }
+    }
+    #[cfg(test)]
+    impl OriginalIntegrityReadLoan<'_> {
+        fn test_code_barrier(&mut self) {
+            let before = self.fields.work.test_code_observation();
+            let expected = self.next().expect("fixed integrity scope remains pending");
+            assert_eq!(self.fields.native.transaction_action(&self.fields.work, self.fields.physical), Some(expected));
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
+            let mut acquire = self.fields.reborrow().original_acquisition();
+            assert_eq!(acquire.constructor().next(), expected);
+            assert_eq!(acquire.a00_epilogue().next(), expected);
+            assert_eq!(acquire.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert!(matches!(acquire.settle(), AcquisitionSettlement::Held(_)));
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        fn test_code_prepare_only(&mut self) {
+            let query = self.fields.native.integrity_read.query;
+            assert_eq!(query.sql(), if query == IntegrityQuery::Check { "PRAGMA integrity_check" } else { "PRAGMA foreign_key_check" });
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::ResourceNotInstalled));
+            self.fields.native.statements[query.index()] = StmtSlot::ProtocolHeld(StmtState { role: Role::Reference, action: query.action(), ..protocol_stmt_state() });
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            self.fields.native.statements[query.index()] = StmtSlot::ProtocolHeld(StmtState { action: FixedAction::SourceId, ..protocol_stmt_state() });
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            self.fields.native.statements[query.index()] = StmtSlot::ProtocolHeld(StmtState { action: query.action(), ..protocol_stmt_state() });
+            self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+        }
+        fn test_code_prepare_query(&mut self) {
+            self.test_code_prepare_only(); self.observe_empty_query(IntegrityReturn::Ok).unwrap();
+        }
+        fn test_code_check_row(&mut self, text: &str) {
+            self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+            assert_eq!(self.observe_step(rusqlite::ffi::SQLITE_DONE), Err(ProtocolFault::UnexpectedObservation));
+            self.observe_column_type(rusqlite::ffi::SQLITE_TEXT).unwrap();
+            { let _short = self.text(text.as_bytes()).unwrap(); }
+            assert_eq!(self.next(), Some(LifecycleAction::IntegrityText));
+            self.text(text.as_bytes()).unwrap().observe_owned_string_return().unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityRowReturn));
+            self.observe_row_return().unwrap();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_whole_check(&mut self, rows: Vec<String>) -> bool {
+            let before = self.fields.work.test_code_observation();
+            self.test_code_barrier(); self.test_code_prepare_query();
+            for text in &rows { self.test_code_check_row(text); }
+            let premature = Vec::new();
+            assert!(self.retain_owned_whole_collection(premature).is_err());
+            self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn));
+            assert!(self.prefix.integrity_rows.is_none()); self.test_code_barrier();
+            assert_eq!(self.retain_whole_error_return(IntegrityReturn::Error), Err(ProtocolFault::UnexpectedObservation));
+            let vector = rows.as_ptr(); let child = rows.first().map(|s| s.as_ptr());
+            self.retain_owned_whole_collection(rows).unwrap_or_else(|_| panic!("actual supplied whole Vec moves once"));
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().first().map(|s| s.as_ptr()), child);
+            assert!(self.retain_owned_whole_collection(Vec::new()).is_err());
+            assert!(self.fields.native.statements[0].live().is_some());
+            self.check_semantic().unwrap(); assert_eq!(self.fields.work.test_code_observation(), before);
+            self.next() == Some(LifecycleAction::PrepareIntegrityRead)
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_foreign_rows(&mut self, rows: usize, overflow: bool) {
+            let vector = self.prefix.integrity_rows.as_ref().unwrap().as_ptr();
+            assert!(self.fields.native.statements[0].live().is_some()); self.test_code_prepare_query();
+            assert!(self.fields.native.statements[0].live().is_some());
+            if overflow { self.prefix.foreign_key_violations = i64::MAX; } // Fixed scalar boundary protocol, not 2^63 actual SQL rows.
+            for _ in 0..rows {
+                self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+                assert_eq!(self.observe_column_type(rusqlite::ffi::SQLITE_TEXT), Err(ProtocolFault::UnexpectedObservation));
+                self.observe_row_return().unwrap();
+                if overflow { assert_eq!(self.next(), Some(LifecycleAction::RetainIntegrityDetail)); break; }
+            }
+            if !overflow {
+                self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+                assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn)); self.test_code_barrier();
+                assert_eq!(self.retain_capture_return(IntegrityReturn::Ok), Err(ProtocolFault::UnexpectedObservation));
+                self.retain_foreign_eof_return().unwrap(); self.check_semantic().unwrap();
+            }
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert!(self.fields.native.statements[0].live().is_some());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_paid_semantic_error(&mut self, detail: String) {
+            let pointer = detail.as_ptr();
+            self.detail_port().unwrap().retain(detail);
+            self.wrap_paid_detail().unwrap(); assert!(self.wrap_paid_detail().is_err());
+            let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &self.fields.physical.primary else { panic!("fixed semantic category"); };
+            assert_eq!(detail.as_ptr(), pointer);
+            assert!(self.fields.native.statements[0].live().is_some());
+            assert!(self.check_semantic().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_driver_error(&mut self, case: super::super::super::FinancialIntegrityErrorCase,
+            raw: rusqlite::Error, cleanup: rusqlite::Error) {
+            use super::super::super::FinancialIntegrityErrorCase as Case;
+            let foreign = matches!(case, Case::ForeignPrepare | Case::ForeignQuery | Case::ForeignStep);
+            if foreign { assert!(self.test_code_whole_check(vec![String::from("ok")])); }
+            if matches!(case, Case::Prepare | Case::ForeignPrepare) {
+                self.observe_prepare(rusqlite::ffi::SQLITE_ERROR).unwrap();
+            } else {
+                self.test_code_prepare_only();
+                if matches!(case, Case::Query | Case::ForeignQuery) {
+                    // This is the first empty-query Result, never a rewind of
+                    // an already-observed successful call or active cursor.
+                    self.observe_empty_query(IntegrityReturn::Error).unwrap();
+                } else {
+                    self.observe_empty_query(IntegrityReturn::Ok).unwrap();
+                    if matches!(case, Case::WrongType | Case::WrongNull | Case::WrongReal | Case::WrongBlob | Case::InvalidUtf8) {
+                        self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+                        if matches!(case, Case::InvalidUtf8) {
+                            self.observe_column_type(rusqlite::ffi::SQLITE_TEXT).unwrap(); assert!(self.text(&[0xff]).is_err());
+                        } else {
+                            let kind = match case { Case::WrongNull => rusqlite::ffi::SQLITE_NULL,
+                                Case::WrongReal => rusqlite::ffi::SQLITE_FLOAT, Case::WrongBlob => rusqlite::ffi::SQLITE_BLOB,
+                                _ => rusqlite::ffi::SQLITE_INTEGER };
+                            self.observe_column_type(kind).unwrap();
+                        }
+                    } else if matches!(case, Case::DoneReset) {
+                        self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                    } else { self.observe_step(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+                }
+            }
+            self.retain_existing_raw(raw).unwrap_or_else(|_| panic!("actual owned driver child before remaining scopes"));
+            if self.next() == Some(LifecycleAction::ResetIntegrityRead) {
+                self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                assert_eq!(self.next(), Some(LifecycleAction::RetainIntegrityOwnedCleanup));
+                self.retain_existing_cleanup(cleanup).unwrap_or_else(|_| panic!("actual ignored reset Result owned once"));
+                { let _short = self.fields.reborrow(); }
+                self.test_code_barrier(); self.discard_owned_cleanup().unwrap();
+                assert!(self.discard_owned_cleanup().is_err());
+            } else { drop(cleanup); }
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn));
+            self.test_code_barrier(); assert!(self.fields.physical.primary.is_none());
+            assert!(self.retain_owned_whole_collection(Vec::new()).is_err());
+            self.retain_whole_error_return(IntegrityReturn::Error).unwrap();
+            assert!(self.retain_whole_error_return(IntegrityReturn::Error).is_err());
+            self.wrap_existing_raw().unwrap();
+            assert!(self.wrap_existing_raw().is_err());
+            if !matches!(case, Case::Prepare) { assert!(self.fields.native.statements[0].live().is_some()); }
+            self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_failed_scope(&mut self, cleanup: rusqlite::Error) {
+            let before = self.fields.work.test_code_observation();
+            let mut cleanup = Some(cleanup);
+            if self.next() == Some(LifecycleAction::ResetIntegrityRead) { self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); }
+            if self.fields.native.statements[1].live().is_some() {
+                assert_eq!(self.next(), Some(LifecycleAction::FinalizeIntegrityRead));
+                let vector = self.prefix.integrity_rows.as_ref().map(|v| v.as_ptr());
+                self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+                assert_eq!(self.prefix.integrity_rows.as_ref().map(|v| v.as_ptr()), vector);
+                assert!(self.fields.native.statements[0].live().is_some());
+            }
+            if self.prefix.integrity_rows.is_some() {
+                assert_eq!(self.next(), Some(LifecycleAction::DiscardIntegrityOwnedVector));
+                assert!(self.fields.native.statements[0].live().is_some());
+                self.discard_vector().unwrap(); assert!(self.prefix.integrity_rows.is_none());
+                assert!(self.discard_vector().is_err());
+            }
+            if self.fields.native.statements[0].live().is_some() {
+                assert_eq!(self.next(), Some(LifecycleAction::FinalizeIntegrityRead));
+                self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                self.test_code_barrier();
+                self.retain_existing_cleanup(cleanup.take().unwrap()).unwrap_or_else(|_| panic!("owned finalize Result persists after VM consumption"));
+                self.test_code_barrier(); self.discard_owned_cleanup().unwrap();
+            }
+            drop(cleanup);
+            assert!(self.fields.native.statements.iter().all(|s| s.live().is_none()));
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityCaptureReturn)); self.test_code_barrier();
+            assert_eq!(self.retain_capture_return(IntegrityReturn::Ok), Err(ProtocolFault::UnexpectedObservation));
+            self.retain_capture_return(IntegrityReturn::Error).unwrap();
+            assert!(self.retain_capture_return(IntegrityReturn::Error).is_err());
+            self.stop_or_reach().unwrap(); assert!(self.stop_or_reach().is_err());
+            assert_eq!(self.fields.native.integrity_read.stage, IntegrityStage::Stopped);
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_success(&mut self) {
+            let vector = self.prefix.integrity_rows.as_ref().unwrap().as_ptr();
+            self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert!(self.fields.native.statements[0].live().is_some());
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityCaptureReturn)); self.test_code_barrier();
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert!(self.discard_vector().is_err());
+            assert_eq!(self.retain_capture_return(IntegrityReturn::Error), Err(ProtocolFault::UnexpectedObservation));
+            self.retain_capture_return(IntegrityReturn::Ok).unwrap(); self.stop_or_reach().unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::IntegrityPrefixReached)); self.test_code_barrier();
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert!(self.fields.native.integrity_read.consumed.iter().all(Option::is_some));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_interruption_cut(&mut self, cut: super::super::super::FinancialIntegrityTerminalCut,
+            raw: rusqlite::Error, cleanup: rusqlite::Error) {
+            use super::super::super::FinancialIntegrityTerminalCut as Cut;
+            if matches!(cut, Cut::BeforePrepare) { drop(raw); drop(cleanup); return; }
+            if matches!(cut, Cut::CompletedBeforeWhole) {
+                self.test_code_prepare_query(); self.test_code_check_row("ok");
+                self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+                assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn));
+                assert!(self.prefix.integrity_rows.is_none()); drop(raw); drop(cleanup); return;
+            }
+            if matches!(cut, Cut::PaidDetailPending | Cut::OwnedPaidDetail) {
+                assert!(!self.test_code_whole_check(vec![String::from("bad")]));
+                if matches!(cut, Cut::PaidDetailPending) { let _short = self.detail_port().unwrap(); }
+                drop(raw); drop(cleanup); return;
+            }
+            if matches!(cut, Cut::SemanticDetail) {
+                assert!(!self.test_code_whole_check(vec![String::from("bad")]));
+                assert_eq!(self.next(), Some(LifecycleAction::RetainIntegrityDetail)); drop(raw); drop(cleanup); return;
+            }
+            if matches!(cut, Cut::ForeignEofPending) {
+                assert!(self.test_code_whole_check(vec![String::from("ok")])); self.test_code_prepare_query();
+                self.observe_step(rusqlite::ffi::SQLITE_DONE).unwrap(); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+                assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn)); drop(raw); drop(cleanup); return;
+            }
+            if matches!(cut, Cut::AfterVector | Cut::ForeignRow) {
+                assert!(self.test_code_whole_check(vec![String::from("ok")]));
+                if matches!(cut, Cut::ForeignRow) { self.test_code_prepare_query(); self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap(); }
+                drop(raw); drop(cleanup); return;
+            }
+            self.test_code_prepare_query();
+            if matches!(cut, Cut::RowWithPartialOwner) { self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap(); drop(raw); drop(cleanup); }
+            else {
+                self.observe_step(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                self.retain_existing_raw(raw).unwrap_or_else(|_| panic!("actual raw child retained before terminal"));
+                if matches!(cut, Cut::OwnedIgnoredReset) {
+                    self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                    self.retain_existing_cleanup(cleanup).unwrap_or_else(|_| panic!("actual owned ignored Result before terminal"));
+                } else { drop(cleanup); }
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_detail_before_interruption(&mut self, detail: String) {
+            let pointer = detail.as_ptr(); self.detail_port().unwrap().retain(detail);
+            assert_eq!(self.prefix.paid_detail.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(self.next(), Some(LifecycleAction::WrapIntegrityDetail)); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_detail_at_interruption(&mut self, detail: String) {
+            let pointer = detail.as_ptr(); assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityDetailReturn)); self.test_code_barrier();
+            self.retain_existing_detail(detail).unwrap_or_else(|_| panic!("already-owned real formatter return after barrier"));
+            assert_eq!(self.prefix.paid_detail.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardIntegrityOwnedDetail));
+            assert!(self.wrap_paid_detail().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_completed_whole_at_interruption(&mut self, rows: Vec<String>) {
+            assert!(self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn)); self.test_code_barrier();
+            assert_eq!(self.retain_whole_error_return(IntegrityReturn::Interrupted), Err(ProtocolFault::UnexpectedObservation));
+            let pointer = rows.as_ptr(); self.retain_owned_whole_collection(rows).unwrap_or_else(|_| panic!("independent actual whole ownership"));
+            assert_eq!(self.prefix.integrity_rows.as_ref().unwrap().as_ptr(), pointer);
+            assert!(self.check_semantic().is_err()); // first-primary stops fresh FK prepare.
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_foreign_eof_at_interruption(&mut self) {
+            assert!(self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityWholeReturn)); self.test_code_barrier();
+            assert_eq!(self.retain_whole_error_return(IntegrityReturn::Interrupted), Err(ProtocolFault::UnexpectedObservation));
+            self.retain_foreign_eof_return().unwrap(); assert!(self.check_semantic().is_err());
+            assert_eq!(self.fields.native.integrity_read.returned, [IntegrityReturn::Ok; 2]);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_partial_owner(&mut self, row: String, rows: Vec<String>) {
+            let row_pointer = row.as_ptr(); let vector_pointer = rows.as_ptr();
+            self.retain_partial_owned(Some(row), Some(rows)).unwrap_or_else(|_| panic!("actual supplied partial children remain parent owned"));
+            assert_eq!(self.prefix.partial_row.as_ref().unwrap().as_ptr(), row_pointer);
+            assert_eq!(self.prefix.partial_rows.as_ref().unwrap().as_ptr(), vector_pointer);
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitIntegrityPartialReturn)); self.test_code_barrier();
+            assert!(self.observe_step(rusqlite::ffi::SQLITE_DONE).is_err());
+            self.observe_partial_owner_return().unwrap(); assert!(self.observe_partial_owner_return().is_err());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_reset_cleanup(&mut self, cleanup: rusqlite::Error) -> usize {
+            assert!(self.fields.work.terminal().is_none() && self.fields.physical.primary.is_some());
+            let before = self.fields.work.test_code_observation();
+            let returned = self.fields.native.integrity_read.returned;
+            assert_eq!(self.next(), Some(LifecycleAction::ResetIntegrityRead));
+            self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::RetainIntegrityOwnedCleanup));
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.stop_or_reach().is_err()); self.test_code_barrier();
+            let rusqlite::Error::InvalidColumnName(name) = &cleanup else { panic!("actual fixed owned reset Result"); };
+            let allocation = name.as_ptr() as usize;
+            self.retain_existing_cleanup(cleanup).unwrap_or_else(|_| panic!("normal primary retains actual ignored Result"));
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardIntegrityOwnedCleanup));
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.stop_or_reach().is_err()); self.test_code_barrier();
+            assert_eq!(self.fields.native.integrity_read.returned, returned);
+            assert_eq!(self.fields.work.test_code_observation(), before); allocation
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_cleanup_once(&mut self, allocation: usize) {
+            let before = self.fields.work.test_code_observation();
+            let returned = self.fields.native.integrity_read.returned;
+            let Some(rusqlite::Error::InvalidColumnName(name)) = &self.fields.native.integrity_read.ignored else { panic!("same-frame owned cleanup after short loan and move"); };
+            assert_eq!(name.as_ptr() as usize, allocation);
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardIntegrityOwnedCleanup));
+            assert!(self.observe_step(rusqlite::ffi::SQLITE_DONE).is_err());
+            assert!(self.observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.stop_or_reach().is_err()); self.test_code_barrier();
+            self.discard_owned_cleanup().unwrap();
+            assert!(self.fields.native.integrity_read.ignored.is_none() && self.fields.native.integrity_read.need_cleanup.is_none());
+            assert_eq!(self.fields.native.integrity_read.phase, IntegrityPhase::Drain);
+            assert_eq!(self.next(), Some(LifecycleAction::FinalizeIntegrityRead));
+            assert!(self.discard_owned_cleanup().is_err());
+            assert_eq!(self.fields.native.integrity_read.returned, returned);
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_drain_interrupted(&mut self) {
+            let before = self.fields.work.test_code_observation();
+            assert!(self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some());
+            assert!(self.observe_empty_query(IntegrityReturn::Ok).is_err());
+            if self.next() == Some(LifecycleAction::DiscardIntegrityOwnedCleanup) { self.discard_owned_cleanup().unwrap(); }
+            if self.next() == Some(LifecycleAction::DiscardIntegrityOwnedDetail) {
+                self.discard_paid_detail().unwrap(); assert!(self.prefix.paid_detail.is_none()); assert!(self.discard_paid_detail().is_err());
+            }
+            if self.next() == Some(LifecycleAction::AwaitIntegrityWholeReturn) {
+                self.retain_whole_error_return(if self.fields.native.integrity_read.raw.is_some() { IntegrityReturn::Error } else { IntegrityReturn::Interrupted }).unwrap();
+            }
+            if self.next() == Some(LifecycleAction::DiscardIntegrityRaw) { self.discard_raw().unwrap(); }
+            for _ in 0..2 {
+                if self.next() == Some(LifecycleAction::ResetIntegrityRead) { self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+                if self.next() == Some(LifecycleAction::FinalizeIntegrityRead) { self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap(); }
+                if self.next() == Some(LifecycleAction::DiscardIntegrityOwnedVector) {
+                    assert!(self.fields.native.statements[1].live().is_none()); self.discard_vector().unwrap();
+                }
+            }
+            if self.next() == Some(LifecycleAction::DiscardIntegrityPartial) { self.discard_partial().unwrap(); }
+            if self.next() == Some(LifecycleAction::AwaitIntegrityWholeReturn) {
+                self.retain_whole_error_return(if self.fields.native.integrity_read.raw.is_some() { IntegrityReturn::Error } else { IntegrityReturn::Interrupted }).unwrap();
+            }
+            if self.next() == Some(LifecycleAction::DiscardIntegrityRaw) { self.discard_raw().unwrap(); }
+            if self.next() == Some(LifecycleAction::AwaitIntegrityCaptureReturn) { self.test_code_barrier(); self.retain_capture_return(IntegrityReturn::Interrupted).unwrap(); }
+            assert_eq!(self.next(), Some(LifecycleAction::StopIntegrityRead)); self.stop_or_reach().unwrap();
+            assert!(self.fields.native.integrity_read.stopped_clear());
+            assert!(self.prefix.integrity_rows.is_none() && self.prefix.partial_row.is_none() && self.prefix.partial_rows.is_none() && self.prefix.paid_detail.is_none());
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+    }
 }
