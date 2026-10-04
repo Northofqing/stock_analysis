@@ -313,23 +313,27 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 | Tools10固定探测与临时输出隔离 | 6项新增及4项受影响旧检查的有限运行证据审查通过；`a8c2cf24` | 1项最新运行及9项经源码路径核对可复用的历史PASS；不是一次当前全10或全77检查，不证明真实native/provider |
 | 完整922输入的普通录制清单 | 全922输入成员及哈希重新核对，独立数据审查通过；`ad93dbd1` | 完整绑定当前工具和财务历史源码；仍为RecordingOnly，真实新录制及可用pin另办 |
 | bundled SQLite录制配方选择 | 独立数据审查、普通录制失败判定及单独root选择后，全922输入及既有工具/metadata重新绑定；`e360fe21` | 仅选择已有可选RecordingOnly配方，不更改默认应用feature；首轮真实请求录制已失败并保留，未证明provider |
+| psm声明、归档证据隔离及普通清单更新 | 6项新增及10项相关检查的有限证据通过；最终版本2项新运行、其余14项未变路径证据复用，独立源码/数据/运行证据审查通过；`0ac2fa1a` | 精确声明、源/角色/cwd关联及归档隔离；清单仅更新owner身份并切回普通RecordingOnly配方，完整922输入未变；不发行native/provider/pin |
 
 真实构建录制仍须按每次实际结果解读。第九次录制保留失败：EXIT2/109.785秒，159个完整调用和1个request-only；消费者ring rustc在执行前因两条原生静态库声明被拒绝。第十次已结束：EXIT2/123.4秒，190个完整调用和2个request-only；ring消费者已实际编译成功、两条声明及归档前后观察闭合，新的拒绝点是rustversion版本探测和thiserror静态编译探测。第十一次使用`ad93dbd1`的完整清单已结束：EXIT2/160.154秒，201个完整调用和1个request-only；两个新探测已实际执行并保持真实状态，拒绝点变为psm0.1.30的`static=psm_s`声明（FrameworkTemplate）。另行选择`e360fe21`的已有bundled配方后，首轮真实bundled录制已结束：EXIT2/184.163秒，215个完整Rust调用；59个ring及3个psm原生请求被当前SQLite专用入口在底层工具执行前拒绝（FixedPackageContext）。没有clang/AR/SQLite子调用成功或失败证据，SQLite实际调用为零。应用library仍未产出，所有失败原件保留，不回填旧记录，不把声明或请求观察当原生资格。
+
+第十二次普通录制使用`0ac2fa1a`已结束：EXIT2/224.764秒，Cargo101，303个完整调用及2个request-only，应用library仍未产出。psm消费者实际EXIT0、blockers为空，归档前后哈希一致，最终声明图已闭合到RecordingOnly。新的明确拒绝是zstd-sys的`static=zstd`声明（Cargo消息为FrameworkTemplate）；anyhow的nightly编译探测只有请求、没有编译子调用结果，不能把包装拒绝当实际Unsupported。另有serde_core生成private.rs的producer关联和consumed-source无法闭合。当前工具/清单、完整922输入在本轮保持不变，失败原件已保留；这轮不发行可用pin、原生SQLite或provider资格。
 
 当前并行分工和依赖：
 
 - 完整历史Stage3A的15个文件已完成源码与修补审查并由root应用。修补后的40项新增及12项相关回归全部实际通过，独立运行证据审查通过，已保存`25b86600`代码检查点。先后首测暴露fixture空库存指纹及重复收盘输入；失败原件保留，生产校验未放宽。这52项通过不发行profile/provider，也不代表真实SQL接线和完整历史路径已完成。
 - SQLite D1本轮工具修复已完成上述14项验证并保存本地检查点。构建记录工具Tools10已修补rustversion/thiserror两个固定探测；实际cwd关联及失败临时输出的负向隔离问题已通过独立源码审查并由root应用。有限6项新增、4项受影响旧检查的实际结果及未变执行路径已通过独立审查，代码提交`a8c2cf24`。历次fixture失败原件保留，修补仅使目录、删参、只读源码和快照反例实际发生，未放宽生产校验；不声称一次当前10PASS或全77检查。
 - 源SQL台账、owned请求、selection/audit/repository编解码请求图、七种flat Value及native清理隐藏分配的设计已审查。专用raw owner的具体资源持有、R599唯一工作转移、部分资源释放及短fatal借用合同已完成有限审查；枚举tag/union容量公式发现并修正了一项设计问题。上述仍为设计，实际Stage3B/4接线、选定布局/规则、原生provider与完整16MiB成功路径证据尚待。
-- root独占实际源码应用、共享Cargo和真实录制，子任务处理独立证据审查及psm声明的下一有限源码修补。当前922个应用输入已完成全成员和哈希新核对，普通清单已安装并提交`ad93dbd1`；bundled清单经单独root选择后已安装并提交`e360fe21`，两轮录制均已保留失败原件及实际拒绝判定。psm声明的新源码包在独立scratch准备、尚未应用；ring/psm原生请求的严格分派另作有限设计，不能直接放行所有CC/AR命令。尚无真实native/provider或可用pin结论。
+- root独占实际源码应用、共享Cargo和真实录制。psm修补经独立审查后已应用并本地提交`0ac2fa1a`；路径别名、已观察归档哈希丢失、当前输出哈希遗漏和Host/helper cwd来源关联问题已修正，旧77项方法及native17/ring/framework/Tools10实现边界保持不变。清单经单独root选择切回普通诊断配方，仅owner身份/profile两处更新；完整922输入重新核对，独立数据审查通过。第十二次真实录制保留上述失败，下一有限诊断针对zstd声明、anyhow探测和serde生成源关联。ring/psm原生请求的严格分派仍为设计，不能直接放行所有CC/AR命令；尚无真实native/provider或可用pin结论。
 
 尚未完成的整体范围：
 
-1. 完整财务历史回放：Raw15/审计/裁定/Legacy carry/FIFO与prepare→render累计工作、真实SQL及环境/品种身份接线；选定编译来源、布局、规则与原生SQLite最终可执行文件/同进程provider资格。阶段性fixture与当前明确拒绝入口不能作为完整成功。
-2. 目标迁移与恢复：exact6→8增量目标、原全部非空财务历史保全、早期代际映射、整制品批准绑定、原子交换、启动/冷恢复及生产重新资格。
-3. 正式资金和正向F2：真实账户B/allocation/seed/cutover批准、唯一正向intent发行与持久版本、调度和实际Paper消费。只读提案和完整拒绝记录不能代替这些条件。
-4. 真实上游资格：实际SDK/source/provider合同、原生身份、整数价格/数量、时间与有效窗、tick/band/halt/liquidity/lifecycle和同版本RPC事实。
-5. 远端存证：四个实际owner的1830天WORM、签名/账户/地区/密钥与冷恢复Gate P；本地留存组件已实现，外部证据未交付。
-6. 运行和研究验收：52个Unit的同事实shadow、单一物理owner晋级、AI比较、PIT/样本外/成本后检验以及M6/M7后续裁定。至少2个合资格交易日、5个自然日等窗口不能用测试压缩；M8仍按需求或容量证据裁定。
+1. 受控构建与原生SQLite：zstd声明、anyhow探测及serde生成源关联；严格原生CC/AR分派、选定编译来源/布局/规则、SQLite最终可执行文件及同进程provider资格。普通录制中的psm成功不替代这些条件。
+2. 完整财务历史回放：Stage3A核心已实现；真实SQL、审计及环境/品种身份接线，专用资源持有实现及全历史prepare→render累计16MiB路径仍待。阶段性fixture不能作为完整成功。
+3. 目标迁移与恢复：exact6→8增量目标、原全部非空财务历史保全、早期代际映射、整制品批准绑定、原子交换、启动/冷恢复及生产重新资格。
+4. 正式资金和正向F2：真实账户B/allocation/seed/cutover批准、唯一正向intent发行与持久版本、调度和实际Paper消费。只读提案和完整拒绝记录不能代替这些条件。
+5. 真实上游资格：实际SDK/source/provider合同、原生身份、整数价格/数量、时间与有效窗、tick/band/halt/liquidity/lifecycle和同版本RPC事实。
+6. 远端存证：四个实际owner的1830天WORM、签名/账户/地区/密钥与冷恢复Gate P；本地留存组件已实现，外部证据未交付。
+7. 运行和研究验收：52个Unit的同事实shadow、单一物理owner晋级、AI比较、PIT/样本外/成本后检验以及M6/M7后续裁定。至少2个合资格交易日、5个自然日等窗口不能用测试压缩；M8仍按需求或容量证据裁定。
 
 继续沿原设计的Rust分层单体、RPC与单一owner推进。待完成项主要是实现接线和证据闭合；源码开发授权不替代资金批准、外部合同或生产激活。没有部署、重启生产或消息重发；消息链路当前状态不能从本轮开发测试推断，仍应读取带实际观察时间的生产回执。
