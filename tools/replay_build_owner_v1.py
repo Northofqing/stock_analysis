@@ -2700,9 +2700,364 @@ FOREIGN_COMPILE_PSM = ("-Wall", "-Wextra", "-xassembler-with-cpp", "-DCFG_TARGET
     "-DCFG_TARGET_ARCH_x86_64", "-DCFG_TARGET_ENV_")
 
 
+# Closed lz4/zstd context and E-only dispatch from bundled2 raw44; no C/AR authority.
+FOREIGN_E_ONLY_PACKAGES = {'lz4-sys': ('1.11.1+lz4-1.10.0', ('1', '11', '1', ''), (), 'lz4'),
+ 'zstd-sys': ('2.0.16+zstd.1.5.7', ('2', '0', '16', ''), ('legacy', 'std', 'zdict_builder'), 'zstd')}
+FOREIGN_E_ONLY_INPUTS = {'lz4-sys': ('lz4-sys/liblz4/lib/lz4.c',
+             'lz4-sys/liblz4/lib/lz4.h',
+             'lz4-sys/liblz4/lib/lz4file.h',
+             'lz4-sys/liblz4/lib/lz4frame.c',
+             'lz4-sys/liblz4/lib/lz4frame.h',
+             'lz4-sys/liblz4/lib/lz4frame_static.h',
+             'lz4-sys/liblz4/lib/lz4hc.c',
+             'lz4-sys/liblz4/lib/lz4hc.h',
+             'lz4-sys/liblz4/lib/xxhash.c',
+             'lz4-sys/liblz4/lib/xxhash.h'),
+ 'zstd-sys': ('zstd-sys/zstd/lib/common/allocations.h',
+              'zstd-sys/zstd/lib/common/bits.h',
+              'zstd-sys/zstd/lib/common/bitstream.h',
+              'zstd-sys/zstd/lib/common/compiler.h',
+              'zstd-sys/zstd/lib/common/cpu.h',
+              'zstd-sys/zstd/lib/common/debug.c',
+              'zstd-sys/zstd/lib/common/debug.h',
+              'zstd-sys/zstd/lib/common/entropy_common.c',
+              'zstd-sys/zstd/lib/common/error_private.c',
+              'zstd-sys/zstd/lib/common/error_private.h',
+              'zstd-sys/zstd/lib/common/fse.h',
+              'zstd-sys/zstd/lib/common/fse_decompress.c',
+              'zstd-sys/zstd/lib/common/huf.h',
+              'zstd-sys/zstd/lib/common/mem.h',
+              'zstd-sys/zstd/lib/common/pool.c',
+              'zstd-sys/zstd/lib/common/pool.h',
+              'zstd-sys/zstd/lib/common/portability_macros.h',
+              'zstd-sys/zstd/lib/common/threading.c',
+              'zstd-sys/zstd/lib/common/threading.h',
+              'zstd-sys/zstd/lib/common/xxhash.h',
+              'zstd-sys/zstd/lib/common/zstd_common.c',
+              'zstd-sys/zstd/lib/common/zstd_deps.h',
+              'zstd-sys/zstd/lib/common/zstd_internal.h',
+              'zstd-sys/zstd/lib/common/zstd_trace.h',
+              'zstd-sys/zstd/lib/compress/clevels.h',
+              'zstd-sys/zstd/lib/compress/fse_compress.c',
+              'zstd-sys/zstd/lib/compress/hist.c',
+              'zstd-sys/zstd/lib/compress/hist.h',
+              'zstd-sys/zstd/lib/compress/huf_compress.c',
+              'zstd-sys/zstd/lib/compress/zstd_compress.c',
+              'zstd-sys/zstd/lib/compress/zstd_compress_internal.h',
+              'zstd-sys/zstd/lib/compress/zstd_compress_literals.c',
+              'zstd-sys/zstd/lib/compress/zstd_compress_literals.h',
+              'zstd-sys/zstd/lib/compress/zstd_compress_sequences.c',
+              'zstd-sys/zstd/lib/compress/zstd_compress_sequences.h',
+              'zstd-sys/zstd/lib/compress/zstd_compress_superblock.c',
+              'zstd-sys/zstd/lib/compress/zstd_compress_superblock.h',
+              'zstd-sys/zstd/lib/compress/zstd_cwksp.h',
+              'zstd-sys/zstd/lib/compress/zstd_double_fast.c',
+              'zstd-sys/zstd/lib/compress/zstd_double_fast.h',
+              'zstd-sys/zstd/lib/compress/zstd_fast.c',
+              'zstd-sys/zstd/lib/compress/zstd_fast.h',
+              'zstd-sys/zstd/lib/compress/zstd_lazy.c',
+              'zstd-sys/zstd/lib/compress/zstd_lazy.h',
+              'zstd-sys/zstd/lib/compress/zstd_ldm.c',
+              'zstd-sys/zstd/lib/compress/zstd_ldm.h',
+              'zstd-sys/zstd/lib/compress/zstd_ldm_geartab.h',
+              'zstd-sys/zstd/lib/compress/zstd_opt.c',
+              'zstd-sys/zstd/lib/compress/zstd_opt.h',
+              'zstd-sys/zstd/lib/compress/zstd_preSplit.c',
+              'zstd-sys/zstd/lib/compress/zstd_preSplit.h',
+              'zstd-sys/zstd/lib/compress/zstdmt_compress.c',
+              'zstd-sys/zstd/lib/compress/zstdmt_compress.h',
+              'zstd-sys/zstd/lib/decompress/huf_decompress.c',
+              'zstd-sys/zstd/lib/decompress/huf_decompress_amd64.S',
+              'zstd-sys/zstd/lib/decompress/zstd_ddict.c',
+              'zstd-sys/zstd/lib/decompress/zstd_ddict.h',
+              'zstd-sys/zstd/lib/decompress/zstd_decompress.c',
+              'zstd-sys/zstd/lib/decompress/zstd_decompress_block.c',
+              'zstd-sys/zstd/lib/decompress/zstd_decompress_block.h',
+              'zstd-sys/zstd/lib/decompress/zstd_decompress_internal.h',
+              'zstd-sys/zstd/lib/deprecated/zbuff.h',
+              'zstd-sys/zstd/lib/dictBuilder/cover.c',
+              'zstd-sys/zstd/lib/dictBuilder/cover.h',
+              'zstd-sys/zstd/lib/dictBuilder/divsufsort.c',
+              'zstd-sys/zstd/lib/dictBuilder/divsufsort.h',
+              'zstd-sys/zstd/lib/dictBuilder/fastcover.c',
+              'zstd-sys/zstd/lib/dictBuilder/zdict.c',
+              'zstd-sys/zstd/lib/legacy/zstd_legacy.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v01.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v01.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v02.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v02.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v03.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v03.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v04.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v04.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v05.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v05.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v06.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v06.h',
+              'zstd-sys/zstd/lib/legacy/zstd_v07.c',
+              'zstd-sys/zstd/lib/legacy/zstd_v07.h',
+              'zstd-sys/zstd/lib/zdict.h',
+              'zstd-sys/zstd/lib/zstd.h',
+              'zstd-sys/zstd/lib/zstd_errors.h')}
+FOREIGN_E_ONLY_SOURCE_PINS = {'cc/Cargo.toml': '9d24fea2d14fe0d763e2017becf9be4fbb7b88c6d17c4ab28d8d7ff23f452f29',
+ 'cc/src/command_helpers.rs': '7fe2e79744d09922c1c8eef63e90473880c9e33a6375e54ebee8fe246555b09e',
+ 'cc/src/detect_compiler_family.c': '97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f',
+ 'cc/src/lib.rs': '834b78638792fa4c8cdfc0ecc9cf2031bfcc223a85bfa0ca52e55011e64059ff',
+ 'cc/src/target/apple.rs': 'da9411b2c4db419e0fa39f765ee53b8665b3837fb39827679a53238734a4a1c1',
+ 'cc/src/target/generated.rs': '99463a5ffa411bafe7f91e8d7ee0f8f4d29ca28c59a42175e7955a3249301ce0',
+ 'cc/src/target/llvm.rs': '190fe8d2b204cd4a6e68f2a1aada17ecd6390799564ed25792fcc08ab34710ba',
+ 'cc/src/target/parser.rs': '56ebea1e462a35c54e53b50a130284f0fb6fd43ad84ddafda2cdb01272e36d60',
+ 'cc/src/tempfile.rs': '3d9a4bd894862a345aa230a61ec266f0c68f4ef9713d1d9c727482e61f1ea7c3',
+ 'cc/src/tool.rs': '1d279a6f0738f9164ca794c85bd55951aa95e2adc788e75a6bb8133393d6cce8',
+ 'lz4-sys/Cargo.toml': '1acf81d8bef849aa6c9b814dba8063465f945ac600d32f31d56685ea90678be6',
+ 'lz4-sys/build.rs': '1592aae45eff1403059337a9e81eedd5e7d48114b4e296936db011441cf90382',
+ 'lz4-sys/liblz4/lib/lz4.c': '9396f7de527bc8435de9c7569fb7998e56545a84b4f3c2d808c0235c01774539',
+ 'lz4-sys/liblz4/lib/lz4.h': '26b82efc53d1570f3b54eef02e9c4764c1ad374ff03cac04e2ced5ea4d4c552f',
+ 'lz4-sys/liblz4/lib/lz4file.h': '400ed90bc74324abcf338d37235dd81aa431fd815c22db4b369b88c12b213115',
+ 'lz4-sys/liblz4/lib/lz4frame.c': '44f421bea199c7f11da263c717f063228cd2c8c05a8384d327b49cc81ccfbac4',
+ 'lz4-sys/liblz4/lib/lz4frame.h': 'b845db4b7ee1bfa64b8f641a94f62e7f636a8b5d673cc61766413782283aaad1',
+ 'lz4-sys/liblz4/lib/lz4frame_static.h': '31ab72a6e97e4fa0bedd4420d24a3f1f8024cbfa1d8ffad88c87cbb4e04f769d',
+ 'lz4-sys/liblz4/lib/lz4hc.c': '126cafafdb91767e6e55238298a910903851b35b2cee27ce80ae2280469ee232',
+ 'lz4-sys/liblz4/lib/lz4hc.h': 'e43824e8a9ba16f54100c4ccbccfa5782a858ca9ab83c48aac303fea3e76e21e',
+ 'lz4-sys/liblz4/lib/xxhash.c': 'b667033dc735fb5ea5648e0a61a2e065e5ef5bbda53669730063bd856c643c48',
+ 'lz4-sys/liblz4/lib/xxhash.h': 'aefdd236f35130495c18764cabed3f7b216906855fc5e6a9025cd2040bc84444',
+ 'zstd-sys/Cargo.toml': '3f400eeb43f176bc78c2ec01d56125c1ccfea814f7c7ff81199573bdbd8d1f1a',
+ 'zstd-sys/build.rs': 'd92ade96b5f7c04496b1e928c564fcf52bb7d59439f56262407da77c5628458d',
+ 'zstd-sys/zstd/lib/common/allocations.h': '6a718e8edaca112abdc0bdfa7de67edefaa44c8d9e514b79672ab58ab3a9118a',
+ 'zstd-sys/zstd/lib/common/bits.h': '5bb7693a35d7ce03f8715c0b1e237062285e052250fdd34f72f38e7e92365090',
+ 'zstd-sys/zstd/lib/common/bitstream.h': 'a9461685c9add6f609078acc950a08db4c02e6e6a849d550f45182ba2ae38556',
+ 'zstd-sys/zstd/lib/common/compiler.h': 'd19829705d8039437ffba873df2b58d20d7b876d58da479121d2e515df55cbf7',
+ 'zstd-sys/zstd/lib/common/cpu.h': '23d520b536a6f23114e66549d03a967b1f24b15560c5b1ebd47ee392ccee4a1c',
+ 'zstd-sys/zstd/lib/common/debug.c': '7ab1ea104acf3243fc1cd4e6d2514046f1dfc1101c7c676145c8da080e8c24ca',
+ 'zstd-sys/zstd/lib/common/debug.h': '8260cd5087b8309679c61b772b535688993c61a675a30481b8ae55b45740ba15',
+ 'zstd-sys/zstd/lib/common/entropy_common.c': '7dfce29c6bc807645b1f0c373dad94bbb49603b175a84e72d1739bf9df65feb8',
+ 'zstd-sys/zstd/lib/common/error_private.c': '3f5873b2626ca1cdf554b7ec7b04ea0ef296fd0f6882d7fad42448b7e2dbb41c',
+ 'zstd-sys/zstd/lib/common/error_private.h': 'ae077bb433eb150ee247410a0357f910b9c07be839c6a9abe0b2e6b18ceb716d',
+ 'zstd-sys/zstd/lib/common/fse.h': '5235ce1e512bf80204d013b1f4cecd776fdaa9effddb48308bce08f6d0b84499',
+ 'zstd-sys/zstd/lib/common/fse_decompress.c': '84eba7030a036b36363a5108e760428ce549f1a833bec6464dc755f6ed51a6fb',
+ 'zstd-sys/zstd/lib/common/huf.h': '9a83d899c8c9bf03389d482562090ec2443bc0f87f27864a2b891b180333f2d4',
+ 'zstd-sys/zstd/lib/common/mem.h': '4dd5fe76fa30a020cd4b3af3134ae143920300a1fe54baac1a5da73297e66783',
+ 'zstd-sys/zstd/lib/common/pool.c': '9431e26cf7ca46ffb878f17df31198046664d592ae208dfbe3715e82b87af79d',
+ 'zstd-sys/zstd/lib/common/pool.h': 'bca19a2408e85f31bad3a13f205de92ac26ecda0c5af96fdd7f213ce03d9fc78',
+ 'zstd-sys/zstd/lib/common/portability_macros.h': '75e2b43968b70decc6bd17876833be04894035594ddc1e745cd6b70be8265637',
+ 'zstd-sys/zstd/lib/common/threading.c': '50448323b46a8e1bde042ee88ec44fcfc646f3d4aeba8a06be54d26a710ed78d',
+ 'zstd-sys/zstd/lib/common/threading.h': '9ca63027ea64046acacccbe056a414d37ea7ea428ce299fe08abe53c204c5c65',
+ 'zstd-sys/zstd/lib/common/xxhash.h': '8cb837b21a8fe9a6b9dbcd0961ab16e733bfcbfa9e003f3a496ce07ae80aa8ee',
+ 'zstd-sys/zstd/lib/common/zstd_common.c': 'f49eb8023a90d3de925373bd9ee0d36ed46b26c529840b64220397446cd73795',
+ 'zstd-sys/zstd/lib/common/zstd_deps.h': '9c77ea7d0afa8d5c868a7839e178a446a82d88eb75fd56f2fd7d9d96c5ab7c11',
+ 'zstd-sys/zstd/lib/common/zstd_internal.h': 'ad3d95ce2b81a8c5c6b00cfe6323d8e80cacb690d3b5883725cd0d939f4f576f',
+ 'zstd-sys/zstd/lib/common/zstd_trace.h': '17f6daa4c7e97055cd1ed7bcf4d9241a4e79b465f083c5d732fda1df2f0be11e',
+ 'zstd-sys/zstd/lib/compress/clevels.h': 'd764daa89b7a636d26fe96ff3536c5075e9867fb5dddbf8c9d57023a8ff4a155',
+ 'zstd-sys/zstd/lib/compress/fse_compress.c': '5070807a489757b87c1e1f50332b099e8ffe22971228218111eef64d3321ae82',
+ 'zstd-sys/zstd/lib/compress/hist.c': '1a613082642b9cabdeecd3b5929f7230cbb2f8344a28f5010f3aec12cb647ab8',
+ 'zstd-sys/zstd/lib/compress/hist.h': '9e3363e69d5fa35c1f6e8d2970c6c2453c06fd8a8ab3cc516a14c77d07cdea35',
+ 'zstd-sys/zstd/lib/compress/huf_compress.c': '0be78471f5175e49bbacb898d8b107bb8f7e13adc84780e0625be5861f016086',
+ 'zstd-sys/zstd/lib/compress/zstd_compress.c': '10c315ae609d49b2fc431521aa95908086e69fd917991c5ed9a875af3d1208e8',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_internal.h': 'ab7754413cef565da559bda7eb738bc2b3708c48877cb9ec37aff767d32c57d1',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_literals.c': 'a8f25f1bd4c0d2d9dda3355d2103c9dfbd0b7056bfd373e29e923662bfea5596',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_literals.h': '02270cd6bc060279217861776a53adb67f8d7e54f47f59d2a4ddcef2e705fe2d',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_sequences.c': '3f4334c19ed770c4007bc12df4098026d4eb1a6fbebfbf36df58054e7babc3e9',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_sequences.h': '361d108d7d452ed26f0ae4b39964f8e62166ed91d03347a5229e5d228734efc8',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_superblock.c': 'dd62ed79ee1feec78b2e5bfc63417ccbdcda426f4220d112b0fcd8a9d0c7e667',
+ 'zstd-sys/zstd/lib/compress/zstd_compress_superblock.h': '6b097999ea1d91776ca5a12e5ee02c1ed15edfcd31ba07b9ada94b0955195677',
+ 'zstd-sys/zstd/lib/compress/zstd_cwksp.h': 'ed77c2739b18b9800b97785262526a1dd4f385311ca5c2caa20b6f2a35f3735d',
+ 'zstd-sys/zstd/lib/compress/zstd_double_fast.c': '9f6d003c2fe1208737bec685910324220424ba47d0323fa30d9d5f53c50e91da',
+ 'zstd-sys/zstd/lib/compress/zstd_double_fast.h': 'd9c29c9c004f572532265e12af78d5949c0908f4ef0bb0158977bcf80e1cf92b',
+ 'zstd-sys/zstd/lib/compress/zstd_fast.c': '8037320f321836652e73ab6cbf7b8f1f4c97cef38835ac6b4aaf0af716aa398d',
+ 'zstd-sys/zstd/lib/compress/zstd_fast.h': 'dffdf43fae7ee10a2acc04e6a5eaaf03f7d3572898117a06c330d647eed5591d',
+ 'zstd-sys/zstd/lib/compress/zstd_lazy.c': 'dd6ccf357165dc8cb574ea56a34ff1db57b7b31728b32103d0c6b72319fd45b1',
+ 'zstd-sys/zstd/lib/compress/zstd_lazy.h': '6f13007fbd6824058a73b097960446defe265e33b22c7c6dc2304dcf53998bbf',
+ 'zstd-sys/zstd/lib/compress/zstd_ldm.c': '4a2bef3612ae4a9e15a78a55541a152091fa8ba160410db24d495bd6dd57249e',
+ 'zstd-sys/zstd/lib/compress/zstd_ldm.h': 'bd0cb86041d3a72fd7846e141a41aadae229c8e331a2117df7f6b70a1b4cb08c',
+ 'zstd-sys/zstd/lib/compress/zstd_ldm_geartab.h': '7285ac8ba1f0fa57a8cd8158bd427ded4e70e32a58e73b57c420b83a76e5e6e3',
+ 'zstd-sys/zstd/lib/compress/zstd_opt.c': '625936ee3fb02d789abb894c1fbc2918ee47582434094c963b630da13532c876',
+ 'zstd-sys/zstd/lib/compress/zstd_opt.h': '9b677efbae28909034d3c24f37dc5c4295d267cf477bf04e14653579f90d8b6e',
+ 'zstd-sys/zstd/lib/compress/zstd_preSplit.c': '8d7da15de31318ebb7dfe2f2e2c79f05b0d0563dcb92d4525814d05a279d0d64',
+ 'zstd-sys/zstd/lib/compress/zstd_preSplit.h': '910facb2e3442e42a6952c514223c4502d95ed957bf7dc73982b3b03785b361b',
+ 'zstd-sys/zstd/lib/compress/zstdmt_compress.c': 'c83db699b4041bf4db89c5558db490dd295635f1eeefd60b643fbc862bbac7b5',
+ 'zstd-sys/zstd/lib/compress/zstdmt_compress.h': '033fb25d96b4295c3d0158edf4d1bd4067f42aac39427706754e6c034b20f80f',
+ 'zstd-sys/zstd/lib/decompress/huf_decompress.c': '710a88d877d5dc5c83a4f839392996f337ec81cf38006c4a5be6042de5b54828',
+ 'zstd-sys/zstd/lib/decompress/huf_decompress_amd64.S': '7fe53316261517a8f877b793f3bfba8305a3f9ff05c5947f1d709aaff346f1dc',
+ 'zstd-sys/zstd/lib/decompress/zstd_ddict.c': '38bf812283d61f4cd1f6aea30f84b43317418257c4e6fc198b09b436bd484397',
+ 'zstd-sys/zstd/lib/decompress/zstd_ddict.h': 'a97a250fd2f956e3ae419ddde68ae1f9fe4025bc0373254058d31bbd352fa71c',
+ 'zstd-sys/zstd/lib/decompress/zstd_decompress.c': '029580818b7e9cd38d9d07c63516b00ceaa943ffcfbd099fc5ccbe3628fa362f',
+ 'zstd-sys/zstd/lib/decompress/zstd_decompress_block.c': '9cb8bcb07aeb87e4717a9c8a86d20832dc525dde2c1b72efdaaab7c937f43b87',
+ 'zstd-sys/zstd/lib/decompress/zstd_decompress_block.h': '62ee0c6ae3f7353020538397f436b59743da8acb922068841b346f480f7078ac',
+ 'zstd-sys/zstd/lib/decompress/zstd_decompress_internal.h': '73217b49a644c0fcf567b70677cae31449ba9f50a235ef3b681001c3f36dc56d',
+ 'zstd-sys/zstd/lib/deprecated/zbuff.h': 'fcd83d7f05dc7bc6e52da6200878e05d7dc4906cf2ccfa70ce4c753e1fdc2422',
+ 'zstd-sys/zstd/lib/dictBuilder/cover.c': '2419631b20b0f4867d0f3c178fc4a3006d05f58e8ce3ce6657133f85ed40d683',
+ 'zstd-sys/zstd/lib/dictBuilder/cover.h': '6e2906e7e5c486a5b7f479f60210ff67d068b2c58744ad6a936ba5a9f4a23755',
+ 'zstd-sys/zstd/lib/dictBuilder/divsufsort.c': '2081acb08865f623857d2c0dcb0e79fce9489f01416528c30cfee7097915c616',
+ 'zstd-sys/zstd/lib/dictBuilder/divsufsort.h': '14c16c2f67019875a2ea6cd07a4e803adfadce448e0b80351c51e5f910230d38',
+ 'zstd-sys/zstd/lib/dictBuilder/fastcover.c': '0b8b511e6370e89cb257d1a4b4d8e77add5537ffb999cfe5e7e59e454c93f38f',
+ 'zstd-sys/zstd/lib/dictBuilder/zdict.c': 'dbe57910c9d446bbf2195f31bdba5cffef2c80b93c0325e9df8c9ffa744b0aa3',
+ 'zstd-sys/zstd/lib/legacy/zstd_legacy.h': '90ecc3816d28da0e0537c610fe99209fb9603b1ecdb764bd1228a5226f5c7484',
+ 'zstd-sys/zstd/lib/legacy/zstd_v01.c': '8f439ec4d83f13caaa4ee86d8de74660a38cade89b48bedf3943a9315b98e167',
+ 'zstd-sys/zstd/lib/legacy/zstd_v01.h': '51e06e92b87abe35f617d9e65c6f26b4b1b50485cda6bf34f5b23bb6e1727b13',
+ 'zstd-sys/zstd/lib/legacy/zstd_v02.c': 'ffedd2b0e4dae744b8592656050f2c56eb4c8ccad1795fb3efeceb7924808712',
+ 'zstd-sys/zstd/lib/legacy/zstd_v02.h': '341dd36148b7080eae742bb21196740482c4d94a97024f47ad1e7c0f2bb20e6b',
+ 'zstd-sys/zstd/lib/legacy/zstd_v03.c': '1d69626197b9c76d28012b78fc66bcc3077bf8d796ff6f82457666d3271e7f3d',
+ 'zstd-sys/zstd/lib/legacy/zstd_v03.h': 'e9d7ccc971055129a14e3b81f0e9494a638e3d9c0b4b36413252d6b3adc90cf2',
+ 'zstd-sys/zstd/lib/legacy/zstd_v04.c': 'a80d9591ff3fc387a05e8e075713af9ad34596dc5c8681666346a716013a6e14',
+ 'zstd-sys/zstd/lib/legacy/zstd_v04.h': 'c8c31b9db45c1b559688738f280331a5f3bce5b275cf4c71e8a41282f406134e',
+ 'zstd-sys/zstd/lib/legacy/zstd_v05.c': '62170472e18505b3347e563cdb1eba439312bb53385663730ac58cd92f3c4678',
+ 'zstd-sys/zstd/lib/legacy/zstd_v05.h': '6fb3be7f31544cee69cfb421d5bc6e34e72f4e2612b38cb38d47032a8531acdf',
+ 'zstd-sys/zstd/lib/legacy/zstd_v06.c': 'd2cadc9e2906fe50e9c9564bdcb291582532060fdcec9c4bc5f0ee4370182b75',
+ 'zstd-sys/zstd/lib/legacy/zstd_v06.h': '138728fdc9de7ebd5c7ffdf471b8b324cafa8e0ab638c6f4d9c048296cfe23ab',
+ 'zstd-sys/zstd/lib/legacy/zstd_v07.c': 'ae9f3c0a440b0f61d0ce44b06ee7ed3d256e10f3cb7dbbd9834d6c13625ac944',
+ 'zstd-sys/zstd/lib/legacy/zstd_v07.h': 'b682d3dffc64564fdf6f19d67baece362a1b7075c0140a80ce54e17f79961b49',
+ 'zstd-sys/zstd/lib/zdict.h': 'abacadb94e3f79e591f4b1648e839b0160fbf4291211fd01bdba1380269b245c',
+ 'zstd-sys/zstd/lib/zstd.h': '9b4bc8245565c98ccfc61c07749928b57e7c0f6fddb0530c4f6aa1971893d88b',
+ 'zstd-sys/zstd/lib/zstd_errors.h': '66a8c3f71d12ea6e797e4f622f31f3f8f81c41b36f48cad4f5de7d8bfb6aac0a'}
+FOREIGN_FLAG_LITERAL_DIGEST = "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+FOREIGN_FLAG_LITERAL_LENGTH = 28
+
+
+def foreign_e_only_declaration(inv, cwd, args, env, session):
+    """Closed source-first negative ownership, never permission to call a tool."""
+    name = next((n for n in FOREIGN_E_ONLY_PACKAGES if cwd == session / "vendor" / n
+                 and cwd.resolve() == cwd and not cwd.is_symlink()), None)
+    flag = None
+    if name is None:
+        out = Path(env.get("OUT_DIR", ""))
+        if (cwd == out and out.is_absolute() and out.resolve() == out and not out.is_symlink()
+                and out.name == "out" and out.parent.parent == session / "target" / TARGET / "debug/build"
+                and re.fullmatch(r"zstd-sys-[0-9a-f]{16}", out.parent.name)
+                and args[-2:] == ["-c", str(out / "flag_check.c")]):
+            name = "zstd-sys"; flag = str(out / "flag_check.c")
+    if name is None: return None
+    version = FOREIGN_E_ONLY_PACKAGES[name][0]
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    require(inv["packages"].count(package) == 1, "ForeignEOnlyDeclarationPackage")
+    sources = {member: FOREIGN_E_ONLY_SOURCE_PINS[member] for member in FOREIGN_E_ONLY_INPUTS[name]}
+    if flag is not None: sources[flag] = FOREIGN_FLAG_LITERAL_DIGEST
+    return {"state": "DeclaredOnly", "source_sha256": sources}
+
+
+def foreign_e_only_context(env, cwd, session, inv, name):
+    version, components, features, links = FOREIGN_E_ONLY_PACKAGES[name]
+    package, root, out = fixed_source_package(name, version, cwd, env, session, inv, ())
+    require(env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and re.fullmatch(re.escape(name) + r"-[0-9a-f]{16}", out.parent.name), "ForeignManifestOutDir")
+    # These four literals are observed Cargo fields, including the empty PRE;
+    # full package VERSION retains build metadata and is checked independently.
+    require(all(env.get("CARGO_PKG_VERSION_" + key) == value for key, value in
+                zip(("MAJOR", "MINOR", "PATCH", "PRE"), components)), "ForeignVersion")
+    require({key: value for key, value in env.items() if key.startswith("CARGO_FEATURE_")} ==
+            {"CARGO_FEATURE_" + f.upper().replace("-", "_"): "1" for f in features}
+            and env.get("CARGO_CFG_FEATURE") == ",".join(features)
+            and env.get("CARGO_MANIFEST_LINKS") == links, "ForeignFeaturesLinks")
+    expected = {"HOST": TARGET, "TARGET": TARGET, "CARGO_CFG_TARGET_ARCH": "x86_64",
+        "CARGO_CFG_TARGET_OS": "macos", "CARGO_CFG_TARGET_ENV": "", "CARGO_CFG_TARGET_ENDIAN": "little",
+        "CARGO_CFG_TARGET_VENDOR": "apple", "CARGO_CFG_TARGET_POINTER_WIDTH": "64",
+        "CARGO_CFG_TARGET_FAMILY": "unix", "CARGO_CFG_TARGET_ABI": "", "CARGO_CFG_UNIX": "",
+        "CARGO_CFG_TARGET_FEATURE": "cmpxchg16b,fxsr,sse,sse2,sse3,sse4.1,ssse3",
+        "CARGO_CFG_TARGET_HAS_ATOMIC": "128,16,32,64,8,ptr", "CARGO_CFG_DEBUG_ASSERTIONS": "",
+        "CARGO_CFG_PANIC": "unwind", "PROFILE": "debug", "DEBUG": "true", "OPT_LEVEL": "0"}
+    require(all(env.get(key) == value for key, value in expected.items()), "ForeignConfiguration")
+    require(not any(key in env for key in ("CARGO_CFG_MIRI", "CARGO_CFG_WINDOWS", "ZSTD_SYS_USE_PKG_CONFIG",
+                                           "RING_PREGENERATE_ASM"))
+            and not (root / ".git").exists() and not (root / ".git").is_symlink(), "ForeignSourceBranch")
+    require(inv["packages"].count({"id": CC_PACKAGE, "tree": "vendor", "manifest": "cc/Cargo.toml"}) == 1,
+            "ForeignCcPackage")
+    members = {member for member in FOREIGN_E_ONLY_SOURCE_PINS if member.startswith(name + "/") or member.startswith("cc/")}
+    sources = {}
+    for member in sorted(members):
+        path = session / "vendor" / member; regular(path)
+        expected_sha = FOREIGN_E_ONLY_SOURCE_PINS[member]
+        require(path.resolve() == path and path.stat().st_nlink == 1
+                and inv["vendor"]["files"].get(member) == expected_sha == file_hash(path), "ForeignEOnlySourcePin")
+        sources[member] = expected_sha
+    require(sources[PROBE_LITERAL] == PROBE_DIGEST
+            and (session / "vendor" / PROBE_LITERAL).stat().st_size == 206, "ForeignProbeLiteral")
+    return {"lane": FOREIGN_LANE, "package_id": package["id"], "manifest": str(root),
+            "out_dir": str(out), "source_sha256": sources}
+
+
+def foreign_e_only_prior(session, context, current_call):
+    """New-package pending calls reserve identities without successful authority."""
+    rows = []; namespace = session / "foreign-native-invocations"
+    if not namespace.exists(): return rows
+    current_request = strict_json((current_call / "request.json").read_bytes()) if current_call else None
+    current_source = (os.fsdecode(bytes.fromhex(current_request["args_hex"][-1])) if current_request else None)
+    for call in namespace.iterdir():
+        if call == current_call: continue
+        require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call
+                and not call.is_symlink(), "ForeignCallAlias")
+        request_path = call / "request.json"; receipt_path = call / "receipt.json"
+        if not request_path.exists() and not request_path.is_symlink():
+            require(not receipt_path.exists() and not receipt_path.is_symlink()
+                    and all(re.fullmatch(r"request\.json\.pending-[0-9a-f]{32}", p.name)
+                            and p.is_file() and not p.is_symlink() for p in call.iterdir()), "ForeignPendingRequest")
+            # Empty/atomic-publish windows are not evidence. Final seal still
+            # requires a complete regular request/receipt for every call.
+            continue
+        regular(request_path)
+        require(request_path.resolve() == request_path and request_path.stat().st_nlink == 1, "ForeignReceiptBinding")
+        request = strict_json(request_path.read_bytes())
+        require(isinstance(request, dict), "ForeignPendingRequest")
+        keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
+        require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly"
+                and request["lane"] == FOREIGN_LANE and request["owner_issued_inspector"] is False, "ForeignReceiptBinding")
+        cwd = os.fsdecode(bytes.fromhex(request["cwd_hex"]))
+        if cwd != context["manifest"]: continue
+        args = [os.fsdecode(bytes.fromhex(value)) for value in request["args_hex"]]
+        if not (args[:1] == ["-E"] and len(args) in (2, 3)): continue
+        source = str((Path(cwd) / args[-1]).resolve())
+        rejected = {"context": context, "protocol_state": "ProtocolRefused", "failures": ["ForeignPendingRequest"],
+                    "operation": {"class": "CompilerFamilyFileProbe", "source": source, "retry": len(args) == 3}}
+        if not receipt_path.exists():
+            require(not receipt_path.is_symlink(), "ForeignReceiptBinding"); rows.append((call, rejected)); continue
+        regular(receipt_path)
+        require(receipt_path.resolve() == receipt_path and receipt_path.stat().st_nlink == 1, "ForeignReceiptBinding")
+        receipt = strict_json(receipt_path.read_bytes())
+        require(isinstance(receipt, dict) and receipt.get("operation_id") == call.name
+                and all(receipt.get(key) == value for key, value in request.items()), "ForeignReceiptBinding")
+        if receipt.get("context") != context:
+            rows.append((call, rejected)); continue
+        if source != current_source or receipt.get("protocol_state") != "Completed":
+            rows.append((call, rejected)); continue
+        if receipt.get("protocol_state") == "Completed":
+            # A same-file retry needs genuine raw/control/stream/state evidence;
+            # another label or a swallowed fault cannot authorize its child.
+            policy = strict_json(POLICY.read_bytes()); owner = strict_json((session / "owner.json").read_bytes())
+            inv = native_control(session, policy, owner)
+            env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+            require(request.get("lane") == FOREIGN_LANE and request.get("role") == "cc"
+                    and request.get("owner_issued_inspector") is False and args == ["-E", source]
+                    and foreign_context(env, Path(cwd), session, inv) == context, "ForeignEOnlyPredecessor")
+            foreign_environment(env, session, inv)
+            controls = foreign_controls(session, policy, owner, context)
+            require(all(receipt.get(key) == controls for key in ("controls_pre", "controls_post", "controls_return"))
+                    and receipt.get("failures") == [] and type(receipt.get("tool_result")) is int
+                    and receipt.get("tool_sha256") == inv["generators"]["CC"]["sha256"]
+                    and receipt.get("argv_hex") == [os.fsencode(inv["generators"]["CC"]["path"]).hex(), *request["args_hex"]],
+                    "ForeignEOnlyPredecessor")
+            foreign_jobserver_binding(receipt["jobserver_identity"], env)
+            require(receipt["jobserver_return"] == receipt["jobserver_identity"], "ForeignJobserverChanged")
+            require(receipt.get("operation") == {"class": "CompilerFamilyFileProbe", "source": source,
+                    "retry": False, "predecessor": None, "context_group": context["out_dir"]}, "ForeignEOnlyPredecessor")
+            for stream in ("stdout", "stderr"):
+                path = call / (stream + ".raw"); regular(path)
+                require(path.resolve() == path and path.stat().st_nlink == 1
+                        and file_hash(path) == receipt[stream + "_sha256"], "ForeignStreamChanged")
+            require(all(isinstance(receipt.get(key), dict) for key in ("input_pre", "input_post"))
+                    and native_state_key(receipt["input_pre"]) == native_state_key(receipt["input_post"])
+                    and receipt["input_pre"]["exists"] is True and receipt["input_pre"]["path"] == source
+                    and receipt["input_pre"]["length"] == 206 and receipt["input_pre"]["sha256"] == PROBE_DIGEST,
+                    "ForeignInputChanged")
+            native_state_check(call, receipt["input_pre"]); native_state_check(call, receipt["input_post"])
+            require(foreign_semantics(call, receipt) == receipt.get("source_semantics"), "ForeignSourceSemantics")
+        rows.append((call, receipt))
+    return rows
+
+
 def foreign_context(env, cwd, session, inv):
     # Source recognition precedes labels, flags and OUT_DIR. No generic fallback.
     require(cwd.is_absolute() and cwd.resolve() == cwd and not cwd.is_symlink(), "ForeignSourceAlias")
+    selected = next((n for n in FOREIGN_E_ONLY_PACKAGES if cwd == session / "vendor" / n), None)
+    if selected is not None: return foreign_e_only_context(env, cwd, session, inv, selected)
     name = next((n for n in FOREIGN_PACKAGES if cwd == session / "vendor" / n), None)
     require(name is not None, "ForeignSourceContext")
     version, features, links = FOREIGN_PACKAGES[name]
@@ -2768,6 +3123,8 @@ def foreign_controls(session, policy, owner, context):
 
 
 def foreign_prior(session, context, current_call=None):
+    if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
+        return foreign_e_only_prior(session, context, current_call)
     rows = []
     root = session / "foreign-native-invocations"
     if not root.exists(): return rows
@@ -2791,6 +3148,9 @@ def foreign_prior(session, context, current_call=None):
 
 def foreign_probe_classify(role, args, context, env, session, inv, *, history=None, current_call=None):
     require(role == "cc", "ForeignRole")
+    if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
+        require((len(args) == 2 and args[:1] == ["-E"])
+                or (len(args) == 3 and args[:2] == ["-E", "--"]), "ForeignEOnlyArgv")
     # Fresh Command::new calls have no Tool.args or compile locale adjustment.
     if args == ["-?"]:
         return {"class": "CompilerFamilyHelpProbe", "context_group": context["out_dir"],
@@ -2835,9 +3195,11 @@ def foreign_semantics(call, receipt):
                 "source_nonzero_default": code != 0}
     if kind == "CompilerObjectCompile":
         return {"compiler_success": code == 0, "object_observed": receipt["output_post"]["exists"]}
-    if kind == "ArchiverFirstAppend":
+    if kind in {"ArchiverFirstAppend", "ArchiverRemainingAppend"}:
         return {"append_success": code == 0, "archive_observed": receipt["archive_post"]["exists"],
                 "fallback_requested": receipt["operation"]["mode"] == "cqD" and code != 0}
+    if kind == "ArchiverIndex":
+        return {"index_success": code == 0, "archive_observed": receipt["archive_post"]["exists"]}
     warning = "-Wslash-u-filename" in stdout or "-Wslash-u-filename" in stderr
     effective = code == 0 and (receipt["operation"]["retry"] or not warning)
     return {"warning_retry_requested": warning and not receipt["operation"]["retry"],
@@ -3052,6 +3414,16 @@ FOREIGN_ARCHIVE_FIRST_MEMBERS = {
     "psm": ("4f9a91766097c4c5-x86_64.o",)}
 
 
+FOREIGN_ARCHIVE_REMAINING_MEMBERS = (
+    "a0330e891e733f4e-p256-nistz.o", "c322a0bcc369f531-chacha-x86_64-macosx.o",
+    "c322a0bcc369f531-aes-gcm-avx2-x86_64-macosx.o", "c322a0bcc369f531-aesni-gcm-x86_64-macosx.o",
+    "c322a0bcc369f531-aesni-x86_64-macosx.o", "c322a0bcc369f531-ghash-x86_64-macosx.o",
+    "c322a0bcc369f531-vpaes-x86_64-macosx.o", "c322a0bcc369f531-x86_64-mont-macosx.o",
+    "c322a0bcc369f531-x86_64-mont5-macosx.o", "c322a0bcc369f531-p256-x86_64-asm-macosx.o",
+    "c322a0bcc369f531-sha512-x86_64-macosx.o", "c322a0bcc369f531-chacha20_poly1305_x86_64-macosx.o",
+    "c322a0bcc369f531-sha256-x86_64-macosx.o")
+
+
 def foreign_archive_environment(env, session, inv):
     native_environment(env, session, inv)
     require("LC_ALL" not in env and env.get("LC_CTYPE") == "C.UTF-8"
@@ -3067,33 +3439,112 @@ def foreign_archive_classify(role, args, context):
     name = Path(context["manifest"]).name; out = Path(context["out_dir"])
     archive = out / (RING_ARCHIVES[0] if name == "ring" else PSM_ARCHIVE)
     members = [str(out / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS[name]]
-    require(args[:1] in (["cqD"], ["cq"]) and args == [args[0], str(archive), *members], "ForeignArchiveTemplate")
+    kind = "ArchiverFirstAppend"
+    if name == "ring" and args == ["cq", str(archive), *[str(out / n) for n in FOREIGN_ARCHIVE_REMAINING_MEMBERS]]:
+        # Legacy first-only observations do not assert a complete cc partition.
+        # This new remaining-stage template alone requires the genuine byte rule.
+        foreign_archive_partition(context)
+        members = [str(out / n) for n in FOREIGN_ARCHIVE_REMAINING_MEMBERS]
+        kind = "ArchiverRemainingAppend"
+    elif name == "psm" and args == ["s", str(archive)]:
+        # The original one-member ledger is semantic input, not members argv.
+        kind = "ArchiverIndex"
+    else:
+        require(args[:1] in (["cqD"], ["cq"]) and args == [args[0], str(archive), *members], "ForeignArchiveTemplate")
     require(archive.resolve() == archive and all(Path(p).resolve() == Path(p) for p in members), "ForeignArchiveAlias")
-    return {"class": "ArchiverFirstAppend", "mode": args[0], "archive": str(archive),
+    return {"class": kind, "mode": args[0], "archive": str(archive),
             "members": members, "context_group": context["out_dir"]}
 
 
-def foreign_archive_members(session, policy, owner, context, operation, *, current_call=None):
-    # The explicit archive-only scan exception supplies no AR success evidence.
-    # foreign_archive_history independently validates every skipped AR request.
+def foreign_archive_partition(context):
+    out = Path(context["out_dir"])
+    require(out.is_absolute() and out.resolve() == out and not out.is_symlink(), "ForeignArchiveAlias")
+    names = (*FOREIGN_ARCHIVE_FIRST_MEMBERS["ring"], *FOREIGN_ARCHIVE_REMAINING_MEMBERS)
+    batches = []; batch = []; remaining = 4000
+    for name in names:
+        path = str(out / name); length = len(os.fsencode(path))
+        if batch and length > remaining:
+            batches.append(batch); batch = []; remaining = 4000
+        batch.append(path); remaining = max(0, remaining - length)
+    if batch: batches.append(batch)
+    require(batches == [[str(out / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS["ring"]],
+                        [str(out / n) for n in FOREIGN_ARCHIVE_REMAINING_MEMBERS]], "ForeignArchiveBatchGeometry")
+    return batches
+
+
+def foreign_archive_stage(operation):
+    stages = {("ArchiverFirstAppend", "cqD"): "FirstD", ("ArchiverFirstAppend", "cq"): "FirstFallbackCQ",
+              ("ArchiverRemainingAppend", "cq"): "RingRemainingCQ", ("ArchiverIndex", "s"): "PSMIndexS"}
+    stage = stages.get((operation["class"], operation["mode"]))
+    require(stage is not None, "ForeignArchiveTemplate")
+    return stage
+
+
+def foreign_archive_producers(session, context, operation, *, current_call=None):
     rows = {}
     for call in (session / "foreign-native-invocations").iterdir():
         if call == current_call or not (call / "receipt.json").exists(): continue
         receipt = strict_json((call / "receipt.json").read_bytes())
         require(isinstance(receipt, dict), "ForeignArchiveReceiptFields")
         if receipt.get("context") != context: continue
+        request_path = call / "request.json"; regular(request_path)
+        require(request_path.resolve() == request_path and request_path.stat().st_nlink == 1, "ForeignArchiveEvidenceAlias")
+        request = strict_json(request_path.read_bytes())
+        # Role is read from raw request, never guessed from a nullable operation.
+        # The caller must independently validate ALL same-context AR history.
+        require(request["role"] == receipt.get("role"), "ForeignArchiveReceiptBinding")
+        if request["role"] == "ar": continue
         operation_row = receipt.get("operation")
         require(isinstance(operation_row, dict), "ForeignArchiveOperationFields")
         if operation_row.get("class") != "CompilerObjectCompile": continue
         output = operation_row["output"]
         if output not in operation["members"]: continue
         require(output not in rows, "ForeignArchiveMemberUnique")
+        require(receipt["protocol_state"] == "Completed" and receipt["tool_result"] == 0
+                and receipt["failures"] == [], "ForeignArchiveMemberProducer")
+        receipt_path = call / "receipt.json"; regular(receipt_path)
+        require(receipt_path.resolve() == receipt_path and receipt_path.stat().st_nlink == 1, "ForeignArchiveEvidenceAlias")
         rows[output] = {"path": output, "operation_id": call.name,
-            "request_sha256": file_hash(call / "request.json"), "receipt_sha256": file_hash(call / "receipt.json"),
+            "request_sha256": file_hash(request_path), "receipt_sha256": file_hash(receipt_path),
             "sha256": receipt["output_post"]["sha256"], "length": receipt["output_post"]["length"]}
     require(set(rows) == set(operation["members"]), "ForeignArchiveMemberProducer")
+    return [rows[path] for path in operation["members"]]
+
+
+def foreign_archive_predecessor(operation, chain):
+    stage = foreign_archive_stage(operation)
+    if stage == "FirstD": require(not chain, "ForeignArchivePredecessor")
+    elif stage == "FirstFallbackCQ":
+        require(len(chain) == 1 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
+                and chain[0][1]["tool_result"] != 0, "ForeignArchivePredecessor")
+    else:
+        require(len(chain) == 2 and foreign_archive_stage(chain[0][1]["operation"]) == "FirstD"
+                and chain[0][1]["tool_result"] != 0
+                and foreign_archive_stage(chain[1][1]["operation"]) == "FirstFallbackCQ"
+                and chain[1][1]["tool_result"] == 0, "ForeignArchivePredecessor")
+    require(not chain or all(r["operation"]["archive"] == operation["archive"] for _, r in chain), "ForeignArchivePredecessor")
+    if stage in ("RingRemainingCQ", "PSMIndexS"):
+        name = "ring" if stage == "RingRemainingCQ" else "psm"
+        expected = [str(Path(operation["archive"]).parent / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS[name]]
+        require([p["path"] for p in foreign_archive_ledger(chain)["producers"]] == expected,
+                "ForeignArchiveLedger")
+
+
+def foreign_archive_ledger(chain):
+    producers = []
+    for _, receipt in chain:
+        if receipt["operation"]["class"] != "ArchiverIndex" and receipt["tool_result"] == 0:
+            producers.extend(receipt["archive_member_producers_pre"])
+    require(len({p["path"] for p in producers}) == len(producers), "ForeignArchiveLedgerUnique")
+    # Successful append operands are recorded; binary archive inventory is not.
+    return {"state": "RecordingOnly", "archive_member_inventory": "not_observed", "producers": producers}
+
+
+def foreign_archive_members(session, policy, owner, context, operation, *, current_call=None):
+    # The archive-only family exception supplies no AR success evidence.
+    # Complete independent history validates every skipped AR request/receipt.
     family = foreign_compile_family(session, policy, owner, context, current_call=current_call, allow_archive=True)
-    return family, [rows[path] for path in operation["members"]]
+    return family, foreign_archive_producers(session, context, operation, current_call=current_call)
 
 
 def foreign_archive_states(call, receipt, operation, *, live_archive=False):
@@ -3117,7 +3568,7 @@ def foreign_archive_states(call, receipt, operation, *, live_archive=False):
             and receipt["archive_post"]["length"] > 0), "ForeignArchiveMissing")
 
 
-def foreign_archive_history(session, policy, owner, context, family, members, *, current_call=None, live_archive=False):
+def foreign_archive_history(session, policy, owner, context, family, *, current_call=None, live_archive=False):
     inv = native_control(session, policy, owner); controls = foreign_controls(session, policy, owner, context)
     rows = {}
     for call in (session / "foreign-native-invocations").iterdir():
@@ -3125,19 +3576,47 @@ def foreign_archive_history(session, policy, owner, context, family, members, *,
         require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call and not call.is_symlink(), "ForeignArchiveEvidenceAlias")
         if not (call / "request.json").exists() and not (call / "receipt.json").exists(): continue
         request = strict_json((call / "request.json").read_bytes())
+        receipt_path = call / "receipt.json"
+        receipt = strict_json(receipt_path.read_bytes()) if receipt_path.exists() else None
         env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
         cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
-        if request["role"] != "ar" or str(cwd) != context["manifest"] or env.get("OUT_DIR") != context["out_dir"]: continue
+        raw_group = str(cwd) == context["manifest"] and env.get("OUT_DIR") == context["out_dir"]
+        retained_context = receipt.get("context") if isinstance(receipt, dict) else None
+        retained_group = (isinstance(retained_context, dict)
+            and retained_context.get("manifest") == context["manifest"]
+            and retained_context.get("out_dir") == context["out_dir"])
+        retained_raw_group = False
+        if isinstance(receipt, dict):
+            try:
+                retained_env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v))
+                                for k, v in receipt["environment_hex"].items()}
+                retained_cwd = os.fsdecode(bytes.fromhex(receipt["cwd_hex"]))
+                retained_raw_group = retained_cwd == context["manifest"] and retained_env.get("OUT_DIR") == context["out_dir"]
+            except (KeyError, TypeError, ValueError, AttributeError):
+                # Invalid retained fields are not evidence of an unrelated group.
+                # Any matching raw/context view still enters the strict gate below.
+                pass
+        # Retained views supply negative relevance only, never predecessor success.
+        if not (raw_group or retained_group or retained_raw_group): continue
+        operation_row = receipt.get("operation") if isinstance(receipt, dict) else None
+        retained_ar = isinstance(receipt, dict) and (receipt.get("role") == "ar"
+            or (isinstance(operation_row, dict) and operation_row.get("class") in
+                {"ArchiverFirstAppend", "ArchiverRemainingAppend", "ArchiverIndex"}))
+        if request["role"] != "ar" and not retained_ar: continue
+        require(raw_group and request["role"] == "ar", "ForeignArchiveReceiptBinding")
         for leaf in ("request.json", "receipt.json"):
             path = call / leaf; regular(path)
             require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignArchiveEvidenceAlias")
         keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
         receipt = strict_json((call / "receipt.json").read_bytes())
+        require(isinstance(receipt, dict), "ForeignArchiveReceiptFields")
         require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly" and request["lane"] == FOREIGN_LANE
                 and request["owner_issued_inspector"] is False and receipt["operation_id"] == call.name
                 and all(receipt.get(k) == v for k, v in request.items()), "ForeignArchiveReceiptBinding")
+        require(receipt.get("context") == context, "ForeignArchiveControl")
         require(receipt["protocol_state"] == "Completed" and receipt["failures"] == []
                 and type(receipt["tool_result"]) is int, "ForeignArchiveSticky")
+        require(isinstance(receipt.get("operation"), dict), "ForeignArchiveOperationFields")
         foreign_archive_environment(env, session, inv)
         require(foreign_context(env, cwd, session, inv) == context and receipt["context"] == context
                 and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignArchiveControl")
@@ -3155,27 +3634,29 @@ def foreign_archive_history(session, policy, owner, context, family, members, *,
         require(foreign_semantics(call, receipt) == receipt["source_semantics"], "ForeignArchiveSemantics")
         pins = foreign_compile_pins(session, inv, context)
         require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
+        specific = foreign_archive_producers(session, context, operation, current_call=call)
         require(receipt["family_pre"] == receipt["family_return"] == family
-                and receipt["archive_member_producers_pre"] == receipt["archive_member_producers_return"] == members, "ForeignArchiveMemberChanged")
+                and receipt["archive_member_producers_pre"] == receipt["archive_member_producers_return"] == specific,
+                "ForeignArchiveMemberChanged")
         foreign_archive_states(call, receipt, operation)
-        require(operation["mode"] not in rows, "ForeignArchiveOnce")
-        rows[operation["mode"]] = (call, receipt)
+        stage = foreign_archive_stage(operation)
+        require(stage not in rows, "ForeignArchiveOnce"); rows[stage] = (call, receipt)
     chain = []
-    if rows:
-        require("cqD" in rows, "ForeignArchivePredecessor")
-        call, first = rows["cqD"]
-        require(first["archive_pre"] == {"exists": False, "path": first["operation"]["archive"]}
-                and first["archive_predecessor"] is None, "ForeignArchiveInitial")
-        chain.append((call, first))
-        if "cq" in rows:
-            next_call, fallback = rows["cq"]
-            require(first["tool_result"] != 0 and fallback["archive_predecessor"] == call.name
-                    and native_state_key(fallback["archive_pre"]) == native_state_key(first["archive_post"]), "ForeignArchivePredecessor")
-            chain.append((next_call, fallback))
-    for index, (_, receipt) in enumerate(chain):
+    stages = ("FirstD", "FirstFallbackCQ", "RingRemainingCQ" if Path(context["manifest"]).name == "ring" else "PSMIndexS")
+    for stage in stages:
+        if stage not in rows: continue
+        call, receipt = rows[stage]; operation = receipt["operation"]
+        foreign_archive_predecessor(operation, chain)
+        require(receipt["archive_predecessor"] == (chain[-1][0].name if chain else None), "ForeignArchivePredecessor")
+        if not chain: require(receipt["archive_pre"] == {"exists": False, "path": operation["archive"]}, "ForeignArchiveInitial")
+        else: require(native_state_key(receipt["archive_pre"]) == native_state_key(chain[-1][1]["archive_post"]), "ForeignArchivePredecessor")
         expected = [{"operation_id": c.name, "request_sha256": file_hash(c / "request.json"),
-                     "receipt_sha256": file_hash(c / "receipt.json")} for c, _ in chain[:index]]
+                     "receipt_sha256": file_hash(c / "receipt.json")} for c, _ in chain]
         require(receipt.get("archive_history_pre") == receipt.get("archive_history_return") == expected, "ForeignArchivePredecessor")
+        require(receipt.get("archive_operand_ledger_pre") == foreign_archive_ledger(chain)
+                and receipt.get("archive_operand_ledger_return") == foreign_archive_ledger([*chain, (call, receipt)]), "ForeignArchiveLedger")
+        chain.append((call, receipt))
+    require(len(rows) == len(chain), "ForeignArchivePredecessor")
     if chain and live_archive: native_state_check(chain[-1][0], chain[-1][1]["archive_post"], live=True)
     return chain
 
@@ -3194,7 +3675,12 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
     receipt = dict(request, operation_id=call.name, protocol_state="ProtocolRefused", tool_result=None, failures=[])
     try:
         inv = native_control(session, policy, owner)
+        declaration = foreign_e_only_declaration(inv, cwd, args, env, session)
+        if declaration is not None: receipt["e_only_input_declaration"] = declaration
         context = foreign_context(env, cwd, session, inv); receipt["context"] = context
+        if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
+            require(role == "cc" and ((len(args) == 2 and args[:1] == ["-E"])
+                    or (len(args) == 3 and args[:2] == ["-E", "--"])), "ForeignEOnlyArgv")
         archiving = role == "ar"; compiling = "-c" in args and not archiving
         if archiving:
             # Declarations are negative-only, retained before environment/pin refusal.
@@ -3216,9 +3702,9 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
             receipt["compile_pins_pre"] = foreign_compile_pins(session, inv, context)
             family, members = foreign_archive_members(session, policy, owner, context, operation, current_call=call)
             receipt["family_pre"] = family; receipt["archive_member_producers_pre"] = members
-            chain = foreign_archive_history(session, policy, owner, context, family, members, current_call=call, live_archive=True)
-            require((operation["mode"] == "cqD" and not chain) or
-                    (operation["mode"] == "cq" and len(chain) == 1 and chain[0][1]["tool_result"] != 0), "ForeignArchivePredecessor")
+            chain = foreign_archive_history(session, policy, owner, context, family, current_call=call, live_archive=True)
+            foreign_archive_predecessor(operation, chain)
+            receipt["archive_operand_ledger_pre"] = foreign_archive_ledger(chain)
             receipt["archive_predecessor"] = chain[-1][0].name if chain else None
             receipt["archive_history_pre"] = [{"operation_id": c.name, "request_sha256": file_hash(c / "request.json"),
                 "receipt_sha256": file_hash(c / "receipt.json")} for c, _ in chain]
@@ -3313,10 +3799,11 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
                 family, members = foreign_archive_members(session, policy, owner, context, operation, current_call=call)
                 receipt["family_return"] = family; receipt["archive_member_producers_return"] = members
                 require(family == receipt["family_pre"] and members == receipt["archive_member_producers_pre"], "ForeignArchiveMemberChanged")
-                chain = foreign_archive_history(session, policy, owner, context, family, members, current_call=call)
+                chain = foreign_archive_history(session, policy, owner, context, family, current_call=call)
                 receipt["archive_history_return"] = [{"operation_id": c.name, "request_sha256": file_hash(c / "request.json"),
                     "receipt_sha256": file_hash(c / "receipt.json")} for c, _ in chain]
                 require(receipt["archive_history_return"] == receipt["archive_history_pre"], "ForeignArchivePredecessor")
+                receipt["archive_operand_ledger_return"] = foreign_archive_ledger([*chain, (call, receipt)])
         except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
             receipt["protocol_state"] = "ProtocolRefused"; receipt["failures"].append(str(error))
     atomic_json(call / "receipt.json", receipt)
@@ -3353,6 +3840,17 @@ def foreign_evidence_namespace(session):
                 for stream in ("stdout", "stderr"):
                     sha = receipt.get(stream + "_sha256")
                     if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
+                # The new negative-only declaration cannot lose later valid SHA
+                # because an earlier member is malformed. Old compile maps stay unchanged.
+                declaration = receipt.get("e_only_input_declaration")
+                if isinstance(declaration, dict) and isinstance(declaration.get("source_sha256"), dict):
+                    members = declaration["source_sha256"]
+                    hashes.update(sha for sha in members.values() if isinstance(sha, str) and HEX.fullmatch(sha))
+                    for member in members:
+                        if isinstance(member, str):
+                            try: paths.add(str((session / "vendor" / member).resolve()))
+                            except (OSError, ValueError) as error:
+                                blockers.append("ForeignNamespace:" + call.name + ":ForeignEOnlyDeclarationPath:" + type(error).__name__)
                 # Native compile inputs/includes keep retained ownership before request parsing.
                 for key in ("compile_input_declaration", "compile_pins_pre", "compile_pins_post", "compile_pins_return"):
                     pins = receipt.get(key)
@@ -3395,6 +3893,17 @@ def foreign_evidence_namespace(session):
                 if arg in {"-o", "-c"}: declared.append(args[index + 1])
             if request["role"] == "ar" and len(args) >= 2: declared.extend(args[1:])
             paths.update(str((cwd / value).resolve()) for value in declared)
+            # Old ring/psm namespace paths do not acquire this new policy/env read.
+            selected = any(cwd == session / "vendor" / n for n in FOREIGN_E_ONLY_PACKAGES)
+            flag_out = (cwd.name == "out" and cwd.parent.parent == session / "target" / TARGET / "debug/build"
+                        and re.fullmatch(r"zstd-sys-[0-9a-f]{16}", cwd.parent.name))
+            if selected or flag_out:
+                inv = strict_json(POLICY.read_bytes())["inventory"]
+                declaration = foreign_e_only_declaration(inv, cwd, args,
+                    {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}, session)
+                if declaration is not None:
+                    for member, sha in declaration["source_sha256"].items():
+                        paths.add(str((session / "vendor" / member).resolve())); hashes.add(sha)
             # A receiptless fixed Compile request owns its closed inputs negatively.
             # Raw cwd/source and pinned package identity suffice for declaration only;
             # labels, environment, flags and receipts cannot grant execution authority.
@@ -3429,7 +3938,8 @@ def foreign_evidence_namespace(session):
                         paths.add(str((session / "vendor" / member).resolve()))
                         if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
                     names = RING_ARCHIVES if name == "ring" else (PSM_ARCHIVE,)
-                    paths.update(str(out / n) for n in (*names, *FOREIGN_ARCHIVE_FIRST_MEMBERS[name]))
+                    paths.update(str(out / n) for n in (*names, *FOREIGN_ARCHIVE_FIRST_MEMBERS[name],
+                                 *(FOREIGN_ARCHIVE_REMAINING_MEMBERS if name == "ring" else ())))
             if receipt is not None:
                 for key in ("input_pre", "input_post", "output_pre", "output_post", "archive_pre", "archive_post"):
                     state = receipt.get(key, {})
@@ -3590,7 +4100,7 @@ def foreign_seal(session, policy):
                     require(predecessor in calls, "ForeignProbePredecessor")
                     history = [calls[predecessor][:2]]
                 compiling = operation["class"] == "CompilerObjectCompile"
-                archiving = operation["class"] == "ArchiverFirstAppend"
+                archiving = operation["class"] in {"ArchiverFirstAppend", "ArchiverRemainingAppend", "ArchiverIndex"}
                 computed = (foreign_archive_classify(receipt["role"], args, receipt["context"]) if archiving
                             else foreign_compile_classify(receipt["role"], args, receipt["context"], session, current_call=call) if compiling
                             else foreign_probe_classify(receipt["role"], args, receipt["context"], env, session, inv, history=history))
@@ -3626,7 +4136,7 @@ def foreign_seal(session, policy):
                             and receipt["output_post"]["length"] > 0, "ForeignCompileNonzeroOrMissing")
                 elif archiving:
                     family, members = foreign_archive_members(session, policy, owner, receipt["context"], operation, current_call=call)
-                    chain = foreign_archive_history(session, policy, owner, receipt["context"], family, members, live_archive=True)
+                    chain = foreign_archive_history(session, policy, owner, receipt["context"], family, live_archive=True)
                     require(any(c.name == ident for c, _ in chain), "ForeignArchivePredecessor")
                     if chain[-1][1]["tool_result"] != 0: failures.append("ForeignArchiveUnresolvedNonzero:" + chain[-1][0].name)
                 else:
