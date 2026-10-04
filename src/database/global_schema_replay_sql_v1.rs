@@ -695,3 +695,226 @@ mod tests {
         assert_eq!(owner.require_replay_clear(), Err(failure));
     }
 }
+
+
+// The new financial-source route has no native entry/issuer in this slice.
+// These fixed places/loans make no selected-provider or release-success claim.
+#[allow(dead_code)]
+mod original_native {
+    use super::super::super::rows::original_source::{OriginalSourceWork, SourceTerminal};
+    use rusqlite::ffi::{sqlite3, sqlite3_stmt};
+    use std::ffi::CString;
+    use std::marker::PhantomData;
+    use std::ptr::NonNull;
+    use std::rc::Rc;
+
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Role { Original, Reference, Copied }
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FixedAction {
+        MaterializeCount, ProspectiveExtent, Pragmas, Integrity, ForeignKeyCheck,
+        SourceId, CompileOptions, Catalog, ForeignKeys, IndexList, IndexXinfo,
+        AttachedNames, TableCount, ReferenceDdl, Encoding, TempCheck,
+        RowsExtent, TableShape, TableColumns, RowsPreflight, RowsStream,
+        CopiedQueryOnly, SelectionReconciliation, Begin, Commit, Rollback,
+        ConstructorClose, OriginalClose, ReferenceClose, CopiedClose,
+    }
+    #[repr(C, u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CodeSlot { NotCalled, Called(i32) }
+    struct ConnectionStatus {
+        open: CodeSlot,
+        extended_result: CodeSlot,
+        busy_timeout: CodeSlot,
+        close_first: CodeSlot,
+        close_second: CodeSlot,
+    }
+    #[repr(u8)]
+    enum ConnectionPhase {
+        OpenError, ConfigureExtended, ConfigureBusyTimeout, Configured,
+        FirstCopiedCloseFailed,
+    }
+    struct RawConnection {
+        db: NonNull<sqlite3>,
+        name: CString,
+        phase: ConnectionPhase,
+        status: ConnectionStatus,
+    }
+    #[repr(C, u8)]
+    enum OriginalPlace {
+        Empty,
+        NameReady { name: CString, status: ConnectionStatus },
+        NoHandle { name: CString, status: ConnectionStatus },
+        Handle(RawConnection),
+        Released(ConnectionStatus),
+    }
+    #[repr(C, u8)]
+    enum ConstructorPlace {
+        NameReady { name: CString, status: ConnectionStatus },
+        NoHandle { name: CString, status: ConnectionStatus },
+        Handle(RawConnection),
+        Released(ConnectionStatus),
+    }
+    #[repr(u8)]
+    enum ReferenceGeneration { G1, G2, G3, G4, G5, G6, G7, G8 }
+    #[repr(u8)]
+    enum ReferencePhase { Legacy, Transitional, Final }
+    struct ReferenceOccurrence {
+        generation: ReferenceGeneration,
+        phase: ReferencePhase,
+    }
+    #[repr(u8)]
+    enum CopiedOccurrence {
+        InitialPair, FinalPair, IssueFifth, RenderSixth,
+        TargetCompareOne, TargetCompareTwo,
+    }
+    #[repr(C, u8)]
+    enum AuxPlace {
+        Empty,
+        Reference { occurrence: ReferenceOccurrence, place: ConstructorPlace },
+        Copied { occurrence: CopiedOccurrence, place: ConstructorPlace },
+    }
+    #[repr(u8)]
+    enum CursorPhase { NoCursor, Active, Ended }
+    struct StmtState {
+        role: Role,
+        action: FixedAction,
+        cursor: CursorPhase,
+        step: CodeSlot,
+        reset: CodeSlot,
+        finalize: CodeSlot,
+    }
+    #[repr(C, u8)]
+    enum StmtSlot {
+        Vacant,
+        Live { stmt: NonNull<sqlite3_stmt>, state: StmtState },
+        Finalized(StmtState),
+    }
+    #[repr(u8)]
+    enum StatementPhase { Empty, Single, Integrity, Catalog, Pair }
+    #[repr(u8)]
+    enum TxPhase { NotCreated, Active, Consuming, Finished }
+    #[repr(u8)]
+    enum TxExit { NotSelected, EarlyError, CommitConsume, FailedCommit }
+    #[repr(C, u8)]
+    enum AutocommitObservation { NotObserved, Observed(i32) }
+    #[repr(u8)]
+    enum RollbackObservation { NotReached, Reached }
+    struct TxRecord {
+        phase: TxPhase,
+        exit: TxExit,
+        autocommit: AutocommitObservation,
+        rollback: RollbackObservation,
+    }
+    struct FixedAdverse {
+        role: Role,
+        action: FixedAction,
+        ordinal: usize,
+        code: i32,
+    }
+    struct NativeOriginalOwner {
+        original: OriginalPlace,
+        aux: AuxPlace,
+        statements: [StmtSlot; 3],
+        statement_phase: StatementPhase,
+        tx: TxRecord,
+        secondary: Option<FixedAdverse>,
+        _thread: PhantomData<Rc<()>>,
+    }
+    // No Connection/Statement/Rows/Transaction overlap, raw getter, from_raw,
+    // live-handle constructor or default Drop is introduced. Real acquisition
+    // and explicit qualified release remain the next behavior slice.
+    impl NativeOriginalOwner {
+        fn empty() -> Self {
+            Self {
+                original: OriginalPlace::Empty,
+                aux: AuxPlace::Empty,
+                statements: [StmtSlot::Vacant, StmtSlot::Vacant, StmtSlot::Vacant],
+                statement_phase: StatementPhase::Empty,
+                tx: TxRecord {
+                    phase: TxPhase::NotCreated,
+                    exit: TxExit::NotSelected,
+                    autocommit: AutocommitObservation::NotObserved,
+                    rollback: RollbackObservation::NotReached,
+                },
+                secondary: None,
+                _thread: PhantomData,
+            }
+        }
+    }
+
+    // Opaque declaration only: the absent issuer cannot create a rule value.
+    // No operation here interprets this as a qualified provider or a gate.
+    struct SelectedOriginalNativeRules { _issuance: std::convert::Infallible }
+    struct OriginalSqlLoan<'n, 'w> {
+        native: &'n mut NativeOriginalOwner,
+        work: OriginalSourceWork<'w>,
+        rules: &'n SelectedOriginalNativeRules,
+    }
+    impl OriginalSqlLoan<'_, '_> {
+        fn reborrow(&mut self) -> OriginalSqlLoan<'_, '_> {
+            OriginalSqlLoan {
+                native: &mut *self.native,
+                work: self.work.reborrow(),
+                rules: self.rules,
+            }
+        }
+    }
+    #[repr(C, u8)]
+    enum BorrowedCell<'v> {
+        Null, Integer(i64), RealBits(u64), Text(&'v [u8]), Blob(&'v [u8]),
+    }
+    struct StatementAccess<'v> {
+        connection: &'v mut RawConnection,
+        slot: &'v mut StmtSlot,
+    }
+    // Cells cannot escape a same-connection mutable borrow. No native cell
+    // operation is implemented until pointer/status/view rules are selected.
+
+    #[repr(u8)]
+    enum FsAction { JournalAbsent, WalIdentity, ShmIdentity, UnlinkWal, UnlinkShm,
+        DirectorySync, SuffixAbsent, NamespaceIdentity }
+    #[repr(C, u8)]
+    enum FsResult { NotCalled, Ok, Errno(i32), IdentityMismatch }
+    struct FsObservation { action: FsAction, ordinal: usize, result: FsResult }
+    #[repr(u8)]
+    enum FileRelease { NotTaken, TakenAndDropped }
+    #[repr(u8)]
+    enum GuardRelease { NotTaken, TakenAndReleased }
+    struct AuditReleaseStatus {
+        unlock: CodeSlot,
+        file: FileRelease,
+        guard: GuardRelease,
+    }
+    struct FixedDrainLedger {
+        first_secondary: Option<FixedAdverse>,
+        filesystem: FsObservation,
+        audit: AuditReleaseStatus,
+    }
+    #[repr(u8)]
+    enum CloseAction { Constructor, Original, Reference, CopiedFirst, CopiedSecond }
+    struct FixedCloseViolation {
+        role: Role,
+        action: CloseAction,
+        status: i32,
+        first_terminal: Option<SourceTerminal>,
+    }
+    struct UnreleasedOriginalFrame<'n, 'w> {
+        loan: OriginalSqlLoan<'n, 'w>,
+        release: &'n mut FixedDrainLedger,
+    }
+    // A future genuine owning frame lends these sibling fields at its actual
+    // last-close cut. Passing this loan moves neither its native owner nor its
+    // RowsWork, and introduces no empty publication/restore/second take.
+    fn native_original_contract_violation(
+        _frame: UnreleasedOriginalFrame<'_, '_>,
+        _violation: FixedCloseViolation,
+    ) -> ! {
+        std::process::abort()
+    }
+    // Loans have no Drop action. Native/work/ledger remain in their owning
+    // fields during the short exclusive borrow; actual abort qualification,
+    // cleanup/native status and all selected layout/full-fit gates stay open.
+}

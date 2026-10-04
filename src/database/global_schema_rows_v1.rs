@@ -105,6 +105,9 @@ pub(super) struct RowsWork {
     rows: u64,
     bytes: u64,
     streams: u64,
+    // Used only by the new financial-source representation. Ordinary Rows
+    // capture continues on its existing safe-driver path.
+    source_terminal: Option<original_source::SourceTerminal>,
 }
 impl RowsWork {
     #[cfg(test)]
@@ -122,6 +125,7 @@ impl RowsWork {
             rows: 0,
             bytes: 0,
             streams: 0,
+            source_terminal: None,
         }
     }
     pub(super) fn reserve_copy_route(
@@ -1381,5 +1385,389 @@ mod tests {
         let mut row = 0;
         work.value(ValueRef::Integer(1), &mut row).unwrap();
         assert!(work.value(ValueRef::Null, &mut row).is_err());
+    }
+}
+
+
+// No provider, native execution, source capability or public-purpose entry is
+// issued here. These owning shapes precede the genuine G acquisition slice.
+#[allow(dead_code)]
+pub(in crate::database) mod original_source {
+    use super::*;
+    use crate::database::global_schema_catalog_v1::RowsSpecDebitFailure;
+    use crate::database::selection_v2::SelectionV2SchemaError;
+    use crate::selection::schema_v2::SchemaV2Error;
+    use diesel::r2d2::Error as ConnectionManagerError;
+
+    // Closed O01..O18 producer sites. They are not caller allocator labels.
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::database) enum SourceSite {
+        PhysicalPaths,
+        PragmasAndIntegrity,
+        RuntimeIdentity,
+        RawCatalog,
+        ForeignKeys,
+        ManagedNames,
+        IndexGeometry,
+        CountsAndPayloads,
+        FrozenRegistry,
+        LegacyDdl,
+        SelectionRegistry,
+        ReferenceState,
+        SelectionPlan,
+        ReferenceExtensions,
+        CatalogComparison,
+        SelectionReconciliation,
+        ReviewAndBinding,
+        SourceTailAndCleanup,
+    }
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::database) enum SourceResourceCause {
+        Overflow,
+        Exceeded,
+    }
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::database) enum SourceRequestFamily {
+        SourceOwned,
+        NativeDriver,
+        CleanupStatus,
+    }
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::database) enum SourceQualificationCause {
+        MissingSourceRule,
+        InapplicableSourceRule,
+        MissingDriverRule,
+        InapplicableDriverRule,
+        MissingCleanupStatusRule,
+        InapplicableCleanupStatusRule,
+    }
+    #[repr(C, u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::database) enum SourceTerminal {
+        Resource {
+            site: SourceSite,
+            cause: SourceResourceCause,
+            attempted_used: u64,
+        },
+        Qualification {
+            family: SourceRequestFamily,
+            site: SourceSite,
+            cause: SourceQualificationCause,
+        },
+    }
+    // These new payload enums use C tag + payload union. Any future bound must
+    // use amended E_C8; existing Rust/std types still require their selected L.
+    // Moving the actual owner error retains its category, text and children.
+    #[repr(C, u8)]
+    pub(in crate::database) enum SourceOperationError {
+        Global(GlobalSchemaV1Error),
+        Catalog(GlobalSchemaCatalogError),
+        SelectionPlan(SelectionV2SchemaError),
+        Audit(SelectionAuditError),
+        Repository(SelectionV2RepositoryError),
+        SelectionValue(SchemaV2Error),
+        RetainedRoute(ConnectionManagerError),
+    }
+    #[repr(C, u8)]
+    pub(in crate::database) enum SourceFailure {
+        Paid(SourceOperationError),
+        Terminal(SourceTerminal),
+    }
+
+    pub(in crate::database) struct OriginalSourceWork<'w> {
+        metadata: &'w mut RowsSpecWork,
+        terminal: &'w mut Option<SourceTerminal>,
+        limits: &'w Limits,
+        rows: &'w mut u64,
+        bytes: &'w mut u64,
+        streams: &'w mut u64,
+    }
+    impl<'w> OriginalSourceWork<'w> {
+        // True field split; this neither constructs a meter nor clones work.
+        fn from_work(work: &'w mut RowsWork) -> Self {
+            let RowsWork {
+                metadata,
+                limits,
+                rows,
+                bytes,
+                streams,
+                source_terminal,
+            } = work;
+            Self {
+                metadata,
+                terminal: source_terminal,
+                limits,
+                rows,
+                bytes,
+                streams,
+            }
+        }
+        pub(in crate::database) fn reborrow(&mut self) -> OriginalSourceWork<'_> {
+            OriginalSourceWork {
+                metadata: &mut *self.metadata,
+                terminal: &mut *self.terminal,
+                limits: self.limits,
+                rows: &mut *self.rows,
+                bytes: &mut *self.bytes,
+                streams: &mut *self.streams,
+            }
+        }
+        pub(in crate::database) fn terminal(&self) -> Option<SourceTerminal> {
+            *self.terminal
+        }
+        fn require_clear(&self) -> Result<(), SourceTerminal> {
+            match *self.terminal {
+                Some(terminal) => Err(terminal),
+                None => Ok(()),
+            }
+        }
+        fn latch(&mut self, terminal: SourceTerminal) -> SourceTerminal {
+            *self.terminal.get_or_insert(terminal)
+        }
+        // Internal debit core only. No byte-amount port is exported: future
+        // named producers must first derive a genuine selected whole request.
+        fn debit(&mut self, site: SourceSite, amount: u64) -> Result<(), SourceTerminal> {
+            self.require_clear()?;
+            match self.metadata.try_charge(amount) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    let cause = match failure {
+                        RowsSpecDebitFailure::Overflow => SourceResourceCause::Overflow,
+                        RowsSpecDebitFailure::Exceeded => SourceResourceCause::Exceeded,
+                    };
+                    let terminal = SourceTerminal::Resource {
+                        site,
+                        cause,
+                        attempted_used: self.metadata.used(),
+                    };
+                    Err(self.latch(terminal))
+                }
+            }
+        }
+        fn qualify(
+            &mut self,
+            family: SourceRequestFamily,
+            site: SourceSite,
+            cause: SourceQualificationCause,
+        ) -> SourceTerminal {
+            self.latch(SourceTerminal::Qualification { family, site, cause })
+        }
+    }
+    // There is deliberately no Drop action: dropping a loan only ends borrows.
+
+    pub(in crate::database) struct StagedOriginalWork {
+        work: RowsWork,
+    }
+    pub(in crate::database) struct PendingConstruction {
+        work: RowsWork,
+        prefix: PendingPrefix,
+    }
+    #[repr(C, u8)]
+    enum PendingPrefix {
+        BeforeEncoding,
+        EncodingChecked,
+        Spec { spec: WholeRowsReadSpec },
+        TailValidated { spec: WholeRowsReadSpec, tail: RetainedRowsSourceTail },
+    }
+    pub(in crate::database) struct FinancialPending {
+        spec: WholeRowsReadSpec,
+        authority: SelectionCatalogCaptureAuthority,
+        references: Option<SameRuntimeCatalogReferences>,
+        work: RowsWork,
+        tail: RetainedRowsSourceTail,
+        initial: Option<Transcript>,
+        final_match: bool,
+        #[cfg(test)]
+        trace: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    }
+    #[repr(C, u8)]
+    pub(in crate::database) enum RowsCaptureExit {
+        Complete(FinancialPending),
+        Rejected { construction: PendingConstruction, failure: SourceFailure },
+    }
+    impl StagedOriginalWork {
+        // Private, unwired origin. The future genuine G purpose owns the only
+        // call before O01; this is not an admission/provider constructor.
+        fn begin(limits: Limits) -> Self {
+            Self { work: RowsWork::new(limits) }
+        }
+        pub(in crate::database) fn enter_rows(self) -> PendingConstruction {
+            let Self { work } = self;
+            PendingConstruction { work, prefix: PendingPrefix::BeforeEncoding }
+        }
+        pub(in crate::database) fn source_loan(&mut self) -> OriginalSourceWork<'_> {
+            OriginalSourceWork::from_work(&mut self.work)
+        }
+    }
+    impl PendingConstruction {
+        pub(in crate::database) fn source_loan(&mut self) -> OriginalSourceWork<'_> {
+            OriginalSourceWork::from_work(&mut self.work)
+        }
+        // No method in this slice advances encoding/spec/tail by a boolean or
+        // supplies a synthetic payload. Completion only moves a reached tail.
+        fn complete(
+            self,
+            authority: SelectionCatalogCaptureAuthority,
+        ) -> Result<FinancialPending, (Self, SelectionCatalogCaptureAuthority)> {
+            if self.work.source_terminal.is_some() {
+                return Err((self, authority));
+            }
+            match self {
+                Self { work, prefix: PendingPrefix::TailValidated { spec, tail } } => {
+                    Ok(FinancialPending {
+                        spec, authority, references: None, work, tail,
+                        initial: None, final_match: false,
+                        #[cfg(test)]
+                        trace: None,
+                    })
+                }
+                construction => Err((construction, authority)),
+            }
+        }
+        fn reject(self, failure: SourceFailure) -> RowsCaptureExit {
+            RowsCaptureExit::Rejected { construction: self, failure }
+        }
+    }
+    impl FinancialPending {
+        pub(in crate::database) fn source_loan(&mut self) -> OriginalSourceWork<'_> {
+            OriginalSourceWork::from_work(&mut self.work)
+        }
+    }
+
+    #[cfg(test)]
+    mod representation_tests {
+        use super::*;
+
+        // Pure move carrier: no WholeRowsReadSpec, retained File/tail, provider
+        // rule or source-success capability is fabricated for these tests.
+        struct TestCarrier { work: RowsWork }
+        impl TestCarrier {
+            fn from_construction(construction: PendingConstruction) -> Self {
+                assert!(matches!(&construction.prefix, PendingPrefix::BeforeEncoding));
+                let PendingConstruction { work, prefix: _ } = construction;
+                Self { work }
+            }
+            fn source_loan(&mut self) -> OriginalSourceWork<'_> {
+                OriginalSourceWork::from_work(&mut self.work)
+            }
+        }
+        fn staged(limit: u64) -> StagedOriginalWork {
+            let mut limits = Limits::production();
+            limits.metadata_bytes = limit;
+            StagedOriginalWork::begin(limits)
+        }
+        #[test]
+        fn history_original_owner_representation_exact_move_and_nested_loan_keep_work() {
+            let mut stage = staged(8);
+            {
+                let mut loan = stage.source_loan();
+                loan.debit(SourceSite::PhysicalPaths, 3).unwrap();
+                *loan.rows = 2;
+                *loan.bytes = 11;
+                *loan.streams = 1;
+            }
+            let mut construction = stage.enter_rows();
+            construction.source_loan().debit(SourceSite::RawCatalog, 5).unwrap();
+            let mut moved = TestCarrier::from_construction(construction);
+            {
+                let mut parent = moved.source_loan();
+                let child = parent.reborrow();
+                child.require_clear().unwrap();
+                assert_eq!(child.metadata.used(), 8);
+                assert_eq!((*child.rows, *child.bytes, *child.streams), (2, 11, 1));
+            }
+            assert_eq!(moved.work.metadata.used(), 8);
+            assert_eq!((moved.work.rows, moved.work.bytes, moved.work.streams), (2, 11, 1));
+            assert_eq!(moved.work.source_terminal, None);
+        }
+        #[test]
+        fn history_original_owner_representation_one_short_blocks_after_move_and_reborrow() {
+            let mut stage = staged(7);
+            stage.source_loan().debit(SourceSite::PhysicalPaths, 3).unwrap();
+            let mut construction = stage.enter_rows();
+            let first = SourceTerminal::Resource {
+                site: SourceSite::RawCatalog,
+                cause: SourceResourceCause::Exceeded,
+                attempted_used: 8,
+            };
+            assert_eq!(construction.source_loan().debit(SourceSite::RawCatalog, 5), Err(first));
+            let mut moved = TestCarrier::from_construction(construction);
+            {
+                let mut parent = moved.source_loan();
+                let mut child = parent.reborrow();
+                assert_eq!(child.debit(SourceSite::ReviewAndBinding, 1), Err(first));
+                assert_eq!(child.qualify(
+                    SourceRequestFamily::NativeDriver,
+                    SourceSite::SourceTailAndCleanup,
+                    SourceQualificationCause::MissingDriverRule,
+                ), first);
+            }
+            assert_eq!(moved.work.metadata.used(), 8);
+            assert_eq!(moved.work.source_terminal, Some(first));
+        }
+        #[test]
+        fn history_original_owner_representation_overflow_rejection_retains_work() {
+            let mut stage = staged(u64::MAX);
+            stage.source_loan().debit(SourceSite::PhysicalPaths, u64::MAX).unwrap();
+            let mut construction = stage.enter_rows();
+            let first = construction.source_loan().debit(SourceSite::RawCatalog, 1).unwrap_err();
+            assert_eq!(first, SourceTerminal::Resource {
+                site: SourceSite::RawCatalog,
+                cause: SourceResourceCause::Overflow,
+                attempted_used: u64::MAX,
+            });
+            let exit = construction.reject(SourceFailure::Terminal(first));
+            let RowsCaptureExit::Rejected { mut construction, failure } = exit else {
+                panic!("pure representation failure must retain construction");
+            };
+            assert!(matches!(failure, SourceFailure::Terminal(terminal) if terminal == first));
+            assert_eq!(construction.work.metadata.used(), u64::MAX);
+            assert_eq!(construction.source_loan().debit(SourceSite::RawCatalog, 0), Err(first));
+            assert_eq!(construction.work.metadata.used(), u64::MAX);
+        }
+        #[test]
+        fn history_original_owner_representation_qualification_survives_move_and_loan_drop() {
+            let mut stage = staged(8);
+            let first = stage.source_loan().qualify(
+                SourceRequestFamily::SourceOwned,
+                SourceSite::PhysicalPaths,
+                SourceQualificationCause::MissingSourceRule,
+            );
+            let mut construction = stage.enter_rows();
+            {
+                let mut parent = construction.source_loan();
+                let child = parent.reborrow();
+                assert_eq!(child.terminal(), Some(first));
+            }
+            assert_eq!(construction.source_loan().debit(SourceSite::RawCatalog, 8), Err(first));
+            assert_eq!(construction.work.metadata.used(), 0);
+            assert_eq!(construction.work.source_terminal, Some(first));
+        }
+        #[test]
+        fn history_original_owner_representation_paid_failure_is_separate_from_terminal() {
+            let mut stage = staged(8);
+            stage.source_loan().debit(SourceSite::PhysicalPaths, 3).unwrap();
+            let construction = stage.enter_rows();
+            // A fixed, preexisting owner-category fixture; no source provider or
+            // paid diagnostic construction is simulated by this representation.
+            let failure = SourceFailure::Paid(SourceOperationError::Global(
+                GlobalSchemaV1Error::ExclusiveProcessMaintenanceLeaseUnavailable,
+            ));
+            let exit = construction.reject(failure);
+            let RowsCaptureExit::Rejected { mut construction, failure } = exit else {
+                panic!("ordinary rejection must retain construction");
+            };
+            let SourceFailure::Paid(SourceOperationError::Global(error)) = failure else {
+                panic!("owner error category must move unchanged");
+            };
+            assert_eq!(error.code(), "global_schema_exclusive_process_lease_busy");
+            assert_eq!(construction.work.metadata.used(), 3);
+            assert_eq!(construction.work.source_terminal, None);
+            assert_eq!(construction.source_loan().require_clear(), Ok(()));
+        }
     }
 }
