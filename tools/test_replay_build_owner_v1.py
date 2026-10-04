@@ -1410,6 +1410,229 @@ compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,extra=['--target'
 emit({'reason':'build-finished','success':True})
 '''
 
+# Deterministic protocol fixtures, not real rustversion/thiserror or Cargo.
+RECORD10_RUSTC = r'''
+import json,os,pathlib,signal,sys
+args=sys.argv[1:];case=os.environ.get('RECORD10_CASE','normal')
+hits=pathlib.Path(os.environ['FIXTURE_HIT_ROOT']);hits.mkdir(parents=True,exist_ok=True)
+def value(k):
+    inline=[a.split('=',1)[1] for a in args if a.startswith(k+'=')]
+    return inline[0] if inline else args[args.index(k)+1]
+version=args==['--version'];probe='build/probe.rs' in args
+name='version' if version else ('feature-probe' if probe else value('--crate-name'))
+stdout=b'rustc 1.95.0 (TEST_CODE protocol oracle)\n' if version else b'TEST_CODE_stream_out\n'
+stderr=(json.dumps({'fixture_argv':args,'fixture_environment':dict(os.environ)},sort_keys=True)+'\n').encode()
+(hits/(name+'-'+os.environ.get('CARGO_PKG_NAME','application')+'.json')).write_text(json.dumps({'argv':sys.argv,'environment':dict(os.environ),'cwd':str(pathlib.Path.cwd()),'stdout_hex':stdout.hex(),'stderr_hex':stderr.hex()}))
+os.write(1,stdout);os.write(2,stderr)
+if version:sys.exit(1 if case=='version-fail' else 0)
+source=next(pathlib.Path(a) for a in args if a.endswith('.rs'))
+out=pathlib.Path(value('--out-dir'));out.mkdir(parents=True,exist_ok=True)
+crate=value('--crate-name');kind=value('--crate-type')
+def esc(s):return str(s).replace(chr(92),chr(92)*2).replace(' ',chr(92)+' ').replace('#',chr(92)+'#').replace(':',chr(92)+':').replace('$','$$')
+deps=[source.resolve()]
+if not probe and source.name=='build.rs' and os.environ.get('CARGO_PKG_NAME')=='rustversion':deps.append(source.parent/'rustc.rs')
+if not probe and source.name=='lib.rs' and os.environ.get('CARGO_PKG_NAME') in ('rustversion','thiserror'):
+    deps.append(pathlib.Path(os.environ['OUT_DIR'])/('version.expr' if os.environ['CARGO_PKG_NAME']=='rustversion' else 'private.rs'))
+if probe:
+    code=0 if case.startswith('probe0') else (2 if case=='probe2' else 1)
+    variant='both' if case in ('snapshot-missing','snapshot-tamper') else (case.split('-',1)[1] if case.startswith(('probe0-','probe1-')) else 'none')
+    files=[]
+    if variant in ('both','dep'):(out/'thiserror.d').write_text('out: '+esc(source.resolve())+'\n');files.append(out/'thiserror.d')
+    if variant in ('both','meta'):(out/'libthiserror.rmeta').write_bytes(b'TEST_CODE_partial_metadata');files.append(out/'libthiserror.rmeta')
+    if case=='dep-error':(out/'thiserror.d').write_text('malformed TEST_CODE dep-info')
+    if case=='capture-alias':(out/'thiserror.d').symlink_to(source.resolve())
+    if case=='capture-late':
+        (out/'thiserror.d').write_text('out: '+esc(source.resolve())+'\n');(out/'libthiserror.rmeta').symlink_to(source.resolve())
+    if case=='source-post':source.chmod(0o644);source.write_bytes(b'TEST_CODE_post_child_source_drift');source.chmod(0o444)
+    if case=='signal':os.kill(os.getpid(),signal.SIGKILL)
+    sys.exit(code)
+files=[out/crate] if kind=='bin' else ([out/('lib'+crate+'.rmeta'),out/('lib'+crate+'.dylib')] if kind=='proc-macro' else [out/('lib'+crate+'.rmeta'),out/('lib'+crate+'.rlib')])
+for f in files:f.write_bytes(b'TEST_CODE_output:'+crate.encode()+b':'+source.read_bytes())
+(out/(crate+'.d')).write_text(esc(files[0])+': '+' '.join(esc(p) for p in deps)+'\n')
+'''
+
+RECORD10_CARGO = r'''
+import hashlib,json,os,pathlib,shutil,subprocess,sys
+CASE=__CASE__
+args=sys.argv[1:]
+def value(k):return args[args.index(k)+1]
+app=pathlib.Path(value('--manifest-path')).parent;session=app.parent;target=pathlib.Path(value('--target-dir'))
+host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+for p in (host,deps):p.mkdir(parents=True,exist_ok=True)
+loader=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']
+nested=str(target/'debug')+':'+str(host)+':'+str(pathlib.Path(os.environ['RUSTC']).parent/'sysroot/lib/rustlib/x86_64-apple-darwin/lib')+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH']
+def emit(e):print(json.dumps(e),flush=True)
+def artifact(pkg,source,name,kind,files,features):
+    manifest=app/'Cargo.toml' if pkg=='TEST_CODE_app' else session/'vendor'/pkg.rsplit('#',1)[1].split('@')[0]/'Cargo.toml'
+    return {'reason':'compiler-artifact','package_id':pkg,'manifest_path':str(manifest),'target':{'src_path':str(source),'kind':[kind],'crate_types':['bin' if kind=='custom-build' else kind],'name':name,'edition':'2021'},'features':features,'filenames':[str(p) for p in files],'executable':None,'fresh':False}
+def env_for(name,version,root,out):
+    major,minor,patch=version.split('.')
+    env=dict(os.environ,CARGO_PKG_NAME=name,CARGO_PKG_VERSION=version,CARGO_PKG_VERSION_MAJOR=major,CARGO_PKG_VERSION_MINOR=minor,CARGO_PKG_VERSION_PATCH=patch,CARGO_PKG_VERSION_PRE='',CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),OUT_DIR=str(out),HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',CARGO_ENCODED_RUSTFLAGS='',FIXTURE_HIT_ROOT=str(session/'compiler-entry'),RECORD10_CASE=CASE,DYLD_FALLBACK_LIBRARY_PATH=loader)
+    if name=='thiserror':env.update(CARGO_FEATURE_DEFAULT='1',CARGO_FEATURE_STD='1')
+    return env
+def compile(name,source,pkg,dest,kind,env,cfg=()):
+    command=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--crate-name',name,'--edition=2021',str(source),'--crate-type',kind,'--emit='+('dep-info,link' if kind=='bin' else 'dep-info,metadata,link'),'--out-dir',str(dest)]+[v for c in cfg for v in ('--cfg',c)]
+    if kind=='lib':command+=['--target','x86_64-apple-darwin']
+    execution_cwd=pathlib.Path(env['CARGO_MANIFEST_DIR'])
+    if env.get('CARGO_PKG_NAME')=='thiserror' and ((CASE=='consumer-cwd' and kind=='lib') or (CASE=='builder-cwd' and kind=='bin')):execution_cwd=app
+    result=subprocess.run(command,env=env,cwd=execution_cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if result.returncode:raise RuntimeError(result.stderr.decode(errors='replace'))
+    files=[dest/name] if kind=='bin' else ([dest/('lib'+name+'.rmeta'),dest/('lib'+name+'.dylib')] if kind=='proc-macro' else [dest/('lib'+name+'.rmeta'),dest/('lib'+name+'.rlib')])
+    return artifact(pkg,source,name,'custom-build' if kind=='bin' else kind,files,[] if env.get('CARGO_PKG_NAME')!='thiserror' else ['default','std'])
+for name,version in (('rustversion','1.0.22'),('thiserror','2.0.18')):
+    root=session/'vendor'/name;pkg='registry+https://github.com/rust-lang/crates.io-index#'+name+'@'+version
+    out=(target/'debug/build' if name=='rustversion' else target/'x86_64-apple-darwin/debug/build')/(name+'-0123456789abcdef')/'out';out.mkdir(parents=True)
+    env=env_for(name,version,root,out);cfg=[] if name=='rustversion' else ['feature="default"','feature="std"']
+    if CASE=='ordinary-probe' and name=='rustversion':
+        ordinary=dict(env,DYLD_FALLBACK_LIBRARY_PATH=os.environ['DYLD_FALLBACK_LIBRARY_PATH']);ordinary.pop('OUT_DIR')
+        result=subprocess.run([os.environ['RUSTC_WRAPPER'],os.environ['RUSTC'],'--version'],env=ordinary,cwd=root,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        if result.returncode:raise RuntimeError('TEST_CODE ordinary Cargo probe refused')
+    source=root/('build/build.rs' if name=='rustversion' else 'build.rs')
+    builderenv={k:v for k,v in env.items() if not k.startswith('CARGO_FEATURE_') and k not in ('OUT_DIR','HOST','TARGET','CARGO_ENCODED_RUSTFLAGS')}
+    builder=compile('build_script_build',source,pkg,target/'debug/build'/(name+'-fedcba9876543210'),'bin',builderenv,cfg)
+    original=pathlib.Path(builder['filenames'][0]);alias=original.parent/'build-script-build';shutil.copyfile(original,alias);builder['filenames']=[str(alias)]
+    if CASE=='alias-bytes' and name=='thiserror':alias.write_bytes(b'TEST_CODE_wrong_alias')
+    if CASE!='missing-builder' or name!='thiserror':emit(builder)
+    if CASE=='duplicate-builder' and name=='thiserror':emit(builder)
+    if CASE=='builder-raw' and name=='thiserror':
+        p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(source));request=p.parent/'request.json';r=json.loads(request.read_text())
+        r['argv_hex']=[os.fsencode(str(root/'src/lib.rs')).hex() if a==os.fsencode(str(source)).hex() else a for a in r['argv_hex']];request.write_text(json.dumps(r))
+    if CASE=='builder-request-cwd' and name=='thiserror':
+        p=next(p for p in (session/'invocations').glob('*/request.json') if (p.parent/'receipt.json').exists() and json.loads((p.parent/'receipt.json').read_text()).get('source')==str(source));r=json.loads(p.read_text());r['cwd_hex']=os.fsencode(str(app)).hex();p.write_text(json.dumps(r))
+    if name=='thiserror':(out/'private.rs').write_bytes(b'#[doc(hidden)]\npub mod __private18 {\n    #[doc(hidden)]\n    pub use crate::private::*;\n}\n')
+    raw=[os.environ['RUSTC'],'--version'] if name=='rustversion' else [os.environ['RUSTC'],'--edition=2018','--crate-name=thiserror','--crate-type=lib','--cap-lints=allow','--emit=dep-info,metadata','--out-dir',str(out/'probe'),'build/probe.rs','--target','x86_64-apple-darwin']
+    childenv=dict(env,DYLD_FALLBACK_LIBRARY_PATH=nested);cwd=root;saved={};variant=None
+    if CASE.startswith('reject:'+name+':'):
+        variant=CASE.split(':',2)[2]
+        if variant=='version':childenv['CARGO_PKG_VERSION']='0.0.1'
+        if variant=='components':childenv['CARGO_PKG_VERSION_PATCH']='99'
+        if variant=='package':childenv['CARGO_PKG_NAME']='unknown'
+        if variant=='manifest':childenv['CARGO_MANIFEST_PATH']=str(app/'Cargo.toml')
+        if variant=='cwd':cwd=app
+        if variant=='features':childenv['CARGO_FEATURE_UNKNOWN']='1'
+        if variant=='feature-missing':childenv.pop('CARGO_FEATURE_STD',None)
+        if variant=='host':childenv['HOST']='unknown'
+        if variant=='target-env':childenv['TARGET']='unknown'
+        if variant=='outdir':childenv['OUT_DIR']=str(target)
+        if variant=='wrapper':childenv['RUSTC_WRAPPER']=str(session/'other')
+        if variant=='compiler':childenv['RUSTC']=str(session/'other')
+        if variant=='loader':childenv['DYLD_FALLBACK_LIBRARY_PATH']=nested+':/other'
+        if variant=='bootstrap':childenv['RUSTC_BOOTSTRAP']=''
+        if variant=='stage':childenv['RUSTC_STAGE']=''
+        if variant=='workspace':childenv['RUSTC_WORKSPACE_WRAPPER']='/other'
+        if variant=='workspace-empty':childenv['RUSTC_WORKSPACE_WRAPPER']=''
+        if variant=='encoded':childenv['CARGO_ENCODED_RUSTFLAGS']='-ZTEST_CODE'
+        if variant in ('source','symlink','hardlink','directory','manifest-hash'):
+            leaf=root/('Cargo.toml' if variant=='manifest-hash' else ('build/rustc.rs' if name=='rustversion' else 'build/probe.rs'));saved[leaf]=leaf.read_bytes();leaf.unlink()
+            if variant=='symlink':leaf.symlink_to(root/'src/lib.rs')
+            elif variant=='hardlink':os.link(root/'src/lib.rs',leaf)
+            elif variant=='directory':leaf.mkdir()
+            else:leaf.write_bytes(b'TEST_CODE_changed')
+        if variant=='empty':raw=raw[:1]
+        if variant=='retry':raw=[raw[0],'--rustc','--version']
+        if variant=='extra':raw+=['--test']
+        if variant=='native':raw+=['-l','TEST_CODE']
+        if variant=='extern':raw+=['--extern','TEST_CODE='+str(host/'foreign.rlib')]
+        if variant=='reorder':raw=raw[:1]+list(reversed(raw[1:]))
+        if variant=='wrong-source':raw=[a.replace('build/probe.rs','build/other.rs') for a in raw]
+        if variant=='missing-target':raw=raw[:-2]
+        if variant=='missing-group':raw=raw[:1]+raw[-1:]
+    if CASE.startswith('namespace-noreceipt-') and name=='thiserror':childenv.pop('CARGO_FEATURE_STD')
+    (session/(name+'-attempt.json')).write_text(json.dumps({'argv_hex':[os.fsencode(a).hex() for a in raw],'environment_hex':{os.fsencode(k).hex():os.fsencode(v).hex() for k,v in childenv.items()},'cwd_hex':os.fsencode(str(cwd)).hex()}))
+    zero=CASE=='zero-child' and name=='thiserror'
+    source_saved=(root/'build/probe.rs').read_bytes() if CASE=='source-post' and name=='thiserror' else None
+    result=None if zero else subprocess.run([os.environ['RUSTC_WRAPPER'],*raw],env=childenv,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if CASE=='duplicate-child' and name=='thiserror':subprocess.run([os.environ['RUSTC_WRAPPER'],*raw],env=childenv,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    for leaf,b in saved.items():
+        if leaf.is_dir() and not leaf.is_symlink():leaf.rmdir()
+        else:leaf.unlink()
+        leaf.write_bytes(b)
+    if CASE=='source-post' and name=='thiserror':
+        leaf=root/'build/probe.rs';leaf.chmod(0o644);leaf.write_bytes(source_saved);leaf.chmod(0o444)
+    if name=='rustversion':(out/'version.expr').write_bytes(b'TEST_CODE_VERSION_EXPR:'+((result.stdout if result else b'')))
+    else:
+        probe=out/'probe'
+        retained=[]
+        for p in (session/'invocations').glob('*/receipt.json'):
+            r=json.loads(p.read_text())
+            if r.get('context',{}).get('kind')=='ThiserrorStaticFeatureProbe':retained.append({'id':p.parent.name,'code':r['exit_code'],'outputs':r['outputs']})
+        (session/'before-builder-cleanup.json').write_text(json.dumps(retained))
+        if probe.exists():shutil.rmtree(probe)
+    for p in (session/'invocations').glob('*/receipt.json'):
+        r=json.loads(p.read_text())
+        if name=='thiserror' and r.get('context',{}).get('kind')=='ThiserrorStaticFeatureProbe':
+            if CASE in ('snapshot-missing','snapshot-tamper') and r['outputs']:
+                q=p.parent/r['outputs'][0]['snapshot'];q.unlink() if CASE=='snapshot-missing' else q.write_bytes(b'TEST_CODE_tamper')
+            if CASE.startswith('namespace-') and not CASE.startswith('namespace-noreceipt-'):
+                denial=CASE.split('-')[1];request=p.parent/'request.json';q=json.loads(request.read_text())
+                if denial=='features':q['environment_hex'].pop(b'CARGO_FEATURE_STD'.hex())
+                elif denial=='manifest':q['environment_hex'][b'CARGO_MANIFEST_PATH'.hex()]=os.fsencode(str(app/'Cargo.toml')).hex()
+                elif denial=='template':q['argv_hex'].remove(b'--cap-lints=allow'.hex())
+                else:raise RuntimeError('TEST_CODE unknown fixed namespace denial')
+                request.write_text(json.dumps(q));r['environment_hex']=q['environment_hex'];r['argv_hex']=q['argv_hex']
+                initial=p.parent/'invocation.json';i=json.loads(initial.read_text());i['environment_hex']=q['environment_hex'];i['argv_hex']=q['argv_hex'];initial.write_text(json.dumps(i))
+            if CASE=='unannotated' or CASE.startswith('namespace-'):
+                r['context']={'kind':'DirectCargoCompile'};r['kind']='Compile';p.write_text(json.dumps(r))
+                initial=p.parent/'invocation.json';i=json.loads(initial.read_text());i['context']=r['context'];i['kind']='Compile';initial.write_text(json.dumps(i))
+    code=0 if zero else result.returncode
+    cfgs=['error_generic_member_access'] if name=='thiserror' and code==0 else []
+    if CASE=='cfg-mismatch' and name=='thiserror':cfgs=[] if cfgs else ['error_generic_member_access']
+    event={'reason':'build-script-executed','package_id':pkg,'out_dir':str(out),'linked_libs':[],'linked_paths':[],'cfgs':cfgs,'env':[]}
+    if CASE=='origin-package' and name=='thiserror':event['package_id']='TEST_CODE_other'
+    if CASE=='origin-outdir' and name=='thiserror':event['out_dir']=str(out.parent/'other');pathlib.Path(event['out_dir']).mkdir()
+    if CASE!='missing-origin' or name!='thiserror':emit(event)
+    if CASE=='duplicate-origin' and name=='thiserror':emit(event)
+    if variant:continue
+    if CASE=='private-bytes' and name=='thiserror':(out/'private.rs').write_bytes(b'TEST_CODE_wrong_private')
+    consumerenv={k:v for k,v in env.items() if not k.startswith('CARGO_FEATURE_') and k not in ('HOST','TARGET','CARGO_ENCODED_RUSTFLAGS')}
+    lib=compile(name,root/'src/lib.rs',pkg,host if name=='rustversion' else deps,'proc-macro' if name=='rustversion' else 'lib',consumerenv,cfg+cfgs)
+    if CASE=='consumer-initial-cwd' and name=='thiserror':
+        p=next(p.parent/'invocation.json' for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));i=json.loads(p.read_text());i['cwd']=str(app);p.write_text(json.dumps(i))
+    if CASE!='missing-consumer' or name!='thiserror':emit(lib)
+    if CASE=='duplicate-consumer' and name=='thiserror':emit(lib)
+    if CASE=='generated-dep-missing' and name=='thiserror':
+        (deps/'thiserror.d').write_text('out: '+str(root/'src/lib.rs')+'\n')
+        p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));r=json.loads(p.read_text())
+        for o in r['outputs']:
+            if o['kind']=='dep-info':o['dep_info']['paths']=[str(root/'src/lib.rs')];o['sha256']=hashlib.sha256((deps/'thiserror.d').read_bytes()).hexdigest()
+        p.write_text(json.dumps(r))
+    if CASE in ('transient-artifact','transient-extern','transient-consumed','transient-ordinary') and name=='thiserror':
+        forbidden=out/'probe/thiserror.d';forbidden.parent.mkdir(exist_ok=True);forbidden.write_bytes(b'TEST_CODE_recreated')
+        if CASE=='transient-artifact':emit(artifact(pkg,root/'src/lib.rs','thiserror','lib',[forbidden],['default','std']))
+        if CASE=='transient-extern':
+            p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));r=json.loads(p.read_text());r['externs']=[{'name':'TEST_CODE','path':str(forbidden)}];p.write_text(json.dumps(r))
+        if CASE=='transient-consumed':
+            (deps/'thiserror.d').write_text('out: '+str(forbidden)+'\n')
+            p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));r=json.loads(p.read_text())
+            for o in r['outputs']:
+                if o['kind']=='dep-info':o['dep_info']['paths']=[str(forbidden)]
+            p.write_text(json.dumps(r))
+        if CASE=='transient-ordinary':
+            p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));r=json.loads(p.read_text());r['declared_outputs'].append({'path':str(forbidden),'kind':'metadata'});p.write_text(json.dumps(r))
+    if CASE.startswith('namespace-') and name=='thiserror':
+        _,denial,reuse,leaf=CASE.split('-');filename='thiserror.d' if leaf=='dep' else 'libthiserror.rmeta'
+        forbidden=out/'probe'/filename;forbidden.parent.mkdir(exist_ok=True);forbidden.write_bytes(b'TEST_CODE_combined_recreated')
+        p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(root/'src/lib.rs'));r=json.loads(p.read_text())
+        if reuse=='artifact':emit(artifact(pkg,root/'src/lib.rs','thiserror','lib',[forbidden],['default','std']))
+        elif reuse=='extern':r['externs']=[{'name':'TEST_CODE','path':str(forbidden)}];p.write_text(json.dumps(r))
+        elif reuse=='consumed':
+            dep=deps/'thiserror.d';dep.write_text('out: '+str(forbidden)+'\n')
+            for o in r['outputs']:
+                if o['kind']=='dep-info':o['dep_info']['paths']=[str(forbidden)];o['sha256']=hashlib.sha256(dep.read_bytes()).hexdigest()
+            p.write_text(json.dumps(r))
+        elif reuse=='ordinary':
+            r['declared_outputs'].append({'path':str(forbidden),'kind':'metadata'})
+            r['outputs'].append({'path':str(forbidden),'kind':'metadata','sha256':hashlib.sha256(forbidden.read_bytes()).hexdigest()});p.write_text(json.dumps(r))
+            emit(artifact('TEST_CODE_app',app/'src/lib.rs','stock_analysis','lib',[forbidden],[]))
+        else:raise RuntimeError('TEST_CODE unknown fixed namespace reuse')
+    if CASE=='version-owned-file' and name=='rustversion':
+        p=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('context',{}).get('kind')=='RustversionBuildVersion');r=json.loads(p.read_text());r['outputs']=[{'path':str(out/'version.expr'),'kind':'metadata','sha256':'0'*64}];p.write_text(json.dumps(r))
+env=dict(os.environ,CARGO_MANIFEST_DIR=str(app),DYLD_FALLBACK_LIBRARY_PATH=loader,FIXTURE_HIT_ROOT=str(session/'compiler-entry'))
+emit(compile('stock_analysis',app/'src/lib.rs','TEST_CODE_app',deps,'lib',env))
+emit({'reason':'build-finished','success':CASE!='cargo-failure'})
+'''
+
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -3197,6 +3420,215 @@ class RecordingProtocolTests(unittest.TestCase):
         self.assertEqual(len(dep["environment_comment_hex"]), 1)
         with self.assertRaises(owner.Refusal):
             owner.dep_info(b"out: $(shell unsafe)\n")
+
+
+    def record10_result(self, case="probe0-both", status=0):
+        inventory = self.prepare("nested:normal")
+        vendor = self.root / "vendor-origin"
+        for name, version, sources in (("rustversion", "1.0.22", ("build/build.rs", "build/rustc.rs", "src/lib.rs")),
+                                        ("thiserror", "2.0.18", ("build.rs", "build/probe.rs", "src/lib.rs"))):
+            write(vendor / name / "Cargo.toml", '[package]\nname="' + name + '"\nversion="' + version + '"\n')
+            for source in sources:
+                write(vendor / name / source, "// TEST_CODE fixed protocol source " + source + "\n")
+            write(vendor / name / ".cargo-checksum.json", '{"files":{},"package":"TEST_CODE"}')
+            inventory["packages"].append({"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+                                           "tree": "vendor", "manifest": name + "/Cargo.toml"})
+        inventory["vendor"] = snapshot(vendor, ["dep", "libc", "proc-macro2", "rustversion", "thiserror"])
+        if case.endswith(":inventory"):
+            name = case.split(":")[1]
+            next(p for p in inventory["packages"] if p["manifest"] == name + "/Cargo.toml")["id"] = "TEST_CODE_wrong_package_identity"
+        rustc = write(self.root / "fake-rustc", "#!" + PYTHON + " -I\n" + RECORD10_RUSTC)
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + RECORD10_CARGO.replace("__CASE__", repr(case)))
+        rustc.chmod(0o700); cargo.chmod(0o700)
+        inventory["rustc"] = {"path": str(rustc), "sha256": sha(rustc)}
+        inventory["cargo"] = {"path": str(cargo), "sha256": sha(cargo)}
+        inventory["generators"]["PROTOC"] = dict(inventory["rustc"])
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.PROFILE, "inventory": inventory}))
+        result = self.invoke("record")
+        self.assertEqual(result.returncode, status, result.stderr.decode(errors="replace"))
+        record = self.record_result(result)
+        session = Path(json.loads(result.stdout)["record_path"]).parent
+        receipts = [(p.parent, json.loads(p.read_text())) for p in (session / "invocations").glob("*/receipt.json")]
+        return session, record, receipts
+
+    def test_record10_nested_origins_preserve_actual_raw_requests(self):
+        session, record, receipts = self.record10_result()
+        self.assertEqual(record["blockers"], [])
+        self.assertEqual(len(record["selected_library"]), 1)
+        children = [(p, r) for p, r in receipts if r["context"]["kind"] in owner.RECORD10_KINDS]
+        self.assertEqual(len(children), 2)
+        for path, r in children:
+            name = "rustversion" if r["kind"] == "Probe" else "thiserror"
+            attempt = json.loads((session / (name + "-attempt.json")).read_text())
+            request = json.loads((path / "request.json").read_text())
+            self.assertEqual(request["argv_hex"], attempt["argv_hex"])
+            self.assertEqual(request["environment_hex"], attempt["environment_hex"])
+            hit = json.loads((session / "compiler-entry" / (("version-" if name == "rustversion" else "feature-probe-") + name + ".json")).read_text())
+            self.assertEqual([os.fsencode(a).hex() for a in hit["argv"]], request["argv_hex"])
+            self.assertEqual({os.fsencode(k).hex(): os.fsencode(v).hex() for k, v in hit["environment"].items()}, request["environment_hex"])
+            self.assertEqual((path / "stdout.raw").read_bytes().hex(), hit["stdout_hex"])
+            self.assertEqual((path / "stderr.raw").read_bytes().hex(), hit["stderr_hex"])
+            self.assertEqual(len(request["argv_hex"]), 2 if name == "rustversion" else 11)
+            self.assertEqual(r["externs"], [])
+            self.assertNotIn("stdin", r)
+        self.assertEqual({r["role"] for _, r in receipts if r["source"] and r["source"].endswith("src/lib.rs")}, {"Host", "Target"})
+        for _, r in receipts:
+            if r["source"] and (r["source"].endswith("build.rs") or r["source"].endswith("src/lib.rs")):
+                self.assertEqual(r["context"]["kind"], "DirectCargoCompile")
+        _, ordinary_record, ordinary_receipts = self.record10_result("ordinary-probe")
+        ordinary = [r for _, r in ordinary_receipts if r["context"]["kind"] == "DirectCargoProbe"]
+        self.assertEqual(len(ordinary), 1)
+        self.assertEqual(ordinary[0]["exit_code"], 0)
+        self.assertEqual(ordinary_record["blockers"], [])
+
+    def test_record10_nested_origin_identity_refuses_before_compiler(self):
+        for name in ("rustversion", "thiserror"):
+            for case in ("inventory", "version", "components", "package", "manifest", "cwd", "features", "host", "target-env", "outdir", "wrapper", "compiler", "loader", "bootstrap", "stage", "workspace", "workspace-empty", "encoded", "source", "symlink", "hardlink", "directory", "manifest-hash") + (("feature-missing",) if name == "thiserror" else ()):
+                with self.subTest(name=name, case=case):
+                    session, record, _ = self.record10_result("reject:" + name + ":" + case, 2)
+                    self.assertFalse((session / "compiler-entry" / (("version-" if name == "rustversion" else "feature-probe-") + name + ".json")).exists())
+                    rejected = [p for p in (session / "invocations").glob("*/request.json") if not (p.parent / "receipt.json").exists()]
+                    self.assertEqual(len(rejected), 1)
+                    self.assertFalse((rejected[0].parent / "invocation.json").exists())
+                    self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+
+    def test_record10_closed_query_probe_templates_do_not_fall_back(self):
+        for name in ("rustversion", "thiserror"):
+            for case in ("empty", "retry", "extra", "native", "extern") + (("missing-group", "reorder", "wrong-source", "missing-target") if name == "thiserror" else ()):
+                with self.subTest(name=name, case=case):
+                    session, record, _ = self.record10_result("reject:" + name + ":" + case, 2)
+                    self.assertFalse((session / "compiler-entry" / (("version-" if name == "rustversion" else "feature-probe-") + name + ".json")).exists())
+                    self.assertTrue(any(b.startswith("IncompleteInvocation:") for b in record["blockers"]))
+        self.assertEqual(self.nested_result()[1]["blockers"], [])
+        self.assertEqual(self.ring9_result()[1]["blockers"], [])
+        self.assertEqual(self.fix5_result("framework")[1]["blockers"], [])
+
+    def test_record10_transient_probe_retains_real_failure_and_cleanup(self):
+        for case, code, count in (("probe0-both", 0, 2), ("probe1-none", 1, 0), ("probe1-dep", 1, 1), ("probe1-meta", 1, 1), ("probe1-both", 1, 2)):
+            with self.subTest(case=case):
+                session, record, receipts = self.record10_result(case)
+                path, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "ThiserrorStaticFeatureProbe")
+                self.assertEqual(r["exit_code"], code)
+                self.assertEqual(len(r["outputs"]), count)
+                self.assertEqual(json.loads((session / "before-builder-cleanup.json").read_text())[0]["outputs"], r["outputs"])
+                self.assertFalse((Path(r["context"]["out_dir"]) / "probe").exists())
+                for output in r["outputs"]:
+                    self.assertEqual(sha(path / output["snapshot"]), output["sha256"])
+                self.assertEqual(record["blockers"], [])
+        for case in ("probe0-none", "probe2", "signal", "source-post", "capture-alias", "capture-late", "dep-error", "snapshot-missing", "snapshot-tamper"):
+            with self.subTest(case=case):
+                session, record, receipts = self.record10_result(case, 2)
+                path, r = next((p, r) for p, r in receipts if r["context"]["kind"] == "ThiserrorStaticFeatureProbe")
+                self.assertEqual(r["exit_code"], -9 if case == "signal" else (2 if case == "probe2" else (0 if case == "probe0-none" else 1)))
+                self.assertTrue((path / "stdout.raw").read_bytes())
+                self.assertTrue((path / "stderr.raw").read_bytes())
+                self.assertTrue(record["blockers"])
+                marker = {"probe0-none": "MissingDeclaredOutput:", "probe2": "CompilerFailed", "signal": "CompilerFailed",
+                          "source-post": "Record10PostSource:", "capture-alias": "TransientEvidence:", "capture-late": "TransientEvidence:",
+                          "dep-error": "TransientEvidence:", "snapshot-missing": "Record10Evidence:", "snapshot-tamper": "Record10Evidence:"}[case]
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                if case == "capture-late":
+                    self.assertEqual(len(r["outputs"]), 1)
+                    self.assertEqual(sha(path / r["outputs"][0]["snapshot"]), r["outputs"][0]["sha256"])
+
+    def test_record10_final_origin_generated_source_and_cfg_joins(self):
+        markers = {"missing-builder": "UnresolvedBuildScriptProducer", "duplicate-builder": "UnresolvedBuildScriptProducer",
+                   "alias-bytes": "UnresolvedCargoArtifact:", "missing-origin": "Record10Graph:Record10OriginJoin",
+                   "duplicate-origin": "DuplicateBuildScriptOutDir:", "origin-package": "Record10Graph:Record10OriginJoin",
+                   "origin-outdir": "Record10Graph:Record10ChildJoin", "missing-consumer": "Record10Graph:Record10ConsumerJoin",
+                   "duplicate-consumer": "Record10Graph:Record10ConsumerJoin", "cfg-mismatch": "Record10Graph:Record10CfgJoin",
+                   "private-bytes": "Record10Graph:Record10GeneratedJoin", "generated-dep-missing": "Record10Graph:Record10GeneratedJoin",
+                   "zero-child": "Record10Graph:Record10ChildJoin", "unannotated": "Record10Evidence:Record10Invocation",
+                   "duplicate-child": "Record10Graph:Record10ChildJoin",
+                   "builder-raw": "Record10Graph:Record10BuilderEvidence",
+                   "builder-cwd": "Record10Graph:Record10BuilderEvidence",
+                   "builder-request-cwd": "Record10Graph:Record10BuilderEvidence",
+                   "consumer-cwd": "Record10Graph:Record10Package",
+                   "consumer-initial-cwd": "Record10Graph:Record10ConsumerJoin",
+                   "version-fail": "Record10Graph:Record10ChildJoin"}
+        for case, marker in markers.items():
+            with self.subTest(case=case):
+                session, record, receipts = self.record10_result(case, 2)
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                if case in ("consumer-cwd", "builder-cwd"):
+                    leaf = "src/lib.rs" if case == "consumer-cwd" else "build.rs"
+                    path, receipt = next((p, r) for p, r in receipts if r.get("source") == str(session / "vendor/thiserror" / leaf))
+                    request = json.loads((path / "request.json").read_text())
+                    self.assertEqual(receipt["cwd"], str(session / "application"))
+                    self.assertEqual(os.fsdecode(bytes.fromhex(request["cwd_hex"])), receipt["cwd"])
+                    self.assertEqual(receipt["exit_code"], 0)
+                    hit = json.loads((session / "compiler-entry" / (("thiserror" if case == "consumer-cwd" else "build_script_build") + "-thiserror.json")).read_text())
+                    self.assertEqual(hit["cwd"], receipt["cwd"])
+                    self.assertEqual([os.fsencode(a).hex() for a in hit["argv"]], request["argv_hex"])
+                    self.assertIn(os.fsencode(str(session / "vendor/thiserror" / leaf)).hex(), request["argv_hex"])
+        for case in ("probe0-both", "probe1-none"):
+            session, record, receipts = self.record10_result(case)
+            self.assertEqual(len(record["nested_origins"]), 2)
+            for path, receipt in receipts:
+                if receipt.get("source") in {str(session / "vendor/thiserror" / f) for f in ("src/lib.rs", "build.rs")}:
+                    request = json.loads((path / "request.json").read_text())
+                    initial = json.loads((path / "invocation.json").read_text())
+                    self.assertEqual(receipt["cwd"], str(session / "vendor/thiserror"))
+                    self.assertEqual(initial["cwd"], receipt["cwd"])
+                    self.assertEqual(os.fsdecode(bytes.fromhex(request["cwd_hex"])), receipt["cwd"])
+            for association in record["build_script_associations"]:
+                filename = "version.expr" if association["package_id"].endswith("#rustversion@1.0.22") else "private.rs"
+                generated = Path(association["out_dir"]) / filename
+                self.assertEqual(association["generated_files"][filename], sha(generated))
+                matched = [c for c in record["consumed_sources"] if c["path"] == str(generated)]
+                self.assertEqual(len(matched), 1)
+                self.assertEqual(matched[0]["owner"]["generated_by"], association["producer_invocation"])
+
+    def test_record10_observation_never_creates_output_or_native_authority(self):
+        markers = {"transient-artifact": "TransientCargoArtifact:", "transient-extern": "TransientExtern:",
+                   "transient-consumed": "TransientConsumedSource:", "transient-ordinary": "TransientOrdinaryOutput:",
+                   "version-owned-file": "Record10Evidence:Record10VersionEvidence", "probe2": "CompilerFailed",
+                   "cargo-failure": "CargoDidNotFinishSuccessfully", "unannotated": "Record10Evidence:Record10Invocation"}
+        for case, marker in markers.items():
+            with self.subTest(case=case):
+                _, record, _ = self.record10_result(case, 2)
+                self.assertTrue(record["blockers"])
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                self.assertEqual(record["native_link_declarations"], [])
+                self.assertNotIn("native_record_sha256", record)
+                self.assertNotIn("qualified", record)
+        cases = [("features", reuse, leaf) for reuse in ("artifact", "extern", "consumed", "ordinary") for leaf in ("dep", "meta")]
+        cases += [(denial, "ordinary", leaf) for denial in ("manifest", "template", "noreceipt") for leaf in ("dep", "meta")]
+        for denial, reuse, leaf in cases:
+            with self.subTest(denial=denial, reuse=reuse, leaf=leaf):
+                session, record, receipts = self.record10_result("namespace-" + denial + "-" + reuse + "-" + leaf, 2)
+                marker = {"features": "Record10Evidence:Record10Features", "manifest": "Record10Evidence:Record10Package",
+                          "template": "Record10Evidence:Record10Template", "noreceipt": "IncompleteInvocation:"}[denial]
+                self.assertTrue(any(b.startswith(marker) for b in record["blockers"]), record["blockers"])
+                out = session / "target/x86_64-apple-darwin/debug/build/thiserror-0123456789abcdef/out"
+                names = {str(out / "probe" / f) for f in ("thiserror.d", "libthiserror.rmeta")}
+                forbidden = str(out / "probe" / ("thiserror.d" if leaf == "dep" else "libthiserror.rmeta"))
+                exclude = {"artifact": "TransientCargoArtifact:", "extern": "TransientExtern:",
+                           "consumed": "TransientConsumedSource:", "ordinary": "TransientOrdinaryOutput:"}[reuse]
+                self.assertIn(exclude + forbidden, record["blockers"])
+                self.assertTrue(all(c["path"] not in names for c in record["consumed_sources"]))
+                self.assertTrue(all(e["path"] not in names or e["producers"] == [] for e in record["extern_edges"]))
+                if reuse == "extern":
+                    self.assertTrue(any(e["path"] == forbidden and e["producers"] == [] for e in record["extern_edges"]))
+                self.assertTrue(all(not names.intersection(a["files"]) for a in record["selected_library"]))
+                self.assertTrue(all(not any(str(Path(a["out_dir"]) / f) in names for f in a["generated_files"]) for a in record["build_script_associations"]))
+                if denial == "noreceipt":
+                    self.assertFalse((session / "compiler-entry/feature-probe-thiserror.json").exists())
+                    self.assertTrue(any(not (p.parent / "receipt.json").exists() for p in (session / "invocations").glob("*/request.json")))
+                else:
+                    child_path, child = next((p, r) for p, r in receipts if r["source"] == str(session / "vendor/thiserror/build/probe.rs"))
+                    request = json.loads((child_path / "request.json").read_text())
+                    self.assertEqual(child["kind"], "Compile")
+                    self.assertEqual(child["context"], {"kind": "DirectCargoCompile"})
+                    self.assertEqual(request["environment_hex"], child["environment_hex"])
+                self.assertEqual(record["native_link_declarations"], [])
+                self.assertNotIn("native_record_sha256", record)
+        session, record, receipts = self.record10_result("probe1-none")
+        paths = {o["path"] for _, r in receipts if r["kind"] == "TransientProbe" for o in r["declared_outputs"]}
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all(not any(c["path"] == p for c in record["consumed_sources"]) for p in paths))
+        self.assertEqual(record["state"], "RecordingOnly")
+        self.assertEqual(record["review_gate"], "IndependentPolicyReviewRequired")
 
 
 if __name__ == "__main__":

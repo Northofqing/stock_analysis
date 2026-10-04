@@ -412,6 +412,302 @@ def sysroot_loader_path(sysroot):
     return str(path)
 
 
+RECORD10_KINDS = {"RustversionBuildVersion", "ThiserrorStaticFeatureProbe"}
+RECORD10_PRIVATE = b"#[doc(hidden)]\npub mod __private18 {\n    #[doc(hidden)]\n    pub use crate::private::*;\n}\n"
+
+
+def record10_candidate(args, env, cwd, session):
+    # Recognize an origin independently of the tokens that its template requires.
+    names = [n for n in ("rustversion", "thiserror")
+             if env.get("CARGO_PKG_NAME") == n or cwd == session / "vendor" / n]
+    nested = (env.get("DYLD_FALLBACK_LIBRARY_PATH", "").startswith(str(session / "target/debug") + ":")
+              or "build/probe.rs" in args[1:]
+              or "OUT_DIR" in env and any(a in {"--version", "--rustc"} for a in args[1:]))
+    if not names or not nested:
+        return None
+    require(len(names) == 1, "Record10Origin")
+    return names[0]
+
+
+def record10_transient_namespace(args, env, cwd, session):
+    # Negative-only quarantine: required features, source and template do not
+    # grant these names, and their later rejection must not erase the names.
+    if record10_candidate(args, env, cwd, session) != "thiserror":
+        return set()
+    raw = env.get("OUT_DIR", "")
+    out = Path(raw)
+    parent = session / "target" / TARGET / "debug/build"
+    require(out.is_absolute() and str(out) == raw and out.resolve() == out
+            and out.is_dir() and not out.is_symlink() and out.name == "out"
+            and out.parent.parent == parent
+            and re.fullmatch(r"thiserror-[0-9a-f]{16}", out.parent.name), "Record10OutDir")
+    require((out / "probe").resolve() == out / "probe", "Record10ProbeDirectory")
+    return {str(out / "probe" / name) for name in ("thiserror.d", "libthiserror.rmeta")}
+
+
+def record10_source(name, env, cwd, session, inv):
+    require(name in {"rustversion", "thiserror"}, "Record10Origin")
+    if name == "rustversion":
+        version, parts = "1.0.22", ("1", "0", "22")
+        sources = ("Cargo.toml", "build/build.rs", "build/rustc.rs", "src/lib.rs")
+        parent = session / "target/debug/build"
+    else:
+        version, parts = "2.0.18", ("2", "0", "18")
+        sources = ("Cargo.toml", "build.rs", "build/probe.rs", "src/lib.rs")
+        parent = session / "target" / TARGET / "debug/build"
+    package = {"id": "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version,
+               "tree": "vendor", "manifest": name + "/Cargo.toml"}
+    root = session / "vendor" / name
+    require(inv["packages"].count(package) == 1 and cwd == root
+            and env.get("CARGO_MANIFEST_DIR") == str(root)
+            and env.get("CARGO_MANIFEST_PATH") == str(root / "Cargo.toml")
+            and env.get("CARGO_PKG_NAME") == name and env.get("CARGO_PKG_VERSION") == version
+            and all(env.get(k) == v for k, v in zip(("CARGO_PKG_VERSION_MAJOR", "CARGO_PKG_VERSION_MINOR",
+                "CARGO_PKG_VERSION_PATCH"), parts)) and env.get("CARGO_PKG_VERSION_PRE") == "",
+            "Record10Package")
+    for source in sources:
+        path = root / source
+        regular(path)
+        require(path.resolve() == path and path.stat().st_nlink == 1
+                and inv["vendor"]["files"].get(name + "/" + source) == file_hash(path),
+                "Record10Source")
+    raw = env.get("OUT_DIR", "")
+    out = Path(raw)
+    require(out.is_absolute() and str(out) == raw and out.resolve() == out and out.is_dir()
+            and not out.is_symlink() and out.name == "out" and out.parent.parent == parent
+            and re.fullmatch(name + r"-[0-9a-f]{16}", out.parent.name), "Record10OutDir")
+    return package, root, out
+
+
+def record10_context(args, env, cwd, session, inv):
+    name = record10_candidate(args, env, cwd, session)
+    if name is None:
+        return None
+    package, root, out = record10_source(name, env, cwd, session, inv)
+    features = set() if name == "rustversion" else {"CARGO_FEATURE_DEFAULT", "CARGO_FEATURE_STD"}
+    require({k for k in env if k.startswith("CARGO_FEATURE_")} == features
+            and all(env[k] == "1" for k in features), "Record10Features")
+    require(args and args[0] == inv["rustc"]["path"] and env.get("RUSTC") == args[0]
+            and env.get("RUSTC_WRAPPER") == str(session / "rustc-wrapper")
+            and "RUSTC_WORKSPACE_WRAPPER" not in env and "RUSTC_STAGE" not in env
+            and "RUSTC_BOOTSTRAP" not in env and env.get("HOST") == TARGET
+            and env.get("TARGET") == TARGET and env.get("CARGO_ENCODED_RUSTFLAGS") == "",
+            "Record10Environment")
+    if name == "rustversion":
+        exact, kind, role = ["--version"], "RustversionBuildVersion", "Host"
+    else:
+        require((out / "probe").resolve() == out / "probe", "Record10ProbeDirectory")
+        exact = ["--edition=2018", "--crate-name=thiserror", "--crate-type=lib", "--cap-lints=allow",
+                 "--emit=dep-info,metadata", "--out-dir", str(out / "probe"), "build/probe.rs", "--target", TARGET]
+        kind, role = "ThiserrorStaticFeatureProbe", "Target"
+    require(args[1:] == exact, "Record10Template")
+    return parse_rustc(args[1:]), {"kind": kind, "package_id": package["id"], "manifest": str(root),
+                                  "out_dir": str(out), "source_role": role}
+
+
+def record10_capture_outputs(call, outputs, code):
+    # Preserve earlier retained files even if a later capture or dep-info fails.
+    captured, blockers = [], []
+    for index, item in enumerate(outputs):
+        path = Path(item["path"])
+        try:
+            if not path.exists() and not path.is_symlink():
+                if code == 0:
+                    blockers.append("MissingDeclaredOutput:" + str(path))
+                continue
+            require(path.resolve() == path, "TransientOutputAlias")
+            regular(path)
+            before = path.stat()
+            require(before.st_nlink == 1, "TransientOutputAlias")
+            snapshot = call / ("probe-output-" + str(index) + ".raw")
+            with open(path, "rb") as source, open(snapshot, "xb") as dest:
+                opened = os.fstat(source.fileno())
+                require((opened.st_dev, opened.st_ino, opened.st_size) == (before.st_dev, before.st_ino, before.st_size),
+                        "TransientOutputChanged")
+                shutil.copyfileobj(source, dest)
+            output = dict(item, sha256=file_hash(snapshot), snapshot=snapshot.name)
+            captured.append(output)
+            after = path.stat()
+            require(path.resolve() == path and after.st_nlink == 1
+                    and (after.st_dev, after.st_ino, after.st_size) == (before.st_dev, before.st_ino, before.st_size)
+                    and file_hash(path) == output["sha256"], "TransientOutputChanged")
+            if item["kind"] == "dep-info":
+                output["dep_info"] = dep_info(snapshot.read_bytes())
+        except (Refusal, OSError) as error:
+            blockers.append("TransientEvidence:" + str(error))
+    return captured, blockers
+
+
+def record10_evidence(receipt, call, session, inv):
+    request = strict_json((call / "request.json").read_bytes())
+    initial = strict_json((call / "invocation.json").read_bytes())
+    args = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+    env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+    cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+    claimed = any(x.get("context", {}).get("kind") in RECORD10_KINDS for x in (initial, receipt))
+    special = record10_context(args, env, cwd, session, inv)
+    if special is None:
+        require(not claimed, "Record10Invocation")
+        return None, []
+    parsed, context = special
+    compiler_environment(env, session, inv["sysroot"], probe=parsed["probe"], context=context)
+    outputs = [] if parsed["probe"] else selected_outputs(parsed, cwd, session / "target")
+    require(all(initial[k] == receipt[k] for k in ("context", "argv_hex", "environment_hex", "parsed",
+            "source", "package", "role", "kind", "declared_outputs", "cwd", "compiler_sha256"))
+            and receipt["context"] == context and receipt["parsed"] == parsed
+            and receipt["argv_hex"] == request["argv_hex"] and receipt["environment_hex"] == request["environment_hex"]
+            and receipt["cwd"] == str(cwd) and receipt["declared_outputs"] == outputs
+            and receipt["compiler_sha256"] == inv["rustc"]["sha256"], "Record10Invocation")
+    if parsed["probe"]:
+        require(receipt["kind"] == "Probe" and receipt["role"] == "Probe"
+                and receipt["source"] is None and receipt["package"] is None and receipt["outputs"] == [],
+                "Record10VersionEvidence")
+    else:
+        require(receipt["kind"] == "TransientProbe" and receipt["role"] == "Target"
+                and receipt["source"] == str(cwd / "build/probe.rs")
+                and receipt["package"] == {"id": context["package_id"], "tree": "vendor", "manifest": "thiserror/Cargo.toml"},
+                "Record10ProbeEvidence")
+        declarations = {o["path"]: (i, o) for i, o in enumerate(outputs)}
+        require(len({o["path"] for o in receipt["outputs"]}) == len(receipt["outputs"]), "Record10ProbeEvidence")
+        if receipt["exit_code"] == 0:
+            require({o["path"] for o in receipt["outputs"]} == set(declarations), "Record10ProbeEvidence")
+        for output in receipt["outputs"]:
+            require(output["path"] in declarations, "Record10ProbeEvidence")
+            index, declaration = declarations[output["path"]]
+            require(output["kind"] == declaration["kind"] and output["snapshot"] == "probe-output-" + str(index) + ".raw",
+                    "Record10ProbeEvidence")
+            snapshot = call / output["snapshot"]
+            regular(snapshot)
+            require(snapshot.resolve() == snapshot and snapshot.stat().st_nlink == 1
+                    and file_hash(snapshot) == output["sha256"], "Record10Snapshot")
+            if output["kind"] == "dep-info":
+                require(output.get("dep_info") == dep_info(snapshot.read_bytes()), "Record10DepInfo")
+    return context, outputs
+
+
+def record10_graph_blockers(receipts, associations, artifacts, events, session, inv):
+    blockers, groups, raw_consumers = [], set(), {}
+    by_id = {r["invocation_id"]: r for r in receipts}
+    for r in receipts:
+        try:
+            request = strict_json((session / "invocations" / r["invocation_id"] / "request.json").read_bytes())
+            raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+            cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        except (Refusal, OSError, KeyError, TypeError, ValueError):
+            blockers.append("Record10Graph:RequestEvidence")
+            continue
+        for name, version in (("rustversion", "1.0.22"), ("thiserror", "2.0.18")):
+            root = session / "vendor" / name
+            package = "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version
+            consumer = any(not a.startswith("-") and a.endswith(".rs") and (cwd / a).resolve() == root / "src/lib.rs" for a in raw[1:])
+            if consumer:
+                raw_consumers.setdefault(name, []).append(r)
+            child = r.get("context", {}).get("kind") in RECORD10_KINDS and r["context"].get("package_id") == package
+            if consumer or child:
+                groups.add((name, package))
+    for name, version in (("rustversion", "1.0.22"), ("thiserror", "2.0.18")):
+        package = "registry+https://github.com/rust-lang/crates.io-index#" + name + "@" + version
+        if any(e["reason"] == "compiler-artifact" and e.get("package_id") == package
+               and e.get("target", {}).get("src_path") == str(session / "vendor" / name / "src/lib.rs") for e in events):
+            groups.add((name, package))
+    # One package has one fixed no-retry/no-bootstrap origin, even when no child was reached.
+    for name, package in groups:
+        try:
+            root = session / "vendor" / name
+            origins = [a for a in associations if a["package_id"] == package]
+            origin_events = [e for e in events if e["reason"] == "build-script-executed" and e.get("package_id") == package]
+            require(len(origins) == len(origin_events) == 1 and origins[0]["cargo_event"] == origin_events[0], "Record10OriginJoin")
+            association = origins[0]
+            builder = by_id[association["producer_invocation"]]
+            build_source = str(root / ("build/build.rs" if name == "rustversion" else "build.rs"))
+            expected_features = [] if name == "rustversion" else ["default", "std"]
+            builder_call = session / "invocations" / builder["invocation_id"]
+            builder_request = strict_json((builder_call / "request.json").read_bytes())
+            builder_initial = strict_json((builder_call / "invocation.json").read_bytes())
+            builder_raw = [os.fsdecode(bytes.fromhex(a)) for a in builder_request["argv_hex"]]
+            builder_env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in builder_request["environment_hex"].items()}
+            require(all(builder_initial[k] == builder[k] for k in ("context", "argv_hex", "environment_hex", "parsed", "source", "package", "role", "kind", "cwd"))
+                    and builder_request["argv_hex"] == builder["argv_hex"]
+                    and builder_request["environment_hex"] == builder["environment_hex"]
+                    and builder["cwd"] == os.fsdecode(bytes.fromhex(builder_request["cwd_hex"])) == str(root)
+                    and builder_raw[0] == inv["rustc"]["path"] and builder["parsed"] == parse_rustc(builder_raw[1:])
+                    and len(builder["parsed"]["inputs"]) == 1
+                    and str((Path(builder["cwd"]) / builder["parsed"]["inputs"][0]).resolve()) == build_source
+                    and not any(k in builder_env for k in ("RUSTC_BOOTSTRAP", "RUSTC_STAGE", "RUSTC_WORKSPACE_WRAPPER"))
+                    and not builder_env.get("CARGO_ENCODED_RUSTFLAGS"), "Record10BuilderEvidence")
+            require(builder["kind"] == "Compile" and builder["role"] == "Host" and builder["exit_code"] == 0
+                    and not builder["blockers"] and builder["source"] == build_source
+                    and builder["package"] == {"id": package, "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                    and sorted(builder["parsed"]["options"].get("--cfg", [])) == sorted('feature="' + f + '"' for f in expected_features),
+                    "Record10BuilderJoin")
+            ba = [a for a in artifacts if a["invocation_id"] == builder["invocation_id"] and "builder_alias" in a]
+            be = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == package
+                  and e.get("target", {}).get("kind") == ["custom-build"]]
+            require(len(ba) == len(be) == 1 and be[0]["target"].get("src_path") == build_source
+                    and sorted(be[0].get("features", [])) == expected_features, "Record10BuilderJoin")
+            build_deps = {str((Path(builder["cwd"]) / p).resolve()) for o in builder["outputs"]
+                          for p in o.get("dep_info", {}).get("paths", [])}
+            required = {build_source} | ({str(root / "build/rustc.rs")} if name == "rustversion" else set())
+            require(required <= build_deps, "Record10BuilderSources")
+            children = [r for r in receipts if r.get("context", {}).get("kind") in RECORD10_KINDS
+                        and r["context"].get("package_id") == package]
+            kind = "RustversionBuildVersion" if name == "rustversion" else "ThiserrorStaticFeatureProbe"
+            require(len(children) == 1 and children[0]["context"]["kind"] == kind
+                    and children[0]["context"]["out_dir"] == association["out_dir"]
+                    and not children[0]["blockers"] and children[0]["exit_code"] in ((0,) if name == "rustversion" else (0, 1)),
+                    "Record10ChildJoin")
+            consumers = raw_consumers.get(name, [])
+            require(len(consumers) == 1, "Record10ConsumerJoin")
+            consumer = consumers[0]
+            call = session / "invocations" / consumer["invocation_id"]
+            request = strict_json((call / "request.json").read_bytes())
+            initial = strict_json((call / "invocation.json").read_bytes())
+            raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+            env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+            raw_cwd = os.fsdecode(bytes.fromhex(request["cwd_hex"]))
+            cwd = Path(raw_cwd)
+            require(all(initial[k] == consumer[k] for k in ("context", "argv_hex", "environment_hex", "source", "package", "parsed", "role", "kind", "cwd"))
+                    and request["argv_hex"] == consumer["argv_hex"] and request["environment_hex"] == consumer["environment_hex"]
+                    and raw[0] == inv["rustc"]["path"] and consumer["parsed"] == parse_rustc(raw[1:])
+                    and consumer["source"] == str(root / "src/lib.rs")
+                    and consumer["cwd"] == raw_cwd and str(cwd) == raw_cwd, "Record10ConsumerJoin")
+            fixed_package, _, out = record10_source(name, env, cwd, session, inv)
+            # Ordinary Cargo rustc consumers need not have build-script feature
+            # environment flags. Their raw cfg and artifact feature set below
+            # are mandatory; a present environment set must still be exact.
+            feature_keys = {k for k in env if k.startswith("CARGO_FEATURE_")}
+            expected_keys = {"CARGO_FEATURE_" + f.upper() for f in expected_features}
+            require(not feature_keys or feature_keys == expected_keys and all(env[k] == "1" for k in feature_keys),
+                    "Record10ConsumerFeatures")
+            role, crate_type = ("Host", "proc-macro") if name == "rustversion" else ("Target", "lib")
+            require(str(out) == association["out_dir"] and consumer["package"] == fixed_package
+                    and consumer["kind"] == "Compile" and consumer["role"] == role and consumer["exit_code"] == 0
+                    and not consumer["blockers"] and consumer["context"]["kind"] == "DirectCargoCompile", "Record10ConsumerJoin")
+            ca = [a for a in artifacts if a["invocation_id"] == consumer["invocation_id"]]
+            ce = [e for e in events if e["reason"] == "compiler-artifact" and e.get("package_id") == package
+                  and e.get("target", {}).get("src_path") == consumer["source"]]
+            require(len(ca) == len(ce) == 1 and ce[0]["target"].get("kind") == [crate_type]
+                    and ce[0]["target"].get("crate_types") == [crate_type] and ce[0]["target"].get("name") == name
+                    and sorted(ce[0].get("features", [])) == expected_features, "Record10ConsumerJoin")
+            event = association["cargo_event"]
+            cfgs = ["error_generic_member_access"] if name == "thiserror" and children[0]["exit_code"] == 0 else []
+            require(event["cfgs"] == cfgs and all(event[k] == [] for k in ("linked_libs", "linked_paths", "env"))
+                    and sorted(consumer["parsed"]["options"].get("--cfg", [])) == sorted(
+                        ['feature="' + f + '"' for f in expected_features] + cfgs), "Record10CfgJoin")
+            filename = "version.expr" if name == "rustversion" else "private.rs"
+            generated = out / filename
+            regular(generated)
+            require(generated.resolve() == generated and generated.stat().st_nlink == 1
+                    and association["generated_files"].get(filename) == file_hash(generated)
+                    and (name == "rustversion" or generated.read_bytes() == RECORD10_PRIVATE), "Record10GeneratedJoin")
+            consumed = {str((Path(consumer["cwd"]) / p).resolve()) for o in consumer["outputs"]
+                        for p in o.get("dep_info", {}).get("paths", [])}
+            require({str(generated), consumer["source"]} <= consumed, "Record10GeneratedJoin")
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("Record10Graph:" + (str(error) if isinstance(error, Refusal) else "Record10Evidence"))
+    return blockers
+
+
 def invocation_context(args, parsed, env, cwd, session, inv):
     """Reached generator templates only; final Cargo events must bind their origin."""
     nested_loader = str(session / "target/debug") + ":"
@@ -1021,7 +1317,7 @@ def compiler_environment(env, session, sysroot, *, probe, context=None):
     require(not any(env.get(key) for key in FORBIDDEN_ENV), "CompilerEnvironmentInjection")
     expected = sysroot_loader_path(sysroot)
     kind = (context or {}).get("kind")
-    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS:
+    if kind in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
         relative = "lib/rustlib/" + TARGET + "/lib"
         host_lib = Path(sysroot["root"]) / relative
         require(host_lib.is_dir() and host_lib.resolve() == host_lib
@@ -1957,7 +2253,9 @@ def wrapper(session_id, args):
     require(args and args[0] == pinned_file(inv["rustc"]), "WrongCompiler")
     cwd = Path.cwd().resolve()
     require(inside(cwd, session), "CompilerCwd")
-    special = rustix_context(args, os.environ, cwd, session, inv)
+    special = record10_context(args, os.environ, cwd, session, inv)
+    if special is None:
+        special = rustix_context(args, os.environ, cwd, session, inv)
     if special is None and policy["profile"] == BUNDLED_PROFILE:
         native_control(session, policy, owner)
         special = sqlite_rust_context(args, os.environ, cwd, session, inv)
@@ -2030,7 +2328,7 @@ def wrapper(session_id, args):
         for value in codegen.get("linker", []):
             require(value in {v["path"] for v in inv["generators"].values()}, "UnpinnedLinker")
         outputs = selected_outputs(parsed, cwd, target)
-    transient = context["kind"] == "ProcMacro2FeatureProbe" or autocfg_stdin or rustix_stdin
+    transient = context["kind"] in {"ProcMacro2FeatureProbe", "ThiserrorStaticFeatureProbe"} or autocfg_stdin or rustix_stdin
     record = {"state": "RecordingOnly", "kind": "TransientProbe" if transient else (
                   "Probe" if parsed["probe"] else "Compile"), "context": context,
               "argv_hex": [os.fsencode(value).hex() for value in args], "parsed": parsed,
@@ -2072,6 +2370,8 @@ def wrapper(session_id, args):
                     record["outputs"] = [dict(outputs[0], sha256=post["sha256"], snapshot=post["snapshot"], observation_only=True)]
                 elif code == 0:
                     record["blockers"].append("MissingDeclaredOutput:" + outputs[0]["path"])
+            elif context["kind"] == "ThiserrorStaticFeatureProbe":
+                record["outputs"], record["blockers"] = record10_capture_outputs(call, outputs, code)
             else:
                 record["outputs"], record["blockers"] = capture_transient_outputs(call, outputs, code)
         except (Refusal, OSError) as error:
@@ -2094,6 +2394,11 @@ def wrapper(session_id, args):
             record["outputs"].append(output)
     else:
         record["blockers"].append("CompilerFailed")
+    if context["kind"] in RECORD10_KINDS:
+        try:
+            require(record10_context(args, os.environ, cwd, session, inv) == (parsed, context), "Record10PostSource")
+        except (Refusal, OSError) as error:
+            record["blockers"].append("Record10PostSource:" + str(error))
     record["blockers"].extend(stdin_failures)
     atomic_json(call / "receipt.json", record)
     return code if code != 0 else (0 if not record["blockers"] else 2)
@@ -2189,7 +2494,20 @@ def seal_record(session, policy, cargo_exit):
     events, blockers = cargo_events(session / "cargo.stdout.raw")
     receipts = []
     sysroot_declarations = {}
+    record10_transient_paths = set()
+    record10_invalid_calls = set()
     for directory in sorted((session / "invocations").iterdir()):
+        # Reconstruct closed names even for request-only failures, before any
+        # full qualification or mutable receipt annotation can be consulted.
+        try:
+            request = strict_json((directory / "request.json").read_bytes())
+            raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+            env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+            cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            record10_transient_paths.update(record10_transient_namespace(raw, env, cwd, session))
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("Record10Namespace:" + str(error))
+            record10_invalid_calls.add(directory.name)
         if not (directory / "receipt.json").is_file():
             blockers.append("IncompleteInvocation:" + directory.name); continue
         receipt = strict_json((directory / "receipt.json").read_bytes())
@@ -2209,6 +2527,16 @@ def seal_record(session, policy, cargo_exit):
         except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError):
             blockers.append("ChangedSysrootExternDeclaration:" + directory.name)
         initial = strict_json((directory / "invocation.json").read_bytes())
+        try:
+            request = strict_json((directory / "request.json").read_bytes())
+            raw = [os.fsdecode(bytes.fromhex(a)) for a in request["argv_hex"]]
+            env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
+            cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+            record10_context(raw, env, cwd, session, policy["inventory"])
+            record10_evidence(receipt, directory, session, policy["inventory"])
+        except (Refusal, OSError, KeyError, IndexError, TypeError, ValueError) as error:
+            blockers.append("Record10Evidence:" + str(error))
+            record10_invalid_calls.add(directory.name)
         if "framework_declaration" in initial.get("context", {}) or "framework_declaration" in receipt.get("context", {}):
             try:
                 request = strict_json((directory / "request.json").read_bytes())
@@ -2245,13 +2573,16 @@ def seal_record(session, policy, cargo_exit):
     # Collect all declared transient paths before registering any ordinary output.
     # An unsupported probe may have no output file; its declared namespace is still excluded.
     transient_paths = {str(Path(o["path"]).resolve()) for r in receipts if r["kind"] == "TransientProbe"
-                       for o in r["declared_outputs"] + r["outputs"]}
+                       for o in r["declared_outputs"] + r["outputs"]} | record10_transient_paths
     native_paths, native_probes = set(), set()
     if policy["profile"] == BUNDLED_PROFILE:
         native_paths, native_probes, namespace_blockers = native_evidence_paths(session)
         blockers.extend(namespace_blockers)
     output_owners, transient_collisions = {}, set()
     for receipt in receipts:
+        if receipt["invocation_id"] in record10_invalid_calls:
+            transient_collisions.add(receipt["invocation_id"])
+            continue
         if native_paths and ((isinstance(receipt.get("source"), str) and native_path_identity(receipt["source"], receipt) in native_paths)
                 or any(native_path_identity(o["path"], receipt) in native_paths
                        for o in receipt["declared_outputs"] + receipt["outputs"])):
@@ -2366,7 +2697,7 @@ def seal_record(session, policy, cargo_exit):
     nested_origins = []
     for receipt in receipts:
         context = receipt.get("context", {})
-        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS:
+        if context.get("kind") in {"LibcBuildVersion", "ProcMacro2FeatureProbe", RUSTIX_KIND} | AUTOCFG_KINDS | RECORD10_KINDS:
             matches = [a for a in associations if a["package_id"] == context["package_id"]
                        and a["out_dir"] == context["out_dir"]]
             if len(matches) != 1:
@@ -2390,6 +2721,7 @@ def seal_record(session, policy, cargo_exit):
                 blockers.append("UnresolvedExternProducer:" + edge["path"])
             edges.append(dict(edge, consumer=receipt["invocation_id"], producers=producers))
     blockers.extend(autocfg_graph_blockers(receipts, associations, edges))
+    blockers.extend(record10_graph_blockers(receipts, associations, artifacts, events, session, policy["inventory"]))
     new_blockers, declarations = new_role_graphs(receipts, associations)
     blockers.extend(new_blockers)
     ring_blockers, ring_declarations = ring_static_graph(receipts, associations, artifacts, events, edges,
