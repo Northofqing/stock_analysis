@@ -826,7 +826,7 @@ impl<'writer> FinancialAuditFields<'_, 'writer> {
         self.physical.primary = Some(error); Ok(())
     }
     fn begin_release(&mut self) -> Result<(), FinancialAuditFault> {
-        if !self.native.transaction_release_ready(&self.work) || !self.physical.audit_pending() || self.physical.audit_phase == FinancialAuditPhase::Draining
+        if !self.native.transaction_release_ready(&self.work, self.physical) || !self.physical.audit_pending() || self.physical.audit_phase == FinancialAuditPhase::Draining
             || (self.work.terminal().is_none() && (self.physical.audit_phase != FinancialAuditPhase::Failed
                 || self.physical.primary.is_none())) { return Err(FinancialAuditFault::UnexpectedCut); }
         self.audit.resources.loan().begin_release().map_err(|_| FinancialAuditFault::UnexpectedCut)?;
@@ -969,6 +969,116 @@ impl<'writer> FinancialRowsConstruction<'writer> {
         FinancialRejectedConstruction { construction: self, failure }
     }
 }
+
+// A01/A02 retain the actual outer purpose, never cloned hooks or a second
+// work pool. This fixed wrapper owns the existing frame and its new sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialInitialReadFault { Purpose, Modes, AlreadyBound }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinancialExtentSchema { Main, Temp }
+#[derive(Clone, Copy)]
+enum FinancialInitialPragma { ApplicationId, UserVersion, ForeignKeys, JournalMode, Synchronous }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinancialExtentFault { ObjectNegative, ObjectOverflow, ByteNegative, ByteOverflow, TotalCap }
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinancialInitialReadCase { NegativeCount, NegativeExtent, ExcessCap, MaximumSum, WrongInteger, JournalWrongType, JournalInvalidUtf8, SynchronousWrongType, StepError, NoRows, NoRowsResetError }
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinancialInitialTerminalCut { BeforePrepare, FirstColumn, QueryReturnUnknown, JournalBeforeReset, OwnedIgnoredReset, RawDriverBeforeReturn, RawDriverAfterReturn }
+// These fixed outer wrapping cuts are reached only through Q's unissued
+// wrap port, after query_row scope cleanup and its independent Error return.
+// C's allocated diagnostic must already be owned/paid by the future formatter.
+fn retain_initial_extent_diagnostic(detail: String) -> rows::original_source::SourceOperationError {
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+        source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage: "prospective-catalog-extent", ddl_id: None, detail },
+    })
+}
+fn retain_initial_pragma_driver_error(kind: FinancialInitialPragma, source: rusqlite::Error) -> rows::original_source::SourceOperationError {
+    let operation = match kind { FinancialInitialPragma::ApplicationId => "capture PRAGMA application_id",
+        FinancialInitialPragma::UserVersion => "capture PRAGMA user_version", FinancialInitialPragma::ForeignKeys => "capture PRAGMA foreign_keys",
+        FinancialInitialPragma::JournalMode => "capture PRAGMA journal_mode", FinancialInitialPragma::Synchronous => "capture PRAGMA synchronous" };
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })
+}
+struct FinancialInitialReadState<'purpose> {
+    purpose: &'purpose SelectionSnapshotPurpose,
+    bound: BoundMode,
+    catalog: GlobalSchemaCatalogMode,
+    objects: u64,
+    bytes: u64,
+    count: Option<i64>,
+    extent: Option<i64>,
+    main: Option<(i64, i64)>,
+    temp: Option<(i64, i64)>,
+    application_id: Option<i64>,
+    user_version: Option<i64>,
+    foreign_keys: Option<i64>,
+    journal_mode: Option<String>,
+    synchronous: Option<i64>,
+}
+impl<'purpose> FinancialInitialReadState<'purpose> {
+    fn from_purpose(purpose: &'purpose SelectionSnapshotPurpose, decision: &FinancialRetainedStartDecision)
+        -> Result<Self, FinancialInitialReadFault> {
+        if !matches!(purpose, SelectionSnapshotPurpose::RowsBackup(_)) { return Err(FinancialInitialReadFault::Purpose); }
+        decide_financial_mode_pair(decision.bound, decision.catalog).map_err(|_| FinancialInitialReadFault::Modes)?;
+        Ok(Self { purpose, bound: decision.bound, catalog: decision.catalog, objects: 0, bytes: 0,
+            count: None, extent: None, main: None, temp: None, application_id: None, user_version: None,
+            foreign_keys: None, journal_mode: None, synchronous: None })
+    }
+    // Called only after the independent completed query_row return, in the
+    // source's count -> extent order. Both-schema cap follows temp conversion.
+    fn finish_extent(&mut self, schema: FinancialExtentSchema) -> Result<(), FinancialExtentFault> {
+        let count = self.count.expect("typed extent first column retained");
+        let extent = self.extent.expect("typed extent second column retained");
+        let objects = u64::try_from(count).map_err(|_| FinancialExtentFault::ObjectNegative)?;
+        self.objects = self.objects.checked_add(objects).ok_or(FinancialExtentFault::ObjectOverflow)?;
+        let bytes = u64::try_from(extent).map_err(|_| FinancialExtentFault::ByteNegative)?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or(FinancialExtentFault::ByteOverflow)?;
+        match schema { FinancialExtentSchema::Main => self.main = Some((count, extent)),
+            FinancialExtentSchema::Temp => self.temp = Some((count, extent)) }
+        if schema == FinancialExtentSchema::Temp {
+            let options = self.purpose.options().expect("validated RowsBackup has real source options");
+            if self.objects > options.max_catalog_objects || self.bytes > options.max_catalog_bytes {
+                return Err(FinancialExtentFault::TotalCap);
+            }
+        }
+        self.count = None; self.extent = None; Ok(())
+    }
+}
+struct FinancialInitialReadFrame<'purpose, 'writer> {
+    source: FinancialSourceStart<'writer>,
+    initial: FinancialInitialReadState<'purpose>,
+}
+struct FinancialInitialReadConstruction<'purpose, 'writer> {
+    source: FinancialRowsConstruction<'writer>,
+    initial: FinancialInitialReadState<'purpose>,
+}
+impl<'writer> FinancialSourceStart<'writer> {
+    fn bind_initial_read<'purpose>(mut self, purpose: &'purpose SelectionSnapshotPurpose)
+        -> Result<FinancialInitialReadFrame<'purpose, 'writer>, (Self, FinancialInitialReadFault)> {
+        let initial = match FinancialInitialReadState::from_purpose(purpose, &self.decision) {
+            Ok(initial) => initial, Err(fault) => return Err((self, fault)),
+        };
+        if !self.fields().bind_initial_read_context() { return Err((self, FinancialInitialReadFault::AlreadyBound)); }
+        Ok(FinancialInitialReadFrame { source: self, initial })
+    }
+}
+impl<'purpose, 'writer> FinancialInitialReadFrame<'purpose, 'writer> {
+    fn read_loan(&mut self) -> replay_work::OriginalInitialReadLoan<'_, 'purpose> {
+        self.source.fields().initial_read(&mut self.initial)
+    }
+    fn begin(&mut self) -> bool { self.source.begin_original_transaction() }
+    fn enter_rows(self) -> FinancialInitialReadConstruction<'purpose, 'writer> {
+        let Self { source, initial } = self;
+        FinancialInitialReadConstruction { source: source.enter_rows(), initial }
+    }
+}
+impl<'purpose> FinancialInitialReadConstruction<'purpose, '_> {
+    fn read_loan(&mut self) -> replay_work::OriginalInitialReadLoan<'_, 'purpose> {
+        self.source.fields().initial_read(&mut self.initial)
+    }
+}
+
 
 /// Non-forgeable permission to capture the selection catalog from the
 /// database connection retained by the global owner.
@@ -2100,6 +2210,170 @@ mod financial_original_audit_acquisition_tests {
                 else { assert!(frame.physical.primary.is_none()); }
                 assert_eq!(frame.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
                 assert_eq!(frame.fields().source_work().test_code_observation(), before);
+            }
+        }
+        fn fixed_initial_raw_error() -> (rusqlite::Error, usize) {
+            let name = String::from("TEST_CODE raw driver error"); let allocation = name.as_ptr() as usize;
+            (rusqlite::Error::InvalidColumnName(name), allocation)
+        }
+        fn assert_initial_primary(physical: &FinancialPhysical, raw: usize, catalog: usize, original: usize) {
+            match physical.primary.as_ref().expect("one retained primary") {
+                SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { source: rusqlite::Error::InvalidColumnName(name), .. }) => assert_eq!(name.as_ptr() as usize, raw),
+                SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { detail, .. } }) => assert_eq!(detail.as_ptr() as usize, catalog),
+                _ => assert_primary(physical, original),
+            }
+        }
+        fn fixed_initial_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialInitialReadFrame<'purpose, 'writer> {
+            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut frame = start.bind_initial_read(purpose).unwrap_or_else(|_| panic!("genuine fixed purpose borrow"));
+            frame.read_loan().test_code_validation_unknown_blocks_begin();
+            assert!(frame.read_loan().test_code_validate_genuine_rows_options());
+            frame.source.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            fixed_ready(&mut frame.source, writer, trace); assert!(frame.begin());
+            frame.source.fields().original_transaction().test_code_done_batch();
+            let (cleanup, _) = fixed_primary(); frame.source.fields().original_transaction().test_code_paid_finalize_then_wait(cleanup);
+            frame.source.fields().original_transaction().test_code_observe_fixed_return_ok();
+            frame.read_loan().test_code_fixed_prerequisites(); frame
+        }
+        #[test]
+        fn history_original_initial_read_prefix_genuine_context_and_exact_typed_caps() {
+            for purpose in [SelectionSnapshotPurpose::Diagnostic, SelectionSnapshotPurpose::Prospective(prospective::Options::production()),
+                SelectionSnapshotPurpose::Backup(backup::Options::production())] {
+                let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+                let Err((mut start, fault)) = start.bind_initial_read(&purpose) else { panic!("non-financial purpose refuses before validation/SQL"); };
+                assert_eq!(fault, FinancialInitialReadFault::Purpose); assert!(start.fields().test_code_unreached());
+                assert_eq!(start.fields().source_work().test_code_observation().used, 0);
+            }
+            let mut bad_options = rows::Options::production(); bad_options.limits.metadata_bytes -= 1;
+            let bad = SelectionSnapshotPurpose::RowsBackup(bad_options);
+            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut rejected = start.bind_initial_read(&bad).unwrap_or_else(|_| panic!("real purpose is still validation Unknown"));
+            rejected.read_loan().test_code_validation_unknown_blocks_begin();
+            assert!(!rejected.read_loan().test_code_validate_genuine_rows_options()); assert!(!rejected.begin());
+            assert!(rejected.source.physical.primary.is_some()); assert!(rejected.source.fields().test_code_unreached());
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+            let before = frame.source.fields().source_work().test_code_observation();
+            let journal = String::from("wal"); let allocation = journal.as_ptr() as usize;
+            frame.read_loan().test_code_exact_prefix(journal);
+            assert_eq!((frame.initial.objects, frame.initial.bytes), (4096, 16 * 1024 * 1024));
+            assert_eq!(frame.initial.main, Some((4095, 16 * 1024 * 1024 - 1))); assert_eq!(frame.initial.temp, Some((1, 1)));
+            assert_eq!((frame.initial.application_id, frame.initial.user_version, frame.initial.foreign_keys, frame.initial.synchronous),
+                (Some(1398035265), Some(1), Some(1), Some(2)));
+            assert_eq!(frame.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+            assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.source.audit);
+            { let _short = frame.read_loan(); }
+            let mut moved = frame.enter_rows(); assert!(std::ptr::eq(moved.initial.purpose, &purpose));
+            assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+            assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+            // This prefix cannot publish capture/Tail/COMMIT. Only a terminal
+            // fixed cleanup is selected here, with the partial owned prefix kept.
+            moved.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            moved.read_loan().test_code_terminal_drain_prefix(); moved.source.fields().original_transaction().test_code_terminal_exit();
+            drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_ok();
+            assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+        }
+        #[test]
+        fn history_original_initial_read_prefix_errors_keep_partial_heap_and_first_primary() {
+            for case in [FinancialInitialReadCase::NegativeCount, FinancialInitialReadCase::NegativeExtent,
+                FinancialInitialReadCase::ExcessCap, FinancialInitialReadCase::MaximumSum,
+                FinancialInitialReadCase::WrongInteger, FinancialInitialReadCase::JournalWrongType,
+                FinancialInitialReadCase::JournalInvalidUtf8, FinancialInitialReadCase::SynchronousWrongType,
+                FinancialInitialReadCase::StepError, FinancialInitialReadCase::NoRows, FinancialInitialReadCase::NoRowsResetError] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let before = frame.source.fields().source_work().test_code_observation();
+                let journal = String::from("wal"); let journal_allocation = journal.as_ptr() as usize;
+                frame.read_loan().test_code_fault_cut(case, journal);
+                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                let (primary, allocation) = fixed_primary(); let (raw, raw_allocation) = fixed_initial_raw_error();
+                frame.read_loan().test_code_retain_first_error(primary, raw); { let _short = frame.read_loan(); }
+                let (cleanup, _) = fixed_initial_raw_error(); let detail_allocation = frame.read_loan().test_code_finish_normal_error(cleanup);
+                let mut moved = frame.enter_rows(); assert_initial_primary(&moved.source.physical, raw_allocation, detail_allocation, allocation);
+                if matches!(case, FinancialInitialReadCase::SynchronousWrongType) {
+                    assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, journal_allocation);
+                }
+                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+                moved.source.fields().original_transaction().test_code_existing_read_primary_exit();
+                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
+                assert_initial_primary(&moved.source.physical, raw_allocation, detail_allocation, allocation); assert_owned_pin(&moved.source.audit);
+                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+            }
+            #[derive(Clone, Copy)]
+            enum PrimaryCut { BeforePrepare, BetweenQueries, AcquiredRow }
+            for cut in [PrimaryCut::BeforePrepare, PrimaryCut::BetweenQueries, PrimaryCut::AcquiredRow] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let before = frame.source.fields().source_work().test_code_observation();
+                match cut {
+                    PrimaryCut::BeforePrepare => frame.read_loan().test_code_primary_before_prepare_cut(),
+                    PrimaryCut::BetweenQueries => frame.read_loan().test_code_primary_between_queries_cut(),
+                    PrimaryCut::AcquiredRow => frame.read_loan().test_code_primary_acquired_row_cut(),
+                }
+                let (primary, allocation) = fixed_primary();
+                if matches!(cut, PrimaryCut::AcquiredRow) {
+                    // Actual G audit producer can retain the first owned error
+                    // while Q holds a ROW; the shared selector must stop reads.
+                    frame.source.audit_fields().note_normal_failure().unwrap();
+                    frame.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("same first audit primary"));
+                } else { frame.read_loan().test_code_retain_before_read_primary(primary); }
+                assert_primary(&frame.source.physical, allocation); assert_owned_pin(&frame.source.audit);
+                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                let (raw, _) = fixed_initial_raw_error(); let (cleanup, _) = fixed_initial_raw_error();
+                frame.read_loan().test_code_primary_drains_existing_read(raw, cleanup);
+                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                { let _short = frame.read_loan(); }
+                assert_eq!(trace.snapshot(), [None; 8]); assert_primary(&frame.source.physical, allocation);
+                let mut moved = frame.enter_rows(); assert!(std::ptr::eq(moved.initial.purpose, &purpose));
+                if matches!(cut, PrimaryCut::BetweenQueries) {
+                    assert_eq!(moved.initial.main, Some((3, 17))); assert!(moved.initial.temp.is_none());
+                } else if matches!(cut, PrimaryCut::AcquiredRow) {
+                    assert_eq!(moved.initial.count, Some(3)); assert!(moved.initial.extent.is_none()); assert!(moved.initial.main.is_none());
+                }
+                if matches!(cut, PrimaryCut::AcquiredRow) {
+                    let (ignored, _) = fixed_primary(); let (finalize, _) = fixed_primary();
+                    moved.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, finalize);
+                } else { moved.source.fields().original_transaction().test_code_existing_read_primary_exit(); }
+                assert_eq!(trace.snapshot(), [None; 8]); assert_primary(&moved.source.physical, allocation);
+                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
+                assert_owned_pin(&moved.source.audit); assert_primary(&moved.source.physical, allocation);
+                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+            }
+        }
+        #[test]
+        fn history_original_initial_read_prefix_terminal_drains_only_reached_owned_resources() {
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut unknown = start.bind_initial_read(&purpose).unwrap_or_else(|_| panic!("real purpose Unknown"));
+            unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            let first = unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            unknown.read_loan().test_code_terminal_drain_prefix(); assert!(!unknown.begin());
+            assert_eq!(unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            assert!(unknown.source.fields().test_code_unreached());
+            for cut in [FinancialInitialTerminalCut::BeforePrepare, FinancialInitialTerminalCut::FirstColumn,
+                FinancialInitialTerminalCut::QueryReturnUnknown, FinancialInitialTerminalCut::JournalBeforeReset,
+                FinancialInitialTerminalCut::OwnedIgnoredReset, FinancialInitialTerminalCut::RawDriverBeforeReturn, FinancialInitialTerminalCut::RawDriverAfterReturn] {
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let journal = String::from("wal"); let allocation = journal.as_ptr() as usize; let (cleanup, _) = fixed_initial_raw_error();
+                frame.read_loan().test_code_terminal_cut(cut, journal, cleanup); { let _short = frame.read_loan(); }
+                let mut moved = frame.enter_rows();
+                if matches!(cut, FinancialInitialTerminalCut::FirstColumn | FinancialInitialTerminalCut::QueryReturnUnknown) {
+                    assert_eq!(moved.initial.count, Some(3)); assert_eq!(moved.initial.objects, 0); assert!(moved.initial.main.is_none());
+                }
+                let first = moved.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                let before = moved.source.fields().source_work().test_code_observation();
+                assert_eq!(moved.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                moved.read_loan().test_code_terminal_drain_prefix();
+                if matches!(cut, FinancialInitialTerminalCut::JournalBeforeReset | FinancialInitialTerminalCut::OwnedIgnoredReset) {
+                    assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+                }
+                moved.source.fields().original_transaction().test_code_terminal_exit();
+                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
+                assert!(moved.source.physical.primary.is_none()); assert_owned_pin(&moved.source.audit);
+                assert_eq!(moved.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
             }
         }
     }

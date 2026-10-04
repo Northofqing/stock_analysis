@@ -849,6 +849,7 @@ pub(super) mod original_native {
         statement_phase: StatementPhase,
         a00: A00Record,
         tx: TxRecord,
+        initial_read: InitialReadRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -877,6 +878,7 @@ pub(super) mod original_native {
                     autocommit: AutocommitObservation::NotObserved,
                     rollback: RollbackObservation::NotReached,
                 },
+                initial_read: InitialReadRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -930,6 +932,10 @@ pub(super) mod original_native {
         DiscardBatchFinalize, AwaitBatchReturn, CancelUnissuedBegin, ConsumeKnownBatchReturn,
         ConsumeEarlyTransaction, ObserveAutocommit, PrepareRollback, StepRollback,
         FinalizeRollback, RetainIgnoredRollback, DiscardIgnoredRollback,
+        AwaitInitialReadContext, ValidateInitialOptions, RetainInitialPrimary, RetainInitialDriverError, WrapInitialDriverError, DiscardInitialDriverError, RequireZeroOwnedWal, BeforeInitialCapture,
+        PrepareInitialRead, CheckInitialNoTail, BindInitialEmpty, StepInitialRead, InitialColumnType, InitialInteger, InitialJournalText,
+        ResetInitialRead, FinalizeInitialRead, RetainInitialResetError, RetainInitialFinalizeError,
+        DiscardInitialOwnedCleanup, AwaitInitialQueryReturn, InitialPrefixReached, StopInitialRead,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1044,7 +1050,7 @@ pub(super) mod original_native {
         // Both ports and settlement consult this same barrier. Terminal drain
         // deliberately bypasses it and never requests an owned error.
         fn pending_normal_action(&self) -> Option<LifecycleAction> {
-            if let Some(action) = self.fields.native.transaction_action(&self.fields.work) { return Some(action); }
+            if let Some(action) = self.fields.native.transaction_action(&self.fields.work, self.fields.physical) { return Some(action); }
             if self.fields.physical.audit_pending() {
                 return Some(if self.fields.physical.primary.is_some() { LifecycleAction::DrainAuditResources }
                     else { LifecycleAction::FinishAuditAcquisition });
@@ -1084,7 +1090,7 @@ pub(super) mod original_native {
             }
         }
         fn drain_action(&self) -> LifecycleAction {
-            if let Some(action) = self.fields.native.transaction_action(&self.fields.work) { return action; }
+            if let Some(action) = self.fields.native.transaction_action(&self.fields.work, self.fields.physical) { return action; }
             if self.fields.physical.audit_pending() { return LifecycleAction::DrainAuditResources; }
             if self.fields.physical.sidecar_locals_pending() { return LifecycleAction::DrainSidecarLocals; }
             if let Some(state) = self.fields.native.statements[0].live() {
@@ -1171,7 +1177,7 @@ pub(super) mod original_native {
             Ok(())
         }
         fn settle(self) -> AcquisitionSettlement<'a> {
-            if self.fields.native.transaction_action(&self.fields.work).is_some()
+            if self.fields.native.transaction_action(&self.fields.work, self.fields.physical).is_some()
                 || (self.terminal().is_none() && self.pending_normal_action().is_some())
                 || self.fields.physical.blocks_original_close()
                 || self.fields.native.original.phase().is_some()
@@ -1760,12 +1766,17 @@ pub(super) mod original_native {
                 (_, BatchPhase::Dormant | BatchPhase::Finished) => return None,
             })
         }
-        fn transaction_action(&self, work: &OriginalSourceWork<'_>) -> Option<LifecycleAction> {
+        fn transaction_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
             let terminal = work.terminal().is_some();
             if let Some(action) = self.batch_action(BatchKind::Begin, terminal) { return Some(action); }
+            if self.initial_read.context != InitialContext::Unbound
+                && (matches!(self.tx.phase, TxPhase::Active) || matches!(self.initial_read.context, InitialContext::Unknown | InitialContext::Refused)) {
+                if let Some(action) = self.initial_read_action(work, physical) { return Some(action); }
+            }
             match self.tx.phase {
                 TxPhase::NotCreated | TxPhase::Finished => None,
-                TxPhase::Active => Some(LifecycleAction::ConsumeEarlyTransaction),
+                TxPhase::Active => Some(if terminal || physical.primary.is_some() { LifecycleAction::ConsumeEarlyTransaction }
+                    else { LifecycleAction::AwaitInitialReadContext }),
                 TxPhase::Consuming => {
                     if matches!(self.tx.autocommit, AutocommitObservation::NotObserved) { return Some(LifecycleAction::ObserveAutocommit); }
                     if let Some(action) = self.batch_action(BatchKind::Rollback, terminal) { return Some(action); }
@@ -1774,10 +1785,11 @@ pub(super) mod original_native {
                 }
             }
         }
-        pub(in crate::database::global_schema_v1) fn transaction_release_ready(&self, work: &OriginalSourceWork<'_>) -> bool {
-            self.transaction_action(work).is_none()
+        pub(in crate::database::global_schema_v1) fn transaction_release_ready(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> bool {
+            self.transaction_action(work, physical).is_none()
                 && matches!(self.tx.phase, TxPhase::NotCreated | TxPhase::Finished)
                 && self.statements.iter().all(|slot| slot.live().is_none())
+                && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1791,6 +1803,7 @@ pub(super) mod original_native {
             if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
                 || !self.fields.physical.parent_sidecars_retained()
                 || self.fields.physical.audit_phase != super::super::super::FinancialAuditPhase::Ready
+                || matches!(n.initial_read.context, InitialContext::Unknown | InitialContext::Refused)
                 || !n.audit_acquisition_ready() || n.tx.begin.phase != BatchPhase::Dormant { return false; }
             let StmtSlot::Finalized(state) = &n.statements[0] else { return false; };
             if state.action != FixedAction::MaterializeCount || state.cursor != CursorPhase::NoCursor
@@ -1806,7 +1819,7 @@ pub(super) mod original_native {
             -> OriginalBatchReturnPort<'s, 'a, 'r> {
             OriginalBatchReturnPort { loan: self, kind, _rules: rules }
         }
-        fn next(&self) -> Option<LifecycleAction> { self.fields.native.transaction_action(&self.fields.work) }
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.transaction_action(&self.fields.work, self.fields.physical) }
         fn adverse(&mut self, action: FixedAction, code: i32) {
             if code == rusqlite::ffi::SQLITE_OK { return; }
             if self.fields.native.secondary.is_none() {
@@ -1944,7 +1957,9 @@ pub(super) mod original_native {
         }
         fn retain_early_primary(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
             if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
-                || self.next() != Some(LifecycleAction::ConsumeEarlyTransaction) { return Err(error); }
+                || !matches!(self.fields.native.tx.phase, TxPhase::Active)
+                || self.fields.native.initial_read.ignored.is_some() || self.fields.native.statements[0].live().is_some()
+                || self.fields.native.initial_read.phase == InitialPhase::Primary || self.fields.native.initial_read.driver_error.is_some() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -1990,7 +2005,7 @@ pub(super) mod original_native {
         }
         pub(in crate::database::global_schema_v1) fn test_code_assert_transaction_barrier(&mut self) {
             assert!(self.next().is_some());
-            assert!(!self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
             let before = self.fields.work.test_code_observation();
             let expected = self.next().unwrap();
             let mut old = self.fields.reborrow().original_acquisition();
@@ -2041,7 +2056,7 @@ pub(super) mod original_native {
             assert!(matches!(self.fields.native.tx.phase, TxPhase::NotCreated));
             assert!(matches!(self.fields.native.tx.autocommit, AutocommitObservation::NotObserved));
             assert!(matches!(self.fields.native.tx.rollback, RollbackObservation::NotReached));
-            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
             self.assert_a00_saved();
         }
         fn assert_a00_saved(&self) {
@@ -2087,7 +2102,7 @@ pub(super) mod original_native {
             assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
             assert!(matches!(self.fields.native.tx.phase, TxPhase::Finished));
             assert!(matches!(self.fields.native.tx.rollback, RollbackObservation::NotReached));
-            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
         }
         pub(in crate::database::global_schema_v1) fn test_code_normal_rollback_error(&mut self, ignored: SourceOperationError, cleanup: SourceOperationError) {
             let SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = &ignored else { panic!("fixed owned ignored result"); };
@@ -2108,7 +2123,7 @@ pub(super) mod original_native {
             self.discard_ignored_rollback().unwrap();
             assert_eq!(self.discard_ignored_rollback(), Err(ProtocolFault::UnexpectedObservation));
             assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
-            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
         }
         pub(in crate::database::global_schema_v1) fn test_code_rollback_tail_error(&mut self) {
             self.observe_autocommit(0).unwrap(); self.fixed_install_batch(BatchKind::Rollback);
@@ -2126,7 +2141,7 @@ pub(super) mod original_native {
             assert_eq!(self.retain_batch_return(BatchKind::Rollback, BatchReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
             self.consume_known_return().unwrap();
             assert_eq!(self.consume_known_return(), Err(ProtocolFault::UnexpectedObservation));
-            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
             assert!(self.fields.native.tx.ignored_rollback.is_none());
             assert_eq!(self.fields.work.test_code_observation(), before);
         }
@@ -2151,7 +2166,7 @@ pub(super) mod original_native {
             assert!(matches!(self.fields.native.tx.phase, TxPhase::Finished));
             assert_eq!(self.observe_autocommit(0), Err(ProtocolFault::UnexpectedObservation));
             assert_eq!(self.early_exit_port().observe(BatchObservation::Step(rusqlite::ffi::SQLITE_DONE)), Err(ProtocolFault::UnexpectedObservation));
-            assert!(self.fields.native.transaction_release_ready(&self.fields.work));
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
             let adverse = self.fields.native.secondary.as_ref().unwrap();
             // First adverse is BEGIN's consumed finalize; rollback cannot
             // overwrite it or the first terminal.
@@ -2261,6 +2276,799 @@ pub(super) mod original_native {
                 && matches!(&self.release.audit.unlock, CodeSlot::NotCalled)
                 && matches!(&self.release.audit.file, FileRelease::NotTaken)
                 && matches!(&self.release.audit.guard, GuardRelease::NotTaken)
+        }
+    }
+
+    // Fixed A01/A02 query_row prefix. No native pointers are installed here.
+    // Actual options/FS/hook/driver return facts require the unissued adapter;
+    // private cfg scripts below exercise only this shared ownership protocol.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialContext { Unbound, Unknown, Valid, Refused }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialStage { BeforeBegin, ZeroWal, BeforeCapture, Main, Temp, AppId, Version, ForeignKeys, Journal, Sync, Reached, Stopped }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialQuery { Main, Temp, AppId, Version, ForeignKeys, Journal, Sync }
+    impl InitialQuery {
+        fn action(self) -> FixedAction { match self { Self::Main | Self::Temp => FixedAction::ProspectiveExtent, _ => FixedAction::Pragmas } }
+        fn index(self) -> usize { match self { Self::Main => 0, Self::Temp => 1, Self::AppId => 2, Self::Version => 3, Self::ForeignKeys => 4, Self::Journal => 5, Self::Sync => 6 } }
+        fn next_stage(self) -> InitialStage { match self { Self::Main => InitialStage::Temp, Self::Temp => InitialStage::AppId,
+            Self::AppId => InitialStage::Version, Self::Version => InitialStage::ForeignKeys,
+            Self::ForeignKeys => InitialStage::Journal, Self::Journal => InitialStage::Sync, Self::Sync => InitialStage::Reached } }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialPhase { Dormant, Prepare, Tail, Bind, Step, Type0, Value0, Type1, Value1, Text, Reset, Primary, NeedResetError, NeedFinalizeError, AwaitReturn, Wrap, Finished }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialOutcome { Unknown, FirstRow, NoRow, Error }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialOwnedCleanup { Reset, Finalize }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitialReturnedFact { Ok, Error }
+    struct InitialReadRecord {
+        context: InitialContext,
+        stage: InitialStage,
+        phase: InitialPhase,
+        prepare: CodeSlot,
+        outcome: InitialOutcome,
+        rows_started: bool,
+        returned: BatchReturn,
+        ignored: Option<(InitialOwnedCleanup, rusqlite::Error)>,
+        driver_error: Option<rusqlite::Error>,
+        consumed: [Option<StmtState>; 7],
+        extent_fault: Option<super::super::super::FinancialExtentFault>,
+    }
+    impl InitialReadRecord {
+        fn empty() -> Self { Self { context: InitialContext::Unbound, stage: InitialStage::BeforeBegin,
+            phase: InitialPhase::Dormant, prepare: CodeSlot::NotCalled, outcome: InitialOutcome::Unknown,
+            rows_started: false, returned: BatchReturn::Unobserved, ignored: None, driver_error: None, consumed: [None; 7], extent_fault: None } }
+        fn query(&self) -> Option<InitialQuery> { match self.stage {
+            InitialStage::Main => Some(InitialQuery::Main), InitialStage::Temp => Some(InitialQuery::Temp),
+            InitialStage::AppId => Some(InitialQuery::AppId), InitialStage::Version => Some(InitialQuery::Version),
+            InitialStage::ForeignKeys => Some(InitialQuery::ForeignKeys), InitialStage::Journal => Some(InitialQuery::Journal),
+            InitialStage::Sync => Some(InitialQuery::Sync), _ => None,
+        } }
+    }
+    impl NativeOriginalOwner {
+        fn initial_read_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            let r = &self.initial_read;
+            if r.context == InitialContext::Unbound || (r.stage == InitialStage::Stopped && r.ignored.is_none() && r.driver_error.is_none()) { return None; }
+            if r.ignored.is_some() { return Some(LifecycleAction::DiscardInitialOwnedCleanup); }
+            let terminal = work.terminal().is_some();
+            if terminal {
+                if let Some(state) = self.statements[0].live() {
+                    // A BEGIN/ROLLBACK VM belongs to its existing batch port.
+                    if !matches!(state.action, FixedAction::ProspectiveExtent | FixedAction::Pragmas) { return None; }
+                    return Some(if r.rows_started && matches!(state.reset, CodeSlot::NotCalled) {
+                        LifecycleAction::ResetInitialRead
+                    } else { LifecycleAction::FinalizeInitialRead });
+                }
+                return Some(if r.driver_error.is_some() { LifecycleAction::DiscardInitialDriverError } else { LifecycleAction::StopInitialRead });
+            }
+            // First G primary forbids new read work through either producer.
+            // Existing raw/ignored Results and a genuinely started call retain
+            // their own cleanup/whole-return obligations before fixed TX exit.
+            if physical.primary.is_some() {
+                if r.phase == InitialPhase::NeedResetError { return Some(LifecycleAction::RetainInitialResetError); }
+                if r.phase == InitialPhase::NeedFinalizeError { return Some(LifecycleAction::RetainInitialFinalizeError); }
+                if r.phase == InitialPhase::Primary && r.query().is_some() && r.extent_fault.is_none()
+                    && r.driver_error.is_none() { return Some(LifecycleAction::RetainInitialDriverError); }
+                if let Some(state) = self.statements[0].live() {
+                    if !matches!(state.action, FixedAction::ProspectiveExtent | FixedAction::Pragmas) { return None; }
+                    return Some(if r.rows_started && matches!(state.reset, CodeSlot::NotCalled) {
+                        LifecycleAction::ResetInitialRead
+                    } else { LifecycleAction::FinalizeInitialRead });
+                }
+                if r.phase == InitialPhase::AwaitReturn || (r.driver_error.is_some() && r.returned == BatchReturn::Unobserved) {
+                    return Some(LifecycleAction::AwaitInitialQueryReturn);
+                }
+                return Some(if r.driver_error.is_some() { LifecycleAction::DiscardInitialDriverError } else { LifecycleAction::StopInitialRead });
+            }
+            if r.context == InitialContext::Unknown { return Some(LifecycleAction::ValidateInitialOptions); }
+            if r.context == InitialContext::Refused {
+                return Some(if physical.primary.is_none() { LifecycleAction::RetainInitialPrimary } else { LifecycleAction::StopInitialRead });
+            }
+            if !matches!(self.tx.phase, TxPhase::Active) { return None; }
+            if r.phase == InitialPhase::Primary { return Some(if r.query().is_some() && r.extent_fault.is_none() { LifecycleAction::RetainInitialDriverError } else { LifecycleAction::RetainInitialPrimary }); }
+            if r.phase == InitialPhase::Wrap { return Some(LifecycleAction::WrapInitialDriverError); }
+            if r.phase == InitialPhase::NeedResetError { return Some(LifecycleAction::RetainInitialResetError); }
+            if r.phase == InitialPhase::NeedFinalizeError { return Some(LifecycleAction::RetainInitialFinalizeError); }
+            if r.phase == InitialPhase::AwaitReturn { return Some(LifecycleAction::AwaitInitialQueryReturn); }
+            Some(match r.stage {
+                InitialStage::ZeroWal => LifecycleAction::RequireZeroOwnedWal,
+                InitialStage::BeforeCapture => LifecycleAction::BeforeInitialCapture,
+                InitialStage::Reached => LifecycleAction::InitialPrefixReached,
+                _ => match r.phase {
+                    InitialPhase::Prepare => LifecycleAction::PrepareInitialRead,
+                    InitialPhase::Tail => LifecycleAction::CheckInitialNoTail,
+                    InitialPhase::Bind => LifecycleAction::BindInitialEmpty,
+                    InitialPhase::Step => LifecycleAction::StepInitialRead,
+                    InitialPhase::Type0 | InitialPhase::Type1 => LifecycleAction::InitialColumnType,
+                    InitialPhase::Value0 | InitialPhase::Value1 => LifecycleAction::InitialInteger,
+                    InitialPhase::Text => LifecycleAction::InitialJournalText,
+                    InitialPhase::Reset => LifecycleAction::ResetInitialRead,
+                    InitialPhase::Finished if self.statements[0].live().is_some() => LifecycleAction::FinalizeInitialRead,
+                    _ => return None,
+                },
+            })
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalInitialReadLoan<'a, 'purpose> {
+        fields: OriginalOwnerFields<'a>,
+        prefix: &'a mut super::super::super::FinancialInitialReadState<'purpose>,
+    }
+    // Named ports select only fixed statements; this is no caller SQL getter.
+    struct OriginalInitialReadPort<'s, 'a, 'purpose, 'r> {
+        loan: &'s mut OriginalInitialReadLoan<'a, 'purpose>,
+        kind: InitialQuery,
+        _rules: &'r SelectedOriginalNativeRules,
+    }
+    struct OriginalInitialPrerequisitePort<'s, 'a, 'purpose, 'r> {
+        loan: &'s mut OriginalInitialReadLoan<'a, 'purpose>,
+        _rules: &'r SelectedOriginalNativeRules,
+    }
+    struct OriginalInitialOuterWrapPort<'s, 'a, 'purpose, 'r> {
+        loan: &'s mut OriginalInitialReadLoan<'a, 'purpose>,
+        _rules: &'r SelectedOriginalNativeRules,
+    }
+    impl OriginalInitialOuterWrapPort<'_, '_, '_, '_> {
+        fn extent_catalog_diagnostic(&mut self, paid_detail: String) -> Result<(), String> { self.loan.retain_catalog_wrapped_detail(paid_detail) }
+        fn pragma_driver_error(&mut self) -> Result<(), ProtocolFault> { self.loan.retain_pragma_wrapped_error() }
+    }
+    struct OriginalInitialRowLoan<'s, 'a, 'purpose> { loan: &'s mut OriginalInitialReadLoan<'a, 'purpose> }
+    struct OriginalJournalTextLoan<'row, 'short, 's, 'a, 'purpose> {
+        row: &'short mut OriginalInitialRowLoan<'s, 'a, 'purpose>,
+        bytes: &'row [u8],
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn bind_initial_read_context(&mut self) -> bool {
+            if self.work.terminal().is_some() || self.physical.primary.is_some()
+                || self.native.initial_read.context != InitialContext::Unbound
+                || self.native.tx.begin.phase != BatchPhase::Dormant { return false; }
+            self.native.initial_read.context = InitialContext::Unknown; true
+        }
+        pub(in crate::database::global_schema_v1) fn initial_read<'purpose>(self, prefix: &'a mut super::super::super::FinancialInitialReadState<'purpose>)
+            -> OriginalInitialReadLoan<'a, 'purpose> { OriginalInitialReadLoan { fields: self, prefix } }
+    }
+    impl<'a, 'purpose> OriginalInitialReadLoan<'a, 'purpose> {
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.initial_read_action(&self.fields.work, self.fields.physical) }
+        fn outer_wrap_port<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> OriginalInitialOuterWrapPort<'s, 'a, 'purpose, 'r> { OriginalInitialOuterWrapPort { loan: self, _rules: rules } }
+        fn prerequisite_port<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> OriginalInitialPrerequisitePort<'s, 'a, 'purpose, 'r> {
+            OriginalInitialPrerequisitePort { loan: self, _rules: rules }
+        }
+        fn fixed_port<'s, 'r>(&'s mut self, kind: InitialQuery, rules: &'r SelectedOriginalNativeRules)
+            -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> {
+            if self.fields.native.initial_read.query() != Some(kind) { return Err(ProtocolFault::UnexpectedObservation); }
+            Ok(OriginalInitialReadPort { loan: self, kind, _rules: rules })
+        }
+        fn main_extent<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::Main, rules) }
+        fn temp_extent<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::Temp, rules) }
+        fn application_id<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::AppId, rules) }
+        fn user_version<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::Version, rules) }
+        fn foreign_keys<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::ForeignKeys, rules) }
+        fn journal_mode<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::Journal, rules) }
+        fn synchronous<'s, 'r>(&'s mut self, rules: &'r SelectedOriginalNativeRules) -> Result<OriginalInitialReadPort<'s, 'a, 'purpose, 'r>, ProtocolFault> { self.fixed_port(InitialQuery::Sync, rules) }
+        fn observe_validation(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ValidateInitialOptions) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.fields.native.initial_read.context = if fact == InitialReturnedFact::Ok { InitialContext::Valid } else { InitialContext::Refused };
+            self.fields.native.initial_read.stage = InitialStage::ZeroWal; Ok(())
+        }
+        fn observe_prerequisite(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            let next = self.next();
+            if !matches!(next, Some(LifecycleAction::RequireZeroOwnedWal | LifecycleAction::BeforeInitialCapture)) { return Err(ProtocolFault::UnexpectedObservation); }
+            if fact == InitialReturnedFact::Error { self.fields.native.initial_read.phase = InitialPhase::Primary; return Ok(()); }
+            if next == Some(LifecycleAction::RequireZeroOwnedWal) { self.fields.native.initial_read.stage = InitialStage::BeforeCapture; }
+            else { self.fields.native.initial_read.stage = InitialStage::Main; self.fields.native.initial_read.phase = InitialPhase::Prepare; }
+            Ok(())
+        }
+        fn begin_query_slot(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareInitialRead) || self.fields.native.statements[0].live().is_some()
+                || !matches!(self.fields.native.initial_read.prepare, CodeSlot::NotCalled) { return Err(ProtocolFault::UnexpectedObservation); }
+            // Only a consumed scalar ledger is replaced; A00/BEGIN already
+            // retain their ledgers. There is still one actual VM slot.
+            self.fields.native.statements[0] = StmtSlot::Vacant; Ok(())
+        }
+        fn adverse(&mut self, code: i32) {
+            if code == rusqlite::ffi::SQLITE_OK { return; }
+            let action = self.fields.native.initial_read.query().map_or(FixedAction::Pragmas, InitialQuery::action);
+            if self.fields.native.secondary.is_none() { self.fields.native.secondary = Some(FixedAdverse { role: Role::Original, action, ordinal: 0, code }); }
+            if self.fields.release.first_secondary.is_none() { self.fields.release.first_secondary = Some(FixedAdverse { role: Role::Original, action, ordinal: 0, code }); }
+        }
+        fn observe_prepare(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::PrepareInitialRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let kind = self.fields.native.initial_read.query().ok_or(ProtocolFault::UnexpectedObservation)?;
+            if code == rusqlite::ffi::SQLITE_OK {
+                let state = self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+                if state.action != kind.action() || state.role != Role::Original { return Err(ProtocolFault::UnexpectedObservation); }
+            } else if self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            record_once(&mut self.fields.native.initial_read.prepare, code)?;
+            self.fields.native.initial_read.phase = if code == rusqlite::ffi::SQLITE_OK { InitialPhase::Tail } else { InitialPhase::Primary };
+            if code != rusqlite::ffi::SQLITE_OK { self.fields.native.initial_read.outcome = InitialOutcome::Error; self.adverse(code); } Ok(())
+        }
+        fn observe_tail_or_bind(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            let next = self.next();
+            if !matches!(next, Some(LifecycleAction::CheckInitialNoTail | LifecycleAction::BindInitialEmpty)) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.initial_read;
+            if fact == InitialReturnedFact::Error { r.phase = InitialPhase::Primary; r.outcome = InitialOutcome::Error; }
+            else if next == Some(LifecycleAction::CheckInitialNoTail) { r.phase = InitialPhase::Bind; }
+            else { r.phase = InitialPhase::Step; r.rows_started = true; }
+            Ok(())
+        }
+        fn observe_step(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StepInitialRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let state = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.step, code)?;
+            state.cursor = if code == rusqlite::ffi::SQLITE_DONE { CursorPhase::Ended } else { CursorPhase::Active };
+            let r = &mut self.fields.native.initial_read;
+            match code {
+                rusqlite::ffi::SQLITE_ROW => { r.outcome = InitialOutcome::FirstRow; r.phase = InitialPhase::Type0; }
+                rusqlite::ffi::SQLITE_DONE => { r.outcome = InitialOutcome::NoRow; r.phase = InitialPhase::Reset; }
+                _ => { r.outcome = InitialOutcome::Error; r.phase = InitialPhase::Primary; }
+            }
+            if code != rusqlite::ffi::SQLITE_ROW && code != rusqlite::ffi::SQLITE_DONE { self.adverse(code); } Ok(())
+        }
+        fn first_row(&mut self) -> Result<OriginalInitialRowLoan<'_, 'a, 'purpose>, ProtocolFault> {
+            if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
+                || !matches!(self.next(), Some(LifecycleAction::InitialColumnType | LifecycleAction::InitialInteger | LifecycleAction::InitialJournalText)) {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            Ok(OriginalInitialRowLoan { loan: self })
+        }
+        fn observe_reset(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ResetInitialRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let state = self.fields.native.statements[0].live_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.reset, code)?; state.cursor = CursorPhase::NoCursor;
+            let r = &mut self.fields.native.initial_read;
+            r.phase = if self.fields.work.terminal().is_some() { InitialPhase::Finished }
+                else if r.outcome == InitialOutcome::NoRow { InitialPhase::Primary }
+                else if code != rusqlite::ffi::SQLITE_OK { InitialPhase::NeedResetError }
+                else { InitialPhase::Finished };
+            self.adverse(code);
+            // DONE propagates reset Err (or then constructs NoRows); ROW and
+            // step/conversion Err ignore the reset Result only after payment.
+            Ok(())
+        }
+        fn observe_finalize(&mut self, code: i32) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::FinalizeInitialRead) { return Err(ProtocolFault::UnexpectedObservation); }
+            let mut state = *self.fields.native.statements[0].live().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            record_once(&mut state.finalize, code)?; state.cursor = CursorPhase::NoCursor;
+            self.fields.native.statements[0] = StmtSlot::Finalized(state);
+            self.fields.native.initial_read.phase = if code != rusqlite::ffi::SQLITE_OK && self.fields.work.terminal().is_none() {
+                InitialPhase::NeedFinalizeError
+            } else { InitialPhase::AwaitReturn };
+            self.adverse(code); Ok(())
+        }
+        fn retain_paid_primary(&mut self, error: SourceOperationError) -> Result<(), SourceOperationError> {
+            if self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some()
+                || self.next() != Some(LifecycleAction::RetainInitialPrimary) { return Err(error); }
+            self.fields.physical.primary = Some(error);
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            let r = &mut self.fields.native.initial_read;
+            if r.context == InitialContext::Refused || r.query().is_none() || r.extent_fault.is_some() {
+                r.stage = InitialStage::Stopped; r.phase = InitialPhase::Finished;
+            } else if let Some(state) = self.fields.native.statements[0].live() {
+                r.phase = if r.rows_started && matches!(state.reset, CodeSlot::NotCalled) { InitialPhase::Reset } else { InitialPhase::Finished };
+            } else if r.returned == BatchReturn::ReturnedError { r.stage = InitialStage::Stopped; r.phase = InitialPhase::Finished; }
+            else { r.phase = InitialPhase::AwaitReturn; }
+            Ok(())
+        }
+        fn retain_paid_driver_error(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.fields.work.terminal().is_some() || self.fields.native.initial_read.driver_error.is_some()
+                || self.next() != Some(LifecycleAction::RetainInitialDriverError) { return Err(error); }
+            let r = &mut self.fields.native.initial_read;
+            r.driver_error = Some(error);
+            r.phase = if let Some(state) = self.fields.native.statements[0].live() {
+                if r.rows_started && matches!(state.reset, CodeSlot::NotCalled) { InitialPhase::Reset } else { InitialPhase::Finished }
+            } else if r.returned == BatchReturn::ReturnedError { InitialPhase::Wrap } else { InitialPhase::AwaitReturn };
+            Ok(())
+        }
+        fn wrap_ready(&self) -> bool {
+            self.next() == Some(LifecycleAction::WrapInitialDriverError)
+                && self.fields.native.initial_read.returned == BatchReturn::ReturnedError
+                && self.fields.native.statements[0].live().is_none()
+                && self.fields.native.initial_read.ignored.is_none()
+                && self.fields.native.initial_read.driver_error.is_some()
+                && self.fields.physical.primary.is_none()
+        }
+        fn retain_catalog_wrapped_detail(&mut self, paid_detail: String) -> Result<(), String> {
+            if !self.wrap_ready() || !matches!(self.fields.native.initial_read.query(), Some(InitialQuery::Main | InitialQuery::Temp)) { return Err(paid_detail); }
+            // Future C formatter produces this already-paid owned detail while
+            // the raw error is still retained. No formatting/copy happens here.
+            self.fields.physical.primary = Some(super::super::super::retain_initial_extent_diagnostic(paid_detail));
+            // Mapping remains pending throughout raw consumption; no ledger
+            // is marked stopped/consumed before the wrapper is parent-retained.
+            drop(self.fields.native.initial_read.driver_error.take());
+            self.finish_wrapped_primary(); Ok(())
+        }
+        fn retain_pragma_wrapped_error(&mut self) -> Result<(), ProtocolFault> {
+            if !self.wrap_ready() { return Err(ProtocolFault::UnexpectedObservation); }
+            let operation = match self.fields.native.initial_read.query() {
+                Some(InitialQuery::AppId) => super::super::super::FinancialInitialPragma::ApplicationId,
+                Some(InitialQuery::Version) => super::super::super::FinancialInitialPragma::UserVersion,
+                Some(InitialQuery::ForeignKeys) => super::super::super::FinancialInitialPragma::ForeignKeys,
+                Some(InitialQuery::Journal) => super::super::super::FinancialInitialPragma::JournalMode,
+                Some(InitialQuery::Sync) => super::super::super::FinancialInitialPragma::Synchronous, _ => return Err(ProtocolFault::UnexpectedObservation),
+            };
+            let raw = self.fields.native.initial_read.driver_error.take().ok_or(ProtocolFault::UnexpectedObservation)?;
+            self.fields.physical.primary = Some(super::super::super::retain_initial_pragma_driver_error(operation, raw));
+            self.finish_wrapped_primary(); Ok(())
+        }
+        fn finish_wrapped_primary(&mut self) {
+            self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
+            self.fields.native.initial_read.stage = InitialStage::Stopped;
+            self.fields.native.initial_read.phase = InitialPhase::Finished;
+        }
+        fn discard_owned_driver_error(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardInitialDriverError) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.initial_read;
+            if let Some(kind) = r.query() {
+                if matches!(r.prepare, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)) {
+                    if let StmtSlot::Finalized(state) = &self.fields.native.statements[0] {
+                        if state.action == kind.action() { r.consumed[kind.index()] = Some(*state); }
+                    }
+                }
+            }
+            drop(r.driver_error.take());
+            // The selector permits normal discard only after the actual whole
+            // Error return with a first G primary; terminal uses primitive drain.
+            self.fields.native.initial_read.stage = InitialStage::Stopped;
+            self.fields.native.initial_read.phase = InitialPhase::Finished; Ok(())
+        }
+        fn retain_paid_cleanup(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> {
+            if self.fields.work.terminal().is_some() || self.fields.native.initial_read.ignored.is_some() { return Err(error); }
+            let kind = match self.next() { Some(LifecycleAction::RetainInitialResetError) => InitialOwnedCleanup::Reset,
+                Some(LifecycleAction::RetainInitialFinalizeError) => InitialOwnedCleanup::Finalize, _ => return Err(error) };
+            self.fields.native.initial_read.ignored = Some((kind, error)); Ok(())
+        }
+        fn discard_owned_cleanup(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardInitialOwnedCleanup) { return Err(ProtocolFault::UnexpectedObservation); }
+            let (kind, error) = self.fields.native.initial_read.ignored.take().ok_or(ProtocolFault::UnexpectedObservation)?;
+            drop(error); self.fields.native.initial_read.phase = if kind == InitialOwnedCleanup::Reset { InitialPhase::Finished } else { InitialPhase::AwaitReturn }; Ok(())
+        }
+        fn row_values_complete(&self, kind: InitialQuery) -> bool {
+            match kind {
+                InitialQuery::Main | InitialQuery::Temp => self.prefix.count.is_some() && self.prefix.extent.is_some(),
+                InitialQuery::AppId => self.prefix.application_id.is_some(), InitialQuery::Version => self.prefix.user_version.is_some(),
+                InitialQuery::ForeignKeys => self.prefix.foreign_keys.is_some(), InitialQuery::Journal => self.prefix.journal_mode.is_some(),
+                InitialQuery::Sync => self.prefix.synchronous.is_some(),
+            }
+        }
+        fn retain_query_return(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::AwaitInitialQueryReturn) || self.fields.native.initial_read.returned != BatchReturn::Unobserved || self.fields.native.statements[0].live().is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            let kind = self.fields.native.initial_read.query().ok_or(ProtocolFault::UnexpectedObservation)?;
+            let values_complete = self.row_values_complete(kind);
+            let first_primary = self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.initial_read;
+            if fact == InitialReturnedFact::Ok {
+                if r.outcome != InitialOutcome::FirstRow || !values_complete || r.driver_error.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+                if let StmtSlot::Finalized(state) = &self.fields.native.statements[0] { r.consumed[kind.index()] = Some(*state); }
+                else { return Err(ProtocolFault::ResourceNotInstalled); }
+                r.returned = BatchReturn::ReturnedOk;
+                if first_primary { r.phase = InitialPhase::Finished; return Ok(()); }
+                if matches!(kind, InitialQuery::Main | InitialQuery::Temp) {
+                    let schema = if kind == InitialQuery::Main { super::super::super::FinancialExtentSchema::Main } else { super::super::super::FinancialExtentSchema::Temp };
+                    if let Err(fault) = self.prefix.finish_extent(schema) { r.extent_fault = Some(fault); r.phase = InitialPhase::Primary; return Ok(()); }
+                }
+                r.stage = kind.next_stage(); r.phase = if r.stage == InitialStage::Reached { InitialPhase::Finished } else { InitialPhase::Prepare };
+                r.prepare = CodeSlot::NotCalled; r.outcome = InitialOutcome::Unknown; r.rows_started = false; r.returned = BatchReturn::Unobserved;
+            } else {
+                // Interrupted, incomplete read work can observe an independent
+                // Error return; a completed typed ROW cannot be relabeled Error.
+                if !matches!(r.outcome, InitialOutcome::Error | InitialOutcome::NoRow)
+                    && !(first_primary && !values_complete) { return Err(ProtocolFault::UnexpectedObservation); }
+                r.returned = BatchReturn::ReturnedError;
+                // Do not infer this fact from primary/step/reset/finalize status.
+                if r.driver_error.is_some() { r.phase = InitialPhase::Wrap; }
+                else { r.phase = InitialPhase::Primary; }
+            } Ok(())
+        }
+        fn stop_terminal_or_failed_prefix(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StopInitialRead) || self.fields.native.statements[0].live().is_some()
+                || self.fields.native.initial_read.ignored.is_some() || self.fields.native.initial_read.driver_error.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.fields.native.initial_read;
+            if let Some(kind) = r.query() {
+                // The shared slot may still hold consumed BEGIN or the prior
+                // query. An unissued successor has no consumed read ledger.
+                if matches!(r.prepare, CodeSlot::Called(rusqlite::ffi::SQLITE_OK)) {
+                    if let StmtSlot::Finalized(state) = &self.fields.native.statements[0] {
+                        if state.action == kind.action() { r.consumed[kind.index()] = Some(*state); }
+                    }
+                }
+            }
+            r.stage = InitialStage::Stopped; r.phase = InitialPhase::Finished; Ok(())
+        }
+    }
+    impl OriginalInitialPrerequisitePort<'_, '_, '_, '_> {
+        fn rows_backup_options_validation(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> { self.loan.observe_validation(fact) }
+        fn require_zero_owned_wal(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::RequireZeroOwnedWal) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.observe_prerequisite(fact)
+        }
+        fn before_initial_capture(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::BeforeInitialCapture) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.observe_prerequisite(fact)
+        }
+    }
+    impl OriginalInitialReadPort<'_, '_, '_, '_> {
+        fn prepare_slot(&mut self) -> Result<(), ProtocolFault> { self.loan.begin_query_slot() }
+        fn prepared(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_prepare(code) }
+        fn checked_no_tail(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::CheckInitialNoTail) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.observe_tail_or_bind(fact)
+        }
+        fn bound_empty(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::BindInitialEmpty) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.observe_tail_or_bind(fact)
+        }
+        fn stepped(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_step(code) }
+        fn reset(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_reset(code) }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.observe_finalize(code) }
+        fn retain_paid_driver_result(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_paid_driver_error(error) }
+        fn retain_paid_cleanup_result(&mut self, error: rusqlite::Error) -> Result<(), rusqlite::Error> { self.loan.retain_paid_cleanup(error) }
+        fn discard_existing_cleanup_result(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_owned_cleanup() }
+        fn discard_existing_driver_result(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_owned_driver_error() }
+        fn sql(&self) -> &'static str { match self.kind {
+            InitialQuery::Main => "SELECT COUNT(*),COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) FROM main.sqlite_schema",
+            InitialQuery::Temp => "SELECT COUNT(*),COALESCE(SUM(length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))+COALESCE(length(CAST(sql AS BLOB)),0)),0) FROM temp.sqlite_schema",
+            InitialQuery::AppId => "PRAGMA application_id", InitialQuery::Version => "PRAGMA user_version",
+            InitialQuery::ForeignKeys => "PRAGMA foreign_keys", InitialQuery::Journal => "PRAGMA journal_mode", InitialQuery::Sync => "PRAGMA synchronous",
+        } }
+        fn completed_query_row(&mut self, fact: InitialReturnedFact) -> Result<(), ProtocolFault> { self.loan.retain_query_return(fact) }
+    }
+    impl<'s, 'a, 'purpose> OriginalInitialRowLoan<'s, 'a, 'purpose> {
+        fn column_type(&mut self, native_type: i32) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::InitialColumnType) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.loan.fields.native.initial_read;
+            let expected = if r.query() == Some(InitialQuery::Journal) { rusqlite::ffi::SQLITE_TEXT } else { rusqlite::ffi::SQLITE_INTEGER };
+            if native_type != expected { r.outcome = InitialOutcome::Error; r.phase = InitialPhase::Primary; }
+            else { r.phase = if expected == rusqlite::ffi::SQLITE_TEXT { InitialPhase::Text }
+                else if r.phase == InitialPhase::Type1 { InitialPhase::Value1 } else { InitialPhase::Value0 }; }
+            Ok(())
+        }
+        fn integer(&mut self, value: i64) -> Result<(), ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::InitialInteger) { return Err(ProtocolFault::UnexpectedObservation); }
+            let r = &mut self.loan.fields.native.initial_read;
+            match r.query().ok_or(ProtocolFault::UnexpectedObservation)? {
+                InitialQuery::Main | InitialQuery::Temp => if r.phase == InitialPhase::Value0 {
+                    self.loan.prefix.count = Some(value); r.phase = InitialPhase::Type1; return Ok(());
+                } else { self.loan.prefix.extent = Some(value); },
+                InitialQuery::AppId => self.loan.prefix.application_id = Some(value),
+                InitialQuery::Version => self.loan.prefix.user_version = Some(value),
+                InitialQuery::ForeignKeys => self.loan.prefix.foreign_keys = Some(value),
+                InitialQuery::Sync => self.loan.prefix.synchronous = Some(value),
+                InitialQuery::Journal => return Err(ProtocolFault::UnexpectedObservation),
+            }
+            r.phase = InitialPhase::Reset; Ok(())
+        }
+        fn journal_text<'row, 'short>(&'short mut self, bytes: &'row [u8])
+            -> Result<OriginalJournalTextLoan<'row, 'short, 's, 'a, 'purpose>, ProtocolFault> {
+            if self.loan.next() != Some(LifecycleAction::InitialJournalText) { return Err(ProtocolFault::UnexpectedObservation); }
+            if std::str::from_utf8(bytes).is_err() {
+                self.loan.fields.native.initial_read.outcome = InitialOutcome::Error;
+                self.loan.fields.native.initial_read.phase = InitialPhase::Primary;
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            Ok(OriginalJournalTextLoan { row: self, bytes })
+        }
+    }
+    impl OriginalJournalTextLoan<'_, '_, '_, '_, '_> {
+        // String has already been paid/owned by the future genuine adapter.
+        // No clone, allocator, arbitrary byte debit or layout authority here.
+        fn retain_paid_string(self, paid: String) -> Result<(), String> {
+            if self.row.loan.fields.work.terminal().is_some() || self.row.loan.fields.physical.primary.is_some()
+                || self.row.loan.next() != Some(LifecycleAction::InitialJournalText) || self.row.loan.prefix.journal_mode.is_some()
+                || paid.as_bytes() != self.bytes { return Err(paid); }
+            self.row.loan.prefix.journal_mode = Some(paid);
+            self.row.loan.fields.native.initial_read.phase = InitialPhase::Reset; Ok(())
+        }
+    }
+
+
+    #[cfg(test)]
+    impl OriginalInitialReadLoan<'_, '_> {
+        pub(in crate::database::global_schema_v1) fn test_code_validation_unknown_blocks_begin(&mut self) {
+            assert_eq!(self.next(), Some(LifecycleAction::ValidateInitialOptions));
+            assert!(!self.fields.reborrow().original_transaction().begin());
+            assert_eq!(self.observe_prerequisite(InitialReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.statements.iter().all(|s| matches!(s, StmtSlot::Vacant)));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_validate_genuine_rows_options(&mut self) -> bool {
+            let super::super::super::SelectionSnapshotPurpose::RowsBackup(options) = self.prefix.purpose else { panic!("fixed genuine purpose"); };
+            assert_eq!(super::super::super::decide_financial_mode_pair(self.prefix.bound, self.prefix.catalog), Ok(super::super::super::FinancialModeDecision::Production));
+            // This safe factory executes only in this test protocol; it does
+            // not confer the absent source diagnostic/layout/payment rules.
+            match options.validate_mode(self.prefix.bound) {
+                Ok(()) => { self.observe_validation(InitialReturnedFact::Ok).unwrap(); true }
+                Err(error) => {
+                    let super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail } = &error else { panic!("genuine options refusal"); };
+                    let allocation = detail.as_ptr() as usize;
+                    self.observe_validation(InitialReturnedFact::Error).unwrap();
+                    self.retain_paid_primary(SourceOperationError::Global(error)).unwrap_or_else(|_| panic!("same cfg-owned refusal"));
+                    let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &self.fields.physical.primary else { panic!("retained real refusal"); };
+                    assert_eq!(detail.as_ptr() as usize, allocation); assert!(!self.fields.reborrow().original_transaction().begin()); false
+                }
+            }
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_fixed_prerequisites(&mut self) {
+            assert_eq!(self.next(), Some(LifecycleAction::RequireZeroOwnedWal));
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            // Explicit fake FS observation, never proof that /dev/null pins
+            // satisfy actual owned-WAL/provider qualification.
+            self.observe_prerequisite(InitialReturnedFact::Ok).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::BeforeInitialCapture));
+            let result = self.prefix.purpose.options().unwrap().phase(super::super::super::prospective::Phase::BeforeInitialCapture);
+            assert!(result.is_ok()); self.observe_prerequisite(InitialReturnedFact::Ok).unwrap();
+        }
+        fn fixed_row(&mut self) {
+            self.begin_query_slot().unwrap();
+            let kind = self.fields.native.initial_read.query().unwrap();
+            self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action: kind.action(), ..protocol_stmt_state() });
+            self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap();
+            self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap();
+            self.observe_step(rusqlite::ffi::SQLITE_ROW).unwrap();
+            assert_eq!(self.observe_step(rusqlite::ffi::SQLITE_DONE), Err(ProtocolFault::UnexpectedObservation));
+        }
+        fn fixed_integers(&mut self, first: i64, second: Option<i64>) {
+            let mut row = self.first_row().unwrap();
+            row.column_type(rusqlite::ffi::SQLITE_INTEGER).unwrap(); row.integer(first).unwrap();
+            if let Some(second) = second { row.column_type(rusqlite::ffi::SQLITE_INTEGER).unwrap(); row.integer(second).unwrap(); }
+        }
+        fn fixed_return_ok(&mut self) {
+            self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+            self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap();
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitInitialQueryReturn));
+            assert_eq!(self.observe_step(rusqlite::ffi::SQLITE_DONE), Err(ProtocolFault::UnexpectedObservation));
+            self.test_code_shared_barrier(); self.retain_query_return(InitialReturnedFact::Ok).unwrap();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_before_prepare_cut(&mut self) {
+            assert_eq!(self.fields.native.initial_read.query(), Some(InitialQuery::Main));
+            assert_eq!(self.next(), Some(LifecycleAction::PrepareInitialRead));
+            assert!(self.fields.native.statements[0].live().is_none());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_between_queries_cut(&mut self) {
+            self.fixed_row(); self.fixed_integers(3, Some(17)); self.fixed_return_ok();
+            assert_eq!(self.prefix.main, Some((3, 17)));
+            assert_eq!(self.fields.native.initial_read.query(), Some(InitialQuery::Temp));
+            assert_eq!(self.next(), Some(LifecycleAction::PrepareInitialRead));
+            assert!(self.fields.native.statements[0].live().is_none());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_acquired_row_cut(&mut self) {
+            self.fixed_row(); self.fixed_integers(3, None);
+            assert_eq!(self.prefix.count, Some(3)); assert!(self.prefix.extent.is_none());
+            assert_eq!(self.next(), Some(LifecycleAction::InitialColumnType));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_before_read_primary(&mut self, primary: SourceOperationError) {
+            assert_eq!(self.next(), Some(LifecycleAction::PrepareInitialRead));
+            self.fields.reborrow().original_transaction().retain_early_primary(primary)
+                .unwrap_or_else(|_| panic!("same first owned early primary"));
+            assert_eq!(self.next(), Some(LifecycleAction::StopInitialRead));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_primary_drains_existing_read(&mut self, raw: rusqlite::Error, cleanup: rusqlite::Error) {
+            let before = self.fields.work.test_code_observation(); assert!(before.terminal.is_none());
+            assert!(self.fields.physical.primary.is_some()); assert!(!self.wrap_ready());
+            assert_eq!(self.begin_query_slot(), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.observe_prepare(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.observe_step(rusqlite::ffi::SQLITE_ROW), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.first_row().is_err()); self.test_code_shared_barrier();
+            if self.fields.native.statements[0].live().is_some() {
+                let rusqlite::Error::InvalidColumnName(raw_name) = &raw else { panic!("fixed raw child"); };
+                let raw_allocation = raw_name.as_ptr() as usize;
+                let rusqlite::Error::InvalidColumnName(cleanup_name) = &cleanup else { panic!("fixed ignored child"); };
+                let cleanup_allocation = cleanup_name.as_ptr() as usize;
+                assert_eq!(self.next(), Some(LifecycleAction::ResetInitialRead));
+                self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap();
+                self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                assert_eq!(self.observe_finalize(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.next(), Some(LifecycleAction::RetainInitialFinalizeError));
+                self.retain_paid_cleanup(cleanup).unwrap();
+                { let _short = self.fields.reborrow(); }
+                let Some((InitialOwnedCleanup::Finalize, rusqlite::Error::InvalidColumnName(name))) = &self.fields.native.initial_read.ignored else { panic!("same owned cleanup retained"); };
+                assert_eq!(name.as_ptr() as usize, cleanup_allocation); self.test_code_shared_barrier();
+                self.discard_owned_cleanup().unwrap();
+                assert_eq!(self.discard_owned_cleanup(), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.next(), Some(LifecycleAction::AwaitInitialQueryReturn));
+                assert!(self.fields.native.initial_read.returned == BatchReturn::Unobserved);
+                assert_eq!(self.stop_terminal_or_failed_prefix(), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.discard_owned_driver_error(), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.fields.reborrow().original_transaction().start_early_error(), Err(ProtocolFault::UnexpectedObservation));
+                self.test_code_shared_barrier();
+                // Incomplete typed ROW cannot claim Ok. Error is separately
+                // supplied by the fixed completed-call observation, never
+                // inferred from primary/reset/finalize or the raw diagnostic.
+                assert_eq!(self.retain_query_return(InitialReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+                assert!(self.fields.native.initial_read.returned == BatchReturn::Unobserved);
+                self.retain_query_return(InitialReturnedFact::Error).unwrap();
+                assert_eq!(self.next(), Some(LifecycleAction::RetainInitialDriverError));
+                self.retain_paid_driver_error(raw).unwrap(); { let _short = self.fields.reborrow(); }
+                let Some(rusqlite::Error::InvalidColumnName(name)) = &self.fields.native.initial_read.driver_error else { panic!("same raw child retained until once discard"); };
+                assert_eq!(name.as_ptr() as usize, raw_allocation); assert!(!self.wrap_ready());
+                assert_eq!(self.retain_pragma_wrapped_error(), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.retain_query_return(InitialReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+                self.test_code_shared_barrier(); self.discard_owned_driver_error().unwrap();
+                assert!(self.fields.native.initial_read.consumed[InitialQuery::Main.index()].is_some());
+                assert_eq!(self.discard_owned_driver_error(), Err(ProtocolFault::UnexpectedObservation));
+            } else {
+                drop(raw); drop(cleanup); // unused test payloads claim no driver failure/payment.
+                assert_eq!(self.next(), Some(LifecycleAction::StopInitialRead));
+                assert_eq!(self.retain_query_return(InitialReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+                assert_eq!(self.retain_query_return(InitialReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+                let kind = self.fields.native.initial_read.query().unwrap();
+                assert!(matches!(self.fields.native.initial_read.prepare, CodeSlot::NotCalled));
+                assert!(self.fields.native.initial_read.consumed[kind.index()].is_none());
+                self.stop_terminal_or_failed_prefix().unwrap();
+                assert!(self.fields.native.initial_read.consumed[kind.index()].is_none());
+                if kind == InitialQuery::Temp { assert!(self.fields.native.initial_read.consumed[InitialQuery::Main.index()].is_some()); }
+            }
+            assert_eq!(self.stop_terminal_or_failed_prefix(), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.initial_read.ignored.is_none()); assert!(self.fields.native.initial_read.driver_error.is_none());
+            assert_eq!(self.fields.native.initial_read.stage, InitialStage::Stopped);
+            assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        fn fixed_through_foreign_keys(&mut self) {
+            for (kind, first, second) in [(InitialQuery::Main, 3, Some(17)), (InitialQuery::Temp, 1, Some(5)),
+                (InitialQuery::AppId, 1398035265, None), (InitialQuery::Version, 1, None), (InitialQuery::ForeignKeys, 1, None)] {
+                assert_eq!(self.fields.native.initial_read.query(), Some(kind)); self.fixed_row(); self.fixed_integers(first, second); self.fixed_return_ok();
+            }
+        }
+        fn fixed_journal(&mut self, paid: String) {
+            self.fixed_row(); let mut row = self.first_row().unwrap(); row.column_type(rusqlite::ffi::SQLITE_TEXT).unwrap();
+            { let _short = row.journal_text(b"wal").unwrap(); }
+            row.journal_text(b"wal").unwrap().retain_paid_string(paid).unwrap_or_else(|_| panic!("one supplied paid String move"));
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_exact_prefix(&mut self, journal: String) {
+            let options = self.prefix.purpose.options().unwrap();
+            let object_cap = options.max_catalog_objects as i64; let byte_cap = options.max_catalog_bytes as i64;
+            for (kind, first, second) in [(InitialQuery::Main, object_cap - 1, Some(byte_cap - 1)),
+                (InitialQuery::Temp, 1, Some(1)), (InitialQuery::AppId, 1398035265, None),
+                (InitialQuery::Version, 1, None), (InitialQuery::ForeignKeys, 1, None)] {
+                assert_eq!(self.fields.native.initial_read.query(), Some(kind)); self.fixed_row(); self.fixed_integers(first, second); self.fixed_return_ok();
+            }
+            self.fixed_journal(journal); self.fixed_return_ok(); self.fixed_row(); self.fixed_integers(2, None); self.fixed_return_ok();
+            assert_eq!(self.next(), Some(LifecycleAction::InitialPrefixReached));
+            assert_eq!(self.retain_query_return(InitialReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+            assert_eq!(self.observe_step(rusqlite::ffi::SQLITE_DONE), Err(ProtocolFault::UnexpectedObservation));
+            let mut tx = self.fields.reborrow().original_transaction();
+            assert_eq!(tx.start_early_error(), Err(ProtocolFault::UnexpectedObservation));
+            self.test_code_shared_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_fault_cut(&mut self, case: super::super::super::FinancialInitialReadCase, journal: String) {
+            use super::super::super::FinancialInitialReadCase as Case;
+            match case {
+                Case::NegativeCount | Case::NegativeExtent | Case::ExcessCap | Case::MaximumSum => {
+                    drop(journal); self.fixed_row();
+                    let (count, extent) = match case { Case::NegativeCount => (-1, 0), Case::NegativeExtent => (1, -1),
+                        Case::MaximumSum => (i64::MAX, i64::MAX), _ => (4096, 0) };
+                    self.fixed_integers(count, Some(extent)); self.fixed_return_ok();
+                    if matches!(case, Case::ExcessCap | Case::MaximumSum) {
+                        assert_eq!(self.fields.native.initial_read.query(), Some(InitialQuery::Temp)); self.fixed_row();
+                        let value = if matches!(case, Case::MaximumSum) { i64::MAX } else { 1 };
+                        self.fixed_integers(value, Some(if matches!(case, Case::MaximumSum) { i64::MAX } else { 0 })); self.fixed_return_ok();
+                        assert_eq!(self.fields.native.initial_read.extent_fault, Some(super::super::super::FinancialExtentFault::TotalCap));
+                        if matches!(case, Case::MaximumSum) { assert_eq!((self.prefix.objects, self.prefix.bytes), (u64::MAX - 1, u64::MAX - 1)); }
+                    }
+                }
+                Case::WrongInteger => {
+                    drop(journal); self.fixed_row(); let mut row = self.first_row().unwrap();
+                    row.column_type(rusqlite::ffi::SQLITE_TEXT).unwrap();
+                    assert_eq!(row.integer(1), Err(ProtocolFault::UnexpectedObservation));
+                }
+                Case::JournalWrongType | Case::JournalInvalidUtf8 | Case::SynchronousWrongType => {
+                    self.fixed_through_foreign_keys();
+                    if matches!(case, Case::SynchronousWrongType) {
+                        self.fixed_journal(journal); self.fixed_return_ok(); self.fixed_row();
+                        self.first_row().unwrap().column_type(rusqlite::ffi::SQLITE_NULL).unwrap();
+                    } else {
+                        drop(journal); self.fixed_row(); let mut row = self.first_row().unwrap();
+                        row.column_type(if matches!(case, Case::JournalWrongType) { rusqlite::ffi::SQLITE_BLOB } else { rusqlite::ffi::SQLITE_TEXT }).unwrap();
+                        assert!(row.journal_text(if matches!(case, Case::JournalWrongType) { b"wal" } else { b"\xff" }).is_err());
+                    }
+                }
+                Case::StepError | Case::NoRows | Case::NoRowsResetError => {
+                    drop(journal); self.begin_query_slot().unwrap();
+                    self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action: FixedAction::ProspectiveExtent, ..protocol_stmt_state() });
+                    self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap(); self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap(); self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap();
+                    self.observe_step(if matches!(case, Case::StepError) { rusqlite::ffi::SQLITE_ERROR } else { rusqlite::ffi::SQLITE_DONE }).unwrap();
+                    if !matches!(case, Case::StepError) { self.observe_reset(if matches!(case, Case::NoRowsResetError) { rusqlite::ffi::SQLITE_ERROR } else { rusqlite::ffi::SQLITE_OK }).unwrap(); }
+                }
+            }
+            assert!(matches!(self.next(), Some(LifecycleAction::RetainInitialPrimary | LifecycleAction::RetainInitialDriverError))); self.test_code_shared_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_first_error(&mut self, primary: SourceOperationError, raw: rusqlite::Error) {
+            if self.next() == Some(LifecycleAction::RetainInitialDriverError) {
+                drop(primary); let rusqlite::Error::InvalidColumnName(name) = &raw else { panic!("fixed raw child"); }; let allocation = name.as_ptr() as usize;
+                self.retain_paid_driver_error(raw).unwrap(); { let _short = self.fields.reborrow(); }
+                let Some(rusqlite::Error::InvalidColumnName(name)) = &self.fields.native.initial_read.driver_error else { panic!("same owned raw error"); }; assert_eq!(name.as_ptr() as usize, allocation);
+                let (spare, allocation) = fixed_supplied_error();
+                let Err(spare) = self.fields.reborrow().original_transaction().retain_early_primary(spare) else { panic!("no early Global wrapper while raw return pending"); }; assert_same_supplied_primary(spare, allocation);
+                assert!(!self.wrap_ready());
+            } else { drop(raw); self.retain_paid_primary(primary).unwrap_or_else(|_| panic!("first supplied non-driver primary")); }
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_normal_error(&mut self, cleanup: rusqlite::Error) -> usize {
+            let raw_allocation = match self.fields.native.initial_read.driver_error.as_ref() { Some(rusqlite::Error::InvalidColumnName(name)) => Some(name.as_ptr() as usize), None => None, _ => panic!("fixed owned raw test shape") };
+            if self.fields.native.statements[0].live().is_some() {
+                if self.next() == Some(LifecycleAction::ResetInitialRead) { self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); }
+                self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap();
+                assert_eq!(self.observe_finalize(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+                self.retain_paid_cleanup(cleanup).unwrap();
+                { let _short = self.fields.reborrow(); } self.test_code_shared_barrier();
+                self.discard_owned_cleanup().unwrap(); assert_eq!(self.discard_owned_cleanup(), Err(ProtocolFault::UnexpectedObservation));
+            } else { drop(cleanup); }
+            if self.next() == Some(LifecycleAction::AwaitInitialQueryReturn) { assert!(!self.wrap_ready()); self.retain_query_return(InitialReturnedFact::Error).unwrap(); }
+            let mut detail_allocation = 0;
+            if self.next() == Some(LifecycleAction::WrapInitialDriverError) {
+                assert_eq!(self.retain_query_return(InitialReturnedFact::Error), Err(ProtocolFault::UnexpectedObservation));
+                if matches!(self.fields.native.initial_read.query(), Some(InitialQuery::Main | InitialQuery::Temp)) {
+                    let raw = self.fields.native.initial_read.driver_error.as_ref().unwrap();
+                    let detail = raw.to_string(); detail_allocation = detail.as_ptr() as usize;
+                    assert_eq!(detail, "Invalid column name: TEST_CODE raw driver error");
+                    self.retain_catalog_wrapped_detail(detail).unwrap();
+                    let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionCatalog { source: super::super::super::GlobalSchemaCatalogError::SqliteReferenceBuildFailure { detail, .. } })) = &self.fields.physical.primary else { panic!("same C/G wrapping payload"); };
+                    assert_eq!(detail.as_ptr() as usize, detail_allocation);
+                } else {
+                    self.retain_pragma_wrapped_error().unwrap();
+                    let Some(SourceOperationError::Global(super::super::super::GlobalSchemaV1Error::SelectionSqlite { source: rusqlite::Error::InvalidColumnName(name), .. })) = &self.fields.physical.primary else { panic!("raw child moved into G wrapper"); };
+                    assert_eq!(Some(name.as_ptr() as usize), raw_allocation);
+                }
+            }
+            assert_eq!(self.fields.native.initial_read.stage, InitialStage::Stopped);
+            assert_eq!(self.retain_pragma_wrapped_error(), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.initial_read.driver_error.is_none()); detail_allocation
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_terminal_cut(&mut self, cut: super::super::super::FinancialInitialTerminalCut, journal: String, cleanup: rusqlite::Error) {
+            use super::super::super::FinancialInitialTerminalCut as Cut;
+            match cut {
+                Cut::BeforePrepare => { drop(journal); drop(cleanup); }
+                Cut::FirstColumn => { drop(journal); drop(cleanup); self.fixed_row(); let mut row = self.first_row().unwrap(); row.column_type(rusqlite::ffi::SQLITE_INTEGER).unwrap(); row.integer(3).unwrap(); }
+                Cut::QueryReturnUnknown => { drop(journal); drop(cleanup); self.fixed_row(); self.fixed_integers(3, Some(17)); self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap(); assert_eq!(self.next(), Some(LifecycleAction::AwaitInitialQueryReturn)); }
+                Cut::RawDriverBeforeReturn | Cut::RawDriverAfterReturn => {
+                    drop(journal); self.begin_query_slot().unwrap();
+                    self.fields.native.statements[0] = StmtSlot::ProtocolHeld(StmtState { action: FixedAction::ProspectiveExtent, ..protocol_stmt_state() });
+                    self.observe_prepare(rusqlite::ffi::SQLITE_OK).unwrap(); self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap(); self.observe_tail_or_bind(InitialReturnedFact::Ok).unwrap();
+                    self.observe_step(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.retain_paid_driver_error(cleanup).unwrap();
+                    if matches!(cut, Cut::RawDriverAfterReturn) { self.observe_reset(rusqlite::ffi::SQLITE_OK).unwrap(); self.observe_finalize(rusqlite::ffi::SQLITE_OK).unwrap(); self.retain_query_return(InitialReturnedFact::Error).unwrap(); assert!(self.wrap_ready()); }
+                    else { assert!(!self.wrap_ready()); }
+                }
+                Cut::JournalBeforeReset | Cut::OwnedIgnoredReset => {
+                    self.fixed_through_foreign_keys(); self.fixed_journal(journal);
+                    if matches!(cut, Cut::OwnedIgnoredReset) { self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); self.retain_paid_cleanup(cleanup).unwrap_or_else(|_| panic!("same ignored reset")); }
+                    else { drop(cleanup); }
+                }
+            }
+            self.test_code_shared_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_terminal_drain_prefix(&mut self) {
+            let before = self.fields.work.test_code_observation(); assert!(before.terminal.is_some());
+            assert!(self.first_row().is_err());
+            assert_eq!(self.observe_prerequisite(InitialReturnedFact::Ok), Err(ProtocolFault::UnexpectedObservation));
+            if self.next() == Some(LifecycleAction::DiscardInitialOwnedCleanup) {
+                self.discard_owned_cleanup().unwrap(); assert_eq!(self.discard_owned_cleanup(), Err(ProtocolFault::UnexpectedObservation));
+            }
+            if self.next() == Some(LifecycleAction::ResetInitialRead) { self.observe_reset(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+            if self.next() == Some(LifecycleAction::FinalizeInitialRead) { self.observe_finalize(rusqlite::ffi::SQLITE_ERROR).unwrap(); }
+            assert_eq!(self.observe_finalize(rusqlite::ffi::SQLITE_OK), Err(ProtocolFault::UnexpectedObservation));
+            if self.next() == Some(LifecycleAction::DiscardInitialDriverError) { self.discard_owned_driver_error().unwrap(); }
+            else { self.stop_terminal_or_failed_prefix().unwrap(); }
+            assert_eq!(self.stop_terminal_or_failed_prefix(), Err(ProtocolFault::UnexpectedObservation));
+            assert!(self.fields.native.initial_read.ignored.is_none()); assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_shared_barrier(&mut self) {
+            let before = self.fields.work.test_code_observation(); let expected = self.fields.native.transaction_action(&self.fields.work, self.fields.physical).unwrap();
+            assert!(!self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
+            let mut acquire = self.fields.reborrow().original_acquisition();
+            assert_eq!(acquire.constructor().next(), expected); assert_eq!(acquire.a00_epilogue().next(), expected);
+            assert_eq!(acquire.constructor().observe(ConstructorObservation::Close(rusqlite::ffi::SQLITE_OK)), Err(ProtocolFault::UnexpectedObservation));
+            assert!(matches!(acquire.settle(), AcquisitionSettlement::Held(_))); assert_eq!(self.fields.work.test_code_observation(), before);
+        }
+    }
+    #[cfg(test)]
+    impl OriginalTransactionLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_read_primary_rollback_once(&mut self, ignored: SourceOperationError, cleanup: SourceOperationError) {
+            assert!(self.fields.physical.primary.is_some()); self.start_early_error().unwrap();
+            self.test_code_normal_rollback_error(ignored, cleanup);
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_existing_read_primary_exit(&mut self) {
+            assert!(self.fields.physical.primary.is_some()); self.start_early_error().unwrap(); self.observe_autocommit(1).unwrap();
+            assert!(self.fields.native.transaction_release_ready(&self.fields.work, self.fields.physical));
         }
     }
 
