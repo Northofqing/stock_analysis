@@ -314,21 +314,30 @@ F2 独立全任务审查现已完成：spec/quality NeedsFixes，一项 Importan
 | 完整922输入的普通录制清单 | 全922输入成员及哈希重新核对，独立数据审查通过；`ad93dbd1` | 完整绑定当前工具和财务历史源码；仍为RecordingOnly，真实新录制及可用pin另办 |
 | bundled SQLite录制配方选择 | 独立数据审查、普通录制失败判定及单独root选择后，全922输入及既有工具/metadata重新绑定；`e360fe21` | 仅选择已有可选RecordingOnly配方，不更改默认应用feature；首轮真实请求录制已失败并保留，未证明provider |
 | psm声明、归档证据隔离及普通清单更新 | 6项新增及10项相关检查的有限证据通过；最终版本2项新运行、其余14项未变路径证据复用，独立源码/数据/运行证据审查通过；`0ac2fa1a` | 精确声明、源/角色/cwd关联及归档隔离；清单仅更新owner身份并切回普通RecordingOnly配方，完整922输入未变；不发行native/provider/pin |
+| Original工作计量及拒绝资源表示 | 5项表示测试及1项原非空财务回放回归通过，独立源码/运行证据审查通过；`796c49aa` | 原工作转移和借用保留计量、首个终止及原错误；资源为空，未接真实SQL或完成FinancialPending |
+| 固定财务工作入口及资源借用 | 同次限定库编译8项通过，复用同一产物的原Catalog6非空财务回放1项通过，独立源码/运行证据审查通过；`77826767` | 私有固定Production入口使用既有16MiB预算，单次工作转移及整体拒绝载体；旧入口保持，真实新来源采集和全路径累计容量仍待 |
+| zstd、Anyhow及Serde构建证据录制 | 6项新增及10项相关旧检查的有限运行证据通过，独立源码/数据/运行证据审查通过；`8065395b` | 保留真实探测状态、归档隔离及明确的RecordingOnly生成源映射；完整922输入清单更新，实际录制及native/provider另验 |
+| ring/psm编译器家族探测 | 6项新增及4项相关旧检查的有限运行证据通过，独立源码/数据/运行证据审查通过；`ad6fb35e` | 固定E、help/version、同文件重试及真实状态记录；修复损坏回执崩溃，仍未分派普通Compile/AR或发行provider资格 |
+| Anyhow消费者识别 | 2项受影响新运行通过，14项未变路径证据复用，源码/运行/组合及数据独立审查通过；`bc73cea9` | `--check-cfg`声明不再误认成子探测；与Native6精确合并，bundled RecordingOnly配方保留 |
 
 真实构建录制仍须按每次实际结果解读。第九次录制保留失败：EXIT2/109.785秒，159个完整调用和1个request-only；消费者ring rustc在执行前因两条原生静态库声明被拒绝。第十次已结束：EXIT2/123.4秒，190个完整调用和2个request-only；ring消费者已实际编译成功、两条声明及归档前后观察闭合，新的拒绝点是rustversion版本探测和thiserror静态编译探测。第十一次使用`ad93dbd1`的完整清单已结束：EXIT2/160.154秒，201个完整调用和1个request-only；两个新探测已实际执行并保持真实状态，拒绝点变为psm0.1.30的`static=psm_s`声明（FrameworkTemplate）。另行选择`e360fe21`的已有bundled配方后，首轮真实bundled录制已结束：EXIT2/184.163秒，215个完整Rust调用；59个ring及3个psm原生请求被当前SQLite专用入口在底层工具执行前拒绝（FixedPackageContext）。没有clang/AR/SQLite子调用成功或失败证据，SQLite实际调用为零。应用library仍未产出，所有失败原件保留，不回填旧记录，不把声明或请求观察当原生资格。
 
 第十二次普通录制使用`0ac2fa1a`已结束：EXIT2/224.764秒，Cargo101，303个完整调用及2个request-only，应用library仍未产出。psm消费者实际EXIT0、blockers为空，归档前后哈希一致，最终声明图已闭合到RecordingOnly。新的明确拒绝是zstd-sys的`static=zstd`声明（Cargo消息为FrameworkTemplate）；anyhow的nightly编译探测只有请求、没有编译子调用结果，不能把包装拒绝当实际Unsupported。另有serde_core生成private.rs的producer关联和consumed-source无法闭合。当前工具/清单、完整922输入在本轮保持不变，失败原件已保留；这轮不发行可用pin、原生SQLite或provider资格。
 
+第十三次普通录制在`8065395b`后已结束：EXIT2/288.823秒，Cargo101，298个完整调用及1个request-only，应用library仍未产出。Anyhow子探测已真实EXIT1/Unsupported且无blocker；普通Host消费者的`--check-cfg cfg(anyhow_build_probe)`被候选识别中的子串条件误认成子探测，因此在实际编译前被AnyhowFeatures拒绝。Serde已有一个wide Host生产者和一个Target消费者完成，private.rs按明确的RecordingOnly feature映射关联，execution_edge仍未观察；zstd此轮仅有Host builder，未到Target声明，不能据此声称实际声明已闭合。固定922应用输入及实际工具/政策保持不变，失败原件保留。原生E1早期失败先暴露测试读取原始回执中不存在的invocation_id，修正后又暴露损坏input_pre导致未处理崩溃；已分别修补回执目录关联及快照类型检查。最终第6整项184.962秒、4项旧回归122.676秒全部通过，旧前5项由独立未变路径核对后复用，合计10项有限证据并提交`ad6fb35e`；原失败轮保留，不声称同一当前整10或全95项。Anyhow消费者识别修补的两个受影响方法已通过（26.788及129.264秒），独立源码/运行/精确组合及数据审查通过，已提交`bc73cea9`；不声称一次当前完整16项或全95项。
+
+第二次真实bundled录制使用`bc73cea9`后的合并工具已结束：EXIT2/303.304秒，Cargo101，262个Rust调用全部有回执。124个原生请求中，ring和psm各有E预处理EXIT0、help EXIT1及version EXIT0，合计6个Completed，原206字节输入及原始输出均保留；这次首次观察真实Clang后续前缀。29个ring及1个psm普通编译在工具执行前被ForeignProbeEnvironment拒绝（Compile请求实际LC_ALL=C、LC_CTYPE缺省），8个lz4-sys及80个zstd-sys请求被ForeignSourceContext拒绝。AR和SQLite实际调用仍为零，应用library未产出；所有工具、清单和922输入在录制前后不变。失败原件保留，下一片是根据新成功探测后的请求实现固定Compile分派，随后才能依据新的实际请求实现AR；不以旧fallback标志或这些探测发行provider/pin资格。
+
 当前并行分工和依赖：
 
 - 完整历史Stage3A的15个文件已完成源码与修补审查并由root应用。修补后的40项新增及12项相关回归全部实际通过，独立运行证据审查通过，已保存`25b86600`代码检查点。先后首测暴露fixture空库存指纹及重复收盘输入；失败原件保留，生产校验未放宽。这52项通过不发行profile/provider，也不代表真实SQL接线和完整历史路径已完成。
 - SQLite D1本轮工具修复已完成上述14项验证并保存本地检查点。构建记录工具Tools10已修补rustversion/thiserror两个固定探测；实际cwd关联及失败临时输出的负向隔离问题已通过独立源码审查并由root应用。有限6项新增、4项受影响旧检查的实际结果及未变执行路径已通过独立审查，代码提交`a8c2cf24`。历次fixture失败原件保留，修补仅使目录、删参、只读源码和快照反例实际发生，未放宽生产校验；不声称一次当前10PASS或全77检查。
-- 源SQL台账、owned请求、selection/audit/repository编解码请求图、七种flat Value及native清理隐藏分配的设计已审查。专用raw owner的具体资源持有、R599唯一工作转移、部分资源释放及短fatal借用合同已完成有限审查；枚举tag/union容量公式发现并修正了一项设计问题。上述仍为设计，实际Stage3B/4接线、选定布局/规则、原生provider与完整16MiB成功路径证据尚待。
-- root独占实际源码应用、共享Cargo和真实录制。psm修补经独立审查后已应用并本地提交`0ac2fa1a`；路径别名、已观察归档哈希丢失、当前输出哈希遗漏和Host/helper cwd来源关联问题已修正，旧77项方法及native17/ring/framework/Tools10实现边界保持不变。清单经单独root选择切回普通诊断配方，仅owner身份/profile两处更新；完整922输入重新核对，独立数据审查通过。第十二次真实录制保留上述失败，下一有限诊断针对zstd声明、anyhow探测和serde生成源关联。ring/psm原生请求的严格分派仍为设计，不能直接放行所有CC/AR命令；尚无真实native/provider或可用pin结论。
+- 源SQL台账、owned请求、selection/audit/repository编解码请求图、七种flat Value及native清理隐藏分配的设计已审查。专用raw owner的具体资源持有、R599唯一工作转移、部分资源释放及短fatal借用合同已完成有限审查；枚举tag/union容量公式发现并修正了一项设计问题。Original计量/错误/空资源表示及G固定工作入口已经实现并提交`796c49aa`、`77826767`，通过上述有限验证；真实Stage3B/4来源采集及SQL接线、选定布局/规则、原生provider与完整16MiB成功路径证据尚待。
+- root独占实际源码应用、共享Cargo和真实录制。psm修补经独立审查后已应用并本地提交`0ac2fa1a`；路径别名、已观察归档哈希丢失、当前输出哈希遗漏和Host/helper cwd来源关联问题已修正，旧77项方法及native17/ring/framework/Tools10实现边界保持不变。清单经单独root选择切回普通诊断配方，仅owner身份/profile两处更新；完整922输入重新核对，独立数据审查通过。第十二次真实录制保留上述失败，zstd声明、anyhow真实编译探测及serde生成源关联的有限修补已独立复核并提交`8065395b`，第十三次普通录制保留上述Anyhow消费者误识别失败，最小识别修补已验证并提交`bc73cea9`。ring/psm固定E、help/version原生探测及损坏快照处理已经上述10项有限证据核对并提交`ad6fb35e`；普通编译/AR尚未实现分派，完整bundled成功构建及native/provider或可用pin另验。
 
 尚未完成的整体范围：
 
-1. 受控构建与原生SQLite：zstd声明、anyhow探测及serde生成源关联；严格原生CC/AR分派、选定编译来源/布局/规则、SQLite最终可执行文件及同进程provider资格。普通录制中的psm成功不替代这些条件。
+1. 受控构建与原生SQLite：ring/psm/lz4/zstd原生编译和严格CC/AR分派，zstd/Anyhow/Serde修补后的真实消费者路径、选定编译来源/布局/规则、SQLite最终可执行文件及同进程provider资格。普通录制中的psm成功不替代这些条件。
 2. 完整财务历史回放：Stage3A核心已实现；真实SQL、审计及环境/品种身份接线，专用资源持有实现及全历史prepare→render累计16MiB路径仍待。阶段性fixture不能作为完整成功。
 3. 目标迁移与恢复：exact6→8增量目标、原全部非空财务历史保全、早期代际映射、整制品批准绑定、原子交换、启动/冷恢复及生产重新资格。
 4. 正式资金和正向F2：真实账户B/allocation/seed/cutover批准、唯一正向intent发行与持久版本、调度和实际Paper消费。只读提案和完整拒绝记录不能代替这些条件。
