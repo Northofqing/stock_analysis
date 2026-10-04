@@ -45,7 +45,9 @@ pub(crate) type Result<T> = std::result::Result<T, FinancialFailure>;
 pub(crate) enum FinancialFailure {
     Financial(LedgerError),
     Fee(AShareFeeV2Error),
-    Terminal(ReplayTerminalFailure)
+    Terminal(ReplayTerminalFailure),
+    History(String),
+    Attribution(crate::database::attribution_epochs::AttributionEpochStoreError),
 }
 impl From<LedgerError> for FinancialFailure {
     fn from(e: LedgerError)->Self {
@@ -89,7 +91,7 @@ pub(crate) enum FinancialWork<'loan, 'pool>{
     Fixture(crate::database::global_schema_v1::replay_work::FinancialFixtureLoan<'loan, 'pool>),
 }
 impl<'loan, 'pool> FinancialWork<'loan, 'pool>{
-    fn is_historical(&self)->bool{
+    pub(crate) fn is_historical(&self)->bool{
         matches!(self, Self::Historical)
     }
     pub(crate) fn finish(&self)->Result<()>{
@@ -982,5 +984,560 @@ impl FinancialWork<'_, '_> {
             Self::Fixture(loan) => loan.expected_boundary_cost(),
             _ => panic!("fixed fixture only")
         }
+    }
+}
+
+// Only the eighteen concrete history temporaries and the Marked subsidiary
+// pair implement this seal in their owning modules. No Deserialize capability.
+pub(crate) mod history_sealed {
+    pub(crate) trait Element {}
+    pub(crate) trait TreeEntry {}
+    pub(crate) trait HashEntry {}
+}
+pub(crate) trait HistoryElement: history_sealed::Element {}
+pub(crate) trait HistoryTreeEntry: history_sealed::TreeEntry {}
+pub(crate) trait HistoryHashEntry: history_sealed::HashEntry {}
+impl history_sealed::Element for i64 {}
+impl HistoryElement for i64 {}
+impl history_sealed::HashEntry for (i64, ()) {}
+impl HistoryHashEntry for (i64, ()) {}
+impl history_sealed::HashEntry for (&str, ()) {}
+impl HistoryHashEntry for (&str, ()) {}
+impl history_sealed::HashEntry for (String, ()) {}
+impl HistoryHashEntry for (String, ()) {}
+impl history_sealed::TreeEntry for (String, u64) {}
+impl HistoryTreeEntry for (String, u64) {}
+
+impl<'loan, 'pool> FinancialWork<'loan, 'pool> {
+    fn history_ops(&mut self) -> std::result::Result<crate::database::global_schema_v1::replay_work::HistoryOps<'_, 'pool>, ReplayTerminalFailure> {
+        match self {
+            Self::Historical => unreachable!("Historical has no qualified history loan"),
+            Self::Bounded(memory) => memory.history_ops(),
+            #[cfg(test)]
+            Self::Fixture(loan) => loan.history_ops(),
+        }
+    }
+    pub(crate) fn history_text(&mut self, text: HistoryText<'_>) -> Result<String> {
+        if self.is_historical() {
+            let mut sink = FinancialSink::Owned(Vec::new());
+            let float = match text.unexpected_float() {
+                Some(value) => Some(crate::database::global_schema_v1::replay_work::historical_history_float(value).expect("finite scalar")),
+                None => None,
+            };
+            text.write(&mut sink, float.as_ref()).expect("closed Historical writer");
+            Ok(String::from_utf8(sink.into_owned()).expect("closed UTF8 writer"))
+        }
+        else {
+            Ok(self.history_ops()?.text(text)?)
+        }
+    }
+    pub(crate) fn history_vector<T: HistoryElement>(&mut self, count: usize) -> Result<Vec<T>> {
+        if self.is_historical() {
+            Ok(Vec::with_capacity(count))
+        }
+        else {
+            Ok(self.history_ops()?.vector(count)?)
+        }
+    }
+    pub(crate) fn history_push<T: HistoryElement>(&mut self, values: &mut Vec<T>, value: T) -> Result<()> {
+        if self.is_historical() {
+            values.push(value);
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.push(values, value)?)
+        }
+    }
+    pub(crate) fn history_seen<T: Eq + std::hash::Hash>(&mut self, set: &mut std::collections::HashSet<T>, value: T) -> Result<bool>
+    where (T, ()): HistoryHashEntry {
+        if self.is_historical() {
+            Ok(set.insert(value))
+        }
+        else {
+            Ok(self.history_ops()?.hash_set_insert(set, value)?)
+        }
+    }
+    pub(crate) fn history_name(&mut self, target: &mut String, source: &String) -> Result<()> {
+        if self.is_historical() {
+            target.clone_from(source);
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.clone_name(target, source)?)
+        }
+    }
+}
+
+/// Owns both the fully paid immutable raw result and its original memory.
+/// Actual retained-reader construction is deliberately left to Stage3B.
+/// No constructor accepts an already owned String as proof of payment.
+pub(crate) struct RawRowFrame<'loan, 'pool> {
+    raw: String,
+    work: FinancialWork<'loan, 'pool>,
+}
+impl<'loan, 'pool> RawRowFrame<'loan, 'pool> {
+    #[cfg(test)]
+    pub(crate) fn fixture_copy(
+        raw: &str, mut work: FinancialWork<'loan, 'pool>,
+    ) -> std::result::Result<Self, (FinancialFailure, FinancialWork<'loan, 'pool>)> {
+        assert!(matches!(&work, FinancialWork::Fixture(_)), "genuine lower borrower only");
+        let owned = match work.history_ops().and_then(|mut operations| operations.copy_raw_sql_result(raw)) {
+            Ok(owned) => owned,
+            Err(error) => return Err((error.into(), work)),
+        };
+        Ok(Self {
+            raw: owned, work
+        })
+    }
+    pub(crate) fn scan(&mut self) -> Result<codec::RawScanLoan<'_, 'loan, 'pool>> {
+        self.work.history_ops()?.finish()?;
+        Ok(codec::RawScanLoan::from_paid_frame(PaidRawView {
+            raw: &self.raw, work: &mut self.work
+        }))
+    }
+    pub(crate) fn finish(self) -> FinancialWork<'loan, 'pool> {
+        self.work
+    }
+    #[cfg(test)]
+    pub(crate) fn copied_bytes(&self) -> &str {
+        &self.raw
+    }
+}
+
+pub(crate) enum HistoryText<'a> {
+    Attribution(crate::database::attribution_epochs::SourceText<'a>),
+    EffectiveCorrection,
+    Adjudication(super::paper_ledger::AdjudText<'a>),
+    Audit(crate::database::order_audit::AuditText),
+    Ledger(super::paper_ledger::LedgerHistoryText),
+    Carry(crate::performance::attribution_epoch::CarryText),
+    Fifo(super::paper_lot_ledger::FifoText<'a>),
+    RawFault {
+        raw: &'a str,
+        fault: super::paper_replay_shapes_v1::RawFault
+    },
+    RawDecoded {
+        raw: &'a str,
+        text: super::paper_replay_shapes_v1::RawText
+    },
+}
+impl HistoryText<'_> {
+    pub(crate) fn unexpected_float(&self) -> Option<f64> {
+        use super::paper_replay_shapes_v1::{
+            RawFaultKind,
+            RawNumber,
+            RawSlot
+        };
+        match self {
+            Self::RawFault {
+                fault,
+                ..
+            } => match fault.kind {
+                RawFaultKind::ExpectedSequence(RawSlot::Number(RawNumber::F64(value))) => Some(value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    pub(crate) fn write(&self, out: &mut FinancialSink<'_>, float: Option<&crate::database::global_schema_v1::replay_work::HistoryFloat>) -> std::result::Result<(), ()> {
+        use super::paper_replay_shapes_v1::{
+            RawFaultKind,
+            RawNumber,
+            RawSlot
+        };
+        match self {
+            Self::Fifo(text) => text.write(out),
+            Self::Carry(text) => text.write(out),
+            Self::Ledger(text) => text.write(out),
+            Self::Audit(text) => text.write(out),
+            Self::Adjudication(text) => text.write(out),
+            Self::EffectiveCorrection => out.bytes(b"historical correction outside legacy scope"),
+            Self::Attribution(text) => text.write(out),
+            Self::RawDecoded {
+                raw,
+                text
+            } => {
+                for c in text.chars(raw) {
+                    out.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
+                }
+                Ok(())
+            }
+            Self::RawFault {
+                raw,
+                fault
+            } => {
+                match fault.kind {
+                    RawFaultKind::Syntax(kind) => out.bytes(kind.literal().as_bytes())?,
+                    RawFaultKind::ExpectedSequence(slot) => {
+                        out.bytes(b"invalid type: ")?;
+                        match slot {
+                            RawSlot::Null => out.bytes(b"null")?,
+                            RawSlot::Bool(value) => out.bytes(if value {
+                                b"boolean `true`"
+                            }
+                            else {
+                                b"boolean `false`"
+                            })?,
+                            RawSlot::Number(RawNumber::I64(value)) => {
+                                out.bytes(b"integer `")?;
+                                out.signed(value)?;
+                                out.bytes(b"`")?;
+                            }
+                            RawSlot::Number(RawNumber::U64(value)) => {
+                                out.bytes(b"integer `")?;
+                                out.unsigned(value)?;
+                                out.bytes(b"`")?;
+                            }
+                            RawSlot::Number(RawNumber::F64(_)) => {
+                                out.bytes(b"floating point `")?;
+                                out.bytes(float.ok_or(())?.bytes())?;
+                                out.bytes(b"`")?;
+                            }
+                            RawSlot::Text(text) => {
+                                out.bytes(b"string \"")?;
+                                for c in text.chars(raw) {
+                                    if c == '\'' {
+                                        out.bytes(b"'")?;
+                                    }
+                                    else {
+                                        for escaped in c.escape_debug() {
+                                            out.bytes(escaped.encode_utf8(&mut [0; 4]).as_bytes())?;
+                                        }
+                                    }
+                                }
+                                out.bytes(b"\"")?;
+                            }
+                            RawSlot::Array => out.bytes(b"sequence")?,
+                            RawSlot::Object => out.bytes(b"map")?,
+                        }
+                        out.bytes(b", expected a sequence")?;
+                    }
+                }
+                out.bytes(b" at line ")?;
+                out.unsigned(fault.line as u64)?;
+                out.bytes(b" column ")?;
+                out.unsigned(fault.column as u64)
+            }
+        }
+    }
+}
+// No caller can assemble a row/work pair. Only RawRowFrame constructs this view.
+pub(crate) struct PaidRawView<'row, 'loan, 'pool> {
+    raw: &'row str,
+    work: &'row mut FinancialWork<'loan, 'pool>,
+}
+impl<'row, 'loan, 'pool> PaidRawView<'row, 'loan, 'pool> {
+    pub(super) fn split(self) -> (&'row str, &'row mut FinancialWork<'loan, 'pool>) {
+        (self.raw, self.work)
+    }
+}
+pub(crate) fn historical_text<T>(result: Result<T>) -> std::result::Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(FinancialFailure::History(text)) => Err(text),
+        _ => unreachable!("Historical string owner cannot issue a terminal"),
+    }
+}
+impl std::fmt::Write for FinancialSink<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.bytes(value.as_bytes()).map_err(|_| std::fmt::Error)
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum HistoryChrono<'a> {
+    Whole(chrono::NaiveDateTime),
+    NaiveNanos(chrono::NaiveDateTime),
+    FixedNanos(chrono::DateTime<chrono::FixedOffset>),
+    Date(chrono::NaiveDate),
+    UtcMillis(chrono::DateTime<chrono::Utc>),
+    Dotted(&'a str),
+}
+impl HistoryChrono<'_> {
+    pub(crate) fn historical(self) -> String {
+        match self {
+            Self::Whole(v) => v.format("%Y-%m-%d %H:%M:%S").to_string(),
+            Self::NaiveNanos(v) => v.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
+            Self::FixedNanos(v) => v.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
+            Self::Date(v) => v.to_string(),
+            Self::UtcMillis(v) => v.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            Self::Dotted(v) => format!("{v}."),
+        }
+    }
+}
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_time(&mut self, request: HistoryChrono<'_>) -> Result<String> {
+        if self.is_historical() {
+            Ok(request.historical())
+        }
+        else {
+            Ok(self.history_ops()?.chrono_text(request)?)
+        }
+    }
+    pub(crate) fn history_error(&mut self, text: HistoryText<'_>) -> Result<FinancialFailure> {
+        Ok(FinancialFailure::History(self.history_text(text)?))
+    }
+}
+
+pub(crate) use crate::database::global_schema_v1::replay_work::{
+    HistoryTreeSlot,
+    HistoryVacant
+};
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_begin(&mut self) -> Result<()> {
+        if self.is_historical() {
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.finish()?)
+        }
+    }
+    pub(crate) fn history_entry<'a, K: Ord, V>(&mut self, map: &'a mut BTreeMap<K, V>, key: K) -> Result<HistoryTreeSlot<'a, K, V>>
+    where (K, V): HistoryTreeEntry {
+        if self.is_historical() {
+            // Historical lookup and vacant-value evaluation retain their order.
+            Ok(crate::database::global_schema_v1::replay_work::historical_history_entry(map, key))
+        }
+        else {
+        Ok(self.history_ops()?.tree_slot(map, key)?)
+        }
+    }
+    pub(crate) fn history_insert<'a, K: Ord, V>(&mut self, vacant: HistoryVacant<'a, K, V>, value: V) -> Result<&'a mut V>
+    where (K, V): HistoryTreeEntry {
+        if self.is_historical() {
+            Ok(crate::database::global_schema_v1::replay_work::historical_history_insert(vacant, value))
+        }
+        else {
+        Ok(self.history_ops()?.tree_insert(vacant, value)?)
+        }
+    }
+    pub(crate) fn history_lot(&mut self, lots: &mut std::collections::VecDeque<super::paper_lot_ledger::OpenPaperLot>, lot: super::paper_lot_ledger::OpenPaperLot) -> Result<()> {
+        if self.is_historical() {
+            lots.push_back(lot);
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.open_lot_push(lots, lot)?)
+        }
+    }
+}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_hash(&mut self, input: codec::HistoryOutput<'_>) -> Result<String> {
+        let bytes = if self.is_historical() {
+            input.historical_bytes().map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?
+        }
+        else {
+            self.history_begin()?;
+            codec::encode_history_output(&input, &mut self.codec()?)?
+        };
+        self.hex(input.digest(&bytes))
+    }
+    pub(crate) fn seed_binding_hash(&mut self, seed: &super::paper_ledger::SeedManifest) -> Result<String> {
+        if self.is_historical() {
+            let bytes = serde_json::to_vec(&(1, super::paper_ledger::MONEY_MODEL, super::paper_ledger::FEE_MODEL, seed)).map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+            self.hex(Sha256::digest(bytes).into())
+        }
+        else {
+            self.history_begin()?;
+            Ok(codec::seed_binding_digest(seed, &mut self.codec()?)?)
+        }
+    }
+}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_map_insert<K: Ord, V>(&mut self, map: &mut BTreeMap<K, V>, key: K, value: V) -> Result<Option<V>>
+    where (K, V): HistoryTreeEntry {
+        match self.history_entry(map, key)? {
+            HistoryTreeSlot::Occupied(slot) => Ok(Some(std::mem::replace(slot, value))),
+            HistoryTreeSlot::Vacant(slot) => {
+                self.history_insert(slot, value)?;
+                Ok(None)
+            }
+        }
+    }
+    pub(crate) fn history_sort(&mut self, values: HistorySort<'_>) -> Result<()> {
+        if self.is_historical() {
+            values.sort();
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.sort(values)?)
+        }
+    }
+    pub(crate) fn collect_marked_history_map(&mut self, marks: Vec<super::paper_ledger::Mark>) -> Result<BTreeMap<String, super::paper_ledger::Mark>> {
+        if self.is_historical() {
+            return Ok(marks.into_iter().map(|m| (m.code.clone(), m)).collect());
+        }
+        // Trusted pair backing precedes every key copy. Unadvanced IntoIter is
+        // then reused by the original stable-sort / duplicates-last collector.
+        let mut pairs = self.history_vector(marks.len())?;
+        for mark in marks {
+            let key = self.copy(&mark.code)?;
+            self.history_push(&mut pairs, (key, mark))?;
+        }
+        Ok(self.history_ops()?.collect_marked_pairs(pairs)?)
+    }
+}
+pub(crate) enum HistorySort<'a> {
+    RecomputeFills(&'a mut Vec<super::paper_ledger::RecomputeFill>),
+    RecomputeMarkets(&'a mut Vec<super::paper_ledger::RecomputeMarket>),
+    Economic(&'a mut Vec<super::paper_ledger::OrderedEconomic>),
+    Frozen(&'a mut Vec<crate::database::attribution_epochs::FrozenPaperFill>),
+}
+impl HistorySort<'_> {
+    pub(crate) fn sort(self) {
+        match self {
+            Self::RecomputeFills(values) => super::paper_ledger::sort_recompute_fills_owner(values),
+            Self::RecomputeMarkets(values) => super::paper_ledger::sort_recompute_markets_owner(values),
+            Self::Economic(values) => super::paper_ledger::sort_economic_owner(values),
+            Self::Frozen(values) => crate::database::attribution_epochs::sort_frozen_owner(values),
+        }
+    }
+}
+impl history_sealed::Element for (String, super::paper_ledger::Mark) {}
+impl HistoryElement for (String, super::paper_ledger::Mark) {}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn ledger_timestamp(&mut self, id: i64, raw: &str) -> Result<chrono::NaiveDateTime> {
+        match super::paper_lot_ledger::parse_paper_fill_timestamp_body(id, raw, self) {
+            Ok(value) => Ok(value),
+            Err(FinancialFailure::History(text)) => Err(LedgerError::IntegrityFailure(text).into()),
+            Err(error) => Err(error),
+        }
+    }
+    pub(crate) fn copy_terminal_hash(&mut self, hash: &str) -> Result<String> {
+        if self.is_historical() {
+            Ok(hash.to_owned())
+        }
+        else {
+            self.history_begin()?;
+            Ok(self.codec()?.string(hash)?)
+        }
+    }
+}
+impl RawRowFrame<'_, '_> {
+    pub(crate) fn legacy_hash(&mut self) -> Result<String> {
+        self.work.history_begin()?;
+        self.work.raw_hash(self.raw.as_bytes())
+    }
+}
+
+pub(crate) fn historical_store<T>(value: Result<T>) -> std::result::Result<T, crate::database::attribution_epochs::AttributionEpochStoreError> {
+    match value {
+        Ok(value) => Ok(value),
+        Err(FinancialFailure::Attribution(error)) => Err(error),
+        _ => unreachable!("Historical store owner cannot issue a terminal"),
+    }
+}
+impl From<crate::database::attribution_epochs::AttributionEpochStoreError> for FinancialFailure {
+    fn from(error: crate::database::attribution_epochs::AttributionEpochStoreError) -> Self {
+        Self::Attribution(error)
+    }
+}
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_identity_missing(&mut self) -> Result<()> {
+        Err(self.history_ops()?.refuse(crate::database::global_schema_v1::replay_work::ReplayHistoryQualificationFailure::IdentityContextUnavailable).into())
+    }
+}
+
+impl<'loan, 'pool> FinancialWork<'loan, 'pool> {
+    pub(crate) fn history_set<T: Eq + std::hash::Hash>(&mut self, count: usize) -> Result<std::collections::HashSet<T>>
+    where (T, ()): HistoryHashEntry {
+        if self.is_historical() {
+            Ok(std::collections::HashSet::with_capacity(count))
+        }
+        else {
+            Ok(self.history_ops()?.hash_set(count)?)
+        }
+    }
+    pub(crate) fn history_hash_map<K: Eq + std::hash::Hash, V>(&mut self, count: usize)
+        -> Result<std::collections::HashMap<K, V>>
+    where (K, V): HistoryHashEntry {
+        if self.is_historical() {
+            Ok(std::collections::HashMap::with_capacity(count))
+        }
+        else {
+            Ok(self.history_ops()?.hash_map(count)?)
+        }
+    }
+    pub(crate) fn history_hash_insert<K: Eq + std::hash::Hash, V>(
+        &mut self, map: &mut std::collections::HashMap<K, V>, key: K, value: V,
+    ) -> Result<Option<V>>
+    where (K, V): HistoryHashEntry {
+        if self.is_historical() {
+            Ok(map.insert(key, value))
+        }
+        else {
+            Ok(self.history_ops()?.hash_insert(map, key, value)?)
+        }
+    }
+    pub(crate) fn history_terminal_index<'a>(
+        &mut self,
+        map: &mut std::collections::HashMap<&'a str, Vec<&'a crate::database::order_audit::CanonicalOrderAuditRow>>,
+        row: &'a crate::database::order_audit::CanonicalOrderAuditRow,
+    ) -> Result<()> {
+        if self.is_historical() {
+            map.entry(row.business_order_id.as_str()).or_default().push(row);
+            Ok(())
+        }
+        else {
+            Ok(self.history_ops()?.terminal_rows_index(map, row)?)
+        }
+    }
+}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_count_overflow(&mut self) -> FinancialFailure {
+        // A valid owned collection cannot overflow its usize length plus one.
+        // Retain the fixed terminal if this closed arithmetic is ever reached.
+        match self.history_ops() {
+            Ok(mut operations) => operations.count_overflow().into(),
+            Err(error) => error.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FinancialWork<'_, '_> {
+    pub(crate) fn history_used(&self) -> u64 {
+        match self {
+            Self::Fixture(loan) => loan.history_used(),
+            _ => panic!("fixed lower fixture")
+        }
+    }
+    pub(crate) fn history_entries(&self) -> [usize; 7] {
+        match self {
+            Self::Fixture(loan) => loan.history_entries(),
+            _ => panic!("fixed lower fixture")
+        }
+    }
+}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn known_audit_boxes(&mut self) -> Result<()> {
+        if self.is_historical() {
+            return Ok(());
+        }
+        Ok(self.history_ops()?.known_audit_boxes()?)
+    }
+    pub(crate) fn known_audit_display(&mut self, error: &crate::database::order_audit::KnownAuditError) -> Result<()> {
+        if self.is_historical() {
+            return Ok(());
+        }
+        Ok(self.history_ops()?.known_audit_display(error)?)
+    }
+}
+
+impl FinancialWork<'_, '_> {
+    pub(crate) fn known_source_lowercase(&mut self, detail: &crate::database::attribution_epochs::KnownSourceDetail) -> Result<()> {
+        if self.is_historical() {
+            return Ok(());
+        }
+        Ok(self.history_ops()?.known_source_lowercase(detail)?)
+    }
+    pub(crate) fn source_error_to_ledger(&mut self, error: crate::database::attribution_epochs::AttributionEpochStoreError) -> Result<LedgerError> {
+        Ok(LedgerError::IntegrityFailure(self.history_text(HistoryText::Attribution(
+            crate::database::attribution_epochs::SourceText::Display(&error)
+        ))?))
     }
 }

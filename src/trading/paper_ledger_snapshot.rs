@@ -125,24 +125,24 @@ fn find(
     Ok(None)
 }
 fn result_hash(revision: &SnapshotRevision) -> Result<String, LedgerError> {
-    Ok(digest(&encode(&(
-        ALGORITHM,
-        revision.target_date,
-        &revision.projection,
-        &revision.metrics,
-        &revision.opening_exclusions,
-        revision.account_realized_pnl,
-    ))?))
+    fw::historical(result_hash_with_work(revision, &mut FinancialWork::Historical))
+}
+fn result_hash_with_work(revision: &SnapshotRevision, work: &mut FinancialWork<'_, '_>) -> fw::Result<String> {
+    work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Snapshot(revision))
 }
 pub(super) fn validate(revision: &SnapshotRevision) -> Result<(), LedgerError> {
-    if revision.algorithm != ALGORITHM
-        || revision.target_date != revision.projection.request.as_of
-        || revision.metrics.date != revision.target_date.to_string()
-        || result_hash(revision)? != revision.result_hash
-    {
-        return Err(LedgerError::IntegrityFailure(
-            "unknown/invalid derived snapshot payload".into(),
-        ));
+    fw::historical(validate_with_work(revision, &mut FinancialWork::Historical))
+}
+pub(super) fn validate_with_work(revision: &SnapshotRevision, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+    if revision.algorithm != ALGORITHM || revision.target_date != revision.projection.request.as_of
+        || revision.metrics.date != work.history_time(fw::HistoryChrono::Date(revision.target_date))?
+        || result_hash_with_work(revision, work)? != revision.result_hash {
+        return Err(ledger_history_error(work, LedgerHistoryText::Snapshot)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn result_hash_fixture(revision: &SnapshotRevision) -> String {
+    result_hash(revision).unwrap()
 }

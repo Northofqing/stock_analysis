@@ -1030,3 +1030,577 @@ pub(crate) fn fixed_scratch_trace() -> ScratchTrace {
     check(&bytes,span,&<crate::trading::paper_ledger::AccountBinding as super::paper_replay_codec_v1::Value>::SHAPE,Origin::Direct,0,&mut trace).unwrap();
     trace
 }
+
+// The raw-paper array is a separate default/std compatibility grammar. It does
+// not add a Deserialize root, materialize Value, or confer source authority.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RawNumber {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+impl RawNumber {
+    pub(super) fn as_f64(self) -> f64 {
+        match self {
+            Self::I64(v) => v as f64,
+            Self::U64(v) => v as f64,
+            Self::F64(v) => v,
+        }
+    }
+    pub(super) fn as_u64(self) -> Option<u64> {
+        match self {
+            Self::U64(v) => Some(v),
+            Self::I64(v) => u64::try_from(v).ok(),
+            Self::F64(_) => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RawText {
+    start: usize,
+    end: usize,
+    decoded: usize,
+}
+impl RawText {
+    pub(super) fn decoded_len(self) -> usize {
+        self.decoded
+    }
+    pub(super) fn chars(self, raw: &str) -> RawChars<'_> {
+        RawChars {
+            raw: &raw[self.start..self.end],
+            at: 0
+        }
+    }
+}
+// Created only after validation; iteration cannot encounter an invalid escape.
+pub(super) struct RawChars<'a> {
+    raw: &'a str,
+    at: usize,
+}
+impl Iterator for RawChars<'_> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> {
+        let c = self.raw[self.at..].chars().next()?;
+        self.at += c.len_utf8();
+        if c != '\\' {
+            return Some(c);
+        }
+        let b = self.raw.as_bytes()[self.at];
+        self.at += 1;
+        Some(match b {
+            b'"' => '"', b'\\' => '\\', b'/' => '/', b'b' => '\u{8}',
+            b'f' => '\u{c}', b'n' => '\n', b'r' => '\r', b't' => '\t',
+            b'u' => {
+                let mut n = 0;
+                for b in &self.raw.as_bytes()[self.at..self.at + 4] {
+                    n = 16 * n + hex(*b).expect("validated hex");
+                }
+                self.at += 4;
+                if (0xD800..=0xDBFF).contains(&n) {
+                    self.at += 2;
+                    let mut low = 0;
+                    for b in &self.raw.as_bytes()[self.at..self.at + 4] {
+                        low = 16 * low + hex(*b).expect("validated low surrogate");
+                    }
+                    self.at += 4;
+                    n = 0x10000 + ((n - 0xD800) << 10) + low - 0xDC00;
+                }
+                char::from_u32(n).expect("validated scalar")
+            }
+            _ => unreachable!("validated escape"),
+        })
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RawSlot {
+    Null,
+    Bool(bool),
+    Number(RawNumber),
+    Text(RawText),
+    Array,
+    Object,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RawSyntax {
+    EofList, EofObject, EofString, EofValue, Colon, ListComma, ObjectComma,
+    Ident, Value, Escape, Number, NumberRange, Control, Key, LoneSurrogate,
+    TrailingComma, TrailingCharacters, EndHex, Depth,
+}
+impl RawSyntax {
+    pub(super) fn literal(self) -> &'static str {
+        match self {
+            Self::EofList => "EOF while parsing a list",
+            Self::EofObject => "EOF while parsing an object",
+            Self::EofString => "EOF while parsing a string",
+            Self::EofValue => "EOF while parsing a value",
+            Self::Colon => "expected `:`",
+            Self::ListComma => "expected `,` or `]`",
+            Self::ObjectComma => "expected `,` or `}`",
+            Self::Ident => "expected ident",
+            Self::Value => "expected value",
+            Self::Escape => "invalid escape",
+            Self::Number => "invalid number",
+            Self::NumberRange => "number out of range",
+            Self::Control => "control character (\\u0000-\\u001F) found while parsing a string",
+            Self::Key => "key must be a string",
+            Self::LoneSurrogate => "lone leading surrogate in hex escape",
+            Self::TrailingComma => "trailing comma",
+            Self::TrailingCharacters => "trailing characters",
+            Self::EndHex => "unexpected end of hex escape",
+            Self::Depth => "recursion limit exceeded",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RawFaultKind {
+    Syntax(RawSyntax),
+    ExpectedSequence(RawSlot),
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RawFault {
+    pub(super) kind: RawFaultKind,
+    pub(super) line: usize,
+    pub(super) column: usize,
+}
+pub(super) struct RawPaperArrayPlan {
+    slots: [Option<RawSlot>; 15],
+    len: usize,
+}
+impl RawPaperArrayPlan {
+    pub(super) fn slot(&self, index: usize) -> Option<RawSlot> {
+        self.slots.get(index).copied().flatten()
+    }
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+}
+#[derive(Clone, Copy)]
+enum RawFrame {
+    ArrayFirst,
+    ArrayNext,
+    ObjectFirst,
+    ObjectNext,
+}
+struct RawScanner<'a> {
+    raw: &'a str,
+    at: usize,
+}
+type RawResult<T> = Result<T, RawFault>;
+impl RawScanner<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.raw.as_bytes().get(self.at).copied()
+    }
+    fn next(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.at += 1;
+        Some(b)
+    }
+    fn space(&mut self) -> Option<u8> {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.at += 1;
+        }
+        self.peek()
+    }
+    fn position(&self, kind: RawFaultKind, peek: bool) -> RawFault {
+        let end = if peek {
+            (self.at + 1).min(self.raw.len())
+        }
+        else {
+            self.at
+        };
+        let bytes = &self.raw.as_bytes()[..end];
+        let start = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        RawFault {
+            kind,
+            line: 1 + bytes[..start].iter().filter(|b| **b == b'\n').count(),
+            column: end - start,
+        }
+    }
+    fn error(&self, kind: RawSyntax) -> RawFault {
+        self.position(RawFaultKind::Syntax(kind), false)
+    }
+    fn peek_error(&self, kind: RawSyntax) -> RawFault {
+        self.position(RawFaultKind::Syntax(kind), true)
+    }
+    fn ident(&mut self, suffix: &[u8]) -> RawResult<()> {
+        for expected in suffix {
+            match self.next() {
+                Some(b) if b == *expected => (),
+                Some(_) => return Err(self.error(RawSyntax::Ident)),
+                None => return Err(self.error(RawSyntax::EofValue)),
+            }
+        }
+        Ok(())
+    }
+    fn quad(&mut self) -> RawResult<u32> {
+        if self.raw.len() - self.at < 4 {
+            self.at = self.raw.len();
+            return Err(self.error(RawSyntax::EofString));
+        }
+        let begin = self.at;
+        self.at += 4;
+        let mut n = 0;
+        for b in &self.raw.as_bytes()[begin..self.at] {
+            n = 16 * n + hex(*b).ok_or_else(|| self.error(RawSyntax::Escape))?;
+        }
+        Ok(n)
+    }
+    fn string(&mut self) -> RawResult<RawText> {
+        self.at += 1;
+        let start = self.at;
+        let mut decoded = 0;
+        loop {
+            let b = self.next().ok_or_else(|| self.error(RawSyntax::EofString))?;
+            match b {
+                b'"' => return Ok(RawText {
+                    start, end: self.at - 1, decoded
+                }),
+                0..=31 => return Err(self.error(RawSyntax::Control)),
+                b'\\' => {
+                    let escape = self.next().ok_or_else(|| self.error(RawSyntax::EofString))?;
+                    match escape {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => decoded += 1,
+                        b'u' => {
+                            let mut n = self.quad()?;
+                            if (0xDC00..=0xDFFF).contains(&n) {
+                                return Err(self.error(RawSyntax::LoneSurrogate));
+                            }
+                            if (0xD800..=0xDBFF).contains(&n) {
+                                for expected in [b'\\', b'u'] {
+                                    match self.next() {
+                                        Some(b) if b == expected => (),
+                                        Some(_) => return Err(self.error(RawSyntax::EndHex)),
+                                        None => return Err(self.error(RawSyntax::EofString)),
+                                    }
+                                }
+                                let low = self.quad()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(self.error(RawSyntax::LoneSurrogate));
+                                }
+                                n = 0x10000 + ((n - 0xD800) << 10) + low - 0xDC00;
+                            }
+                            decoded += char::from_u32(n).expect("validated scalar").len_utf8();
+                        }
+                        _ => return Err(self.error(RawSyntax::Escape)),
+                    }
+                }
+                _ => decoded += 1,
+            }
+        }
+    }
+    fn number(&mut self, positive: bool) -> RawResult<RawNumber> {
+        let first = self.next().ok_or_else(|| self.error(RawSyntax::EofValue))?;
+        let mut n = match first {
+            b'0' => {
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(self.peek_error(RawSyntax::Number));
+                }
+                0
+            }
+            b'1'..=b'9' => u64::from(first - b'0'),
+            _ => return Err(self.error(RawSyntax::Number)),
+        };
+        if first != b'0' {
+            while let Some(b @ b'0'..=b'9') = self.peek() {
+                let Some(next) = n.checked_mul(10).and_then(|v| v.checked_add(u64::from(b - b'0'))) else {
+                    let mut exponent = 0;
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.at += 1;
+                        exponent += 1;
+                    }
+                    return match self.peek() {
+                        Some(b'.') => self.decimal(positive, n, exponent),
+                        Some(b'e' | b'E') => self.exponent(positive, n, exponent),
+                        _ => self.float(positive, n, exponent),
+                    }.map(RawNumber::F64);
+                };
+                self.at += 1;
+                n = next;
+            }
+        }
+        match self.peek() {
+            Some(b'.') => self.decimal(positive, n, 0).map(RawNumber::F64),
+            Some(b'e' | b'E') => self.exponent(positive, n, 0).map(RawNumber::F64),
+            _ if positive => Ok(RawNumber::U64(n)),
+            _ => {
+                let negative = (n as i64).wrapping_neg();
+                Ok(if negative >= 0 {
+                    RawNumber::F64(-(n as f64))
+                }
+                else {
+                    RawNumber::I64(negative)
+                })
+            }
+        }
+    }
+    fn decimal(&mut self, positive: bool, mut n: u64, before: i32) -> RawResult<f64> {
+        self.at += 1;
+        let mut after = 0;
+        while let Some(b @ b'0'..=b'9') = self.peek() {
+            let Some(next) = n.checked_mul(10).and_then(|v| v.checked_add(u64::from(b - b'0'))) else {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                }
+                return match self.peek() {
+                    Some(b'e' | b'E') => self.exponent(positive, n, before + after),
+                    _ => self.float(positive, n, before + after),
+                };
+            };
+            self.at += 1;
+            n = next;
+            after -= 1;
+        }
+        if after == 0 {
+            return Err(self.peek_error(if self.peek().is_some() {
+                RawSyntax::Number
+            }
+            else {
+                RawSyntax::EofValue
+            }));
+        }
+        match self.peek() {
+            Some(b'e' | b'E') => self.exponent(positive, n, before + after),
+            _ => self.float(positive, n, before + after),
+        }
+    }
+    fn exponent(&mut self, positive: bool, n: u64, before: i32) -> RawResult<f64> {
+        self.at += 1;
+        let exp_positive = match self.peek() {
+            Some(b'+') => {
+                self.at += 1;
+                true
+            },
+            Some(b'-') => {
+                self.at += 1;
+                false
+            },
+            _ => true,
+        };
+        let mut exp = match self.next() {
+            Some(b @ b'0'..=b'9') => i32::from(b - b'0'),
+            Some(_) => return Err(self.error(RawSyntax::Number)),
+            None => return Err(self.error(RawSyntax::EofValue)),
+        };
+        while let Some(b @ b'0'..=b'9') = self.peek() {
+            self.at += 1;
+            let Some(next) = exp.checked_mul(10).and_then(|v| v.checked_add(i32::from(b - b'0'))) else {
+                if n != 0 && exp_positive {
+                    return Err(self.error(RawSyntax::NumberRange));
+                }
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                }
+                return Ok(if positive {
+                    0.0
+                }
+                else {
+                    -0.0
+                });
+            };
+            exp = next;
+        }
+        self.float(positive, n, if exp_positive {
+            before.saturating_add(exp)
+        }
+        else {
+            before.saturating_sub(exp)
+        })
+    }
+    fn float(&self, positive: bool, n: u64, mut exponent: i32) -> RawResult<f64> {
+        let mut value = n as f64;
+        loop {
+            if let Some(power) = RAW_POW10.get(exponent.wrapping_abs() as usize) {
+                if exponent >= 0 {
+                    value *= power;
+                    if value.is_infinite() {
+                        return Err(self.error(RawSyntax::NumberRange));
+                    }
+                }
+                else {
+                    value /= power;
+                }
+                break;
+            }
+            if value == 0.0 {
+                break;
+            }
+            if exponent >= 0 {
+                return Err(self.error(RawSyntax::NumberRange));
+            }
+            value /= 1e308;
+            exponent += 308;
+        }
+        Ok(if positive {
+            value
+        }
+        else {
+            -value
+        })
+    }
+    fn scalar(&mut self) -> RawResult<RawSlot> {
+        match self.space() {
+            Some(b'n') => {
+                self.at += 1;
+                self.ident(b"ull")?;
+                Ok(RawSlot::Null)
+            },
+            Some(b't') => {
+                self.at += 1;
+                self.ident(b"rue")?;
+                Ok(RawSlot::Bool(true))
+            },
+            Some(b'f') => {
+                self.at += 1;
+                self.ident(b"alse")?;
+                Ok(RawSlot::Bool(false))
+            },
+            Some(b'"') => self.string().map(RawSlot::Text),
+            Some(b'-') => {
+                self.at += 1;
+                self.number(false).map(RawSlot::Number)
+            },
+            Some(b'0'..=b'9') => self.number(true).map(RawSlot::Number),
+            Some(b'[') => Ok(RawSlot::Array),
+            Some(b'{') => Ok(RawSlot::Object),
+            Some(_) => Err(self.peek_error(RawSyntax::Value)),
+            None => Err(self.peek_error(RawSyntax::EofValue)),
+        }
+    }
+}
+// The only production caller holds an inseparable paid-owned-row/work view.
+// This function is not exported as a decoder that accepts caller qualification.
+pub(super) fn scan_paid_raw_array(raw: &str) -> RawResult<RawPaperArrayPlan> {
+    let mut scan = RawScanner {
+        raw,
+        at: 0
+    };
+    if scan.space() != Some(b'[') {
+        let unexpected = scan.scalar()?;
+        return Err(scan.position(RawFaultKind::ExpectedSequence(unexpected), false));
+    }
+    let mut frames = [RawFrame::ArrayFirst; 127];
+    let mut depth = 1;
+    scan.at += 1;
+    let mut plan = RawPaperArrayPlan {
+        slots: [None; 15],
+        len: 0
+    };
+    loop {
+        let state = frames[depth - 1];
+        let peek = scan.space();
+        let array = matches!(state, RawFrame::ArrayFirst | RawFrame::ArrayNext);
+        let close = if array {
+            b']'
+        }
+        else {
+            b'}'
+        };
+        if peek == Some(close) {
+            scan.at += 1;
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+            continue;
+        }
+        let Some(mut next) = peek else {
+            return Err(scan.peek_error(if array {
+                RawSyntax::EofList
+            }
+            else {
+                RawSyntax::EofObject
+            }));
+        };
+        if matches!(state, RawFrame::ArrayNext | RawFrame::ObjectNext) {
+            if next != b',' {
+                return Err(scan.peek_error(if array {
+                    RawSyntax::ListComma
+                }
+                else {
+                    RawSyntax::ObjectComma
+                }));
+            }
+            scan.at += 1;
+            next = scan.space().ok_or_else(|| scan.peek_error(RawSyntax::EofValue))?;
+            if next == close {
+                return Err(scan.peek_error(RawSyntax::TrailingComma));
+            }
+        }
+        if !array {
+            if next != b'"' {
+                return Err(scan.peek_error(RawSyntax::Key));
+            }
+            scan.string()?;
+            match scan.space() {
+                Some(b':') => scan.at += 1,
+                Some(_) => return Err(scan.peek_error(RawSyntax::Colon)),
+                None => return Err(scan.peek_error(RawSyntax::EofObject)),
+            }
+        }
+        let value = scan.scalar()?;
+        if depth == 1 {
+            if plan.len < 15 {
+                plan.slots[plan.len] = Some(value);
+            }
+            plan.len += 1;
+        }
+        frames[depth - 1] = if array {
+            RawFrame::ArrayNext
+        }
+        else {
+            RawFrame::ObjectNext
+        };
+        let child = match value {
+            RawSlot::Array => Some(RawFrame::ArrayFirst),
+            RawSlot::Object => Some(RawFrame::ObjectFirst),
+            _ => None,
+        };
+        if let Some(child) = child {
+            // Original remaining_depth starts at128 and rejects its zero entry.
+            if depth == 127 {
+                return Err(scan.peek_error(RawSyntax::Depth));
+            }
+            scan.at += 1;
+            frames[depth] = child;
+            depth += 1;
+        }
+    }
+    if scan.space().is_some() {
+        return Err(scan.peek_error(RawSyntax::TrailingCharacters));
+    }
+    Ok(plan)
+}
+
+static RAW_POW10: [f64; 309] = [
+    1e000, 1e001, 1e002, 1e003, 1e004, 1e005, 1e006, 1e007, 1e008, 1e009, //
+    1e010, 1e011, 1e012, 1e013, 1e014, 1e015, 1e016, 1e017, 1e018, 1e019, //
+    1e020, 1e021, 1e022, 1e023, 1e024, 1e025, 1e026, 1e027, 1e028, 1e029, //
+    1e030, 1e031, 1e032, 1e033, 1e034, 1e035, 1e036, 1e037, 1e038, 1e039, //
+    1e040, 1e041, 1e042, 1e043, 1e044, 1e045, 1e046, 1e047, 1e048, 1e049, //
+    1e050, 1e051, 1e052, 1e053, 1e054, 1e055, 1e056, 1e057, 1e058, 1e059, //
+    1e060, 1e061, 1e062, 1e063, 1e064, 1e065, 1e066, 1e067, 1e068, 1e069, //
+    1e070, 1e071, 1e072, 1e073, 1e074, 1e075, 1e076, 1e077, 1e078, 1e079, //
+    1e080, 1e081, 1e082, 1e083, 1e084, 1e085, 1e086, 1e087, 1e088, 1e089, //
+    1e090, 1e091, 1e092, 1e093, 1e094, 1e095, 1e096, 1e097, 1e098, 1e099, //
+    1e100, 1e101, 1e102, 1e103, 1e104, 1e105, 1e106, 1e107, 1e108, 1e109, //
+    1e110, 1e111, 1e112, 1e113, 1e114, 1e115, 1e116, 1e117, 1e118, 1e119, //
+    1e120, 1e121, 1e122, 1e123, 1e124, 1e125, 1e126, 1e127, 1e128, 1e129, //
+    1e130, 1e131, 1e132, 1e133, 1e134, 1e135, 1e136, 1e137, 1e138, 1e139, //
+    1e140, 1e141, 1e142, 1e143, 1e144, 1e145, 1e146, 1e147, 1e148, 1e149, //
+    1e150, 1e151, 1e152, 1e153, 1e154, 1e155, 1e156, 1e157, 1e158, 1e159, //
+    1e160, 1e161, 1e162, 1e163, 1e164, 1e165, 1e166, 1e167, 1e168, 1e169, //
+    1e170, 1e171, 1e172, 1e173, 1e174, 1e175, 1e176, 1e177, 1e178, 1e179, //
+    1e180, 1e181, 1e182, 1e183, 1e184, 1e185, 1e186, 1e187, 1e188, 1e189, //
+    1e190, 1e191, 1e192, 1e193, 1e194, 1e195, 1e196, 1e197, 1e198, 1e199, //
+    1e200, 1e201, 1e202, 1e203, 1e204, 1e205, 1e206, 1e207, 1e208, 1e209, //
+    1e210, 1e211, 1e212, 1e213, 1e214, 1e215, 1e216, 1e217, 1e218, 1e219, //
+    1e220, 1e221, 1e222, 1e223, 1e224, 1e225, 1e226, 1e227, 1e228, 1e229, //
+    1e230, 1e231, 1e232, 1e233, 1e234, 1e235, 1e236, 1e237, 1e238, 1e239, //
+    1e240, 1e241, 1e242, 1e243, 1e244, 1e245, 1e246, 1e247, 1e248, 1e249, //
+    1e250, 1e251, 1e252, 1e253, 1e254, 1e255, 1e256, 1e257, 1e258, 1e259, //
+    1e260, 1e261, 1e262, 1e263, 1e264, 1e265, 1e266, 1e267, 1e268, 1e269, //
+    1e270, 1e271, 1e272, 1e273, 1e274, 1e275, 1e276, 1e277, 1e278, 1e279, //
+    1e280, 1e281, 1e282, 1e283, 1e284, 1e285, 1e286, 1e287, 1e288, 1e289, //
+    1e290, 1e291, 1e292, 1e293, 1e294, 1e295, 1e296, 1e297, 1e298, 1e299, //
+    1e300, 1e301, 1e302, 1e303, 1e304, 1e305, 1e306, 1e307, 1e308,
+];

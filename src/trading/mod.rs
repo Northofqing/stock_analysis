@@ -717,3 +717,6 @@ pub(crate) mod paper_replay_codec_v1;
 pub(crate) mod paper_replay_financial_work_v1;
 #[cfg(test)]
 pub(crate) mod paper_replay_transition_v1_tests;
+
+#[cfg(test)]
+pub(crate) mod paper_replay_history_v1_tests;

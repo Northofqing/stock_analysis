@@ -32,7 +32,7 @@ pub struct ValuationBatch {
     pub marks: Vec<Mark>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct OrderFact {
+pub(crate) struct OrderFact {
     pub plan_id: String,
     pub intent_hash: String,
     pub code: String,
@@ -577,15 +577,17 @@ fn financial_check(
 }
 
 pub(super) fn apply_fact(state: &mut Projection, fact: &Fact) -> Result<(), LedgerError> {
+    fw::historical(apply_fact_with_work(state, fact, &mut FinancialWork::Historical))
+}
+pub(super) fn apply_fact_with_work(state: &mut Projection, fact: &Fact, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
     match fact {
-        Fact::DerivedSnapshotV1(revision)=>super::snapshot::validate(revision)?,
-        Fact::AdjudicatedV1(ruling)=>*state=ruling.projection.clone(),
-        Fact::Seeded{
+        Fact::DerivedSnapshotV1(revision) => super::snapshot::validate_with_work(revision, work)?,
+        Fact::AdjudicatedV1(ruling) => *state = work.copy(&ruling.projection)?,
+        Fact::Seeded {
             ..
-        }
-        =>return Err(LedgerError::IntegrityFailure("second genesis".into())),
-        Fact::Marked(batch)=>fw::historical(apply_marked_with_work(state, batch, &mut FinancialWork::Historical))?,
-        Fact::Order(order)=>fw::historical(apply_order_with_work(state, order, &mut FinancialWork::Historical))?,
+        } => return Err(work.error(Txt::V1(fw::V1Text::SecondGenesis))?),
+        Fact::Marked(batch) => apply_marked_with_work(state, batch, work)?,
+        Fact::Order(order) => apply_order_with_work(state, order, work)?,
     }
     Ok(())
 }
